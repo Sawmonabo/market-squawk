@@ -33,7 +33,8 @@ pub(crate) use source_runtime::{
     SourceRuntimeEvidenceError, source_runtime_evidence_maximum_dynamic_bytes,
 };
 pub(crate) use store::{
-    SnapshotPlaneBundle, SnapshotPublishError, SnapshotPublisher, create_snapshot_plane,
+    SnapshotPlaneBundle, SnapshotPlaneRevocation, SnapshotPublishError, SnapshotPublisher,
+    create_snapshot_plane,
 };
 
 /// Hard bound aligned with one shard's preallocated route table.
@@ -178,6 +179,7 @@ pub struct LastTradeSnapshot {
     pub(crate) price: PriceTicks,
     pub(crate) quantity: QuantityLots,
     pub(crate) aggressor_side: AggressorSide,
+    pub(crate) taker_order_type: Option<market_squawk_domain::TradeTakerOrderType>,
     pub(crate) source_timestamp: Option<Timestamp>,
     pub(crate) received_at: Timestamp,
     pub(crate) available_at: Timestamp,
@@ -217,6 +219,11 @@ impl LastTradeSnapshot {
     /// Returns the executed quantity in instrument-defined lots.
     pub const fn quantity(&self) -> QuantityLots {
         self.quantity
+    }
+
+    /// Returns the provider-authored taker order type when the selected trade feed supplies it.
+    pub const fn taker_order_type(&self) -> Option<market_squawk_domain::TradeTakerOrderType> {
+        self.taker_order_type
     }
 
     /// Returns the source-supplied or inferred aggressor side.

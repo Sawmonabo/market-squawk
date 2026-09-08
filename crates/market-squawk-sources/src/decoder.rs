@@ -7,7 +7,7 @@
 use market_squawk_domain::{
     AggressorSide, AuctionPhase, CorporateActionKind, DigestAlgorithm, EvidenceDigest,
     HaltTransition, InstrumentId, IntegrityRule, LiveEventClass, MarketDepth, SequenceNumber,
-    SourceIdentifier, Timestamp, TradingStatus, VenueId,
+    SourceIdentifier, Timestamp, TradeTakerOrderType, TradingStatus, VenueId,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
@@ -28,8 +28,12 @@ pub use outcome::{
 
 /// Maximum provider observations emitted by one transport frame.
 pub const MAX_DECODED_EVENTS: usize = 1_024;
-/// Maximum numeric provider fields retained across one decoded frame.
-pub const MAX_DECODED_BOOK_ITEMS: usize = 20_000;
+/// Maximum provider book levels or changes retained across one decoded frame.
+///
+/// The bound admits a complete current Coinbase Advanced Trade snapshot while remaining below the
+/// closed 16 MiB transport-frame ceiling. Downstream live admission applies the stricter configured
+/// retained-byte limit before the batch enters a shard mailbox.
+pub const MAX_DECODED_BOOK_ITEMS: usize = 131_072;
 const MAX_DECIMAL_LEXEME_BYTES: usize = 128;
 
 /// Exact raw-frame and decoder-rule evidence attached to one provider batch.
@@ -374,8 +378,8 @@ impl ProviderAggressorEvidence {
 #[derive(Clone, Debug)]
 pub struct ProviderBookSnapshotPayload {
     depth: MarketDepth,
-    bids: BoundedVec<ProviderBookLevel, 10_000>,
-    asks: BoundedVec<ProviderBookLevel, 10_000>,
+    bids: BoundedVec<ProviderBookLevel, MAX_DECODED_BOOK_ITEMS>,
+    asks: BoundedVec<ProviderBookLevel, MAX_DECODED_BOOK_ITEMS>,
 }
 
 impl ProviderBookSnapshotPayload {
@@ -399,7 +403,7 @@ impl ProviderBookSnapshotPayload {
 #[derive(Clone, Debug)]
 pub struct ProviderBookDeltaPayload {
     depth: MarketDepth,
-    changes: BoundedVec<ProviderBookChange, 20_000>,
+    changes: BoundedVec<ProviderBookChange, MAX_DECODED_BOOK_ITEMS>,
 }
 
 impl ProviderBookDeltaPayload {

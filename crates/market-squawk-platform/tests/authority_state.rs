@@ -25,25 +25,99 @@ type CorruptionCase = (&'static str, fn(&mut Vec<u8>));
 #[test]
 fn round_trip_replacement_and_reopen_preserve_only_the_latest_canonical_payload() -> TestResult {
     let directory = tempfile::tempdir()?;
+    let root = directory.path().join("authority");
+    let retained_root = if cfg!(unix) {
+        directory.path().join("retained-authority")
+    } else {
+        root.clone()
+    };
+    let namespace = "a".repeat(64);
     {
-        let store = LocalAuthorityStateStore::try_open(directory.path())?;
+        let store = LocalAuthorityStateStore::try_open(&root)?;
         assert_eq!(store.load()?, None);
         store.store(b"first-authority-state")?;
         assert_eq!(store.load()?, Some(b"first-authority-state".to_vec()));
+        for invalid in [
+            "",
+            "-",
+            ".",
+            "..",
+            "../outside",
+            "a/b",
+            "a\\b",
+            "UPPER",
+            "a:",
+            "é",
+        ] {
+            assert!(matches!(
+                store.try_open_namespace(invalid),
+                Err(LocalAuthorityStateStoreError::InvalidNamespace)
+            ));
+        }
+        assert!(matches!(
+            store.try_open_namespace(&"a".repeat(65)),
+            Err(LocalAuthorityStateStoreError::InvalidNamespace)
+        ));
+        #[cfg(unix)]
+        {
+            fs::rename(&root, &retained_root)?;
+            fs::create_dir(&root)?;
+        }
+        let archive = store.try_open_namespace(&namespace)?;
+        assert_eq!(archive.load()?, None);
+        archive.store(b"first-authority-state")?;
+        assert!(matches!(
+            store.try_open_namespace(&namespace),
+            Err(LocalAuthorityStateStoreError::AlreadyLocked)
+        ));
+        let other = store.try_open_namespace("other")?;
+        assert_eq!(other.load()?, None);
+        other.store(b"independent-archive")?;
+        assert!(matches!(
+            other.try_open_namespace(&namespace),
+            Err(LocalAuthorityStateStoreError::AlreadyLocked)
+        ));
         store.store(b"second-authority-state")?;
         assert_eq!(store.load()?, Some(b"second-authority-state".to_vec()));
+        assert_eq!(archive.load()?, Some(b"first-authority-state".to_vec()));
+        #[cfg(unix)]
+        assert_eq!(fs::read_dir(&root)?.count(), 0);
+        drop(store);
+        let reopened = LocalAuthorityStateStore::try_open(&retained_root)?;
+        assert!(matches!(
+            reopened.try_open_namespace(&namespace),
+            Err(LocalAuthorityStateStoreError::AlreadyLocked)
+        ));
     }
 
     #[cfg(unix)]
-    fs::hard_link(
-        directory.path().join(SLOT_A_FILE),
-        directory.path().join(TEMP_A_FILE),
-    )?;
+    for prefix in [String::new(), format!(".authority-namespace-{namespace}--")] {
+        fs::hard_link(
+            retained_root.join(format!("{prefix}{SLOT_A_FILE}")),
+            retained_root.join(format!("{prefix}{TEMP_A_FILE}")),
+        )?;
+    }
 
-    let reopened = LocalAuthorityStateStore::try_open(directory.path())?;
+    let reopened = LocalAuthorityStateStore::try_open(&retained_root)?;
     assert_eq!(reopened.load()?, Some(b"second-authority-state".to_vec()));
-    assert!(!directory.path().join(TEMP_A_FILE).exists());
-    assert!(!directory.path().join(TEMP_B_FILE).exists());
+    let archive = reopened.try_open_namespace(&namespace)?;
+    assert_eq!(archive.load()?, Some(b"first-authority-state".to_vec()));
+    assert_eq!(
+        reopened.try_open_namespace("other")?.load()?,
+        Some(b"independent-archive".to_vec())
+    );
+    for prefix in [String::new(), format!(".authority-namespace-{namespace}--")] {
+        assert!(
+            !retained_root
+                .join(format!("{prefix}{TEMP_A_FILE}"))
+                .exists()
+        );
+        assert!(
+            !retained_root
+                .join(format!("{prefix}{TEMP_B_FILE}"))
+                .exists()
+        );
+    }
     Ok(())
 }
 
@@ -126,6 +200,39 @@ fn unproven_orphan_temp_is_rejected_as_ambiguous_state() -> TestResult {
         LocalAuthorityStateStore::try_open(directory.path()),
         Err(LocalAuthorityStateStoreError::UnsafeFileType)
     ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn valid_pre_replace_temporary_is_discarded_without_advancing_committed_state() -> TestResult {
+    let canonical = tempfile::tempdir()?;
+    {
+        let store = LocalAuthorityStateStore::try_open(canonical.path())?;
+        store.store(b"committed")?;
+    }
+
+    let successor = tempfile::tempdir()?;
+    fs::copy(
+        canonical.path().join(SLOT_A_FILE),
+        successor.path().join(SLOT_A_FILE),
+    )?;
+    fs::copy(
+        canonical.path().join(SLOT_B_FILE),
+        successor.path().join(SLOT_B_FILE),
+    )?;
+    {
+        let store = LocalAuthorityStateStore::try_open(successor.path())?;
+        store.store(b"not-committed")?;
+    }
+    fs::copy(
+        successor.path().join(SLOT_A_FILE),
+        canonical.path().join(TEMP_A_FILE),
+    )?;
+
+    let reopened = LocalAuthorityStateStore::try_open(canonical.path())?;
+    assert_eq!(reopened.load()?, Some(b"committed".to_vec()));
+    assert!(!canonical.path().join(TEMP_A_FILE).exists());
     Ok(())
 }
 

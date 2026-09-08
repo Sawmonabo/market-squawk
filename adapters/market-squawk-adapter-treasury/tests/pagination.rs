@@ -3,24 +3,41 @@ use market_squawk_adapter_treasury::{
     TreasuryProtocolError,
 };
 use market_squawk_domain::CalendarDate;
+use market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES;
 use sha2::{Digest, Sha256};
 use std::num::NonZeroU16;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn accepts_one_based_schema_bound_pages_and_rejects_repetition() -> TestResult {
+fn accepts_compact_pages_and_rejects_the_first_page_above_the_common_cap() -> TestResult {
     let query = average_rates_query(2026)?;
     let request = query.page(1)?;
-    let exact_payload = include_bytes!("../fixtures/average_interest_rates.json");
-    let page = FiscalDataPage::parse(
-        exact_payload,
-        &request,
-        FiscalDataParseLimits::production_defaults(),
-    )?;
+    let mut compact: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../fixtures/average_interest_rates.json"))?;
+    compact["meta"]["total-count"] = serde_json::json!(2);
+    compact["meta"]["total-pages"] = serde_json::json!(2);
+    compact["links"]["last"] = serde_json::json!("&page%5Bnumber%5D=2&page%5Bsize%5D=1");
+    let exact_payload = serde_json::to_vec(&compact)?;
+    let common_limits =
+        FiscalDataParseLimits::try_new(32 * 1024 * 1024, 10_000, 512, MAX_PROVIDER_CAPTURE_PAGES)?;
+    let mut over_record_limit = compact.clone();
+    over_record_limit["data"]
+        .as_array_mut()
+        .ok_or("fixture data must be an array")?
+        .push(serde_json::json!(false));
+    assert_eq!(
+        FiscalDataPage::parse(
+            &serde_json::to_vec(&over_record_limit)?,
+            &request,
+            FiscalDataParseLimits::try_new(32 * 1024 * 1024, 1, 512, MAX_PROVIDER_CAPTURE_PAGES,)?,
+        ),
+        Err(TreasuryProtocolError::InvalidMetadata)
+    );
+    let page = FiscalDataPage::parse(&exact_payload, &request, common_limits)?;
     assert_eq!(page.page_number(), 1);
     assert_eq!(page.records().len(), 1);
-    assert_eq!(page.total_pages(), 4_977);
+    assert_eq!(page.total_pages(), 2);
     assert_eq!(page.records()[0].get("record_date"), Some("2026-06-30"));
 
     assert_eq!(
@@ -29,10 +46,11 @@ fn accepts_one_based_schema_bound_pages_and_rejects_repetition() -> TestResult {
     );
     assert_eq!(
         page.response_payload_digest(),
-        <[u8; 32]>::from(Sha256::digest(exact_payload))
+        <[u8; 32]>::from(Sha256::digest(&exact_payload))
     );
 
-    let mut tracker = TreasuryPaginationTracker::try_new(&query, 5_000, 10_000)?;
+    let mut tracker =
+        TreasuryPaginationTracker::try_new(&query, MAX_PROVIDER_CAPTURE_PAGES, 10_000)?;
     assert!(!tracker.accept(&page)?);
     assert_eq!(
         tracker.accept(&page),
@@ -40,6 +58,13 @@ fn accepts_one_based_schema_bound_pages_and_rejects_repetition() -> TestResult {
             expected: 2,
             actual: 1,
         })
+    );
+    compact["meta"]["total-count"] = serde_json::json!(65);
+    compact["meta"]["total-pages"] = serde_json::json!(65);
+    compact["links"]["last"] = serde_json::json!("&page%5Bnumber%5D=65&page%5Bsize%5D=1");
+    assert_eq!(
+        FiscalDataPage::parse(&serde_json::to_vec(&compact)?, &request, common_limits),
+        Err(TreasuryProtocolError::InvalidMetadata)
     );
     Ok(())
 }

@@ -5,9 +5,11 @@ use market_squawk_platform::SecretGeneration;
 use market_squawk_sources::{
     AuthoritySet, CapabilityRegistrationOutcome, OnboardingEvent, OnboardingLifecycle,
     OnboardingState, ProviderCapability, ProviderCapabilityRevision, ProviderPublicConfiguration,
+    RuntimeVerificationContext,
 };
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::CatalogError;
@@ -23,6 +25,45 @@ const MAX_PROVIDER_SURFACES: i64 = 64;
 const MAX_PROVIDER_REVISIONS: u64 = 256;
 const LEGACY_RESERVATION_SCHEMA_VERSION: i64 = 1;
 const RESERVATION_SCHEMA_VERSION: i64 = 2;
+const MAX_ONBOARDING_MIGRATION_SESSIONS: usize = 65_536;
+const MAX_ONBOARDING_MIGRATION_RECORD_BYTES: usize = 128 * 1024;
+const MAX_ONBOARDING_MIGRATION_SESSION_BYTES: usize = 72 * 1024 * 1024;
+const ONBOARDING_STREAM_VERSION: i64 = 1;
+const ONBOARDING_STREAM_GENESIS_DOMAIN: &[u8] =
+    b"market-squawk/provider-onboarding-stream/genesis/v1";
+const ONBOARDING_STREAM_EVENT_DOMAIN: &[u8] = b"market-squawk/provider-onboarding-stream/event/v1";
+
+enum OnboardingValidationBudget<'a> {
+    Query(&'a mut ResultBudget),
+    Migration { remaining_bytes: usize },
+}
+
+impl OnboardingValidationBudget<'_> {
+    fn for_migration() -> Self {
+        Self::Migration {
+            remaining_bytes: MAX_ONBOARDING_MIGRATION_SESSION_BYTES,
+        }
+    }
+
+    fn charge<const N: usize>(&mut self, components: [usize; N]) -> Result<(), CatalogError> {
+        match self {
+            Self::Query(budget) => budget.charge(components),
+            Self::Migration { remaining_bytes } => {
+                let record_bytes = components
+                    .into_iter()
+                    .try_fold(0_usize, |total, component| total.checked_add(component))
+                    .ok_or(CatalogError::CorruptCatalog)?;
+                if record_bytes > MAX_ONBOARDING_MIGRATION_RECORD_BYTES
+                    || record_bytes > *remaining_bytes
+                {
+                    return Err(CatalogError::CorruptCatalog);
+                }
+                *remaining_bytes -= record_bytes;
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Validated immutable input for one durable onboarding reservation.
 #[derive(Clone, Debug)]
@@ -253,10 +294,6 @@ impl CatalogAuthority {
             return Err(CatalogError::OnboardingDeadlineExceeded);
         }
         require_registered_capability(&transaction, request.capability())?;
-        let lifecycle = OnboardingLifecycle::reserve(
-            request.capability(),
-            request.requested_authority.clone(),
-        )?;
         let authority_json = serde_json::to_vec(request.requested_authority())?;
         if authority_json.len() > MAX_AUTHORITY_JSON_BYTES {
             return Err(CatalogError::InvalidRecord);
@@ -265,6 +302,17 @@ impl CatalogAuthority {
         let public_configuration_json = request.public_configuration().canonical_json()?;
         let public_configuration_digest = sha256(&public_configuration_json);
         let session_id = Uuid::new_v4();
+        let runtime_verification_context = RuntimeVerificationContext::try_new(
+            SourceIdentifier::try_from(session_id.hyphenated().to_string())
+                .map_err(|_| CatalogError::InvalidRecord)?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, public_configuration_digest),
+        )
+        .map_err(|_| CatalogError::InvalidRecord)?;
+        let lifecycle = OnboardingLifecycle::reserve_with_runtime_verification_context(
+            request.capability(),
+            request.requested_authority.clone(),
+            runtime_verification_context,
+        )?;
         let audit_digest = reservation_audit_digest(
             RESERVATION_SCHEMA_VERSION,
             session_id,
@@ -310,6 +358,22 @@ impl CatalogAuthority {
                 public_configuration_json,
             ],
         )?;
+        let stream_genesis = onboarding_stream_genesis_digest(
+            session_id,
+            u64::try_from(audit_sequence).map_err(|_| CatalogError::InvalidRecord)?,
+            audit_digest,
+        );
+        transaction.execute(
+            "INSERT INTO provider_onboarding_stream_heads
+             (session_id, stream_version, event_count, last_event_sequence,
+              last_audit_sequence, cumulative_sha256)
+             VALUES (?1, ?2, 0, NULL, NULL, ?3)",
+            params![
+                session_id.to_string(),
+                ONBOARDING_STREAM_VERSION,
+                stream_genesis
+            ],
+        )?;
         transaction.commit()?;
         Ok(OnboardingReservation {
             catalog_id: self.session_id(),
@@ -326,7 +390,7 @@ impl CatalogAuthority {
     }
 
     /// Appends one contiguous event, or confirms an exact prior commit.
-    pub fn append_provider_onboarding_event(
+    pub(crate) fn append_provider_onboarding_event(
         &self,
         reservation: &OnboardingReservation,
         sequence: u64,
@@ -355,13 +419,21 @@ impl CatalogAuthority {
             return Err(CatalogError::InvalidOnboardingReservationCapability);
         }
         if sequence < resumed.next_sequence {
-            return verify_event_replay(
+            verify_event_replay(
                 &transaction,
                 reservation.session_id,
                 sequence,
                 &event_json,
                 event_digest,
-            );
+            )?;
+            let checked_at = trusted_catalog_now(&transaction)?;
+            let deadline_exceeded = checked_at >= reservation.deadline_at()
+                && !event_allowed_after_deadline(&resumed.lifecycle, &event);
+            transaction.commit()?;
+            if deadline_exceeded {
+                return Err(CatalogError::OnboardingDeadlineExceeded);
+            }
+            return Ok(OnboardingAppendOutcome::Replay);
         }
         if sequence != resumed.next_sequence {
             return Err(CatalogError::OnboardingSequenceConflict);
@@ -402,6 +474,48 @@ impl CatalogAuthority {
                 audit_sequence
             ],
         )?;
+        let next_stream_digest = onboarding_stream_event_digest(
+            resumed.stream_head.cumulative_digest,
+            reservation.session_id,
+            sequence,
+            event_digest,
+            resulting_state.database_name(),
+            occurred_at,
+            u64::try_from(audit_sequence).map_err(|_| CatalogError::InvalidRecord)?,
+        );
+        let updated = transaction.execute(
+            "UPDATE provider_onboarding_stream_heads
+             SET event_count=?2, last_event_sequence=?2, last_audit_sequence=?3,
+                 cumulative_sha256=?4
+             WHERE session_id=?1
+               AND stream_version=?5
+               AND event_count=?6
+               AND last_event_sequence IS ?7
+               AND last_audit_sequence IS ?8
+               AND cumulative_sha256=?9",
+            params![
+                reservation.session_id.to_string(),
+                to_sql_u64(sequence)?,
+                audit_sequence,
+                next_stream_digest,
+                ONBOARDING_STREAM_VERSION,
+                to_sql_u64(resumed.stream_head.event_count)?,
+                resumed
+                    .stream_head
+                    .last_event_sequence
+                    .map(to_sql_u64)
+                    .transpose()?,
+                resumed
+                    .stream_head
+                    .last_audit_sequence
+                    .map(to_sql_u64)
+                    .transpose()?,
+                resumed.stream_head.cumulative_digest,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(CatalogError::CorruptCatalog);
+        }
         transaction.commit()?;
         Ok(OnboardingAppendOutcome::Inserted)
     }
@@ -524,6 +638,116 @@ impl CatalogAuthority {
     }
 }
 
+/// Reconstructs the v1 stream head for every exact retained v21 onboarding session.
+///
+/// This is called only from migration 22, after the empty head table is created and before the
+/// migration transaction commits. Every reservation, capability, configuration, audit edge,
+/// event, deadline, lifecycle transition, and hash-chain component is revalidated before any head
+/// is inserted. Ordinary reads never invoke this path and always require the retained head.
+pub(super) fn backfill_provider_onboarding_stream_heads(
+    transaction: &Transaction<'_>,
+) -> Result<(), CatalogError> {
+    let session_count = transaction.query_row(
+        "SELECT COUNT(*) FROM provider_onboarding_sessions",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let session_count = usize::try_from(session_count).map_err(|_| CatalogError::CorruptCatalog)?;
+    if session_count > MAX_ONBOARDING_MIGRATION_SESSIONS {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let retained_heads = transaction.query_row(
+        "SELECT COUNT(*) FROM provider_onboarding_stream_heads",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if retained_heads != 0 {
+        return Err(CatalogError::CorruptCatalog);
+    }
+
+    let row_limit = i64::try_from(MAX_ONBOARDING_MIGRATION_SESSIONS)
+        .map_err(|_| CatalogError::MigrationRegistryMismatch)?
+        .checked_add(1)
+        .ok_or(CatalogError::MigrationRegistryMismatch)?;
+    let mut statement = transaction.prepare(
+        "SELECT session_id FROM provider_onboarding_sessions ORDER BY session_id LIMIT ?1",
+    )?;
+    let rows = statement.query_map([row_limit], |row| row.get::<_, String>(0))?;
+    let mut session_ids = Vec::new();
+    session_ids
+        .try_reserve_exact(session_count)
+        .map_err(|_| CatalogError::Allocation)?;
+    for row in rows {
+        let encoded = row?;
+        if session_ids.len() >= MAX_ONBOARDING_MIGRATION_SESSIONS {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        session_ids.push(Uuid::parse_str(&encoded).map_err(|_| CatalogError::CorruptCatalog)?);
+    }
+    drop(statement);
+    if session_ids.len() != session_count {
+        return Err(CatalogError::CorruptCatalog);
+    }
+
+    for session_id in session_ids {
+        let mut budget = OnboardingValidationBudget::for_migration();
+        let PreparedOnboardingReplay {
+            reservation,
+            capability,
+            public_configuration: _,
+            mut lifecycle,
+            reservation_audit_sequence,
+            reservation_audit_digest,
+        } = prepare_onboarding_replay(transaction, Uuid::nil(), session_id, &mut budget)?;
+        let stream = reconstruct_onboarding_stream(
+            transaction,
+            session_id,
+            &capability,
+            &mut lifecycle,
+            reservation.created_at(),
+            reservation.deadline_at(),
+            reservation_audit_sequence,
+            reservation_audit_digest,
+            &mut budget,
+        )?;
+        let inserted = transaction.execute(
+            "INSERT INTO provider_onboarding_stream_heads
+             (session_id, stream_version, event_count, last_event_sequence,
+              last_audit_sequence, cumulative_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id.to_string(),
+                ONBOARDING_STREAM_VERSION,
+                to_sql_u64(stream.head.event_count)?,
+                stream
+                    .head
+                    .last_event_sequence
+                    .map(to_sql_u64)
+                    .transpose()?,
+                stream
+                    .head
+                    .last_audit_sequence
+                    .map(to_sql_u64)
+                    .transpose()?,
+                stream.head.cumulative_digest,
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(CatalogError::CorruptCatalog);
+        }
+    }
+
+    let backfilled = transaction.query_row(
+        "SELECT COUNT(*) FROM provider_onboarding_stream_heads",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if usize::try_from(backfilled).ok() != Some(session_count) {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(())
+}
+
 pub(super) fn diagnostic_current_sessions(
     connection: &rusqlite::Connection,
     limit: super::CatalogLimit,
@@ -583,6 +807,7 @@ struct LoadedOnboarding {
     public_configuration: ProviderPublicConfiguration,
     lifecycle: OnboardingLifecycle,
     next_sequence: u64,
+    stream_head: OnboardingStreamHead,
 }
 
 impl LoadedOnboarding {
@@ -594,6 +819,28 @@ impl LoadedOnboarding {
             next_sequence: self.next_sequence,
         }
     }
+}
+
+struct PreparedOnboardingReplay {
+    reservation: OnboardingReservation,
+    capability: ProviderCapability,
+    public_configuration: ProviderPublicConfiguration,
+    lifecycle: OnboardingLifecycle,
+    reservation_audit_sequence: u64,
+    reservation_audit_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OnboardingStreamHead {
+    event_count: u64,
+    last_event_sequence: Option<u64>,
+    last_audit_sequence: Option<u64>,
+    cumulative_digest: [u8; 32],
+}
+
+struct VerifiedOnboardingStream {
+    next_sequence: u64,
+    head: OnboardingStreamHead,
 }
 
 struct StoredSession {
@@ -646,6 +893,42 @@ fn load_session(
     session_id: Uuid,
     budget: &mut ResultBudget,
 ) -> Result<LoadedOnboarding, CatalogError> {
+    let mut budget = OnboardingValidationBudget::Query(budget);
+    let PreparedOnboardingReplay {
+        reservation,
+        capability,
+        public_configuration,
+        mut lifecycle,
+        reservation_audit_sequence,
+        reservation_audit_digest,
+    } = prepare_onboarding_replay(transaction, catalog_id, session_id, &mut budget)?;
+    let stream = replay_events(
+        transaction,
+        session_id,
+        &capability,
+        &mut lifecycle,
+        reservation.created_at(),
+        reservation.deadline_at(),
+        reservation_audit_sequence,
+        reservation_audit_digest,
+        &mut budget,
+    )?;
+    Ok(LoadedOnboarding {
+        reservation,
+        capability,
+        public_configuration,
+        lifecycle,
+        next_sequence: stream.next_sequence,
+        stream_head: stream.head,
+    })
+}
+
+fn prepare_onboarding_replay(
+    transaction: &Transaction<'_>,
+    catalog_id: Uuid,
+    session_id: Uuid,
+    budget: &mut OnboardingValidationBudget<'_>,
+) -> Result<PreparedOnboardingReplay, CatalogError> {
     let stored = transaction
         .query_row(
             "SELECT s.surface_id, s.capability_revision, s.capability_sha256, s.setup_mode,
@@ -702,7 +985,19 @@ fn load_session(
         .map_err(|_| CatalogError::CorruptCatalog)?;
     let operation_owner = SourceIdentifier::try_from(stored.operation_owner.as_str())
         .map_err(|_| CatalogError::CorruptCatalog)?;
-    let mut lifecycle = OnboardingLifecycle::reserve(&capability, requested_authority.clone())?;
+    let public_configuration_evidence_digest =
+        EvidenceDigest::new(DigestAlgorithm::Sha256, public_configuration_digest);
+    let runtime_verification_context = RuntimeVerificationContext::try_new(
+        SourceIdentifier::try_from(session_id.hyphenated().to_string())
+            .map_err(|_| CatalogError::CorruptCatalog)?,
+        public_configuration_evidence_digest,
+    )
+    .map_err(|_| CatalogError::CorruptCatalog)?;
+    let lifecycle = OnboardingLifecycle::reserve_with_runtime_verification_context(
+        &capability,
+        requested_authority.clone(),
+        runtime_verification_context,
+    )?;
     if lifecycle.state().database_name() != stored.initial_state {
         return Err(CatalogError::CorruptCatalog);
     }
@@ -720,7 +1015,7 @@ fn load_session(
         deadline_at,
         u8::try_from(stored.retry_budget).map_err(|_| CatalogError::CorruptCatalog)?,
     )?;
-    verify_reservation_audit(
+    let reservation_audit_digest = verify_reservation_audit(
         transaction,
         &stored,
         session_id,
@@ -733,22 +1028,19 @@ fn load_session(
         catalog_id,
         session_id,
         capability_digest,
-        public_configuration_digest: EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            public_configuration_digest,
-        ),
+        public_configuration_digest: public_configuration_evidence_digest,
         initial_state: lifecycle.state(),
         created_at,
         deadline_at,
     };
-    let next_sequence =
-        replay_events(transaction, session_id, &capability, &mut lifecycle, budget)?;
-    Ok(LoadedOnboarding {
+    Ok(PreparedOnboardingReplay {
         reservation,
         capability,
         public_configuration,
         lifecycle,
-        next_sequence,
+        reservation_audit_sequence: u64::try_from(stored.reservation_audit_sequence)
+            .map_err(|_| CatalogError::CorruptCatalog)?,
+        reservation_audit_digest,
     })
 }
 
@@ -757,20 +1049,64 @@ fn replay_events(
     session_id: Uuid,
     capability: &ProviderCapability,
     lifecycle: &mut OnboardingLifecycle,
-    budget: &mut ResultBudget,
-) -> Result<u64, CatalogError> {
+    created_at: Timestamp,
+    deadline_at: Timestamp,
+    reservation_audit_sequence: u64,
+    reservation_audit_digest: [u8; 32],
+    budget: &mut OnboardingValidationBudget<'_>,
+) -> Result<VerifiedOnboardingStream, CatalogError> {
+    let stored_head = load_onboarding_stream_head(transaction, session_id, budget)?;
+    let reconstructed = reconstruct_onboarding_stream(
+        transaction,
+        session_id,
+        capability,
+        lifecycle,
+        created_at,
+        deadline_at,
+        reservation_audit_sequence,
+        reservation_audit_digest,
+        budget,
+    )?;
+    if reconstructed.head != stored_head {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(reconstructed)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "migration and runtime replay share every exact reservation and chronology binding"
+)]
+fn reconstruct_onboarding_stream(
+    transaction: &Transaction<'_>,
+    session_id: Uuid,
+    capability: &ProviderCapability,
+    lifecycle: &mut OnboardingLifecycle,
+    created_at: Timestamp,
+    deadline_at: Timestamp,
+    reservation_audit_sequence: u64,
+    reservation_audit_digest: [u8; 32],
+    budget: &mut OnboardingValidationBudget<'_>,
+) -> Result<VerifiedOnboardingStream, CatalogError> {
     let mut statement = transaction.prepare(
         "SELECT e.sequence, e.event_kind, e.event_sha256, e.event_json, e.resulting_state,
                 e.credential_generation, e.prior_generation, e.occurred_at_ns,
-                a.event_type, a.subject_id, a.details_digest, a.occurred_at_ns
+                e.audit_sequence, a.sequence, a.event_type, a.subject_id, a.details_digest,
+                a.occurred_at_ns
          FROM provider_onboarding_events e
-         JOIN audit_events a ON a.sequence=e.audit_sequence
+         LEFT JOIN audit_events a ON a.sequence=e.audit_sequence
          WHERE e.session_id=?1
          ORDER BY e.sequence",
     )?;
     let mut rows = statement.query([session_id.to_string()])?;
     let mut expected = 1_u64;
-    let mut prior_time = lifecycle_created_at(transaction, session_id)?;
+    let mut prior_time = created_at;
+    let mut last_audit_sequence = None;
+    let mut cumulative_digest = onboarding_stream_genesis_digest(
+        session_id,
+        reservation_audit_sequence,
+        reservation_audit_digest,
+    );
     while let Some(row) = rows.next()? {
         if expected > MAX_ONBOARDING_EVENTS {
             return Err(CatalogError::CorruptCatalog);
@@ -784,10 +1120,25 @@ fn replay_events(
         let stored_generation = parse_optional_generation(row.get(5)?)?;
         let stored_prior = parse_optional_generation(row.get(6)?)?;
         let occurred_at = Timestamp::from_unix_nanos(row.get(7)?);
-        let audit_type: String = row.get(8)?;
-        let audit_subject: String = row.get(9)?;
-        let audit_digest: Vec<u8> = row.get(10)?;
-        let audit_at = Timestamp::from_unix_nanos(row.get(11)?);
+        let event_audit_sequence =
+            u64::try_from(row.get::<_, i64>(8)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let audit_sequence = row
+            .get::<_, Option<i64>>(9)?
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(CatalogError::CorruptCatalog)?;
+        let audit_type: String = row
+            .get::<_, Option<String>>(10)?
+            .ok_or(CatalogError::CorruptCatalog)?;
+        let audit_subject: String = row
+            .get::<_, Option<String>>(11)?
+            .ok_or(CatalogError::CorruptCatalog)?;
+        let audit_digest: Vec<u8> = row
+            .get::<_, Option<Vec<u8>>>(12)?
+            .ok_or(CatalogError::CorruptCatalog)?;
+        let audit_at = Timestamp::from_unix_nanos(
+            row.get::<_, Option<i64>>(13)?
+                .ok_or(CatalogError::CorruptCatalog)?,
+        );
         budget.charge([
             kind.len(),
             event_sha256.len(),
@@ -798,10 +1149,16 @@ fn replay_events(
             audit_digest.len(),
         ])?;
         let digest = exact_sha256(&event_sha256)?;
-        let event = OnboardingEvent::try_from_json(&event_json)?;
+        let event = OnboardingEvent::try_from_json(&event_json)
+            .map_err(|_| CatalogError::CorruptCatalog)?;
         if sequence != expected
+            || event_audit_sequence != audit_sequence
+            || audit_sequence <= last_audit_sequence.unwrap_or(reservation_audit_sequence)
             || sha256(&event_json) != digest
-            || event.canonical_json()? != event_json
+            || event
+                .canonical_json()
+                .map_err(|_| CatalogError::CorruptCatalog)?
+                != event_json
             || event.kind().database_name() != kind
             || event.generation() != stored_generation
             || event.prior_generation() != stored_prior
@@ -813,16 +1170,97 @@ fn replay_events(
         {
             return Err(CatalogError::CorruptCatalog);
         }
-        let state = lifecycle.apply(capability, event, occurred_at)?;
+        if occurred_at >= deadline_at && !event_allowed_after_deadline(lifecycle, &event) {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let state = lifecycle
+            .apply(capability, event, occurred_at)
+            .map_err(|_| CatalogError::CorruptCatalog)?;
         if state.database_name() != resulting_state {
             return Err(CatalogError::CorruptCatalog);
         }
         expected = expected
             .checked_add(1)
             .ok_or(CatalogError::CorruptCatalog)?;
+        cumulative_digest = onboarding_stream_event_digest(
+            cumulative_digest,
+            session_id,
+            sequence,
+            digest,
+            state.database_name(),
+            occurred_at,
+            audit_sequence,
+        );
+        last_audit_sequence = Some(audit_sequence);
         prior_time = occurred_at;
     }
-    Ok(expected)
+    let event_count = expected
+        .checked_sub(1)
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let last_event_sequence = (event_count != 0).then_some(event_count);
+    let reconstructed = OnboardingStreamHead {
+        event_count,
+        last_event_sequence,
+        last_audit_sequence,
+        cumulative_digest,
+    };
+    Ok(VerifiedOnboardingStream {
+        next_sequence: expected,
+        head: reconstructed,
+    })
+}
+
+fn load_onboarding_stream_head(
+    transaction: &Transaction<'_>,
+    session_id: Uuid,
+    budget: &mut OnboardingValidationBudget<'_>,
+) -> Result<OnboardingStreamHead, CatalogError> {
+    let stored = transaction
+        .query_row(
+            "SELECT stream_version, event_count, last_event_sequence, last_audit_sequence,
+                    cumulative_sha256
+             FROM provider_onboarding_stream_heads
+             WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(CatalogError::CorruptCatalog)?;
+    budget.charge([stored.4.len()])?;
+    let event_count = u64::try_from(stored.1).map_err(|_| CatalogError::CorruptCatalog)?;
+    let last_event_sequence = stored
+        .2
+        .map(|value| u64::try_from(value).map_err(|_| CatalogError::CorruptCatalog))
+        .transpose()?;
+    let last_audit_sequence = stored
+        .3
+        .map(|value| u64::try_from(value).map_err(|_| CatalogError::CorruptCatalog))
+        .transpose()?;
+    if stored.0 != ONBOARDING_STREAM_VERSION
+        || event_count > MAX_ONBOARDING_EVENTS
+        || last_event_sequence != (event_count != 0).then_some(event_count)
+        || (event_count == 0) != last_audit_sequence.is_none()
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let cumulative_digest = exact_sha256(&stored.4)?;
+    if cumulative_digest == [0; 32] {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(OnboardingStreamHead {
+        event_count,
+        last_event_sequence,
+        last_audit_sequence,
+        cumulative_digest,
+    })
 }
 
 fn verify_event_replay(
@@ -989,44 +1427,32 @@ fn verify_reservation_audit(
     initial_state: OnboardingState,
     authority_digest: [u8; 32],
     public_configuration_digest: [u8; 32],
-) -> Result<(), CatalogError> {
+) -> Result<[u8; 32], CatalogError> {
     let (event_type, subject, digest, occurred_at): (String, String, Vec<u8>, i64) = transaction
         .query_row(
             "SELECT event_type, subject_id, details_digest, occurred_at_ns
              FROM audit_events WHERE sequence=?1",
             [stored.reservation_audit_sequence],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+        )
+        .optional()?
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let expected_digest = reservation_audit_digest(
+        stored.reservation_schema_version,
+        session_id,
+        request,
+        initial_state,
+        authority_digest,
+        public_configuration_digest,
+    )?;
     if event_type != "provider-onboarding.reserved"
         || subject != session_id.to_string()
-        || digest
-            != reservation_audit_digest(
-                stored.reservation_schema_version,
-                session_id,
-                request,
-                initial_state,
-                authority_digest,
-                public_configuration_digest,
-            )?
+        || digest != expected_digest
         || occurred_at != stored.created_at_ns
     {
         return Err(CatalogError::CorruptCatalog);
     }
-    Ok(())
-}
-
-fn lifecycle_created_at(
-    transaction: &Transaction<'_>,
-    session_id: Uuid,
-) -> Result<Timestamp, CatalogError> {
-    transaction
-        .query_row(
-            "SELECT created_at_ns FROM provider_onboarding_sessions WHERE session_id=?1",
-            [session_id.to_string()],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(Timestamp::from_unix_nanos)
-        .map_err(Into::into)
+    Ok(expected_digest)
 }
 
 fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &OnboardingEvent) -> bool {
@@ -1151,6 +1577,40 @@ fn parse_optional_generation(value: Option<i64>) -> Result<Option<SecretGenerati
             SecretGeneration::new(value).map_err(|_| CatalogError::CorruptCatalog)
         })
         .transpose()
+}
+
+fn onboarding_stream_genesis_digest(
+    session_id: Uuid,
+    reservation_audit_sequence: u64,
+    reservation_audit_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(ONBOARDING_STREAM_GENESIS_DOMAIN);
+    digest.update(session_id.as_bytes());
+    digest.update(reservation_audit_sequence.to_be_bytes());
+    digest.update(reservation_audit_digest);
+    digest.finalize().into()
+}
+
+fn onboarding_stream_event_digest(
+    prior_digest: [u8; 32],
+    session_id: Uuid,
+    event_sequence: u64,
+    event_digest: [u8; 32],
+    resulting_state: &str,
+    occurred_at: Timestamp,
+    audit_sequence: u64,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(ONBOARDING_STREAM_EVENT_DOMAIN);
+    digest.update(prior_digest);
+    digest.update(session_id.as_bytes());
+    digest.update(event_sequence.to_be_bytes());
+    digest.update(event_digest);
+    digest.update(resulting_state.as_bytes());
+    digest.update(occurred_at.unix_nanos().to_be_bytes());
+    digest.update(audit_sequence.to_be_bytes());
+    digest.finalize().into()
 }
 
 fn to_sql_u64(value: u64) -> Result<i64, CatalogError> {

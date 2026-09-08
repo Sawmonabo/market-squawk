@@ -1,0 +1,31 @@
+[package]
+name = "market-squawk-adapter-options-reference"
+description = "Bounded OCC and Cboe option-reference transport, parsing, and typed export contracts"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+csv.workspace = true
+futures-util.workspace = true
+httpdate.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
+market-squawk-sources.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -28,10 +28,47 @@ pub(crate) struct SnapshotPublisher {
     runtime_incarnation: std::num::NonZeroU64,
     notification: mpsc::Sender<()>,
     dropped_notifications: Arc<AtomicU64>,
+    plane_closed: Arc<AtomicBool>,
+    readers: Arc<Semaphore>,
+    clean_terminal_published: bool,
+}
+
+/// Close-only capability used when a generation-transfer outcome becomes ambiguous.
+///
+/// It carries no snapshot cell and cannot publish or read. Revocation synchronously prevents all
+/// subsequent reader acquisition, so a dropped control-plane grant cannot leave a stale Ready
+/// snapshot authoritative.
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotPlaneRevocation {
+    plane_closed: Arc<AtomicBool>,
+    readers: Arc<Semaphore>,
+}
+
+impl SnapshotPlaneRevocation {
+    pub(crate) fn revoke(&self) {
+        self.plane_closed.store(true, Ordering::Release);
+        self.readers.close();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test() -> Self {
+        Self {
+            plane_closed: Arc::new(AtomicBool::new(false)),
+            readers: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_revoked_for_test(&self) -> bool {
+        self.plane_closed.load(Ordering::Acquire) && self.readers.is_closed()
+    }
 }
 
 impl SnapshotPublisher {
     pub(crate) fn publish(&self, snapshot: ShardSnapshot) -> Result<(), SnapshotPublishError> {
+        if self.plane_closed.load(Ordering::Acquire) {
+            return Err(SnapshotPublishError::Closed);
+        }
         if snapshot.shard_id() != self.cell.shard
             || snapshot.routing_version() != self.routing_version
             || snapshot.shard_count() != self.shard_count
@@ -69,11 +106,43 @@ impl SnapshotPublisher {
     pub(crate) fn dropped_notifications(&self) -> u64 {
         self.dropped_notifications.load(Ordering::Relaxed)
     }
+
+    /// Revokes every future read when this publisher can no longer advance its shard cell.
+    pub(crate) fn close(&self) {
+        self.plane_revocation().revoke();
+    }
+
+    pub(crate) fn plane_revocation(&self) -> SnapshotPlaneRevocation {
+        SnapshotPlaneRevocation {
+            plane_closed: Arc::clone(&self.plane_closed),
+            readers: Arc::clone(&self.readers),
+        }
+    }
+
+    /// Marks this shard publisher as having durably published its terminal topology.
+    ///
+    /// A clean publisher drop must not close the shared plane while sibling shards are still
+    /// publishing their own terminal snapshots. The runtime owner closes the plane once every
+    /// actor has joined. Any publisher that drops without this mark still revokes the whole plane
+    /// so a fatal shard exit can never leave a stale Ready snapshot readable.
+    pub(crate) fn mark_clean_terminal_published(&mut self) {
+        self.clean_terminal_published = true;
+    }
+}
+
+impl Drop for SnapshotPublisher {
+    fn drop(&mut self) {
+        if !self.clean_terminal_published {
+            self.close();
+        }
+    }
 }
 
 /// Fail-closed immutable publication rejection.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SnapshotPublishError {
+    #[error("snapshot read plane is closed")]
+    Closed,
     #[error("snapshot routing, shard, or runtime incarnation identity was transplanted")]
     IdentityTransplant,
     #[error("snapshot revision exhausted")]
@@ -88,7 +157,7 @@ pub(crate) struct SnapshotPlane {
     count: ShardCount,
     cells: Box<[Arc<SnapshotCell>]>,
     readers: Arc<Semaphore>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
 }
 
 /// Fully allocated publication plane returned before any actor is spawned.
@@ -199,6 +268,8 @@ pub(crate) fn create_snapshot_plane(
     receivers
         .try_reserve_exact(initial.len())
         .map_err(|_| SnapshotReadError::ReaderLimitReached)?;
+    let reader_budget = Arc::new(Semaphore::new(readers));
+    let closed = Arc::new(AtomicBool::new(false));
     for (index, snapshot) in initial.into_iter().enumerate() {
         if snapshot.shard_id().index()
             != u16::try_from(index).map_err(|_| SnapshotReadError::UnknownShard)?
@@ -222,6 +293,9 @@ pub(crate) fn create_snapshot_plane(
             runtime_incarnation,
             notification,
             dropped_notifications: Arc::new(AtomicU64::new(0)),
+            plane_closed: Arc::clone(&closed),
+            readers: Arc::clone(&reader_budget),
+            clean_terminal_published: false,
         });
         cells.push(cell);
         receivers.push(receiver);
@@ -229,8 +303,8 @@ pub(crate) fn create_snapshot_plane(
     let plane = Arc::new(SnapshotPlane {
         count,
         cells: cells.into_boxed_slice(),
-        readers: Arc::new(Semaphore::new(readers)),
-        closed: AtomicBool::new(false),
+        readers: reader_budget,
+        closed,
     });
     Ok(SnapshotPlaneBundle {
         publishers: publishers.into_boxed_slice(),

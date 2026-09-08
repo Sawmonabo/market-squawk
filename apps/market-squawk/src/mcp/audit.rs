@@ -25,12 +25,12 @@ const AUDIT_FILE_NAME: &str = "mcp-audit.jsonl";
 
 /// One-session bounded audit sink retained by the production composition.
 #[derive(Debug)]
-pub(super) struct DurableAuditSink {
+pub(crate) struct DurableAuditSink {
     state: Arc<Mutex<AuditState>>,
 }
 
 impl DurableAuditSink {
-    pub(super) fn try_new(control: Dir) -> Result<Self, LocalAuditError> {
+    pub(crate) fn try_new(control: Dir) -> Result<Self, LocalAuditError> {
         let file = open_audit_file(&control)?;
         validate_private_file_identity(&control, &file)?;
         match file.try_lock() {
@@ -62,7 +62,7 @@ impl DurableAuditSink {
         })
     }
 
-    pub(super) fn flush(&self) -> Result<(), LocalAuditError> {
+    pub(crate) fn flush(&self) -> Result<(), LocalAuditError> {
         let mut state = self.state.lock().map_err(|_| LocalAuditError::State)?;
         if state.poisoned {
             return Err(LocalAuditError::Poisoned);
@@ -536,6 +536,11 @@ enum AuditOperationRecord<'event> {
         name: &'event str,
         version: &'event str,
     },
+    ReadResource {
+        name: &'event str,
+        operation: &'event str,
+        version: &'event str,
+    },
     Other,
 }
 
@@ -546,6 +551,15 @@ impl<'event> From<&'event AuditOperation> for AuditOperationRecord<'event> {
             AuditOperation::Ping => Self::Ping,
             AuditOperation::ListTools => Self::ListTools,
             AuditOperation::CallTool { name, version } => Self::CallTool { name, version },
+            AuditOperation::ReadResource {
+                name,
+                operation,
+                version,
+            } => Self::ReadResource {
+                name,
+                operation,
+                version,
+            },
             AuditOperation::Other => Self::Other,
         }
     }
@@ -573,6 +587,7 @@ const fn identity_name(identity: LocalProcessIdentityClass) -> &'static str {
     match identity {
         LocalProcessIdentityClass::InheritedStdioUnverified => "inherited_stdio_unverified",
         LocalProcessIdentityClass::CallerSuppliedIoUnverified => "caller_supplied_io_unverified",
+        LocalProcessIdentityClass::AuthenticatedInstalledClient => "authenticated_installed_client",
     }
 }
 

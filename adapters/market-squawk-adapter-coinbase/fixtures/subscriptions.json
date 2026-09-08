@@ -1,1 +1,1 @@
-{"type":"subscriptions","channels":[{"name":"level2_batch","product_ids":["BTC-USD"]},{"name":"matches","product_ids":["BTC-USD"]},{"name":"heartbeat","product_ids":["BTC-USD"]}]}
+{"channel":"subscriptions","client_id":"","timestamp":"2026-08-08T12:00:00.523456Z","sequence_num":4,"events":[{"subscriptions":{"heartbeats":["heartbeats"],"level2":["BTC-USD"],"market_trades":["BTC-USD"]}}]}

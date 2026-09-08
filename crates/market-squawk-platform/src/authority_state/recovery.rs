@@ -3,7 +3,7 @@
 use zeroize::Zeroizing;
 
 use super::LocalAuthorityStateStoreError;
-use super::envelope::Envelope;
+use super::envelope::{Envelope, next_context};
 use super::filesystem::{Slot, StateFiles};
 
 pub(super) struct Head {
@@ -18,6 +18,7 @@ enum SlotRead {
 }
 
 pub(super) fn reconcile(files: &StateFiles) -> Result<Option<Head>, LocalAuthorityStateStoreError> {
+    reconcile_publication_residue(files)?;
     let a = read_slot(files, Slot::A)?;
     let b = read_slot(files, Slot::B)?;
     match (a, b) {
@@ -34,6 +35,112 @@ pub(super) fn reconcile(files: &StateFiles) -> Result<Option<Head>, LocalAuthori
         (SlotRead::Invalid(_), SlotRead::Invalid(_)) => {
             Err(LocalAuthorityStateStoreError::CorruptEnvelope)
         }
+    }
+}
+
+fn reconcile_publication_residue(files: &StateFiles) -> Result<(), LocalAuthorityStateStoreError> {
+    let Some(residue) = files.publication_residue()? else {
+        return Ok(());
+    };
+    let candidate = Envelope::decode(&residue.bytes)
+        .map_err(|_| LocalAuthorityStateStoreError::UnsafeFileType)?;
+    let a = read_slot(files, Slot::A)?;
+    let b = read_slot(files, Slot::B)?;
+    if !is_proven_publication_residue(residue.slot, &candidate, &a, &b)? {
+        return Err(LocalAuthorityStateStoreError::UnsafeFileType);
+    }
+    files.discard_publication_residue(&residue)
+}
+
+fn is_proven_publication_residue(
+    candidate_slot: Slot,
+    candidate: &Envelope,
+    a: &SlotRead,
+    b: &SlotRead,
+) -> Result<bool, LocalAuthorityStateStoreError> {
+    match (a, b) {
+        (SlotRead::Absent, SlotRead::Absent) => {
+            let initial = next_context(None)?;
+            Ok(candidate_slot == Slot::A
+                && candidate.is_first_copy()
+                && candidate.context == initial)
+        }
+        (SlotRead::Valid(a), SlotRead::Valid(b)) => {
+            is_proven_against_pair(candidate_slot, candidate, a, b)
+        }
+        (SlotRead::Valid(authority), SlotRead::Absent | SlotRead::Invalid(_)) => Ok(
+            is_exact_peer_copy(candidate_slot, candidate, Slot::A, authority),
+        ),
+        (SlotRead::Absent | SlotRead::Invalid(_), SlotRead::Valid(authority)) => Ok(
+            is_exact_peer_copy(candidate_slot, candidate, Slot::B, authority),
+        ),
+        (SlotRead::Invalid(_), SlotRead::Absent)
+        | (SlotRead::Absent, SlotRead::Invalid(_))
+        | (SlotRead::Invalid(_), SlotRead::Invalid(_)) => Ok(false),
+    }
+}
+
+fn is_proven_against_pair(
+    candidate_slot: Slot,
+    candidate: &Envelope,
+    a: &Envelope,
+    b: &Envelope,
+) -> Result<bool, LocalAuthorityStateStoreError> {
+    let (high_slot, high, low_slot, low) = if a.generation > b.generation {
+        (Slot::A, a, Slot::B, b)
+    } else if b.generation > a.generation {
+        (Slot::B, b, Slot::A, a)
+    } else {
+        return Ok(false);
+    };
+    if high.generation != low.generation.saturating_add(1)
+        || high.predecessor != low.envelope_digest
+    {
+        return Ok(false);
+    }
+    if high.same_logical_payload(low) {
+        if !low.is_first_copy() || !high.is_second_copy() {
+            return Ok(false);
+        }
+        let expected = next_context(Some(high))?;
+        Ok(candidate_slot == high_slot.other()
+            && candidate.is_first_copy()
+            && candidate.context == expected)
+    } else if low.is_second_copy() && high.is_first_copy() {
+        Ok(
+            is_exact_peer_copy(candidate_slot, candidate, high_slot, high)
+                && candidate_slot == low_slot,
+        )
+    } else {
+        Ok(false)
+    }
+}
+
+fn is_exact_peer_copy(
+    candidate_slot: Slot,
+    candidate: &Envelope,
+    authority_slot: Slot,
+    authority: &Envelope,
+) -> bool {
+    if candidate_slot != authority_slot.other() || !candidate.same_logical_payload(authority) {
+        return false;
+    }
+    if authority.is_first_copy() {
+        candidate.is_second_copy()
+            && candidate.predecessor == authority.envelope_digest
+            && authority
+                .generation
+                .checked_add(1)
+                .is_some_and(|generation| candidate.generation == generation)
+    } else if authority.is_second_copy() {
+        candidate.is_first_copy()
+            && candidate.envelope_digest == authority.predecessor
+            && candidate
+                .generation
+                .checked_add(1)
+                .is_some_and(|generation| authority.generation == generation)
+    } else {
+        false
     }
 }
 

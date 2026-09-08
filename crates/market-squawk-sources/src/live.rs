@@ -439,6 +439,23 @@ impl<'de> Deserialize<'de> for RawMarketFrame {
 
 /// Nonblocking bounded sink used by a live source reader before decoding.
 pub trait RawMarketSink: Send {
+    /// Binds an exact active provider request to health derived from this live stream.
+    ///
+    /// Sources whose connection itself consumes a provider concurrency slot call this once after
+    /// the transport handshake and before publishing the first frame. Sinks that do not qualify
+    /// live authority may ignore the opaque lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed sink error when the sink cannot accept the request authority.
+    fn bind_active_request_budget(
+        &mut self,
+        request: crate::BudgetPermitLease,
+    ) -> Result<(), SinkError> {
+        let _request = request;
+        Ok(())
+    }
+
     /// Attempts to publish one exact raw frame without waiting for capacity.
     ///
     /// # Errors
@@ -495,6 +512,73 @@ pub enum SinkError {
     /// Capture path is already known incomplete for this generation.
     #[error("raw capture integrity is incomplete")]
     CaptureIncomplete,
+}
+
+/// Closed payload-free metadata-schema failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceMetadataIntervalViolation {
+    /// The response-envelope start was not a valid civil date.
+    ResponseEnvelopeStart,
+    /// The response-envelope end was not a valid civil date.
+    ResponseEnvelopeEnd,
+    /// The response envelope was reversed.
+    ResponseEnvelopeOrder,
+    /// The response envelope did not equal the exact requested envelope.
+    ResponseEnvelopeBinding,
+    /// A metadata-record start was not a valid civil date.
+    RecordStart,
+    /// A metadata-record end was not a valid civil date.
+    RecordEnd,
+    /// A metadata-record interval was reversed.
+    RecordOrder,
+    /// The earliest metadata record did not cover the response-envelope start.
+    OuterStartCoverage,
+    /// The latest metadata record did not cover the response-envelope end.
+    OuterEndCoverage,
+    /// Two metadata records declared the same interval.
+    DuplicateInterval,
+    /// Adjacent ordered metadata records left an uncovered interval.
+    Gap,
+    /// Adjacent ordered metadata records overlapped.
+    Overlap,
+}
+
+/// Closed payload-free metadata-schema failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceMetadataSchemaViolation {
+    /// The bounded response was not the selected document shape.
+    DocumentShape,
+    /// The bounded response did not contain the exact selected record cardinality.
+    RecordCardinality,
+    /// Required bounded text was missing, empty, or outside its admitted limit.
+    RequiredText,
+    /// The selected update timestamp did not match its documented lexical contract.
+    UpdateTimestamp,
+    /// The returned record identity did not bind to the exact request.
+    RecordIdentity,
+    /// Page and record effective intervals were malformed or inconsistent.
+    PageRecordInterval(SourceMetadataIntervalViolation),
+    /// The provider-declared observation interval was malformed.
+    ObservationInterval,
+}
+
+/// Closed payload-free provider-response failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceProtocolViolation {
+    /// A bounded metadata response declared an unsupported transport encoding.
+    MetadataEncoding,
+    /// A bounded metadata response violated its selected schema at the retained closed stage.
+    MetadataSchema(SourceMetadataSchemaViolation),
+    /// A bounded metadata response did not preserve the requested effective interval.
+    MetadataInterval,
+    /// A bounded observation response declared an unsupported transport encoding.
+    ObservationsEncoding,
+    /// A bounded observation response violated its selected schema.
+    ObservationsSchema,
+    /// A bounded observation response did not bind to its exact request.
+    ObservationsRequestBinding,
+    /// Exact response evidence could not bind to the bounded raw-capture contract.
+    CaptureBinding,
 }
 
 /// Live source lifecycle or bounded-input failure.

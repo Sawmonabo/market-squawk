@@ -5,6 +5,7 @@ import {
   Bot,
   Boxes,
   BriefcaseBusiness,
+  Crosshair,
   Database,
   FileClock,
   FileTerminal,
@@ -14,83 +15,141 @@ import {
   Network,
   Settings,
   ShieldCheck,
+  ServerCog,
   type LucideIcon,
 } from "lucide-react"
 
-import type { DesktopBootstrap } from "@/lib/schemas"
+import { productCapabilitySet } from "@/lib/product-capabilities"
+import type { DesktopBootstrap, ProductCapability } from "@/lib/schemas"
 
 export interface NavigationItem {
   label: string
   path: string
   icon: LucideIcon
-  domain?: string
+  capabilities?: readonly ProductCapability[]
 }
 
-const overviewNavigation: NavigationItem = {
-  label: "Overview",
-  path: "/overview",
+export interface NavigationSection {
+  label: string
+  items: NavigationItem[]
+}
+
+const homeNavigation: NavigationItem = {
+  label: "Home",
+  path: "/home",
   icon: Boxes,
 }
 
-export const workspaceNavigation: NavigationItem[] = [
-  overviewNavigation,
-  { label: "Markets", path: "/markets", icon: BarChart3, domain: "market" },
-  { label: "Sources", path: "/sources", icon: Database, domain: "source" },
+export const everydayNavigation: NavigationItem[] = [
+  homeNavigation,
   {
-    label: "Research",
-    path: "/research",
-    icon: FlaskConical,
-    domain: "research",
+    label: "Markets",
+    path: "/markets",
+    icon: BarChart3,
+    capabilities: ["market_overview", "market_universe"],
   },
   {
-    label: "Portfolios",
-    path: "/portfolios",
+    label: "Opportunities",
+    path: "/opportunities",
+    icon: Crosshair,
+    capabilities: ["decision_screen_list", "decision_analysis_list"],
+  },
+  {
+    label: "Portfolio",
+    path: "/portfolio",
     icon: BriefcaseBusiness,
-    domain: "portfolio",
+    capabilities: ["portfolio_account_list", "portfolio_holdings"],
   },
-  { label: "Models", path: "/models", icon: Bot, domain: "model" },
-  {
-    label: "Backtests",
-    path: "/backtests",
-    icon: FileClock,
-    domain: "analysis",
-  },
+]
+
+export const paperExecutionNavigation: NavigationItem[] = [
   {
     label: "Paper Execution",
     path: "/paper-execution",
     icon: FileTerminal,
-    domain: "execution",
+    capabilities: ["execution_orders", "bot_status"],
   },
-  { label: "Risk", path: "/risk", icon: ShieldCheck, domain: "bot" },
-  {
-    label: "Fair Value",
-    path: "/fair-value",
-    icon: Landmark,
-    domain: "fair_value",
-  },
-  { label: "MCP", path: "/mcp", icon: Network },
 ]
 
-export const operationsNavigation: NavigationItem[] = [
-  { label: "Updates", path: "/updates", icon: Activity },
+export const advancedNavigation: NavigationItem[] = [
+  { label: "Advanced Overview", path: "/advanced", icon: Boxes },
+  {
+    label: "Research & Data",
+    path: "/advanced/research-data",
+    icon: FlaskConical,
+    capabilities: ["research_dataset_list", "macro_context"],
+  },
+  {
+    label: "Models & Forecasts",
+    path: "/advanced/models-forecasts",
+    icon: Bot,
+    capabilities: ["model_evidence", "forecast_list"],
+  },
+  {
+    label: "Backtests",
+    path: "/advanced/backtests",
+    icon: FileClock,
+    capabilities: ["backtest_preparation", "backtest_activity"],
+  },
+  {
+    label: "Valuation & Targets",
+    path: "/advanced/valuation-targets",
+    icon: Landmark,
+    capabilities: ["decision_analysis_list", "decision_analysis"],
+  },
+  {
+    label: "Risk & Recommendation Policy",
+    path: "/advanced/risk-recommendation-policy",
+    icon: ShieldCheck,
+    capabilities: ["portfolio_risk", "risk_kill_switch", "bot_status"],
+  },
+]
+
+export const connectionsSystemNavigation: NavigationItem[] = [
+  {
+    label: "Connections & Sources",
+    path: "/connections/sources",
+    icon: Database,
+  },
+  { label: "AI Connections", path: "/system/ai-connections", icon: Network },
+  {
+    label: "Operations & Jobs",
+    path: "/system/operations-jobs",
+    icon: ServerCog,
+  },
+  { label: "Updates & Repair", path: "/system/updates-repair", icon: Activity },
   {
     label: "Backup & Recovery",
-    path: "/backup-recovery",
+    path: "/system/backup-recovery",
     icon: ArchiveRestore,
   },
-  { label: "Logs", path: "/logs", icon: Logs },
-  { label: "Settings", path: "/settings", icon: Settings },
+  { label: "Logs & Diagnostics", path: "/system/logs-diagnostics", icon: Logs },
+  { label: "Settings", path: "/system/settings", icon: Settings },
 ]
 
-export const allNavigation = [
-  ...workspaceNavigation,
-  ...operationsNavigation,
+const everydaySection: NavigationSection = {
+  label: "Everyday",
+  items: everydayNavigation,
+}
+
+export const navigationSections: NavigationSection[] = [
+  everydaySection,
+  { label: "Simulated execution", items: paperExecutionNavigation },
+  { label: "Advanced", items: advancedNavigation },
+  { label: "Connections & System", items: connectionsSystemNavigation },
 ]
+
+export const allNavigation = navigationSections.flatMap((section) => section.items)
 
 export function navigationForPath(pathname: string) {
+  return allNavigation.find((item) => item.path === pathname) ?? homeNavigation
+}
+
+export function navigationSectionForPath(pathname: string) {
   return (
-    allNavigation.find((item) => item.path === pathname) ??
-    overviewNavigation
+    navigationSections.find((section) =>
+      section.items.some((item) => item.path === pathname),
+    ) ?? everydaySection
   )
 }
 
@@ -103,53 +162,14 @@ export function navigationAdmission(
   item: NavigationItem,
   bootstrap: DesktopBootstrap,
 ): NavigationAdmission {
-  const stepReady = (id: DesktopBootstrap["setupSteps"][number]["id"]) =>
-    bootstrap.setupSteps.some((step) => step.id === id && step.complete)
-  const operationReady =
-    !item.domain ||
-    bootstrap.operations.some((operation) => operation.domain === item.domain)
-
-  const prerequisite = (() => {
-    switch (item.path) {
-      case "/markets":
-        return {
-          ready: stepReady("sources"),
-          reason: "Connect and verify a market-data source first.",
-        }
-      case "/research":
-      case "/backtests":
-        return {
-          ready: stepReady("research"),
-          reason: "Restore the complete Research services first.",
-        }
-      case "/portfolios":
-        return {
-          ready: stepReady("portfolio"),
-          reason: "Restore the complete Portfolio services first.",
-        }
-      case "/models":
-        return {
-          ready: bootstrap.modelRuntime.state === "ready",
-          reason: "Configure and admit a verified local training release first.",
-        }
-      case "/paper-execution":
-      case "/risk":
-        return {
-          ready: stepReady("paper"),
-          reason: "Restore the complete risk-controlled paper services first.",
-        }
-      default:
-        return { ready: true, reason: null }
-    }
-  })()
-
-  if (!prerequisite.ready) {
-    return { admitted: false, reason: prerequisite.reason }
-  }
-  if (!operationReady) {
+  const capabilities = productCapabilitySet(bootstrap)
+  const capabilityReady =
+    !item.capabilities ||
+    item.capabilities.some((capability) => capabilities.has(capability))
+  if (!capabilityReady) {
     return {
       admitted: false,
-      reason: `The installed application does not expose the ${item.label} service.`,
+      reason: `${item.label} is not available in this workspace.`,
     }
   }
   return { admitted: true, reason: null }

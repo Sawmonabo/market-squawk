@@ -1,18 +1,17 @@
 //! Least-privilege Tauri bridge over the existing local application authorities.
 
-use std::sync::OnceLock;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
+use market_squawk::service::BootstrapRequirement;
 use market_squawk::{
-    AppConfig, LocalProduct, OnboardingNextAction, OnboardingSessionView, ProviderOnboardingError,
-    ProviderPortalActivationAuthority, ProviderPortalActivationError, StartOnboardingRequest,
+    SchwabOAuthInstallationCapabilityError, SchwabOAuthInstallationTrustAction,
+    SchwabOAuthInstallationTrustState,
 };
-use market_squawk_data::CatalogLimit;
 use market_squawk_installer::{
     CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, repair, rollback,
     status as installation_status, update_from_channel,
@@ -20,103 +19,626 @@ use market_squawk_installer::{
 use market_squawk_installer::{ProgramName, program_install_snapshot};
 #[cfg(not(target_os = "windows"))]
 use market_squawk_installer::{UninstallRequest, uninstall};
-use market_squawk_platform::SecretValue;
-use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
-    validate_json_contract,
-};
-use serde::Serialize;
+use market_squawk_platform::{LocalPaths, SecretValue};
+use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient, RuntimeIdentity};
+use market_squawk_services::RequestId;
 use serde_json::{Map, Value, json};
-use tauri::State;
+use tauri::{Manager as _, State};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
+use crate::analytical_controller::DesktopAnalyticalController;
 use crate::contracts::{
-    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, InstallationControlCommand,
-    McpClientInstruction, OperationSummary, ProviderOnboardingCommand, Readiness, ReadinessState,
-    SetupStep, SetupStepAction, SetupStepState,
+    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, DesktopServiceBootstrapCommand,
+    DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopServiceReconnect,
+    DesktopStartup, InstallationControlCommand, ProductCapability, ProductSessionToken,
+    ProviderOnboardingCommand, Readiness, ReadinessState,
+};
+use crate::events::DesktopEventSubscriptions;
+use crate::mcp_clients::{DesktopMcpClientState, DesktopMcpRuntimeBinding};
+use crate::service::{
+    self, DesktopBootstrapAction, DesktopServiceAuthority, DesktopServiceBootstrap,
+    DesktopServiceConnection, DesktopServiceError, DesktopServiceStartup,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
 const MAXIMUM_DESKTOP_RESULT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_DESKTOP_RESULT_ITEMS: u64 = 1_000;
+const MAXIMUM_SAFE_JAVASCRIPT_INTEGER: i64 = 9_007_199_254_740_991;
 const MAXIMUM_OPERATION_BYTES: usize = 128;
-const MAXIMUM_PROVIDER_SESSIONS: usize = 32;
+const MAXIMUM_RESEARCH_COLLECTION_TOKENS: usize = 4_096;
+const MAXIMUM_RESEARCH_PRODUCT_TOKENS: usize = 4_096;
+const MAXIMUM_RESEARCH_PREPARATION_RECEIPTS: usize = 256;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
-const LIVE_MARKET_SETUP_SURFACES: [&str; 3] = [
-    "coinbase.public-market-data",
-    "coinbase.exchange-direct-market-data",
-    "kraken.spot-public-market-data",
-];
-const RESEARCH_SETUP_OPERATIONS: [&str; 5] = [
-    "Research.ListDatasets",
-    "Research.GetManifest",
-    "Research.GetHistory",
-    "Research.GetAlternativeData",
-    "Research.IngestSource",
-];
-const PORTFOLIO_SETUP_OPERATIONS: [&str; 6] = [
-    "Portfolio.Import",
-    "Portfolio.GetHoldings",
-    "Portfolio.GetTransactions",
-    "Portfolio.GetPerformance",
-    "Portfolio.GetExposure",
-    "Portfolio.GetRisk",
-];
-const PAPER_SETUP_OPERATIONS: [&str; 8] = [
-    "Bot.GetStatus",
-    "Bot.Start",
-    "Bot.Stop",
-    "Execution.GetOrders",
-    "Execution.GetFills",
-    "Execution.Cancel",
-    "Execution.Reconcile",
-    "Risk.TriggerKillSwitch",
-];
+const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
+const SCHWAB_PROVIDER_ID: &str = "schwab.trader-api-market-data";
+
+#[derive(Clone)]
+pub(crate) struct DesktopCompositionContext {
+    configured_data_root: PathBuf,
+    service_data_root: PathBuf,
+    installation_root: PathBuf,
+    installation_status: InstallStatus,
+    relay_program: PathBuf,
+}
+
+impl DesktopCompositionContext {
+    pub(crate) fn new(
+        configured_data_root: PathBuf,
+        service_data_root: PathBuf,
+        installation_root: PathBuf,
+        installation_status: InstallStatus,
+        relay_program: PathBuf,
+    ) -> Self {
+        Self {
+            configured_data_root,
+            service_data_root,
+            installation_root,
+            installation_status,
+            relay_program,
+        }
+    }
+}
+
+enum PendingDesktopBootstrap {
+    Initial {
+        service: DesktopServiceBootstrap,
+        context: DesktopCompositionContext,
+    },
+    Reconnect {
+        service: DesktopServiceBootstrap,
+        expected_runtime: RuntimeIdentity,
+    },
+}
+
+pub(crate) struct DesktopBootstrapState {
+    pending: tokio::sync::Mutex<Option<PendingDesktopBootstrap>>,
+    reconnect_gate: tokio::sync::Mutex<()>,
+}
+
+impl DesktopBootstrapState {
+    pub(crate) fn compose(
+        app: &tauri::AppHandle,
+        startup: DesktopServiceStartup,
+        context: DesktopCompositionContext,
+    ) -> Result<Self, DesktopCommandError> {
+        let pending = match startup {
+            DesktopServiceStartup::Ready(connection) => {
+                manage_ready_desktop(app, *connection, &context)?;
+                None
+            }
+            DesktopServiceStartup::BootstrapRequired(service) => {
+                Some(PendingDesktopBootstrap::Initial { service, context })
+            }
+        };
+        Ok(Self {
+            pending: tokio::sync::Mutex::new(pending),
+            reconnect_gate: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    async fn status(&self) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
+        let pending = self.pending.lock().await;
+        let pending = pending.as_ref().ok_or_else(DesktopCommandError::internal)?;
+        pending_bootstrap_status(pending)
+    }
+
+    async fn pending_status(
+        &self,
+    ) -> Result<Option<DesktopServiceBootstrapStatus>, DesktopCommandError> {
+        self.pending
+            .lock()
+            .await
+            .as_ref()
+            .map(pending_bootstrap_status)
+            .transpose()
+    }
+}
+
+fn pending_bootstrap_status(
+    pending: &PendingDesktopBootstrap,
+) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
+    let service = match pending {
+        PendingDesktopBootstrap::Initial { service, .. }
+        | PendingDesktopBootstrap::Reconnect { service, .. } => service,
+    };
+    desktop_bootstrap_status(service)
+}
+
+fn desktop_bootstrap_status(
+    service: &DesktopServiceBootstrap,
+) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
+    Ok(DesktopServiceBootstrapStatus::required(
+        match service
+            .requirement()
+            .ok_or_else(DesktopCommandError::internal)?
+        {
+            BootstrapRequirement::EncryptedFallbackLocked => {
+                DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
+            }
+            BootstrapRequirement::ForegroundKeyringCredential => {
+                DesktopServiceBootstrapRequirement::ForegroundKeyringCredential
+            }
+        },
+    ))
+}
+
+fn manage_ready_desktop(
+    app: &tauri::AppHandle,
+    connection: DesktopServiceConnection,
+    context: &DesktopCompositionContext,
+) -> Result<(), DesktopCommandError> {
+    if app.try_state::<DesktopState>().is_some() {
+        return Err(DesktopCommandError::internal());
+    }
+    let state = DesktopState::try_new(connection, context.clone())?;
+    if !app.manage(state) {
+        return Err(DesktopCommandError::internal());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
-enum InvocationAuthority {
+pub(crate) enum InvocationAuthority {
     ReadOnly,
     ExactConfirmed(&'static str),
+    RiskMediated(&'static str),
+}
+
+#[derive(Clone, Debug)]
+struct ServiceOperation {
+    name: String,
+    domain: String,
+    authorization: String,
+    read_only: bool,
+    input_schema: Value,
+}
+
+#[derive(Debug)]
+struct ServiceBootstrapSnapshot {
+    runtime: RuntimeIdentity,
+    workspace_placement: ServiceWorkspacePlacement,
+    mcp_endpoint_identity: String,
+    claude_code_credential_identity: String,
+    codex_credential_identity: String,
+    provider_profiles: Value,
+    encrypted_file_fallback: Value,
+    operations: Vec<ServiceOperation>,
+    mcp_ready: bool,
+    model_runtime_configured: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceWorkspacePlacement {
+    Managed,
+    LegacyMigrationRequired,
+}
+
+impl TryFrom<Value> for ServiceBootstrapSnapshot {
+    type Error = DesktopCommandError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        if value.get("schemaVersion").and_then(Value::as_u64) != Some(1)
+            || value.pointer("/product/name").and_then(Value::as_str) != Some("Market Squawk")
+            || value.pointer("/product/deployment").and_then(Value::as_str) != Some("self_hosted")
+            || value.pointer("/product/version").and_then(Value::as_str)
+                != Some(env!("CARGO_PKG_VERSION"))
+            || value.pointer("/readiness/service").and_then(Value::as_bool) != Some(true)
+            || value
+                .pointer("/readiness/nativeApplication")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err(DesktopCommandError::new(
+                "invalid_service_contract",
+                "The installed Market Squawk service contract is incompatible with this dashboard.",
+            ));
+        }
+        let runtime = serde_json::from_value::<RuntimeIdentity>(
+            value
+                .get("runtime")
+                .cloned()
+                .ok_or_else(DesktopCommandError::internal)?,
+        )
+        .map_err(|_error| DesktopCommandError::internal())?;
+        if value.pointer("/workspace/id").and_then(Value::as_str)
+            != Some(runtime.workspace_id().as_uuid().to_string().as_str())
+            || value
+                .pointer("/workspace/generation")
+                .and_then(Value::as_u64)
+                != Some(runtime.service_generation().get())
+        {
+            return Err(DesktopCommandError::internal());
+        }
+        let workspace_placement = match required_string(&value, "/workspace/placement")? {
+            "managed" => ServiceWorkspacePlacement::Managed,
+            "legacy_migration_required" => ServiceWorkspacePlacement::LegacyMigrationRequired,
+            _ => return Err(DesktopCommandError::internal()),
+        };
+        let mcp_endpoint_identity =
+            required_string(&value, "/mcpAuthority/endpointIdentity")?.to_owned();
+        let claude_code_credential_identity =
+            required_string(&value, "/mcpAuthority/claudeCodeCredentialIdentity")?.to_owned();
+        let codex_credential_identity =
+            required_string(&value, "/mcpAuthority/codexCredentialIdentity")?.to_owned();
+        let provider_profiles = value
+            .pointer("/sources/profiles")
+            .filter(|profiles| profiles.is_array())
+            .cloned()
+            .ok_or_else(DesktopCommandError::internal)?;
+        let encrypted_file_fallback = value
+            .pointer("/sources/encryptedFileFallback")
+            .cloned()
+            .ok_or_else(DesktopCommandError::internal)?;
+        let operations = value
+            .pointer("/application/operations")
+            .and_then(Value::as_array)
+            .ok_or_else(DesktopCommandError::internal)?;
+        let mut names = BTreeSet::new();
+        let mut parsed_operations = Vec::new();
+        parsed_operations
+            .try_reserve(operations.len())
+            .map_err(|_error| DesktopCommandError::internal())?;
+        for operation in operations {
+            let name = required_string(operation, "/name")?.to_owned();
+            if !names.insert(name.clone()) {
+                return Err(DesktopCommandError::internal());
+            }
+            let authorization = required_string(operation, "/contract/authorization")?.to_owned();
+            let read_only = operation
+                .pointer("/effects/readOnly")
+                .and_then(Value::as_bool)
+                .ok_or_else(DesktopCommandError::internal)?;
+            if !matches!(
+                authorization.as_str(),
+                "read_only" | "local_confirmation" | "risk_mediated"
+            ) || (authorization == "read_only") != read_only
+            {
+                return Err(DesktopCommandError::internal());
+            }
+            required_string(operation, "/description")?;
+            operation
+                .pointer("/effects/destructive")
+                .and_then(Value::as_bool)
+                .ok_or_else(DesktopCommandError::internal)?;
+            parsed_operations.push(ServiceOperation {
+                name,
+                domain: required_string(operation, "/contract/domain")?.to_owned(),
+                authorization,
+                read_only,
+                input_schema: operation
+                    .get("inputSchema")
+                    .filter(|schema| schema.is_object())
+                    .cloned()
+                    .ok_or_else(DesktopCommandError::internal)?,
+            });
+        }
+        let mcp_ready = value
+            .pointer("/readiness/mcp")
+            .and_then(Value::as_bool)
+            .ok_or_else(DesktopCommandError::internal)?;
+        let model_runtime_configured = value
+            .pointer("/readiness/modelRuntimeConfigured")
+            .and_then(Value::as_bool)
+            .ok_or_else(DesktopCommandError::internal)?;
+        Ok(Self {
+            runtime,
+            workspace_placement,
+            mcp_endpoint_identity,
+            claude_code_credential_identity,
+            codex_credential_identity,
+            provider_profiles,
+            encrypted_file_fallback,
+            operations: parsed_operations,
+            mcp_ready,
+            model_runtime_configured,
+        })
+    }
+}
+
+fn required_string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, DesktopCommandError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)
 }
 
 pub(crate) struct DesktopState {
-    product: LocalProduct,
-    config: AppConfig,
-    config_path: Option<PathBuf>,
-    installation_root: PathBuf,
-    installation_status: InstallStatus,
-    portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
-    cancellation: CancellationToken,
+    current: RwLock<Arc<DesktopGeneration>>,
+    webview_admitted_product_session: RwLock<ProductSessionToken>,
+    service: Arc<DesktopServiceAuthority>,
+    context: DesktopCompositionContext,
     restart_program: OnceLock<PathBuf>,
 }
 
+pub(crate) struct DesktopGeneration {
+    application: Arc<LoopbackApplicationClient>,
+    service_bootstrap: ServiceBootstrapSnapshot,
+    product_session_token: ProductSessionToken,
+    data_root: PathBuf,
+    cancellation: CancellationToken,
+    governance_authorizations: Mutex<HashMap<Uuid, NativeGovernanceAuthorization>>,
+    research_collections: Mutex<ResearchCollectionTokens>,
+    research_preparation_choices: Mutex<StableProductTokens>,
+    research_preparation_receipts: Mutex<OneUseProductTokens>,
+    research_activities: Mutex<StableProductTokens>,
+    mcp_clients: Arc<DesktopMcpClientState>,
+    analytical_controller: Arc<DesktopAnalyticalController>,
+    analytical_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Default)]
+struct ResearchCollectionTokens {
+    by_dataset: HashMap<String, Uuid>,
+    by_token: HashMap<Uuid, String>,
+}
+
+#[derive(Default)]
+struct StableProductTokens {
+    by_key: HashMap<String, Uuid>,
+    by_token: HashMap<Uuid, Value>,
+}
+
+impl StableProductTokens {
+    fn register(
+        &mut self,
+        key: String,
+        authority: Value,
+        capacity_message: &'static str,
+    ) -> Result<Uuid, DesktopCommandError> {
+        if let Some(token) = self.by_key.get(&key).copied() {
+            self.by_token.insert(token, authority);
+            return Ok(token);
+        }
+        if self.by_key.len() >= MAXIMUM_RESEARCH_PRODUCT_TOKENS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                capacity_message,
+            ));
+        }
+        self.by_key
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        self.by_token
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let token = next_opaque_token(&self.by_token);
+        self.by_key.insert(key, token);
+        self.by_token.insert(token, authority);
+        Ok(token)
+    }
+
+    fn resolve(
+        &self,
+        token: Uuid,
+        missing_message: &'static str,
+    ) -> Result<Value, DesktopCommandError> {
+        self.by_token
+            .get(&token)
+            .cloned()
+            .ok_or_else(|| DesktopCommandError::new("not_found", missing_message))
+    }
+}
+
+#[derive(Default)]
+struct OneUseProductTokens {
+    by_token: HashMap<Uuid, Value>,
+}
+
+impl OneUseProductTokens {
+    fn register(&mut self, authority: Value) -> Result<Uuid, DesktopCommandError> {
+        if self.by_token.len() >= MAXIMUM_RESEARCH_PREPARATION_RECEIPTS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                "Too many research preparations are waiting for review. Finish or reopen Research before preparing another.",
+            ));
+        }
+        self.by_token
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let token = next_opaque_token(&self.by_token);
+        self.by_token.insert(token, authority);
+        Ok(token)
+    }
+
+    fn consume(&mut self, token: Uuid) -> Result<Value, DesktopCommandError> {
+        self.by_token.remove(&token).ok_or_else(|| {
+            DesktopCommandError::new(
+                "not_found",
+                "That research preparation is no longer available. Review the preparation again.",
+            )
+        })
+    }
+}
+
+fn next_opaque_token<T>(entries: &HashMap<Uuid, T>) -> Uuid {
+    loop {
+        let candidate = Uuid::new_v4();
+        if !entries.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+impl ResearchCollectionTokens {
+    fn register(&mut self, dataset: &str) -> Result<Uuid, DesktopCommandError> {
+        if let Some(token) = self.by_dataset.get(dataset) {
+            return Ok(*token);
+        }
+        if self.by_dataset.len() >= MAXIMUM_RESEARCH_COLLECTION_TOKENS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                "Too many research collections are open. Reopen the workspace and narrow the collection list.",
+            ));
+        }
+        self.by_dataset
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        self.by_token
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let token = next_opaque_token(&self.by_token);
+        self.by_dataset.insert(dataset.to_owned(), token);
+        self.by_token.insert(token, dataset.to_owned());
+        Ok(token)
+    }
+
+    fn resolve(&self, token: Uuid) -> Result<String, DesktopCommandError> {
+        self.by_token.get(&token).cloned().ok_or_else(|| {
+            DesktopCommandError::new(
+                "not_found",
+                "That research collection is no longer open. Refresh Research and try again.",
+            )
+        })
+    }
+}
+
+struct PreparedDesktopReplacement {
+    generation: Arc<DesktopGeneration>,
+    mcp_binding: DesktopMcpRuntimeBinding,
+    bootstrap: DesktopBootstrap,
+}
+
+struct NativeGovernanceAuthorization {
+    window_label: String,
+    preview_id: Uuid,
+    ticket_id: Uuid,
+    retained_until: Instant,
+}
+
 impl DesktopState {
-    pub(crate) fn new(
-        product: LocalProduct,
-        config: AppConfig,
-        config_path: Option<PathBuf>,
-        installation_root: PathBuf,
-        installation_status: InstallStatus,
-    ) -> Self {
-        let portal_activation = product.provider_portal_activation();
-        Self {
-            product,
-            config,
-            config_path,
-            installation_root,
-            installation_status,
-            portal_activation,
-            cancellation: CancellationToken::new(),
+    pub(crate) fn try_new(
+        connection: DesktopServiceConnection,
+        context: DesktopCompositionContext,
+    ) -> Result<Self, DesktopCommandError> {
+        let service = Arc::clone(&connection.authority);
+        let generation = DesktopGeneration::try_new(connection, &context)?;
+        let product_session_token = generation.product_session_token();
+        Ok(Self {
+            current: RwLock::new(Arc::new(generation)),
+            webview_admitted_product_session: RwLock::new(product_session_token),
+            service,
+            context,
             restart_program: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn generation(&self) -> Result<Arc<DesktopGeneration>, DesktopCommandError> {
+        let generation = self.current_generation()?;
+        let admitted = self
+            .webview_admitted_product_session
+            .read()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        admit_webview_product_session(*admitted, generation.product_session_token())?;
+        Ok(generation)
+    }
+
+    pub(crate) fn current_generation(&self) -> Result<Arc<DesktopGeneration>, DesktopCommandError> {
+        self.current
+            .read()
+            .map(|generation| Arc::clone(&generation))
+            .map_err(|_error| DesktopCommandError::internal())
+    }
+
+    pub(crate) fn admit_current(
+        &self,
+        generation: &Arc<DesktopGeneration>,
+    ) -> Result<(), DesktopCommandError> {
+        let current = self
+            .current
+            .read()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        if Arc::ptr_eq(&current, generation) {
+            Ok(())
+        } else {
+            Err(service_generation_changed())
         }
     }
 
+    async fn prepare_replacement(
+        &self,
+        current: &Arc<DesktopGeneration>,
+        expected: RuntimeIdentity,
+        connection: DesktopServiceConnection,
+    ) -> Result<PreparedDesktopReplacement, DesktopCommandError> {
+        if !Arc::ptr_eq(&self.service, &connection.authority) {
+            return Err(DesktopCommandError::internal());
+        }
+        let replacement =
+            DesktopGeneration::try_replacement(connection, &self.context, current, expected)?;
+        let mcp_binding = DesktopMcpClientState::prepare_runtime_binding(
+            replacement.runtime(),
+            replacement.service_bootstrap.mcp_endpoint_identity.clone(),
+            replacement
+                .service_bootstrap
+                .claude_code_credential_identity
+                .clone(),
+            replacement
+                .service_bootstrap
+                .codex_credential_identity
+                .clone(),
+        )
+        .map_err(|_error| DesktopCommandError::internal())?;
+        let generation = Arc::new(replacement);
+        let bootstrap = generation
+            .prepare_bootstrap(&self.context.installation_status)
+            .await?;
+        self.admit_current(current)?;
+        Ok(PreparedDesktopReplacement {
+            generation,
+            mcp_binding,
+            bootstrap,
+        })
+    }
+
+    fn replace_generation(
+        &self,
+        expected: RuntimeIdentity,
+        replacement: Arc<DesktopGeneration>,
+    ) -> Result<Arc<DesktopGeneration>, DesktopCommandError> {
+        let mut current = self
+            .current
+            .write()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        admit_replacement(
+            current.runtime(),
+            &current.data_root,
+            expected,
+            replacement.runtime(),
+            &replacement.data_root,
+        )?;
+        Ok(std::mem::replace(&mut current, replacement))
+    }
+
+    pub(crate) fn acknowledge_webview_product_session(
+        &self,
+        generation: &Arc<DesktopGeneration>,
+        product_session_token: ProductSessionToken,
+    ) -> Result<(), DesktopCommandError> {
+        self.admit_current(generation)?;
+        if generation.product_session_token() != product_session_token {
+            return Err(service_generation_changed());
+        }
+        let mut admitted = self
+            .webview_admitted_product_session
+            .write()
+            .map_err(|_error| DesktopCommandError::internal())?;
+        self.admit_current(generation)?;
+        *admitted = product_session_token;
+        Ok(())
+    }
+
+    pub(crate) fn service_authority(&self) -> Arc<DesktopServiceAuthority> {
+        Arc::clone(&self.service)
+    }
+
     fn schedule_restart(&self, program: PathBuf) -> Result<(), DesktopCommandError> {
-        self.restart_program.set(program).map_err(|_| {
+        self.restart_program.set(program).map_err(|_error| {
             DesktopCommandError::new(
                 "installation_restart_pending",
                 "Market Squawk is already restarting into the selected release.",
@@ -128,48 +650,303 @@ impl DesktopState {
         self.restart_program.get().cloned()
     }
 
-    fn bootstrap(&self) -> Result<DesktopBootstrap, DesktopCommandError> {
-        let onboarding = self.product.provider_onboarding();
-        let session_limit = CatalogLimit::new(MAXIMUM_PROVIDER_SESSIONS)
-            .map_err(|_error| DesktopCommandError::internal())?;
-        let profiles = serialize(onboarding.profiles())?;
-        let session_views = onboarding
-            .current_sessions(session_limit)
-            .map_err(map_onboarding_error)?;
-        let sessions = serialize(&session_views)?;
-        let fallback = serialize(
-            onboarding
-                .encrypted_file_fallback_status()
-                .map_err(map_onboarding_error)?,
+    pub(crate) fn begin_shutdown(&self) {
+        if let Ok(generation) = self.current_generation() {
+            generation.begin_shutdown();
+        }
+    }
+
+    pub(crate) async fn finish_shutdown(&self) {
+        self.begin_shutdown();
+    }
+}
+
+fn admit_replacement(
+    current: RuntimeIdentity,
+    current_data_root: &Path,
+    expected: RuntimeIdentity,
+    replacement: RuntimeIdentity,
+    replacement_data_root: &Path,
+) -> Result<(), DesktopCommandError> {
+    if current != expected
+        || replacement.installation_id() != current.installation_id()
+        || replacement.service_generation() <= current.service_generation()
+    {
+        Err(DesktopCommandError::new(
+            "service_reconnect_rejected",
+            "The installed service reconnect did not prove a newer runtime for this installation.",
+        ))
+    } else if replacement.workspace_id() != current.workspace_id()
+        || replacement_data_root != current_data_root
+    {
+        Err(DesktopCommandError::new(
+            "service_relaunch_required",
+            "The installed service opened a different workspace. Relaunch Market Squawk to admit that workspace explicitly.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn service_generation_changed() -> DesktopCommandError {
+    DesktopCommandError::new(
+        "service_generation_changed",
+        "The installed service changed while this request was running. Review the refreshed workspace before retrying.",
+    )
+}
+
+fn admit_webview_product_session(
+    admitted: ProductSessionToken,
+    current: ProductSessionToken,
+) -> Result<(), DesktopCommandError> {
+    if admitted == current {
+        Ok(())
+    } else {
+        Err(service_generation_changed())
+    }
+}
+
+impl DesktopGeneration {
+    fn try_new(
+        connection: DesktopServiceConnection,
+        context: &DesktopCompositionContext,
+    ) -> Result<Self, DesktopCommandError> {
+        let service_bootstrap = ServiceBootstrapSnapshot::try_from(connection.bootstrap)?;
+        let data_root = resolve_workspace_data_root(
+            &service_bootstrap,
+            &context.configured_data_root,
+            &context.service_data_root,
         )?;
-        let capabilities = self.product.application().capabilities();
-        let research_service_available = RESEARCH_SETUP_OPERATIONS
+        let local_paths = LocalPaths::open_existing(&data_root)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let analytical_controller = DesktopAnalyticalController::try_open(
+            &local_paths,
+            service_bootstrap.runtime.workspace_id().as_uuid(),
+        )?;
+        let mcp_clients = DesktopMcpClientState::try_new(
+            &local_paths,
+            context.relay_program.clone(),
+            &context.service_data_root,
+            service_bootstrap.runtime,
+            service_bootstrap.mcp_endpoint_identity.clone(),
+            service_bootstrap.claude_code_credential_identity.clone(),
+            service_bootstrap.codex_credential_identity.clone(),
+        )
+        .map_err(|_error| DesktopCommandError::internal())?;
+        Ok(Self {
+            application: Arc::new(connection.application),
+            service_bootstrap,
+            product_session_token: ProductSessionToken::random(),
+            data_root,
+            cancellation: CancellationToken::new(),
+            governance_authorizations: Mutex::new(HashMap::new()),
+            research_collections: Mutex::new(ResearchCollectionTokens::default()),
+            research_preparation_choices: Mutex::new(StableProductTokens::default()),
+            research_preparation_receipts: Mutex::new(OneUseProductTokens::default()),
+            research_activities: Mutex::new(StableProductTokens::default()),
+            mcp_clients: Arc::new(mcp_clients),
+            analytical_controller: Arc::new(analytical_controller),
+            analytical_gate: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    fn try_replacement(
+        connection: DesktopServiceConnection,
+        context: &DesktopCompositionContext,
+        current: &Arc<Self>,
+        expected: RuntimeIdentity,
+    ) -> Result<Self, DesktopCommandError> {
+        let service_bootstrap = ServiceBootstrapSnapshot::try_from(connection.bootstrap)?;
+        let data_root = resolve_workspace_data_root(
+            &service_bootstrap,
+            &context.configured_data_root,
+            &context.service_data_root,
+        )?;
+        admit_replacement(
+            current.runtime(),
+            &current.data_root,
+            expected,
+            service_bootstrap.runtime,
+            &data_root,
+        )?;
+        Ok(Self {
+            application: Arc::new(connection.application),
+            service_bootstrap,
+            product_session_token: ProductSessionToken::random(),
+            data_root,
+            cancellation: CancellationToken::new(),
+            governance_authorizations: Mutex::new(HashMap::new()),
+            research_collections: Mutex::new(ResearchCollectionTokens::default()),
+            research_preparation_choices: Mutex::new(StableProductTokens::default()),
+            research_preparation_receipts: Mutex::new(OneUseProductTokens::default()),
+            research_activities: Mutex::new(StableProductTokens::default()),
+            mcp_clients: Arc::clone(&current.mcp_clients),
+            analytical_controller: Arc::clone(&current.analytical_controller),
+            analytical_gate: Arc::clone(&current.analytical_gate),
+        })
+    }
+
+    pub(crate) fn application(&self) -> Arc<LoopbackApplicationClient> {
+        Arc::clone(&self.application)
+    }
+
+    pub(crate) const fn runtime(&self) -> RuntimeIdentity {
+        self.service_bootstrap.runtime
+    }
+
+    pub(crate) const fn product_session_token(&self) -> ProductSessionToken {
+        self.product_session_token
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.child_token()
+    }
+
+    pub(crate) fn register_research_collection(
+        &self,
+        dataset: &str,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_collections
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(dataset)
+    }
+
+    pub(crate) fn resolve_research_collection(
+        &self,
+        collection: Uuid,
+    ) -> Result<String, DesktopCommandError> {
+        self.research_collections
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .resolve(collection)
+    }
+
+    pub(crate) fn register_research_preparation_choice(
+        &self,
+        key: String,
+        authority: Value,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_preparation_choices
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(
+                key,
+                authority,
+                "Too many research choices are open. Reopen Research and narrow the available choices.",
+            )
+    }
+
+    pub(crate) fn resolve_research_preparation_choice(
+        &self,
+        choice: Uuid,
+    ) -> Result<Value, DesktopCommandError> {
+        self.research_preparation_choices
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .resolve(
+                choice,
+                "That research choice is no longer available. Refresh Research and try again.",
+            )
+    }
+
+    pub(crate) fn register_research_preparation_receipt(
+        &self,
+        authority: Value,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_preparation_receipts
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(authority)
+    }
+
+    pub(crate) fn consume_research_preparation_receipt(
+        &self,
+        receipt: Uuid,
+    ) -> Result<Value, DesktopCommandError> {
+        self.research_preparation_receipts
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .consume(receipt)
+    }
+
+    pub(crate) fn register_research_activity(
+        &self,
+        key: String,
+        authority: Value,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_activities
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(
+                key,
+                authority,
+                "Too much background activity is open. Reopen Research to refresh the activity list.",
+            )
+    }
+
+    pub(crate) fn resolve_research_activity(
+        &self,
+        activity: Uuid,
+    ) -> Result<Value, DesktopCommandError> {
+        self.research_activities
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .resolve(
+                activity,
+                "That background activity is no longer available. Refresh Research and try again.",
+            )
+    }
+
+    pub(crate) fn service_operation_index(&self) -> BTreeMap<String, String> {
+        self.service_bootstrap
+            .operations
             .iter()
-            .all(|operation| capabilities.find(operation).is_some());
-        let portfolio_service_available = PORTFOLIO_SETUP_OPERATIONS
+            .filter(|descriptor| !descriptor.read_only && descriptor.authorization != "read_only")
+            .map(|descriptor| (descriptor.name.clone(), descriptor.domain.clone()))
+            .collect()
+    }
+
+    pub(crate) const fn mcp_ready(&self) -> bool {
+        self.service_bootstrap.mcp_ready
+    }
+
+    pub(crate) fn mcp_clients(&self) -> &DesktopMcpClientState {
+        self.mcp_clients.as_ref()
+    }
+
+    pub(crate) fn analytical_controller(&self) -> &DesktopAnalyticalController {
+        self.analytical_controller.as_ref()
+    }
+
+    pub(crate) async fn analytical_retirement_fence(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.analytical_gate).lock_owned().await
+    }
+
+    async fn bootstrap(
+        self: &Arc<Self>,
+        state: &DesktopState,
+    ) -> Result<DesktopBootstrap, DesktopCommandError> {
+        Ok(self.present_bootstrap(&state.context.installation_status))
+    }
+
+    async fn prepare_bootstrap(
+        self: &Arc<Self>,
+        installation_status: &InstallStatus,
+    ) -> Result<DesktopBootstrap, DesktopCommandError> {
+        Ok(self.present_bootstrap(installation_status))
+    }
+
+    fn present_bootstrap(&self, installation_status: &InstallStatus) -> DesktopBootstrap {
+        let capabilities = self
+            .service_bootstrap
+            .operations
             .iter()
-            .all(|operation| capabilities.find(operation).is_some());
-        let paper_service_available = PAPER_SETUP_OPERATIONS
-            .iter()
-            .all(|operation| capabilities.find(operation).is_some());
-        let operations = capabilities
-            .tools()
-            .iter()
-            .map(|tool| {
-                let contract = tool.contract();
-                let effects = tool.effects();
-                OperationSummary::new(
-                    tool.name().to_owned(),
-                    tool.description().to_owned(),
-                    contract.domain().as_str(),
-                    contract.authorization().as_str(),
-                    effects.read_only(),
-                    effects.destructive(),
-                    Value::Object(tool.input_schema().clone()),
-                )
-            })
+            .filter_map(|operation| ProductCapability::for_operation(&operation.name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
-        let model_runtime = if self.product.model_runtime().is_some() {
+        let model_runtime = if self.service_bootstrap.model_runtime_configured {
             Readiness::new(
                 ReadinessState::Ready,
                 "Verified",
@@ -182,36 +959,28 @@ impl DesktopState {
                 "No verified local training release is configured for this workspace.",
             )
         };
-        let mcp_client = self.mcp_client_instruction();
-        let mcp_available = mcp_client.is_some();
-        let setup_steps = setup_steps(
-            &session_views,
-            research_service_available,
-            portfolio_service_available,
-            paper_service_available,
-            mcp_available,
-        );
+        let mcp_available = self.service_bootstrap.mcp_ready;
         let mcp = if mcp_available {
             Readiness::new(
                 ReadinessState::Available,
                 "Available",
-                "The packaged CLI path and bounded local stdio MCP tool contract were verified. The service is not running.",
+                "The shared local MCP service is running. Client connection can be configured without exposing its credential to this window.",
             )
         } else {
             Readiness::new(
                 ReadinessState::Unverified,
                 "Unavailable",
-                "A complete local MCP client instruction could not be generated from verified installed state.",
+                "The installed service did not report the complete local MCP contract as ready.",
             )
         };
-        let installation = &self.installation_status;
-        let installation = if installation.is_installed() && installation.is_healthy() {
+        let installation = if installation_status.is_installed() && installation_status.is_healthy()
+        {
             Readiness::new(
                 ReadinessState::Ready,
                 "Verified",
                 "The complete installed release and every retained component passed verification.",
             )
-        } else if installation.is_installed() {
+        } else if installation_status.is_installed() {
             Readiness::new(
                 ReadinessState::Unverified,
                 "Repair required",
@@ -224,254 +993,416 @@ impl DesktopState {
                 "No complete versioned Market Squawk release is active for this user.",
             )
         };
-        Ok(DesktopBootstrap::new(
+        DesktopBootstrap::new(
             env!("CARGO_PKG_VERSION"),
             if cfg!(debug_assertions) {
                 "development"
             } else {
                 "release"
             },
-            self.product.paths().root().display().to_string(),
+            self.data_root.to_string_lossy().into_owned(),
+            self.product_session_token,
             Readiness::new(
                 ReadinessState::Ready,
                 "Ready",
-                "The controlled local workspace and catalogs opened successfully.",
+                "The installed service authenticated this window for the active workspace.",
             ),
             installation,
             model_runtime,
             mcp,
-            mcp_client,
-            fallback,
-            profiles,
-            sessions,
-            setup_steps,
-            operations,
-        ))
+            capabilities,
+        )
     }
 
-    fn mcp_client_instruction(&self) -> Option<McpClientInstruction> {
-        let cli_program = self.product.verified_local_mcp_program().ok()?;
-        let appimage_launcher = crate::appimage_mcp_launcher(&cli_program).ok()?;
-        let (program, appimage_dispatch) = match appimage_launcher {
-            Some(launcher) => (launcher.program, true),
-            None => (cli_program, false),
-        };
-        let mut arguments = Vec::with_capacity(9);
-        if appimage_dispatch {
-            arguments.push("--stdio-mcp".to_owned());
-        }
-        if let Some(config_path) = self.config_path.as_deref() {
-            arguments.push("--config".to_owned());
-            arguments.push(path_text(config_path)?);
-        }
-        arguments.push("--data-dir".to_owned());
-        arguments.push(path_text(self.product.paths().root())?);
-        if let Some(training_release_root) = self.config.training_release_root() {
-            arguments.push("--training-release-root".to_owned());
-            arguments.push(path_text(training_release_root)?);
-        }
-        if !appimage_dispatch {
-            arguments.push("mcp".to_owned());
-            arguments.push("serve".to_owned());
-        }
+    async fn provider_sessions(
+        self: &Arc<Self>,
+        state: &DesktopState,
+    ) -> Result<Vec<Value>, DesktopCommandError> {
+        let result = invoke_application(
+            ApplicationInvocation {
+                operation: SOURCE_STATUS_OPERATION.to_owned(),
+                arguments: Map::new(),
+            },
+            state,
+            self,
+            InvocationAuthority::ReadOnly,
+        )
+        .await?;
+        Self::parse_provider_sessions(result)
+    }
 
-        Some(McpClientInstruction::new(
-            path_text(&program)?,
-            arguments,
-            BTreeMap::new(),
-        ))
+    fn parse_provider_sessions(result: Value) -> Result<Vec<Value>, DesktopCommandError> {
+        let rows = match result.get("data") {
+            Some(Value::Array(rows)) => rows,
+            Some(Value::Null) => return Ok(Vec::new()),
+            _ => return Err(DesktopCommandError::internal()),
+        };
+        let mut identities = BTreeSet::new();
+        let mut sessions = Vec::new();
+        for row in rows {
+            let Some(session) = row.get("currentSession") else {
+                return Err(DesktopCommandError::internal());
+            };
+            if session.is_null() {
+                continue;
+            }
+            let identity = session
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(DesktopCommandError::internal)?;
+            if identities.insert(identity.to_owned()) {
+                sessions.push(session.clone());
+            }
+        }
+        Ok(sessions)
+    }
+
+    pub(crate) fn retain_governance_authorization(
+        &self,
+        window_label: &str,
+        mut result: Value,
+    ) -> Result<Value, DesktopCommandError> {
+        let authorization = result
+            .pointer("/data/authorization")
+            .and_then(Value::as_object)
+            .ok_or_else(DesktopCommandError::internal)?;
+        let ticket_id = required_uuid(authorization, "ticketId")?;
+        let preview_id = required_uuid(authorization, "previewId")?;
+        let principal_id = required_uuid(authorization, "principalId")?;
+        let expires_at = authorization
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(DesktopCommandError::internal)?
+            .to_owned();
+        let retained_until = Instant::now()
+            .checked_add(GOVERNANCE_AUTHORIZATION_LIFETIME)
+            .ok_or_else(DesktopCommandError::internal)?;
+        let mut authorizations = self
+            .governance_authorizations
+            .lock()
+            .map_err(|_| DesktopCommandError::internal())?;
+        authorizations.retain(|_, entry| entry.retained_until > Instant::now());
+        if authorizations.len() >= MAXIMUM_GOVERNANCE_AUTHORIZATIONS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                "Too many pending governance authorizations are open. Finish or restart the current review.",
+            ));
+        }
+        let handle = allocate_authorization_handle(&authorizations)?;
+        authorizations.insert(
+            handle,
+            NativeGovernanceAuthorization {
+                window_label: window_label.to_owned(),
+                preview_id,
+                ticket_id,
+                retained_until,
+            },
+        );
+        let data = result
+            .get_mut("data")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(DesktopCommandError::internal)?;
+        data.insert(
+            "authorization".to_owned(),
+            json!({
+                "authorizationHandle": handle,
+                "previewId": preview_id,
+                "principalId": principal_id,
+                "expiresAt": expires_at,
+            }),
+        );
+        Ok(result)
+    }
+
+    pub(crate) fn consume_governance_authorizations(
+        &self,
+        window_label: &str,
+        preview_id: Uuid,
+        handles: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>, DesktopCommandError> {
+        if handles.is_empty() || handles.len() > 2 {
+            return Err(DesktopCommandError::invalid_request(
+                "The governance action requires one or two current authorizations.",
+            ));
+        }
+        let mut unique = HashSet::new();
+        if handles.iter().any(|handle| !unique.insert(*handle)) {
+            return Err(DesktopCommandError::invalid_request(
+                "A governance authorization can be used only once.",
+            ));
+        }
+        let now = Instant::now();
+        let mut authorizations = self
+            .governance_authorizations
+            .lock()
+            .map_err(|_| DesktopCommandError::internal())?;
+        authorizations.retain(|_, entry| entry.retained_until > now);
+        let mut ticket_ids = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            let entry = authorizations.get(handle).ok_or_else(|| {
+                DesktopCommandError::new(
+                    "authorization_unavailable",
+                    "The governance authorization expired or is no longer available. Authenticate again.",
+                )
+            })?;
+            if entry.window_label != window_label || entry.preview_id != preview_id {
+                return Err(DesktopCommandError::new(
+                    "unauthorized",
+                    "The governance authorization does not belong to this window and preview.",
+                ));
+            }
+            ticket_ids.push(entry.ticket_id);
+        }
+        for handle in handles {
+            authorizations.remove(&handle);
+        }
+        Ok(ticket_ids)
     }
 
     pub(crate) fn begin_shutdown(&self) {
         self.cancellation.cancel();
-        self.product.application().begin_shutdown();
-    }
-
-    pub(crate) async fn finish_shutdown(&self) {
-        self.begin_shutdown();
-        let application = self.product.application();
-        let Some(deadline) = Instant::now().checked_add(application.shutdown_timeout()) else {
-            return;
-        };
-        let _report = application.shutdown(deadline).await;
+        if let Ok(mut authorizations) = self.governance_authorizations.lock() {
+            authorizations.clear();
+        }
     }
 }
 
-fn path_text(path: &Path) -> Option<String> {
-    path.to_str().map(str::to_owned)
+fn resolve_workspace_data_root(
+    bootstrap: &ServiceBootstrapSnapshot,
+    configured_data_root: &Path,
+    service_data_root: &Path,
+) -> Result<PathBuf, DesktopCommandError> {
+    let candidate = match bootstrap.workspace_placement {
+        ServiceWorkspacePlacement::Managed => service_data_root
+            .join("workspaces")
+            .join(bootstrap.runtime.workspace_id().as_uuid().to_string()),
+        ServiceWorkspacePlacement::LegacyMigrationRequired => configured_data_root.to_path_buf(),
+    };
+    if !candidate.is_absolute() {
+        return Err(DesktopCommandError::internal());
+    }
+    let paths =
+        LocalPaths::open_existing(candidate).map_err(|_error| DesktopCommandError::internal())?;
+    Ok(paths.root().to_path_buf())
 }
 
-fn setup_steps(
-    sessions: &[OnboardingSessionView],
-    research_service_available: bool,
-    portfolio_service_available: bool,
-    paper_service_available: bool,
-    mcp_available: bool,
-) -> Vec<SetupStep> {
-    let sources_ready = sessions.iter().any(|session| {
-        LIVE_MARKET_SETUP_SURFACES.contains(&session.surface_id())
-            && session.next_action() == OnboardingNextAction::Active
-    });
-    let files_imported = has_active_session(sessions, "local.files");
-    let portfolio_imported = has_active_session(sessions, "local.portfolio-imports");
-    let research_ready = research_service_available;
-    let portfolio_ready = portfolio_service_available;
-    let paper_ready = paper_service_available;
-    let review_ready =
-        sources_ready && research_ready && portfolio_ready && paper_ready && mcp_available;
-
-    vec![
-        SetupStep::new(
-            "system",
-            "System",
-            SetupStepState::Complete,
-            true,
-            "Validated configuration, controlled paths, catalogs, and application services initialized successfully.",
-            None,
-            None,
-            None,
-        ),
-        SetupStep::new(
-            "storage",
-            "Storage",
-            SetupStepState::Complete,
-            true,
-            "The controlled workspace and catalog are open in the effective data directory.",
-            None,
-            None,
-            None,
-        ),
-        SetupStep::new(
-            "sources",
-            "Sources",
-            if sources_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            sources_ready,
-            "Activate at least one supported live market-data source.",
-            (!sources_ready)
-                .then_some("No supported live market provider session currently holds active authority."),
-            (!sources_ready).then_some(
-                "Connect Coinbase public, Coinbase Exchange direct, or Kraken and complete its provider-specific verification.",
-            ),
-            Some(SetupStepAction::ConfigureSources),
-        ),
-        SetupStep::new(
-            "research",
-            "Research",
-            if research_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            research_ready,
-            if research_service_available && files_imported {
-                "The complete Research contract is initialized and a local-file import authority is active; model-runtime admission remains separate."
-            } else if research_service_available {
-                "The complete Research contract is initialized; importing private local data is optional and no import has been recorded."
-            } else {
-                "The installed application is missing one or more required Research operations."
-            },
-            (!research_ready).then_some("The complete Research application contract is unavailable."),
-            (!research_ready).then_some(
-                "Repair or reinstall the complete native package, then refresh status.",
-            ),
-            Some(SetupStepAction::ConfigureResearch),
-        ),
-        SetupStep::new(
-            "portfolio",
-            "Portfolio",
-            if portfolio_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            portfolio_ready,
-            if portfolio_service_available && portfolio_imported {
-                "The complete Portfolio contract is initialized and a private import authority is active."
-            } else if portfolio_service_available {
-                "The complete Portfolio contract is initialized; importing private holdings or transactions is optional."
-            } else {
-                "The installed application is missing one or more required Portfolio operations."
-            },
-            (!portfolio_ready)
-                .then_some("The complete Portfolio application contract is unavailable."),
-            (!portfolio_ready)
-                .then_some("Repair or reinstall the complete native package, then refresh status."),
-            Some(SetupStepAction::ConfigurePortfolio),
-        ),
-        SetupStep::new(
-            "paper",
-            "Paper",
-            if paper_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            paper_ready,
-            if paper_service_available {
-                "The complete local paper-only Bot and Execution contract is initialized under central risk authority."
-            } else {
-                "The installed application is missing one or more required paper bot or execution operations."
-            },
-            (!paper_ready).then_some("The complete paper application contract is unavailable."),
-            (!paper_ready)
-                .then_some("Repair or reinstall the complete native package, then refresh status."),
-            Some(SetupStepAction::ConfigurePaper),
-        ),
-        SetupStep::new(
-            "mcp",
-            "MCP",
-            if mcp_available {
-                SetupStepState::Available
-            } else {
-                SetupStepState::Blocked
-            },
-            mcp_available,
-            if mcp_available {
-                "The verified packaged CLI and required workspace identity paths are available as a client configuration; the MCP service is not running."
-            } else {
-                "The local stdio MCP service requires a verified packaged CLI, representable workspace paths, and a valid tool contract."
-            },
-            (!mcp_available).then_some(
-                "The installed CLI, effective paths, or bounded MCP tool contract is unavailable.",
-            ),
-            (!mcp_available).then_some(
-                "Repair or reinstall the complete native package, then refresh setup status.",
-            ),
-            Some(SetupStepAction::ReviewMcp),
-        ),
-        SetupStep::new(
-            "review",
-            "Review",
-            if review_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::Blocked
-            },
-            review_ready,
-            "Final readiness is derived from every required owning authority above.",
-            (!review_ready).then_some("One or more required setup authorities remain incomplete."),
-            (!review_ready)
-                .then_some("Resolve each named blocker, refresh status, and review again."),
-            Some(SetupStepAction::ReviewStatus),
-        ),
-    ]
+fn required_uuid(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<Uuid, DesktopCommandError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|value| !value.is_nil())
+        .ok_or_else(DesktopCommandError::internal)
 }
 
-fn has_active_session(sessions: &[OnboardingSessionView], surface_id: &str) -> bool {
-    sessions.iter().any(|session| {
-        session.surface_id() == surface_id && session.next_action() == OnboardingNextAction::Active
-    })
+fn allocate_authorization_handle(
+    authorizations: &HashMap<Uuid, NativeGovernanceAuthorization>,
+) -> Result<Uuid, DesktopCommandError> {
+    (0..16)
+        .map(|_| Uuid::new_v4())
+        .find(|candidate| !authorizations.contains_key(candidate))
+        .ok_or_else(DesktopCommandError::internal)
 }
 
 #[tauri::command]
-pub(crate) fn desktop_bootstrap(
+pub(crate) async fn desktop_bootstrap(
+    app: tauri::AppHandle,
+    bootstrap_state: State<'_, DesktopBootstrapState>,
+) -> Result<DesktopStartup, DesktopCommandError> {
+    let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
+    if let Some(status) = bootstrap_state.pending_status().await? {
+        return Ok(DesktopStartup::BootstrapRequired(status));
+    }
+    if let Some(state) = app.try_state::<DesktopState>() {
+        let generation = state.current_generation()?;
+        let bootstrap = generation.bootstrap(&state).await?;
+        state.admit_current(&generation)?;
+        return Ok(DesktopStartup::Ready(Box::new(bootstrap)));
+    }
+    bootstrap_state
+        .status()
+        .await
+        .map(DesktopStartup::BootstrapRequired)
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_service_bootstrap(
+    request: DesktopServiceBootstrapCommand,
+    window: tauri::Window,
+    app: tauri::AppHandle,
+    bootstrap_state: State<'_, DesktopBootstrapState>,
+    subscriptions: State<'_, DesktopEventSubscriptions>,
+) -> Result<(), DesktopCommandError> {
+    if window.label() != "main" {
+        return Err(DesktopCommandError::new(
+            "service_bootstrap_unavailable",
+            "Secure startup is available only from the main Market Squawk window.",
+        ));
+    }
+    let action = match request {
+        DesktopServiceBootstrapCommand::UnlockEncryptedFallback { unlock } => {
+            DesktopBootstrapAction::Unlock(SecretValue::new(unlock).map_err(|_error| {
+                DesktopCommandError::new(
+                    "service_bootstrap_rejected",
+                    "Market Squawk could not use that secure-startup request.",
+                )
+            })?)
+        }
+        DesktopServiceBootstrapCommand::CompleteForegroundKeyring => {
+            DesktopBootstrapAction::CompleteForegroundKeyring
+        }
+    };
+    let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
+    let mut pending_guard = bootstrap_state.pending.lock().await;
+    let pending = pending_guard.as_ref().ok_or_else(|| {
+        DesktopCommandError::new(
+            "service_bootstrap_unavailable",
+            "Secure startup is no longer waiting for this action.",
+        )
+    })?;
+    let service = match pending {
+        PendingDesktopBootstrap::Initial { service, .. }
+        | PendingDesktopBootstrap::Reconnect { service, .. } => service,
+    };
+    let connection = service::complete_bootstrap(service, action)
+        .await
+        .map_err(|_error| {
+            DesktopCommandError::new(
+                "service_bootstrap_failed",
+                "Market Squawk could not complete secure startup. Try again.",
+            )
+        })?;
+    match pending_guard
+        .as_ref()
+        .ok_or_else(DesktopCommandError::internal)?
+    {
+        PendingDesktopBootstrap::Initial { context, .. } => {
+            if app.try_state::<DesktopState>().is_some() {
+                return Err(DesktopCommandError::new(
+                    "service_bootstrap_unavailable",
+                    "The initial local service bootstrap is no longer current.",
+                ));
+            }
+            manage_ready_desktop(&app, connection, &context)?;
+        }
+        PendingDesktopBootstrap::Reconnect {
+            expected_runtime, ..
+        } => {
+            let state = app.try_state::<DesktopState>().ok_or_else(|| {
+                DesktopCommandError::new(
+                    "service_bootstrap_unavailable",
+                    "The reconnecting desktop service state is no longer available.",
+                )
+            })?;
+            if let Err(error) =
+                commit_reconnected_generation(&state, &subscriptions, *expected_runtime, connection)
+                    .await
+            {
+                // Foreground recovery already produced a connection. The old generation remains
+                // current on every preparation failure, so retaining a consumed bootstrap action
+                // would be misleading; a later reconnect must start fresh.
+                let _cleared = pending_guard.take();
+                return Err(error);
+            }
+        }
+    }
+    let _completed = pending_guard
+        .take()
+        .ok_or_else(DesktopCommandError::internal)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_service_reconnect(
+    request: DesktopServiceReconnect,
+    window: tauri::Window,
     state: State<'_, DesktopState>,
+    bootstrap_state: State<'_, DesktopBootstrapState>,
+    subscriptions: State<'_, DesktopEventSubscriptions>,
+) -> Result<DesktopStartup, DesktopCommandError> {
+    if window.label() != "main" {
+        return Err(DesktopCommandError::new(
+            "service_reconnect_unavailable",
+            "The installed service reconnect is not available for this window.",
+        ));
+    }
+    let _reconnect_guard = bootstrap_state.reconnect_gate.lock().await;
+    if bootstrap_state.pending.lock().await.is_some() {
+        return Err(DesktopCommandError::new(
+            "service_reconnect_pending",
+            "The installed service is already waiting for foreground recovery.",
+        ));
+    }
+    let generation = state.current_generation()?;
+    if generation.product_session_token() != request.expected_product_session_token() {
+        return Err(DesktopCommandError::new(
+            "service_reconnect_stale",
+            "The reconnect request belongs to an earlier desktop service generation.",
+        ));
+    }
+    let expected_runtime = generation.runtime();
+    let startup = service::reconnect_or_start(&state.service_authority())
+        .await
+        .map_err(|_error| {
+            DesktopCommandError::new(
+                "service_reconnect_failed",
+                "The installed service could not reconnect or restart within the local deadline.",
+            )
+        })?;
+    match startup {
+        DesktopServiceStartup::Ready(connection) => {
+            let bootstrap = commit_reconnected_generation(
+                &state,
+                &subscriptions,
+                expected_runtime,
+                *connection,
+            )
+            .await?;
+            Ok(DesktopStartup::Ready(Box::new(bootstrap)))
+        }
+        DesktopServiceStartup::BootstrapRequired(service) => {
+            let status = desktop_bootstrap_status(&service)?;
+            *bootstrap_state.pending.lock().await = Some(PendingDesktopBootstrap::Reconnect {
+                service,
+                expected_runtime,
+            });
+            Ok(DesktopStartup::BootstrapRequired(status))
+        }
+    }
+}
+
+async fn commit_reconnected_generation(
+    state: &DesktopState,
+    subscriptions: &DesktopEventSubscriptions,
+    expected_runtime: RuntimeIdentity,
+    connection: DesktopServiceConnection,
 ) -> Result<DesktopBootstrap, DesktopCommandError> {
-    state.bootstrap()
+    let old = state.current_generation()?;
+    let retirement_fence = old.mcp_clients().retirement_fence().await;
+    state.admit_current(&old)?;
+    let analytical_fence = old.analytical_retirement_fence().await;
+    state.admit_current(&old)?;
+    let prepared = state
+        .prepare_replacement(&old, expected_runtime, connection)
+        .await?;
+    let retired = subscriptions
+        .stop_clear_and_replace(|| {
+            old.mcp_clients().commit_runtime_binding_while_fenced(
+                &retirement_fence,
+                prepared.mcp_binding,
+                || state.replace_generation(expected_runtime, Arc::clone(&prepared.generation)),
+            )
+        })
+        .await?;
+    retired.begin_shutdown();
+    drop(retirement_fence);
+    drop(analytical_fence);
+    drop(retired);
+    Ok(prepared.bootstrap)
 }
 
 #[tauri::command]
@@ -481,16 +1412,18 @@ pub(crate) async fn installation_control(
     state: State<'_, DesktopState>,
     app: tauri::AppHandle,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     if request.requires_confirmation() && !confirmed {
         return Err(DesktopCommandError::new(
             "confirmation_required",
             "Confirm the installation change before continuing.",
         ));
     }
-    let root = state.installation_root.clone();
+    let root = state.context.installation_root.clone();
     match request {
         InstallationControlCommand::Status => {
             let current = blocking_installation(move || installation_status(&root)).await?;
+            state.admit_current(&generation)?;
             Ok(json!({
                 "action": "status",
                 "status": current,
@@ -503,6 +1436,7 @@ pub(crate) async fn installation_control(
                 Ok(receipt) => receipt,
                 Err(CommandError::Lifecycle(InstallError::UpdateNotNewer)) => {
                     let current = blocking_installation(move || installation_status(&root)).await?;
+                    state.admit_current(&generation)?;
                     return Ok(json!({
                         "action": "update",
                         "status": current,
@@ -512,7 +1446,8 @@ pub(crate) async fn installation_control(
                 }
                 Err(error) => return Err(map_installation_error(error)),
             };
-            let current = prepare_installation_restart(root, &state).await?;
+            state.admit_current(&generation)?;
+            let current = prepare_installation_restart(root, &state, &generation).await?;
             request_installation_restart(&app);
             Ok(json!({
                 "action": "update",
@@ -525,7 +1460,9 @@ pub(crate) async fn installation_control(
             let operation_root = root.clone();
             let receipt =
                 blocking_installation(move || repair(RepairRequest::new(operation_root))).await?;
+            state.admit_current(&generation)?;
             let current = blocking_installation(move || installation_status(&root)).await?;
+            state.admit_current(&generation)?;
             Ok(json!({
                 "action": "repair",
                 "status": current,
@@ -538,7 +1475,8 @@ pub(crate) async fn installation_control(
             let receipt =
                 blocking_installation(move || rollback(RollbackRequest::new(operation_root)))
                     .await?;
-            let current = prepare_installation_restart(root, &state).await?;
+            state.admit_current(&generation)?;
+            let current = prepare_installation_restart(root, &state, &generation).await?;
             request_installation_restart(&app);
             Ok(json!({
                 "action": "rollback",
@@ -547,7 +1485,11 @@ pub(crate) async fn installation_control(
                 "restartRequired": true,
             }))
         }
-        InstallationControlCommand::Uninstall => uninstall_programs(root, &app).await,
+        InstallationControlCommand::Uninstall => {
+            let result = uninstall_programs(root, &app).await;
+            state.admit_current(&generation)?;
+            result
+        }
     }
 }
 
@@ -600,10 +1542,12 @@ async fn uninstall_programs(
 async fn prepare_installation_restart(
     root: PathBuf,
     state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
 ) -> Result<InstallStatus, DesktopCommandError> {
     let snapshot =
         blocking_installation(move || program_install_snapshot(&root, ProgramName::Desktop))
             .await?;
+    state.admit_current(generation)?;
     let current = snapshot.status().clone();
     let program = snapshot
         .program_path()
@@ -629,17 +1573,10 @@ where
         .map_err(map_installation_error)
 }
 
-#[tauri::command]
-pub(crate) async fn application_invoke(
-    request: ApplicationInvocation,
-    state: State<'_, DesktopState>,
-) -> Result<Value, DesktopCommandError> {
-    invoke_application(request, &state, InvocationAuthority::ReadOnly).await
-}
-
-async fn invoke_application(
+pub(crate) async fn invoke_application(
     mut request: ApplicationInvocation,
     state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
     authority: InvocationAuthority,
 ) -> Result<Value, DesktopCommandError> {
     if request.operation.is_empty()
@@ -650,70 +1587,187 @@ async fn invoke_application(
             "The selected Market Squawk operation is invalid.",
         ));
     }
-    let application = state.product.application();
-    let capabilities = application.capabilities();
-    let descriptor = capabilities
-        .find(&request.operation)
-        .ok_or_else(|| map_service_error(ServiceError::NotFound))?;
+    if matches!(
+        authority,
+        InvocationAuthority::ExactConfirmed(_) | InvocationAuthority::RiskMediated(_)
+    ) {
+        request
+            .arguments
+            .insert("confirm".to_owned(), Value::Bool(true));
+    }
+    invoke_service_operation(
+        state,
+        generation,
+        &request.operation,
+        request.arguments,
+        authority,
+        true,
+    )
+    .await
+}
+
+/// Invokes one private installed-client operation without copying transport bookkeeping fields into
+/// its closed business input. The operation must still be present in the authenticated service
+/// bootstrap and match the exact native authority supplied by the caller.
+pub(crate) async fn invoke_private_application(
+    operation: &'static str,
+    mut arguments: Map<String, Value>,
+    state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
+    authority: InvocationAuthority,
+) -> Result<Value, DesktopCommandError> {
+    if matches!(
+        authority,
+        InvocationAuthority::ExactConfirmed(_) | InvocationAuthority::RiskMediated(_)
+    ) {
+        arguments.insert("confirm".to_owned(), Value::Bool(true));
+    }
+    invoke_service_operation(state, generation, operation, arguments, authority, false).await
+}
+
+async fn invoke_service_operation(
+    state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
+    operation: &str,
+    arguments: Map<String, Value>,
+    authority: InvocationAuthority,
+    apply_desktop_result_limits: bool,
+) -> Result<Value, DesktopCommandError> {
+    state.admit_current(generation)?;
+    let result = invoke_generation_operation(
+        generation,
+        operation,
+        arguments,
+        authority,
+        apply_desktop_result_limits,
+    )
+    .await?;
+    state.admit_current(generation)?;
+    Ok(result)
+}
+
+async fn invoke_generation_operation(
+    generation: &Arc<DesktopGeneration>,
+    operation: &str,
+    mut arguments: Map<String, Value>,
+    authority: InvocationAuthority,
+    apply_desktop_result_limits: bool,
+) -> Result<Value, DesktopCommandError> {
+    let descriptor = generation
+        .service_bootstrap
+        .operations
+        .iter()
+        .find(|descriptor| descriptor.name == operation)
+        .ok_or_else(|| DesktopCommandError::new("not_found", "The operation is unavailable."))?;
     let authorized = match authority {
-        InvocationAuthority::ReadOnly => descriptor.effects().read_only(),
-        InvocationAuthority::ExactConfirmed(operation) => request.operation == operation,
+        InvocationAuthority::ReadOnly => {
+            descriptor.read_only && descriptor.authorization == "read_only"
+        }
+        InvocationAuthority::ExactConfirmed(expected) => {
+            operation == expected
+                && !descriptor.read_only
+                && descriptor.authorization == "local_confirmation"
+        }
+        InvocationAuthority::RiskMediated(expected) => {
+            operation == expected
+                && !descriptor.read_only
+                && descriptor.authorization == "risk_mediated"
+        }
     };
     if !authorized {
-        return Err(map_service_error(ServiceError::Unauthorized));
+        return Err(DesktopCommandError::new(
+            "unauthorized",
+            "The dashboard is not authorized to invoke this operation.",
+        ));
     }
-    request.arguments.insert(
-        "resultLimits".to_owned(),
-        json!({
-            "maximumItems": MAXIMUM_DESKTOP_RESULT_ITEMS,
-            "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
-        }),
-    );
-    let input = Value::Object(request.arguments.clone());
-    let input_structure = JsonStructureLimits::try_new(24, 64 * 1024, 4_096, 1_024)
-        .map_err(|_error| DesktopCommandError::internal())?;
-    validate_json_contract(&input, input_structure, MAXIMUM_APPLICATION_ARGUMENT_BYTES).map_err(
-        |_error| {
-            DesktopCommandError::invalid_request(
-                "The operation input exceeds the desktop safety limits.",
-            )
-        },
-    )?;
-
-    let result_structure = JsonStructureLimits::try_new(32, 1024 * 1024, 10_000, 10_000)
-        .map_err(|_error| DesktopCommandError::internal())?;
-    let limits = ServiceLimits::try_new(
-        1024 * 1024,
-        1_000,
-        4 * 1024 * 1024,
-        10_000,
-        result_structure,
-    )
-    .map_err(|_error| DesktopCommandError::internal())?;
-    let deadline = Instant::now()
-        .checked_add(APPLICATION_REQUEST_TIMEOUT)
-        .ok_or_else(DesktopCommandError::internal)?;
-    let cancellation = state.cancellation.child_token();
+    if apply_desktop_result_limits
+        && descriptor
+            .input_schema
+            .pointer("/properties/resultLimits")
+            .is_some()
+    {
+        arguments.insert(
+            "resultLimits".to_owned(),
+            json!({
+                "maximumItems": MAXIMUM_DESKTOP_RESULT_ITEMS,
+                "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
+            }),
+        );
+    }
+    let arguments = Value::Object(arguments);
+    let argument_bytes =
+        serde_json::to_vec(&arguments).map_err(|_error| DesktopCommandError::internal())?;
+    if argument_bytes.len() > MAXIMUM_APPLICATION_ARGUMENT_BYTES {
+        return Err(DesktopCommandError::invalid_request(
+            "The operation input exceeds the desktop safety limits.",
+        ));
+    }
     let request_id = RequestId::try_string(format!("desktop-{}", Uuid::new_v4()))
         .map_err(|_error| DesktopCommandError::internal())?;
-    let context = RequestContext::new(request_id, cancellation.clone(), deadline, limits);
-    let operation = request.operation;
-    let arguments = request.arguments;
-    tokio::select! {
-        biased;
-        () = state.cancellation.cancelled() => {
-            cancellation.cancel();
-            Err(map_service_error(ServiceError::Cancelled))
+    let response = generation
+        .application
+        .invoke_operation(
+            request_id,
+            operation,
+            arguments,
+            APPLICATION_REQUEST_TIMEOUT,
+            generation.cancellation(),
+        )
+        .await
+        .map_err(map_application_client_error)?;
+    let result = decode_application_result(response.result())?;
+    let result_bytes =
+        serde_json::to_vec(&result).map_err(|_error| DesktopCommandError::internal())?;
+    let maximum_result_bytes = usize::try_from(MAXIMUM_DESKTOP_RESULT_BYTES)
+        .map_err(|_error| DesktopCommandError::internal())?;
+    if result_bytes.len() > maximum_result_bytes {
+        return Err(DesktopCommandError::new(
+            "resource_exhausted",
+            "The operation result exceeds the dashboard safety limit.",
+        ));
+    }
+    let result = lossless_webview_value(result);
+    let webview_bytes =
+        serde_json::to_vec(&result).map_err(|_error| DesktopCommandError::internal())?;
+    if webview_bytes.len() > maximum_result_bytes {
+        return Err(DesktopCommandError::new(
+            "resource_exhausted",
+            "The operation result exceeds the dashboard safety limit.",
+        ));
+    }
+    Ok(result)
+}
+
+/// Preserves integers that JavaScript cannot represent exactly as decimal strings.
+///
+/// Tauri transports JSON values through a WebView. Nanosecond timestamps routinely exceed
+/// JavaScript's safe-integer range, so allowing Serde to emit them as JSON numbers would silently
+/// alter point-in-time evidence before the dashboard validates it.
+pub(crate) fn lossless_webview_value(value: Value) -> Value {
+    match value {
+        Value::Number(number) => {
+            let outside_safe_range = number.as_i64().is_some_and(|value| {
+                !(-MAXIMUM_SAFE_JAVASCRIPT_INTEGER..=MAXIMUM_SAFE_JAVASCRIPT_INTEGER)
+                    .contains(&value)
+            }) || number
+                .as_u64()
+                .is_some_and(|value| value > MAXIMUM_SAFE_JAVASCRIPT_INTEGER as u64);
+            if outside_safe_range {
+                Value::String(number.to_string())
+            } else {
+                Value::Number(number)
+            }
         }
-        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-            cancellation.cancel();
-            Err(map_service_error(ServiceError::DeadlineExceeded))
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(lossless_webview_value).collect())
         }
-        result = application.invoke(&operation, arguments, context) => {
-            result
-                .map(|result| result.into_envelope())
-                .map_err(map_service_error)
-        }
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, lossless_webview_value(value)))
+                .collect(),
+        ),
+        scalar => scalar,
     }
 }
 
@@ -723,118 +1777,46 @@ pub(crate) async fn provider_onboarding(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
     if request.requires_confirmation() && !confirmed {
         return Err(DesktopCommandError::new(
             "confirmation_required",
             "Confirm the provider change before continuing.",
         ));
     }
-    let cancellation = state.cancellation.child_token();
-    let operation_cancellation = cancellation.clone();
-    let onboarding = state.product.provider_onboarding();
-    let activation = Arc::clone(&state.portal_activation);
-    let operation = async move {
-        match request {
-            ProviderOnboardingCommand::Bootstrap => provider_bootstrap(&onboarding),
-            ProviderOnboardingCommand::Start {
-                surface_id,
-                organization,
-                administrative_email,
-            } => {
-                let request =
-                    StartOnboardingRequest::try_new(surface_id, organization, administrative_email)
-                        .map_err(map_onboarding_error)?;
-                serialize(
-                    onboarding
-                        .start(request, operation_cancellation)
-                        .await
-                        .map_err(map_onboarding_error)?,
-                )
-            }
-            ProviderOnboardingCommand::Resume { session_id } => serialize(
-                onboarding
-                    .resume(session_id)
-                    .map_err(map_onboarding_error)?,
-            ),
-            ProviderOnboardingCommand::UnlockFallback { secret } => {
-                let secret = SecretValue::new(secret).map_err(|_error| {
-                    DesktopCommandError::invalid_request(
-                        "The encrypted-storage unlock value is invalid.",
-                    )
-                })?;
-                serialize(
-                    onboarding
-                        .unlock_encrypted_file_fallback(secret, operation_cancellation)
-                        .await
-                        .map_err(map_onboarding_error)?,
-                )
-            }
-            ProviderOnboardingCommand::LockFallback => serialize(
-                onboarding
-                    .lock_encrypted_file_fallback(operation_cancellation)
-                    .await
-                    .map_err(map_onboarding_error)?,
-            ),
-            ProviderOnboardingCommand::SubmitSecret { session_id, secret } => {
-                let secret = SecretValue::new(secret).map_err(|_error| {
-                    DesktopCommandError::invalid_request(
-                        "The provider credential is empty or too large.",
-                    )
-                })?;
-                serialize(
-                    onboarding
-                        .submit_secret(session_id, secret, operation_cancellation)
-                        .await
-                        .map_err(map_onboarding_error)?,
-                )
-            }
-            ProviderOnboardingCommand::Activate {
-                session_id,
-                request,
-            } => serialize(
-                activation
-                    .activate(session_id, request, operation_cancellation)
-                    .await
-                    .map_err(map_activation_error)?,
-            ),
-            ProviderOnboardingCommand::Renew { session_id } => serialize(
-                onboarding
-                    .begin_renewal(session_id)
-                    .await
-                    .map_err(map_onboarding_error)?,
-            ),
-            ProviderOnboardingCommand::Cleanup { session_id } => serialize(
-                onboarding
-                    .reconcile_cleanup(session_id, operation_cancellation)
-                    .await
-                    .map_err(map_onboarding_error)?,
-            ),
-            ProviderOnboardingCommand::Cancel { session_id } => serialize(
-                activation
-                    .cancel(session_id, operation_cancellation)
-                    .await
-                    .map_err(map_activation_error)?,
-            ),
+    match request {
+        ProviderOnboardingCommand::Bootstrap => provider_bootstrap(&state, &generation).await,
+        ProviderOnboardingCommand::Start {
+            surface_id,
+            organization,
+            administrative_email,
+        } => reject_protected_provider_action((surface_id, organization, administrative_email)),
+        ProviderOnboardingCommand::Resume { session_id }
+        | ProviderOnboardingCommand::Renew { session_id }
+        | ProviderOnboardingCommand::Cleanup { session_id }
+        | ProviderOnboardingCommand::Cancel { session_id } => {
+            reject_protected_provider_action(session_id)
         }
-    };
-    tokio::select! {
-        biased;
-        () = state.cancellation.cancelled() => {
-            cancellation.cancel();
-            Err(DesktopCommandError::new(
-                "cancelled",
-                "The desktop is shutting down.",
-            ))
+        ProviderOnboardingCommand::UnlockFallback { secret } => {
+            reject_protected_provider_action(secret)
         }
-        () = tokio::time::sleep(PROVIDER_REQUEST_TIMEOUT) => {
-            cancellation.cancel();
-            Err(DesktopCommandError::new(
-                "deadline_exceeded",
-                "The provider operation exceeded its local deadline.",
-            ))
+        ProviderOnboardingCommand::LockFallback => reject_protected_provider_action(()),
+        ProviderOnboardingCommand::SubmitSecret { session_id, secret } => {
+            reject_protected_provider_action((session_id, secret))
         }
-        result = operation => result,
+        ProviderOnboardingCommand::Activate {
+            session_id,
+            request,
+        } => reject_protected_provider_action((session_id, request)),
     }
+}
+
+fn reject_protected_provider_action<T>(request: T) -> Result<Value, DesktopCommandError> {
+    drop(request);
+    Err(DesktopCommandError::new(
+        "protected_provider_setup_required",
+        "Continue this provider change in Market Squawk's protected local setup window.",
+    ))
 }
 
 #[tauri::command]
@@ -842,21 +1824,31 @@ pub(crate) fn open_official_provider_page(
     provider_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), DesktopCommandError> {
-    let profile = state
-        .product
-        .provider_onboarding()
-        .profiles()
-        .into_iter()
-        .find(|profile| profile.id() == provider_id)
+    let generation = state.generation()?;
+    let profiles = generation
+        .service_bootstrap
+        .provider_profiles
+        .as_array()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let official_url = profiles
+        .iter()
+        .find(|profile| profile.get("id").and_then(Value::as_str) == Some(provider_id.as_str()))
+        .and_then(|profile| profile.get("official_handoff_url"))
+        .and_then(Value::as_str)
         .ok_or_else(|| {
             DesktopCommandError::invalid_request("The selected provider is not supported.")
         })?;
-    tauri_plugin_opener::open_url(profile.official_handoff_url(), None::<&str>).map_err(|_error| {
+    let parsed = Url::parse(official_url).map_err(|_error| DesktopCommandError::internal())?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err(DesktopCommandError::internal());
+    }
+    tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>).map_err(|_error| {
         DesktopCommandError::new(
             "open_failed",
             "The official provider page could not be opened in the system browser.",
         )
-    })
+    })?;
+    state.admit_current(&generation)
 }
 
 #[tauri::command]
@@ -864,16 +1856,58 @@ pub(crate) async fn open_protected_provider_setup(
     provider_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<(), DesktopCommandError> {
-    let supported = state
-        .product
-        .provider_onboarding()
-        .profiles()
-        .into_iter()
-        .any(|profile| profile.id() == provider_id);
+    let generation = state.generation()?;
+    let supported = generation
+        .service_bootstrap
+        .provider_profiles
+        .as_array()
+        .is_some_and(|profiles| {
+            profiles.iter().any(|profile| {
+                profile.get("id").and_then(Value::as_str) == Some(provider_id.as_str())
+            })
+        });
     if !supported {
         return Err(DesktopCommandError::invalid_request(
             "The selected provider is not supported.",
         ));
+    }
+    if provider_id == SCHWAB_PROVIDER_ID {
+        let authority = state.service_authority();
+        let status = authority
+            .schwab_oauth_installation_trust(
+                SchwabOAuthInstallationTrustAction::Status,
+                generation.cancellation(),
+            )
+            .await
+            .map_err(map_schwab_callback_trust_error)?;
+        let trust = match status {
+            SchwabOAuthInstallationTrustState::Trusted => status,
+            SchwabOAuthInstallationTrustState::SetupRequired => authority
+                .schwab_oauth_installation_trust(
+                    SchwabOAuthInstallationTrustAction::Enroll,
+                    generation.cancellation(),
+                )
+                .await
+                .map_err(map_schwab_callback_trust_error)?,
+            SchwabOAuthInstallationTrustState::RepairRequired => {
+                return Err(DesktopCommandError::new(
+                    "schwab_callback_repair_required",
+                    "Schwab's private local callback needs repair before setup can continue.",
+                ));
+            }
+            SchwabOAuthInstallationTrustState::Unsupported => {
+                return Err(DesktopCommandError::new(
+                    "schwab_callback_unsupported",
+                    "Secure Schwab browser setup is not available on this operating system yet.",
+                ));
+            }
+        };
+        if trust != SchwabOAuthInstallationTrustState::Trusted {
+            return Err(DesktopCommandError::new(
+                "schwab_callback_trust_required",
+                "Schwab setup needs approval for Market Squawk's private local callback.",
+            ));
+        }
     }
     let mut arguments = Map::new();
     arguments.insert("provider".to_owned(), Value::String(provider_id));
@@ -884,6 +1918,7 @@ pub(crate) async fn open_protected_provider_setup(
             arguments,
         },
         &state,
+        &generation,
         InvocationAuthority::ExactConfirmed(SOURCE_SETUP_OPERATION),
     )
     .await?;
@@ -908,95 +1943,221 @@ pub(crate) async fn open_protected_provider_setup(
             "open_failed",
             "The protected provider setup could not be opened in the system browser.",
         )
-    })
+    })?;
+    state.admit_current(&generation)
 }
 
-fn provider_bootstrap(
-    onboarding: &market_squawk::ProviderOnboardingService,
+fn map_schwab_callback_trust_error(error: DesktopServiceError) -> DesktopCommandError {
+    match error {
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::TrustCancelled,
+        ) => DesktopCommandError::new(
+            "schwab_callback_cancelled",
+            "Schwab setup was cancelled before the private local callback was approved.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::TrustTimeout,
+        ) => DesktopCommandError::new(
+            "schwab_callback_timeout",
+            "Schwab setup approval timed out. Try again when you are ready.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::InvalidTlsIdentity,
+        ) => DesktopCommandError::new(
+            "schwab_callback_repair_required",
+            "Schwab's private local callback needs repair before setup can continue.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::UnsupportedPlatform,
+        ) => DesktopCommandError::new(
+            "schwab_callback_unsupported",
+            "Secure Schwab browser setup is not available on this operating system yet.",
+        ),
+        DesktopServiceError::SchwabOAuthTrust(
+            SchwabOAuthInstallationCapabilityError::TrustEnrollment,
+        ) => DesktopCommandError::new(
+            "schwab_callback_trust_required",
+            "Schwab setup needs approval for Market Squawk's private local callback.",
+        ),
+        _ => DesktopCommandError::internal(),
+    }
+}
+
+async fn provider_bootstrap(
+    state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
 ) -> Result<Value, DesktopCommandError> {
-    let limit = CatalogLimit::new(MAXIMUM_PROVIDER_SESSIONS)
-        .map_err(|_error| DesktopCommandError::internal())?;
+    let sessions = generation.provider_sessions(state).await?;
+    let supports = |operation: &str| {
+        generation
+            .service_bootstrap
+            .operations
+            .iter()
+            .any(|candidate| candidate.name == operation)
+    };
+    state.admit_current(generation)?;
     Ok(json!({
-        "profiles": onboarding.profiles(),
-        "sessions": onboarding
-            .current_sessions(limit)
-            .map_err(map_onboarding_error)?,
-        "encryptedFileFallback": onboarding
-            .encrypted_file_fallback_status()
-            .map_err(map_onboarding_error)?,
+        "profiles": generation.service_bootstrap.provider_profiles,
+        "sessions": sessions,
+        "encryptedFileFallback": generation.service_bootstrap.encrypted_file_fallback,
+        "capabilities": {
+            "credentialImport": supports("Source.ImportCredentialBundle"),
+            "health": supports("Source.GetHealth"),
+            "manifestEvidence": supports("Research.GetManifest"),
+            "researchIngestion": supports("Source.GetStatus")
+                && supports("Source.ListObjects")
+                && supports("Source.Discover")
+                && supports("Research.StartIngestSource"),
+            "status": supports("Source.GetStatus"),
+            "coverage": supports("Source.GetCoverage"),
+        },
     }))
 }
 
-fn serialize(value: impl Serialize) -> Result<Value, DesktopCommandError> {
-    serde_json::to_value(value).map_err(|_error| DesktopCommandError::internal())
-}
-
-fn map_service_error(error: ServiceError) -> DesktopCommandError {
-    DesktopCommandError::new(
-        match error {
-            ServiceError::InvalidRequest => "invalid_request",
-            ServiceError::NotFound => "not_found",
-            ServiceError::Unauthorized => "unauthorized",
-            ServiceError::ResourceExhausted => "resource_exhausted",
-            ServiceError::Cancelled => "cancelled",
-            ServiceError::DeadlineExceeded => "deadline_exceeded",
-            ServiceError::Unavailable => "unavailable",
-            ServiceError::InvalidResult => "invalid_result",
-            ServiceError::Internal => "internal",
-        },
-        error.to_string(),
-    )
-}
-
-fn map_onboarding_error(error: ProviderOnboardingError) -> DesktopCommandError {
-    let code = match error {
-        ProviderOnboardingError::UnknownProfile => "unknown_provider",
-        ProviderOnboardingError::InvalidRequest | ProviderOnboardingError::InvalidSecretShape => {
-            "invalid_request"
-        }
-        ProviderOnboardingError::AdministrativeContactRequired => "contact_required",
-        ProviderOnboardingError::CredentialRejected => "credential_rejected",
-        ProviderOnboardingError::ProbeRateLimited => "rate_limited",
-        ProviderOnboardingError::ProbeDeadlineExceeded => "deadline_exceeded",
-        ProviderOnboardingError::OperationCancelled => "cancelled",
-        ProviderOnboardingError::EvidenceRefreshRequired => "evidence_refresh_required",
-        ProviderOnboardingError::RightsBlocked => "rights_blocked",
-        ProviderOnboardingError::ActivationExpired => "activation_expired",
-        ProviderOnboardingError::SecretCleanupUnavailable
-        | ProviderOnboardingError::RemoteReconciliationRequired => "reconciliation_required",
-        ProviderOnboardingError::InvalidProfile
-        | ProviderOnboardingError::SecretImportUnavailable
-        | ProviderOnboardingError::RenewalUnavailable
-        | ProviderOnboardingError::ActivationUnavailable
-        | ProviderOnboardingError::SecretVerificationFailed
-        | ProviderOnboardingError::InvalidSessionState
-        | ProviderOnboardingError::ClientConfiguration
-        | ProviderOnboardingError::ProbeUnavailable
-        | ProviderOnboardingError::OfficialDocumentUnavailable
-        | ProviderOnboardingError::SecretOperationUnavailable
-        | ProviderOnboardingError::Clock
-        | ProviderOnboardingError::Profile(_)
-        | ProviderOnboardingError::Catalog(_)
-        | ProviderOnboardingError::SecretStore(_)
-        | ProviderOnboardingError::Identity(_)
-        | ProviderOnboardingError::Network(_)
-        | ProviderOnboardingError::Tls(_) => "provider_unavailable",
+pub(crate) fn map_application_client_error(error: ApplicationClientError) -> DesktopCommandError {
+    let (code, message) = match error {
+        ApplicationClientError::Rejected => (
+            "operation_rejected",
+            "The installed service rejected the dashboard request.",
+        ),
+        ApplicationClientError::Unavailable => (
+            "service_unavailable",
+            "The installed Market Squawk service is unavailable.",
+        ),
+        ApplicationClientError::Interrupted => (
+            "request_interrupted",
+            "The dashboard request was cancelled or exceeded its deadline.",
+        ),
+        ApplicationClientError::InvalidResponse => (
+            "invalid_service_response",
+            "The installed service returned an invalid response.",
+        ),
     };
-    DesktopCommandError::new(code, error.to_string())
-}
-
-fn map_activation_error(error: ProviderPortalActivationError) -> DesktopCommandError {
-    DesktopCommandError::new(
-        match error {
-            ProviderPortalActivationError::InvalidRequest => "invalid_request",
-            ProviderPortalActivationError::Unavailable => "provider_unavailable",
-            ProviderPortalActivationError::StateUnavailable => "state_unavailable",
-            ProviderPortalActivationError::Cancelled => "cancelled",
-        },
-        error.to_string(),
-    )
+    DesktopCommandError::new(code, message)
 }
 
 fn map_installation_error(error: impl std::fmt::Display) -> DesktopCommandError {
     DesktopCommandError::new("installation_failed", error.to_string())
+}
+
+pub(crate) fn decode_application_result(response: &Value) -> Result<Value, DesktopCommandError> {
+    let object = response
+        .as_object()
+        .ok_or_else(DesktopCommandError::internal)?;
+    if object.len() != 2 || object.get("ok") != Some(&Value::Bool(true)) {
+        return Err(DesktopCommandError::new(
+            "operation_failed",
+            "The Market Squawk service rejected the operation.",
+        ));
+    }
+    object
+        .get("value")
+        .cloned()
+        .ok_or_else(DesktopCommandError::internal)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use market_squawk_runtime::{InstallationId, RuntimeIdentity, ServiceGeneration, WorkspaceId};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::contracts::ProductSessionToken;
+
+    use super::{
+        admit_replacement, admit_webview_product_session, decode_application_result,
+        lossless_webview_value,
+    };
+
+    #[test]
+    fn native_success_returns_the_application_result_envelope() {
+        let response = json!({
+            "ok": true,
+            "value": {
+                "data": {"status": "ready"},
+                "metadata": {
+                    "completeness": "complete",
+                    "returnedItems": 1,
+                    "availableItems": 1,
+                    "sourceCoverage": null,
+                    "dataQuality": null
+                }
+            }
+        });
+
+        assert_eq!(
+            decode_application_result(&response).ok(),
+            Some(json!({
+                "data": {"status": "ready"},
+                "metadata": {
+                    "completeness": "complete",
+                    "returnedItems": 1,
+                    "availableItems": 1,
+                    "sourceCoverage": null,
+                    "dataQuality": null
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn webview_transport_preserves_financial_time_integers_exactly() {
+        assert_eq!(
+            lossless_webview_value(json!({
+                "timestamp": 1_800_000_000_000_000_001_i64,
+                "safeCount": 42
+            })),
+            json!({
+                "timestamp": "1800000000000000001",
+                "safeCount": 42
+            })
+        );
+    }
+
+    #[test]
+    fn reconnect_requires_the_existing_workspace_root_and_a_new_webview_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = runtime_identity(1, 2, 7)?;
+        let replacement = runtime_identity(1, 2, 8)?;
+        let other_workspace = runtime_identity(1, 3, 8)?;
+        let root = Path::new("/canonical/workspace");
+
+        assert!(admit_replacement(current, root, current, replacement, root).is_ok());
+        assert!(admit_replacement(current, root, current, other_workspace, root).is_err());
+        assert!(
+            admit_replacement(
+                current,
+                root,
+                current,
+                replacement,
+                Path::new("/other/workspace"),
+            )
+            .is_err()
+        );
+        let admitted_product_session = ProductSessionToken::random();
+        let replacement_product_session = ProductSessionToken::random();
+        assert!(
+            admit_webview_product_session(admitted_product_session, replacement_product_session)
+                .is_err()
+        );
+        assert!(
+            admit_webview_product_session(replacement_product_session, replacement_product_session)
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    fn runtime_identity(
+        installation: u128,
+        workspace: u128,
+        generation: u64,
+    ) -> Result<RuntimeIdentity, Box<dyn std::error::Error>> {
+        Ok(RuntimeIdentity::try_new(
+            InstallationId::try_from_uuid(Uuid::from_u128(installation))?,
+            WorkspaceId::try_from_uuid(Uuid::from_u128(workspace))?,
+            ServiceGeneration::try_new(generation)?,
+        )?)
+    }
 }

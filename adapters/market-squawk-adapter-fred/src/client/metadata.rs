@@ -6,20 +6,26 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     ApiEndpointRule, ExtractionAuthority, ExtractionSourceError, NetworkPolicyError, PathScope,
-    QueryParameterRule, QuerySensitivity, SourceError,
+    ProviderCaptureMaterial, QueryParameterRule, QuerySensitivity, SourceError,
+    SourceMetadataIntervalViolation, SourceMetadataSchemaViolation, SourceProtocolViolation,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::FredParseLimits;
 use crate::series::{admit_body, parse_date, validate_strings};
-use crate::{FredOperation, FredParseLimits, FredRightsDisposition};
 
 use super::http::system_timestamp;
 use super::lineage::{evidence_for_payload, map_adapter_error};
-use super::{FredDataset, FredHttpRequest, FredSource, FredSourceError, acquire_request_permit};
+use super::{
+    FredDataset, FredDiscoveryError, FredHttpAuthorization, FredHttpRequest, FredSource,
+    FredSourceError, acquire_request_permit, protocol_violation, standalone_capture_material,
+};
 
 const SERIES_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series";
 const MAX_METADATA_STRING_BYTES: usize = 8 * 1024;
+/// Maximum ordered metadata revisions retained from one bounded series response.
+pub const MAX_FRED_SERIES_METADATA_REVISIONS: usize = 4_096;
 
 /// Builds the exact endpoint-policy rule required by [`FredSource::acquire_series_metadata`].
 ///
@@ -151,7 +157,7 @@ impl FredSeriesMetadata {
     /// Parses one bounded credential-probe response for an exact code-owned series selector.
     ///
     /// This uses the same strict one-series schema and civil-date consistency checks as normal
-    /// extraction without manufacturing a durable dataset or rights decision.
+    /// extraction without manufacturing a durable dataset.
     ///
     /// # Errors
     ///
@@ -162,21 +168,28 @@ impl FredSeriesMetadata {
         expected_series: &SourceIdentifier,
         limits: FredParseLimits,
     ) -> Result<Self, FredSourceError> {
-        parse_series_metadata_for_series(bytes, expected_series.as_str(), limits)
+        let revisions =
+            parse_series_metadata_for_series(bytes, expected_series.as_str(), None, limits)
+                .map_err(|_| FredSourceError::Protocol)?;
+        if revisions.len() != 1 {
+            return Err(FredSourceError::Protocol);
+        }
+        revisions.into_vec().pop().ok_or(FredSourceError::Protocol)
     }
 }
 
 /// One exact FRED series-metadata response bound to its source and dataset identities.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FredSeriesMetadataDocument {
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     dataset: SourceIdentifier,
-    series: FredSeriesMetadata,
+    series_revisions: Box<[FredSeriesMetadata]>,
     response_bytes: Bytes,
     response_length: u64,
     evidence: ExactPayloadEvidence,
     received_at: Timestamp,
+    capture: ProviderCaptureMaterial,
 }
 
 impl FredSeriesMetadataDocument {
@@ -195,12 +208,12 @@ impl FredSeriesMetadataDocument {
         &self.dataset
     }
 
-    /// Returns validated provider-authored series semantics.
-    pub const fn series(&self) -> &FredSeriesMetadata {
-        &self.series
+    /// Returns every validated provider-authored metadata revision in real-time order.
+    pub fn series_revisions(&self) -> &[FredSeriesMetadata] {
+        &self.series_revisions
     }
 
-    /// Returns the exact response bytes used to construct [`Self::series`].
+    /// Returns the exact response bytes used to construct [`Self::series_revisions`].
     pub const fn response_bytes(&self) -> &Bytes {
         &self.response_bytes
     }
@@ -218,6 +231,22 @@ impl FredSeriesMetadataDocument {
     /// Returns when this process completed receipt of the exact response.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
+    }
+
+    /// Returns the exact metadata response ready for source-neutral raw sealing.
+    pub const fn capture_material(&self) -> &ProviderCaptureMaterial {
+        &self.capture
+    }
+
+    /// Consumes the document into its exact metadata response material.
+    pub fn into_capture_material(self) -> ProviderCaptureMaterial {
+        self.capture
+    }
+
+    pub(super) fn into_native_semantics_and_capture(
+        self,
+    ) -> (Box<[FredSeriesMetadata]>, ProviderCaptureMaterial) {
+        (self.series_revisions, self.capture)
     }
 }
 
@@ -237,32 +266,30 @@ impl FredSource {
         dataset: &SourceIdentifier,
         deadline: Timestamp,
         cancellation: CancellationToken,
-        operation: FredOperation,
     ) -> Result<FredSeriesMetadataDocument, ExtractionSourceError> {
+        self.acquire_series_metadata_with_diagnostic(authority, dataset, deadline, cancellation)
+            .await
+            .map_err(FredDiscoveryError::into_source_error)
+    }
+
+    pub(super) async fn acquire_series_metadata_with_diagnostic(
+        &self,
+        authority: &ExtractionAuthority,
+        dataset: &SourceIdentifier,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<FredSeriesMetadataDocument, FredDiscoveryError> {
         self.validate_authority(authority)?;
+        self.validate_provider_dataset(dataset)?;
         if cancellation.is_cancelled() {
-            return Err(ExtractionSourceError::Cancelled);
+            return Err(ExtractionSourceError::Cancelled.into());
         }
         let dataset_identity = FredDataset::parse(dataset)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let now = system_timestamp().map_err(map_adapter_error)?;
         if deadline <= now {
-            return Err(ExtractionSourceError::DeadlineExceeded);
+            return Err(ExtractionSourceError::DeadlineExceeded.into());
         }
-        let rights = self
-            .rights
-            .assess(
-                &SourceIdentifier::try_from(dataset_identity.series_id()).map_err(|_| {
-                    ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-                })?,
-                &[operation],
-                now,
-            )
-            .map_err(|_| ExtractionSourceError::Source(SourceError::Unauthorized))?;
-        if rights.disposition() != FredRightsDisposition::Permitted {
-            return Err(ExtractionSourceError::Source(SourceError::Unauthorized));
-        }
-
         let mut public_url = url::Url::parse(SERIES_ENDPOINT)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         public_url
@@ -300,6 +327,7 @@ impl FredSource {
                 FredHttpRequest {
                     public_url: public_url.clone(),
                     api_key: self.api_key.clone(),
+                    authorization: FredHttpAuthorization::QueryParameter,
                 },
                 self.response_limit,
                 timeout,
@@ -309,51 +337,63 @@ impl FredSource {
             .map_err(map_adapter_error)?;
         in_flight.validate_response_size(
             u64::try_from(response.body.len())
-                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
+                .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?,
         )?;
         if response
             .content_encoding
             .as_deref()
             .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
         {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
+            return Err(protocol_violation(
+                SourceProtocolViolation::MetadataEncoding,
             ));
         }
         match response.status {
             200 => {}
-            401 | 403 => return Err(ExtractionSourceError::Source(SourceError::Unauthorized)),
+            401 | 403 => {
+                return Err(ExtractionSourceError::Source(SourceError::Unauthorized).into());
+            }
             429 | 503 => {
                 let deadline =
                     in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
-                return Err(ExtractionSourceError::Source(
-                    SourceError::BudgetWaitUntil { deadline },
-                ));
+                return Err(ExtractionSourceError::Source(SourceError::BudgetWaitUntil {
+                    deadline,
+                })
+                .into());
             }
-            _ => return Err(ExtractionSourceError::Source(SourceError::Network)),
+            _ => return Err(ExtractionSourceError::Source(SourceError::Network).into()),
         }
 
         let limits = FredParseLimits::try_new(
-            1,
+            MAX_FRED_SERIES_METADATA_REVISIONS,
             self.response_limit,
             self.response_limit.min(MAX_METADATA_STRING_BYTES),
         )
-        .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let series = parse_series_metadata(&response.body, &dataset_identity, limits)
-            .map_err(map_adapter_error)?;
+        .map_err(|_| {
+            protocol_violation(SourceProtocolViolation::MetadataSchema(
+                SourceMetadataSchemaViolation::DocumentShape,
+            ))
+        })?;
+        let series_revisions = parse_series_metadata(&response.body, &dataset_identity, limits)
+            .map_err(protocol_violation)?;
         let response_length = u64::try_from(response.body.len())
-            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let evidence =
-            evidence_for_payload(&response.body, &public_url).map_err(map_adapter_error)?;
+            .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
+        let evidence = evidence_for_payload(&response.body, &public_url)
+            .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
+        let capture =
+            standalone_capture_material(&self.metadata, dataset.clone(), &public_url, &response)
+                .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
+        in_flight.record_success()?;
         Ok(FredSeriesMetadataDocument {
             source_id: self.metadata.source_id().clone(),
             metadata_revision: self.metadata.revision().clone(),
             dataset: dataset.clone(),
-            series,
+            series_revisions,
             response_bytes: response.body,
             response_length,
             evidence,
             received_at: response.received_at,
+            capture,
         })
     }
 }
@@ -362,79 +402,139 @@ fn parse_series_metadata(
     bytes: &[u8],
     dataset: &FredDataset,
     limits: FredParseLimits,
-) -> Result<FredSeriesMetadata, FredSourceError> {
-    let series = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)?;
-    if series.realtime_start != dataset.realtime_start()
-        || series.realtime_end != dataset.realtime_end()
-    {
-        return Err(FredSourceError::Protocol);
-    }
-    Ok(series)
+) -> Result<Box<[FredSeriesMetadata]>, SourceProtocolViolation> {
+    let series_revisions = parse_series_metadata_for_series(
+        bytes,
+        dataset.series_id(),
+        Some((dataset.realtime_start(), dataset.realtime_end())),
+        limits,
+    )
+    .map_err(SourceProtocolViolation::MetadataSchema)?;
+    Ok(series_revisions)
 }
 
 fn parse_series_metadata_for_series(
     bytes: &[u8],
     expected_series: &str,
+    expected_page_interval: Option<(CalendarDate, CalendarDate)>,
     limits: FredParseLimits,
-) -> Result<FredSeriesMetadata, FredSourceError> {
-    admit_body(bytes, limits).map_err(|_| FredSourceError::Protocol)?;
+) -> Result<Box<[FredSeriesMetadata]>, SourceMetadataSchemaViolation> {
+    admit_body(bytes, limits).map_err(|_| SourceMetadataSchemaViolation::DocumentShape)?;
     let wire: SeriesResponseWire =
-        serde_json::from_slice(bytes).map_err(|_| FredSourceError::Protocol)?;
-    if wire.seriess.len() != 1 {
-        return Err(FredSourceError::Protocol);
+        serde_json::from_slice(bytes).map_err(|_| SourceMetadataSchemaViolation::DocumentShape)?;
+    if wire.seriess.is_empty() || wire.seriess.len() > limits.max_records {
+        return Err(SourceMetadataSchemaViolation::RecordCardinality);
     }
-    let page_start = parse_date(&wire.realtime_start).map_err(|_| FredSourceError::Protocol)?;
-    let page_end = parse_date(&wire.realtime_end).map_err(|_| FredSourceError::Protocol)?;
-    let mut rows = wire.seriess.into_iter();
-    let row = rows.next().ok_or(FredSourceError::Protocol)?;
-    let values = [
-        row.id.as_str(),
-        row.title.as_str(),
-        row.frequency.as_str(),
-        row.frequency_short.as_str(),
-        row.units.as_str(),
-        row.units_short.as_str(),
-        row.seasonal_adjustment.as_str(),
-        row.seasonal_adjustment_short.as_str(),
-        row.last_updated.as_str(),
-        row.notes.as_deref().unwrap_or_default(),
-    ];
-    validate_strings(values, limits).map_err(|_| FredSourceError::Protocol)?;
-    if values[..9].iter().any(|value| value.is_empty()) || !is_valid_last_updated(&row.last_updated)
+    let page_start = parse_date(&wire.realtime_start)
+        .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::ResponseEnvelopeStart))?;
+    let page_end = parse_date(&wire.realtime_end)
+        .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::ResponseEnvelopeEnd))?;
+    if page_start > page_end {
+        return Err(metadata_interval(
+            SourceMetadataIntervalViolation::ResponseEnvelopeOrder,
+        ));
+    }
+    if expected_page_interval.is_some_and(|expected| expected != (page_start, page_end)) {
+        return Err(metadata_interval(
+            SourceMetadataIntervalViolation::ResponseEnvelopeBinding,
+        ));
+    }
+    let mut revisions = Vec::new();
+    revisions
+        .try_reserve_exact(wire.seriess.len())
+        .map_err(|_| SourceMetadataSchemaViolation::RecordCardinality)?;
+    for row in wire.seriess {
+        let values = [
+            row.id.as_str(),
+            row.title.as_str(),
+            row.frequency.as_str(),
+            row.frequency_short.as_str(),
+            row.units.as_str(),
+            row.units_short.as_str(),
+            row.seasonal_adjustment.as_str(),
+            row.seasonal_adjustment_short.as_str(),
+            row.last_updated.as_str(),
+            row.notes.as_deref().unwrap_or_default(),
+        ];
+        validate_strings(values, limits)
+            .map_err(|_| SourceMetadataSchemaViolation::RequiredText)?;
+        if values[..9].iter().any(|value| value.is_empty()) {
+            return Err(SourceMetadataSchemaViolation::RequiredText);
+        }
+        if !is_valid_last_updated(&row.last_updated) {
+            return Err(SourceMetadataSchemaViolation::UpdateTimestamp);
+        }
+        let series_id = SourceIdentifier::try_from(row.id)
+            .map_err(|_| SourceMetadataSchemaViolation::RecordIdentity)?;
+        let realtime_start = parse_date(&row.realtime_start)
+            .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::RecordStart))?;
+        let realtime_end = parse_date(&row.realtime_end)
+            .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::RecordEnd))?;
+        let observation_start = parse_date(&row.observation_start)
+            .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
+        let observation_end = parse_date(&row.observation_end)
+            .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
+        if series_id.as_str() != expected_series {
+            return Err(SourceMetadataSchemaViolation::RecordIdentity);
+        }
+        if realtime_start > realtime_end {
+            return Err(metadata_interval(
+                SourceMetadataIntervalViolation::RecordOrder,
+            ));
+        }
+        if observation_start > observation_end {
+            return Err(SourceMetadataSchemaViolation::ObservationInterval);
+        }
+        revisions.push(FredSeriesMetadata {
+            series_id,
+            realtime_start,
+            realtime_end,
+            title: row.title,
+            observation_start,
+            observation_end,
+            frequency: row.frequency,
+            frequency_short: row.frequency_short,
+            units: row.units,
+            units_short: row.units_short,
+            seasonal_adjustment: row.seasonal_adjustment,
+            seasonal_adjustment_short: row.seasonal_adjustment_short,
+            last_updated: row.last_updated,
+            popularity: row.popularity,
+            notes: row.notes,
+        });
+    }
+    // This endpoint has no ordering selector. Preserve the exact provider array in the raw
+    // capture, but canonicalize the semantic timeline before proving interval validity.
+    revisions.sort_unstable_by_key(|revision| (revision.realtime_start, revision.realtime_end));
+    // The response-level dates are the requested envelope, not a promise that metadata semantics
+    // existed throughout it. Retain every exact provider interval and defer completeness authority
+    // to each observation that is eligible for publication.
+    for pair in revisions.windows(2) {
+        if let Some(reason) = metadata_interval_discontinuity(&pair[0], &pair[1]) {
+            return Err(metadata_interval(reason));
+        }
+    }
+    Ok(revisions.into_boxed_slice())
+}
+
+const fn metadata_interval(
+    reason: SourceMetadataIntervalViolation,
+) -> SourceMetadataSchemaViolation {
+    SourceMetadataSchemaViolation::PageRecordInterval(reason)
+}
+
+fn metadata_interval_discontinuity(
+    previous: &FredSeriesMetadata,
+    next: &FredSeriesMetadata,
+) -> Option<SourceMetadataIntervalViolation> {
+    if previous.realtime_start == next.realtime_start && previous.realtime_end == next.realtime_end
     {
-        return Err(FredSourceError::Protocol);
+        return Some(SourceMetadataIntervalViolation::DuplicateInterval);
     }
-    let series_id = SourceIdentifier::try_from(row.id).map_err(|_| FredSourceError::Protocol)?;
-    let realtime_start = parse_date(&row.realtime_start).map_err(|_| FredSourceError::Protocol)?;
-    let realtime_end = parse_date(&row.realtime_end).map_err(|_| FredSourceError::Protocol)?;
-    let observation_start =
-        parse_date(&row.observation_start).map_err(|_| FredSourceError::Protocol)?;
-    let observation_end =
-        parse_date(&row.observation_end).map_err(|_| FredSourceError::Protocol)?;
-    if series_id.as_str() != expected_series
-        || realtime_start != page_start
-        || realtime_end != page_end
-        || observation_start > observation_end
-    {
-        return Err(FredSourceError::Protocol);
+    if next.realtime_start <= previous.realtime_end {
+        return Some(SourceMetadataIntervalViolation::Overlap);
     }
-    Ok(FredSeriesMetadata {
-        series_id,
-        realtime_start,
-        realtime_end,
-        title: row.title,
-        observation_start,
-        observation_end,
-        frequency: row.frequency,
-        frequency_short: row.frequency_short,
-        units: row.units,
-        units_short: row.units_short,
-        seasonal_adjustment: row.seasonal_adjustment,
-        seasonal_adjustment_short: row.seasonal_adjustment_short,
-        last_updated: row.last_updated,
-        popularity: row.popularity,
-        notes: row.notes,
-    })
+    None
 }
 
 fn is_valid_last_updated(value: &str) -> bool {

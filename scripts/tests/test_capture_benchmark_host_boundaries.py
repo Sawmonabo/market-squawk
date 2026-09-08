@@ -152,6 +152,7 @@ def build_evidence_value(backend: str) -> dict:
         "executable_sha256": "b" * 64,
         "cargo_json_path": "./capture-bench-build.json",
         "cargo_json_sha256": digest,
+        "measured_source_closure_sha256": digest,
         "source_inventory_sha256": digest,
         "cargo_lock_sha256": digest,
         "workspace_manifest_sha256": digest,

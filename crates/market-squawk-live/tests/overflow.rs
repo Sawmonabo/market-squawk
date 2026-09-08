@@ -1,4 +1,9 @@
-use market_squawk_live::{BoundShardIngress, LiveIngressError, LiveRuntime, LiveRuntimeHealthKind};
+use std::time::Duration;
+
+use market_squawk_live::{
+    BoundShardIngress, LiveIngressBindError, LiveIngressError, LiveRuntime, LiveRuntimeHealthKind,
+    RegistrationFailure,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::current_source;
@@ -116,14 +121,75 @@ async fn health_refresh_rebind_accepts_fresh_batch_on_same_route() -> TestResult
     let runtime = start(8 * 1024 * 1024).await?;
     let mut source = SourceHarness::try_new("source-a", 1, INSTRUMENT_ONE)?;
     let original = bind(&runtime, &source).await?;
+    let route = original.route().clone();
+    let shard = original.shard();
+    let (_, initial) = source.batch("initial", 1)?;
+    original.try_publish(initial)?;
+    wait_for_generation_current(&runtime, true).await?;
+
+    original.revoke_generation().await?;
+    let snapshots = runtime.snapshots().try_load_all()?;
+    let revoked = snapshots
+        .snapshots()
+        .flat_map(|snapshot| snapshot.routes())
+        .find(|candidate| candidate.route() == &route)
+        .and_then(|candidate| candidate.streams().first())
+        .ok_or("revocation publication omitted the configured source stream")?;
+    assert!(!revoked.generation_current());
+    drop(snapshots);
+
+    assert_eq!(
+        bind(&runtime, &source).await.err(),
+        Some(LiveIngressBindError::Registration(
+            RegistrationFailure::NotCurrent
+        ))
+    );
+
     source.refresh_health()?;
     let refreshed = bind(&runtime, &source).await?;
-    let (_, fresh_batch) = source.batch("refreshed", 1)?;
+    let (_, fresh_batch) = source.batch("refreshed", 2)?;
 
-    assert_eq!(original.route(), refreshed.route());
-    assert_eq!(original.shard(), refreshed.shard());
+    assert_eq!(&route, refreshed.route());
+    assert_eq!(shard, refreshed.shard());
     refreshed.try_publish(fresh_batch)?;
+    wait_for_generation_current(&runtime, true).await?;
     assert!(runtime.shutdown().await.is_complete());
+    Ok(())
+}
+
+async fn wait_for_generation_current(runtime: &LiveRuntime, expected: bool) -> TestResult {
+    let route = current_source::route(INSTRUMENT_ONE)?;
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshots = runtime.snapshots().try_load_all()?;
+            let current = snapshots
+                .snapshots()
+                .flat_map(|snapshot| snapshot.routes())
+                .find(|candidate| candidate.route() == &route)
+                .is_some_and(|candidate| {
+                    candidate
+                        .streams()
+                        .iter()
+                        .any(|stream| stream.generation_current() == expected)
+                });
+            if current {
+                return TestResult::Ok(());
+            }
+            drop(snapshots);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result?,
+        Err(_) => {
+            let snapshots = runtime.snapshots().try_load_all()?;
+            return Err(format!(
+                "timed out waiting for generation_current={expected}: {snapshots:#?}"
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 

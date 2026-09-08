@@ -1,9 +1,12 @@
 //! Bounded Source-domain result construction and request parsing.
 
 use market_squawk_data::CatalogError;
-use market_squawk_domain::{DataQuality, SourceIdentifier, Timestamp};
+use market_squawk_domain::{CoverageDelay, DataQuality, SourceIdentifier, Timestamp};
 use market_squawk_services::{
     ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
+};
+use market_squawk_sources::{
+    ConnectionLiveness, MarketFreshness, SourceTimestampFreshness, TransportFreshness,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -106,20 +109,80 @@ fn runtime_status_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, Servic
             .provider_channel()
             .as_source_identifier()
             .as_str(),
-        "connectionGeneration": runtime.connection_generation.get(),
+        "connectionGeneration": runtime.connection_generation.get().to_string(),
         "sessionId": runtime.session_id.as_str(),
-        "healthEpoch": runtime.health_epoch,
-        "stateRevision": runtime.state_revision,
+        "healthEpoch": runtime.health_epoch.to_string(),
+        "stateRevision": runtime.state_revision.to_string(),
         "assessmentId": runtime.assessment_id.as_str(),
         "bindingDigest": encode_hex(runtime.binding_digest),
-        "connection": to_json(&runtime.connection)?,
+        "connection": connection_liveness_value(runtime.connection),
         "integrity": to_json(&runtime.stream_integrity)?,
         "quality": to_json(&runtime.quality)?,
-        "observedAtUnixNanos": runtime.observed_at.unix_nanos(),
+        "observedAtUnixNanos": runtime.observed_at.unix_nanos().to_string(),
         "qualificationEvaluatedAtUnixNanos":
-            runtime.qualification_evaluated_at.unix_nanos(),
-        "qualificationValidUntilUnixNanos": runtime.qualification_valid_until.unix_nanos(),
+            runtime.qualification_evaluated_at.unix_nanos().to_string(),
+        "qualificationValidUntilUnixNanos": runtime.qualification_valid_until.unix_nanos().to_string(),
     }))
+}
+
+fn connection_liveness_value(value: ConnectionLiveness) -> Value {
+    match value {
+        ConnectionLiveness::Connecting => json!("connecting"),
+        ConnectionLiveness::Live { last_activity_at } => {
+            json!({"live": {"last_activity_at": last_activity_at.unix_nanos().to_string()}})
+        }
+        ConnectionLiveness::Stale { last_activity_at } => {
+            json!({"stale": {"last_activity_at": last_activity_at.unix_nanos().to_string()}})
+        }
+        ConnectionLiveness::Disconnected { disconnected_at } => {
+            json!({"disconnected": {"disconnected_at": disconnected_at.unix_nanos().to_string()}})
+        }
+    }
+}
+
+fn transport_freshness_value(value: TransportFreshness) -> Value {
+    match value {
+        TransportFreshness::Uninitialized => json!("uninitialized"),
+        TransportFreshness::Fresh { last_transport_at } => {
+            json!({"fresh": {"last_transport_at": last_transport_at.unix_nanos().to_string()}})
+        }
+        TransportFreshness::Stale { last_transport_at } => {
+            json!({"stale": {"last_transport_at": last_transport_at.unix_nanos().to_string()}})
+        }
+    }
+}
+
+fn market_freshness_value(value: MarketFreshness) -> Value {
+    match value {
+        MarketFreshness::Uninitialized => json!("uninitialized"),
+        MarketFreshness::Fresh { last_market_at } => {
+            json!({"fresh": {"last_market_at": last_market_at.unix_nanos().to_string()}})
+        }
+        MarketFreshness::Stale { last_market_at } => {
+            json!({"stale": {"last_market_at": last_market_at.unix_nanos().to_string()}})
+        }
+    }
+}
+
+fn source_timestamp_freshness_value(value: SourceTimestampFreshness) -> Value {
+    match value {
+        SourceTimestampFreshness::Uninitialized => json!("uninitialized"),
+        SourceTimestampFreshness::Fresh { last_source_at } => {
+            json!({"fresh": {"last_source_at": last_source_at.unix_nanos().to_string()}})
+        }
+        SourceTimestampFreshness::Stale { last_source_at } => {
+            json!({"stale": {"last_source_at": last_source_at.unix_nanos().to_string()}})
+        }
+    }
+}
+
+fn coverage_delay_value(value: CoverageDelay) -> Value {
+    match value {
+        CoverageDelay::RealTime => json!({"kind": "real_time"}),
+        CoverageDelay::Delayed(nanos) => {
+            json!({"kind": "delayed", "value": nanos.to_string()})
+        }
+    }
 }
 
 fn runtime_coverage_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, ServiceError> {
@@ -133,10 +196,13 @@ fn runtime_coverage_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, Serv
         "providerChannel": scope.provider_channel().as_source_identifier().as_str(),
         "eventClass": to_json(&scope.event_class())?,
         "marketDepth": to_json(&scope.depth())?,
-        "delay": to_json(&scope.delay())?,
+        "delay": coverage_delay_value(scope.delay()),
         "consolidation": to_json(&scope.consolidation())?,
-        "effectiveFromUnixNanos": scope.effective_from().unix_nanos(),
-        "effectiveUntilUnixNanos": scope.effective_until().map(Timestamp::unix_nanos),
+        "effectiveFromUnixNanos": scope.effective_from().unix_nanos().to_string(),
+        "effectiveUntilUnixNanos": scope
+            .effective_until()
+            .map(Timestamp::unix_nanos)
+            .map(|nanos| nanos.to_string()),
         "metadataRevision": scope.metadata_revision().as_source_identifier().as_str(),
         "status": to_json(&runtime.coverage_status)?,
     }))
@@ -148,24 +214,25 @@ fn runtime_health_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, Servic
         "sourceId": runtime.source_id.as_str(),
         "venueId": runtime.coverage_scope.venue_id().as_str(),
         "instrumentId": runtime.instrument_id.to_string(),
-        "connectionGeneration": runtime.connection_generation.get(),
+        "connectionGeneration": runtime.connection_generation.get().to_string(),
         "sessionId": runtime.session_id.as_str(),
-        "healthEpoch": runtime.health_epoch,
-        "stateRevision": runtime.state_revision,
+        "healthEpoch": runtime.health_epoch.to_string(),
+        "stateRevision": runtime.state_revision.to_string(),
         "assessmentId": runtime.assessment_id.as_str(),
         "bindingDigest": encode_hex(runtime.binding_digest),
-        "connection": to_json(&runtime.connection)?,
-        "transportFreshness": to_json(&runtime.transport_freshness)?,
-        "marketFreshness": to_json(&runtime.market_freshness)?,
-        "sourceTimestampFreshness": to_json(&runtime.source_freshness)?,
+        "connection": connection_liveness_value(runtime.connection),
+        "transportFreshness": transport_freshness_value(runtime.transport_freshness),
+        "marketFreshness": market_freshness_value(runtime.market_freshness),
+        "sourceTimestampFreshness": source_timestamp_freshness_value(runtime.source_freshness),
         "streamIntegrity": to_json(&runtime.stream_integrity)?,
         "captureIntegrity": to_json(&runtime.capture_integrity)?,
         "coverageStatus": to_json(&runtime.coverage_status)?,
         "quality": to_json(&runtime.quality)?,
-        "observedAtUnixNanos": runtime.observed_at.unix_nanos(),
+        "observedAtUnixNanos": runtime.observed_at.unix_nanos().to_string(),
         "qualificationEvaluatedAtUnixNanos":
-            runtime.qualification_evaluated_at.unix_nanos(),
-        "qualificationValidUntilUnixNanos": runtime.qualification_valid_until.unix_nanos(),
+            runtime.qualification_evaluated_at.unix_nanos().to_string(),
+        "qualificationValidUntilUnixNanos":
+            runtime.qualification_valid_until.unix_nanos().to_string(),
     }))
 }
 
@@ -380,7 +447,6 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         | ProviderOnboardingError::InvalidSessionState
         | ProviderOnboardingError::ClientConfiguration
         | ProviderOnboardingError::ProbeUnavailable
-        | ProviderOnboardingError::OfficialDocumentUnavailable
         | ProviderOnboardingError::EvidenceRefreshRequired
         | ProviderOnboardingError::ActivationUnavailable
         | ProviderOnboardingError::ActivationExpired

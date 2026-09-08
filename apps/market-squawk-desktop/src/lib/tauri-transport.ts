@@ -1,51 +1,321 @@
-import { invoke, isTauri } from "@tauri-apps/api/core"
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core"
 
+import { analyticalControllerResponseSchema } from "@/features/advanced/analytical-profile-contracts"
 import {
   applicationResultSchema,
-  desktopBootstrapSchema,
+  desktopEventSchema,
+  desktopEventSubscriptionReceiptSchema,
+  desktopSystemStartupSchema,
   encryptedFileFallbackSchema,
   installationControlResultSchema,
+  inputTicketSchema,
+  mcpClientsStatusSchema,
+  nativeEvidenceApplicationResultSchema,
   providerActivationSchema,
   providerBootstrapSchema,
   providerSessionSchema,
 } from "@/lib/schemas"
 import type {
-  ApplicationRequest,
+  DesktopTransport,
+  DecisionControlRequest,
+  FairValueControlRequest,
+  GovernanceControlRequest,
+  GovernanceQueryRequest,
+  JobControlRequest,
   InstallationControlRequest,
+  ModelControlRequest,
+  McpClientControlRequest,
+  ManualPaperRequest,
+  OperationsControlRequest,
+  PaperControlRequest,
+  ProductQuery,
   ProductTransport,
   ProviderOnboardingRequest,
   ProviderOnboardingResult,
+  ResearchControlRequest,
+  SourceLifecycleAction,
+  SourceLifecycleRequest,
+  SystemQuery,
+  SystemTransport,
+  TrainingInputKind,
 } from "@/lib/transport"
 
-export function createProductTransport(): ProductTransport {
-  if (!isTauri()) {
-    return new UnavailableBrowserTransport()
+export function createDesktopTransport(): DesktopTransport {
+  const bridge = isTauri()
+    ? new TauriTransport()
+    : new UnavailableBrowserTransport()
+  return {
+    product: productPort(bridge),
+    system: systemPort(bridge),
   }
-  return new TauriTransport()
 }
 
-class TauriTransport implements ProductTransport {
+function productPort(transport: ProductTransport): ProductTransport {
+  return Object.freeze({
+    query: transport.query.bind(transport),
+    modelProducts: transport.modelProducts.bind(transport),
+    backtestProducts: transport.backtestProducts.bind(transport),
+    datasetPreparation: transport.datasetPreparation.bind(transport),
+    backtestPreparation: transport.backtestPreparation.bind(transport),
+    forecastPreparation: transport.forecastPreparation.bind(transport),
+    researchExport: transport.researchExport.bind(transport),
+    paperControl: transport.paperControl.bind(transport),
+    manualPaper: transport.manualPaper.bind(transport),
+  })
+}
+
+function systemPort(transport: SystemTransport): SystemTransport {
+  return Object.freeze({
+    bootstrap: transport.bootstrap.bind(transport),
+    bootstrapService: transport.bootstrapService.bind(transport),
+    installation: transport.installation.bind(transport),
+    systemQuery: transport.systemQuery.bind(transport),
+    analyticalController: transport.analyticalController.bind(transport),
+    researchControl: transport.researchControl.bind(transport),
+    startBacktestFromFile: transport.startBacktestFromFile.bind(transport),
+    modelControl: transport.modelControl.bind(transport),
+    decisionControl: transport.decisionControl.bind(transport),
+    governanceQuery: transport.governanceQuery.bind(transport),
+    governanceControl: transport.governanceControl.bind(transport),
+    fairValueControl: transport.fairValueControl.bind(transport),
+    jobControl: transport.jobControl.bind(transport),
+    sourceControl: transport.sourceControl.bind(transport),
+    importProviderCredentialBundle:
+      transport.importProviderCredentialBundle.bind(transport),
+    operationsControl: transport.operationsControl.bind(transport),
+    stageTrainingInput: transport.stageTrainingInput.bind(transport),
+    mcpClients: transport.mcpClients.bind(transport),
+    mcpClientControl: transport.mcpClientControl.bind(transport),
+    subscribe: transport.subscribe.bind(transport),
+    onboard: transport.onboard.bind(transport),
+    openOfficialProviderPage: transport.openOfficialProviderPage.bind(transport),
+    openProtectedProviderSetup:
+      transport.openProtectedProviderSetup.bind(transport),
+  })
+}
+
+class TauriTransport implements ProductTransport, SystemTransport {
   async bootstrap() {
     const value = await invoke("desktop_bootstrap")
-    return desktopBootstrapSchema.parse(value)
+    return desktopSystemStartupSchema.parse(value)
   }
 
-  async installation(request: InstallationControlRequest) {
+  async bootstrapService(request: Parameters<SystemTransport["bootstrapService"]>[0]) {
+    await invoke("desktop_service_bootstrap", { request })
+  }
+
+  async installation(request: InstallationControlRequest, confirmed = false) {
     const value = await invoke("installation_control", {
       request,
-      confirmed: request.action !== "status",
+      confirmed,
     })
     return installationControlResultSchema.parse(value)
   }
 
-  async invoke(request: ApplicationRequest) {
-    const value = await invoke("application_invoke", {
+  async query(request: ProductQuery) {
+    const value =
+      request.query === "analysisSettings"
+        ? await invoke("analytical_product")
+        : await invoke("dashboard_query", { request })
+    return applicationResultSchema.parse(value)
+  }
+
+  async systemQuery(request: SystemQuery) {
+    const value = await invoke("dashboard_query", { request })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async modelProducts(request: Parameters<ProductTransport["modelProducts"]>[0]) {
+    const value = await invoke("model_products", { request })
+    return applicationResultSchema.parse(value)
+  }
+
+  async backtestProducts(
+    request: Parameters<ProductTransport["backtestProducts"]>[0],
+  ) {
+    const value = await invoke("backtest_products", { request })
+    return applicationResultSchema.parse(value)
+  }
+
+  async analyticalController(
+    request: Parameters<SystemTransport["analyticalController"]>[0],
+    confirmed = false,
+  ) {
+    const value = await invoke("analytical_controller", { request, confirmed })
+    return analyticalControllerResponseSchema.parse(value)
+  }
+
+  async researchControl(request: ResearchControlRequest, confirmed = false) {
+    const value = await invoke("research_control", { request, confirmed })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async researchExport(collectionToken: string, confirmed = false) {
+    const value = await invoke("research_control", {
       request: {
-        operation: request.operation,
-        arguments: request.arguments ?? {},
+        action: "startCollectionExport",
+        collection: collectionToken,
       },
+      confirmed,
     })
     return applicationResultSchema.parse(value)
+  }
+
+  async datasetPreparation(request: unknown, confirmed = false) {
+    const value = await invoke("analysis_control", {
+      request: mapPreparationAction(request, {
+        options: "featureDatasetOptions",
+        preview: "previewFeatureDataset",
+        start: "startPreparedFeatureDataset",
+      }),
+      confirmed,
+    })
+    return applicationResultSchema.parse(value)
+  }
+
+  async backtestPreparation(request: unknown, confirmed = false) {
+    const value = await invoke("analysis_control", {
+      request: mapPreparationAction(request, {
+        options: "backtestOptions",
+        preview: "previewBacktest",
+        start: "startPreparedBacktest",
+      }),
+      confirmed,
+    })
+    return applicationResultSchema.parse(value)
+  }
+
+  async startBacktestFromFile(confirmed = false) {
+    const value = await invoke("start_backtest_from_file", { confirmed })
+    return value === null ? null : applicationResultSchema.parse(value)
+  }
+
+  async modelControl(request: ModelControlRequest, confirmed = false) {
+    const value = await invoke("model_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async forecastPreparation(request: unknown, confirmed = false) {
+    const value = await invoke("model_control", {
+      request: mapPreparationAction(request, {
+        options: "forecastPreparationOptions",
+        preview: "prepareForecast",
+        start: "startPreparedForecast",
+      }),
+      confirmed,
+    })
+    return applicationResultSchema.parse(value)
+  }
+
+  async decisionControl(request: DecisionControlRequest, confirmed = false) {
+    const value = await invoke("decision_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async governanceQuery(request: GovernanceQueryRequest) {
+    const value = await invoke("governance_query", { request })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async governanceControl(request: GovernanceControlRequest, confirmed = false) {
+    const value = await invoke("governance_control", { request, confirmed })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async fairValueControl(request: FairValueControlRequest, confirmed = false) {
+    const value = await invoke("fair_value_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async paperControl(request: PaperControlRequest, confirmed = false) {
+    const value = await invoke("paper_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async manualPaper(request: ManualPaperRequest, confirmed = false) {
+    const value = await invoke("paper_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async jobControl(request: JobControlRequest, confirmed = false) {
+    const value = await invoke("job_control", { request, confirmed })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async sourceControl(
+    action: SourceLifecycleAction,
+    request: SourceLifecycleRequest,
+    confirmed = false,
+  ) {
+    const value = await invoke("source_control", { action, request, confirmed })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async importProviderCredentialBundle() {
+    return invoke<unknown | null>("import_provider_credential_bundle", {
+      confirmed: true,
+    })
+  }
+
+  async operationsControl(request: OperationsControlRequest, confirmed = false) {
+    const value = await invoke("operations_control", { request, confirmed })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async stageTrainingInput(kind: TrainingInputKind) {
+    const value = await invoke("stage_training_input", { kind })
+    return value === null ? null : inputTicketSchema.parse(value)
+  }
+
+  async mcpClients() {
+    const value = await invoke("mcp_status")
+    return mcpClientsStatusSchema.parse(value)
+  }
+
+  async mcpClientControl(request: McpClientControlRequest, confirmed = false) {
+    const value = await invoke("mcp_client_control", { request, confirmed })
+    return mcpClientsStatusSchema.parse(value)
+  }
+
+  async subscribe(
+    request: Parameters<SystemTransport["subscribe"]>[0],
+    onEvent: Parameters<SystemTransport["subscribe"]>[1],
+    onProtocolError: Parameters<SystemTransport["subscribe"]>[2],
+  ) {
+    let active = true
+    const channel = new Channel<unknown>((value) => {
+      if (!active) return
+      const parsed = desktopEventSchema.safeParse(value)
+      if (parsed.success) {
+        onEvent(parsed.data)
+      } else {
+        active = false
+        onProtocolError(
+          new Error("The local service event stream violated its closed contract."),
+        )
+      }
+    })
+    const receiptResult = desktopEventSubscriptionReceiptSchema.safeParse(
+      await invoke("subscribe_service_events", { request, onEvent: channel }),
+    )
+    if (!receiptResult.success) {
+      active = false
+      const error = new Error(
+        "The local service event subscription receipt violated its closed contract.",
+      )
+      onProtocolError(error)
+      throw error
+    }
+    const receipt = receiptResult.data
+    let release: Promise<void> | null = null
+    const unsubscribe = () => {
+      active = false
+      release ??= invoke("unsubscribe_service_events", {
+        subscriptionId: receipt.subscriptionId,
+      })
+      return release
+    }
+    return { receipt, unsubscribe }
   }
 
   async onboard<Request extends ProviderOnboardingRequest>(
@@ -63,6 +333,25 @@ class TauriTransport implements ProductTransport {
   async openProtectedProviderSetup(providerId: string) {
     await invoke("open_protected_provider_setup", { providerId })
   }
+}
+
+function mapPreparationAction(
+  request: unknown,
+  operations: Readonly<Record<"options" | "preview" | "start", string>>,
+): Record<string, unknown> {
+  if (
+    typeof request !== "object" ||
+    request === null ||
+    Array.isArray(request) ||
+    !("action" in request)
+  ) {
+    throw new Error("The guided preparation request is invalid.")
+  }
+  const action = request.action
+  if (action !== "options" && action !== "preview" && action !== "start") {
+    throw new Error("The guided preparation action is unsupported.")
+  }
+  return { ...request, action: operations[action] }
 }
 
 function parseProviderResult<Request extends ProviderOnboardingRequest>(
@@ -85,20 +374,124 @@ function parseProviderResult<Request extends ProviderOnboardingRequest>(
   return parsed as ProviderOnboardingResult<Request>
 }
 
-class UnavailableBrowserTransport implements ProductTransport {
+class UnavailableBrowserTransport implements ProductTransport, SystemTransport {
   bootstrap(): Promise<never> {
     return Promise.reject(
       new Error(
-        "Open this interface through the Market Squawk desktop application. Use the protected provider portal for browser fallback.",
+        "Open this workspace through the Market Squawk desktop application.",
       ),
     )
+  }
+
+  bootstrapService(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
   }
 
   installation(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
-  invoke(): Promise<never> {
+  query(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  systemQuery(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  modelProducts(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  backtestProducts(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  analyticalController(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  researchControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  datasetPreparation(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  backtestPreparation(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  startBacktestFromFile(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  modelControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  forecastPreparation(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  researchExport(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  decisionControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  governanceQuery(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  governanceControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  fairValueControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  paperControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  manualPaper(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  jobControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  sourceControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  importProviderCredentialBundle(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  operationsControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  stageTrainingInput(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  mcpClients(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  mcpClientControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  subscribe(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

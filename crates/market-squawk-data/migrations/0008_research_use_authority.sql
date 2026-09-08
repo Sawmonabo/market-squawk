@@ -199,16 +199,108 @@ WHEN NOT EXISTS (
     FROM analytical_generations AS generation
     JOIN dataset_manifests AS manifest
       ON manifest.manifest_id = generation.anchor_manifest_id
-    JOIN artifacts AS artifact
-      ON artifact.artifact_id = manifest.artifact_id
     JOIN ingest_runs AS run
-      ON run.run_id = artifact.run_id
+      ON run.run_id = manifest.run_id
     WHERE generation.generation_sequence = NEW.generation_sequence
       AND generation.generation_kind = 'ingest'
       AND run.run_id = NEW.run_id
       AND run.source_id = NEW.source_id
       AND run.rights_id = NEW.rights_id
       AND run.operation = 'persist'
+      AND (SELECT COUNT(*) FROM artifacts AS member
+           WHERE member.run_id = run.run_id) BETWEEN 1 AND 1024
+      AND manifest.artifact_id = (
+          SELECT member.artifact_id
+          FROM artifacts AS member
+          WHERE member.run_id = run.run_id
+          ORDER BY member.publication_ordinal DESC
+          LIMIT 1
+      )
+      AND (
+          (
+              generation.manifest_version = 1
+              AND generation.parent_count = 0
+              AND (SELECT COUNT(*)
+                   FROM analytical_generation_objects AS object
+                   WHERE object.dataset_id = generation.dataset_id
+                     AND object.manifest_version = generation.manifest_version) = (
+                  SELECT COUNT(*) FROM artifacts AS member
+                  WHERE member.run_id = run.run_id
+              )
+          ) OR (
+              generation.manifest_version > 1
+              AND generation.parent_count = 1
+              AND EXISTS (
+                  SELECT 1
+                  FROM analytical_generation_parents AS edge
+                  JOIN analytical_generations AS parent
+                    ON parent.generation_sequence = edge.parent_generation_sequence
+                   AND parent.dataset_id = edge.parent_dataset_id
+                   AND parent.manifest_version = edge.parent_manifest_version
+                  WHERE edge.child_dataset_id = generation.dataset_id
+                    AND edge.child_manifest_version = generation.manifest_version
+                    AND edge.ordinal = 0
+                    AND edge.relation = 'append_predecessor'
+                    AND parent.dataset_id = generation.dataset_id
+                    AND parent.manifest_version = generation.manifest_version - 1
+                    AND (SELECT COUNT(*)
+                         FROM analytical_generation_objects AS current_object
+                         WHERE current_object.dataset_id = generation.dataset_id
+                           AND current_object.manifest_version =
+                               generation.manifest_version) = (
+                        SELECT COUNT(*)
+                        FROM analytical_generation_objects AS parent_object
+                        WHERE parent_object.dataset_id = parent.dataset_id
+                          AND parent_object.manifest_version = parent.manifest_version
+                    ) + (
+                        SELECT COUNT(*) FROM artifacts AS member
+                        WHERE member.run_id = run.run_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM analytical_generation_objects AS parent_object
+                        LEFT JOIN analytical_generation_objects AS current_object
+                          ON current_object.dataset_id = generation.dataset_id
+                         AND current_object.manifest_version = generation.manifest_version
+                         AND current_object.ordinal = parent_object.ordinal
+                        WHERE parent_object.dataset_id = parent.dataset_id
+                          AND parent_object.manifest_version = parent.manifest_version
+                          AND (
+                              current_object.artifact_id IS NULL
+                              OR current_object.artifact_id <> parent_object.artifact_id
+                              OR current_object.content_hash <> parent_object.content_hash
+                              OR current_object.row_count <> parent_object.row_count
+                              OR current_object.size_bytes <> parent_object.size_bytes
+                              OR current_object.lineage_hash <> parent_object.lineage_hash
+                          )
+                    )
+              )
+          )
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM artifacts AS member
+          LEFT JOIN analytical_generation_objects AS object
+            ON object.dataset_id = generation.dataset_id
+           AND object.manifest_version = generation.manifest_version
+           AND object.ordinal = (
+               SELECT COUNT(*)
+               FROM analytical_generation_objects AS retained
+               WHERE retained.dataset_id = generation.dataset_id
+                 AND retained.manifest_version = generation.manifest_version
+           ) - (
+               SELECT COUNT(*) FROM artifacts AS current_member
+               WHERE current_member.run_id = run.run_id
+           ) + member.publication_ordinal
+          WHERE member.run_id = run.run_id
+            AND (
+                object.artifact_id IS NULL
+                OR object.artifact_id <> member.artifact_id
+                OR member.content_algorithm <> 1
+                OR object.content_hash <> member.content_digest
+                OR object.size_bytes <> member.size_bytes
+            )
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'analytical generation source input is invalid');
@@ -241,7 +333,8 @@ JOIN dataset_manifests AS manifest
 JOIN artifacts AS artifact
   ON artifact.artifact_id = manifest.artifact_id
 JOIN ingest_runs AS run
-  ON run.run_id = artifact.run_id
+  ON run.run_id = manifest.run_id
+ AND artifact.run_id = run.run_id
 WHERE generation.generation_kind = 'ingest'
 ORDER BY generation.generation_sequence;
 

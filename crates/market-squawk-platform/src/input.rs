@@ -15,6 +15,8 @@ use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::paths::{ArtifactRoot, PathError};
+
 #[path = "input/ownership.rs"]
 mod ownership;
 
@@ -32,11 +34,32 @@ pub struct UserAuthorizedInputRoot {
     inner: Arc<InputRootInner>,
 }
 
+/// A no-follow input capability rooted beneath the controlled artifact repository.
+///
+/// Unlike [`UserAuthorizedInputRoot`], this capability does not claim that the retained directory
+/// is the user's original selected root and cannot issue local-ownership evidence. It is created
+/// only by opening an existing bounded directory chain beneath an already-retained
+/// [`ArtifactRoot`].
+#[derive(Clone)]
+pub struct ControlledImportInputRoot {
+    inner: Arc<InputRootInner>,
+}
+
 struct InputRootInner {
     display_root: PathBuf,
     directory: Dir,
     identity: FileSystemIdentity,
+    validation: InputRootValidation,
     ownership_binding: Arc<InputRootOwnershipBinding>,
+}
+
+enum InputRootValidation {
+    UserAuthorized,
+    ControlledImport {
+        artifact_root: ArtifactRoot,
+        components: Vec<OsString>,
+        component_identities: Vec<FileSystemIdentity>,
+    },
 }
 
 struct InputRootOwnershipBinding {
@@ -195,8 +218,8 @@ pub enum InputFileError {
         /// Exact configured ceiling.
         max: u64,
     },
-    /// The exact admitted input buffer could not be reserved without exceeding its ceiling.
-    #[error("input buffer allocation failed within the admitted byte limit")]
+    /// Bounded input capability state could not be reserved within its admitted ceiling.
+    #[error("bounded input capability allocation failed")]
     AllocationFailed,
     /// Another process holds an incompatible cooperative file lock.
     #[error("input file is busy")]
@@ -244,6 +267,7 @@ impl UserAuthorizedInputRoot {
                 display_root,
                 identity,
                 directory,
+                validation: InputRootValidation::UserAuthorized,
                 ownership_binding: Arc::new(InputRootOwnershipBinding {
                     identity_digest: ownership::root_identity_digest(identity),
                 }),
@@ -264,20 +288,7 @@ impl UserAuthorizedInputRoot {
         &self,
         relative: impl AsRef<Path>,
     ) -> Result<InputFileCapability, InputFileError> {
-        self.inner.validate_root()?;
-        let components = validate_relative_reference(relative.as_ref())?;
-        let (parent, parent_identities) =
-            walk_relative_parents(&self.inner.directory, &components)?;
-        let file_name = components.last().ok_or(InputFileError::UnsafeComponent)?;
-        let metadata = nofollow_regular_metadata(&parent, file_name)?;
-        let identity = InputFileIdentity::from_metadata(&metadata)?;
-        self.inner.validate_root()?;
-        Ok(InputFileCapability {
-            root: Arc::clone(&self.inner),
-            components,
-            parent_identities,
-            identity,
-        })
+        self.inner.resolve(relative.as_ref())
     }
 
     /// Verifies that a controlled writable root is disjoint from this read-only input capability.
@@ -291,13 +302,72 @@ impl UserAuthorizedInputRoot {
     ///
     /// Rejects relative, parent-traversing, unresolvable, or overlapping roots.
     pub fn ensure_disjoint_root(&self, candidate: impl AsRef<Path>) -> Result<(), InputFileError> {
-        self.inner.validate_root()?;
-        let input = canonical_candidate(&self.inner.display_root)?;
-        let candidate = canonical_candidate(candidate.as_ref())?;
-        if candidate.starts_with(&input) || input.starts_with(&candidate) {
-            return Err(InputFileError::RootOverlap);
+        self.inner.ensure_disjoint_root(candidate.as_ref())
+    }
+}
+
+impl ControlledImportInputRoot {
+    pub(crate) fn open_beneath_artifact_root(
+        artifact_root: &ArtifactRoot,
+        relative: &Path,
+    ) -> Result<Self, InputFileError> {
+        let components = validate_relative_reference(relative)?;
+        let retained_artifact_root = artifact_root
+            .try_clone_directory()
+            .map_err(map_artifact_root_error)?;
+        let (directory, component_identities) =
+            walk_relative_directories(&retained_artifact_root, &components)?;
+        let metadata = directory.dir_metadata().map_err(InputFileError::io)?;
+        if !metadata.is_dir() || is_windows_reparse(&metadata) {
+            return Err(InputFileError::SymlinkOrReparsePoint);
         }
-        Ok(())
+        let identity = filesystem_identity(&metadata);
+        let display_root = artifact_root.root().join(relative);
+        let root = Self {
+            inner: Arc::new(InputRootInner {
+                display_root,
+                directory,
+                identity,
+                validation: InputRootValidation::ControlledImport {
+                    artifact_root: artifact_root.clone(),
+                    components,
+                    component_identities,
+                },
+                // This private binding preserves origin separation for bounded reads. No
+                // ownership-evidence issuer can be constructed for this root.
+                ownership_binding: Arc::new(InputRootOwnershipBinding {
+                    identity_digest: ownership::root_identity_digest(identity),
+                }),
+            }),
+        };
+        root.inner.validate_root()?;
+        Ok(root)
+    }
+
+    /// Resolves one existing regular file below this controlled import root.
+    ///
+    /// Resolution is relative to the retained directory handle. The complete import-root chain,
+    /// every object parent, and the final regular-file identity are checked without following
+    /// symlinks or Windows reparse points.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsafe, over-deep, linked, replaced, or non-regular inputs and path-redacted I/O
+    /// failures.
+    pub fn resolve(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<InputFileCapability, InputFileError> {
+        self.inner.resolve(relative.as_ref())
+    }
+
+    /// Verifies that a controlled writable authority root is disjoint from this import root.
+    ///
+    /// # Errors
+    ///
+    /// Rejects relative, parent-traversing, unresolvable, or overlapping roots.
+    pub fn ensure_disjoint_root(&self, candidate: impl AsRef<Path>) -> Result<(), InputFileError> {
+        self.inner.ensure_disjoint_root(candidate.as_ref())
     }
 }
 
@@ -326,6 +396,32 @@ fn canonical_candidate(path: &Path) -> Result<PathBuf, InputFileError> {
 }
 
 impl InputRootInner {
+    fn resolve(self: &Arc<Self>, relative: &Path) -> Result<InputFileCapability, InputFileError> {
+        self.validate_root()?;
+        let components = validate_relative_reference(relative)?;
+        let (parent, parent_identities) = walk_relative_parents(&self.directory, &components)?;
+        let file_name = components.last().ok_or(InputFileError::UnsafeComponent)?;
+        let metadata = nofollow_regular_metadata(&parent, file_name)?;
+        let identity = InputFileIdentity::from_metadata(&metadata)?;
+        self.validate_root()?;
+        Ok(InputFileCapability {
+            root: Arc::clone(self),
+            components,
+            parent_identities,
+            identity,
+        })
+    }
+
+    fn ensure_disjoint_root(&self, candidate: &Path) -> Result<(), InputFileError> {
+        self.validate_root()?;
+        let input = canonical_candidate(&self.display_root)?;
+        let candidate = canonical_candidate(candidate)?;
+        if candidate.starts_with(&input) || input.starts_with(&candidate) {
+            return Err(InputFileError::RootOverlap);
+        }
+        Ok(())
+    }
+
     fn validate_root(&self) -> Result<(), InputFileError> {
         let retained = self.directory.dir_metadata().map_err(InputFileError::io)?;
         if !retained.is_dir()
@@ -334,14 +430,37 @@ impl InputRootInner {
         {
             return Err(InputFileError::IdentityChanged);
         }
-        let reopened = open_absolute_directory(&self.display_root)
-            .map_err(|_| InputFileError::IdentityChanged)?;
-        let displayed = reopened.dir_metadata().map_err(InputFileError::io)?;
-        if !displayed.is_dir()
-            || filesystem_identity(&displayed) != self.identity
-            || is_windows_reparse(&displayed)
-        {
-            return Err(InputFileError::IdentityChanged);
+        match &self.validation {
+            InputRootValidation::UserAuthorized => {
+                let reopened = open_absolute_directory(&self.display_root)
+                    .map_err(|_| InputFileError::IdentityChanged)?;
+                let displayed = reopened.dir_metadata().map_err(InputFileError::io)?;
+                if !displayed.is_dir()
+                    || filesystem_identity(&displayed) != self.identity
+                    || is_windows_reparse(&displayed)
+                {
+                    return Err(InputFileError::IdentityChanged);
+                }
+            }
+            InputRootValidation::ControlledImport {
+                artifact_root,
+                components,
+                component_identities,
+            } => {
+                let retained_artifact_root = artifact_root
+                    .try_clone_directory()
+                    .map_err(map_artifact_root_error)?;
+                let (displayed, displayed_identities) =
+                    walk_relative_directories(&retained_artifact_root, components)?;
+                let displayed_metadata = displayed.dir_metadata().map_err(InputFileError::io)?;
+                if displayed_identities != *component_identities
+                    || !displayed_metadata.is_dir()
+                    || filesystem_identity(&displayed_metadata) != self.identity
+                    || is_windows_reparse(&displayed_metadata)
+                {
+                    return Err(InputFileError::IdentityChanged);
+                }
+            }
         }
         Ok(())
     }
@@ -694,6 +813,12 @@ impl fmt::Debug for UserAuthorizedInputRoot {
     }
 }
 
+impl fmt::Debug for ControlledImportInputRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ControlledImportInputRoot([RETAINED CONTROLLED IMPORT ROOT])")
+    }
+}
+
 impl fmt::Debug for InputRootInner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("InputRootInner([RETAINED ROOT CAPABILITY])")
@@ -786,6 +911,58 @@ fn walk_relative_parents(
         current = next;
     }
     Ok((current, identities))
+}
+
+fn walk_relative_directories(
+    root: &Dir,
+    components: &[OsString],
+) -> Result<(Dir, Vec<FileSystemIdentity>), InputFileError> {
+    let mut current = root.try_clone().map_err(InputFileError::io)?;
+    let mut identities = Vec::new();
+    identities
+        .try_reserve_exact(components.len())
+        .map_err(|_| InputFileError::AllocationFailed)?;
+    for component in components {
+        let metadata = current
+            .symlink_metadata(component)
+            .map_err(InputFileError::io)?;
+        if metadata.file_type().is_symlink() || is_windows_reparse(&metadata) {
+            return Err(InputFileError::SymlinkOrReparsePoint);
+        }
+        if !metadata.is_dir() {
+            return Err(InputFileError::UnsafeComponent);
+        }
+        let next = current
+            .open_dir_nofollow(component)
+            .map_err(classify_nofollow_error)?;
+        let opened = next.dir_metadata().map_err(InputFileError::io)?;
+        let identity = filesystem_identity(&opened);
+        if !opened.is_dir()
+            || is_windows_reparse(&opened)
+            || identity != filesystem_identity(&metadata)
+        {
+            return Err(InputFileError::IdentityChanged);
+        }
+        identities.push(identity);
+        current = next;
+    }
+    Ok((current, identities))
+}
+
+fn map_artifact_root_error(error: PathError) -> InputFileError {
+    match error {
+        PathError::Io { source, .. } => InputFileError::io(source),
+        PathError::PreparedRootChanged => InputFileError::IdentityChanged,
+        PathError::ReadOnly
+        | PathError::ArtifactRootUnavailable
+        | PathError::ControlRootUnavailable
+        | PathError::CatalogLocationUnavailable
+        | PathError::CatalogAlreadyLocked
+        | PathError::JobDatabaseAlreadyLocked
+        | PathError::DecisionDatabaseAlreadyLocked
+        | PathError::CatalogRestoreConflict
+        | PathError::CatalogRestoreIndeterminate => InputFileError::IdentityChanged,
+    }
 }
 
 fn nofollow_regular_metadata(

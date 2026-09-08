@@ -18,7 +18,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BacktestScope, GovernedBacktestCommand, GovernedBacktestRecord, GovernedBacktestRepository,
+    BacktestScope, GovernedBacktestCommand, GovernedBacktestDiscoveryPage,
+    GovernedBacktestDiscoveryQuery, GovernedBacktestRecord, GovernedBacktestRepository,
     canonical_run_id,
 };
 use crate::PinnedBacktestInput;
@@ -292,6 +293,28 @@ impl GovernedBacktestRepository for ProductionGovernedBacktestRepository {
         .await
     }
 
+    async fn discover_completed(
+        &self,
+        query: GovernedBacktestDiscoveryQuery,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<GovernedBacktestDiscoveryPage, ServiceError> {
+        let call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
+        let index = Arc::clone(&self.index);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _call = call;
+            let index = index.lock().map_err(|_| ServiceError::Unavailable)?;
+            index.discover_completed(&query)
+        });
+        await_blocking(
+            worker,
+            &cancellation,
+            self.lifecycle.shutdown_token(),
+            deadline,
+        )
+        .await
+    }
+
     fn begin_shutdown(&self) {
         self.lifecycle.begin_shutdown();
         self.resolver.begin_shutdown();
@@ -334,6 +357,17 @@ fn validate_input_evidence(
     command: &GovernedBacktestCommand,
     input: &PinnedBacktestInput,
 ) -> Result<(), ServiceError> {
+    if let Some(cohort) = &input.cohort {
+        if cohort.members.is_empty()
+            || cohort
+                .members
+                .iter()
+                .any(|member| !input_within_command_scope(command, &member.input))
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        return Ok(());
+    }
     let definition_count = input.instrument_definitions.instrument_count();
     if definition_count == 0
         || (!command.scope().instruments().is_empty()
@@ -364,15 +398,75 @@ fn validate_input_evidence(
     if batches.is_empty() || *byte_count == 0 {
         return Err(ServiceError::InvalidResult);
     }
-    if let Some((starts_at, ends_at)) = command.scope().time_range()
-        && (input.instrument_definitions.as_of() < ends_at
-            || batches
+    if !command.scope().time_ranges().is_empty()
+        && (input.instrument_definitions.as_of()
+            < command
+                .scope()
+                .time_ranges()
                 .iter()
-                .any(|batch| !batch_within_time_range(batch, starts_at, ends_at)))
+                .map(|(_, ends_at)| *ends_at)
+                .max()
+                .ok_or(ServiceError::InvalidResult)?
+            || batches.iter().any(|batch| {
+                !command
+                    .scope()
+                    .time_ranges()
+                    .iter()
+                    .any(|(starts_at, ends_at)| {
+                        batch_within_time_range(batch, *starts_at, *ends_at)
+                    })
+            }))
     {
         return Err(ServiceError::InvalidResult);
     }
     Ok(())
+}
+
+fn input_within_command_scope(
+    command: &GovernedBacktestCommand,
+    input: &PinnedBacktestInput,
+) -> bool {
+    let instruments = input
+        .instrument_definitions
+        .instrument_ids()
+        .collect::<Vec<_>>();
+    if instruments.is_empty()
+        || instruments.iter().any(|instrument| {
+            command
+                .scope()
+                .instruments()
+                .binary_search(instrument)
+                .is_err()
+        })
+        || input.sources.is_empty()
+        || !strictly_ordered(&input.sources)
+        || !input.sources.iter().all(|source| {
+            SourceId::try_from(source.as_str())
+                .ok()
+                .is_some_and(|source| command.scope().sources().binary_search(&source).is_ok())
+        })
+    {
+        return false;
+    }
+    let QueryResult::Inline {
+        batches,
+        byte_count,
+    } = input.query.result()
+    else {
+        return false;
+    };
+    *byte_count > 0
+        && !batches.is_empty()
+        && batches.iter().all(|batch| {
+            command
+                .scope()
+                .time_ranges()
+                .iter()
+                .any(|(starts_at, ends_at)| {
+                    input.instrument_definitions.as_of() >= *ends_at
+                        && batch_within_time_range(batch, *starts_at, *ends_at)
+                })
+        })
 }
 
 pub(super) fn strictly_ordered<T: Ord>(values: &[T]) -> bool {
@@ -476,21 +570,31 @@ fn map_repository_error_to_service(
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, sync::Arc, time::Instant};
+    use std::{error::Error, num::NonZeroUsize, sync::Arc, time::Instant};
 
     use async_trait::async_trait;
-    use market_squawk_domain::SourceIdentifier;
+    use market_squawk_backtesting::{
+        ResearchExecutionAssumptions, ResearchExecutionAssumptionsInput, ResearchLiquidityPriority,
+    };
+    use market_squawk_domain::{BasisPoints, Currency, InstrumentId, SourceIdentifier};
     use market_squawk_platform::LocalPaths;
     use market_squawk_services::ServiceError;
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     use super::{
         GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
-        ProductionGovernedBacktestRepository, ResolvedGovernedBacktestInput,
+        ProductionGovernedBacktestRepository, ResolvedGovernedBacktestInput, command_digest,
+        value_digest,
     };
     use crate::application::analysis::{
         BacktestScope, GovernedBacktestCommand, GovernedBacktestRecord, GovernedBacktestRepository,
+    };
+
+    use super::super::{
+        GovernedBacktestArtifactEvidence, GovernedBacktestCohortDiagnosticsEvidence,
+        GovernedBacktestDiscoveryQuery, encode_hex, execution_assumptions_content,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -516,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_index_survives_restart_and_rejects_conflicting_reuse() -> TestResult {
+    async fn terminal_index_survives_restart_and_discovers_only_exact_bound_scope() -> TestResult {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path())?;
         let limits = GovernedBacktestRepositoryLimits::standard();
@@ -525,18 +629,46 @@ mod tests {
             Arc::new(MissingInputResolver),
             limits,
         )?;
-        let record = record_with_dataset("11")?;
+        let instrument = InstrumentId::try_from(Uuid::from_u128(1))?;
+        let other_instrument = InstrumentId::try_from(Uuid::from_u128(2))?;
         let command = GovernedBacktestCommand::new(
             SourceIdentifier::try_from("strategy-v1")?,
             SourceIdentifier::try_from("input-v1")?,
-            BacktestScope::new(Vec::new(), None, Vec::new()),
+            BacktestScope::new(vec![instrument], Vec::new(), Vec::new()),
         );
+        let other_command = GovernedBacktestCommand::new(
+            SourceIdentifier::try_from("strategy-v1")?,
+            SourceIdentifier::try_from("input-other-instrument")?,
+            BacktestScope::new(vec![other_instrument], Vec::new(), Vec::new()),
+        );
+        let other_strategy_command = GovernedBacktestCommand::new(
+            SourceIdentifier::try_from("strategy-v2")?,
+            SourceIdentifier::try_from("input-other-strategy")?,
+            BacktestScope::new(vec![instrument], Vec::new(), Vec::new()),
+        );
+        let record = record_with_dataset("aa", "11")?;
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         first
             .publish(&command, record.clone(), CancellationToken::new(), deadline)
             .await?;
         first
             .publish(&command, record, CancellationToken::new(), deadline)
+            .await?;
+        first
+            .publish(
+                &other_command,
+                record_with_dataset("bb", "33")?,
+                CancellationToken::new(),
+                deadline,
+            )
+            .await?;
+        first
+            .publish(
+                &other_strategy_command,
+                record_with_dataset("cc", "44")?,
+                CancellationToken::new(),
+                deadline,
+            )
             .await?;
         first.begin_shutdown();
         first.finish_shutdown(deadline).await?;
@@ -554,10 +686,47 @@ mod tests {
                 Instant::now() + std::time::Duration::from_secs(5),
             )
             .await?;
+        let all_query = GovernedBacktestDiscoveryQuery::try_new(
+            instrument,
+            None,
+            NonZeroUsize::new(8).ok_or("discovery bound")?,
+        )?;
+        let all_for_instrument = restarted
+            .discover_completed(
+                all_query.clone(),
+                CancellationToken::new(),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await?;
+        let repeated_for_instrument = restarted
+            .discover_completed(
+                all_query,
+                CancellationToken::new(),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await?;
+        let exact_strategy = restarted
+            .discover_completed(
+                GovernedBacktestDiscoveryQuery::try_new(
+                    instrument,
+                    Some(SourceIdentifier::try_from("strategy-v1")?),
+                    NonZeroUsize::new(8).ok_or("discovery bound")?,
+                )?,
+                CancellationToken::new(),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await?;
+        let limited_for_instrument = restarted
+            .discover_completed(
+                GovernedBacktestDiscoveryQuery::try_new(instrument, None, NonZeroUsize::MIN)?,
+                CancellationToken::new(),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await?;
         let conflict = restarted
             .publish(
                 &command,
-                record_with_dataset("22")?,
+                record_with_dataset("aa", "22")?,
                 CancellationToken::new(),
                 Instant::now() + std::time::Duration::from_secs(5),
             )
@@ -569,26 +738,158 @@ mod tests {
                 conflict,
             ),
             (
-                Some(record_with_dataset("11")?.content()),
+                Some(record_with_dataset("aa", "11")?.content()),
                 Err(ServiceError::InvalidResult),
             )
+        );
+        assert_eq!(
+            all_for_instrument
+                .entries()
+                .iter()
+                .map(|entry| entry.record().run_id())
+                .collect::<Vec<_>>(),
+            vec!["aa".repeat(32), "cc".repeat(32)]
+        );
+        assert!(!all_for_instrument.truncated());
+        assert!(all_for_instrument.is_complete());
+        assert_eq!(
+            all_for_instrument.selection_digest(),
+            repeated_for_instrument.selection_digest()
+        );
+        assert_eq!(exact_strategy.entries().len(), 1);
+        assert_eq!(exact_strategy.entries()[0].command(), &command);
+        let expected_command_digest = command_digest(&command)?;
+        let expected_record_digest = value_digest(exact_strategy.entries()[0].record().content())?;
+        assert_eq!(
+            exact_strategy.entries()[0].command_digest(),
+            expected_command_digest.as_str()
+        );
+        assert_eq!(
+            exact_strategy.entries()[0].record_digest(),
+            expected_record_digest.as_str()
+        );
+        assert!(limited_for_instrument.truncated());
+        assert!(!limited_for_instrument.is_complete());
+        assert_ne!(
+            limited_for_instrument.selection_digest(),
+            all_for_instrument.selection_digest()
+        );
+        let recommendation_evidence =
+            all_for_instrument.recommendation_evidence(&all_for_instrument.entries()[0])?;
+        assert_eq!(
+            (
+                recommendation_evidence.selection_digest(),
+                recommendation_evidence.command_digest(),
+                recommendation_evidence.record_digest(),
+                recommendation_evidence.dataset_identity(),
+                recommendation_evidence.command(),
+                recommendation_evidence.terminal().metrics().len(),
+                recommendation_evidence.terminal().reporting_currency(),
+                recommendation_evidence.terminal().partial_fill_count(),
+            ),
+            (
+                all_for_instrument.selection_digest(),
+                command.evidence_digest()?,
+                all_for_instrument.entries()[0].record().evidence_digest()?,
+                market_squawk_domain::EvidenceDigest::new(
+                    market_squawk_domain::DigestAlgorithm::Sha256,
+                    [0x11; 32],
+                ),
+                &command,
+                3,
+                Currency::try_from("USD")?,
+                0,
+            )
+        );
+        assert!(matches!(
+            recommendation_evidence.terminal().artifact(),
+            GovernedBacktestArtifactEvidence::GovernedReport(_)
+        ));
+        assert_eq!(
+            recommendation_evidence.terminal().execution_assumptions(),
+            &execution_assumptions()?
+        );
+        let GovernedBacktestCohortDiagnosticsEvidence::Completed(cohort) =
+            recommendation_evidence.terminal().cohort_diagnostics()
+        else {
+            return Err("expected completed cohort evidence".into());
+        };
+        assert_eq!(cohort.trial_count(), 12);
+        assert!(
+            recommendation_evidence
+                .terminal()
+                .dataset_partition()
+                .starts_at()
+                < recommendation_evidence
+                    .terminal()
+                    .dataset_partition()
+                    .ends_at()
         );
         Ok(())
     }
 
-    fn record_with_dataset(dataset_byte: &str) -> Result<GovernedBacktestRecord, ServiceError> {
+    fn record_with_dataset(
+        run_byte: &str,
+        dataset_byte: &str,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
         let digest = |byte: &str| byte.repeat(32);
+        let assumptions = execution_assumptions()?;
         GovernedBacktestRecord::try_from_persisted(json!({
-            "recordVersion": 1,
-            "runId": digest("aa"),
+            "recordVersion": 2,
+            "runId": digest(run_byte),
             "datasetIdentity": digest(dataset_byte),
             "objectGraphDigest": digest("bb"),
-            "executionAssumptionDigest": digest("cc"),
-            "cohortAuthorityDigest": Value::Null,
-            "cohortUniverseDigest": Value::Null,
+            "executionAssumptionDigest": encode_hex(assumptions.digest().bytes()),
+            "cohortAuthorityDigest": digest("f1"),
+            "cohortUniverseDigest": digest("f2"),
             "seed": 7,
-            "selectionCriterion": "risk-adjusted-return",
-            "status": {"state": "failed"}
+            "selectionCriterion": "cost-adjusted-total-return",
+            "status": {
+                "state": "completed",
+                "resultDigest": digest("dd"),
+                "artifact": {
+                    "artifactId": format!("backtest-report-{}", digest("ee")),
+                    "sha256": digest("ee"),
+                    "byteCount": 1,
+                    "mediaType": "application/json"
+                },
+                "metrics": [
+                    {"name": "cost-adjusted-total-return", "value": 0.1},
+                    {"name": "maximum-drawdown", "value": 0.05},
+                    {"name": "return-observations", "value": 3.0}
+                ],
+                "datasetPartition": {"startsAtUnixNanos": 1, "endsAtUnixNanos": 2},
+                "fillCount": 0,
+                "partialFillCount": 0,
+                "noActionCount": 1,
+                "reportingCurrency": "USD",
+                "accountingReconciliation": "independent",
+                "executionAssumptions": execution_assumptions_content(assumptions),
+                "cohortDiagnostics": {
+                    "state": "completed",
+                    "evaluationId": digest("f3"),
+                    "trialCount": 12,
+                    "probabilityOfBacktestOverfitting": 0.25,
+                    "foldCount": 2,
+                    "deflatedPerformanceProbability": 0.75,
+                    "expectedMaximumSharpe": 0.5
+                }
+            }
         }))
+    }
+
+    fn execution_assumptions() -> Result<ResearchExecutionAssumptions, ServiceError> {
+        ResearchExecutionAssumptions::try_new(ResearchExecutionAssumptionsInput {
+            version: 3,
+            fee_basis_points: BasisPoints::new(1),
+            slippage_basis_points: BasisPoints::new(2),
+            maximum_random_slippage_basis_points: BasisPoints::new(3),
+            maximum_participation_basis_points: BasisPoints::new(5),
+            liquidity_priority: ResearchLiquidityPriority::SignalTimeThenOrderId,
+            latency_nanos: 4,
+            allow_partial_fills: true,
+            fee_decimal_scale: 2,
+        })
+        .map_err(|_| ServiceError::InvalidResult)
     }
 }

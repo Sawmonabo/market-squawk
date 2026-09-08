@@ -64,14 +64,17 @@ fn complete_feature_budget_accepts_equality_and_rejects_one_byte_below() -> Test
 }
 
 #[test]
-fn every_feature_capacity_is_nonzero_and_cross_venue_can_hold_two_venues() -> TestResult {
+fn required_feature_capacities_are_nonzero_and_action_hooks_are_optional() -> TestResult {
     let mut zero_window = input(u64::MAX)?;
     zero_window.maximum_feature_window_observations_per_route = 0;
     assert!(LiveRuntimeConfig::try_new(zero_window).is_err());
 
     let mut zero_hook = input(u64::MAX)?;
     zero_hook.maximum_action_hook_bytes_per_route = 0;
-    assert!(LiveRuntimeConfig::try_new(zero_hook).is_err());
+    assert_eq!(
+        LiveRuntimeConfig::try_new(zero_hook)?.maximum_action_hook_bytes_per_route(),
+        0
+    );
 
     let mut one_venue = input(u64::MAX)?;
     one_venue.maximum_venues_per_cross_venue_instrument = 1;

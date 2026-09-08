@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discard-portfolio-import"
+description = "Enables the discard_portfolio_import command without any pre-configured scope."
+commands.allow = ["discard_portfolio_import"]
+
+[[permission]]
+identifier = "deny-discard-portfolio-import"
+description = "Denies the discard_portfolio_import command without any pre-configured scope."
+commands.deny = ["discard_portfolio_import"]

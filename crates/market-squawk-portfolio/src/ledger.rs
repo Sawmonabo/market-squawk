@@ -306,20 +306,30 @@ fn translate_task10(
             } else {
                 matches!(side, TradeSide::Sell | TradeSide::SellShort)
             };
-            let method_matches = match transaction.lot_method() {
-                Some(NormalizedPortfolioLotMethod::Fifo) => {
-                    matches!(lot_selection, crate::LotSelection::Fifo)
+            // Opening a long/short lot does not dispose any prior inventory. Its source lot
+            // method remains retained in normalized evidence, but it cannot require fabricated
+            // specific-lot identifiers; only a disposal applies the selection policy.
+            let method_matches = if matches!(side, TradeSide::Buy | TradeSide::SellShort) {
+                true
+            } else {
+                match transaction.lot_method() {
+                    Some(NormalizedPortfolioLotMethod::Fifo) => {
+                        matches!(lot_selection, crate::LotSelection::Fifo)
+                    }
+                    Some(NormalizedPortfolioLotMethod::SpecificIdentification) => {
+                        matches!(
+                            lot_selection,
+                            crate::LotSelection::SpecificIdentification(_)
+                        )
+                    }
+                    Some(NormalizedPortfolioLotMethod::Lifo) => {
+                        matches!(lot_selection, crate::LotSelection::Lifo)
+                    }
+                    Some(NormalizedPortfolioLotMethod::AverageCost) => {
+                        matches!(lot_selection, crate::LotSelection::AverageCost)
+                    }
+                    None => false,
                 }
-                Some(NormalizedPortfolioLotMethod::SpecificIdentification) => {
-                    matches!(
-                        lot_selection,
-                        crate::LotSelection::SpecificIdentification(_)
-                    )
-                }
-                Some(
-                    NormalizedPortfolioLotMethod::Lifo | NormalizedPortfolioLotMethod::AverageCost,
-                )
-                | None => false,
             };
             if !side_matches_sign || !method_matches {
                 return Err(PortfolioError::AmbiguousNormalizedRecord);

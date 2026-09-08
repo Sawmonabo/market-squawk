@@ -394,8 +394,21 @@ pub struct QueryParameterRule {
     max_value_bytes: u16,
     allow_multiple: bool,
     sensitivity: QuerySensitivity,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    exact_public_value: Option<SourceIdentifier>,
+    value_rule: QueryValueRule,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryValueRule {
+    OptionalBounded,
+    RequiredExactPublic(SourceIdentifier),
+    RequiredExactEmptyPublic,
+}
+
+impl QueryValueRule {
+    const fn requires_presence(&self) -> bool {
+        !matches!(self, Self::OptionalBounded)
+    }
 }
 
 impl QueryParameterRule {
@@ -410,7 +423,13 @@ impl QueryParameterRule {
         allow_multiple: bool,
         sensitivity: QuerySensitivity,
     ) -> Result<Self, NetworkPolicyError> {
-        Self::try_new_inner(key, max_value_bytes, allow_multiple, sensitivity, None)
+        Self::try_new_inner(
+            key,
+            max_value_bytes,
+            allow_multiple,
+            sensitivity,
+            QueryValueRule::OptionalBounded,
+        )
     }
 
     /// Constructs a single-valued public query rule that admits only one decoded value.
@@ -430,7 +449,22 @@ impl QueryParameterRule {
             max_value_bytes,
             false,
             QuerySensitivity::Public,
-            Some(exact_public_value),
+            QueryValueRule::RequiredExactPublic(exact_public_value),
+        )
+    }
+
+    /// Constructs a required, single-valued public query rule that admits only an empty value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects delimiters in the exact case-sensitive key.
+    pub fn try_new_exact_empty_public(key: SourceIdentifier) -> Result<Self, NetworkPolicyError> {
+        Self::try_new_inner(
+            key,
+            0,
+            false,
+            QuerySensitivity::Public,
+            QueryValueRule::RequiredExactEmptyPublic,
         )
     }
 
@@ -439,16 +473,25 @@ impl QueryParameterRule {
         max_value_bytes: u16,
         allow_multiple: bool,
         sensitivity: QuerySensitivity,
-        exact_public_value: Option<SourceIdentifier>,
+        value_rule: QueryValueRule,
     ) -> Result<Self, NetworkPolicyError> {
-        if max_value_bytes == 0 || max_value_bytes > 8_192 || key.as_str().contains(['&', '=']) {
+        if key.as_str().contains(['&', '=']) {
             return Err(NetworkPolicyError::InvalidRequestBounds);
         }
-        if exact_public_value.as_ref().is_some_and(|value| {
-            sensitivity != QuerySensitivity::Public
-                || allow_multiple
-                || value.as_str().len() != usize::from(max_value_bytes)
-        }) {
+        let valid_value_rule = match &value_rule {
+            QueryValueRule::OptionalBounded => max_value_bytes != 0 && max_value_bytes <= 8_192,
+            QueryValueRule::RequiredExactPublic(value) => {
+                max_value_bytes != 0
+                    && max_value_bytes <= 8_192
+                    && value.as_str().len() == usize::from(max_value_bytes)
+                    && sensitivity == QuerySensitivity::Public
+                    && !allow_multiple
+            }
+            QueryValueRule::RequiredExactEmptyPublic => {
+                max_value_bytes == 0 && sensitivity == QuerySensitivity::Public && !allow_multiple
+            }
+        };
+        if !valid_value_rule {
             return Err(NetworkPolicyError::InvalidRequestBounds);
         }
         Ok(Self {
@@ -456,7 +499,7 @@ impl QueryParameterRule {
             max_value_bytes,
             allow_multiple,
             sensitivity,
-            exact_public_value,
+            value_rule,
         })
     }
 }
@@ -468,8 +511,7 @@ struct QueryParameterRuleWire {
     max_value_bytes: u16,
     allow_multiple: bool,
     sensitivity: QuerySensitivity,
-    #[serde(default)]
-    exact_public_value: Option<SourceIdentifier>,
+    value_rule: QueryValueRule,
 }
 
 impl<'de> Deserialize<'de> for QueryParameterRule {
@@ -483,7 +525,7 @@ impl<'de> Deserialize<'de> for QueryParameterRule {
             wire.max_value_bytes,
             wire.allow_multiple,
             wire.sensitivity,
-            wire.exact_public_value,
+            wire.value_rule,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -665,11 +707,14 @@ impl ApiEndpointRule {
                     reason: EndpointDenialReason::QueryBound,
                 });
             }
-            if rule
-                .exact_public_value
-                .as_ref()
-                .is_some_and(|expected| expected.as_str() != value.as_ref())
-            {
+            let exact_value_matches = match &rule.value_rule {
+                QueryValueRule::OptionalBounded => true,
+                QueryValueRule::RequiredExactPublic(expected) => {
+                    expected.as_str() == value.as_ref()
+                }
+                QueryValueRule::RequiredExactEmptyPublic => value.is_empty(),
+            };
+            if !exact_value_matches {
                 return Err(NetworkPolicyError::EndpointDenied {
                     reason: EndpointDenialReason::QueryBound,
                 });
@@ -678,7 +723,7 @@ impl ApiEndpointRule {
             seen.push(key.into_owned());
         }
         if self.query_rules.as_slice().iter().any(|rule| {
-            rule.exact_public_value.is_some()
+            rule.value_rule.requires_presence()
                 && !seen.iter().any(|seen_key| seen_key == rule.key.as_str())
         }) {
             return Err(NetworkPolicyError::EndpointDenied {
@@ -770,11 +815,15 @@ include!("policy/budget.rs");
 #[path = "policy/provider_rate.rs"]
 mod provider_rate;
 pub use provider_rate::{
-    ProviderRateAuthority, ProviderRateCollisionIdentity, ProviderRateCollisionKind,
-    ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId, ProviderRatePermitId,
-    ProviderRateRegistration, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
+    PreparedProviderRateRegistrationBatch, ProviderRateAuthority, ProviderRateAvailability,
+    ProviderRateCollisionIdentity, ProviderRateCollisionKind, ProviderRateDeclaration,
+    ProviderRateDispatchDecision, ProviderRateExtensionKey, ProviderRateExtensionRevision,
+    ProviderRateExtensionState, ProviderRateGroupId, ProviderRatePermitId,
+    ProviderRateRegistration, ProviderRateReservationDecision, ProviderRateReservationId,
+    ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
 };
 pub(in crate::policy) use provider_rate::{
-    ProviderRateBinding, ProviderRatePermit, wall_deadline_to_monotonic,
+    ProviderRateBinding, ProviderRatePermit, ProviderRateReservation,
+    ProviderRateReservationDispatch, wall_deadline_to_monotonic,
 };
 include!("policy/tests.rs");

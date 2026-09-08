@@ -10,6 +10,8 @@ use thiserror::Error;
 
 const MAX_SUBSCRIPTION_WARNINGS: usize = 16;
 const MAX_WARNING_JSON_BYTES: usize = 512;
+pub(crate) const MAX_SUBSCRIPTION_ERROR_BYTES: usize = 512;
+pub(crate) const PUBLIC_SUBSCRIPTION_REQUEST_ID: u64 = 1;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

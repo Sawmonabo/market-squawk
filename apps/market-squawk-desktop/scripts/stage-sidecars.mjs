@@ -95,6 +95,7 @@ const packageVersion = metadata.packages.find(
 )?.version
 const programs = [
   "market-squawk",
+  "market-squawk-service",
   "market-squawk-capture-helper",
   "market-squawk-onnx-worker",
 ]

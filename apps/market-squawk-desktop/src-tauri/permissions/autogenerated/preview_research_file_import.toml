@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-research-file-import"
+description = "Enables the preview_research_file_import command without any pre-configured scope."
+commands.allow = ["preview_research_file_import"]
+
+[[permission]]
+identifier = "deny-preview-research-file-import"
+description = "Denies the preview_research_file_import command without any pre-configured scope."
+commands.deny = ["preview_research_file_import"]

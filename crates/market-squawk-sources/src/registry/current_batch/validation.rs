@@ -169,6 +169,9 @@ pub enum RegistryError {
     /// Health evidence identity differed from the current session tuple.
     #[error("source health evidence is bound to another session")]
     HealthBindingMismatch,
+    /// Active provider-request budget evidence differed from the registered session allocation.
+    #[error("active provider request is bound to another or inactive budget allocation")]
+    BudgetAuthorityMismatch,
     /// Snapshot freshness thresholds differ from current metadata.
     #[error("source health freshness policy conflicts with current metadata")]
     HealthPolicyMismatch,

@@ -354,7 +354,7 @@ const fn maybe_reverse(ordering: Ordering, reversed: bool) -> Ordering {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::strategy) mod tests {
     use std::{cmp::Ordering, num::NonZeroU32, str::FromStr};
 
     use market_squawk_analytics::{FeatureError, FeatureValue};
@@ -466,7 +466,8 @@ mod tests {
         ))
     }
 
-    fn paper_execution_terms() -> Result<InstrumentExecutionTerms, Box<dyn std::error::Error>> {
+    pub(in crate::strategy) fn paper_execution_terms()
+    -> Result<InstrumentExecutionTerms, Box<dyn std::error::Error>> {
         let currency = Currency::try_from("USD")?;
         Ok(InstrumentExecutionTerms::try_new(
             "018f0000-0000-7000-8000-000000000001".parse()?,
@@ -479,7 +480,7 @@ mod tests {
         )?)
     }
 
-    fn paper_market_event(
+    pub(in crate::strategy) fn paper_market_event(
         event_class: LiveEventClass,
     ) -> Result<MarketEvent, Box<dyn std::error::Error>> {
         let provenance = LiveProvenance::recorded(RecordedLiveProvenanceInput::new(
@@ -506,6 +507,7 @@ mod tests {
                 PriceTicks::new(100),
                 QuantityLots::new(1)?,
                 AggressorSide::Buy,
+                None,
             )?),
             _ => return Err("unsupported paper strategy event fixture".into()),
         })

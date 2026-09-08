@@ -22,6 +22,30 @@ impl CurrentHealthReporter {
         &mut self,
         snapshot: crate::SourceHealthSnapshot,
     ) -> Result<CurrentHealthUpdate, RegistryError> {
+        let budget = CurrentBudgetAuthority::observe(self.budget.as_ref());
+        self.report_with_budget(snapshot, budget)
+    }
+
+    /// Binds health to the exact currently active provider request that carries this live stream.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an inactive or transplanted request permit in addition to the ordinary health
+    /// identity, policy, session, and temporal validation failures.
+    pub fn report_with_active_request(
+        &mut self,
+        snapshot: crate::SourceHealthSnapshot,
+        request: &crate::BudgetPermitLease,
+    ) -> Result<CurrentHealthUpdate, RegistryError> {
+        let budget = CurrentBudgetAuthority::observe_active_request(self.budget.as_ref(), request)?;
+        self.report_with_budget(snapshot, budget)
+    }
+
+    fn report_with_budget(
+        &mut self,
+        snapshot: crate::SourceHealthSnapshot,
+        budget: CurrentBudgetAuthority,
+    ) -> Result<CurrentHealthUpdate, RegistryError> {
         if !self.lease.is_current()
             || !snapshot.uses_freshness_policy(self.freshness)
             || !snapshot
@@ -43,7 +67,7 @@ impl CurrentHealthReporter {
             snapshot,
             binding: self.binding.clone(),
             lease: Arc::clone(&self.lease),
-            budget: CurrentBudgetAuthority::observe(self.budget.as_ref()),
+            budget,
             trusted_reported_at,
         })
     }
@@ -223,10 +247,10 @@ impl ExtractionAuthority {
         Ok(())
     }
 
-    /// Atomically authorizes an exact target and reserves the registry-coordinated request budget.
+    /// Atomically authorizes an exact target and reserves registry-coordinated concurrency.
     ///
     /// The returned permit retains this authority and must be revalidated during paged or streamed
-    /// I/O. Dropping it releases concurrency while preserving request-window consumption.
+    /// I/O. Dropping it releases concurrency without consuming request-window capacity.
     ///
     /// # Errors
     ///
@@ -250,12 +274,12 @@ impl ExtractionAuthority {
             .budget
             .as_ref()
             .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
-        let budget_permit = match budget.try_acquire() {
-            crate::BudgetDecision::Ready(permit) => permit,
-            crate::BudgetDecision::WaitUntil(deadline) => {
+        let budget_reservation = match budget.try_reserve_request() {
+            crate::BudgetReservationDecision::Ready(reservation) => reservation,
+            crate::BudgetReservationDecision::WaitUntil(deadline) => {
                 return Err(crate::ExtractionAuthorityError::BudgetWaitUntil { deadline });
             }
-            crate::BudgetDecision::Unavailable(reason) => {
+            crate::BudgetReservationDecision::Unavailable(reason) => {
                 return Err(crate::ExtractionAuthorityError::BudgetUnavailable { reason });
             }
         };
@@ -263,7 +287,7 @@ impl ExtractionAuthority {
         Ok(crate::ExtractionRequestPermit::new(
             self.clone(),
             authorization,
-            budget_permit,
+            budget_reservation,
         ))
     }
 
@@ -285,9 +309,9 @@ impl ExtractionAuthority {
             .budget
             .as_ref()
             .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
-        budget.remaining_wait(deadline).map_err(|reason| {
-            crate::ExtractionAuthorityError::BudgetUnavailable { reason }
-        })
+        budget
+            .remaining_wait(deadline)
+            .map_err(|reason| crate::ExtractionAuthorityError::BudgetUnavailable { reason })
     }
 
     pub(crate) fn apply_retry_after_header(
@@ -305,6 +329,18 @@ impl ExtractionAuthority {
             field,
             fallback_jitter_sample_basis_points,
         ))
+    }
+
+    pub(crate) fn record_success(&self) -> Result<(), crate::ExtractionAuthorityError> {
+        self.validate_current()?;
+        let budget = self
+            .budget
+            .as_ref()
+            .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
+        budget
+            .record_success()
+            .map_err(|reason| crate::ExtractionAuthorityError::BudgetUnavailable { reason })?;
+        self.validate_current()
     }
 }
 
@@ -459,6 +495,7 @@ impl FrameSessionLease {
             terminal: AtomicBool::new(false),
             live_qualified: AtomicBool::new(false),
             health_epoch: AtomicU64::new(0),
+            minimum_valid_health_epoch: AtomicU64::new(0),
             valid_from_nanos: AtomicI64::new(i64::MAX),
             valid_until_nanos: AtomicI64::new(i64::MIN),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
@@ -600,7 +637,11 @@ impl HttpResponseReceiptAuthority {
     pub(crate) fn observe(
         self,
     ) -> Result<
-        (FrameSessionBinding, TrustedReceiptObservation, FrameSessionLease),
+        (
+            FrameSessionBinding,
+            TrustedReceiptObservation,
+            FrameSessionLease,
+        ),
         crate::SegmentedHttpCaptureError,
     > {
         match self.0 {
@@ -813,11 +854,9 @@ impl ActiveLiveSourceGeneration {
             _ => false,
         };
         budget_is_exact
-            && self.frames.shares_generation_graph_with(
-                &self.binding,
-                &self.lease,
-                &self.capture,
-            )
+            && self
+                .frames
+                .shares_generation_graph_with(&self.binding, &self.lease, &self.capture)
     }
 
     /// Revalidates the registry lease, capture state, and complete generation authority graph.
@@ -842,10 +881,23 @@ impl ActiveLiveSourceGeneration {
 
     /// Returns the immutable connection-generation identity retained by this authority.
     ///
-    /// This is data identity only. It exposes no binding, lease, frame factory, or minting
-    /// capability.
+    /// This is data identity only. It exposes no lease, frame factory, or minting capability.
     pub fn generation(&self) -> market_squawk_domain::ConnectionGeneration {
         self.binding.connection_generation()
+    }
+
+    /// Returns the exact registry-issued frame-session allocation as read-only data identity.
+    ///
+    /// The O(1) clone cannot mint frames, extend the session lease, or access registry authority.
+    /// It exists so an adapter can bind a successful socket write to the same non-reconstructable
+    /// allocation later carried by the provider's captured response.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed under the same conditions as [`Self::validate_current`].
+    pub fn frame_binding(&self) -> Result<FrameSessionBinding, crate::SourceError> {
+        self.validate_current()?;
+        Ok(self.binding.clone())
     }
 
     /// Validates one frame minted by this exact active generation.
@@ -950,6 +1002,51 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         self.validate_captured_batch_owned(batch, receipt)
     }
 
+    /// Upgrades one exact bounded HTTP response and its adapter-normalized observations through
+    /// the same current health, coverage, and protocol authority as captured transport frames.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale or transplanted response authority, non-success responses, a normalization
+    /// rule outside the current metadata revision, or invalid observation profile/scope evidence.
+    pub fn validate_http_response_batch_owned(
+        &self,
+        batch: NormalizedHttpResponseBatch,
+    ) -> Result<CurrentDecodedProviderBatches, RegistryError> {
+        self.validated.session.validate_current_lease()?;
+        let receipt = batch.receipt();
+        let currentness = receipt.currentness_lease();
+        let expected_currentness = FrameSessionLease::new(
+            self.validated.session.binding.clone(),
+            Arc::clone(&self.validated.session.lease),
+        );
+        currentness
+            .validate_current()
+            .map_err(|_error| RegistryError::SessionNotCurrent)?;
+        if !(200..=299).contains(&receipt.status())
+            || !self
+                .validated
+                .session
+                .binding
+                .shares_allocation_with(receipt.binding())
+            || !currentness.shares_authority_with(&expected_currentness)
+        {
+            return Err(RegistryError::CaptureReceiptMismatch);
+        }
+        self.validated
+            .session
+            .lease
+            .validate_receipt(receipt.trusted_receipt())?;
+        let (receipt, normalization_rule, observations) = batch.into_parts();
+        self.validate_normalized_observations_owned(
+            CurrentObservationEvidence::HttpResponse(CurrentHttpResponseEvidence::new(
+                receipt,
+                normalization_rule,
+            )),
+            observations,
+        )
+    }
+
     /// Issues an owned opaque source lease for pre-feed generation registration.
     ///
     /// The returned value retains the exact process-local session allocation, current health
@@ -958,8 +1055,8 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
     ///
     /// # Errors
     ///
-    /// Rejects a stale session, changed health epoch, unhealthy capture generation, or expired
-    /// current-health deadline.
+    /// Rejects a stale session, an authority outside the bounded healthy-refresh overlap,
+    /// unhealthy capture generation, degradation, or an expired current-health deadline.
     pub fn try_current_lease(&self) -> Result<CurrentSourceAuthorityLease, RegistryError> {
         let mint_at = self.clock.observe()?;
         self.validated.session.validate_current_lease()?;
@@ -1149,17 +1246,29 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .session
             .lease
             .validate_receipt(receipt.trusted_receipt())?;
+        let (decoder_evidence, provider_observations) = batch.into_parts();
+        self.validate_normalized_observations_owned(
+            CurrentObservationEvidence::TransportFrame(CurrentFrameEvidence::new(decoder_evidence)),
+            provider_observations,
+        )
+    }
+
+    fn validate_normalized_observations_owned(
+        &self,
+        evidence: CurrentObservationEvidence,
+        provider_observations: Vec<crate::ProviderNormalizedObservation>,
+    ) -> Result<CurrentDecodedProviderBatches, RegistryError> {
         let crate::SourceProtocolProfile::Live(protocol) =
             self.validated.metadata.protocol_profile()
         else {
             return Err(RegistryError::DecoderProfileMismatch);
         };
-        if batch.evidence().decoder_rule() != protocol.decoder_rule() {
+        if evidence.normalization_rule() != protocol.decoder_rule() {
             return Err(RegistryError::DecoderProfileMismatch);
         }
-        let mut observation_authorities = Vec::with_capacity(batch.observations().len());
+        let mut observation_authorities = Vec::with_capacity(provider_observations.len());
         let quality_ceiling = self.validated.metadata.quality_ceiling();
-        for observation in batch.observations() {
+        for observation in &provider_observations {
             validate_observation_profile(protocol, quality_ceiling, observation)?;
             let scope = self.validate_live_scope(
                 observation.venue(),
@@ -1172,13 +1281,11 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             }
             observation_authorities.push(scope);
         }
-        let (decoder_evidence, provider_observations) = batch.into_parts();
-        let frame_evidence = CurrentFrameEvidence::new(decoder_evidence);
         let observations = provider_observations
             .into_iter()
             .zip(observation_authorities)
             .map(|(observation, scope)| {
-                scope.into_current_observation(observation, frame_evidence.clone())
+                scope.into_current_observation(observation, evidence.clone())
             })
             .collect::<Result<Vec<_>, RegistryError>>()?;
         let mut positions: HashMap<CurrentBatchKey, usize> =
@@ -1198,23 +1305,25 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .into_iter()
             .map(|(key, observations)| {
                 let observation_unique_allocations =
-                    observations.iter().try_fold(0_usize, |total, observation| {
-                        let provider = observation
-                            .observation
-                            .dynamic_retained_bytes()
-                            .map_err(|_| RegistryError::RetainedSizeOverflow)?;
-                        total
-                            .checked_add(observation.policy.deep_allocation_charge()?)
-                            .and_then(|bytes| {
-                                bytes.checked_add(observation.key.dynamic_retained_bytes())
-                            })
-                            .and_then(|bytes| bytes.checked_add(provider))
-                            .ok_or(RegistryError::RetainedSizeOverflow)
-                    })?;
-                let frame_shared_allocation = observations
+                    observations
+                        .iter()
+                        .try_fold(0_usize, |total, observation| {
+                            let provider = observation
+                                .observation
+                                .dynamic_retained_bytes()
+                                .map_err(|_| RegistryError::RetainedSizeOverflow)?;
+                            total
+                                .checked_add(observation.policy.deep_allocation_charge()?)
+                                .and_then(|bytes| {
+                                    bytes.checked_add(observation.key.dynamic_retained_bytes())
+                                })
+                                .and_then(|bytes| bytes.checked_add(provider))
+                                .ok_or(RegistryError::RetainedSizeOverflow)
+                        })?;
+                let evidence_shared_allocation = observations
                     .first()
                     .ok_or(RegistryError::DecoderProfileMismatch)?
-                    .frame_evidence
+                    .evidence
                     .shared_allocation_charge()?;
                 let authority_shared_allocation = observations
                     .first()
@@ -1226,7 +1335,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                     observations.len(),
                     observation_unique_allocations,
                     authority_shared_allocation,
-                    frame_shared_allocation,
+                    evidence_shared_allocation,
                 )?;
                 let observations = observations.into_boxed_slice();
                 let authority = observations

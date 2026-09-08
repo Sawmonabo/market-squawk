@@ -1,28 +1,54 @@
 //! Market Squawk's Tauri 2 composition root.
 
 use std::{
+    cell::RefCell,
     ffi::OsString,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use clap::Parser;
+use market_squawk::cli::McpClientArgument;
+#[cfg(debug_assertions)]
+use market_squawk::verified_development_mcp_relay_program;
 #[cfg(target_os = "linux")]
 use market_squawk::verified_installed_cli_program;
-use market_squawk::{LocalProduct, LocalProductError};
 use market_squawk_installer::{
-    InstallError, PlatformError, UninstallRequest, default_install_root, uninstall,
+    InstallError, PlatformError, ProgramName, UninstallRequest, default_installation_data_root,
+    program_install_snapshot, uninstall,
 };
 use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources};
 use tauri::Manager;
 use thiserror::Error;
 
+mod analytical_controller;
 mod bridge;
 mod contracts;
+mod events;
+mod input_staging;
 mod installation;
+mod mcp_clients;
+mod service;
+mod service_client;
 
+use analytical_controller::{analytical_controller, analytical_product};
 use bridge::{
-    DesktopState, application_invoke, desktop_bootstrap, installation_control,
+    DesktopBootstrapState, DesktopCompositionContext, DesktopState, desktop_bootstrap,
+    desktop_service_bootstrap, desktop_service_reconnect, installation_control,
     open_official_provider_page, open_protected_provider_setup, provider_onboarding,
+};
+use contracts::DesktopCommandError;
+use events::{DesktopEventSubscriptions, subscribe_service_events, unsubscribe_service_events};
+use input_staging::{
+    commit_portfolio_import, commit_research_file_import, discard_portfolio_import,
+    discard_research_file_import, import_provider_credential_bundle, preview_portfolio_import,
+    preview_research_file_import, stage_training_input, start_backtest_from_file,
+};
+use mcp_clients::{mcp_client_control, mcp_status};
+use service_client::{
+    analysis_control, backtest_products, dashboard_query, decision_control, fair_value_control,
+    governance_control, governance_query, job_control, model_control, model_products,
+    operations_control, paper_control, research_control, source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -33,6 +59,8 @@ const APPIMAGE_HEADER_BYTES: usize = 11;
 const DESKTOP_EXECUTABLE_BASENAME: &str = "market-squawk-desktop";
 #[cfg(target_os = "linux")]
 const CLI_EXECUTABLE_BASENAME: &str = "market-squawk";
+#[cfg(debug_assertions)]
+const DEVELOPMENT_MCP_RELAY_PROGRAM: &str = "MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM";
 
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk-desktop")]
@@ -45,17 +73,29 @@ struct DesktopArgs {
     /// Local Market Squawk data root.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Explicit installed-service and managed-installation root for isolated verification.
+    #[arg(long, hide = true)]
+    installation_data_root: Option<PathBuf>,
     /// Absolute verified Python training-release root.
     #[arg(long)]
     training_release_root: Option<PathBuf>,
     /// Dispatch the packaged stdio MCP process from a portable Linux image.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, requires = "mcp_client")]
     stdio_mcp: bool,
+    /// Installed MCP client identity for the portable Linux relay.
+    #[arg(long, hide = true, value_enum, requires = "stdio_mcp")]
+    mcp_client: Option<McpClientArgument>,
     /// Remove the current user's managed program store before native package removal.
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = ["config", "data_dir", "training_release_root", "stdio_mcp"]
+        conflicts_with_all = [
+            "config",
+            "data_dir",
+            "training_release_root",
+            "stdio_mcp",
+            "mcp_client"
+        ]
     )]
     native_uninstall: bool,
 }
@@ -82,16 +122,30 @@ enum DesktopStartupError {
     },
     #[error("desktop configuration is invalid")]
     Configuration(#[from] ConfigError),
-    #[error("complete product installation failed")]
+    #[error("complete product installation failed: {0}")]
     Installation(#[from] installation::InstallationStartupError),
-    #[error("local product initialization failed")]
-    Product(#[from] LocalProductError),
+    #[error("installed service initialization failed: {0}")]
+    Service(#[from] service::DesktopServiceError),
+    #[error("installed service data location is unavailable")]
+    ServiceDataRoot {
+        #[source]
+        source: PlatformError,
+    },
+    #[error("installed service data location must be absolute")]
+    InvalidInstallationDataRoot,
+    #[error("installed service bootstrap is incompatible with this dashboard: {source}")]
+    InvalidServiceBootstrap {
+        #[source]
+        source: DesktopCommandError,
+    },
     #[error("desktop runtime initialization failed")]
     Tauri(#[from] tauri::Error),
+    #[error("desktop main window is unavailable")]
+    MainWindowUnavailable,
     #[error("desktop state was already installed")]
     DuplicateState,
-    #[error("native package cleanup could not determine the program root")]
-    NativeUninstallRoot(#[from] PlatformError),
+    #[error("installed MCP client authority is unavailable")]
+    McpClientAuthority,
     #[error("native package cleanup failed")]
     NativeUninstall(#[from] InstallError),
 }
@@ -100,7 +154,7 @@ enum DesktopStartupError {
 pub fn run() {
     let args = DesktopArgs::try_parse().unwrap_or_else(|error| error.exit());
     let result = if args.native_uninstall {
-        run_native_uninstall()
+        run_native_uninstall(args.installation_data_root)
     } else if args.stdio_mcp {
         run_stdio_mcp(args)
     } else {
@@ -116,16 +170,37 @@ pub fn run() {
     std::process::exit(code);
 }
 
-fn run_native_uninstall() -> Result<i32, DesktopStartupError> {
-    let root = default_install_root()?;
+fn run_native_uninstall(
+    installation_data_root: Option<PathBuf>,
+) -> Result<i32, DesktopStartupError> {
+    let root = selected_installation_data_root(installation_data_root)?.join("program");
     uninstall(UninstallRequest::preserving_data(root))?;
     Ok(0)
+}
+
+fn selected_installation_data_root(
+    installation_data_root: Option<PathBuf>,
+) -> Result<PathBuf, DesktopStartupError> {
+    let root = installation_data_root
+        .map_or_else(default_installation_data_root, Ok)
+        .map_err(|source| DesktopStartupError::ServiceDataRoot { source })?;
+    if !root.is_absolute() {
+        return Err(DesktopStartupError::InvalidInstallationDataRoot);
+    }
+    Ok(root)
 }
 
 #[cfg(target_os = "linux")]
 fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     use std::os::unix::process::CommandExt as _;
 
+    let mcp_client = match args
+        .mcp_client
+        .ok_or(DesktopStartupError::McpTransportUnavailable)?
+    {
+        McpClientArgument::ClaudeCode => "claude-code",
+        McpClientArgument::Codex => "codex",
+    };
     let cli = verified_installed_cli_program()
         .map_err(|_error| DesktopStartupError::McpTransportUnavailable)?;
     let launcher = appimage_mcp_launcher(&cli)
@@ -155,6 +230,8 @@ fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             }
         })
         .transpose()?;
+    let installation_data_root = selected_installation_data_root(args.installation_data_root)
+        .map_err(|_error| DesktopStartupError::McpTransportUnavailable)?;
 
     let mut command = std::process::Command::new(launcher.cli_program);
     if let Some(path) = config_path {
@@ -164,7 +241,14 @@ fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     if let Some(path) = training_release_root {
         command.arg("--training-release-root").arg(path);
     }
-    command.arg("mcp").arg("serve");
+    command
+        .arg("--installation-data-root")
+        .arg(installation_data_root);
+    command
+        .arg("mcp")
+        .arg("serve")
+        .arg("--client")
+        .arg(mcp_client);
     let source = command.exec();
     Err(DesktopStartupError::McpTransportStart { source })
 }
@@ -175,17 +259,51 @@ fn run_stdio_mcp(_args: DesktopArgs) -> Result<i32, DesktopStartupError> {
 }
 
 fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
+    let installation_data_root =
+        selected_installation_data_root(args.installation_data_root.clone())?;
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(DesktopEventSubscriptions::default())
         .invoke_handler(tauri::generate_handler![
-            application_invoke,
+            analytical_controller,
+            analytical_product,
+            analysis_control,
+            backtest_products,
+            commit_research_file_import,
+            dashboard_query,
+            decision_control,
             desktop_bootstrap,
+            desktop_service_bootstrap,
+            desktop_service_reconnect,
+            discard_portfolio_import,
+            discard_research_file_import,
+            fair_value_control,
+            governance_control,
+            governance_query,
+            job_control,
             installation_control,
+            import_provider_credential_bundle,
+            mcp_client_control,
+            mcp_status,
+            model_control,
+            model_products,
+            operations_control,
             open_official_provider_page,
             open_protected_provider_setup,
-            provider_onboarding
+            paper_control,
+            preview_portfolio_import,
+            preview_research_file_import,
+            provider_onboarding,
+            research_control,
+            source_control,
+            stage_training_input,
+            start_backtest_from_file,
+            commit_portfolio_import,
+            subscribe_service_events,
+            unsubscribe_service_events
         ])
         .build(tauri::generate_context!())?;
-    let installation = installation::prepare(app.handle())?;
+    let installation = installation::prepare(app.handle(), installation_data_root.join("program"))?;
     if let Some(program) = installation.handoff_program.as_ref() {
         return handoff_to_selected_release(program);
     }
@@ -193,7 +311,11 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
     environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
+    #[cfg(debug_assertions)]
+    {
+        environment.remove(&OsString::from("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM"));
+        environment.remove(&OsString::from(DEVELOPMENT_MCP_RELAY_PROGRAM));
+    }
     let config_path = args
         .config
         .as_deref()
@@ -214,39 +336,117 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         )
         .with_data_directory_default(desktop_data_directory),
     )?;
-    let product_config = config.clone();
-    let product =
-        tauri::async_runtime::block_on(async move { LocalProduct::try_new(product_config) })?;
-    let state = DesktopState::new(
-        product,
-        config,
-        config_path,
-        installation.root,
-        installation.status,
-    );
-    if !app.manage(state) {
+    let service = tauri::async_runtime::block_on(service::connect_or_start(
+        &config,
+        config_path.as_deref(),
+        Some(&installation_data_root),
+    ))?;
+    let relay_program = mcp_relay_program(&installation.root)?;
+    let bootstrap_state = DesktopBootstrapState::compose(
+        app.handle(),
+        service,
+        DesktopCompositionContext::new(
+            config.data_dir().to_path_buf(),
+            installation_data_root,
+            installation.root,
+            installation.status,
+            relay_program,
+        ),
+    )
+    .map_err(|source| DesktopStartupError::InvalidServiceBootstrap { source })?;
+    if !app.manage(bootstrap_state) {
         return Err(DesktopStartupError::DuplicateState);
     }
-    let exit_code = app.run_return(|handle, event| match event {
+    let runtime_startup_error = Rc::new(RefCell::new(None));
+    let runtime_startup_error_for_event = Rc::clone(&runtime_startup_error);
+    let exit_code = app.run_return(move |handle, event| match event {
+        tauri::RunEvent::Ready => {
+            let show_result = (|| -> Result<(), DesktopStartupError> {
+                let window = handle
+                    .get_webview_window("main")
+                    .ok_or(DesktopStartupError::MainWindowUnavailable)?;
+                #[cfg(debug_assertions)]
+                if std::env::var_os("MSQ_DEVTOOLS").is_some() {
+                    window.open_devtools();
+                }
+                window.show()?;
+                window.set_focus()?;
+                Ok(())
+            })();
+            if let Err(error) = show_result {
+                runtime_startup_error_for_event.replace(Some(error));
+                handle.exit(1);
+            }
+        }
         tauri::RunEvent::ExitRequested { .. } => {
-            handle.state::<DesktopState>().begin_shutdown();
+            if let Some(state) = handle.try_state::<DesktopState>() {
+                state.begin_shutdown();
+            }
         }
         tauri::RunEvent::Exit => {
-            let state = handle.state::<DesktopState>();
-            let restart_program = state.scheduled_restart_program();
-            tauri::async_runtime::block_on(state.finish_shutdown());
-            if let Some(program) = restart_program
-                && std::process::Command::new(program)
-                    .args(std::env::args_os().skip(1))
-                    .spawn()
-                    .is_err()
-            {
-                eprintln!("market-squawk-desktop: failed to restart the selected release");
+            if let Some(state) = handle.try_state::<DesktopState>() {
+                let restart_program = state.scheduled_restart_program();
+                tauri::async_runtime::block_on(state.finish_shutdown());
+                if let Some(program) = restart_program
+                    && std::process::Command::new(program)
+                        .args(std::env::args_os().skip(1))
+                        .spawn()
+                        .is_err()
+                {
+                    eprintln!("market-squawk-desktop: failed to restart the selected release");
+                }
             }
         }
         _ => {}
     });
+    if let Some(error) = runtime_startup_error.borrow_mut().take() {
+        return Err(error);
+    }
     Ok(exit_code)
+}
+
+fn mcp_relay_program(installation_root: &Path) -> Result<PathBuf, DesktopStartupError> {
+    #[cfg(debug_assertions)]
+    if let Some(program) = std::env::var_os(DEVELOPMENT_MCP_RELAY_PROGRAM) {
+        return verified_development_mcp_relay_program(Path::new(&program))
+            .map_err(|_error| DesktopStartupError::McpClientAuthority);
+    }
+    let installed = program_install_snapshot(installation_root, ProgramName::McpRelay)?;
+    #[cfg(debug_assertions)]
+    {
+        let current =
+            std::env::current_exe().map_err(|_source| DesktopStartupError::McpClientAuthority)?;
+        mcp_relay_program_for(installed.program_path(), &current)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        mcp_relay_program_for(installed.program_path(), Path::new(""))
+    }
+}
+
+fn mcp_relay_program_for(
+    installed_program: Option<&Path>,
+    current_executable: &Path,
+) -> Result<PathBuf, DesktopStartupError> {
+    if let Some(installed_program) = installed_program {
+        return Ok(installed_program.to_path_buf());
+    }
+    #[cfg(debug_assertions)]
+    {
+        let directory = current_executable
+            .parent()
+            .filter(|directory| current_executable.is_absolute() && directory.is_absolute())
+            .ok_or(DesktopStartupError::McpClientAuthority)?;
+        Ok(directory.join(format!(
+            "market-squawk-mcp-relay{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = current_executable;
+        Err(DesktopStartupError::McpClientAuthority)
+    }
 }
 
 fn handoff_to_selected_release(program: &Path) -> Result<i32, DesktopStartupError> {
@@ -270,13 +470,13 @@ fn handoff_to_selected_release(program: &Path) -> Result<i32, DesktopStartupErro
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct AppImageMcpLauncher {
-    pub(crate) program: PathBuf,
-    #[cfg(target_os = "linux")]
     cli_program: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AppImageMcpLauncherError;
 
@@ -341,15 +541,67 @@ pub(crate) fn appimage_mcp_launcher(
     if current != expected_current || cli_program != expected_cli || current == program {
         return Err(AppImageMcpLauncherError);
     }
-    Ok(Some(AppImageMcpLauncher {
-        program,
-        cli_program,
-    }))
+    Ok(Some(AppImageMcpLauncher { cli_program }))
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) const fn appimage_mcp_launcher(
-    _cli_program: &Path,
-) -> Result<Option<AppImageMcpLauncher>, AppImageMcpLauncherError> {
-    Ok(None)
+#[cfg(test)]
+mod tests {
+    use std::{env, ffi::OsString, path::PathBuf};
+
+    use clap::Parser as _;
+
+    use super::{
+        DesktopArgs, DesktopStartupError, mcp_relay_program_for, selected_installation_data_root,
+    };
+
+    #[test]
+    fn debug_relay_selection_prefers_installation_and_uses_only_the_desktop_sibling() {
+        let executable = env::temp_dir()
+            .join("market-squawk-desktop-test")
+            .join(format!("market-squawk-desktop{}", env::consts::EXE_SUFFIX));
+        let installed = env::temp_dir()
+            .join("market-squawk-managed-test")
+            .join(format!(
+                "market-squawk-mcp-relay{}",
+                env::consts::EXE_SUFFIX
+            ));
+        let sibling = executable.with_file_name(format!(
+            "market-squawk-mcp-relay{}",
+            env::consts::EXE_SUFFIX
+        ));
+
+        assert_eq!(
+            mcp_relay_program_for(Some(&installed), &executable)
+                .ok()
+                .as_deref(),
+            Some(installed.as_path())
+        );
+        assert_eq!(
+            mcp_relay_program_for(None, &executable).ok().as_deref(),
+            Some(sibling.as_path())
+        );
+    }
+
+    #[test]
+    fn isolated_installation_root_is_absolute_and_available_to_native_cleanup() {
+        let root = env::current_dir()
+            .expect("the test working directory must be available")
+            .join("market-squawk-isolated-installation");
+        let arguments = DesktopArgs::try_parse_from([
+            OsString::from("market-squawk-desktop"),
+            OsString::from("--installation-data-root"),
+            root.clone().into_os_string(),
+            OsString::from("--native-uninstall"),
+        ])
+        .expect("an explicit root must be compatible with native cleanup");
+
+        assert_eq!(
+            selected_installation_data_root(arguments.installation_data_root).ok(),
+            Some(root)
+        );
+        assert!(matches!(
+            selected_installation_data_root(Some(PathBuf::from("relative"))),
+            Err(DesktopStartupError::InvalidInstallationDataRoot)
+        ));
+    }
 }

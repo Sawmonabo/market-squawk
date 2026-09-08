@@ -21,7 +21,8 @@ use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_platform::ArtifactRoot;
 use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
-    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactReferenceResolver,
+    ArtifactRepository, ArtifactResolveRequest, NDJSON_ARTIFACT_MEDIA_TYPE,
     PARQUET_ARTIFACT_MEDIA_TYPE,
 };
 use sha2::{Digest, Sha256};
@@ -256,9 +257,8 @@ impl ArtifactReadReaper {
 pub(crate) fn controlled_artifact_repository(
     root: ArtifactRoot,
     maximum_bytes: NonZeroUsize,
-) -> Result<Arc<dyn ArtifactRepository>, ArtifactError> {
-    ControlledArtifactRepository::try_new(root, maximum_bytes)
-        .map(|repository| Arc::new(repository) as Arc<dyn ArtifactRepository>)
+) -> Result<Arc<ControlledArtifactRepository>, ArtifactError> {
+    ControlledArtifactRepository::try_new(root, maximum_bytes).map(Arc::new)
 }
 
 /// Bounded content-addressed repository under the configured artifact capability.
@@ -391,6 +391,30 @@ impl ArtifactRepository for ControlledArtifactRepository {
         self.reads
             .run(context, move |worker_cancellation| {
                 read_verified_artifact(
+                    &root,
+                    maximum_bytes,
+                    request,
+                    &worker_context,
+                    &worker_cancellation,
+                )
+            })
+            .await
+    }
+}
+
+#[async_trait]
+impl ArtifactReferenceResolver for ControlledArtifactRepository {
+    async fn resolve(
+        &self,
+        request: ArtifactResolveRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactReference, ArtifactError> {
+        let root = self.root.clone();
+        let maximum_bytes = self.maximum_bytes;
+        let worker_context = context.clone();
+        self.reads
+            .run(context, move |worker_cancellation| {
+                resolve_verified_reference(
                     &root,
                     maximum_bytes,
                     request,
@@ -565,9 +589,66 @@ fn read_verified_artifact(
     ArtifactRead::try_new(request.into_reference(), content)
 }
 
+fn resolve_verified_reference(
+    root: &ArtifactRoot,
+    repository_maximum: NonZeroUsize,
+    request: ArtifactResolveRequest,
+    context: &ArtifactReadContext,
+    worker_cancellation: &CancellationToken,
+) -> Result<ArtifactReference, ArtifactError> {
+    ensure_artifact_read_live(context, worker_cancellation)?;
+    let coordinate = artifact_coordinate_from_id(request.id())?;
+    drop(
+        root.resolve(&coordinate.path)
+            .map_err(|_| ArtifactError::InvalidReference)?,
+    );
+    let directory = root
+        .try_clone_directory()
+        .map_err(|_| ArtifactError::Unavailable)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    configure_nonblocking_read(&mut options);
+    let file = directory
+        .open_with(&coordinate.path, &options)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ArtifactError::NotFound
+            } else {
+                ArtifactError::Unavailable
+            }
+        })?;
+    let metadata = file.metadata().map_err(|_| ArtifactError::Unavailable)?;
+    let byte_count = usize::try_from(metadata.len()).map_err(|_| ArtifactError::Unavailable)?;
+    if !metadata.is_file() || byte_count == 0 {
+        return Err(ArtifactError::Unavailable);
+    }
+    if byte_count > repository_maximum.get() || byte_count > request.maximum_bytes().get() {
+        return Err(ArtifactError::ReadLimitExceeded);
+    }
+    drop(file);
+    let reference = ArtifactReference::try_new(
+        coordinate.id,
+        coordinate.sha256,
+        byte_count,
+        coordinate.media_type,
+    )?;
+    let read_request = ArtifactReadRequest::try_new(reference, request.maximum_bytes())?;
+    read_verified_artifact(
+        root,
+        repository_maximum,
+        read_request,
+        context,
+        worker_cancellation,
+    )
+    .map(|read| read.reference().clone())
+}
+
 #[derive(Debug)]
 struct ArtifactCoordinate {
     id: String,
+    sha256: String,
+    media_type: &'static str,
     path: std::path::PathBuf,
 }
 
@@ -579,14 +660,48 @@ fn artifact_coordinate(
     match media_type {
         "application/json" => Ok(ArtifactCoordinate {
             id: format!("mcp-{digest}"),
+            sha256: digest.to_owned(),
+            media_type: "application/json",
             path: format!("{ARTIFACT_NAMESPACE}/{prefix}/{digest}.json").into(),
         }),
         PARQUET_ARTIFACT_MEDIA_TYPE => Ok(ArtifactCoordinate {
             id: format!("mcp-parquet-{digest}"),
+            sha256: digest.to_owned(),
+            media_type: PARQUET_ARTIFACT_MEDIA_TYPE,
             path: format!("{ARTIFACT_NAMESPACE}/parquet/{prefix}/{digest}.parquet").into(),
+        }),
+        NDJSON_ARTIFACT_MEDIA_TYPE => Ok(ArtifactCoordinate {
+            id: format!("mcp-ndjson-{digest}"),
+            sha256: digest.to_owned(),
+            media_type: NDJSON_ARTIFACT_MEDIA_TYPE,
+            path: format!("{ARTIFACT_NAMESPACE}/ndjson/{prefix}/{digest}.ndjson").into(),
         }),
         _ => Err(ArtifactError::InvalidReference),
     }
+}
+
+fn artifact_coordinate_from_id(id: &str) -> Result<ArtifactCoordinate, ArtifactError> {
+    let (digest, media_type) = if let Some(digest) = id.strip_prefix("mcp-parquet-") {
+        (digest, PARQUET_ARTIFACT_MEDIA_TYPE)
+    } else if let Some(digest) = id.strip_prefix("mcp-ndjson-") {
+        (digest, NDJSON_ARTIFACT_MEDIA_TYPE)
+    } else if let Some(digest) = id.strip_prefix("mcp-") {
+        (digest, "application/json")
+    } else {
+        return Err(ArtifactError::InvalidReference);
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(ArtifactError::InvalidReference);
+    }
+    let coordinate = artifact_coordinate(media_type, digest)?;
+    if coordinate.id != id {
+        return Err(ArtifactError::InvalidReference);
+    }
+    Ok(coordinate)
 }
 
 fn ensure_artifact_read_live(
@@ -775,7 +890,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use market_squawk_services::{ArtifactError, ArtifactReadContext};
+    use market_squawk_platform::LocalPaths;
+    use market_squawk_services::{
+        ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReadContext,
+        ArtifactReferenceResolver, ArtifactRepository, ArtifactResolveRequest,
+    };
     use tokio_util::sync::CancellationToken;
 
     use super::ArtifactReadSupervisor;
@@ -784,6 +903,45 @@ mod tests {
 
     static ARTIFACT_READ_TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test]
+    async fn published_parquet_resolves_to_its_complete_verified_reference() -> TestResult {
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path())?;
+        let repository = super::ControlledArtifactRepository::try_new(
+            paths.artifacts()?.clone(),
+            NonZeroUsize::new(1024).ok_or("invalid test artifact limit")?,
+        )?;
+        let context = || {
+            ArtifactReadContext::new(
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+        };
+        let publication = ArtifactPublication::try_parquet(b"PAR1payloadPAR1".to_vec())?;
+        let reference = repository
+            .publish(
+                publication,
+                ArtifactPublicationContext::new(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+            )
+            .await?;
+
+        let resolved = repository
+            .resolve(
+                ArtifactResolveRequest::try_new(
+                    reference.id(),
+                    NonZeroUsize::new(1024).ok_or("invalid test artifact limit")?,
+                )?,
+                context(),
+            )
+            .await?;
+
+        assert_eq!(resolved, reference);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn dropped_artifact_waiter_is_reaped_and_capacity_recovers_after_worker_exit()

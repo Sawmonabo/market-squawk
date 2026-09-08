@@ -8,8 +8,9 @@ use std::{
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
-    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, MAX_DISCOVERY_OBJECTS, SourceMetadata,
-    SourceObject,
+    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, MAX_DISCOVERY_OBJECTS,
+    MAX_PROVIDER_CAPTURE_BYTES, ProviderCaptureMaterial, SourceMetadata, SourceObject,
+    SourceObjectCaptureIdentity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -228,6 +229,7 @@ impl RetainedDiscoverySelections {
         rights: &ResearchRightsAuthority,
         admission: &ResearchProviderAdmission,
         discovery: DiscoveryBatch,
+        capture_material: Option<ProviderCaptureMaterial>,
         retention: Duration,
         observed_monotonic: Instant,
         observed_wall: Timestamp,
@@ -238,12 +240,47 @@ impl RetainedDiscoverySelections {
             .map_err(|_error| ServiceError::Unavailable)?;
         self.prune_expired(observed_monotonic, observed_wall);
         let object_count = discovery.objects().len();
+        if capture_material.is_some() && object_count != 1 {
+            return Err(ServiceError::InvalidResult);
+        }
+        if let Some(capture_material) = &capture_material {
+            let object = discovery
+                .objects()
+                .first()
+                .ok_or(ServiceError::InvalidResult)?;
+            let receipt = capture_material.receipt();
+            if receipt.source_id() != object.source_id()
+                || receipt.metadata_revision() != object.metadata_revision()
+                || receipt.dataset() != object.dataset()
+                || !SourceObjectCaptureIdentity::try_from_capture(receipt)
+                    .is_ok_and(|identity| identity == object.capture_identity())
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+        }
         let retained_count = self
             .entries
             .len()
             .checked_add(object_count)
             .ok_or(ServiceError::ResourceExhausted)?;
         if retained_count > MAX_DISCOVERY_OBJECTS {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let retained_capture_bytes = self.entries.iter().try_fold(0_u64, |total, selection| {
+            total.checked_add(
+                selection
+                    .capture_material
+                    .as_ref()
+                    .map_or(0, |material| material.receipt().total_body_bytes()),
+            )
+        });
+        let incoming_capture_bytes = capture_material
+            .as_ref()
+            .map_or(0, |material| material.receipt().total_body_bytes());
+        if retained_capture_bytes
+            .and_then(|total| total.checked_add(incoming_capture_bytes))
+            .is_none_or(|total| total > MAX_PROVIDER_CAPTURE_BYTES)
+        {
             return Err(ServiceError::ResourceExhausted);
         }
 
@@ -285,6 +322,7 @@ impl RetainedDiscoverySelections {
         objects
             .try_reserve_exact(object_count)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let mut capture_material = capture_material;
         for object in discovery.objects() {
             let receipt = Uuid::new_v4();
             if self
@@ -304,6 +342,7 @@ impl RetainedDiscoverySelections {
                 admission: admission.clone(),
                 request: discovery.request().clone(),
                 object: object.clone(),
+                capture_material: capture_material.take(),
                 monotonic_expiry,
                 wall_expiry: receipt_expiry,
             });
@@ -423,6 +462,7 @@ struct RetainedDiscoverySelection {
     admission: ResearchProviderAdmission,
     request: DiscoveryRequest,
     object: SourceObject,
+    capture_material: Option<ProviderCaptureMaterial>,
     monotonic_expiry: Instant,
     wall_expiry: Timestamp,
 }
@@ -443,6 +483,7 @@ pub(super) struct PreparedRetainedSelection {
     pub(super) authority: ExtractionAuthority,
     pub(super) object: SourceObject,
     pub(super) admission: ResearchProviderAdmission,
+    pub(super) capture_material: Option<ProviderCaptureMaterial>,
 }
 
 impl CoordinatorAuthority {
@@ -508,6 +549,7 @@ impl CoordinatorAuthority {
             authority,
             object: selection.object,
             admission: selection.admission,
+            capture_material: selection.capture_material,
         })
     }
 }

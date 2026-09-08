@@ -1,0 +1,381 @@
+import * as React from "react"
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query"
+import { AlertCircle, Database, RefreshCw, Rows3, Search } from "lucide-react"
+import { Link } from "react-router-dom"
+
+import { productKeys } from "@/app/query-client"
+import { useProduct } from "@/app/product-context"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Skeleton } from "@/components/ui/skeleton"
+import { MacroContext } from "@/features/macro"
+import { hasProductCapability } from "@/lib/product-capabilities"
+import type { DesktopBootstrap } from "@/lib/schemas"
+import type { ProductTransport } from "@/lib/transport"
+
+import { DatasetBuilder } from "./dataset-builder"
+import { DatasetEvidence } from "./dataset-evidence"
+import { parseResearchCollectionPage } from "./research-contracts"
+
+export function ResearchPage() {
+  const product = useProduct()
+
+  if (product.status === "loading") return <ResearchLoading />
+  if (product.status === "error") {
+    return (
+      <ResearchFrame>
+        <Alert variant="destructive">
+          <AlertCircle aria-hidden="true" />
+          <AlertTitle>Research is unavailable right now</AlertTitle>
+          <AlertDescription>
+            Your other workspace areas are still available. Try opening Research again.
+          </AlertDescription>
+        </Alert>
+        <Button className="mt-4" onClick={product.refresh}>
+          Try again
+        </Button>
+      </ResearchFrame>
+    )
+  }
+
+  const available = hasProductCapability(
+    product.bootstrap,
+    "research_dataset_list",
+  )
+  if (!available) {
+    return (
+      <ResearchFrame>
+        <UnavailableResearch />
+      </ResearchFrame>
+    )
+  }
+
+  return (
+    <ResearchWorkspace
+      bootstrap={product.bootstrap}
+      transport={product.transport}
+    />
+  )
+}
+
+function ResearchWorkspace({
+  bootstrap,
+  transport,
+}: {
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
+}) {
+  const queryClient = useQueryClient()
+  const [filter, setFilter] = React.useState("")
+  const [selectedId, setSelectedId] = React.useState<string | null>(null)
+  const collectionKey = [
+    ...productKeys.domain(bootstrap.productSessionToken, "research"),
+    "collections",
+  ] as const
+  const collections = useInfiniteQuery({
+    queryKey: collectionKey,
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) =>
+      parseResearchCollectionPage(
+        await transport.query({
+          query: "researchCollections",
+          ...(pageParam ? { afterCollection: pageParam } : {}),
+        }),
+      ),
+    getNextPageParam: (page) =>
+      page.hasMore ? (page.nextCollection ?? undefined) : undefined,
+  })
+
+  const allCollections = collections.data?.pages.flatMap((page) => page.items) ?? []
+  const normalizedFilter = filter.trim().toLocaleLowerCase()
+  const visibleCollections = normalizedFilter
+    ? allCollections.filter((collection) =>
+        collection.title.toLocaleLowerCase().includes(normalizedFilter),
+      )
+    : allCollections
+  const selected =
+    visibleCollections.find(
+      (collection) => collection.collectionToken === selectedId,
+    ) ??
+    visibleCollections[0] ??
+    null
+  const totalRows = allCollections.reduce(
+    (total, collection) => total + collection.rowCount,
+    0,
+  )
+  const refreshing = collections.isFetching
+
+  return (
+    <ResearchFrame>
+      <header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between">
+        <div>
+          <p className="text-[10px] uppercase tracking-[0.18em] text-primary">
+            Research and data
+          </p>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Research</h1>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+            Prepare dated information, review its history and limitations, and use it in analysis
+            or model work. Connections manages information access; Operations &amp; Jobs tracks
+            longer work.
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          onClick={() => {
+            void collections.refetch()
+          }}
+          disabled={refreshing}
+        >
+          <RefreshCw
+            className={refreshing ? "animate-spin" : ""}
+            aria-hidden="true"
+          />
+          Refresh
+        </Button>
+      </header>
+
+      <div className="mt-6">
+        <MacroContext bootstrap={bootstrap} transport={transport} />
+      </div>
+
+      <DatasetBuilder
+        bootstrap={bootstrap}
+        transport={transport}
+        onStarted={async () => {
+          await queryClient.invalidateQueries({ queryKey: collectionKey })
+        }}
+      />
+
+      {collections.isPending ? (
+        <ResearchContentLoading />
+      ) : collections.isError ? (
+        <DatasetError retry={() => void collections.refetch()} />
+      ) : allCollections.length === 0 ? (
+        <>
+          <EmptyResearch />
+          <ResearchOperationsLink />
+        </>
+      ) : (
+        <>
+          <section
+            aria-label="Loaded research facts"
+            className="mt-5 grid overflow-hidden rounded-xl border border-border bg-card/50 sm:grid-cols-2"
+          >
+            <ResearchFact
+              icon={Database}
+              label="Available collections"
+              value={formatCount(allCollections.length)}
+            />
+            <ResearchFact
+              icon={Rows3}
+              label="Research observations"
+              value={formatCount(totalRows)}
+            />
+          </section>
+
+          <div className="mt-5 grid min-h-[560px] gap-4 xl:grid-cols-[minmax(280px,0.78fr)_minmax(0,1.42fr)]">
+            <section className="overflow-hidden rounded-xl border border-border bg-card/35">
+              <div className="border-b border-border p-4">
+                <label
+                  htmlFor="research-dataset-filter"
+                  className="text-xs font-semibold"
+                >
+                  Find a collection
+                </label>
+                <div className="relative mt-2">
+                  <Search
+                    className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+                    aria-hidden="true"
+                  />
+                  <Input
+                    id="research-dataset-filter"
+                    value={filter}
+                    onChange={(event) => setFilter(event.target.value)}
+                    placeholder="Name of the information"
+                    className="pl-9"
+                  />
+                </div>
+              </div>
+              <div className="max-h-[620px] overflow-y-auto p-2">
+                {visibleCollections.length ? (
+                  <ul className="space-y-1" aria-label="Research collections">
+                    {visibleCollections.map((collection) => {
+                      const active =
+                        selected?.collectionToken === collection.collectionToken
+                      return (
+                        <li key={collection.collectionToken}>
+                          <button
+                            type="button"
+                            aria-pressed={active}
+                            onClick={() => setSelectedId(collection.collectionToken)}
+                            className={`w-full rounded-lg border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                              active
+                                ? "border-primary/45 bg-primary/10"
+                                : "border-transparent hover:border-border hover:bg-accent/45"
+                            }`}
+                          >
+                            <span className="block truncate text-sm font-medium">
+                              {collection.title}
+                            </span>
+                            <span className="mt-1 block truncate text-[11px] text-muted-foreground">
+                              {formatCount(collection.rowCount)} observations
+                            </span>
+                          </button>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                ) : (
+                  <p className="p-5 text-sm leading-6 text-muted-foreground">
+                    No collection matches “{filter}”. Try another description.
+                  </p>
+                )}
+              </div>
+              {collections.hasNextPage ? (
+                <div className="border-t border-border p-3">
+                  <Button
+                    className="w-full"
+                    variant="outline"
+                    onClick={() => void collections.fetchNextPage()}
+                    disabled={collections.isFetchingNextPage}
+                  >
+                    {collections.isFetchingNextPage ? "Loading…" : "Load more collections"}
+                  </Button>
+                </div>
+              ) : null}
+            </section>
+
+            <div className="space-y-4">
+              {selected ? (
+                <DatasetEvidence
+                  collection={selected}
+                  bootstrap={bootstrap}
+                  transport={transport}
+                />
+              ) : null}
+              <ResearchOperationsLink />
+            </div>
+          </div>
+        </>
+      )}
+    </ResearchFrame>
+  )
+}
+
+function ResearchOperationsLink() {
+  return (
+    <section className="mt-4 rounded-xl border border-border bg-card/35 p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">Research work</h2>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            Longer preparations and exports continue if this window closes.
+          </p>
+        </div>
+        <Button asChild size="xs" variant="outline">
+          <Link to="/system/operations-jobs">Open Operations &amp; Jobs</Link>
+        </Button>
+      </div>
+    </section>
+  )
+}
+
+function EmptyResearch() {
+  return (
+    <section className="mt-6 rounded-xl border border-dashed border-border bg-card/30 p-8 text-center">
+      <Database className="mx-auto size-7 text-primary" aria-hidden="true" />
+      <h2 className="mt-4 text-lg font-semibold">No research collections yet</h2>
+      <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
+        Add the information you want from Connections. Completed research will appear here when it
+        is ready to use.
+      </p>
+      <Button asChild className="mt-5">
+        <Link to="/connections/sources">Manage connections</Link>
+      </Button>
+    </section>
+  )
+}
+
+function UnavailableResearch() {
+  return (
+    <Alert>
+      <AlertCircle aria-hidden="true" />
+      <AlertTitle>Research is not ready</AlertTitle>
+      <AlertDescription>
+        Add or reconnect research information from Connections, then return here.
+      </AlertDescription>
+      <Button asChild className="mt-3" size="sm" variant="outline">
+        <Link to="/connections/sources">Open Connections</Link>
+      </Button>
+    </Alert>
+  )
+}
+
+function DatasetError({ retry }: { retry: () => void }) {
+  return (
+    <div className="mt-6">
+      <Alert variant="destructive">
+        <AlertCircle aria-hidden="true" />
+        <AlertTitle>Research information could not be loaded</AlertTitle>
+        <AlertDescription>
+          Refresh the research library to try again.
+        </AlertDescription>
+      </Alert>
+      <Button className="mt-4" variant="outline" onClick={retry}>
+        Try again
+      </Button>
+    </div>
+  )
+}
+
+function ResearchFact({
+  icon: Icon,
+  label,
+  value,
+}: {
+  icon: typeof Database
+  label: string
+  value: string
+}) {
+  return (
+    <div className="border-b border-border p-4 last:border-b-0 sm:odd:border-r xl:border-b-0 xl:border-r xl:last:border-r-0">
+      <div className="flex items-center gap-2 text-muted-foreground">
+        <Icon className="size-3.5" aria-hidden="true" />
+        <p className="text-[9px] uppercase tracking-wider">{label}</p>
+      </div>
+      <p className="mt-2 font-mono text-lg font-semibold">{value}</p>
+    </div>
+  )
+}
+
+function ResearchFrame({ children }: { children: React.ReactNode }) {
+  return <main className="mx-auto w-full max-w-[1240px] p-5 lg:p-7">{children}</main>
+}
+
+function ResearchLoading() {
+  return (
+    <ResearchFrame>
+      <Skeleton className="h-4 w-40" />
+      <Skeleton className="mt-3 h-10 w-52" />
+      <Skeleton className="mt-3 h-5 w-3/5" />
+      <ResearchContentLoading />
+    </ResearchFrame>
+  )
+}
+
+function ResearchContentLoading() {
+  return (
+    <div className="mt-6 space-y-4" aria-label="Loading research information">
+      <Skeleton className="h-20 rounded-xl" />
+      <div className="grid gap-4 xl:grid-cols-[minmax(280px,0.78fr)_minmax(0,1.42fr)]">
+        <Skeleton className="h-[560px] rounded-xl" />
+        <Skeleton className="h-[560px] rounded-xl" />
+      </div>
+    </div>
+  )
+}
+
+function formatCount(value: number) {
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value)
+}

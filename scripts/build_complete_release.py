@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlsplit
 import zipfile
 
 
@@ -23,10 +24,16 @@ MAXIMUM_FILE_BYTES = 1024 * 1024 * 1024
 MAXIMUM_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAXIMUM_PLATFORM_MANIFEST_BYTES = 8 * 1024 * 1024
+MAXIMUM_UPDATE_METADATA_BYTES = 1024 * 1024
 COPY_BUFFER_BYTES = 1024 * 1024
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 OBJECT_PATTERN = re.compile(r"[0-9a-f]{40}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
+UPDATE_CHANNEL_PATH = "share/market-squawk/update/channel.json"
+PINNED_UPDATE_ROOT_PATH = "share/market-squawk/update/1.root.json"
+UPDATE_SPEC_VERSION = "1.0.35"
 BUILD_ONLY_PYTHON_PATHS = frozenset({".lock", ".market-squawk-owned-v1"})
 LOCKED_PYTHON_PORTABILITY_EXCLUSIONS = {
     "x86_64-unknown-linux-gnu": {
@@ -160,6 +167,11 @@ class TargetProfile:
         suffix = self.executable_suffix
         return (
             (f"market-squawk-desktop{suffix}", f"bin/market-squawk-desktop{suffix}"),
+            (f"market-squawk-service{suffix}", f"bin/market-squawk-service{suffix}"),
+            (
+                f"market-squawk-mcp-relay{suffix}",
+                f"bin/market-squawk-mcp-relay{suffix}",
+            ),
             (
                 f"market-squawk-capture-helper{suffix}",
                 f"bin/market-squawk-capture-helper{suffix}",
@@ -223,6 +235,10 @@ class Options:
     python_release: Path
     native_bundle: Path
     output: Path
+    update_repository_base_url: str | None
+    pinned_update_root: Path | None
+    minimum_workspace_schema_version: int | None
+    maximum_workspace_schema_version: int | None
 
 
 @dataclass(frozen=True)
@@ -230,6 +246,7 @@ class AggregateOptions:
     inputs: tuple[Path, ...]
     install_template: Path
     output: Path
+    update_metadata: Path | None
 
 
 @dataclass(frozen=True)
@@ -289,11 +306,21 @@ def parse_aggregate_options(arguments: list[str]) -> AggregateOptions:
     parser.add_argument("--input", required=True, action="append", type=Path)
     parser.add_argument("--install-template", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--update-metadata",
+        type=Path,
+        help="closed directory containing externally signed TUF top-level metadata",
+    )
     values = parser.parse_args(arguments)
     return AggregateOptions(
         inputs=tuple(path.expanduser().absolute() for path in values.input),
         install_template=values.install_template.expanduser().absolute(),
         output=values.output.expanduser().absolute(),
+        update_metadata=(
+            values.update_metadata.expanduser().absolute()
+            if values.update_metadata is not None
+            else None
+        ),
     )
 
 
@@ -420,6 +447,16 @@ def aggregate_release(options: AggregateOptions) -> None:
     if sorted(targets) != sorted(TARGETS) or len(set(targets)) != len(TARGETS):
         raise ReleaseBuildError("platform release input set is incomplete or duplicated")
 
+    update_contracts = [_embedded_update_contract(release) for release in releases]
+    channel_bytes, channel, pinned_root_bytes = update_contracts[0]
+    if any(contract != update_contracts[0] for contract in update_contracts[1:]):
+        raise ReleaseBuildError("platform packages do not share one update trust contract")
+    available = channel.get("availability") == "available"
+    if available != (options.update_metadata is not None):
+        raise ReleaseBuildError(
+            "signed update metadata and the packaged update channel availability disagree"
+        )
+
     index_targets = []
     expected_outputs: set[str] = set()
     bootstrap_digests: dict[str, str] = {}
@@ -490,14 +527,33 @@ def aggregate_release(options: AggregateOptions) -> None:
     expected_outputs.add(install_path.name)
 
     artifacts = tuple(
-        path for path in sorted(output.iterdir()) if path.name != "SHA256SUMS"
+        path
+        for path in sorted(output.iterdir())
+        if path.is_file() and path.name != "SHA256SUMS"
     )
     write_checksums(output, artifacts)
     expected_outputs.add("SHA256SUMS")
-    observed = {path.name for path in output.iterdir()}
-    if observed != expected_outputs or any(
-        path.is_symlink() or not path.is_file() for path in output.iterdir()
-    ):
+
+    update_root = output / "update"
+    update_root.mkdir(mode=0o755)
+    _write_bytes(update_root / "channel.json", channel_bytes)
+    expected_outputs.add("update/channel.json")
+    if options.update_metadata is not None:
+        if pinned_root_bytes is None:
+            raise ReleaseBuildError("available update channel has no pinned root")
+        expected_outputs.update(
+            assemble_update_repository(
+                options.update_metadata,
+                update_root,
+                channel,
+                pinned_root_bytes,
+                releases,
+                output,
+            )
+        )
+
+    observed = set(list_regular_paths(output))
+    if observed != expected_outputs:
         raise ReleaseBuildError("aggregated GitHub Release asset set is not closed")
 
 
@@ -614,6 +670,290 @@ def _admit_platform_publish_input(path: Path) -> dict[str, object]:
     }
 
 
+def _embedded_update_contract(
+    release: dict[str, object],
+) -> tuple[bytes, dict[str, object], bytes | None]:
+    root = release["root"]
+    manifest = release["manifest"]
+    target = release["target"]
+    if not isinstance(root, Path) or not isinstance(manifest, dict) or not isinstance(target, dict):
+        raise ReleaseBuildError("platform release update contract is unavailable")
+    target_name = target["target"]
+    bundle = root / f"market-squawk-{manifest['version']}-{target_name}.zip"
+    component_by_path = {
+        component["path"]: component
+        for component in target["components"]
+        if isinstance(component, dict) and isinstance(component.get("path"), str)
+    }
+    try:
+        with zipfile.ZipFile(bundle, "r") as archive:
+            channel_bytes = archive.read(UPDATE_CHANNEL_PATH)
+            root_bytes = (
+                archive.read(PINNED_UPDATE_ROOT_PATH)
+                if PINNED_UPDATE_ROOT_PATH in archive.namelist()
+                else None
+            )
+    except KeyError as error:
+        raise ReleaseBuildError("platform package omits its update channel descriptor") from error
+    _verify_embedded_component(component_by_path, UPDATE_CHANNEL_PATH, channel_bytes)
+    channel = _parse_update_channel(channel_bytes)
+    if channel["availability"] == "available":
+        if root_bytes is None:
+            raise ReleaseBuildError("available platform package omits its pinned update root")
+        _verify_embedded_component(component_by_path, PINNED_UPDATE_ROOT_PATH, root_bytes)
+        root_envelope = _metadata_envelope(root_bytes, "root")
+        signed_root = root_envelope["signed"]
+        if signed_root.get("version") != 1 or signed_root.get("consistent_snapshot") is not True:
+            raise ReleaseBuildError("packaged pinned update root is invalid")
+        pinned = channel["pinnedRoot"]
+        if (
+            pinned["size"] != len(root_bytes)
+            or pinned["sha256"] != hashlib.sha256(root_bytes).hexdigest()
+        ):
+            raise ReleaseBuildError("packaged update root differs from its channel descriptor")
+    elif root_bytes is not None:
+        raise ReleaseBuildError("unavailable update channel must not ship a trust root")
+    return channel_bytes, channel, root_bytes
+
+
+def _verify_embedded_component(
+    components: dict[str, dict[str, object]], path: str, bytes_value: bytes
+) -> None:
+    component = components.get(path)
+    if (
+        component is None
+        or component.get("size") != len(bytes_value)
+        or component.get("sha256") != hashlib.sha256(bytes_value).hexdigest()
+        or component.get("executable") is not False
+    ):
+        raise ReleaseBuildError("packaged update component differs from its release manifest")
+
+
+def _parse_update_channel(bytes_value: bytes) -> dict[str, object]:
+    if not bytes_value or len(bytes_value) > MAXIMUM_UPDATE_METADATA_BYTES:
+        raise ReleaseBuildError("update channel descriptor exceeds its fixed bound")
+    try:
+        channel = json.loads(bytes_value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("update channel descriptor is malformed") from error
+    if not isinstance(channel, dict) or channel.get("schemaVersion") != 1:
+        raise ReleaseBuildError("update channel descriptor is invalid")
+    if channel.get("availability") == "unavailable":
+        if set(channel) != {"availability", "reason", "schemaVersion"} or channel.get(
+            "reason"
+        ) != "production-signing-material-unavailable":
+            raise ReleaseBuildError("unavailable update channel descriptor is invalid")
+        return channel
+    if set(channel) != {
+        "availability",
+        "maximumWorkspaceSchemaVersion",
+        "minimumWorkspaceSchemaVersion",
+        "pinnedRoot",
+        "repositoryBaseUrl",
+        "schemaVersion",
+        "targets",
+    } or channel.get("availability") != "available":
+        raise ReleaseBuildError("available update channel descriptor is invalid")
+    minimum = channel["minimumWorkspaceSchemaVersion"]
+    maximum = channel["maximumWorkspaceSchemaVersion"]
+    pinned = channel["pinnedRoot"]
+    targets = channel["targets"]
+    if (
+        type(minimum) is not int
+        or type(maximum) is not int
+        or minimum < 1
+        or minimum > maximum
+        or not isinstance(pinned, dict)
+        or set(pinned) != {"path", "sha256", "size"}
+        or pinned["path"] != "1.root.json"
+        or not isinstance(pinned["sha256"], str)
+        or SHA256_PATTERN.fullmatch(pinned["sha256"]) is None
+        or type(pinned["size"]) is not int
+        or pinned["size"] < 1
+        or pinned["size"] > MAXIMUM_UPDATE_METADATA_BYTES
+        or not isinstance(targets, dict)
+        or set(targets) != set(TARGETS)
+    ):
+        raise ReleaseBuildError("available update channel contract is invalid")
+    if not isinstance(channel["repositoryBaseUrl"], str):
+        raise ReleaseBuildError("update repository base URL is invalid")
+    _validate_update_base_url(channel["repositoryBaseUrl"])
+    for target_name, paths in targets.items():
+        if paths != _update_target_paths(target_name):
+            raise ReleaseBuildError("update channel target selection is invalid")
+    return channel
+
+
+def assemble_update_repository(
+    metadata_directory: Path,
+    update_root: Path,
+    channel: dict[str, object],
+    pinned_root_bytes: bytes,
+    releases: list[dict[str, object]],
+    aggregate_root: Path,
+) -> set[str]:
+    metadata_root = controlled_directory(metadata_directory, "signed update metadata")
+    paths = list_regular_paths(metadata_root)
+    target_names = [path for path in paths if re.fullmatch(r"[1-9][0-9]*\.targets\.json", path)]
+    snapshot_names = [
+        path for path in paths if re.fullmatch(r"[1-9][0-9]*\.snapshot\.json", path)
+    ]
+    if (
+        len(target_names) != 1
+        or len(snapshot_names) != 1
+        or set(paths)
+        != {"1.root.json", "timestamp.json", target_names[0], snapshot_names[0]}
+    ):
+        raise ReleaseBuildError("signed update metadata directory is not a closed role set")
+
+    copy_stable(metadata_root / "1.root.json", update_root / "1.root.json", executable=False)
+    copy_stable(
+        metadata_root / snapshot_names[0],
+        update_root / snapshot_names[0],
+        executable=False,
+    )
+    copy_stable(
+        metadata_root / target_names[0],
+        update_root / target_names[0],
+        executable=False,
+    )
+    copy_stable(metadata_root / "timestamp.json", update_root / "timestamp.json", executable=False)
+    root_bytes = (update_root / "1.root.json").read_bytes()
+    if root_bytes != pinned_root_bytes:
+        raise ReleaseBuildError("signed update repository root differs from the packaged pin")
+    root_envelope = _metadata_envelope(root_bytes, "root")
+    if (
+        root_envelope["signed"].get("version") != 1
+        or root_envelope["signed"].get("consistent_snapshot") is not True
+    ):
+        raise ReleaseBuildError("signed update repository root is invalid")
+
+    timestamp_bytes = (update_root / "timestamp.json").read_bytes()
+    snapshot_bytes = (update_root / snapshot_names[0]).read_bytes()
+    targets_bytes = (update_root / target_names[0]).read_bytes()
+    timestamp = _metadata_envelope(timestamp_bytes, "timestamp")["signed"]
+    snapshot = _metadata_envelope(snapshot_bytes, "snapshot")["signed"]
+    targets = _metadata_envelope(targets_bytes, "targets")["signed"]
+    if targets.get("delegations") is not None:
+        raise ReleaseBuildError("delegated update targets are unsupported")
+    if snapshot_names[0] != f"{snapshot['version']}.snapshot.json" or target_names[
+        0
+    ] != f"{targets['version']}.targets.json":
+        raise ReleaseBuildError("signed update metadata filenames do not match role versions")
+    _verify_metadata_description(
+        timestamp,
+        "snapshot.json",
+        snapshot["version"],
+        snapshot_bytes,
+    )
+    _verify_metadata_description(
+        snapshot,
+        "targets.json",
+        targets["version"],
+        targets_bytes,
+    )
+
+    described_targets = targets.get("targets")
+    expected_sources: dict[str, Path] = {}
+    for release in releases:
+        manifest = release["manifest"]
+        target = release["target"]["target"]
+        selected = channel["targets"][target]
+        expected_sources[selected["manifestTargetPath"]] = (
+            aggregate_root / f"market-squawk-release-{target}.json"
+        )
+        expected_sources[selected["archiveTargetPath"]] = (
+            aggregate_root / f"market-squawk-{manifest['version']}-{target}.zip"
+        )
+    if not isinstance(described_targets, dict) or set(described_targets) != set(expected_sources):
+        raise ReleaseBuildError("signed update targets do not match the complete platform set")
+
+    minimum = channel["minimumWorkspaceSchemaVersion"]
+    maximum = channel["maximumWorkspaceSchemaVersion"]
+    release_version = releases[0]["manifest"]["version"]
+    expected_paths = {
+        "update/channel.json",
+        "update/1.root.json",
+        f"update/{snapshot_names[0]}",
+        f"update/{target_names[0]}",
+        "update/timestamp.json",
+    }
+    for logical_path, source in sorted(expected_sources.items()):
+        description = described_targets[logical_path]
+        is_manifest = logical_path.endswith("/manifest.json")
+        _verify_target_description(
+            description,
+            source,
+            release_version=release_version if is_manifest else None,
+            minimum_schema_version=minimum if is_manifest else None,
+            maximum_schema_version=maximum if is_manifest else None,
+        )
+        digest = file_sha256(source)
+        consistent_path = _consistent_target_path(logical_path, digest)
+        copy_stable(source, update_root / consistent_path, executable=False)
+        expected_paths.add(f"update/{consistent_path}")
+    return expected_paths
+
+
+def _verify_metadata_description(
+    parent: dict[str, object],
+    role_name: str,
+    version: int,
+    child_bytes: bytes,
+) -> None:
+    meta = parent.get("meta")
+    description = meta.get(role_name) if isinstance(meta, dict) else None
+    if (
+        not isinstance(description, dict)
+        or set(description) != {"hashes", "length", "version"}
+        or type(description.get("version")) is not int
+        or type(description.get("length")) is not int
+        or description.get("version") != version
+        or description.get("length") != len(child_bytes)
+        or description.get("hashes")
+        != {"sha256": hashlib.sha256(child_bytes).hexdigest()}
+    ):
+        raise ReleaseBuildError("signed update metadata parent identity is invalid")
+
+
+def _verify_target_description(
+    description: object,
+    source: Path,
+    *,
+    release_version: str | None,
+    minimum_schema_version: int | None,
+    maximum_schema_version: int | None,
+) -> None:
+    if not isinstance(description, dict):
+        raise ReleaseBuildError("signed update target identity is invalid")
+    expected_keys = {"hashes", "length"}
+    if release_version is not None:
+        expected_keys.add("custom")
+    if (
+        set(description) != expected_keys
+        or type(description.get("length")) is not int
+        or description.get("length") != source.stat().st_size
+        or description.get("hashes") != {"sha256": file_sha256(source)}
+    ):
+        raise ReleaseBuildError("signed update target differs from the release artifact")
+    if release_version is not None and description.get("custom") != {
+        "marketSquawk": {
+            "maximumSchemaVersion": maximum_schema_version,
+            "minimumSchemaVersion": minimum_schema_version,
+            "releaseVersion": release_version,
+            "schemaVersion": 1,
+        }
+    }:
+        raise ReleaseBuildError("signed update manifest compatibility is invalid")
+
+
+def _consistent_target_path(logical_path: str, digest: str) -> str:
+    parent, name = logical_path.rsplit("/", 1)
+    path = f"{parent}/{digest}.{name}"
+    validate_portable_path(path)
+    return path
+
+
 def _admit_manifest_target(
     root: Path,
     tag: str,
@@ -721,6 +1061,113 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
         os.fsync(stream.fileno())
 
 
+def _write_bytes(path: Path, value: bytes) -> None:
+    if not value or len(value) > MAXIMUM_UPDATE_METADATA_BYTES:
+        raise ReleaseBuildError("update metadata output exceeds its fixed bound")
+    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    with path.open("xb") as stream:
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _metadata_envelope(bytes_value: bytes, expected_role: str) -> dict[str, object]:
+    if not bytes_value or len(bytes_value) > MAXIMUM_UPDATE_METADATA_BYTES:
+        raise ReleaseBuildError(f"{expected_role} metadata exceeds its fixed bound")
+    try:
+        value = json.loads(bytes_value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError(f"{expected_role} metadata is malformed") from error
+    if not isinstance(value, dict) or set(value) != {"signatures", "signed"}:
+        raise ReleaseBuildError(f"{expected_role} metadata envelope is invalid")
+    signatures = value["signatures"]
+    signed = value["signed"]
+    if (
+        not isinstance(signatures, list)
+        or not signatures
+        or len(signatures) > 64
+        or not isinstance(signed, dict)
+        or signed.get("_type") != expected_role
+        or signed.get("spec_version") != UPDATE_SPEC_VERSION
+        or type(signed.get("version")) is not int
+        or signed["version"] < 1
+        or not isinstance(signed.get("expires"), str)
+        or not signed["expires"]
+    ):
+        raise ReleaseBuildError(f"{expected_role} signed metadata is invalid")
+    seen = set()
+    for signature in signatures:
+        if (
+            not isinstance(signature, dict)
+            or set(signature) != {"keyid", "sig"}
+            or not isinstance(signature["keyid"], str)
+            or not isinstance(signature["sig"], str)
+            or SHA256_PATTERN.fullmatch(signature["keyid"]) is None
+            or SIGNATURE_PATTERN.fullmatch(signature["sig"]) is None
+            or signature["keyid"] in seen
+        ):
+            raise ReleaseBuildError(f"{expected_role} metadata signatures are invalid")
+        seen.add(signature["keyid"])
+    if expected_role == "root":
+        _validate_root_metadata(signed)
+    return value
+
+
+def _validate_root_metadata(signed: dict[str, object]) -> None:
+    keys = signed.get("keys")
+    roles = signed.get("roles")
+    if (
+        signed.get("consistent_snapshot") is not True
+        or not isinstance(keys, dict)
+        or not 1 <= len(keys) <= 64
+        or not isinstance(roles, dict)
+        or not {"root", "targets", "snapshot", "timestamp"}.issubset(roles)
+    ):
+        raise ReleaseBuildError("root trust roles are invalid")
+    for key_id, key in keys.items():
+        if (
+            not isinstance(key_id, str)
+            or SHA256_PATTERN.fullmatch(key_id) is None
+            or not isinstance(key, dict)
+            or key.get("keytype") != "ed25519"
+            or key.get("scheme") != "ed25519"
+            or not isinstance(key.get("keyval"), dict)
+            or not isinstance(key["keyval"].get("public"), str)
+            or SHA256_PATTERN.fullmatch(key["keyval"]["public"]) is None
+        ):
+            raise ReleaseBuildError("root public key is invalid")
+    for role in roles.values():
+        if not isinstance(role, dict) or set(role) != {"keyids", "threshold"}:
+            raise ReleaseBuildError("root role definition is invalid")
+        key_ids = role["keyids"]
+        threshold = role["threshold"]
+        if (
+            not isinstance(key_ids, list)
+            or any(not isinstance(key_id, str) for key_id in key_ids)
+            or type(threshold) is not int
+            or threshold < 1
+            or threshold > len(key_ids)
+            or len(set(key_ids)) != len(key_ids)
+            or any(key_id not in keys for key_id in key_ids)
+        ):
+            raise ReleaseBuildError("root role threshold is invalid")
+
+
+def _validate_update_base_url(value: str) -> None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.endswith("/")
+        or parsed.path.startswith("//")
+    ):
+        raise ReleaseBuildError("update repository base URL is invalid")
+
+
 def _render_install_template(
     template: Path,
     output: Path,
@@ -769,14 +1216,34 @@ def parse_options() -> Options:
     parser.add_argument("--python-release", required=True, type=Path)
     parser.add_argument("--native-bundle", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--update-repository-base-url")
+    parser.add_argument("--pinned-update-root", type=Path)
+    parser.add_argument("--minimum-workspace-schema-version", type=int)
+    parser.add_argument("--maximum-workspace-schema-version", type=int)
     values = parser.parse_args()
+    update_values = (
+        values.update_repository_base_url,
+        values.pinned_update_root,
+        values.minimum_workspace_schema_version,
+        values.maximum_workspace_schema_version,
+    )
     if (
         VERSION_PATTERN.fullmatch(values.version) is None
         or OBJECT_PATTERN.fullmatch(values.commit) is None
         or OBJECT_PATTERN.fullmatch(values.tree) is None
         or values.native_trust_mode not in NATIVE_TRUST_MODES[values.target]
+        or any(value is None for value in update_values)
+        and any(value is not None for value in update_values)
     ):
         raise ReleaseBuildError("release identity or native trust mode is invalid")
+    if all(value is not None for value in update_values):
+        _validate_update_base_url(values.update_repository_base_url)
+        if (
+            values.minimum_workspace_schema_version < 1
+            or values.minimum_workspace_schema_version
+            > values.maximum_workspace_schema_version
+        ):
+            raise ReleaseBuildError("workspace update compatibility range is invalid")
     return Options(
         target=TARGETS[values.target],
         native_trust_mode=values.native_trust_mode,
@@ -786,6 +1253,14 @@ def parse_options() -> Options:
         python_release=values.python_release.expanduser().absolute(),
         native_bundle=values.native_bundle.expanduser().absolute(),
         output=values.output.expanduser().absolute(),
+        update_repository_base_url=values.update_repository_base_url,
+        pinned_update_root=(
+            values.pinned_update_root.expanduser().absolute()
+            if values.pinned_update_root is not None
+            else None
+        ),
+        minimum_workspace_schema_version=values.minimum_workspace_schema_version,
+        maximum_workspace_schema_version=values.maximum_workspace_schema_version,
     )
 
 
@@ -877,6 +1352,7 @@ def assemble_staging(root: Path, staging: Path, options: Options) -> None:
             staging / destination_name,
             executable=True,
         )
+    write_package_update_contract(staging, options)
     for source_name, destination_name in (*LICENSE_INPUTS, *NOTICE_INPUTS):
         copy_stable(root / source_name, staging / destination_name, executable=False)
 
@@ -898,10 +1374,78 @@ def assemble_staging(root: Path, staging: Path, options: Options) -> None:
         raise ReleaseBuildError("complete staging tree is missing a required product component")
 
 
+def write_package_update_contract(staging: Path, options: Options) -> None:
+    channel_path = staging / UPDATE_CHANNEL_PATH
+    channel_path.parent.mkdir(parents=True, mode=0o755)
+    if options.pinned_update_root is None:
+        _write_json(
+            channel_path,
+            {
+                "availability": "unavailable",
+                "reason": "production-signing-material-unavailable",
+                "schemaVersion": 1,
+            },
+        )
+        return
+
+    root = controlled_regular_file(
+        options.pinned_update_root,
+        "pinned update root",
+        MAXIMUM_UPDATE_METADATA_BYTES,
+    )
+    root_path = staging / PINNED_UPDATE_ROOT_PATH
+    copy_stable(root, root_path, executable=False)
+    root_bytes = root_path.read_bytes()
+    root_envelope = _metadata_envelope(root_bytes, "root")
+    if root_envelope["signed"].get("version") != 1:
+        raise ReleaseBuildError("pinned update root must be version 1")
+    minimum = options.minimum_workspace_schema_version
+    maximum = options.maximum_workspace_schema_version
+    if minimum is None or maximum is None or options.update_repository_base_url is None:
+        raise ReleaseBuildError("available update channel is incomplete")
+    _write_json(
+        channel_path,
+        {
+            "availability": "available",
+            "minimumWorkspaceSchemaVersion": minimum,
+            "maximumWorkspaceSchemaVersion": maximum,
+            "pinnedRoot": {
+                "path": "1.root.json",
+                "sha256": hashlib.sha256(root_bytes).hexdigest(),
+                "size": len(root_bytes),
+            },
+            "repositoryBaseUrl": options.update_repository_base_url,
+            "schemaVersion": 1,
+            "targets": {
+                target: _update_target_paths(target) for target in sorted(TARGETS)
+            },
+        },
+    )
+
+
+def _update_target_paths(target: str) -> dict[str, str]:
+    return {
+        "archiveTargetPath": f"channels/stable/{target}/bundle.zip",
+        "manifestTargetPath": f"channels/stable/{target}/manifest.json",
+    }
+
+
 def controlled_directory(path: Path, label: str) -> Path:
     metadata = path.lstat()
     if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
         raise ReleaseBuildError(f"{label} is not a controlled directory")
+    return path.resolve(strict=True)
+
+
+def controlled_regular_file(path: Path, label: str, maximum: int) -> Path:
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size == 0
+        or metadata.st_size > maximum
+    ):
+        raise ReleaseBuildError(f"{label} is not a bounded regular file")
     return path.resolve(strict=True)
 
 

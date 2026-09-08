@@ -26,11 +26,14 @@ EXPECTED_MANIFESTS = {
     "market-squawk-platform": "crates/market-squawk-platform/Cargo.toml",
     "market-squawk-sources": "crates/market-squawk-sources/Cargo.toml",
     "market-squawk-live": "crates/market-squawk-live/Cargo.toml",
+    "market-squawk-jobs": "crates/market-squawk-jobs/Cargo.toml",
     "market-squawk-data": "crates/market-squawk-data/Cargo.toml",
     "market-squawk-analytics": "crates/market-squawk-analytics/Cargo.toml",
+    "market-squawk-decisions": "crates/market-squawk-decisions/Cargo.toml",
     "market-squawk-services": "crates/market-squawk-services/Cargo.toml",
     "market-squawk-modeling": "crates/market-squawk-modeling/Cargo.toml",
     "market-squawk-portfolio": "crates/market-squawk-portfolio/Cargo.toml",
+    "market-squawk-runtime": "crates/market-squawk-runtime/Cargo.toml",
     "market-squawk-backtesting": "crates/market-squawk-backtesting/Cargo.toml",
     "market-squawk-execution": "crates/market-squawk-execution/Cargo.toml",
     "market-squawk-valuation": "crates/market-squawk-valuation/Cargo.toml",
@@ -74,10 +77,28 @@ CORE_LOCAL_DEPENDENCIES = {
         "market-squawk-sources",
     },
     "market-squawk-services": {"market-squawk-domain", "market-squawk-platform"},
+    "market-squawk-jobs": {
+        "market-squawk-domain",
+        "market-squawk-platform",
+        "market-squawk-services",
+    },
+    "market-squawk-runtime": {
+        "market-squawk-domain",
+        "market-squawk-jobs",
+        "market-squawk-platform",
+        "market-squawk-services",
+    },
     "market-squawk-modeling": {
         "market-squawk-domain",
         "market-squawk-analytics",
         "market-squawk-data",
+    },
+    "market-squawk-decisions": {
+        "market-squawk-domain",
+        "market-squawk-analytics",
+        "market-squawk-modeling",
+        "market-squawk-portfolio",
+        "market-squawk-valuation",
     },
     "market-squawk-portfolio": {
         "market-squawk-domain",
@@ -108,7 +129,9 @@ CORE_LOCAL_DEPENDENCIES = {
     },
     "market-squawk-mcp": {
         "market-squawk-domain",
+        "market-squawk-jobs",
         "market-squawk-platform",
+        "market-squawk-runtime",
         "market-squawk-services",
     },
     "market-squawk-python": {
@@ -235,8 +258,11 @@ def allowed_local_dependencies(package_name: str) -> set[str]:
             "market-squawk-data",
             "market-squawk-installer",
             "market-squawk-platform",
+            "market-squawk-runtime",
             "market-squawk-services",
         }
+    if package_name == "market-squawk-installer":
+        return {"market-squawk-runtime"}
     if package_name in PROVIDER_ADAPTERS:
         return PROVIDER_DEPENDENCIES
     if package_name == "market-squawk-adapter-paper":

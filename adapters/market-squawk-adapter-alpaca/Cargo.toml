@@ -1,0 +1,40 @@
+[package]
+name = "market-squawk-adapter-alpaca"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded Alpaca Basic market-data adapter for Market Squawk"
+repository = "https://github.com/Sawmonabo/market-squawk"
+readme = "../../README.md"
+keywords = ["finance", "market-data", "alpaca", "websocket"]
+categories = ["finance", "network-programming"]
+
+[features]
+default = []
+scripted-historical-transport-fixture = []
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
+market-squawk-sources.workspace = true
+reqwest.workspace = true
+rmp-serde.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

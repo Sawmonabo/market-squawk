@@ -2,7 +2,9 @@
 
 use std::num::{NonZeroU32, NonZeroUsize};
 
-use market_squawk_domain::RoundingPolicy;
+use market_squawk_domain::{
+    FeatureDatasetMacroComponentDescriptor, RoundingPolicy, feature_dataset_macro_components_v1,
+};
 
 use crate::{
     BatchRegistrationOutcome, FeatureDataType, FeatureInput, FeatureInputSchema, FeatureKey,
@@ -13,7 +15,8 @@ use crate::{
 };
 
 /// Number of code-owned batch feature definitions compiled into this release.
-pub const REQUIRED_BATCH_FEATURE_COUNT: usize = 43;
+pub const REQUIRED_BATCH_FEATURE_COUNT: usize =
+    BATCH_SPECS.len() + feature_dataset_macro_components_v1().len();
 
 /// Result-changing policies shared by canonical batch-feature definitions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +157,13 @@ impl BatchFeatureCatalog {
         let entries = BATCH_SPECS
             .iter()
             .map(|spec| metadata(*spec, config, implementation_revision))
+            .chain(
+                feature_dataset_macro_components_v1()
+                    .iter()
+                    .map(|descriptor| {
+                        macro_component_metadata(*descriptor, config, implementation_revision)
+                    }),
+            )
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             entries: entries.into_boxed_slice(),
@@ -221,6 +231,7 @@ enum InputFamily {
     RateCurve,
     RateCurvePair,
     MacroSurprise,
+    MacroComponent,
     Portfolio,
     PortfolioAndScenario,
 }
@@ -258,7 +269,7 @@ const fn spec(
     }
 }
 
-const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
+const BATCH_SPECS: &[BatchSpec] = &[
     spec(
         "research.price-return",
         KnownFeatureImplementation::BatchReturns,
@@ -672,6 +683,26 @@ fn metadata(
     )
 }
 
+fn macro_component_metadata(
+    descriptor: FeatureDatasetMacroComponentDescriptor,
+    config: BatchFeatureCatalogConfig,
+    revision: &str,
+) -> Result<FeatureMetadata, FeatureMetadataError> {
+    metadata(
+        spec(
+            descriptor.component_name(),
+            KnownFeatureImplementation::BatchMacro,
+            InputFamily::MacroComponent,
+            FeatureOutputType::Decimal,
+            FeatureUnit::Rate,
+            1,
+            ParameterFamily::None,
+        ),
+        config,
+        revision,
+    )
+}
+
 fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataError> {
     let fields = match family {
         InputFamily::Prices => vec![
@@ -847,6 +878,9 @@ fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataErro
                 FeatureUnit::Unitless,
             )?,
         ],
+        InputFamily::MacroComponent => {
+            vec![field("value", FeatureDataType::Decimal, FeatureUnit::Rate)?]
+        }
         InputFamily::Portfolio => vec![
             field(
                 "allocation_dimensions",

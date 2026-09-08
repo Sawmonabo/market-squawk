@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stage-training-input"
+description = "Enables the stage_training_input command without any pre-configured scope."
+commands.allow = ["stage_training_input"]
+
+[[permission]]
+identifier = "deny-stage-training-input"
+description = "Denies the stage_training_input command without any pre-configured scope."
+commands.deny = ["stage_training_input"]

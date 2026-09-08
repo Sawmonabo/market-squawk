@@ -20,6 +20,136 @@ const MAX_EVIDENCE_ARTIFACTS: usize = 100_000;
 const MAX_EVIDENCE_REFERENCES: usize = 400_000;
 const MAX_EVIDENCE_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAX_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_PROVIDER_RELATION_KEY_BYTES: usize = 128;
+
+/// Closed durable provider relations whose exact rows participate in catalog authority evidence.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ProviderCatalogRelation {
+    SealedRawObject,
+    LogicalPublicationBinding,
+    LogicalPublicationRequiredFamily,
+    LogicalPublicationObject,
+    LogicalPublicationPartition,
+    LogicalPublicationCanonicalExpectation,
+    OptionMarketBinding,
+    OptionMarketNativeLineage,
+    OptionMarketBindingRow,
+    MarketEventSelectionIndex,
+    DirectProviderCaptureBinding,
+    DirectProviderPublicationBinding,
+}
+
+impl ProviderCatalogRelation {
+    pub(super) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::SealedRawObject => 1,
+            Self::LogicalPublicationBinding => 2,
+            Self::LogicalPublicationRequiredFamily => 3,
+            Self::LogicalPublicationObject => 4,
+            Self::LogicalPublicationPartition => 5,
+            Self::LogicalPublicationCanonicalExpectation => 6,
+            Self::OptionMarketBinding => 7,
+            Self::OptionMarketNativeLineage => 8,
+            Self::OptionMarketBindingRow => 9,
+            Self::MarketEventSelectionIndex => 10,
+            Self::DirectProviderCaptureBinding => 11,
+            Self::DirectProviderPublicationBinding => 12,
+        }
+    }
+
+    pub(crate) const fn database_name(self) -> &'static str {
+        match self {
+            Self::SealedRawObject => "sealed_raw_objects",
+            Self::LogicalPublicationBinding => "provider_logical_publication_bindings",
+            Self::LogicalPublicationRequiredFamily => {
+                "provider_logical_publication_required_families"
+            }
+            Self::LogicalPublicationObject => "provider_logical_publication_objects",
+            Self::LogicalPublicationPartition => "provider_logical_publication_partitions",
+            Self::LogicalPublicationCanonicalExpectation => {
+                "provider_logical_publication_canonical_expectations"
+            }
+            Self::OptionMarketBinding => "provider_option_market_bindings",
+            Self::OptionMarketNativeLineage => "provider_option_market_binding_native_lineage",
+            Self::OptionMarketBindingRow => "provider_option_market_binding_rows",
+            Self::MarketEventSelectionIndex => "provider_market_event_selection_index",
+            Self::DirectProviderCaptureBinding => "ingest_run_provider_capture_bindings",
+            Self::DirectProviderPublicationBinding => "ingest_run_provider_publication_bindings",
+        }
+    }
+
+    fn from_database_name(value: &str) -> Option<Self> {
+        Some(match value {
+            "sealed_raw_objects" => Self::SealedRawObject,
+            "provider_logical_publication_bindings" => Self::LogicalPublicationBinding,
+            "provider_logical_publication_required_families" => {
+                Self::LogicalPublicationRequiredFamily
+            }
+            "provider_logical_publication_objects" => Self::LogicalPublicationObject,
+            "provider_logical_publication_partitions" => Self::LogicalPublicationPartition,
+            "provider_logical_publication_canonical_expectations" => {
+                Self::LogicalPublicationCanonicalExpectation
+            }
+            "provider_option_market_bindings" => Self::OptionMarketBinding,
+            "provider_option_market_binding_native_lineage" => Self::OptionMarketNativeLineage,
+            "provider_option_market_binding_rows" => Self::OptionMarketBindingRow,
+            "provider_market_event_selection_index" => Self::MarketEventSelectionIndex,
+            "ingest_run_provider_capture_bindings" => Self::DirectProviderCaptureBinding,
+            "ingest_run_provider_publication_bindings" => Self::DirectProviderPublicationBinding,
+            _ => return None,
+        })
+    }
+}
+
+/// One exact provider-catalog row reduced under a relation-specific, field-complete SHA-256 domain.
+///
+/// Large JSON and native sidecar values are hashed while each SQLite row is owned and are not
+/// retained in the snapshot. The canonical primary key remains explicit so duplicate rows and
+/// non-deterministic relation ordering fail closed independently of the row-content digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderCatalogRelationEvidenceRow {
+    relation: ProviderCatalogRelation,
+    primary_key: Box<[u8]>,
+    row_content_digest: Sha256Digest,
+    accounted_object_bytes: u64,
+}
+
+impl ProviderCatalogRelationEvidenceRow {
+    pub(crate) fn try_new(
+        relation: ProviderCatalogRelation,
+        primary_key: impl Into<Box<[u8]>>,
+        row_content_digest: Sha256Digest,
+        accounted_object_bytes: u64,
+    ) -> Result<Self, EvidenceError> {
+        let primary_key = primary_key.into();
+        if primary_key.is_empty()
+            || primary_key.len() > MAX_PROVIDER_RELATION_KEY_BYTES
+            || (relation == ProviderCatalogRelation::SealedRawObject)
+                != (accounted_object_bytes > 0)
+            || accounted_object_bytes > MAX_EVIDENCE_OBJECT_BYTES
+        {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        }
+        Ok(Self {
+            relation,
+            primary_key,
+            row_content_digest,
+            accounted_object_bytes,
+        })
+    }
+
+    pub(super) const fn relation(&self) -> ProviderCatalogRelation {
+        self.relation
+    }
+
+    pub(super) fn primary_key(&self) -> &[u8] {
+        &self.primary_key
+    }
+
+    pub(super) const fn row_content_digest(&self) -> Sha256Digest {
+        self.row_content_digest
+    }
+}
 
 /// Caller-selected resource bounds, capped by fixed process ceilings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +231,7 @@ impl EvidenceSnapshotRequest {
 pub(crate) struct ArtifactEvidenceRow {
     artifact_id: Uuid,
     run_id: Uuid,
+    publication_ordinal: u16,
     relative_reference: Box<str>,
     content_hash: Sha256Digest,
     size_bytes: u64,
@@ -110,6 +241,7 @@ impl ArtifactEvidenceRow {
     pub(crate) fn try_new(
         artifact_id: Uuid,
         run_id: Uuid,
+        publication_ordinal: u16,
         relative_reference: impl Into<Box<str>>,
         content_hash: Sha256Digest,
         size_bytes: u64,
@@ -117,6 +249,7 @@ impl ArtifactEvidenceRow {
         let relative_reference = relative_reference.into();
         if artifact_id.is_nil()
             || run_id.is_nil()
+            || publication_ordinal > 1023
             || size_bytes == 0
             || size_bytes > MAX_EVIDENCE_OBJECT_BYTES
             || !canonical_object_reference(&relative_reference, content_hash)
@@ -126,6 +259,7 @@ impl ArtifactEvidenceRow {
         Ok(Self {
             artifact_id,
             run_id,
+            publication_ordinal,
             relative_reference,
             content_hash,
             size_bytes,
@@ -138,6 +272,10 @@ impl ArtifactEvidenceRow {
 
     pub(super) const fn run_id(&self) -> Uuid {
         self.run_id
+    }
+
+    pub(super) const fn publication_ordinal(&self) -> u16 {
+        self.publication_ordinal
     }
 
     pub(crate) fn relative_reference(&self) -> &str {
@@ -515,15 +653,67 @@ pub(crate) struct CatalogEvidenceSnapshot {
     manifests: Vec<ManifestEvidenceRow>,
     generations: Vec<GenerationEvidenceRow>,
     query_artifacts: Vec<QueryArtifactEvidenceRow>,
+    provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
 }
 
 impl CatalogEvidenceSnapshot {
+    #[cfg(test)]
     pub(crate) fn try_new(
         request: EvidenceSnapshotRequest,
         artifacts: Vec<ArtifactEvidenceRow>,
         manifests: Vec<ManifestEvidenceRow>,
         generations: Vec<GenerationEvidenceRow>,
         query_artifacts: Vec<QueryArtifactEvidenceRow>,
+    ) -> Result<Self, EvidenceError> {
+        Self::try_new_with_provider_relations(
+            request,
+            artifacts,
+            manifests,
+            generations,
+            query_artifacts,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn try_new_with_provider_relation_rows(
+        request: EvidenceSnapshotRequest,
+        artifacts: Vec<ArtifactEvidenceRow>,
+        manifests: Vec<ManifestEvidenceRow>,
+        generations: Vec<GenerationEvidenceRow>,
+        query_artifacts: Vec<QueryArtifactEvidenceRow>,
+        provider_relation_rows: Vec<(Box<str>, Box<[u8]>, Sha256Digest, u64)>,
+    ) -> Result<Self, EvidenceError> {
+        let provider_relations = provider_relation_rows
+            .into_iter()
+            .map(
+                |(relation, primary_key, row_content_digest, accounted_object_bytes)| {
+                    ProviderCatalogRelationEvidenceRow::try_new(
+                        ProviderCatalogRelation::from_database_name(&relation)
+                            .ok_or(EvidenceError::InvalidCatalogEvidence)?,
+                        primary_key,
+                        row_content_digest,
+                        accounted_object_bytes,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new_with_provider_relations(
+            request,
+            artifacts,
+            manifests,
+            generations,
+            query_artifacts,
+            provider_relations,
+        )
+    }
+
+    fn try_new_with_provider_relations(
+        request: EvidenceSnapshotRequest,
+        artifacts: Vec<ArtifactEvidenceRow>,
+        manifests: Vec<ManifestEvidenceRow>,
+        generations: Vec<GenerationEvidenceRow>,
+        query_artifacts: Vec<QueryArtifactEvidenceRow>,
+        provider_relations: Vec<ProviderCatalogRelationEvidenceRow>,
     ) -> Result<Self, EvidenceError> {
         let limits = request.limits;
         let generation_objects = generations.iter().try_fold(0_usize, |count, generation| {
@@ -542,10 +732,16 @@ impl CatalogEvidenceSnapshot {
             .and_then(|count| count.checked_add(generation_objects))
             .and_then(|count| count.checked_add(generation_parents))
             .and_then(|count| count.checked_add(query_artifacts.len()))
+            .and_then(|count| count.checked_add(provider_relations.len()))
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
+        let sealed_raw_objects = provider_relations
+            .iter()
+            .filter(|row| row.relation == ProviderCatalogRelation::SealedRawObject)
+            .count();
         let physical_artifacts = artifacts
             .len()
             .checked_add(query_artifacts.len())
+            .and_then(|count| count.checked_add(sealed_raw_objects))
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         if physical_artifacts > limits.max_artifacts || references > limits.max_references {
             return Err(EvidenceError::ResourceLimitExceeded);
@@ -556,6 +752,7 @@ impl CatalogEvidenceSnapshot {
             &manifests,
             &generations,
             &query_artifacts,
+            &provider_relations,
         )?;
         Ok(Self {
             request,
@@ -563,6 +760,7 @@ impl CatalogEvidenceSnapshot {
             manifests,
             generations,
             query_artifacts,
+            provider_relations,
         })
     }
 
@@ -584,6 +782,10 @@ impl CatalogEvidenceSnapshot {
 
     pub(crate) fn query_artifacts(&self) -> &[QueryArtifactEvidenceRow] {
         &self.query_artifacts
+    }
+
+    pub(crate) fn provider_relations(&self) -> &[ProviderCatalogRelationEvidenceRow] {
+        &self.provider_relations
     }
 
     pub(crate) fn physical_artifact_count(&self) -> usize {
@@ -612,11 +814,12 @@ fn validate_relational_evidence(
     manifests: &[ManifestEvidenceRow],
     generations: &[GenerationEvidenceRow],
     query_artifacts: &[QueryArtifactEvidenceRow],
+    provider_relations: &[ProviderCatalogRelationEvidenceRow],
 ) -> Result<(), EvidenceError> {
     let limits = request.limits;
     let mut artifacts_by_id = BTreeMap::new();
+    let mut artifacts_by_run: BTreeMap<Uuid, BTreeMap<u16, &ArtifactEvidenceRow>> = BTreeMap::new();
     let mut physical_artifact_ids = BTreeSet::new();
-    let mut runs = BTreeSet::new();
     let mut references = BTreeSet::new();
     let mut total_bytes = 0_u64;
     for artifact in artifacts {
@@ -625,7 +828,11 @@ fn validate_relational_evidence(
                 .insert(artifact.artifact_id, artifact)
                 .is_some()
             || !physical_artifact_ids.insert(artifact.artifact_id)
-            || !runs.insert(artifact.run_id)
+            || artifacts_by_run
+                .entry(artifact.run_id)
+                .or_default()
+                .insert(artifact.publication_ordinal, artifact)
+                .is_some()
             || !references.insert(artifact.relative_reference.as_ref())
         {
             return Err(EvidenceError::InvalidCatalogEvidence);
@@ -637,10 +844,29 @@ fn validate_relational_evidence(
             return Err(EvidenceError::ResourceLimitExceeded);
         }
     }
+    if artifacts_by_run.values().any(|group| {
+        group.is_empty()
+            || group.len() > 1024
+            || group
+                .keys()
+                .copied()
+                .enumerate()
+                .any(|(expected, retained)| usize::from(retained) != expected)
+    }) {
+        return Err(EvidenceError::InvalidCatalogEvidence);
+    }
 
     let mut manifests_by_id = BTreeMap::new();
+    let mut manifest_runs = BTreeSet::new();
     for manifest in manifests {
-        if !artifacts_by_id.contains_key(&manifest.artifact_id)
+        let Some(anchor) = artifacts_by_id.get(&manifest.artifact_id) else {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        };
+        let group = artifacts_by_run
+            .get(&anchor.run_id)
+            .ok_or(EvidenceError::InvalidCatalogEvidence)?;
+        if usize::from(anchor.publication_ordinal) != group.len() - 1
+            || !manifest_runs.insert(anchor.run_id)
             || manifests_by_id
                 .insert(manifest.manifest_id, manifest)
                 .is_some()
@@ -686,7 +912,12 @@ fn validate_relational_evidence(
         validate_generation_parents(generation, &generations_by_dataset)?;
     }
     for versions in generations_by_dataset.values() {
-        validate_dataset_history(versions)?;
+        validate_dataset_history(
+            versions,
+            &manifests_by_id,
+            &artifacts_by_id,
+            &artifacts_by_run,
+        )?;
     }
 
     let mut query_reservations = BTreeSet::new();
@@ -701,6 +932,20 @@ fn validate_relational_evidence(
         }
         total_bytes = total_bytes
             .checked_add(query.size_bytes)
+            .ok_or(EvidenceError::ResourceLimitExceeded)?;
+        if total_bytes > limits.max_total_bytes {
+            return Err(EvidenceError::ResourceLimitExceeded);
+        }
+    }
+    let mut provider_keys = BTreeSet::new();
+    for row in provider_relations {
+        if !provider_keys.insert((row.relation, row.primary_key.as_ref()))
+            || row.accounted_object_bytes > limits.max_object_bytes
+        {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        }
+        total_bytes = total_bytes
+            .checked_add(row.accounted_object_bytes)
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         if total_bytes > limits.max_total_bytes {
             return Err(EvidenceError::ResourceLimitExceeded);
@@ -763,6 +1008,9 @@ fn validate_generation_parents(
 
 fn validate_dataset_history(
     versions: &BTreeMap<u64, &GenerationEvidenceRow>,
+    manifests: &BTreeMap<Uuid, &ManifestEvidenceRow>,
+    artifacts: &BTreeMap<Uuid, &ArtifactEvidenceRow>,
+    artifacts_by_run: &BTreeMap<Uuid, BTreeMap<u16, &ArtifactEvidenceRow>>,
 ) -> Result<(), EvidenceError> {
     let mut previous_plan: Option<ManifestPlan> = None;
     let mut retained_schema: Option<&DatasetSchemaRef> = None;
@@ -775,15 +1023,37 @@ fn validate_dataset_history(
         }
         let plan = match generation.kind {
             GenerationKind::Ingest => {
-                let object = generation
+                let anchor = manifests
+                    .get(&generation.anchor_manifest_id)
+                    .and_then(|manifest| artifacts.get(&manifest.artifact_id))
+                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
+                let group = artifacts_by_run
+                    .get(&anchor.run_id)
+                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
+                let suffix = generation
                     .objects
-                    .last()
-                    .ok_or(EvidenceError::GenerationSemanticMismatch)?
-                    .manifest_object()?;
+                    .get(
+                        generation
+                            .objects
+                            .len()
+                            .checked_sub(group.len())
+                            .ok_or(EvidenceError::GenerationSemanticMismatch)?..,
+                    )
+                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
+                if suffix
+                    .iter()
+                    .zip(group.values())
+                    .any(|(object, artifact)| object.artifact_id != artifact.artifact_id)
+                {
+                    return Err(EvidenceError::GenerationSemanticMismatch);
+                }
                 ManifestPlan::append(
                     generation.dataset_id.clone(),
                     previous_plan.as_ref(),
-                    object,
+                    suffix
+                        .iter()
+                        .map(GenerationObjectEvidenceRow::manifest_object)
+                        .collect::<Result<Vec<_>, _>>()?,
                     generation.objects.len(),
                 )
                 .map_err(|_| EvidenceError::GenerationSemanticMismatch)?

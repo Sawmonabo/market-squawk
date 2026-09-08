@@ -33,7 +33,7 @@ the complete persistence system: mutexes, durable store I/O, registry reconcilia
 composition are covered by their deterministic tests rather than this atomic kernel model.
 
 Loom also does not model every execution allowed by the full C11 memory model. In particular, its
-[documented unsupported features](https://github.com/tokio-rs/loom/blob/loom-0.7.2/README.md#unsupported-features)
+[documented unsupported features](https://github.com/tokio-rs/loom/blob/v0.7.2/README.md#unsupported-features)
 include load-buffering behaviors, and Loom replacement types must be used for an operation to enter
 the model. The bounded passing result must therefore never be described as exhaustive proof of all
 hardware executions or of synchronization outside `LifecycleWord`.

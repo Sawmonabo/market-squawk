@@ -8,7 +8,7 @@ use market_squawk_domain::Timestamp;
 use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
-use self::hash::operation_digest;
+use self::hash::{operation_digest, snapshot_logical_digest};
 use super::runs::CatalogAuthority;
 use super::storage::{ResultBudget, sha256, trusted_catalog_now};
 use super::types::CatalogError;
@@ -574,6 +574,26 @@ pub struct FairValueCatalogSnapshot {
     position: FairValueCatalogPosition,
 }
 
+/// Versioned SHA-256 identity of one complete validated fair-value catalog snapshot.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FairValueCatalogSnapshotDigest([u8; 32]);
+
+impl FairValueCatalogSnapshotDigest {
+    /// Canonical digest format version.
+    pub const FORMAT_VERSION: u16 = 1;
+
+    /// Returns the exact SHA-256 identity.
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for FairValueCatalogSnapshotDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FairValueCatalogSnapshotDigest([SHA-256])")
+    }
+}
+
 /// Explicit independent ceilings for one complete fair-value recovery read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FairValueCatalogSnapshotLimits {
@@ -664,5 +684,57 @@ impl FairValueCatalogSnapshot {
     /// Returns the exact durable head validated by this snapshot.
     pub const fn position(&self) -> FairValueCatalogPosition {
         self.position
+    }
+
+    /// Computes the v1 canonical logical identity of all validated catalog content and its head.
+    ///
+    /// The digest binds record payloads, audit operations and relationships, aggregate counts,
+    /// and the exact durable position. It is intended for owner-issued backup attestations; it is
+    /// not a duplicate database export.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidRecord`] if a platform-sized count cannot be represented by
+    /// the canonical unsigned 64-bit format.
+    pub fn logical_digest(&self) -> Result<FairValueCatalogSnapshotDigest, CatalogError> {
+        snapshot_logical_digest(self).map(FairValueCatalogSnapshotDigest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_digest_binds_payload_and_catalog_position() -> Result<(), CatalogError> {
+        let snapshot = |payload: &[u8], last_audit_sequence| -> Result<_, CatalogError> {
+            let record = FairValueCatalogRecord::try_new(
+                FairValueRecordKind::Evidence,
+                [7; 32],
+                payload.to_vec(),
+            )?;
+            Ok(FairValueCatalogSnapshot {
+                records: vec![record].into_boxed_slice(),
+                audit: Box::new([]),
+                membership_count: 0,
+                link_count: 0,
+                position: FairValueCatalogPosition {
+                    records: 1,
+                    operations: 0,
+                    memberships: 0,
+                    links: 0,
+                    last_audit_sequence,
+                    last_audit_id: None,
+                },
+            })
+        };
+
+        let original = snapshot(b"evidence-a", 0)?.logical_digest()?;
+        let changed_payload = snapshot(b"evidence-b", 0)?.logical_digest()?;
+        let changed_position = snapshot(b"evidence-a", 1)?.logical_digest()?;
+
+        assert_ne!(original, changed_payload);
+        assert_ne!(original, changed_position);
+        Ok(())
     }
 }

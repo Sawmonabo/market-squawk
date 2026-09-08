@@ -1,8 +1,10 @@
 use std::path::Path;
 
-use market_squawk_platform::{ArtifactPathError, JournalFileFormat, JournalOpenError, LocalPaths};
 #[cfg(unix)]
-use market_squawk_platform::{JournalError, PathError};
+use market_squawk_platform::JournalError;
+use market_squawk_platform::{
+    ArtifactPathError, JournalFileFormat, JournalOpenError, LocalPaths, PathError,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -232,6 +234,46 @@ fn journal_source_names_are_single_bounded_portable_components()
     }
     assert!(paths.journal_write_file("coinbase-exchange").is_ok());
     assert!(!directory.path().join("missing").exists());
+    Ok(())
+}
+
+#[test]
+fn job_database_is_private_unique_and_single_writer() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let location = paths.control_root()?.job_database_location();
+    assert_eq!(
+        location.path(),
+        paths.control_root()?.root().join("jobs.sqlite3")
+    );
+
+    let file = location.prepare_database_file()?;
+    file.validate_identity()?;
+    let writer = location.acquire_writer()?;
+    assert!(matches!(
+        location.acquire_writer(),
+        Err(PathError::JobDatabaseAlreadyLocked)
+    ));
+
+    let wal = location.path().with_file_name("jobs.sqlite3-wal");
+    let shm = location.path().with_file_name("jobs.sqlite3-shm");
+    std::fs::write(&wal, b"wal")?;
+    std::fs::write(&shm, b"shm")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o600))?;
+    }
+    location.validate_sqlite_sidecars()?;
+
+    std::fs::hard_link(&wal, directory.path().join("wal-alias"))?;
+    assert!(matches!(
+        location.validate_sqlite_sidecars(),
+        Err(PathError::PreparedRootChanged)
+    ));
+    drop(writer);
     Ok(())
 }
 

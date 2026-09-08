@@ -69,7 +69,11 @@ impl ShardActor {
                 .and_then(|value| value.checked_sub(seed.retained_bytes))
                 .ok_or(SnapshotBuildError::RetainedSizeOverflow)?
                 .min(self.maximum_feature_snapshot_bytes);
-            let features = owner.features.build_snapshot(feature_budget)?;
+            let feature_available_at =
+                system_timestamp().map_err(|_| SnapshotBuildError::ClockRange)?;
+            let features = owner
+                .features
+                .build_snapshot(feature_budget, feature_available_at)?;
             let candidate_retained_bytes = retained_bytes
                 .checked_add(seed.retained_bytes)
                 .and_then(|value| value.checked_add(route_charge))

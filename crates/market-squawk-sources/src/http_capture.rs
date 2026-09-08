@@ -9,6 +9,7 @@ use market_squawk_domain::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 use crate::authority_time::TrustedReceiptObservation;
 use crate::registry::HttpResponseReceiptAuthority;
@@ -56,6 +57,7 @@ pub struct SegmentedHttpResponseReceipt {
     binding: FrameSessionBinding,
     observation: TrustedReceiptObservation,
     currentness: crate::FrameSessionLease,
+    event_id: Uuid,
     method: HttpCaptureMethod,
     final_url: Box<str>,
     status: u16,
@@ -103,6 +105,11 @@ impl SegmentedHttpResponseReceipt {
         &self.currentness
     }
 
+    /// Returns the capture-owned identity minted when the complete response was admitted.
+    pub const fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+
     /// Returns the exact request method.
     pub const fn method(&self) -> HttpCaptureMethod {
         self.method
@@ -136,6 +143,51 @@ impl SegmentedHttpResponseReceipt {
     /// Returns exact per-segment receipts in body order.
     pub fn segments(&self) -> &[HttpResponseSegmentReceipt] {
         &self.segments
+    }
+
+    /// Returns a domain-separated digest of the complete exact response coordinate.
+    pub fn coordinate_digest(&self) -> EvidenceDigest {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/current-http-response-coordinate/v1");
+        digest.update([match self.method {
+            HttpCaptureMethod::Get => 0,
+        }]);
+        digest.update((self.final_url.len() as u64).to_be_bytes());
+        digest.update(self.final_url.as_bytes());
+        digest.update(self.status.to_be_bytes());
+        match self.declared_body_length {
+            Some(length) => {
+                digest.update([1]);
+                digest.update(length.to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+        digest.update(self.body_length.to_be_bytes());
+        digest.update(self.body_digest.bytes());
+        digest.update(self.received_at().unix_nanos().to_be_bytes());
+        digest.update((self.segments.len() as u64).to_be_bytes());
+        for segment in &self.segments {
+            digest.update(segment.ordinal().to_be_bytes());
+            digest.update(segment.body_length().to_be_bytes());
+            digest.update(segment.body_digest().bytes());
+        }
+        EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+    }
+
+    pub(crate) const fn trusted_receipt(&self) -> &TrustedReceiptObservation {
+        &self.observation
+    }
+
+    pub(crate) fn dynamic_retained_bytes(&self) -> Option<usize> {
+        self.binding
+            .shared_allocation_charge()?
+            .checked_add(self.currentness.shared_allocation_charge()?)?
+            .checked_add(self.final_url.len())?
+            .checked_add(
+                self.segments
+                    .len()
+                    .checked_mul(std::mem::size_of::<HttpResponseSegmentReceipt>())?,
+            )
     }
 }
 
@@ -345,6 +397,7 @@ impl SegmentedHttpResponseBuilder {
                 binding,
                 observation,
                 currentness,
+                event_id: Uuid::new_v4(),
                 method: self.method,
                 final_url: self.final_url,
                 status: self.status,

@@ -39,14 +39,20 @@ pub const UNIVERSE_COMPONENT: &str = "market_squawk.backtest.universe_status";
 const EXAMPLE_ID: usize = 0;
 const INSTRUMENT_ID: usize = 1;
 const CUTOFF_AT: usize = 2;
-const COMPONENT_KIND: usize = 4;
-const COMPONENT_NAME: usize = 5;
-const COMPONENT_VERSION: usize = 6;
-const VALUE_F64: usize = 7;
-const VALUE_DECIMAL: usize = 8;
-const VALUE_SCALE: usize = 9;
-const MISSING_REASON: usize = 12;
-const LINEAGE: usize = 13;
+const OBSERVED_EFFECTIVE_AT: usize = 3;
+const LABEL_EFFECTIVE_AT: usize = 4;
+const TARGET_COORDINATE_KIND: usize = 5;
+const SPLIT: usize = 6;
+const COMPONENT_KIND: usize = 7;
+const COMPONENT_NAME: usize = 8;
+const COMPONENT_VERSION: usize = 9;
+const VALUE_F64: usize = 10;
+const VALUE_DECIMAL: usize = 11;
+const VALUE_SCALE: usize = 12;
+const MISSING_REASON: usize = 15;
+const LINEAGE: usize = 16;
+const EXACT_TARGET_COORDINATES: u8 = 1;
+const NON_EXACT_TARGET_COORDINATES: u8 = 2;
 const FEATURE_KIND: u8 = 1;
 const LABEL_KIND: u8 = 2;
 const RESERVED_VERSION: u32 = 1;
@@ -159,6 +165,10 @@ fn admit_batch(
     let examples = array::<FixedSizeBinaryArray>(batch, EXAMPLE_ID)?;
     let instruments = array::<FixedSizeBinaryArray>(batch, INSTRUMENT_ID)?;
     let cutoffs = array::<TimestampNanosecondArray>(batch, CUTOFF_AT)?;
+    let observed_effective = array::<TimestampNanosecondArray>(batch, OBSERVED_EFFECTIVE_AT)?;
+    let label_effective = array::<TimestampNanosecondArray>(batch, LABEL_EFFECTIVE_AT)?;
+    let target_coordinate_kinds = array::<UInt8Array>(batch, TARGET_COORDINATE_KIND)?;
+    let splits = array::<UInt8Array>(batch, SPLIT)?;
     let kinds = array::<UInt8Array>(batch, COMPONENT_KIND)?;
     let names = array::<FixedSizeBinaryArray>(batch, COMPONENT_NAME)?;
     let versions = array::<UInt32Array>(batch, COMPONENT_VERSION)?;
@@ -171,10 +181,14 @@ fn admit_batch(
         return Err(BacktestError::InvalidDataset);
     }
     for row in 0..batch.num_rows() {
-        if kinds.is_null(row) {
-            return Err(BacktestError::InvalidDataset);
-        }
-        match kinds.value(row) {
+        let coordinates = target_coordinates(
+            observed_effective,
+            label_effective,
+            target_coordinate_kinds,
+            splits,
+            row,
+        )?;
+        match required(kinds, row)? {
             LABEL_KIND => continue,
             FEATURE_KIND => {}
             _ => return Err(BacktestError::InvalidDataset),
@@ -188,6 +202,7 @@ fn admit_batch(
             cutoff,
             instrument_id,
             example_id: fixed_text(examples, row)?.to_owned(),
+            coordinates,
         };
         let version =
             NonZeroU32::new(required(versions, row)?).ok_or(BacktestError::InvalidDataset)?;
@@ -212,11 +227,47 @@ fn admit_batch(
     Ok(())
 }
 
+fn target_coordinates(
+    observed_effective: &TimestampNanosecondArray,
+    label_effective: &TimestampNanosecondArray,
+    target_coordinate_kinds: &UInt8Array,
+    splits: &UInt8Array,
+    row: usize,
+) -> Result<TargetCoordinates, BacktestError> {
+    let observed_effective_at = optional_timestamp(observed_effective, row);
+    let label_effective_at = optional_timestamp(label_effective, row);
+    let kind = required(target_coordinate_kinds, row)?;
+    let split = required(splits, row)?;
+    let valid_target = match (kind, observed_effective_at, label_effective_at) {
+        (EXACT_TARGET_COORDINATES, Some(observed), Some(target)) => target > observed,
+        (NON_EXACT_TARGET_COORDINATES, None, None) => true,
+        _ => false,
+    };
+    if !valid_target || !matches!(split, 1..=3) {
+        return Err(BacktestError::InvalidDataset);
+    }
+    Ok(TargetCoordinates {
+        observed_effective_at,
+        label_effective_at,
+        kind,
+        split,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TargetCoordinates {
+    observed_effective_at: Option<Timestamp>,
+    label_effective_at: Option<Timestamp>,
+    kind: u8,
+    split: u8,
+}
+
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GroupKey {
     cutoff: Timestamp,
     instrument_id: InstrumentId,
     example_id: String,
+    coordinates: TargetCoordinates,
 }
 
 #[derive(Debug)]
@@ -443,6 +494,10 @@ fn required<T: arrow::array::ArrowPrimitiveType>(
     } else {
         Ok(values.value(row))
     }
+}
+
+fn optional_timestamp(values: &TimestampNanosecondArray, row: usize) -> Option<Timestamp> {
+    (!values.is_null(row)).then(|| Timestamp::from_unix_nanos(values.value(row)))
 }
 
 fn fixed_text(values: &FixedSizeBinaryArray, row: usize) -> Result<&str, BacktestError> {

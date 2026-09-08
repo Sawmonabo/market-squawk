@@ -23,8 +23,8 @@ use crate::authority_time::{
 use crate::bounded::BoundedVec;
 use crate::policy::{
     AuthorityDurabilitySession, AuthorityPersistenceError, BudgetAvailabilityLease,
-    BudgetPolicyResolutionError, DurableBudgetGroup, PersistedProviderBudgetPolicy,
-    ProviderBudgetPool, ResolvedProviderBudgetPolicy,
+    BudgetPermitLease, BudgetPolicyResolutionError, DurableBudgetGroup,
+    PersistedProviderBudgetPolicy, ProviderBudgetPool, ResolvedProviderBudgetPolicy,
 };
 use crate::{FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata};
 
@@ -51,6 +51,7 @@ struct SessionLeaseState {
     terminal: AtomicBool,
     live_qualified: AtomicBool,
     health_epoch: AtomicU64,
+    minimum_valid_health_epoch: AtomicU64,
     valid_from_nanos: AtomicI64,
     valid_until_nanos: AtomicI64,
     last_health_observed_nanos: AtomicI64,
@@ -101,6 +102,8 @@ impl SessionLeaseState {
 
     fn terminally_invalidate_health_authority(&self) {
         self.live_qualified.store(false, Ordering::Release);
+        self.minimum_valid_health_epoch
+            .store(u64::MAX, Ordering::Release);
         self.valid_from_nanos.store(i64::MAX, Ordering::Release);
         self.valid_until_nanos.store(i64::MIN, Ordering::Release);
         self.current.store(false, Ordering::Release);
@@ -122,6 +125,7 @@ impl SessionLeaseState {
         valid_until: Option<Timestamp>,
     ) {
         self.live_qualified.store(false, Ordering::Release);
+        let previous_epoch = self.health_epoch.load(Ordering::Acquire);
         self.valid_from_nanos.store(
             valid_from.map_or(i64::MAX, Timestamp::unix_nanos),
             Ordering::Release,
@@ -130,6 +134,17 @@ impl SessionLeaseState {
             valid_until.map_or(i64::MIN, Timestamp::unix_nanos),
             Ordering::Release,
         );
+        // A routine healthy refresh overlaps the immediately preceding immutable authority until
+        // that authority's own deadline. This lets already-admitted FIFO work drain without
+        // treating a freshness renewal as data loss. An unhealthy update publishes no overlap,
+        // and the next healthy update cannot resurrect an older qualified epoch.
+        let minimum_valid_epoch = if qualified && previous_epoch != 0 {
+            previous_epoch
+        } else {
+            epoch
+        };
+        self.minimum_valid_health_epoch
+            .store(minimum_valid_epoch, Ordering::Release);
         self.health_epoch.store(epoch, Ordering::Release);
         self.live_qualified.store(qualified, Ordering::Release);
     }
@@ -139,9 +154,12 @@ impl SessionLeaseState {
     }
 
     fn validate_health_epoch(&self, epoch: u64, at: Timestamp) -> bool {
+        let current_epoch = self.health_epoch.load(Ordering::Acquire);
+        let minimum_epoch = self.minimum_valid_health_epoch.load(Ordering::Acquire);
         self.is_current()
             && self.is_live_qualified()
-            && self.health_epoch.load(Ordering::Acquire) == epoch
+            && epoch >= minimum_epoch
+            && epoch <= current_epoch
             && at.unix_nanos() >= self.valid_from_nanos.load(Ordering::Acquire)
             && at.unix_nanos() <= self.valid_until_nanos.load(Ordering::Acquire)
     }
@@ -198,6 +216,61 @@ struct CurrentHealthAuthority {
     budget: CurrentBudgetAuthority,
 }
 
+/// Result of recording one exact-generation health observation.
+///
+/// An unqualified result never carries live-data authority. Its retained cause classification is
+/// intentionally opaque so callers cannot reconstruct or weaken the registry's qualification
+/// predicate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum CurrentHealthRecording {
+    /// Every registry-owned current-data requirement was satisfied.
+    Qualified,
+    /// The observation was retained but issued no current-data authority.
+    Unqualified(CurrentHealthUnqualification),
+}
+
+/// Opaque reason set for a retained health observation that issued no current-data authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CurrentHealthUnqualification {
+    causes: u16,
+}
+
+impl CurrentHealthUnqualification {
+    const CAPTURE: u16 = 1 << 0;
+    const CONNECTION_FRESHNESS: u16 = 1 << 1;
+    const TRANSPORT_FRESHNESS: u16 = 1 << 2;
+    const MARKET_FRESHNESS: u16 = 1 << 3;
+    const SOURCE_FRESHNESS: u16 = 1 << 4;
+    const STREAM_INTEGRITY: u16 = 1 << 5;
+    const CAPTURE_INTEGRITY: u16 = 1 << 6;
+    const AUTHORIZATION: u16 = 1 << 7;
+    const COVERAGE: u16 = 1 << 8;
+    const SNAPSHOT_BUDGET: u16 = 1 << 9;
+    const REPORTER_BUDGET: u16 = 1 << 10;
+    const LAST_ERROR: u16 = 1 << 11;
+    const CURRENT_DATA_DEADLINE: u16 = 1 << 12;
+    const STATIC_DEADLINE: u16 = 1 << 13;
+    const OBSERVATION_TIME: u16 = 1 << 14;
+    const FRESHNESS: u16 = Self::CONNECTION_FRESHNESS
+        | Self::TRANSPORT_FRESHNESS
+        | Self::MARKET_FRESHNESS
+        | Self::SOURCE_FRESHNESS
+        | Self::CURRENT_DATA_DEADLINE;
+
+    const fn new(causes: u16) -> Self {
+        Self { causes }
+    }
+
+    /// Returns true only when every rejected dimension is a current-data freshness clock.
+    ///
+    /// Authorization, coverage, budget, capture, integrity, and provider-error failures can never
+    /// be classified as freshness-only, including when one also coexists with stale data.
+    pub const fn is_freshness_only(self) -> bool {
+        self.causes != 0 && self.causes & !Self::FRESHNESS == 0
+    }
+}
+
 #[derive(Debug)]
 struct UnconfiguredAuthorizationSubjectResolver;
 
@@ -215,6 +288,7 @@ impl crate::AuthorizationSubjectResolver for UnconfiguredAuthorizationSubjectRes
 enum CurrentBudgetAuthority {
     NotRequired,
     Available(BudgetAvailabilityLease),
+    ActiveRequest(BudgetPermitLease),
     Unavailable,
 }
 
@@ -229,10 +303,22 @@ impl CurrentBudgetAuthority {
         }
     }
 
+    fn observe_active_request(
+        budget: Option<&SharedProviderBudget>,
+        lease: &BudgetPermitLease,
+    ) -> Result<Self, RegistryError> {
+        let budget = budget.ok_or(RegistryError::BudgetAuthorityMismatch)?;
+        if !lease.shares_allocation_with(budget) || !lease.is_current() {
+            return Err(RegistryError::BudgetAuthorityMismatch);
+        }
+        Ok(Self::ActiveRequest(lease.clone()))
+    }
+
     fn is_available(&self) -> bool {
         match self {
             Self::NotRequired => true,
             Self::Available(lease) => lease.is_available(),
+            Self::ActiveRequest(lease) => lease.is_current(),
             Self::Unavailable => false,
         }
     }
@@ -248,6 +334,9 @@ impl CurrentBudgetAuthority {
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
         match self {
             Self::Available(lease) => lease
+                .shared_allocation_charge()
+                .ok_or(RegistryError::RetainedSizeOverflow),
+            Self::ActiveRequest(lease) => lease
                 .shared_allocation_charge()
                 .ok_or(RegistryError::RetainedSizeOverflow),
             Self::NotRequired | Self::Unavailable => Ok(0),
@@ -360,6 +449,72 @@ pub struct RegistryAuthorityState {
     schema_version: SchemaVersion,
     sources: BoundedVec<PersistedSourceAuthority, MAX_AUTHORITY_SOURCES>,
     budget_policies: BoundedVec<PersistedProviderBudgetPolicy, MAX_BUDGET_SCOPES>,
+}
+
+/// Canonical clean-restart image for registry tombstones and durable provider-budget checkpoints.
+///
+/// The opaque payload contains no registry handles, active sessions, request permits, health
+/// authority, runtime clock handles, or in-use run marker. It can only be minted after the live
+/// registry proves that every durable budget allocation has zero in-flight requests.
+pub(crate) struct RegistryCleanRestartBackup {
+    bytes: Box<[u8]>,
+}
+
+impl RegistryCleanRestartBackup {
+    /// Validates one canonical owner-issued clean-restart image.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, in-use, future-dated, or non-clean budget state.
+    pub(crate) fn try_from_bytes(bytes: &[u8]) -> Result<Self, RegistryError> {
+        let now = current_registry_wall_time()?;
+        let envelope = crate::policy::deserialize_clean_restart_backup(bytes, now)
+            .map_err(map_authority_persistence_error)?;
+        let canonical = crate::policy::serialize_clean_restart_backup(&envelope)
+            .map_err(map_authority_persistence_error)?;
+        Ok(Self {
+            bytes: canonical.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the exact canonical clean-restart bytes.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Seeds an absent production store without opening registry or runtime authority.
+    ///
+    /// Normal startup must subsequently reconstruct the registry and adapters through their usual
+    /// constructors. Existing authority state is never overwritten.
+    pub(crate) fn restore_fresh(
+        &self,
+        store: market_squawk_platform::LocalAuthorityStateStore,
+    ) -> Result<(), RegistryError> {
+        if store
+            .load()
+            .map_err(|_error| RegistryError::AuthorityPersistence)?
+            .is_some()
+        {
+            return Err(RegistryError::InvalidAuthorityState);
+        }
+        store
+            .store(&self.bytes)
+            .map_err(|_error| RegistryError::AuthorityPersistence)
+    }
+}
+
+impl std::fmt::Debug for RegistryCleanRestartBackup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryCleanRestartBackup")
+            .field("byte_length", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn current_registry_wall_time() -> Result<Timestamp, RegistryError> {
+    let clock = SealedRegistryClock::new(Arc::new(SystemRawRegistryClock::try_new()?));
+    clock.observe().map(TrustedRegistryTime::wall)
 }
 
 impl RegistryAuthorityState {
@@ -504,6 +659,7 @@ impl<'de> Deserialize<'de> for RegistryAuthorityState {
 include!("registry/catalog.rs");
 #[path = "registry/catalog/construction.rs"]
 mod catalog_construction;
+pub use catalog_construction::RESEARCH_SOURCE_AUTHORITY_DIRECTORY;
 #[path = "registry/catalog/persistence.rs"]
 mod catalog_persistence;
 include!("registry/health_authority.rs");

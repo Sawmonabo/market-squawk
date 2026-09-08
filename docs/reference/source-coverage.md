@@ -9,8 +9,8 @@ adapters.
 | Document type | Reference |
 | Audience | Operators, source-adapter authors, research engineers, risk engineers, and auditors |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `50912c18271a0389fb5ac8817555230930dd0506` |
+| Last substantive review | 2026-08-12 |
+| Reviewed commit | `8fd91dad768affda2126ed91a5b97f1bd1e32209` plus the Wave 8B profile/documentation candidate |
 
 ## Contents
 
@@ -48,6 +48,19 @@ provider setup procedure or reproduce every provider response schema. Procedures
 [Source operations](../operations/source-operations.md); the only mutable completion state belongs
 in the [delivery ledger](../plans/delivery-ledger.md).
 
+The maintained [provider-contract index](providers/README.md) is deliberately separate. It records
+the approved target providers, current official contracts, account-specific probes, intended
+canonical destinations, and implementation gaps—including owner-enabled Schwab—without falsely
+adding those sources to the implemented product-path matrix below. The current selected-provider
+candidate contains provider-native core and transport code for Schwab, Yahoo, IEX HIST, OCC/Cboe
+reference, BEA, Census, EIA, Tiingo, and the Federal Reserve Board. Board profile revision 4 also
+has an exact bounded H.15 onboarding doctor plus application activation/source construction,
+shared rich-capture binding, analytical-dataset registration, and lifecycle restore code. Those
+surfaces do not become product paths until focused proof, durable canonical publication,
+point-in-time typed reads, workflow composition, restart acceptance, and frozen-head acceptance
+are complete. The matrix below reports that end-to-end composition, not crate, profile, or
+unaccepted code-path presence.
+
 ## Source identity and immutable metadata
 
 ### Identity types
@@ -74,7 +87,7 @@ The current `SourceMetadata` schema version is `1`. Its object is closed and con
 | `schema_version` | Supported `SchemaVersion`; unsupported versions are rejected |
 | `source_id` | Exact internal `SourceId` |
 | `revision_evidence` | Atomic metadata-revision and exact-payload evidence |
-| `source_class` | `exchange`, `broker`, `official_agency`, `regulatory_filing`, `local_file`, `portfolio_export`, `licensed_dataset`, or `on_chain` |
+| `source_class` | `exchange`, `broker`, `official_agency`, `regulatory_filing`, `standards_publisher`, `local_file`, `portfolio_export`, `licensed_dataset`, or `on_chain` |
 | `provider` | Bounded provider `SourceIdentifier` used in metadata and diagnostics |
 | `authorization` | Closed `AuthorizationGrant` |
 | `coverage` | Closed `SourceCoverage` declaration |
@@ -94,9 +107,10 @@ half-open effective interval `[start, end)`. Modes are:
 - `user_owned_local` for user-owned local input requiring no provider network access.
 
 Local-file and portfolio-export metadata must use `user_owned_local`, deny all network access, and
-have no provider budget. Remote exchange, broker, official-agency, regulatory-filing, and on-chain
-metadata must carry an endpoint allowlist and a shared provider budget. A budget's provider and
-account qualification must match the provider and authorization evidence.
+have no provider budget. Remote exchange, broker, official-agency, regulatory-filing,
+`StandardsPublisher`, and on-chain metadata must carry an endpoint allowlist and a shared provider
+budget. A budget's provider and account qualification must match the provider and authorization
+evidence.
 
 `FreshnessPolicy` has five nanosecond fields:
 `max_connection_idle_nanos`, `max_transport_age_nanos`, `max_source_age_nanos`,
@@ -359,17 +373,48 @@ does not become `DirectVerified`.
 
 ## Research and local adapters
 
+### Federal Reserve Board H.15 profile boundary
+
+`federal-reserve-board.data-download-program` revision 4 is `available` under its unchanged exact
+no-key doctor: the 11-series H.15 Treasury constant-maturity CSV package bounded to ten recent
+dates per series. The application performs one exact allowlisted GET, enforces a shared
+one-request-per-minute/single-flight application policy, and accepts the response only when the
+provider-native parser proves the exact metadata, identities, units, periods, 11 series, and 110
+observations.
+
+The active production dataset is a separate live-verified `Output.aspx` contract bounded to the
+latest 100 dates: exactly 1,100 H.15 observations. Doctor, rolling dashboard, and full-history
+packages have distinct request, contract, provider-dataset, and analytical-dataset identities.
+The full-history `Download.aspx` contract is retained as an explicit research identity, but the
+one-batch `BoardSource` rejects it until a partitioned, checkpointed, resumable extraction path
+exists.
+
+The provider-native adapter has authority-governed HTTPS retrieval, exact response/capture
+evidence, strict parsing, canonical macro mapping, correction/repost modeling, and publication
+primitives. The application now constructs that source under an active onboarding lease, binds its
+rich output to the shared capture protocol, registers the exact analytical dataset identity, and
+serializes/restores the lifecycle surface. The scripted installed journey proves 1,100-row rich
+capture and sealing, catalog/Parquet publication, typed history and macro-dashboard reads, stable
+evidence across a clean same-root restart, and zero provider HTTP after restart. A separate
+exact-head real-network installed smoke now proves the official no-key doctor, durable rate refusal,
+rolling acquisition, `MSJ1` seal, 1,100-row Parquet publication, authenticated macro-dashboard
+read, and same-root local reread with unchanged immutable evidence. The native Desktop package and
+release gates remain open. Therefore Board remains absent from any matrix that denotes a fully
+released native product rather than a completed installed backend vertical.
+
 ### Lease-gated research adapters
 
 Research activation requires an active immutable onboarding lease for the exact surface, exact
 source/revision binding, and admitted `persist` rights with non-refresh exact evidence. The CLI
-activation request is a closed schema-version-3 object with schema-version-2 recovery, capped at
-1 MiB. Its provider kinds are
-`sec`, `bls`, `treasury_fiscal`, `treasury_daily_rates`, and `fred_alfred`; each kind has a closed,
-provider-specific scope. The loopback portal exposes these typed research activations plus
-source-session activation for public Coinbase, Coinbase Direct, and Kraken. Source-session
-activation verifies onboarding authority but does not manufacture a research adapter or expand
-durable-use rights beyond the exact evidence admitted by its profile and request.
+activation request is a closed schema-version-5 object with bounded schema-version-2 through
+schema-version-4 recovery, capped at 1 MiB. Its provider kinds are `sec`, `bls`,
+`treasury_fiscal`, `treasury_daily_rates`, `fred_alfred`, and
+`federal_reserve_board_h15`; each kind has a closed, provider-specific scope, and Board is admitted
+only in schema version 5. The activation authority also accepts these typed research requests from
+the loopback portal boundary plus source-session activation for public Coinbase, Coinbase Direct,
+and Kraken. Source-session activation verifies onboarding authority but does not manufacture a
+research adapter or expand durable-use rights beyond the exact evidence admitted by its profile
+and request.
 
 | Adapter | Extracted scope | Important bounded/authority behavior |
 | --- | --- | --- |
@@ -378,14 +423,17 @@ durable-use rights beyond the exact evidence admitted by its profile and request
 | FRED/ALFRED | Exact series metadata, observations, vintage dates, and revision history | API key for ephemeral retrieval; durable use additionally requires exact Bank service permission, explicit local review, and exact per-series rights |
 | Treasury Fiscal Data | Average Interest Rates v2 for an exact date interval and page size | Exact endpoint/query allowlist; dataset/version provenance |
 | Treasury daily XML | All five official families over an inclusive year range | Exact family schemas and start years; strict year/month/all-history requests; cross-page integrity; exact payload/revision lineage |
+| Federal Reserve Board H.15 | Exact rolling 100-date × 11-series Treasury constant-maturity dashboard generation | No-key active lease; exact endpoint/query allowlist; shared one-request-per-minute/single-flight application budget; strict 1,100-observation parser bound; distinct doctor/rolling/full-history identities; rich capture binding; full history requires partitioned resumable extraction |
 
 The research metadata for these adapters uses a positive one-nanosecond `delayed` declaration and
 `unknown` delivery rather than claiming real-time or direct delivery.
 
-Durable activation recipes exist for exactly six profile surfaces: SEC; BLS v1 and v2; Treasury
-Fiscal and daily XML; and FRED/ALFRED. Recipes are secret-free and bind exact request and evidence
-digests. On restart, SEC, BLS v1, and both Treasury surfaces can be reconstructed without a
-credential when their authority remains valid. BLS v2 and FRED return
+Durable activation recipes now cover seven profile surfaces: SEC; BLS v1 and v2; Treasury Fiscal
+and daily XML; FRED/ALFRED; and Federal Reserve Board H.15. Recipes are secret-free and bind exact
+request and evidence digests. Restore code can reconstruct SEC, BLS v1, both Treasury surfaces,
+and Board without a credential when their authority remains valid; both the scripted Board journey
+and exact-head real-network installed publication/read/restart smoke pass. Native Desktop/package
+and release acceptance remain open. BLS v2 and FRED return
 `provider activation requires explicit foreground credential resume` and remain disabled until
 that explicit resume. Invalid evidence, authority, or adapter state quarantines the recipe.
 
@@ -403,6 +451,11 @@ At the reviewed commit, release and rights gates have concrete consequences:
   each exact series.
 - Treasury Fiscal Data and daily-rate XML are available built-in official profiles with all six
   rights operations admitted by their separate dataset-level evidence.
+- Federal Reserve Board revision 4 admits the exact H.15 activation and restore code path; current
+  activation must select the rolling 100-date dataset. Scripted and real-network installed rolling
+  capture, publication, typed dashboard reads, and same-root restart pass; native Desktop/package
+  and release acceptance remain incomplete, while full-history publication is unavailable pending
+  a partitioned resumable path.
 
 ### FRED durable-rights boundary
 
@@ -489,6 +542,7 @@ redistribute.
 | BLS v2 registered | Admitted | Admitted | Admitted | Admitted | Pending | Pending |
 | Treasury daily-rates XML | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
 | Treasury Fiscal Data | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
+| Federal Reserve Board H.15 | Admitted | Admitted | Admitted | Admitted | Blocked | Blocked |
 | Local files | Admitted | Admitted | Admitted | Admitted | Admitted | Pending |
 | Local portfolio imports | Admitted | Admitted | Admitted | Admitted | Admitted | Pending |
 | Local paper execution | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
@@ -544,6 +598,7 @@ contracts are in the [CLI reference](cli.md) and [MCP reference](mcp.md).
 
 - [Data quality](data-quality.md)
 - [Time and provenance](time-and-provenance.md)
+- [Configured provider contracts](providers/README.md)
 - [Configuration reference](configuration.md)
 - [CLI reference](cli.md)
 - [MCP reference](mcp.md)

@@ -13,6 +13,24 @@ impl AuthoritativeSourceRegistry {
         session: &CurrentSourceSession,
         update: CurrentHealthUpdate,
     ) -> Result<(), RegistryError> {
+        self.record_health_with_qualification(session, update)
+            .map(|_recording| ())
+    }
+
+    /// Records health and reports whether the registry issued current-data authority.
+    ///
+    /// The returned classification is computed by the same closed predicate that owns health
+    /// authority. It exists so a capture-first caller can distinguish an aged bootstrap from a
+    /// revoked or otherwise invalid source without recreating the predicate outside the registry.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale/transplanted sessions or health evidence bound to another session tuple.
+    pub fn record_health_with_qualification(
+        &mut self,
+        session: &CurrentSourceSession,
+        update: CurrentHealthUpdate,
+    ) -> Result<CurrentHealthRecording, RegistryError> {
         let health = &update.snapshot;
         let session_started_at = self
             .validate_session_structure(session)?
@@ -72,35 +90,77 @@ impl AuthoritativeSourceRegistry {
             ) if provider_product == live.provider_product()
                 && provider_channel == live.provider_channel()
         );
-        let source_timestamp_qualified = match health.source_freshness() {
-            crate::SourceTimestampFreshness::Fresh { .. } => true,
-            crate::SourceTimestampFreshness::Uninitialized => {
-                quality_ceiling != market_squawk_domain::DataQuality::DirectVerified
-            }
-            crate::SourceTimestampFreshness::Stale { .. } => false,
-        };
-        let qualified = session.capture.is_healthy()
-            && matches!(health.connection(), crate::ConnectionLiveness::Live { .. })
+        let mut causes = 0_u16;
+        if !session.capture.is_healthy() {
+            causes |= CurrentHealthUnqualification::CAPTURE;
+        }
+        if !matches!(health.connection(), crate::ConnectionLiveness::Live { .. }) {
+            causes |= CurrentHealthUnqualification::CONNECTION_FRESHNESS;
+        }
+        if !matches!(
+            health.transport_freshness(),
+            crate::TransportFreshness::Fresh { .. }
+        ) {
+            causes |= CurrentHealthUnqualification::TRANSPORT_FRESHNESS;
+        }
+        if !matches!(
+            health.market_freshness(),
+            crate::MarketFreshness::Fresh { .. }
+        ) {
+            causes |= CurrentHealthUnqualification::MARKET_FRESHNESS;
+        }
+        if matches!(
+            health.source_freshness(),
+            crate::SourceTimestampFreshness::Stale { .. }
+        ) || quality_ceiling == market_squawk_domain::DataQuality::DirectVerified
             && matches!(
-                health.transport_freshness(),
-                crate::TransportFreshness::Fresh { .. }
+                health.source_freshness(),
+                crate::SourceTimestampFreshness::Uninitialized
             )
-            && matches!(
-                health.market_freshness(),
-                crate::MarketFreshness::Fresh { .. }
-            )
-            && source_timestamp_qualified
-            && health.stream_integrity() == market_squawk_domain::StreamIntegrityState::Healthy
-            && health.capture_integrity()
-                != market_squawk_domain::CaptureIntegrityState::Incomplete
-            && matches!(
-                health.authorization(),
-                crate::AuthorizationHealth::Valid { .. }
-            )
-            && exact_runtime_coverage
-            && health.budget() == crate::BudgetHealth::Available
-            && update.budget.health() == crate::BudgetHealth::Available
-            && health.last_error().is_none();
+        {
+            causes |= CurrentHealthUnqualification::SOURCE_FRESHNESS;
+        }
+        if health.stream_integrity() != market_squawk_domain::StreamIntegrityState::Healthy {
+            causes |= CurrentHealthUnqualification::STREAM_INTEGRITY;
+        }
+        if health.capture_integrity() == market_squawk_domain::CaptureIntegrityState::Incomplete {
+            causes |= CurrentHealthUnqualification::CAPTURE_INTEGRITY;
+        }
+        if !matches!(
+            health.authorization(),
+            crate::AuthorizationHealth::Valid { .. }
+        ) {
+            causes |= CurrentHealthUnqualification::AUTHORIZATION;
+        }
+        if !exact_runtime_coverage {
+            causes |= CurrentHealthUnqualification::COVERAGE;
+        }
+        if health.budget() != crate::BudgetHealth::Available {
+            causes |= CurrentHealthUnqualification::SNAPSHOT_BUDGET;
+        }
+        if update.budget.health() != crate::BudgetHealth::Available {
+            causes |= CurrentHealthUnqualification::REPORTER_BUDGET;
+        }
+        if health.last_error().is_some() {
+            causes |= CurrentHealthUnqualification::LAST_ERROR;
+        }
+        if validation_at.wall() < health.observed_at() {
+            causes |= CurrentHealthUnqualification::OBSERVATION_TIME;
+        }
+        if !matches!(
+            health.authorization(),
+            crate::AuthorizationHealth::Valid { valid_until, .. }
+                if validation_at.wall() <= *valid_until
+        ) {
+            causes |= CurrentHealthUnqualification::AUTHORIZATION;
+        }
+        if !matches!(
+            health.coverage(),
+            crate::CoverageHealth::Sufficient { valid_until, .. }
+                if validation_at.wall() <= *valid_until
+        ) {
+            causes |= CurrentHealthUnqualification::COVERAGE;
+        }
         let valid_until = health
             .current_data_valid_until(quality_ceiling)
             .map(|health_until| {
@@ -120,9 +180,22 @@ impl AuthoritativeSourceRegistry {
             .map(|until| validation_at.checked_deadline(until))
             .transpose()?
             .flatten();
-        let qualified = qualified
-            && validation_at.wall() >= health.observed_at()
-            && valid_until_monotonic.is_some();
+        let metadata_authorization_current = entry
+            .metadata
+            .authorization()
+            .inclusive_authorization_deadline()
+            .is_none_or(|deadline| validation_at.wall() <= deadline);
+        let metadata_coverage_current = entry
+            .metadata
+            .coverage()
+            .inclusive_coverage_deadline()
+            .is_none_or(|deadline| validation_at.wall() <= deadline);
+        if !metadata_authorization_current || !metadata_coverage_current {
+            causes |= CurrentHealthUnqualification::STATIC_DEADLINE;
+        } else if valid_until_monotonic.is_none() {
+            causes |= CurrentHealthUnqualification::CURRENT_DATA_DEADLINE;
+        }
+        let qualified = causes == 0;
         let epoch = match session.lease.next_health_epoch() {
             Some(epoch) => epoch,
             None => {
@@ -159,7 +232,11 @@ impl AuthoritativeSourceRegistry {
             .last_health_observed_nanos
             .store(health.observed_at().unix_nanos(), Ordering::Release);
         entry.health_authority = next_authority;
-        Ok(())
+        Ok(if qualified {
+            CurrentHealthRecording::Qualified
+        } else {
+            CurrentHealthRecording::Unqualified(CurrentHealthUnqualification::new(causes))
+        })
     }
 
     /// Returns opaque current health/subscription authority for live scope validation.

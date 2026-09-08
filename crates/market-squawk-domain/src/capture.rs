@@ -18,7 +18,10 @@ use crate::{
 use crate::RetainedLayoutError;
 
 /// Maximum exact payload accepted at every live capture boundary.
-pub const MAX_LIVE_CAPTURE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+///
+/// The ceiling accommodates full price-level snapshots from the supported public venues while
+/// remaining equal to tungstenite's bounded default frame ceiling.
+pub const MAX_LIVE_CAPTURE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum historical payload accepted only by committed-wire compatibility readers.
 pub const MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES: usize = 33_554_431;

@@ -177,29 +177,118 @@ END;
 
 CREATE TABLE artifacts (
     artifact_id TEXT PRIMARY KEY CHECK (length(CAST(artifact_id AS BLOB)) = 36),
-    run_id TEXT NOT NULL UNIQUE REFERENCES ingest_runs(run_id),
+    run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
+    publication_ordinal INTEGER NOT NULL CHECK (
+        publication_ordinal BETWEEN 0 AND 1023
+    ),
     relative_reference TEXT NOT NULL UNIQUE CHECK (
         length(CAST(relative_reference AS BLOB)) BETWEEN 1 AND 1024
     ),
     content_algorithm INTEGER NOT NULL CHECK (content_algorithm IN (1, 2)),
     content_digest BLOB NOT NULL CHECK (length(content_digest) = 32),
     size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
-    created_at_ns INTEGER NOT NULL
+    created_at_ns INTEGER NOT NULL,
+    UNIQUE (run_id, publication_ordinal),
+    UNIQUE (artifact_id, run_id)
 ) STRICT;
 
 CREATE TABLE dataset_manifests (
     manifest_id TEXT PRIMARY KEY CHECK (length(CAST(manifest_id AS BLOB)) = 36),
+    run_id TEXT NOT NULL UNIQUE REFERENCES ingest_runs(run_id),
     dataset_name TEXT NOT NULL CHECK (
         length(CAST(dataset_name AS BLOB)) BETWEEN 1 AND 512
     ),
     schema_version INTEGER NOT NULL CHECK (schema_version > 0),
-    artifact_id TEXT NOT NULL UNIQUE REFERENCES artifacts(artifact_id)
-        CHECK (length(CAST(artifact_id AS BLOB)) = 36),
+    artifact_id TEXT NOT NULL UNIQUE CHECK (length(CAST(artifact_id AS BLOB)) = 36),
     content_algorithm INTEGER NOT NULL CHECK (content_algorithm IN (1, 2)),
     content_digest BLOB NOT NULL CHECK (length(content_digest) = 32),
     created_at_ns INTEGER NOT NULL,
-    UNIQUE (dataset_name, content_algorithm, content_digest)
+    UNIQUE (dataset_name, content_algorithm, content_digest),
+    FOREIGN KEY (artifact_id, run_id) REFERENCES artifacts(artifact_id, run_id)
 ) STRICT;
+
+CREATE TRIGGER artifacts_guarded_insert
+BEFORE INSERT ON artifacts
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM ingest_runs AS run
+    WHERE run.run_id = NEW.run_id
+      AND run.state = 'reserved'
+      AND NOT EXISTS (
+          SELECT 1 FROM dataset_manifests AS manifest
+          WHERE manifest.run_id = run.run_id
+      )
+      AND (SELECT COUNT(*) FROM artifacts AS retained
+           WHERE retained.run_id = run.run_id) < 1024
+      AND NEW.publication_ordinal = (
+          SELECT COUNT(*) FROM artifacts AS retained
+          WHERE retained.run_id = run.run_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'artifact publication ordinal is invalid');
+END;
+
+CREATE TRIGGER dataset_manifests_guarded_insert
+BEFORE INSERT ON dataset_manifests
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM ingest_runs AS run
+    JOIN artifacts AS anchor
+      ON anchor.run_id = run.run_id
+     AND anchor.artifact_id = NEW.artifact_id
+    WHERE run.run_id = NEW.run_id
+      AND run.state = 'reserved'
+      AND (SELECT COUNT(*) FROM artifacts AS member
+           WHERE member.run_id = run.run_id) BETWEEN 1 AND 1024
+      AND anchor.publication_ordinal = (
+          SELECT COUNT(*) - 1 FROM artifacts AS member
+          WHERE member.run_id = run.run_id
+      )
+      AND (SELECT MIN(member.publication_ordinal) FROM artifacts AS member
+           WHERE member.run_id = run.run_id) = 0
+      AND (SELECT MAX(member.publication_ordinal) FROM artifacts AS member
+           WHERE member.run_id = run.run_id) = (
+          SELECT COUNT(*) - 1 FROM artifacts AS member
+          WHERE member.run_id = run.run_id
+      )
+      AND NEW.created_at_ns >= (
+          SELECT MAX(member.created_at_ns) FROM artifacts AS member
+          WHERE member.run_id = run.run_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'dataset manifest does not close an exact artifact group');
+END;
+
+CREATE TRIGGER ingest_runs_publication_guarded_success
+BEFORE UPDATE ON ingest_runs
+WHEN NEW.state = 'succeeded'
+ AND NEW.operation IN ('persist', 'cache')
+ AND NOT EXISTS (
+    SELECT 1
+    FROM dataset_manifests AS manifest
+    JOIN artifacts AS anchor
+      ON anchor.artifact_id = manifest.artifact_id
+     AND anchor.run_id = manifest.run_id
+    WHERE manifest.run_id = NEW.run_id
+      AND (SELECT COUNT(*) FROM artifacts AS member
+           WHERE member.run_id = NEW.run_id) BETWEEN 1 AND 1024
+      AND anchor.publication_ordinal = (
+          SELECT COUNT(*) - 1 FROM artifacts AS member
+          WHERE member.run_id = NEW.run_id
+      )
+      AND (SELECT MIN(member.publication_ordinal) FROM artifacts AS member
+           WHERE member.run_id = NEW.run_id) = 0
+      AND (SELECT MAX(member.publication_ordinal) FROM artifacts AS member
+           WHERE member.run_id = NEW.run_id) = (
+          SELECT COUNT(*) - 1 FROM artifacts AS member
+          WHERE member.run_id = NEW.run_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'successful ingest run lacks a closed artifact group');
+END;
 
 CREATE TRIGGER artifacts_immutable_update
 BEFORE UPDATE ON artifacts BEGIN

@@ -9,23 +9,56 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::{Id, JoinSet};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::actor::{ActorCompletion, ActorStartFailure, ShardActorInput, run};
 use super::admission::{
-    LiveRuntimeHealthEvent, LiveRuntimeIngress, RouteIngressChannels, ShardCommand,
+    ActionControlChannels, ActionHookControlFailure, ActionHookInstallCommand,
+    ActionHookRemoveCommand, ActorControlCommand, LiveRuntimeHealthEvent, LiveRuntimeIngress,
+    RouteIngressChannels, ShardCommand,
 };
 use super::{LiveRouteConfig, LiveRuntimeConfig, LiveRuntimeConfigError, system_timestamp};
 use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
 use crate::cross_venue::create_cross_venue_plane;
 use crate::snapshot::{SnapshotPlaneBundle, create_snapshot_plane};
 use crate::{
-    LiveSnapshotReader, RouteActionHook, RouteActionHookError, RouteQualifiedMarketExport, ShardId,
-    ShardKey, ShardLifecycleSnapshot, ShardRouter, ShardSnapshot, SnapshotDimension,
-    SnapshotReadError,
+    ActionHookActivationLease, LiveActionControlError, LiveActionControlRejection,
+    LiveActionHookGeneration, LiveActionHookReapReceipt, LiveSnapshotReader,
+    PreparedLiveActionHookGroup, RouteActionHook, RouteActionHookError,
+    RouteCommittedResearchMarketExport, RouteQualifiedMarketExport, ShardId, ShardKey,
+    ShardLifecycleSnapshot, ShardRouter, ShardSnapshot, SnapshotDimension, SnapshotReadError,
 };
 
 static NEXT_RUNTIME_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+/// Independently bounded post-commit export routes admitted at runtime startup.
+#[derive(Debug, Default)]
+pub struct LiveRuntimeExportPlan {
+    qualified_market: Vec<RouteQualifiedMarketExport>,
+    committed_research: Vec<RouteCommittedResearchMarketExport>,
+}
+
+impl LiveRuntimeExportPlan {
+    pub const fn new(
+        qualified_market: Vec<RouteQualifiedMarketExport>,
+        committed_research: Vec<RouteCommittedResearchMarketExport>,
+    ) -> Self {
+        Self {
+            qualified_market,
+            committed_research,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<RouteQualifiedMarketExport>,
+        Vec<RouteCommittedResearchMarketExport>,
+    ) {
+        (self.qualified_market, self.committed_research)
+    }
+}
 
 /// Complete owner of one exact runtime incarnation and every actor task it spawned.
 #[derive(Debug)]
@@ -39,6 +72,10 @@ pub struct LiveRuntime {
     snapshot_notifications: Box<[mpsc::Receiver<()>]>,
     notification_cursor: usize,
     health: mpsc::Receiver<LiveRuntimeHealthEvent>,
+    action_controls: Box<[ActionControlChannels]>,
+    dynamic_action_group: Option<DynamicActionGroupRecord>,
+    startup_action_hooks: bool,
+    next_action_hook_generation: u64,
     cancellation: CancellationToken,
     actors: Option<JoinSet<ActorCompletion>>,
     cross_venue_task: Option<tokio::task::JoinHandle<()>>,
@@ -53,7 +90,7 @@ impl LiveRuntime {
         config: LiveRuntimeConfig,
         routes: Vec<LiveRouteConfig>,
     ) -> Result<Self, LiveRuntimeStartError> {
-        Self::start_inner(config, routes, None, Vec::new()).await
+        Self::start_inner(config, routes, None, LiveRuntimeExportPlan::default()).await
     }
 
     /// Starts a runtime only after every configured route transfers one exact action hook.
@@ -67,7 +104,13 @@ impl LiveRuntime {
         routes: Vec<LiveRouteConfig>,
         action_hooks: Vec<RouteActionHook>,
     ) -> Result<Self, LiveRuntimeStartError> {
-        Self::start_inner(config, routes, Some(action_hooks), Vec::new()).await
+        Self::start_inner(
+            config,
+            routes,
+            Some(action_hooks),
+            LiveRuntimeExportPlan::default(),
+        )
+        .await
     }
 
     /// Starts a market-data runtime with opt-in bounded post-decision observation exports.
@@ -76,7 +119,13 @@ impl LiveRuntime {
         routes: Vec<LiveRouteConfig>,
         qualified_market_exports: Vec<RouteQualifiedMarketExport>,
     ) -> Result<Self, LiveRuntimeStartError> {
-        Self::start_inner(config, routes, None, qualified_market_exports).await
+        Self::start_inner(
+            config,
+            routes,
+            None,
+            LiveRuntimeExportPlan::new(qualified_market_exports, Vec::new()),
+        )
+        .await
     }
 
     /// Starts an action-enabled runtime with independently bounded post-decision exports.
@@ -86,30 +135,61 @@ impl LiveRuntime {
         action_hooks: Vec<RouteActionHook>,
         qualified_market_exports: Vec<RouteQualifiedMarketExport>,
     ) -> Result<Self, LiveRuntimeStartError> {
-        Self::start_inner(config, routes, Some(action_hooks), qualified_market_exports).await
+        Self::start_inner(
+            config,
+            routes,
+            Some(action_hooks),
+            LiveRuntimeExportPlan::new(qualified_market_exports, Vec::new()),
+        )
+        .await
+    }
+
+    /// Starts a market-data runtime with independently bounded post-commit export routes.
+    pub async fn start_with_exports(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        exports: LiveRuntimeExportPlan,
+    ) -> Result<Self, LiveRuntimeStartError> {
+        Self::start_inner(config, routes, None, exports).await
+    }
+
+    /// Starts an action-enabled runtime with independently bounded post-commit export routes.
+    pub async fn start_with_action_hooks_and_exports(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Vec<RouteActionHook>,
+        exports: LiveRuntimeExportPlan,
+    ) -> Result<Self, LiveRuntimeStartError> {
+        Self::start_inner(config, routes, Some(action_hooks), exports).await
     }
 
     async fn start_inner(
         config: LiveRuntimeConfig,
         routes: Vec<LiveRouteConfig>,
         action_hooks: Option<Vec<RouteActionHook>>,
-        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+        exports: LiveRuntimeExportPlan,
     ) -> Result<Self, LiveRuntimeStartError> {
         config.validate_routes(&routes)?;
+        let startup_action_hooks = action_hooks.is_some();
         let mut action_hooks = validate_action_hooks(&config, &routes, action_hooks)?;
+        let (qualified_market_exports, committed_research_market_exports) = exports.into_parts();
         let mut qualified_market_exports =
             validate_qualified_market_exports(&routes, qualified_market_exports)?;
-        let export_bytes =
+        let mut committed_research_market_exports =
+            validate_committed_research_market_exports(&routes, committed_research_market_exports)?;
+        let qualified_export_bytes = export_reserved_bytes(
             qualified_market_exports
                 .values()
-                .try_fold(0_u64, |total, exporter| {
-                    total
-                        .checked_add(
-                            u64::try_from(exporter.reserved_bytes().get())
-                                .map_err(|_| LiveRuntimeStartError::Allocation)?,
-                        )
-                        .ok_or(LiveRuntimeStartError::Allocation)
-                })?;
+                .map(RouteQualifiedMarketExport::reserved_bytes),
+        )?;
+        let research_export_bytes = export_reserved_bytes(
+            committed_research_market_exports
+                .values()
+                .map(RouteCommittedResearchMarketExport::reserved_bytes),
+        )?;
+        let export_bytes = qualified_export_bytes
+            .checked_add(research_export_bytes)
+            .ok_or(LiveRuntimeStartError::Allocation)?;
         let estimated_peak_bytes = config
             .estimated_peak_bytes(&routes)?
             .get()
@@ -117,7 +197,11 @@ impl LiveRuntime {
             .and_then(NonZeroU64::new)
             .ok_or(LiveRuntimeStartError::Allocation)?;
         if estimated_peak_bytes > config.maximum_runtime_bytes() {
-            return Err(LiveRuntimeStartError::QualifiedMarketExportMemoryExceeded);
+            return Err(if research_export_bytes == 0 {
+                LiveRuntimeStartError::QualifiedMarketExportMemoryExceeded
+            } else {
+                LiveRuntimeStartError::MarketExportMemoryExceeded
+            });
         }
         let incarnation = next_incarnation()?;
         let mut runtime_owner = RuntimeLeaseOwner::new(incarnation.get());
@@ -149,6 +233,20 @@ impl LiveRuntime {
                     .cmp(right.route().venue().as_str())
                     .then_with(|| left.route().instrument().cmp(&right.route().instrument()))
             });
+        }
+        let mut action_hook_byte_budgets = Vec::new();
+        action_hook_byte_budgets
+            .try_reserve_exact(partitions.len())
+            .map_err(|_| LiveRuntimeStartError::Allocation)?;
+        for shard_routes in &partitions {
+            let permits = config
+                .maximum_action_hook_bytes_per_route()
+                .checked_mul(shard_routes.len())
+                .ok_or(LiveRuntimeStartError::Allocation)?;
+            if permits > Semaphore::MAX_PERMITS {
+                return Err(LiveRuntimeStartError::Allocation);
+            }
+            action_hook_byte_budgets.push(permits);
         }
         let mut action_hook_partitions = (0..shard_count)
             .map(|_| Vec::new())
@@ -186,6 +284,22 @@ impl LiveRuntime {
         }
         if !qualified_market_exports.is_empty() {
             return Err(LiveRuntimeStartError::QualifiedMarketExportPartitionInvariant);
+        }
+        let mut committed_research_export_partitions = (0..shard_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<RouteCommittedResearchMarketExport>>>();
+        for (shard_routes, shard_exports) in partitions
+            .iter()
+            .zip(&mut committed_research_export_partitions)
+        {
+            for route in shard_routes {
+                if let Some(exporter) = committed_research_market_exports.remove(route.route()) {
+                    shard_exports.push(exporter);
+                }
+            }
+        }
+        if !committed_research_market_exports.is_empty() {
+            return Err(LiveRuntimeStartError::CommittedResearchMarketExportPartitionInvariant);
         }
 
         let initial = initial_snapshots(&config, incarnation, &partitions)?;
@@ -232,13 +346,24 @@ impl LiveRuntime {
         ingress_routes
             .try_reserve(route_total)
             .map_err(|_| LiveRuntimeStartError::Allocation)?;
+        let mut action_controls = Vec::new();
+        action_controls
+            .try_reserve_exact(shard_count)
+            .map_err(|_| LiveRuntimeStartError::Allocation)?;
 
-        for (((shard, shard_routes), shard_action_hooks), shard_qualified_market_exports) in
-            shard_ids
-                .into_iter()
-                .zip(partitions)
-                .zip(action_hook_partitions)
-                .zip(qualified_market_export_partitions)
+        for (
+            (
+                (((shard, shard_routes), shard_action_hooks), shard_qualified_market_exports),
+                shard_committed_research_market_exports,
+            ),
+            action_hook_byte_permits,
+        ) in shard_ids
+            .into_iter()
+            .zip(partitions)
+            .zip(action_hook_partitions)
+            .zip(qualified_market_export_partitions)
+            .zip(committed_research_export_partitions)
+            .zip(action_hook_byte_budgets)
         {
             let shard_index = shard.index();
             let shard_owner = ShardLeaseOwner::new(u64::from(shard_index) + 1);
@@ -246,8 +371,9 @@ impl LiveRuntime {
             let byte_budget = Arc::new(Semaphore::new(mailbox_byte_permits));
             let (mailbox_sender, mailbox) =
                 mpsc::channel::<ShardCommand>(config.mailbox_count_per_shard().get());
-            let (registration_sender, registrations) =
+            let (control_sender, controls) =
                 mpsc::channel(config.registration_control_capacity().get());
+            let action_hook_byte_budget = Arc::new(Semaphore::new(action_hook_byte_permits));
             for route in &shard_routes {
                 let channels = RouteIngressChannels {
                     shard,
@@ -255,7 +381,7 @@ impl LiveRuntime {
                     shard_liveness: shard_liveness.clone(),
                     mailbox: mailbox_sender.clone(),
                     byte_budget: Arc::clone(&byte_budget),
-                    registration: registration_sender.clone(),
+                    control: control_sender.clone(),
                     registration_deadline: config.registration_deadline(),
                     maximum_message_bytes: config.maximum_message_bytes().get(),
                     health: health_sender.clone(),
@@ -274,6 +400,13 @@ impl LiveRuntime {
                     return Err(LiveRuntimeStartError::RoutePartitionInvariant);
                 }
             }
+            action_controls.push(ActionControlChannels {
+                shard,
+                runtime: runtime.clone(),
+                shard_liveness: shard_liveness.clone(),
+                control: control_sender,
+                byte_budget: action_hook_byte_budget,
+            });
             let Some(publisher) = publishers.next() else {
                 cleanup_failed_startup(&mut runtime_owner, &cancellation, &mut actors, &snapshots)
                     .await;
@@ -292,9 +425,8 @@ impl LiveRuntime {
                 routes: shard_routes,
                 action_hooks: shard_action_hooks,
                 qualified_market_exports: shard_qualified_market_exports,
-                maximum_action_hook_bytes_per_route: config
-                    .maximum_action_hook_bytes_per_route()
-                    .get(),
+                committed_research_market_exports: shard_committed_research_market_exports,
+                maximum_action_hook_bytes_per_route: config.maximum_action_hook_bytes_per_route(),
                 maximum_sources_per_route: config.maximum_sources_per_route().get(),
                 maximum_streams_per_route: config.maximum_streams_per_route().get(),
                 feature_capacity: config.feature_capacity(),
@@ -304,7 +436,7 @@ impl LiveRuntime {
                         config.maximum_message_bytes().get(),
                     ),
                 mailbox,
-                registrations,
+                controls,
                 snapshot_limits: config.snapshot_limits(),
                 snapshot_interval: config.snapshot_interval(),
                 snapshot_event_trigger: config.snapshot_event_trigger().get(),
@@ -383,6 +515,10 @@ impl LiveRuntime {
             snapshot_notifications,
             notification_cursor: 0,
             health,
+            action_controls: action_controls.into_boxed_slice(),
+            dynamic_action_group: None,
+            startup_action_hooks,
+            next_action_hook_generation: 1,
             cancellation,
             actors: Some(actors),
             cross_venue_task,
@@ -430,6 +566,332 @@ impl LiveRuntime {
     /// Returns the checked conservative peak model accepted at startup.
     pub const fn estimated_peak_bytes(&self) -> NonZeroU64 {
         self.estimated_peak_bytes
+    }
+
+    /// Installs one complete route-hook group into this already-running incarnation while disabled.
+    ///
+    /// Every affected shard acknowledges actor ownership before the returned non-cloneable token
+    /// can activate the group. Installation never reconnects a feed or exports execution
+    /// authority. If installation fails after a partial cross-shard transfer, the shared gate
+    /// remains disabled and bounded rollback is attempted before this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty, duplicate, unknown, oversized, stale, or competing group; cancellation;
+    /// bounded control-plane timeout or closure; actor rejection; and incomplete rollback.
+    pub async fn prepare_action_hooks(
+        &mut self,
+        mut hooks: Vec<RouteActionHook>,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedLiveActionHookGroup, LiveActionControlError> {
+        if self.startup_action_hooks {
+            return Err(LiveActionControlError::StartupHooksInstalled);
+        }
+        if self.dynamic_action_group.is_some() {
+            return Err(LiveActionControlError::GroupAlreadyPrepared);
+        }
+        if hooks.is_empty() {
+            return Err(LiveActionControlError::EmptyGroup);
+        }
+        self.ingress
+            .runtime
+            .validate()
+            .map_err(|_| LiveActionControlError::RuntimeClosed)?;
+        hooks.sort_unstable_by(|left, right| {
+            left.route()
+                .venue()
+                .as_str()
+                .cmp(right.route().venue().as_str())
+                .then_with(|| left.route().instrument().cmp(&right.route().instrument()))
+        });
+        for hook in &hooks {
+            if !self.ingress.routes.contains_key(hook.route()) {
+                return Err(LiveActionControlError::UnknownRoute {
+                    route: hook.route().clone(),
+                });
+            }
+            hook.validate_retained_bytes(self.config.maximum_action_hook_bytes_per_route())
+                .map_err(|error| LiveActionControlError::InvalidHook {
+                    route: hook.route().clone(),
+                    error,
+                })?;
+        }
+        if let Some(duplicate) = hooks
+            .windows(2)
+            .find(|pair| pair[0].route() == pair[1].route())
+        {
+            return Err(LiveActionControlError::DuplicateRoute {
+                route: duplicate[0].route().clone(),
+            });
+        }
+
+        let generation = self.next_action_hook_generation()?;
+        let (activation, prepared) = ActionHookActivationLease::prepare(
+            self.incarnation,
+            generation,
+            self.ingress.runtime.clone(),
+        );
+        let router = ShardRouter::v1(self.config.shard_count().get())?;
+        let shard_count = usize::from(self.config.shard_count().get());
+        let mut partition_counts = Vec::new();
+        partition_counts
+            .try_reserve_exact(shard_count)
+            .map_err(|_| LiveActionControlError::Allocation)?;
+        partition_counts.resize(shard_count, 0_usize);
+        for hook in &hooks {
+            let index = usize::from(router.route(hook.route()).index());
+            let count = partition_counts
+                .get_mut(index)
+                .ok_or(LiveActionControlError::ShardInvariant)?;
+            *count = count
+                .checked_add(1)
+                .ok_or(LiveActionControlError::RetainedSizeOverflow)?;
+        }
+        let mut partitions = Vec::new();
+        partitions
+            .try_reserve_exact(shard_count)
+            .map_err(|_| LiveActionControlError::Allocation)?;
+        for count in &partition_counts {
+            let mut partition = Vec::new();
+            partition
+                .try_reserve_exact(*count)
+                .map_err(|_| LiveActionControlError::Allocation)?;
+            partitions.push(partition);
+        }
+        for hook in hooks {
+            let shard = router.route(hook.route());
+            partitions
+                .get_mut(usize::from(shard.index()))
+                .ok_or(LiveActionControlError::ShardInvariant)?
+                .push(hook);
+        }
+        let mut shard_counts = Vec::new();
+        shard_counts
+            .try_reserve_exact(partitions.iter().filter(|hooks| !hooks.is_empty()).count())
+            .map_err(|_| LiveActionControlError::Allocation)?;
+        for (index, hooks) in partitions.iter().enumerate() {
+            if !hooks.is_empty() {
+                shard_counts.push(DynamicActionShard {
+                    shard: ShardId::new(
+                        u16::try_from(index).map_err(|_| LiveActionControlError::ShardInvariant)?,
+                        self.config.shard_count().get(),
+                    )?,
+                    expected_hooks: hooks.len(),
+                });
+            }
+        }
+        self.dynamic_action_group = Some(DynamicActionGroupRecord {
+            activation: activation.clone(),
+            generation,
+            shards: shard_counts,
+            install_complete: false,
+            removal_started: false,
+        });
+
+        let install = self
+            .install_dynamic_action_hooks(partitions, activation, generation, &cancellation)
+            .await;
+        if let Err(error) = install {
+            let rollback_cancellation = CancellationToken::new();
+            let rollback = self.reap_action_hooks_inner(&rollback_cancellation).await;
+            return if rollback.is_ok() {
+                Err(error)
+            } else {
+                Err(LiveActionControlError::RollbackIncomplete { generation })
+            };
+        }
+        let record = self
+            .dynamic_action_group
+            .as_mut()
+            .ok_or(LiveActionControlError::GroupStateLost)?;
+        record.install_complete = true;
+        Ok(prepared)
+    }
+
+    /// Removes and drops the one current disabled dynamic group after bounded actor acknowledgments.
+    ///
+    /// This operation is retryable after cancellation, timeout, or a lost acknowledgement. The
+    /// gate must have been disabled synchronously first; active hooks are never removed underneath
+    /// an executing application owner.
+    pub async fn reap_action_hooks(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<LiveActionHookReapReceipt, LiveActionControlError> {
+        self.reap_action_hooks_inner(&cancellation).await
+    }
+
+    async fn install_dynamic_action_hooks(
+        &mut self,
+        mut partitions: Vec<Vec<RouteActionHook>>,
+        activation: ActionHookActivationLease,
+        generation: LiveActionHookGeneration,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LiveActionControlError> {
+        let deadline = control_deadline(self.config.registration_deadline())?;
+        let mut responses = Vec::new();
+        responses
+            .try_reserve_exact(partitions.iter().filter(|hooks| !hooks.is_empty()).count())
+            .map_err(|_| LiveActionControlError::Allocation)?;
+        for (index, hooks) in partitions.iter_mut().enumerate() {
+            if hooks.is_empty() {
+                continue;
+            }
+            let channels = self
+                .action_controls
+                .get(index)
+                .ok_or(LiveActionControlError::ShardInvariant)?;
+            channels
+                .runtime
+                .validate()
+                .map_err(|_| LiveActionControlError::RuntimeClosed)?;
+            channels.shard_liveness.validate().map_err(|_| {
+                LiveActionControlError::ShardClosed {
+                    shard: channels.shard,
+                }
+            })?;
+            let mut byte_permits = Vec::new();
+            byte_permits
+                .try_reserve_exact(hooks.len())
+                .map_err(|_| LiveActionControlError::Allocation)?;
+            let mut retained_bytes = Vec::new();
+            retained_bytes
+                .try_reserve_exact(hooks.len())
+                .map_err(|_| LiveActionControlError::Allocation)?;
+            for hook in hooks.iter() {
+                retained_bytes.push(
+                    u32::try_from(hook.declared_retained_bytes())
+                        .map_err(|_| LiveActionControlError::RetainedSizeOverflow)?,
+                );
+            }
+            for retained in retained_bytes {
+                let permit = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(LiveActionControlError::Cancelled),
+                    result = Arc::clone(&channels.byte_budget).acquire_many_owned(retained) => {
+                        result.map_err(|_| LiveActionControlError::ControlClosed)?
+                    }
+                    () = tokio::time::sleep_until(deadline) => {
+                        return Err(LiveActionControlError::DeadlineExceeded);
+                    }
+                };
+                byte_permits.push(permit);
+            }
+            let sender = channels.control.clone();
+            let permit = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(LiveActionControlError::Cancelled),
+                result = sender.reserve_owned() => {
+                    result.map_err(|_| LiveActionControlError::ControlClosed)?
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(LiveActionControlError::DeadlineExceeded);
+                }
+            };
+            let expected_hooks = hooks.len();
+            let (response, receiver) = oneshot::channel();
+            permit.send(ActorControlCommand::InstallActionHooks(
+                ActionHookInstallCommand {
+                    runtime_incarnation: self.incarnation,
+                    generation,
+                    activation: activation.clone(),
+                    hooks: std::mem::take(hooks),
+                    response,
+                    _byte_permits: byte_permits,
+                },
+            ));
+            responses.push((channels.shard, expected_hooks, receiver));
+        }
+        await_action_control_responses(responses, deadline, cancellation, false).await?;
+        Ok(())
+    }
+
+    async fn reap_action_hooks_inner(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<LiveActionHookReapReceipt, LiveActionControlError> {
+        let record = self
+            .dynamic_action_group
+            .as_mut()
+            .ok_or(LiveActionControlError::NoPreparedGroup)?;
+        record
+            .activation
+            .validate_disabled(self.incarnation, record.generation)?;
+        let allow_absent = record.removal_started || !record.install_complete;
+        record.removal_started = true;
+        let activation = record.activation.clone();
+        let generation = record.generation;
+        let mut shards = Vec::new();
+        shards
+            .try_reserve_exact(record.shards.len())
+            .map_err(|_| LiveActionControlError::Allocation)?;
+        shards.extend_from_slice(&record.shards);
+        let deadline = control_deadline(self.config.registration_deadline())?;
+        let mut responses = Vec::new();
+        responses
+            .try_reserve_exact(shards.len())
+            .map_err(|_| LiveActionControlError::Allocation)?;
+        for shard in &shards {
+            let channels = self
+                .action_controls
+                .get(usize::from(shard.shard.index()))
+                .ok_or(LiveActionControlError::ShardInvariant)?;
+            channels
+                .runtime
+                .validate()
+                .map_err(|_| LiveActionControlError::RuntimeClosed)?;
+            channels.shard_liveness.validate().map_err(|_| {
+                LiveActionControlError::ShardClosed {
+                    shard: channels.shard,
+                }
+            })?;
+            let sender = channels.control.clone();
+            let permit = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(LiveActionControlError::Cancelled),
+                result = sender.reserve_owned() => {
+                    result.map_err(|_| LiveActionControlError::ControlClosed)?
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(LiveActionControlError::DeadlineExceeded);
+                }
+            };
+            let (response, receiver) = oneshot::channel();
+            permit.send(ActorControlCommand::RemoveActionHooks(
+                ActionHookRemoveCommand {
+                    runtime_incarnation: self.incarnation,
+                    generation,
+                    activation: activation.clone(),
+                    expected_hooks: shard.expected_hooks,
+                    response,
+                },
+            ));
+            responses.push((channels.shard, shard.expected_hooks, receiver));
+        }
+        let removed =
+            await_action_control_responses(responses, deadline, cancellation, allow_absent).await?;
+        activation.retire()?;
+        self.dynamic_action_group = None;
+        Ok(LiveActionHookReapReceipt::new(
+            self.incarnation,
+            generation,
+            removed,
+        ))
+    }
+
+    fn next_action_hook_generation(
+        &mut self,
+    ) -> Result<LiveActionHookGeneration, LiveActionControlError> {
+        if self.next_action_hook_generation == 0 || self.next_action_hook_generation == u64::MAX {
+            return Err(LiveActionControlError::GenerationExhausted);
+        }
+        let generation = NonZeroU64::new(self.next_action_hook_generation)
+            .map(LiveActionHookGeneration::new)
+            .ok_or(LiveActionControlError::GenerationExhausted)?;
+        self.next_action_hook_generation = self
+            .next_action_hook_generation
+            .checked_add(1)
+            .ok_or(LiveActionControlError::GenerationExhausted)?;
+        Ok(generation)
     }
 
     /// Invalidates and completely joins this incarnation before starting a clean replacement.
@@ -503,10 +965,16 @@ impl LiveRuntime {
 
     /// Release-invalidates ingress, drains or aborts-and-awaits every actor, and returns outcomes.
     pub async fn shutdown(mut self) -> LiveRuntimeShutdown {
+        if let Some(group) = self.dynamic_action_group.as_ref() {
+            group.activation.disable();
+        }
         if let Some(owner) = self.runtime_owner.as_mut() {
             owner.invalidate();
         }
         for channels in self.ingress.routes.values() {
+            channels.byte_budget.close();
+        }
+        for channels in &self.action_controls {
             channels.byte_budget.close();
         }
         self.cancellation.cancel();
@@ -567,6 +1035,9 @@ impl LiveRuntime {
 
 impl Drop for LiveRuntime {
     fn drop(&mut self) {
+        if let Some(group) = self.dynamic_action_group.as_ref() {
+            group.activation.disable();
+        }
         if let Some(owner) = self.runtime_owner.as_mut() {
             owner.invalidate();
         }
@@ -578,6 +1049,84 @@ impl Drop for LiveRuntime {
         if let Some(task) = self.cross_venue_task.as_mut() {
             task.abort();
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DynamicActionShard {
+    shard: ShardId,
+    expected_hooks: usize,
+}
+
+#[derive(Debug)]
+struct DynamicActionGroupRecord {
+    activation: ActionHookActivationLease,
+    generation: LiveActionHookGeneration,
+    shards: Vec<DynamicActionShard>,
+    install_complete: bool,
+    removal_started: bool,
+}
+
+type ActionControlResponse = (
+    ShardId,
+    usize,
+    oneshot::Receiver<Result<usize, ActionHookControlFailure>>,
+);
+
+async fn await_action_control_responses(
+    responses: Vec<ActionControlResponse>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    allow_absent: bool,
+) -> Result<usize, LiveActionControlError> {
+    let mut acknowledged = 0_usize;
+    for (shard, expected, response) in responses {
+        let response = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(LiveActionControlError::Cancelled),
+            response = response => response.map_err(|_| LiveActionControlError::ControlClosed)?,
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(LiveActionControlError::DeadlineExceeded);
+            }
+        };
+        let observed = response.map_err(|error| LiveActionControlError::ActorRejected {
+            shard,
+            reason: action_control_rejection(&error),
+        })?;
+        if observed != expected && !(allow_absent && observed == 0) {
+            return Err(LiveActionControlError::AcknowledgementMismatch {
+                shard,
+                expected,
+                observed,
+            });
+        }
+        acknowledged = acknowledged
+            .checked_add(observed)
+            .ok_or(LiveActionControlError::RetainedSizeOverflow)?;
+    }
+    Ok(acknowledged)
+}
+
+fn control_deadline(duration: std::time::Duration) -> Result<Instant, LiveActionControlError> {
+    Instant::now()
+        .checked_add(duration)
+        .ok_or(LiveActionControlError::DeadlineRange)
+}
+
+fn action_control_rejection(error: &ActionHookControlFailure) -> LiveActionControlRejection {
+    match error {
+        ActionHookControlFailure::RuntimeMismatch => LiveActionControlRejection::RuntimeMismatch,
+        ActionHookControlFailure::InvalidActivation => {
+            LiveActionControlRejection::InvalidActivation
+        }
+        ActionHookControlFailure::EmptyGroup => LiveActionControlRejection::EmptyGroup,
+        ActionHookControlFailure::DuplicateRoute => LiveActionControlRejection::DuplicateRoute,
+        ActionHookControlFailure::UnknownRoute => LiveActionControlRejection::UnknownRoute,
+        ActionHookControlFailure::HookAlreadyInstalled => {
+            LiveActionControlRejection::HookAlreadyInstalled
+        }
+        ActionHookControlFailure::PartialGroup => LiveActionControlRejection::PartialGroup,
+        ActionHookControlFailure::InvalidHook(_) => LiveActionControlRejection::InvalidHook,
     }
 }
 
@@ -605,7 +1154,7 @@ fn validate_action_hooks(
         if !known_routes.contains(&route) {
             return Err(LiveRuntimeStartError::UnknownActionHook { route });
         }
-        hook.validate_retained_bytes(config.maximum_action_hook_bytes_per_route().get())
+        hook.validate_retained_bytes(config.maximum_action_hook_bytes_per_route())
             .map_err(|error| LiveRuntimeStartError::InvalidActionHook {
                 route: route.clone(),
                 error,
@@ -649,6 +1198,43 @@ fn validate_qualified_market_exports(
         }
     }
     Ok(validated)
+}
+
+fn validate_committed_research_market_exports(
+    routes: &[LiveRouteConfig],
+    exporters: Vec<RouteCommittedResearchMarketExport>,
+) -> Result<HashMap<ShardKey, RouteCommittedResearchMarketExport>, LiveRuntimeStartError> {
+    let mut known_routes = std::collections::HashSet::new();
+    known_routes
+        .try_reserve(routes.len())
+        .map_err(|_| LiveRuntimeStartError::Allocation)?;
+    for route in routes {
+        known_routes.insert(route.route().clone());
+    }
+    let mut validated = HashMap::new();
+    validated
+        .try_reserve(exporters.len())
+        .map_err(|_| LiveRuntimeStartError::Allocation)?;
+    for exporter in exporters {
+        let route = exporter.route().clone();
+        if !known_routes.contains(&route) {
+            return Err(LiveRuntimeStartError::UnknownCommittedResearchMarketExport { route });
+        }
+        if validated.insert(route.clone(), exporter).is_some() {
+            return Err(LiveRuntimeStartError::DuplicateCommittedResearchMarketExport { route });
+        }
+    }
+    Ok(validated)
+}
+
+fn export_reserved_bytes(
+    reservations: impl IntoIterator<Item = std::num::NonZeroUsize>,
+) -> Result<u64, LiveRuntimeStartError> {
+    reservations.into_iter().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(u64::try_from(bytes.get()).map_err(|_| LiveRuntimeStartError::Allocation)?)
+            .ok_or(LiveRuntimeStartError::Allocation)
+    })
 }
 
 fn initial_snapshots(
@@ -861,6 +1447,14 @@ pub enum LiveRuntimeStartError {
     QualifiedMarketExportPartitionInvariant,
     #[error("qualified-market export reservation exceeds the configured runtime memory ceiling")]
     QualifiedMarketExportMemoryExceeded,
+    #[error("committed research-market export was configured more than once for route {route:?}")]
+    DuplicateCommittedResearchMarketExport { route: ShardKey },
+    #[error("committed research-market export was configured for unknown route {route:?}")]
+    UnknownCommittedResearchMarketExport { route: ShardKey },
+    #[error("committed research-market exports did not preserve deterministic shard partitioning")]
+    CommittedResearchMarketExportPartitionInvariant,
+    #[error("market export reservations exceed the configured runtime memory ceiling")]
+    MarketExportMemoryExceeded,
     #[error("snapshot publication plane did not match configured shards")]
     SnapshotPlaneInvariant,
     #[error("bounded cross-venue plane could not initialize")]

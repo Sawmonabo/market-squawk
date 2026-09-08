@@ -12,20 +12,19 @@ use std::{
 
 use market_squawk_services::{
     RequestContext as ServiceRequestContext, RequestId as ServiceRequestId, ServiceCapabilities,
-    ServiceError, ServiceErrorClass, ToolArtifactPolicy, ToolDescriptor, ToolServices,
+    ServiceError, ServiceErrorClass, ToolDescriptor, ToolServices,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ContentBlock, ErrorCode,
-        Implementation, InitializeRequestParams, InitializeResult, ListToolsResult, Meta,
-        NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion, RequestId,
-        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool,
-        ToolAnnotations, ToolExecution,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
+        ContentBlock, ErrorCode, Implementation, InitializeRequestParams, InitializeResult,
+        ListToolsResult, MetaObject, NumberOrString, PaginatedRequestParams, ProgressToken,
+        ProtocolVersion, RequestId, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+        ServerResult, Tool, ToolAnnotations,
     },
     service::{NotificationContext, QuitReason, RequestContext as McpRequestContext},
 };
-use serde_json::json;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -34,8 +33,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRepository,
-    AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
+    ArtifactRepository, AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
     framing::OutputChannel,
     isolation::{
         IsolatedSdkOutcome, McpProgressSink, OwnedSdkThread, ProgressDelivery,
@@ -413,12 +411,7 @@ impl<S: ToolServices> ServiceHandler<S> {
                 Ok(result) => result,
                 Err(error) => return tool_execution_error(error),
             };
-            self.render_result(
-                descriptor,
-                result,
-                ArtifactPublicationContext::new(request_cancellation.clone(), deadline),
-            )
-            .await
+            self.render_result(descriptor, result)
         };
         let outcome = tokio::select! {
             biased;
@@ -443,11 +436,10 @@ impl<S: ToolServices> ServiceHandler<S> {
         outcome
     }
 
-    async fn render_result(
+    fn render_result(
         &self,
         descriptor: &ToolDescriptor,
         result: market_squawk_services::TypedToolResult,
-        artifact_context: ArtifactPublicationContext,
     ) -> Result<CallToolResult, McpError> {
         let limits = self.limits.service_limits();
         result
@@ -456,39 +448,16 @@ impl<S: ToolServices> ServiceHandler<S> {
         result
             .validate_for(descriptor)
             .map_err(|_| service_error(ServiceError::InvalidResult))?;
-        let inline = result.encoded_bytes() <= limits.maximum_inline_bytes()
+        let projection = descriptor.result_projection();
+        let projected_bytes = result
+            .projected_encoded_bytes(projection, limits)
+            .map_err(|_| service_error(ServiceError::InvalidResult))?;
+        let inline = projected_bytes <= limits.maximum_inline_bytes()
             && result.item_count() <= limits.maximum_inline_items();
         if inline {
-            return Ok(structured_result(result.into_envelope()));
+            return Ok(structured_result(result.into_envelope(projection)));
         }
-        if matches!(
-            descriptor.contract().result().artifact(),
-            ToolArtifactPolicy::InlineOnly
-        ) {
-            return tool_execution_error(ServiceError::ResourceExhausted);
-        }
-
-        let metadata = result.metadata_value();
-        let structured = result.into_envelope();
-        let encoded = serde_json::to_vec(&structured)
-            .map_err(|_| McpError::internal_error("result encoding failed", None))?;
-        let publication = ArtifactPublication::try_json(encoded).map_err(artifact_error)?;
-        let reference = self
-            .artifacts
-            .publish(publication.clone(), artifact_context)
-            .await
-            .map_err(artifact_error)?;
-        if !reference.matches(&publication) {
-            return Err(McpError::internal_error(
-                "artifact repository returned inconsistent metadata",
-                None,
-            ));
-        }
-        let value = serde_json::to_value(reference)
-            .map_err(|_| McpError::internal_error("artifact reference encoding failed", None))?;
-        Ok(structured_result(
-            json!({ "artifact": value, "metadata": metadata }),
-        ))
+        Err(service_error(ServiceError::ResourceExhausted))
     }
 }
 
@@ -507,12 +476,15 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
             ServerCapabilities::default()
         };
         InitializeResult::new(capabilities)
-            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new(
                 "market-squawk",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(match self.identity_class {
+                LocalProcessIdentityClass::AuthenticatedInstalledClient => {
+                    "Authenticated access to the installed Market Squawk service."
+                }
                 LocalProcessIdentityClass::InheritedStdioUnverified => {
                     "Inherited local stdio; peer identity is unverified. No business-domain tools are present unless explicitly registered."
                 }
@@ -522,11 +494,16 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
             })
     }
 
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+    }
+
     async fn initialize(
         &self,
-        _request: InitializeRequestParams,
-        _context: McpRequestContext<RoleServer>,
+        request: InitializeRequestParams,
+        context: McpRequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request);
         self.initialization_state
             .compare_exchange(
                 STATE_AWAIT_INITIALIZE,
@@ -601,8 +578,8 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
         &self,
         request: CallToolRequestParams,
         context: McpRequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.execute_tool(request, context).await
+    ) -> Result<CallToolResponse, McpError> {
+        self.execute_tool(request, context).await.map(Into::into)
     }
 }
 
@@ -623,7 +600,7 @@ pub fn validate_service_capabilities(
     validated_protocol_tools(capabilities, limits).map(|_tools| ())
 }
 
-fn validated_protocol_tools(
+pub(crate) fn validated_protocol_tools(
     capabilities: &ServiceCapabilities,
     limits: McpLimits,
 ) -> Result<Arc<[Tool]>, ServerError> {
@@ -688,10 +665,9 @@ fn to_rmcp_tool(descriptor: &ToolDescriptor) -> Tool {
             .idempotent(effects.idempotent())
             .open_world(effects.open_world()),
     )
-    .with_raw_output_schema(Arc::new(descriptor.output_schema().clone()))
-    .with_execution(ToolExecution::new().with_task_support(TaskSupport::Forbidden));
+    .with_raw_output_schema(Arc::new(descriptor.output_schema().clone()));
     if !descriptor.metadata().is_empty() {
-        tool = tool.with_meta(Meta(descriptor.metadata().clone()));
+        tool = tool.with_meta(MetaObject(descriptor.metadata().clone()));
     }
     tool
 }
@@ -752,18 +728,6 @@ fn cancelled_error() -> McpError {
 
 fn deadline_error() -> McpError {
     McpError::new(ErrorCode(-32_008), "request deadline exceeded", None)
-}
-
-fn artifact_error(error: ArtifactError) -> McpError {
-    match error {
-        ArtifactError::Cancelled => cancelled_error(),
-        ArtifactError::DeadlineExceeded => deadline_error(),
-        ArtifactError::InvalidPublication
-        | ArtifactError::InvalidReference
-        | ArtifactError::ReadLimitExceeded
-        | ArtifactError::NotFound
-        | ArtifactError::Unavailable => McpError::internal_error("artifact operation failed", None),
-    }
 }
 
 fn controlled_or_initialization_error(

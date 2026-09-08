@@ -1,7 +1,6 @@
 //! Secret-free status contracts shared by local portal and CLI transports.
 
 use market_squawk_adapter_bls::BlsSeriesMetadataInput;
-use market_squawk_adapter_fred::FredOperation;
 use market_squawk_data::ResumedProviderOnboarding;
 use market_squawk_domain::{
     CalendarDate, DataQuality, EvidenceDigest, SourceIdentifier, Timestamp,
@@ -13,7 +12,7 @@ use market_squawk_sources::{
     OnboardingState, OperationAdmission, ProfileEvidence, ProfileReleaseState,
     ProviderBudgetPolicy, ProviderCapabilityRevision, ProviderOnboardingProfile,
     ProviderPublicConfiguration, RatePolicyDescriptor, RemoteRevocationOutcome, Requirement,
-    RightsAdmissionState, SetupMode, ZeroFeeStatus,
+    RightsAdmissionState, RuntimeVerificationEvidence, SetupMode, ZeroFeeStatus,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -197,6 +196,9 @@ pub enum OnboardingNextAction {
     ImportSecret,
     /// Verify the securely stored credential and activate its exact admitted authority.
     VerifyAndActivate,
+    /// Complete the code-owned Schwab OAuth authorization before entitlement verification.
+    #[serde(rename = "complete_oauth_authorization")]
+    CompleteOAuthAuthorization,
     /// Refresh the named mutable official evidence.
     RefreshEvidence,
     /// Import a replacement credential before the active verification expires.
@@ -215,6 +217,59 @@ pub enum OnboardingNextAction {
     Active,
     /// The session is terminally blocked or cancelled.
     None,
+}
+
+/// Exact local Schwab OAuth control operation exposed by onboarding transports.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchwabOAuthLifecycleAction {
+    Begin,
+    Continue,
+    Cancel,
+    Unlink,
+}
+
+/// Secret-free Schwab OAuth authority state returned to local control surfaces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchwabOAuthLifecycleState {
+    AwaitingAuthorization,
+    ExchangingAuthorization,
+    Active,
+    ReauthorizationRequired,
+    Cancelled,
+    Unlinked,
+}
+
+/// Secret-free result of one application-owned Schwab OAuth lifecycle operation.
+#[derive(Clone, Debug, Serialize)]
+pub struct SchwabOAuthLifecycleView {
+    session_id: Uuid,
+    action: SchwabOAuthLifecycleAction,
+    state: SchwabOAuthLifecycleState,
+    access_token_generation: Option<u64>,
+    access_expires_at: Option<Timestamp>,
+    refresh_expires_at: Option<Timestamp>,
+}
+
+impl SchwabOAuthLifecycleView {
+    pub(crate) const fn new(
+        session_id: Uuid,
+        action: SchwabOAuthLifecycleAction,
+        state: SchwabOAuthLifecycleState,
+        access_token_generation: Option<u64>,
+        access_expires_at: Option<Timestamp>,
+        refresh_expires_at: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            session_id,
+            action,
+            state,
+            access_token_generation,
+            access_expires_at,
+            refresh_expires_at,
+        }
+    }
 }
 
 /// Exact zero-padded SEC Central Index Key supplied through local onboarding.
@@ -310,93 +365,17 @@ pub enum ProviderPortalActivationRequest {
         /// Inclusive final observation year.
         end_year: u16,
     },
-    /// FRED/ALFRED using typed, exact-series rights evidence.
+    /// FRED/ALFRED using one exact configured series and vintage interval.
     FredAlfred {
-        /// Exact written St. Louis Fed service permission for every durable operation.
-        service_permission: Box<FredPortalServicePermissionInput>,
-        /// Exact rights grants; the guided starter uses reviewed `UNRATE` evidence.
-        grants: Vec<FredPortalGrantInput>,
+        /// Exact provider discovery dataset retained through restart and immutable reads.
+        provider_dataset: SourceIdentifier,
     },
-}
-
-/// Exact written St. Louis Fed permission for Market Squawk's durable FRED API operations.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FredPortalServicePermissionInput {
-    pub(crate) evidence: FredPortalServiceEvidenceInput,
-    pub(crate) review: FredPortalServiceReviewInput,
-}
-
-/// Exact raw Bank-response evidence imported through the local portal.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FredPortalServiceEvidenceInput {
-    pub(crate) channel: FredPortalServicePermissionChannelInput,
-    pub(crate) sha256: String,
-    pub(crate) byte_length: u64,
-    pub(crate) content_base64: String,
-}
-
-/// Closed authentic delivery channel for one exact Bank response.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-pub(crate) enum FredPortalServicePermissionChannelInput {
-    OfficialHttps {
-        evidence_url: String,
-        authority_url: String,
-    },
-}
-
-/// Explicit local review decision bound to the exact raw Bank response.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FredPortalServiceReviewInput {
-    pub(crate) reviewer: SourceIdentifier,
-    pub(crate) reviewed_at_unix_nanos: String,
-    pub(crate) issuer: SourceIdentifier,
-    pub(crate) application: SourceIdentifier,
-    pub(crate) service: SourceIdentifier,
-    pub(crate) series: Vec<SourceIdentifier>,
-    pub(crate) operations: Vec<FredOperation>,
-    pub(crate) conditions: Vec<String>,
-    pub(crate) effective_at_unix_nanos: String,
-    pub(crate) expires_at_unix_nanos: Option<String>,
-    pub(crate) revalidate_by_unix_nanos: String,
-}
-
-/// One exact FRED series grant accepted from the bounded local portal.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FredPortalGrantInput {
-    pub(crate) series: SourceIdentifier,
-    pub(crate) owner: SourceIdentifier,
-    pub(crate) evidence: FredPortalEvidenceInput,
-    pub(crate) effective_at_unix_nanos: String,
-    pub(crate) expires_at_unix_nanos: String,
-}
-
-/// Typed exact evidence accepted for one portal-created FRED series grant.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-pub(crate) enum FredPortalEvidenceInput {
-    /// The exact code-reviewed BLS public-domain decision for FRED series `UNRATE`.
-    ReviewedUnrate,
-    /// Caller-supplied exact public-domain evidence.
-    PublicDomain {
-        evidence_reference_url: String,
-        authority_url: String,
-        sha256: String,
-        byte_length: u64,
-        content_base64: String,
-    },
-    /// Caller-supplied exact series-owner permission.
-    OwnerPermission {
-        evidence_reference_url: String,
-        authority_url: String,
-        sha256: String,
-        byte_length: u64,
-        content_base64: String,
-    },
+    /// Federal Reserve Board H.15 current-definition Treasury constant-maturity rates.
+    FederalReserveBoardH15,
+    /// No-key, explicit-demand Yahoo enrichment using the application-owned adaptive lane.
+    YahooEnrichment,
+    /// Secret-store-backed Tiingo Starter NAV/EOD access using the durable application quota.
+    TiingoStarterEodNav,
 }
 
 /// Secret-free evidence returned after durable adapter registration succeeds.
@@ -495,13 +474,119 @@ pub struct ProviderActivationLease {
     public_configuration: ProviderPublicConfiguration,
     account_digest: Option<EvidenceDigest>,
     verification_evidence_digest: Option<EvidenceDigest>,
-    runtime_evidence_digest: EvidenceDigest,
+    runtime_verification_evidence: RuntimeVerificationEvidence,
     provider_budget_policy: Option<ProviderBudgetPolicy>,
     generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
     verification_expires_at: Option<Timestamp>,
     authority_effective_at: Timestamp,
     issued_at: Timestamp,
+}
+
+/// Restricted in-process authority to open only the protected Schwab OAuth bootstrap.
+///
+/// This lease carries no market-data activation, publication, read, account, order, or execution
+/// authority. Its opaque application-secret reference can be consumed only by the onboarding
+/// service's Schwab OAuth authority factory.
+#[derive(Clone)]
+pub(crate) struct SchwabOAuthBootstrapLease {
+    session_id: Uuid,
+    surface_id: SourceIdentifier,
+    capability_revision: ProviderCapabilityRevision,
+    capability_digest: EvidenceDigest,
+    public_configuration_digest: EvidenceDigest,
+    rights_decision_digest: EvidenceDigest,
+    rate_policy_digest: EvidenceDigest,
+    generation: SecretGeneration,
+    application_secret_reference: SecretRef,
+    verification_evidence_digest: EvidenceDigest,
+    issued_at: Timestamp,
+    exclusive_expires_at: Timestamp,
+}
+
+impl SchwabOAuthBootstrapLease {
+    pub(super) fn new(input: SchwabOAuthBootstrapLeaseInput) -> Self {
+        Self {
+            session_id: input.session_id,
+            surface_id: input.surface_id,
+            capability_revision: input.capability_revision,
+            capability_digest: input.capability_digest,
+            public_configuration_digest: input.public_configuration_digest,
+            rights_decision_digest: input.rights_decision_digest,
+            rate_policy_digest: input.rate_policy_digest,
+            generation: input.generation,
+            application_secret_reference: input.application_secret_reference,
+            verification_evidence_digest: input.verification_evidence_digest,
+            issued_at: input.issued_at,
+            exclusive_expires_at: input.exclusive_expires_at,
+        }
+    }
+
+    pub(crate) fn same_authority_as(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.surface_id == other.surface_id
+            && self.capability_revision == other.capability_revision
+            && self.capability_digest == other.capability_digest
+            && self.public_configuration_digest == other.public_configuration_digest
+            && self.rights_decision_digest == other.rights_decision_digest
+            && self.rate_policy_digest == other.rate_policy_digest
+            && self.generation == other.generation
+            && self.application_secret_reference == other.application_secret_reference
+            && self.verification_evidence_digest == other.verification_evidence_digest
+            && self.exclusive_expires_at == other.exclusive_expires_at
+    }
+
+    pub(crate) const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+    pub(crate) const fn surface_id(&self) -> &SourceIdentifier {
+        &self.surface_id
+    }
+    pub(crate) const fn capability_revision(&self) -> ProviderCapabilityRevision {
+        self.capability_revision
+    }
+    pub(crate) const fn generation(&self) -> SecretGeneration {
+        self.generation
+    }
+    pub(crate) const fn application_secret_reference(&self) -> &SecretRef {
+        &self.application_secret_reference
+    }
+    pub(crate) const fn issued_at(&self) -> Timestamp {
+        self.issued_at
+    }
+    pub(crate) const fn exclusive_expires_at(&self) -> Timestamp {
+        self.exclusive_expires_at
+    }
+}
+
+impl std::fmt::Debug for SchwabOAuthBootstrapLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabOAuthBootstrapLease")
+            .field("session_id", &self.session_id)
+            .field("surface_id", &self.surface_id)
+            .field("capability_revision", &self.capability_revision)
+            .field("generation", &self.generation)
+            .field("application_secret_reference", &"[OPAQUE]")
+            .field("issued_at", &self.issued_at)
+            .field("exclusive_expires_at", &self.exclusive_expires_at)
+            .finish()
+    }
+}
+
+pub(super) struct SchwabOAuthBootstrapLeaseInput {
+    pub session_id: Uuid,
+    pub surface_id: SourceIdentifier,
+    pub capability_revision: ProviderCapabilityRevision,
+    pub capability_digest: EvidenceDigest,
+    pub public_configuration_digest: EvidenceDigest,
+    pub rights_decision_digest: EvidenceDigest,
+    pub rate_policy_digest: EvidenceDigest,
+    pub generation: SecretGeneration,
+    pub application_secret_reference: SecretRef,
+    pub verification_evidence_digest: EvidenceDigest,
+    pub issued_at: Timestamp,
+    pub exclusive_expires_at: Timestamp,
 }
 
 impl ProviderActivationLease {
@@ -518,7 +603,7 @@ impl ProviderActivationLease {
             public_configuration: input.public_configuration,
             account_digest: input.account_digest,
             verification_evidence_digest: input.verification_evidence_digest,
-            runtime_evidence_digest: input.runtime_evidence_digest,
+            runtime_verification_evidence: input.runtime_verification_evidence,
             provider_budget_policy: input.provider_budget_policy,
             generation: input.generation,
             secret_reference: input.secret_reference,
@@ -526,6 +611,27 @@ impl ProviderActivationLease {
             authority_effective_at: input.authority_effective_at,
             issued_at: input.issued_at,
         }
+    }
+
+    /// Returns whether both leases represent the same exact activation authority.
+    ///
+    /// The trusted-local `issued_at` timestamp is deliberately excluded because recovery may
+    /// remint the same authority at a later issuance instant.
+    pub(crate) fn same_authority_as(&self, other: &Self) -> bool {
+        self.session_id() == other.session_id()
+            && self.surface_id() == other.surface_id()
+            && self.capability_revision() == other.capability_revision()
+            && self.capability_digest() == other.capability_digest()
+            && self.rights_decision_digest() == other.rights_decision_digest()
+            && self.public_configuration_digest() == other.public_configuration_digest()
+            && self.account_digest() == other.account_digest()
+            && self.verification_evidence_digest() == other.verification_evidence_digest()
+            && self.runtime_verification_evidence() == other.runtime_verification_evidence()
+            && self.provider_budget_policy() == other.provider_budget_policy()
+            && self.generation() == other.generation()
+            && self.secret_reference() == other.secret_reference()
+            && self.verification_expires_at() == other.verification_expires_at()
+            && self.authority_effective_at() == other.authority_effective_at()
     }
 
     /// Returns the durable onboarding session bound into this lease.
@@ -586,8 +692,13 @@ impl ProviderActivationLease {
     }
 
     /// Returns the exact successful provider response or local-verifier evidence.
-    pub const fn runtime_evidence_digest(&self) -> EvidenceDigest {
-        self.runtime_evidence_digest
+    pub fn runtime_evidence_digest(&self) -> EvidenceDigest {
+        self.runtime_verification_evidence.evidence_digest()
+    }
+
+    /// Returns the complete retained runtime-verification evidence.
+    pub const fn runtime_verification_evidence(&self) -> &RuntimeVerificationEvidence {
+        &self.runtime_verification_evidence
     }
 
     /// Returns the exact admitted provider budget policy for this capability revision.
@@ -634,7 +745,10 @@ impl std::fmt::Debug for ProviderActivationLease {
                 "verification_evidence_digest",
                 &self.verification_evidence_digest,
             )
-            .field("runtime_evidence_digest", &self.runtime_evidence_digest)
+            .field(
+                "runtime_evidence_digest",
+                &self.runtime_verification_evidence.evidence_digest(),
+            )
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
@@ -656,7 +770,7 @@ pub(super) struct ProviderActivationLeaseInput {
     pub public_configuration: ProviderPublicConfiguration,
     pub account_digest: Option<EvidenceDigest>,
     pub verification_evidence_digest: Option<EvidenceDigest>,
-    pub runtime_evidence_digest: EvidenceDigest,
+    pub runtime_verification_evidence: RuntimeVerificationEvidence,
     pub provider_budget_policy: Option<ProviderBudgetPolicy>,
     pub generation: Option<SecretGeneration>,
     pub secret_reference: Option<SecretRef>,
@@ -730,13 +844,33 @@ pub(super) fn session_view(
                 OnboardingNextAction::ImportReplacement
             }
             OnboardingState::SecretReconciliationRequired => OnboardingNextAction::ImportSecret,
+            OnboardingState::StoredUnverified
+                if profile.id() == super::SCHWAB_MARKET_DATA_SURFACE_ID =>
+            {
+                OnboardingNextAction::CompleteOAuthAuthorization
+            }
             OnboardingState::StoredUnverified => OnboardingNextAction::VerifyAndActivate,
+            OnboardingState::RuntimeVerificationPending
+                if profile.id() == super::SCHWAB_MARKET_DATA_SURFACE_ID =>
+            {
+                OnboardingNextAction::CompleteOAuthAuthorization
+            }
             OnboardingState::RuntimeVerificationPending
                 if lifecycle.active_generation().is_some() =>
             {
                 OnboardingNextAction::VerifyAndCutover
             }
             OnboardingState::RuntimeVerificationPending => OnboardingNextAction::VerifyAndActivate,
+            OnboardingState::RenewalRequired
+                if lifecycle
+                    .active_generation()
+                    .and_then(|generation| {
+                        lifecycle.generation_alpaca_paper_iex_doctor_receipt(generation)
+                    })
+                    .is_some() =>
+            {
+                OnboardingNextAction::VerifyAndActivate
+            }
             OnboardingState::RenewalRequired => OnboardingNextAction::RenewCredential,
             OnboardingState::RotationPending if credential_stored => {
                 OnboardingNextAction::VerifyAndCutover

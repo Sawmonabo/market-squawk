@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::io;
 use std::mem::size_of;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +14,7 @@ use arrow::array::{
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, CorporateActionObservation, DigestAlgorithm, EvidenceDigest,
-    ResearchObservation, ResearchTemporalCoordinate, SourceIdentifier,
+    ResearchObservation, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -22,9 +22,10 @@ use tokio_util::sync::CancellationToken;
 use super::model::{
     ComponentAdjustmentEvidence, ComponentKind, ComponentValue, CorporateActionSensitivity,
     DatasetBuildRequest, DatasetExample, DatasetSplit, DatasetSplitCounts,
-    FeatureLabelComponentInput, FeatureLabelDataset, MissingValuePolicy,
+    FeatureLabelComponentInput, FeatureLabelDataset, FeatureLabelMeasurement,
+    FeatureLabelMeasurementBinding, MissingValuePolicy,
 };
-use super::{DatasetBuildError, DatasetBuilderService, admission, canonical};
+use super::{DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuilderService, canonical};
 use crate::schema::{
     FEATURE_LABEL_COMPONENT_NAME_BYTES, FEATURE_LABEL_CURRENCY_BYTES,
     FEATURE_LABEL_EXAMPLE_ID_BYTES, FEATURE_LABEL_MISSING_REASON_BYTES, FEATURE_LABEL_UNIT_BYTES,
@@ -34,8 +35,8 @@ use crate::{
     DatasetArrowBatch, DatasetManifestRecord, DatasetSchemaRegistry, DerivedOutputObjectInput,
     FeatureLabelBatchBindings, GenerationParentRelation, IngestIdentity, ManifestObject,
     ManifestPlan, PinnedDataset, PointInTimeCandidate, PointInTimeRequest, PointInTimeSelection,
-    PointInTimeService, ResearchArrowBatch, ResearchUseRequest, Sha256Digest, SourceOperation,
-    UniverseSnapshot,
+    PointInTimeService, RegisteredRightsGrant, ResearchArrowBatch, ResearchUseRequest,
+    Sha256Digest, SourceOperation, UniverseSnapshot,
 };
 
 #[derive(Debug)]
@@ -50,6 +51,24 @@ struct OutputRow<'request> {
     split: DatasetSplit,
     component: &'request FeatureLabelComponentInput,
     lineage: Sha256Digest,
+}
+
+struct ComponentWindowSelection<'candidate> {
+    kind: ComponentKind,
+    knowledge_cutoff: Timestamp,
+    effective_cutoff: ResearchTemporalCoordinate,
+    label_effective_cutoff: Option<ResearchTemporalCoordinate>,
+    selection: PointInTimeSelection<'candidate>,
+    action_plan: CorporateActionPlan,
+}
+
+impl ComponentWindowSelection<'_> {
+    fn matches(&self, example: &DatasetExample, component: &FeatureLabelComponentInput) -> bool {
+        self.kind == component.spec().kind()
+            && self.knowledge_cutoff == component_knowledge_cutoff(example, component)
+            && &self.effective_cutoff == component.selection_effective_cutoff()
+            && self.label_effective_cutoff.as_ref() == component.label_selection_effective_cutoff()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,21 +113,30 @@ pub(super) async fn build(
     builder: &DatasetBuilderService<'_>,
     request: DatasetBuildRequest,
     cancellation: CancellationToken,
+    precommit_authority: Option<Arc<dyn DatasetBuildPrecommitAuthority>>,
 ) -> Result<FeatureLabelDataset, DatasetBuildError> {
     let deadline = Instant::now()
         .checked_add(request.limits().max_duration())
         .ok_or(DatasetBuildError::DeadlineExceeded)?;
     check_control(&cancellation, deadline)?;
     authorize_research_use(builder, &request, &cancellation)?;
-    if let Some(existing) = matching_existing(builder, &request)? {
-        authorize_existing_output(builder, &request, &existing, &cancellation)?;
-        return admit_result(
-            builder,
-            result_from_existing(&request, expected_split_counts(&request)?, existing),
-        );
-    }
     let mut budget = BuildRetainedBudget::new(request.limits().max_retained_bytes());
     budget.charge(request.retained_bytes())?;
+    let label_measurements = derive_label_measurements(&request, &mut budget)?;
+    if let Some(existing) = matching_existing(builder, &request)? {
+        drop(authorize_existing_output(
+            builder,
+            &request,
+            &existing,
+            &cancellation,
+        )?);
+        return Ok(result_from_existing(
+            &request,
+            expected_split_counts(&request)?,
+            existing,
+            label_measurements,
+        ));
+    }
     let candidates = read_inputs(builder, &request, &cancellation, deadline, &mut budget).await?;
     let prepared =
         prepare_rows(&request, &candidates, &cancellation, deadline, &mut budget).await?;
@@ -126,11 +154,18 @@ pub(super) async fn build(
     check_control(&cancellation, deadline)?;
     let authorization = authorize_research_use(builder, &request, &cancellation)?;
     if let Some(existing) = matching_existing(builder, &request)? {
-        authorize_existing_output(builder, &request, &existing, &cancellation)?;
-        return admit_result(
+        drop(authorize_existing_output(
             builder,
-            result_from_existing(&request, prepared.split_counts, existing),
-        );
+            &request,
+            &existing,
+            &cancellation,
+        )?);
+        return Ok(result_from_existing(
+            &request,
+            prepared.split_counts,
+            existing,
+            label_measurements,
+        ));
     }
     check_control(&cancellation, deadline)?;
     let store = builder.service.object_store();
@@ -202,11 +237,15 @@ pub(super) async fn build(
             EvidenceDigest::new(DigestAlgorithm::Sha256, plan.content_hash().bytes()),
             created_at,
         );
-        let durable = authority.publish_artifact_manifest(&reservation, &artifact, &anchor)?;
+        let durable = authority.publish_artifact_manifest(
+            &reservation,
+            std::slice::from_ref(&artifact),
+            &anchor,
+        )?;
         let bound = authority.bind_derived_output_object(
             &reservation,
             DerivedOutputObjectInput::try_new(
-                durable.artifact().artifact_id(),
+                durable.artifacts()[0].artifact_id(),
                 published.content_hash(),
                 published.row_count(),
                 published.size_bytes(),
@@ -218,41 +257,46 @@ pub(super) async fn build(
             schema,
             plan,
             vec![bound],
-            durable.artifact().artifact_id(),
+            durable.artifacts()[0].artifact_id(),
         )?;
         check_control(&cancellation, deadline)?;
-        authority.publish_derived_generation(input)?
+        if let Some(precommit_authority) = precommit_authority.as_deref() {
+            precommit_authority.validate_precommit()?;
+        }
+        let derived = authority.publish_derived_generation(input)?;
+        if let Some(precommit_authority) = precommit_authority.as_deref() {
+            precommit_authority.commit_succeeded();
+        }
+        derived
     };
     drop(publication);
     check_control(&cancellation, deadline)?;
     let pinned = builder.service.pinned(derived.manifest())?;
-    admit_result(
-        builder,
-        FeatureLabelDataset {
-            pinned,
-            build_spec_digest: request.build_spec_digest(),
-            policy_digest: request.policy_digest(),
-            universe_digest: request.universe_digest(),
-            split_counts: prepared.split_counts,
-            universe_id: request.inputs().universe_id().clone(),
-            split_policy: request.policy().split(),
-            point_in_time_policy: request.policy().point_in_time(),
-            missing_value_policy: request.policy().missing_values(),
-            component_specs: request
-                .inputs()
-                .component_specs()
-                .to_vec()
-                .into_boxed_slice(),
-        },
-    )
+    Ok(FeatureLabelDataset {
+        pinned,
+        build_spec_digest: request.build_spec_digest(),
+        policy_digest: request.policy_digest(),
+        universe_digest: request.universe_digest(),
+        split_counts: prepared.split_counts,
+        universe_id: request.inputs().universe_id().clone(),
+        split_policy: request.policy().split(),
+        point_in_time_policy: request.policy().point_in_time(),
+        missing_value_policy: request.policy().missing_values(),
+        component_specs: request
+            .inputs()
+            .component_specs()
+            .to_vec()
+            .into_boxed_slice(),
+        label_measurements,
+    })
 }
 
-fn admit_result(
+pub(super) fn validate_request_authority(
     builder: &DatasetBuilderService<'_>,
-    dataset: FeatureLabelDataset,
-) -> Result<FeatureLabelDataset, DatasetBuildError> {
-    admission::register(builder, &dataset)?;
-    Ok(dataset)
+    request: &DatasetBuildRequest,
+    cancellation: &CancellationToken,
+) -> Result<(), DatasetBuildError> {
+    authorize_research_use(builder, request, cancellation).map(|_authorization| ())
 }
 
 async fn read_inputs(
@@ -317,7 +361,7 @@ async fn read_inputs(
             let (observations, observation_bytes) =
                 ResearchArrowBatch::decode_record_batch_bounded(batch, budget.remaining()?)
                     .map_err(|error| match error {
-                        crate::ArrowConversionError::RetainedLimitExceeded
+                        crate::ArrowConversionError::RetainedLimitExceeded { .. }
                         | crate::ArrowConversionError::AllocationFailure
                         | crate::ArrowConversionError::RetainedSizeOverflow => {
                             DatasetBuildError::LimitExceeded
@@ -491,49 +535,80 @@ async fn prepare_rows<'request>(
             .split()
             .split_for(example.cutoff_at())
             .ok_or(DatasetBuildError::TemporalLeakage)?;
-        let feature_request = point_in_time_request(
+        let universe_request = point_in_time_request(
             request,
             example.cutoff_at(),
-            example.cutoff_at(),
+            ResearchTemporalCoordinate::exact(example.cutoff_at()),
             None,
             budget.remaining()?,
         )?;
-        let features = selector
-            .select(&feature_request, candidates, cancellation, deadline)
+        let universe_evidence = selector
+            .select(&universe_request, candidates, cancellation, deadline)
             .await
             .map_err(|_| DatasetBuildError::PointInTime)?;
-        budget.charge(features.retained_bytes())?;
-        let label_request = point_in_time_request(
-            request,
-            example.label_cutoff_at(),
-            example.cutoff_at(),
-            Some(example.label_cutoff_at()),
-            budget.remaining()?,
-        )?;
-        let labels = selector
-            .select(&label_request, candidates, cancellation, deadline)
-            .await
-            .map_err(|_| DatasetBuildError::PointInTime)?;
-        budget.charge(labels.retained_bytes())?;
+        budget.charge(universe_evidence.retained_bytes())?;
         let universe_limits = bounded_universe_limits(request, budget.remaining()?)?;
         let universe = UniverseSnapshot::try_build(
             request.inputs().universe_id().clone(),
             example.cutoff_at(),
-            validated_universe_memberships(request, &features, budget.remaining()?)?,
+            validated_universe_memberships(request, &universe_evidence, budget.remaining()?)?,
             universe_limits,
         )?;
         budget.charge(universe.retained_bytes())?;
         if !universe.contains(example.instrument_id()) {
             return Err(DatasetBuildError::InstrumentOutsideUniverse);
         }
-        let feature_actions =
-            action_plan_from_selection(request, example, &features, false, budget.remaining()?)?;
-        budget.charge(feature_actions.retained_bytes())?;
-        let label_actions =
-            action_plan_from_selection(request, example, &labels, true, budget.remaining()?)?;
-        budget.charge(label_actions.retained_bytes())?;
-        if !feature_actions.conflicts().is_empty() || !label_actions.conflicts().is_empty() {
-            return Err(DatasetBuildError::UnresolvedCorporateAction);
+
+        let window_bytes = example
+            .components()
+            .len()
+            .checked_mul(size_of::<ComponentWindowSelection<'_>>())
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+        budget.charge(window_bytes)?;
+        let mut windows = Vec::new();
+        windows
+            .try_reserve_exact(example.components().len())
+            .map_err(|_| DatasetBuildError::LimitExceeded)?;
+        for component in example.components() {
+            if windows
+                .iter()
+                .any(|window: &ComponentWindowSelection<'_>| window.matches(example, component))
+            {
+                continue;
+            }
+            let knowledge_cutoff = component_knowledge_cutoff(example, component);
+            let component_request = point_in_time_request(
+                request,
+                knowledge_cutoff,
+                component.selection_effective_cutoff().clone(),
+                component.label_selection_effective_cutoff().cloned(),
+                budget.remaining()?,
+            )?;
+            let selection = selector
+                .select(&component_request, candidates, cancellation, deadline)
+                .await
+                .map_err(|_| DatasetBuildError::PointInTime)?;
+            budget.charge(selection.retained_bytes())?;
+            let label = component.spec().kind() == ComponentKind::Label;
+            let action_plan = action_plan_from_selection(
+                request,
+                example,
+                &selection,
+                label,
+                budget.remaining()?,
+            )?;
+            budget.charge(action_plan.retained_bytes())?;
+            if !action_plan.conflicts().is_empty() {
+                return Err(DatasetBuildError::UnresolvedCorporateAction);
+            }
+            windows.push(ComponentWindowSelection {
+                kind: component.spec().kind(),
+                knowledge_cutoff,
+                effective_cutoff: component.selection_effective_cutoff().clone(),
+                label_effective_cutoff: component.label_selection_effective_cutoff().cloned(),
+                selection,
+                action_plan,
+            });
         }
         let mut example_rows = Vec::new();
         let example_row_bytes = example
@@ -547,13 +622,18 @@ async fn prepare_rows<'request>(
             .map_err(|_| DatasetBuildError::LimitExceeded)?;
         let mut drop_example = false;
         for component in example.components() {
-            let (selection, action_plan) = match component.spec().kind() {
-                ComponentKind::Feature => (&features, &feature_actions),
-                ComponentKind::Label => (&labels, &label_actions),
-            };
+            let mut matching_windows = windows
+                .iter()
+                .filter(|window| window.matches(example, component));
+            let window = matching_windows
+                .next()
+                .ok_or(DatasetBuildError::InvalidRequest)?;
+            if matching_windows.next().is_some() {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
             validate_component_adjustment(
                 component,
-                action_plan,
+                &window.action_plan,
                 request.policy().corporate_actions(),
             )?;
             let evidence_bytes = component
@@ -562,7 +642,7 @@ async fn prepare_rows<'request>(
                 .checked_mul(size_of::<Sha256Digest>())
                 .ok_or(DatasetBuildError::LimitExceeded)?;
             budget.charge(evidence_bytes)?;
-            let evidence = resolve_component_evidence(component, selection)?;
+            let evidence = resolve_component_evidence(component, &window.selection)?;
             if component.value().is_missing() {
                 match request.policy().missing_values() {
                     MissingValuePolicy::Reject => {
@@ -577,13 +657,13 @@ async fn prepare_rows<'request>(
                 example,
                 split,
                 component,
-                selection.content_identity(),
-                selection.audit_identity(),
+                window.selection.content_identity(),
+                window.selection.audit_identity(),
                 &evidence,
                 universe.content_hash(),
                 universe.audit_hash(),
-                action_plan.content_hash(),
-                action_plan.audit_hash(),
+                window.action_plan.content_hash(),
+                window.action_plan.audit_hash(),
             );
             budget.release(evidence_bytes)?;
             example_rows.push(OutputRow {
@@ -601,16 +681,28 @@ async fn prepare_rows<'request>(
             return Err(DatasetBuildError::LimitExceeded);
         }
         budget.release(example_row_bytes)?;
-        budget.release(label_actions.retained_bytes())?;
-        budget.release(feature_actions.retained_bytes())?;
+        for window in &windows {
+            budget.release(window.action_plan.retained_bytes())?;
+            budget.release(window.selection.retained_bytes())?;
+        }
+        budget.release(window_bytes)?;
         budget.release(universe.retained_bytes())?;
-        budget.release(labels.retained_bytes())?;
-        budget.release(features.retained_bytes())?;
+        budget.release(universe_evidence.retained_bytes())?;
     }
     if rows.is_empty() {
         return Err(DatasetBuildError::EmptyDataset);
     }
     Ok(PreparedRows { rows, split_counts })
+}
+
+fn component_knowledge_cutoff(
+    example: &DatasetExample,
+    component: &FeatureLabelComponentInput,
+) -> Timestamp {
+    match component.spec().kind() {
+        ComponentKind::Feature => example.cutoff_at(),
+        ComponentKind::Label => example.label_cutoff_at(),
+    }
 }
 
 fn validated_universe_memberships(
@@ -687,8 +779,8 @@ fn validate_component_adjustment(
 fn point_in_time_request(
     request: &DatasetBuildRequest,
     as_of: market_squawk_domain::Timestamp,
-    effective_cutoff: market_squawk_domain::Timestamp,
-    label_cutoff: Option<market_squawk_domain::Timestamp>,
+    effective_cutoff: ResearchTemporalCoordinate,
+    label_cutoff: Option<ResearchTemporalCoordinate>,
     remaining_bytes: usize,
 ) -> Result<PointInTimeRequest, DatasetBuildError> {
     let configured = request.limits().point_in_time();
@@ -704,9 +796,9 @@ fn point_in_time_request(
     PointInTimeRequest::try_new(
         request.policy().point_in_time(),
         as_of,
-        Some(ResearchTemporalCoordinate::exact(as_of)),
-        ResearchTemporalCoordinate::exact(effective_cutoff),
-        label_cutoff.map(ResearchTemporalCoordinate::exact),
+        None,
+        effective_cutoff,
+        label_cutoff,
         limits,
     )
     .map_err(|_| DatasetBuildError::InvalidRequest)
@@ -872,6 +964,14 @@ fn feature_label_batch(
     let lineages =
         FixedSizeBinaryArray::try_from_iter(rows.iter().map(|row| row.lineage.bytes().to_vec()))
             .map_err(crate::ArrowConversionError::from)?;
+    let mut target_coordinate_kinds = bounded_output_vec(rows.len())?;
+    for row in rows {
+        target_coordinate_kinds.push(if exact_terminal_coordinates(row.example).is_some() {
+            1
+        } else {
+            2
+        });
+    }
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(fixed_text_array(
             rows.iter().map(|row| Some(row.example.example_id())),
@@ -890,6 +990,23 @@ fn feature_label_batch(
             )
             .with_timezone_utc(),
         ),
+        Arc::new(
+            TimestampNanosecondArray::from_iter(rows.iter().map(|row| {
+                exact_terminal_coordinates(row.example)
+                    .map(|(observed, _target)| observed.unix_nanos())
+            }))
+            .with_timezone_utc(),
+        ),
+        Arc::new(
+            TimestampNanosecondArray::from_iter(rows.iter().map(|row| {
+                exact_terminal_coordinates(row.example)
+                    .map(|(_observed, target)| target.unix_nanos())
+            }))
+            .with_timezone_utc(),
+        ),
+        Arc::new(UInt8Array::from_iter_values(
+            target_coordinate_kinds.iter().copied(),
+        )),
         Arc::new(UInt8Array::from_iter_values(rows.iter().map(
             |row| match row.split {
                 DatasetSplit::Train => 1,
@@ -1033,12 +1150,12 @@ fn authorize_research_use(
         .map_err(Into::into)
 }
 
-fn authorize_existing_output(
+pub(super) fn authorize_existing_output(
     builder: &DatasetBuilderService<'_>,
     request: &DatasetBuildRequest,
     existing: &PinnedDataset,
     cancellation: &CancellationToken,
-) -> Result<(), DatasetBuildError> {
+) -> Result<RegisteredRightsGrant, DatasetBuildError> {
     if cancellation.is_cancelled() {
         return Err(DatasetBuildError::Cancelled);
     }
@@ -1049,12 +1166,13 @@ fn authorize_existing_output(
         .authority
         .lock()
         .map_err(|_| DatasetBuildError::AuthorityLockPoisoned)?;
-    authority.admit_source_rights(
-        request
-            .output_authorization()
-            .rights_decision(object.object().content_hash(), current_timestamp()?),
-    )?;
-    Ok(())
+    authority
+        .admit_source_rights(
+            request
+                .output_authorization()
+                .rights_decision(object.object().content_hash(), current_timestamp()?),
+        )
+        .map_err(Into::into)
 }
 
 fn current_timestamp() -> Result<market_squawk_domain::Timestamp, DatasetBuildError> {
@@ -1093,10 +1211,133 @@ fn expected_split_counts(
     Ok(counts)
 }
 
+fn derive_label_measurements(
+    request: &DatasetBuildRequest,
+    budget: &mut BuildRetainedBudget,
+) -> Result<Box<[FeatureLabelMeasurementBinding]>, DatasetBuildError> {
+    let specs = request.inputs().component_specs();
+    let observed_bytes = size_of::<Option<FeatureLabelMeasurement>>()
+        .checked_add(size_of::<FixedHorizonState>())
+        .and_then(|bytes| bytes.checked_mul(specs.len()))
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    budget.charge(observed_bytes)?;
+    let mut observed = Vec::new();
+    observed
+        .try_reserve_exact(specs.len())
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    observed.resize(specs.len(), None);
+    let mut horizons = Vec::new();
+    horizons
+        .try_reserve_exact(specs.len())
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    horizons.resize(specs.len(), FixedHorizonState::Unseen);
+    for example in request.inputs().examples() {
+        let has_missing = example
+            .components()
+            .iter()
+            .any(|component| component.value().is_missing());
+        match (request.policy().missing_values(), has_missing) {
+            (MissingValuePolicy::Reject, true) => {
+                return Err(DatasetBuildError::MissingValueRejected);
+            }
+            (MissingValuePolicy::DropExample, true) => continue,
+            (MissingValuePolicy::Reject, false)
+            | (MissingValuePolicy::Preserve, _)
+            | (MissingValuePolicy::DropExample, false) => {}
+        }
+        for (index, component) in example.components().iter().enumerate() {
+            if component.spec().kind() != ComponentKind::Label {
+                continue;
+            }
+            let Some(measurement) = FeatureLabelMeasurement::try_from_value(component.value())?
+            else {
+                continue;
+            };
+            if observed[index].is_some_and(|retained| retained != measurement) {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
+            observed[index] = Some(measurement);
+            horizons[index].observe(example);
+        }
+    }
+    let binding_count = specs
+        .iter()
+        .zip(&observed)
+        .filter(|(spec, measurement)| spec.kind() == ComponentKind::Label && measurement.is_some())
+        .count();
+    let binding_bytes = size_of::<FeatureLabelMeasurementBinding>()
+        .checked_mul(binding_count)
+        .and_then(|bytes| {
+            specs
+                .iter()
+                .zip(&observed)
+                .filter(|(spec, measurement)| {
+                    spec.kind() == ComponentKind::Label && measurement.is_some()
+                })
+                .try_fold(bytes, |total, (spec, _)| {
+                    total.checked_add(spec.name().len())
+                })
+        })
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    budget.charge(binding_bytes)?;
+    let mut bindings = Vec::new();
+    bindings
+        .try_reserve_exact(binding_count)
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    for ((spec, measurement), horizon) in specs.iter().zip(observed).zip(horizons) {
+        if spec.kind() == ComponentKind::Label {
+            if let Some(measurement) = measurement {
+                bindings.push(FeatureLabelMeasurementBinding::try_new(
+                    spec.clone(),
+                    measurement,
+                    horizon.fixed(),
+                )?);
+            }
+        }
+    }
+    budget.release(observed_bytes)?;
+    Ok(bindings.into_boxed_slice())
+}
+
+#[derive(Clone, Copy)]
+enum FixedHorizonState {
+    Unseen,
+    Fixed(NonZeroU64),
+    Unsupported,
+}
+
+impl FixedHorizonState {
+    fn observe(&mut self, example: &DatasetExample) {
+        let candidate = exact_terminal_coordinates(example)
+            .and_then(|(observed, target)| target.unix_nanos().checked_sub(observed.unix_nanos()))
+            .and_then(|value| u64::try_from(value).ok())
+            .and_then(NonZeroU64::new);
+        *self = match (*self, candidate) {
+            (Self::Unseen, Some(value)) => Self::Fixed(value),
+            (Self::Fixed(expected), Some(value)) if value == expected => Self::Fixed(expected),
+            (Self::Unsupported, _) | (_, None) | (Self::Fixed(_), Some(_)) => Self::Unsupported,
+        };
+    }
+
+    const fn fixed(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Fixed(value) => Some(value),
+            Self::Unseen | Self::Unsupported => None,
+        }
+    }
+}
+
+fn exact_terminal_coordinates(example: &DatasetExample) -> Option<(Timestamp, Timestamp)> {
+    let observed = example.effective_cutoff().exact_timestamp()?;
+    let target = example.label_effective_cutoff().exact_timestamp()?;
+    (target > observed).then_some((observed, target))
+}
+
 fn result_from_existing(
     request: &DatasetBuildRequest,
     split_counts: DatasetSplitCounts,
     pinned: PinnedDataset,
+    label_measurements: Box<[FeatureLabelMeasurementBinding]>,
 ) -> FeatureLabelDataset {
     FeatureLabelDataset {
         pinned,
@@ -1113,6 +1354,7 @@ fn result_from_existing(
             .component_specs()
             .to_vec()
             .into_boxed_slice(),
+        label_measurements,
     }
 }
 

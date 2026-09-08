@@ -9,14 +9,15 @@ authority-free source status views.
 | Document type | Operations runbook |
 | Audience | Source operators, data-rights reviewers, incident responders, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `50912c18271a0389fb5ac8817555230930dd0506` |
+| Last substantive review | 2026-08-12 |
+| Review basis | `8fd91dad768affda2126ed91a5b97f1bd1e32209` plus the Wave 8B profile/documentation candidate; not provider-workflow or release acceptance |
 
 ## Contents
 
 - [Scope and non-goals](#scope-and-non-goals)
 - [Preconditions](#preconditions)
 - [Safety and authority](#safety-and-authority)
+- [Import the selected provider credential bundle](#import-the-selected-provider-credential-bundle)
 - [Current code-owned source surfaces](#current-code-owned-source-surfaces)
 - [Read source status, coverage, and health](#read-source-status-coverage-and-health)
 - [Register a source profile](#register-a-source-profile)
@@ -25,7 +26,6 @@ authority-free source status views.
 - [Understand the source activate boundary](#understand-the-source-activate-boundary)
 - [Inspect one FRED or ALFRED page without persistence](#inspect-one-fred-or-alfred-page-without-persistence)
 - [Discover and ingest an exact provider object](#discover-and-ingest-an-exact-provider-object)
-- [Exchange sources, capture, and bot authority](#exchange-sources-capture-and-bot-authority)
 - [Expected success evidence](#expected-success-evidence)
 - [Rollback and recovery](#rollback-and-recovery)
 - [Known failure modes](#known-failure-modes)
@@ -38,6 +38,7 @@ authority-free source status views.
 The shipping source CLI is:
 
 ```text
+source import-credentials <ABSOLUTE_FILE> --confirm
 source register <PROVIDER> --confirm
 source status [PROVIDER]
 source coverage [PROVIDER]
@@ -49,11 +50,12 @@ source inspect <PROVIDER> --onboarding-session-id <UUID> \
 source activate <REQUEST> --confirm
 ```
 
-This page covers those exact commands, the bounded FRED/ALFRED inspection path, and the usable
-Treasury Fiscal Data and five-family daily-rates portal paths. It explains how the same source
-surface can have distinct profile, onboarding, extraction, and live-runtime states.
+This page covers those exact commands, the one-time selected-provider credential import, the
+bounded FRED/ALFRED inspection path, and the usable Treasury Fiscal Data and five-family
+daily-rates portal paths. It explains how the same source surface can have distinct import,
+profile, onboarding, extraction, publication, and live-runtime states.
 
-At the reviewed commit there is no generic:
+In the current candidate there is no generic:
 
 - `source start`;
 - `source stop`;
@@ -67,7 +69,7 @@ Live venue reconnection and book recovery belong to their source runtime; resear
 performed by the ingest/dataset workflows after its adapter has been admitted. Local files,
 portfolio imports, and paper execution use their own CLI domains rather than portal activation.
 
-Provider availability and external terms can change after this reviewed source head. The
+Provider availability and external terms can change after this review. The
 [delivery ledger](../plans/delivery-ledger.md) is the sole mutable authority for release blockers
 and accepted provider-qualification outcomes.
 
@@ -101,6 +103,7 @@ CONFIG=/absolute/operator-owned/market-squawk/config.toml
 
 | Layer | What it proves | What it does not prove |
 | --- | --- | --- |
+| Credential-bundle disposition | The exact selected provider was disabled, needs a probe, stored an unverified credential, or could not match its code-owned profile | Provider verification, entitlement, activation, collection, publication, product availability, or trading authority |
 | Code-owned profile | Reviewed setup requirements, release state, declared coverage, quality ceiling, rights decision, duties, probe, and evidence revision | Current connectivity, active adapter, observed data quality, or execution eligibility |
 | Catalog registration | Exact profile revision and canonical bytes are durably retained | Onboarding completed or any runtime started |
 | Onboarding session | Provider handoff, public configuration, credential generation when applicable, verification, and rights state progressed through a durable lifecycle | Research adapter registration unless activation evidence also succeeded |
@@ -124,13 +127,12 @@ The portal is bounded to 15 minutes, uses a local session cookie and CSRF token,
 requests, connections, time, and body sizes. Keep it on loopback. Do not proxy, publish, bookmark,
 or forward its URL.
 
-If a profile requests provider-created credentials, enter them only into the write-only fields
-served by that exact local portal. Coinbase Direct accepts separate API-key, passphrase, and
-signing-secret fields and constructs the closed version-1 envelope inside the local page. Never put
-credential material in a source activation request, TOML, an environment variable, CLI argument,
-issue, log, or chat. The current `LocalProduct` uses the OS keyring first and a code-owned
-encrypted-file fallback that accepts its unlock only through the explicit foreground loopback
-portal; see
+Provider credentials enter the product through either an admitted write-only local portal or the
+exact one-time credential bundle described below. Never put credential material in startup TOML,
+the process environment, a CLI argument, an activation request, an issue, a log, or chat. The
+bundle path is a CLI argument; its values are not. Do not source the bundle as a shell file. The
+current `LocalProduct` uses the OS keyring first and a code-owned encrypted-file fallback that
+accepts its unlock only through the explicit foreground loopback portal; see
 [Configuration and secrets operations](configuration-and-secrets.md).
 
 ### Treat rights as authority, not advice
@@ -145,33 +147,92 @@ A successful handoff or network probe never widens `retrieve`, `display`, `persi
 ephemeral retrieval. Durable operations require both exact written St. Louis Fed service permission
 with a hash-bound local review and independent authority for every exact series and operation.
 
+## Import the selected provider credential bundle
+
+The installed CLI owns one strict import path for the exact
+[`market-squawk-provider-credentials/v1`](../reference/market-squawk-provider-credentials.env.example)
+contract. The file has 32 ordered fields: one schema identifier, provider enablement/probe intent,
+the exact Alpaca `paper` realm, selected credentials, and SEC identifying values. Endpoint URLs,
+the Schwab callback (`https://127.0.0.1:8182`), authentication routes, provider limits, application
+budgets, batching, pagination, and scheduling are code-owned. They are not accepted from this file.
+
+Use an owner-only regular file outside the repository. On POSIX systems, require mode `0600` and
+an owner-only containing directory before import:
+
+```bash
+CREDENTIALS=/absolute/operator-owned/market-squawk-provider-credentials.env
+chmod 600 "$CREDENTIALS"
+"$MSQ" --config "$CONFIG" --output json \
+  source import-credentials "$CREDENTIALS" --confirm
+```
+
+The command requires the running installed application service. It reads at most 64 KiB through a
+no-follow, identity-checked file capability, stages the exact bytes once to that service, strictly
+parses the closed V1 key set, and delegates only to the existing onboarding and protected-secret
+authorities. Unknown, duplicate, out-of-order, malformed, placeholder, or inconsistent
+enabled/credential fields fail closed. The importer does not call a provider, verify entitlement,
+activate a runtime, start a scheduler, publish data, or call any brokerage trading endpoint.
+
+The result always contains the 17 selected mappings in this fixed order:
+
+| Receipt provider | Selected profile and revision | Imported input |
+| --- | --- | --- |
+| `schwab` | `schwab.trader-api-market-data` rev 3 | App key plus app secret |
+| `alpaca` | `alpaca.basic-market-data` rev 3 | Paper key ID plus secret key; realm fixed to `paper` |
+| `yahoo_finance_experimental` | `yahoo-finance.experimental-enrichment` rev 3 | No secret; enabled intent only |
+| `nasdaq_trader_reference` | `nasdaq-trader-symbol-directory-reference` rev 3 | No secret |
+| `occ_options_reference` | `occ.options-reference` rev 3 | No secret |
+| `cboe_options_reference` | `cboe.options-reference` rev 3 | No secret |
+| `iex_hist` | `iex.hist-feed-files` rev 3 | No secret; exact feed/date job intent only |
+| `bls` | `bls.v2-registered` rev 3 | Registration key |
+| `bea` | `bea.api-data` rev 3 | BEA UserID |
+| `census` | `census.data-api` rev 3 | Census API key |
+| `eia` | `eia.api-v2` rev 3 | EIA API key |
+| `fred_alfred` | `fred-alfred.api-v1-v2` rev 5 | FRED API key |
+| `tiingo` | `tiingo.starter-eod-nav` rev 3 | Tiingo token |
+| `sec` | `sec.edgar-public` rev 4 | No secret; organization and contact email become public onboarding configuration |
+| `treasury_fiscal_data` | `treasury.fiscal-data` rev 5 | No secret |
+| `treasury_daily_rates` | `treasury.daily-rates-xml` rev 5 | No secret |
+| `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 4 | No secret; exact H.15 doctor intent only |
+
+Each provider row has exactly one secret-free `disposition`:
+
+| Disposition | Meaning |
+| --- | --- |
+| `disabled` | Neither enablement condition requested this provider; no session was created |
+| `credential_stored_unverified` | The enabled credential was stored through the protected secret authority; verification and activation remain required |
+| `probe_required` | Enabled no-secret intent created a durable onboarding session; its bounded probe and activation remain required |
+| `profile_unavailable` | The selected profile is absent, its revision/release contract no longer matches, or the exact V1 file cannot satisfy it |
+
+`onboardingSessionId` is a UUID only when a durable session was created; otherwise it is `null`. A
+stored credential may be described as **Configured**; `probe_required` remains **Probe required**.
+Neither is **Available**. Availability requires current entitlement, exact production, durable raw
+and canonical publication, a point-in-time typed read, product composition, and focused restart
+proof.
+
 ## Current code-owned source surfaces
 
-These are frozen code facts at the reviewed commit, not a substitute for the mutable delivery
-ledger.
+The selected mappings above are current code facts, not claims that their data reaches a product.
+The existing application already has substantive Alpaca, Nasdaq reference, SEC, BLS,
+FRED/ALFRED, and Treasury foundations. Provider-native core and transport code is also present for
+Schwab, Yahoo, IEX HIST, OCC/Cboe reference, BEA, Census, EIA, Tiingo, and the Federal Reserve
+Board. Board revision 4 retains an exact bounded no-key H.15 onboarding GET whose response must
+pass the adapter's exact 11-series/ten-date parser under the shared one-request-per-minute,
+single-flight application budget. Production is a distinct rolling 100-date/1,100-observation
+contract; the full-history package is unavailable to the one-batch source until partitioned
+resumable extraction exists.
 
-| Provider surface | Release state | Declared quality ceiling | Current operator boundary |
-| --- | --- | --- | --- |
-| `coinbase.public-market-data` | `rights_limited` | `direct_verified` | No-credential portal probe and source-session activation; persistence, modeling, export, and redistribution remain pending, and the shipping live adapter remains `DirectUnverified` |
-| `coinbase.exchange-direct-market-data` | `rights_limited` | `direct_verified` | Import and verify one View-only Exchange key envelope through the local portal; start the live-to-paper runtime only with the exact active session UUID; research/fair-value persistence, modeling, export, and redistribution remain pending |
-| `kraken.spot-public-market-data` | `rights_limited` | `direct_verified` | No-credential portal probe and source-session activation; the shipping book-v2 adapter remains `DirectUnverified` |
-| `sec.edgar-public` | `available` | `official_delayed` | Start zero-fee public setup with a truthful non-secret organization and monitored administrative email; activation and ingestion still require the exact CIK-to-instrument mapping and bounded official probe |
-| `fred-alfred.api-v1-v2` | `rights_limited` | `official_delayed` | Import a provider-issued zero-fee API key through guided setup, then use bounded `source inspect` with the active session. Durable activation additionally requires current terms, an exact Bank permission response matched against a fresh reacquisition from its official HTTPS URL, a hash-bound local review of exact series/operations/conditions, and independent exact-series authority |
-| `bls.v1-unregistered` | `available` | `official_delayed` | Start the zero-fee, no-account public-v1 setup; activation remains bounded to exact series metadata, inclusive years, and the public-v1 request budget |
-| `bls.v2-registered` | `refresh_required` | `official_delayed` | BLS v2 registered-tier and key lifecycle are implemented but portal secret import and activation are disabled pending evidence refresh |
-| `treasury.daily-rates-xml` | `available` | `official_delayed` | No-credential five-family research activation, durable publication, query, and restart recovery |
-| `treasury.fiscal-data` | `available` | `official_delayed` | Current supported portal workflow; no account, key, or paid service required |
-| `local.files` | `available` | `direct_unverified` | Use bounded `ingest file`; the portal accepts no filesystem path |
-| `local.portfolio-imports` | `available` | `direct_unverified` | Use bounded portfolio import commands; preserve user-owned source evidence |
-| `local.paper-execution` | `available` | `modeled` | Use bot/execution commands under central risk; no external account is requested |
-
-The portal lists every profile with its handoff instruction, release state, and official link. The
-full rights, duties, coverage, and evidence remain available in `source status` and
-`source coverage`. Setup is enabled only for `available` or `rights_limited` profiles with an
-exact source-session or research-adapter request. Public Coinbase, Coinbase Direct, Kraken,
-SEC, unregistered BLS v1, Treasury daily XML, Treasury Fiscal Data, and scoped FRED/ALFRED
-therefore have guided setup. Registered BLS v2 remains disabled while `refresh_required`; public
-v1 availability does not authorize the registered surface.
+Most of these selected surfaces remain `refresh_required`; Board revision 4 is `available` at the
+profile/onboarding-doctor boundary and now has code-owned activation/source construction, shared
+rich-capture binding, analytical-dataset registration, and lifecycle serialization/restore.
+The scripted installed Board journey proves rolling capture/sealing, durable catalog/Parquet
+publication, typed history and macro-dashboard reads, stable same-root restart evidence, and zero
+post-restart provider HTTP. An exact-head real-network installed smoke independently proves the
+official no-key doctor, durable one-minute rate refusal, rolling retrieval, raw seal, 1,100-row
+publication, authenticated dashboard read, and same-root local reread. Native Desktop/package and
+frozen-head release acceptance remain separate gates. Read `source status`, `source
+coverage`, and the [delivery ledger](../plans/delivery-ledger.md) rather than inferring product
+availability from a profile release state or code-path presence.
 
 ## Read source status, coverage, and health
 
@@ -394,7 +455,7 @@ Its parent directory becomes the authorized input root. The top-level closed JSO
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 5,
   "session_id": "<uuid>",
   "provider": {
     "kind": "<closed-provider-kind>"
@@ -411,10 +472,12 @@ The closed provider kinds are:
 | `treasury_fiscal` | Inclusive first/last dates and page size for the exact Fiscal Data query |
 | `treasury_daily_rates` | Inclusive first/last years; every official family available in that range is activated |
 | `fred_alfred` | Exact current terms artifact; exact official-HTTPS Bank response bytes verified by fresh reacquisition; explicit hash-bound review with reviewer, issuer, grantee, service, exact series, operations, conditions, and revalidation; independent per-series public-domain or owner evidence |
+| `federal_reserve_board_h15` | No additional input; must match an active revision-4 Board lease and construct only the exact rolling 100-date H.15 dashboard contract; the full-history contract is rejected until partitioned resumable extraction exists |
 
 Credential bytes are never part of this request. FRED's request shape does not create rights:
 without an admitted active lease and both exact authority gates, the command fails closed. A
-contact-form submission or receipt is request-route provenance, not permission.
+contact-form submission or receipt is request-route provenance, not permission. Board is admitted
+only in schema version 5; older request versions cannot acquire this new surface implicitly.
 
 Request bytes and referenced evidence digests are part of durable recipe identity. Do not
 reconstruct or reformat a portal request from status output, and do not use `source activate` after
@@ -478,43 +541,17 @@ returned `discoveryReceipt` with the exact provider, dataset, and object to conf
 credentials, cannot authorize a different object, and are revoked when discovery publication
 fails.
 
-## Exchange sources, capture, and bot authority
-
-Public Coinbase and Kraken remain compatibility sources below automated-action quality:
-
-- Coinbase production metadata is `DirectUnverified`; the current adapter does not provide the
-  complete sequence/checksum qualification required by Market Squawk's live evidence policy.
-- Kraken book-v2 is also configured as `DirectUnverified` in the shipping composition even though
-  the upstream book channel publishes a checksum; current Market Squawk sequence qualification is
-  insufficient for `DirectVerified`.
-
-The distinct `coinbase.exchange-direct-market-data` surface is user-authorized and
-`rights_limited`. Its current View-only credential generation, authenticated `ws-direct` full
-channel, REST level-3 bootstrap, exact sequence/snapshot handoff, product status, timestamps,
-precision, coverage, and live integrity evidence can derive `DirectVerified` authority. Start it
-only through `bot start --provider coinbase-direct --provider-session-id <UUID>` so the shipping
-application retains the exact onboarding lease, signer, shared rate/account authority, central
-qualification, risk, and paper runtime.
-
-Operational consequences:
-
-- `source coverage` must not be read as current observation quality;
-- public connectivity, a subscription acknowledgement, message flow, or a provider checksum by
-  itself does not produce automated-action authority;
-- the standalone `capture` command is a bounded Coinbase diagnostic journal path, not provider
-  onboarding or execution qualification;
-- `capture --paper-bot` remains paper-only;
-- `bot start --provider coinbase|kraken` remains subject to the `DirectUnverified` ceiling and
-  cannot produce an executable intent;
-- Coinbase Direct loses authority immediately on session rotation/revocation, sequence or snapshot
-  failure, stale data, invalid status, overflow, or terminal supervision; and
-- the current Direct rights do not authorize research/fair-value persistence, modeling, or export.
-
-For the complete qualification rules, see
-[Data quality and live qualification](../reference/data-quality.md). Current provider blockers and
-the default `DirectVerified` automated-action gate remain ledger-owned.
-
 ## Expected success evidence
+
+### Credential import
+
+- The command exits `0` and returns schema `market-squawk-provider-credentials/v1`.
+- Exactly 17 provider rows appear in the fixed mapping order.
+- Every row has one of the four documented secret-free dispositions.
+- No key, secret, token, provider response, endpoint override, account value, or trading authority
+  appears in the result.
+- Import completion is recorded separately from probe, activation, publication, and workflow
+  availability.
 
 ### Registration
 
@@ -564,6 +601,10 @@ extraction completed or that a dataset was published.
 
 ## Rollback and recovery
 
+- **Credential import was unintended:** import never activates a provider. Preserve the secret-free
+  receipt, inspect the created onboarding session, and use the product-owned authority-removal flow
+  before deleting the owner-managed input copy. Do not delete keyring entries, fallback-vault
+  records, or catalog rows by hand.
 - **Registration was unintended:** there is no unregister command. Registration alone activates
   nothing, so leave the exact profile record intact and do not delete catalog state manually.
 - **Portal opened but no mutation was intended:** press Ctrl-C or wait for expiry. If no activation
@@ -595,7 +636,9 @@ the data root, and never remove files or catalog rows by hand.
 | Symptom | Likely cause | Safe response |
 | --- | --- | --- |
 | Mutation rejects with confirmation required | `--confirm` omitted | Recheck the exact provider/request, then rerun explicitly |
-| Unknown provider | Argument is not one of the eleven exact surface IDs | Use `source status` without a filter and copy the code-owned ID |
+| Credential import rejects the file | Path/input confinement failed, the file exceeded 64 KiB, or the closed ordered V1 schema/enablement rules failed | Use an owner-only regular file at an absolute path, compare all 32 fields with the repository example, and correct the input without sourcing it |
+| Import row is `profile_unavailable` | The selected profile is absent, its revision/release state differs from the exact mapping, or V1 cannot satisfy it | Preserve the receipt and wait for a reviewed mapping/profile correction; do not rename the provider or edit catalog state |
+| Unknown provider | Argument is not an exact registered surface ID | Use `source status` without a filter and copy the code-owned ID |
 | Portal setup button is disabled | Profile is `refresh_required` or `rights_blocked`, or no exact supported request exists | Read the displayed release state and ledger; setup is unavailable for that surface at this head |
 | Browser does not open | Local browser integration failed | Use only the exact loopback URL emitted on stdout/stderr while the command remains running |
 | Portal returns expired/unauthorized/CSRF error | Portal lifetime or local session boundary ended | Close the page and run a new confirmed `source setup` |
@@ -604,9 +647,9 @@ the data root, and never remove files or catalog rows by hand.
 | Registered BLS v2 cannot activate | The distinct keyed profile remains `refresh_required`, or its foreground credential is unavailable | Use public v1 within its limits or wait for an admitted registered-v2 revision; never treat v1 authority as v2 authority |
 | FRED key/import or use is rejected | API-key format, current terms, exact written Bank permission, hash-bound local review, exact-series authority, requested operations, or validity intersection is missing or mismatched | Correct the exact rejected authority or key generation; a successful key probe or contact receipt cannot replace either rights gate |
 | Treasury XML cannot publish durably | Family/query authority, CC0 evidence, official response, or publication integrity is incomplete | Preserve the exact error and rerun only after correcting the named family or authority input; never inherit rights across surfaces |
+| Board full-history source construction is rejected | The full-history response cannot satisfy the indivisible one-batch capture/publication contract | Use the code-owned rolling 100-date dashboard source; do not raise bounds or relabel it as full history. Implement reviewed partitioned, checkpointed, resumable ingestion before admitting the full-history research contract |
 | Discovery or ingestion rejects an object | Provider activation, rights, exact dataset/object identity, metadata, or the fresh process-local receipt no longer matches | Read current source status, rerun the bounded listing, and retry the exact confirmed ingestion; never fabricate or reuse a receipt |
 | Status shows `currentSession: active` and `runtime: not_active` | Research extraction adapter is active but no live market runtime exists in this process | Treat session/activation evidence as extraction status; do not fabricate live health |
-| Public Coinbase/Kraken coverage says `direct_verified` but runtime quality does not | Profile ceiling was confused with evidence-derived current qualification | Use runtime quality and the data-quality gate; those public shipping paths remain `DirectUnverified` |
 | Activation request rejects as invalid | Wrong schema version, unknown field/kind, oversized or symlinked input, surface/session mismatch, missing evidence, or bad hash | Use the exact controlled request and evidence root; do not weaken validation |
 | Restart quarantines one provider | Durable recipe/evidence is invalid, superseded, unauthorized, or rejected by its adapter | Preserve quarantine evidence and re-onboard that surface; other providers stay isolated |
 
@@ -614,6 +657,7 @@ the data root, and never remove files or catalog rows by hand.
 
 | Location or stream | Contents |
 | --- | --- |
+| Owner-managed credential bundle | One-time 32-field input outside the repository; POSIX mode `0600`; not startup configuration and not deleted automatically by import |
 | `<data-root>/catalog.sqlite3` | Code-owned profile registrations and durable onboarding sessions; SQLite sidecars may exist while active |
 | `<data-root>/control/sources/research-runtime/` | Durable research source-registry and rights authority state |
 | `<data-root>/control/sources/provider-activation-v1/recipes/` | Desired or quarantined, secret-free provider activation recipes |
@@ -633,6 +677,9 @@ configure a remote log exporter by default.
 
 - [Installation and local bootstrap](installation-and-bootstrap.md)
 - [Configuration and secrets operations](configuration-and-secrets.md)
+- [Provider accounts and credential preparation](provider-account-setup.md)
+- [Selected provider credential example](../reference/market-squawk-provider-credentials.env.example)
+- [Selected provider contracts](../reference/providers/README.md)
 - [CLI reference](../reference/cli.md)
 - [Configuration reference](../reference/configuration.md)
 - [Source coverage and adapter reference](../reference/source-coverage.md)
@@ -643,6 +690,9 @@ configure a remote log exporter by default.
 - [Security and trust boundaries](../architecture/security-and-trust-boundaries.md)
 - [Delivery ledger](../plans/delivery-ledger.md)
 - [Source CLI definitions](../../apps/market-squawk/src/cli.rs)
+- [Installed credential import service](../../apps/market-squawk/src/service/provider_credential_import.rs)
+- [Strict credential-bundle parser](../../apps/market-squawk/src/provider_onboarding/credential_bundle.rs)
+- [Selected credential delegation](../../apps/market-squawk/src/provider_onboarding/credential_bundle_delegation.rs)
 - [Source application service and read semantics](../../apps/market-squawk/src/application/source.rs)
 - [Source result shapes](../../apps/market-squawk/src/application/source/results.rs)
 - [Built-in profile registry](../../crates/market-squawk-sources/src/onboarding/built_in_profiles.rs)
@@ -650,23 +700,15 @@ configure a remote log exporter by default.
 - [Bounded loopback portal](../../apps/market-squawk/src/provider_onboarding/portal.rs)
 - [CLI research-provider activation](../../apps/market-squawk/src/local_product/cli_provider.rs)
 - [Durable activation recovery state](../../apps/market-squawk/src/local_product/provider_activation_state.rs)
-- [Coinbase adapter metadata](../../adapters/market-squawk-adapter-coinbase/src/lib.rs)
-- [Kraken qualification boundary](../../adapters/market-squawk-adapter-kraken/src/qualification.rs)
-- [Paper-bot source defaults](../../apps/market-squawk/src/paper_bot/defaults.rs)
 
 ## Official sources
 
-These provider sources were reviewed directly through 2026-07-26. They describe upstream
+These selected provider sources were reviewed directly through 2026-08-11. They describe upstream
 interfaces, limits, and terms; the reviewed Market Squawk profile revision remains the authority
 for what the product currently admits.
 
 | Source | Applied fact | Reviewed |
 | --- | --- | --- |
-| [Coinbase Exchange WebSocket overview](https://docs.cdp.coinbase.com/exchange/websocket-feed/overview) | Public feed endpoints, increasing product sequence numbers, gap/out-of-order handling, and the need for consumer synchronization logic | 2026-07-23 |
-| [Coinbase Exchange WebSocket channels](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels) | Heartbeat, level-book, and missed-message recovery characteristics of upstream channels | 2026-07-23 |
-| [Coinbase Exchange WebSocket authentication](https://docs.cdp.coinbase.com/exchange/websocket-feed/authentication) | Signed subscription fields for the authenticated Direct feed | 2026-07-25 |
-| [Coinbase Market Data Terms](https://www.coinbase.com/legal/market_data) | Current scoped-use and downstream-use boundary retained by the code-owned rights profile | 2026-07-25 |
-| [Kraken WebSocket v2 book checksum](https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2) | Optional CRC32 validation over the top ten price levels and exact local-book maintenance order | 2026-07-23 |
 | [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Public submissions/XBRL API boundary, no API key for these data APIs, and automated-access policy reference | 2026-07-26 |
 | [SEC developer resources](https://www.sec.gov/about/developer-resources) | Aggregate fair-access ceiling of no more than ten requests per second and declared-bot requirement | 2026-07-26 |
 | [SEC EDGAR public API authority](../research/providers/sec-edgar-public-api-2026-07-26.md) | Exact zero-fee setup authority and mandatory real-response acceptance boundary | 2026-07-26 |
@@ -677,6 +719,8 @@ for what the product currently admits.
 | [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/) | Official Fiscal Service API query and pagination contract | 2026-07-23 |
 | [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Five XML families, year/month selectors, and zero-based 300-row all-history pagination | 2026-07-26 |
 | [Treasury daily-rates release authority](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md) | Dataset-level public-access and CC0 evidence for durable local use | 2026-07-26 |
+| [Federal Reserve Board Data Download Program](https://www.federalreserve.gov/datadownload/) | No-key DDP entry point and current-definition release boundary | 2026-08-12 |
+| [Federal Reserve Board DDP help](https://www.federalreserve.gov/datadownload/help/) | Automated download formats, one-frequency-per-file behavior, labels, units, and multipliers | 2026-08-12 |
 | [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | Required API key, mutable terms, usage restrictions, and obligations that prevent implied durable rights | 2026-07-23 |
 | [FRED API key documentation](https://fred.stlouisfed.org/docs/api/api_key.html) | Provider-controlled account/key boundary; application users require their own keys | 2026-07-26 |
 | [Current FRED legal terms](https://fred.stlouisfed.org/legal/) | Current service and API-specific storage, caching, archival, database, software-development, and model-training prohibitions | 2026-07-26 |

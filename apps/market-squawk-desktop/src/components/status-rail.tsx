@@ -1,49 +1,55 @@
+import * as React from "react"
+
 import { useProduct } from "@/app/product-context"
+import { GlobalLookup } from "@/features/lookup/global-lookup"
 
 export function StatusRail() {
   const product = useProduct()
-  const bootstrap = product.status === "ready" ? product.bootstrap : null
-  const paper = bootstrap?.setupSteps.find((step) => step.id === "paper")
 
   return (
     <section
-      aria-label="Operational status"
+      aria-label="Workspace summary"
       className="flex min-h-7 shrink-0 items-center gap-4 border-b border-border/70 bg-card/20 px-5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground"
     >
       <StatusFact
-        label="Local"
+        label="Workspace"
         value={
           product.status === "loading"
             ? "Starting"
             : product.status === "ready"
-              ? product.bootstrap.storage.label
+              ? "Ready"
               : "Unavailable"
         }
-        ready={bootstrap?.storage.state === "ready"}
+        ready={product.status === "ready"}
       />
-      <StatusFact
-        label="Install"
-        value={bootstrap?.installation.label ?? "Unknown"}
-        ready={bootstrap?.installation.state === "ready"}
-      />
-      <StatusFact
-        label="Mode"
-        value={paper?.complete ? "Paper only" : "Unavailable"}
-        ready={paper?.complete}
-      />
-      <StatusFact
-        label="Telemetry"
-        value={bootstrap?.telemetryEnabled ? "On" : "Off"}
-      />
-      <time className="ml-auto tabular-nums" dateTime={new Date().toISOString()}>
-        {new Intl.DateTimeFormat(undefined, {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-          timeZoneName: "short",
-        }).format(new Date())}
-      </time>
+      <div className="ml-auto flex items-center gap-2">
+        {product.status === "ready" ? (
+          <GlobalLookup
+            transport={product.transport}
+            scope={product.bootstrap.productSessionToken}
+          />
+        ) : null}
+        <CurrentClock />
+      </div>
     </section>
+  )
+}
+
+function CurrentClock() {
+  const [now, setNow] = React.useState(() => new Date())
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  return (
+    <time className="tabular-nums" dateTime={now.toISOString()}>
+      {new Intl.DateTimeFormat(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        timeZoneName: "short",
+      }).format(now)}
+    </time>
   )
 }
 

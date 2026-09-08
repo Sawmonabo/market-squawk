@@ -248,12 +248,12 @@ struct RecordedAnalyticalStorage {
     point_in_time_content_sha256: [u8; 32],
     point_in_time_audit_sha256: [u8; 32],
     point_in_time_retained_bytes: usize,
-    python_verified_rows: u64,
-    python_selected_rows_per_verification: u64,
-    python_export_sha256: [u8; 32],
-    python_catalog_identity: [u8; 32],
-    python_selection_sha256: [u8; 32],
-    python_dataset_admission_revalidation: RecordedStorageLatency,
+    phase_one_verified_rows: u64,
+    phase_one_component_rows_per_verification: u64,
+    phase_one_descriptor_sha256: [u8; 32],
+    phase_one_manifest_sha256: [u8; 32],
+    phase_one_object_sha256: [u8; 32],
+    phase_one_descriptor_object_verification: RecordedStorageLatency,
 }
 
 #[derive(Debug, Deserialize)]
@@ -726,7 +726,7 @@ fn validate_current_rss(observation: &RecordedCurrentRssObservation, label: &str
 fn validate_analytical_storage(storage: &RecordedAnalyticalStorage) -> Result<()> {
     if storage.requested_rows != EXACT_STORAGE_ROWS
         || storage.physical_rows_per_object != 4_096
-        || storage.python_selected_rows_per_verification != 48_000
+        || storage.phase_one_component_rows_per_verification != 48_000
     {
         bail!("performance analytical-storage evidence violates the fixed workload");
     }
@@ -742,18 +742,18 @@ fn validate_analytical_storage(storage: &RecordedAnalyticalStorage) -> Result<()
     let query_rows = query_operations
         .checked_mul(storage.physical_rows_per_object)
         .context("performance analytical-storage query-row count overflowed")?;
-    let python_operations = storage
+    let phase_one_operations = storage
         .requested_rows
-        .div_ceil(storage.python_selected_rows_per_verification);
-    let expected_python_rows = python_operations
-        .checked_mul(storage.python_selected_rows_per_verification)
-        .context("performance Python verified-row count overflowed")?;
+        .div_ceil(storage.phase_one_component_rows_per_verification);
+    let expected_phase_one_rows = phase_one_operations
+        .checked_mul(storage.phase_one_component_rows_per_verification)
+        .context("performance phase-one verified-row count overflowed")?;
     if storage.measured_rows != expected_measured_rows
         || storage.unique_parquet_objects != 1
         || storage.parquet_size_bytes == 0
         || storage.point_in_time_selected_rows != storage.physical_rows_per_object
         || storage.point_in_time_retained_bytes == 0
-        || storage.python_verified_rows != expected_python_rows
+        || storage.phase_one_verified_rows != expected_phase_one_rows
     {
         bail!("performance analytical-storage evidence violates the fixed workload");
     }
@@ -761,9 +761,9 @@ fn validate_analytical_storage(storage: &RecordedAnalyticalStorage) -> Result<()
         &storage.parquet_content_sha256,
         &storage.point_in_time_content_sha256,
         &storage.point_in_time_audit_sha256,
-        &storage.python_export_sha256,
-        &storage.python_catalog_identity,
-        &storage.python_selection_sha256,
+        &storage.phase_one_descriptor_sha256,
+        &storage.phase_one_manifest_sha256,
+        &storage.phase_one_object_sha256,
     ] {
         if digest.iter().all(|byte| *byte == 0) {
             bail!("performance analytical-storage evidence contains a zero identity");
@@ -778,9 +778,9 @@ fn validate_analytical_storage(storage: &RecordedAnalyticalStorage) -> Result<()
     }
     validate_storage_latency(&storage.datafusion_query, query_operations, query_rows)?;
     validate_storage_latency(
-        &storage.python_dataset_admission_revalidation,
-        python_operations,
-        expected_python_rows,
+        &storage.phase_one_descriptor_object_verification,
+        phase_one_operations,
+        expected_phase_one_rows,
     )?;
     Ok(())
 }

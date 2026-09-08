@@ -8,20 +8,20 @@
 use market_squawk_domain::{
     AssessmentValidity, BindingError, BookIntegrity, BookLevel, BookStateBinding, BoundAssessment,
     CanonicalStateDigest, CanonicalizationRule, CaptureIntegrityState, ChecksumCapability,
-    ChecksumEvidence, ClassificationError, CoverageError, CoverageScope, CoverageStatus,
-    DataQuality, DigestAlgorithm, EvidenceDigest, InitializedSnapshot, InstrumentExecutionTerms,
-    InstrumentId, IntegrityAssessmentSet, IntegrityCapabilities, LiveEvidenceBinding,
-    LiveProvenance, LiveTimingAssessment, LiveTimingPolicy, MarketAssessmentSet, MarketEvent,
-    MarketEventError, MarketEventTiming, PayloadHash, PayloadReference, PrecisionIntegrity,
-    PriceTicks, ProvenanceError, QualificationAssessment, QualificationAssessmentId,
-    QualificationAssessmentInput, QualificationError, QuantityLots, RecordedLiveProvenanceInput,
-    RuleVersion, SequenceCapability, SequenceEvidence, SnapshotEvidence, SourceAuthorization,
-    SourceCoverageRecord, SourceId, SourceIdentifier, SourcePolicyAssessment, StreamIntegrityState,
-    Timestamp, TradingStatus, VenueId,
+    ChecksumEvidence, ClassificationError, ConnectionGeneration, CoverageError, CoverageScope,
+    CoverageStatus, DataQuality, DigestAlgorithm, EvidenceDigest, InitializedSnapshot,
+    InstrumentExecutionTerms, InstrumentId, IntegrityAssessmentSet, IntegrityCapabilities,
+    LiveEvidenceBinding, LiveProvenance, LiveTimingAssessment, LiveTimingPolicy,
+    MarketAssessmentSet, MarketEvent, MarketEventError, MarketEventTiming, PayloadHash,
+    PayloadReference, PrecisionIntegrity, PriceTicks, ProvenanceError, QualificationAssessment,
+    QualificationAssessmentId, QualificationAssessmentInput, QualificationError, QuantityLots,
+    RecordedLiveProvenanceInput, RuleVersion, SequenceCapability, SequenceEvidence,
+    SnapshotEvidence, SourceAuthorization, SourceCoverageRecord, SourceId, SourceIdentifier,
+    SourcePolicyAssessment, StreamIntegrityState, Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
-    AuthorizationHealth, ChecksumValidationProfile, CoverageHealth, CurrentProviderObservation,
-    ProviderTimestampEvidence, SequenceValidationProfile,
+    AuthorizationHealth, ChecksumValidationProfile, CoverageHealth, CurrentObservationEvidence,
+    CurrentProviderObservation, FrameId, ProviderTimestampEvidence, SequenceValidationProfile,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -93,6 +93,184 @@ pub struct CommittedQualifiedMarketObservation {
     execution_terms: InstrumentExecutionTerms,
     stable_trade_id: Option<SourceIdentifier>,
     price: QualifiedMarketPrice,
+}
+
+/// Non-executable owned export of one post-commit, directly unverified market observation.
+///
+/// Only the instrument-owned runtime can construct this value. It retains the complete canonical
+/// event and qualification assessment but carries no execution authority, action gate, or price
+/// eligibility projection.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CommittedResearchMarketObservation {
+    event: MarketEvent,
+    assessment: QualificationAssessment,
+    binding_digest: [u8; 32],
+    committed_state_revision: u64,
+    generation: ConnectionGeneration,
+    source_coordinate: CommittedResearchSourceCoordinate,
+    stable_trade_id: Option<SourceIdentifier>,
+}
+
+/// Exact source-object and row coordinate retained by one committed research observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedResearchSourceCoordinate {
+    evidence: CurrentObservationEvidence,
+    row_ordinal: usize,
+    row_count: usize,
+}
+
+impl CommittedResearchSourceCoordinate {
+    fn try_new(
+        evidence: CurrentObservationEvidence,
+        row_ordinal: usize,
+        row_count: usize,
+    ) -> Option<Self> {
+        if row_count == 0 || row_ordinal >= row_count {
+            return None;
+        }
+        Some(Self {
+            evidence,
+            row_ordinal,
+            row_count,
+        })
+    }
+
+    /// Returns the exact captured source-object evidence.
+    pub const fn evidence(&self) -> &CurrentObservationEvidence {
+        &self.evidence
+    }
+
+    /// Returns a frame identity only when the row originated in a transport frame.
+    pub fn frame_id(&self) -> Option<FrameId> {
+        self.evidence
+            .transport_frame()
+            .map(market_squawk_sources::CurrentFrameEvidence::frame_id)
+    }
+
+    /// Returns the complete response receipt only when the row originated in HTTP capture.
+    pub fn http_response_receipt(
+        &self,
+    ) -> Option<&market_squawk_sources::SegmentedHttpResponseReceipt> {
+        self.evidence
+            .http_response()
+            .map(market_squawk_sources::CurrentHttpResponseEvidence::receipt)
+    }
+
+    /// Returns the zero-based normalized row ordinal within the exact source object.
+    pub const fn row_ordinal(&self) -> usize {
+        self.row_ordinal
+    }
+
+    /// Returns the complete normalized row count for the exact source object.
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+}
+
+impl CommittedResearchMarketObservation {
+    pub(crate) fn from_committed(
+        event: MarketEvent,
+        assessment: QualificationAssessment,
+        binding_digest: [u8; 32],
+        committed_state_revision: u64,
+        generation: ConnectionGeneration,
+        source_evidence: CurrentObservationEvidence,
+        row_ordinal: usize,
+        row_count: usize,
+        stable_trade_id: Option<SourceIdentifier>,
+    ) -> Option<Self> {
+        let provenance = event_provenance(&event);
+        if assessment.recorded_quality() != DataQuality::DirectUnverified
+            || provenance.binding() != assessment.binding()
+            || provenance.connection_generation() != generation
+        {
+            return None;
+        }
+        let source_coordinate =
+            CommittedResearchSourceCoordinate::try_new(source_evidence, row_ordinal, row_count)?;
+        Some(Self {
+            event,
+            assessment,
+            binding_digest,
+            committed_state_revision,
+            generation,
+            source_coordinate,
+            stable_trade_id,
+        })
+    }
+
+    /// Returns the committed canonical event without granting execution authority.
+    pub const fn event(&self) -> &MarketEvent {
+        &self.event
+    }
+
+    /// Returns the complete qualification assessment retained at commit.
+    pub const fn qualification(&self) -> &QualificationAssessment {
+        &self.assessment
+    }
+
+    /// Returns the exact qualification binding digest.
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Returns the instrument-owned state revision committed with this event.
+    pub const fn committed_state_revision(&self) -> u64 {
+        self.committed_state_revision
+    }
+
+    /// Returns the exact source connection generation.
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    /// Returns the generation-local physical frame identity.
+    pub fn frame_id(&self) -> Option<FrameId> {
+        self.source_coordinate.frame_id()
+    }
+
+    /// Returns the complete source-object/row coordinate.
+    pub const fn source_coordinate(&self) -> &CommittedResearchSourceCoordinate {
+        &self.source_coordinate
+    }
+
+    pub const fn wire_ordinal(&self) -> usize {
+        self.source_coordinate.row_ordinal()
+    }
+
+    pub const fn row_count(&self) -> usize {
+        self.source_coordinate.row_count()
+    }
+
+    /// Returns the provider's stable economic trade identity when supplied.
+    pub const fn stable_trade_id(&self) -> Option<&SourceIdentifier> {
+        self.stable_trade_id.as_ref()
+    }
+
+    /// Consumes the one-use carrier into complete publication evidence.
+    pub fn into_parts(self) -> CommittedResearchMarketObservationParts {
+        CommittedResearchMarketObservationParts {
+            event: self.event,
+            assessment: self.assessment,
+            binding_digest: self.binding_digest,
+            committed_state_revision: self.committed_state_revision,
+            generation: self.generation,
+            source_coordinate: self.source_coordinate,
+            stable_trade_id: self.stable_trade_id,
+        }
+    }
+}
+
+/// Owned parts of one consumed research-only committed observation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CommittedResearchMarketObservationParts {
+    pub event: MarketEvent,
+    pub assessment: QualificationAssessment,
+    pub binding_digest: [u8; 32],
+    pub committed_state_revision: u64,
+    pub generation: ConnectionGeneration,
+    pub source_coordinate: CommittedResearchSourceCoordinate,
+    pub stable_trade_id: Option<SourceIdentifier>,
 }
 
 impl CommittedQualifiedMarketObservation {
@@ -298,8 +476,8 @@ where
         | market_squawk_sources::ProviderObservationPayload::CorporateAction { .. } => None,
     };
     let policy = current.policy();
-    let frame = current.frame_evidence();
-    let frame_binding = frame.binding();
+    let source_evidence = current.evidence();
+    let source_binding = source_evidence.binding();
     let source_timestamp = match observation.timestamp() {
         ProviderTimestampEvidence::Provided { value, .. } => Some(*value),
         ProviderTimestampEvidence::AuthoritativelyAbsent(_) => None,
@@ -311,10 +489,10 @@ where
         policy.freshness().max_market_age_nanos(),
     )?;
     let timing = LiveTimingAssessment::assess(
-        frame_binding.connection_generation(),
+        source_binding.connection_generation(),
         Some(MarketEventTiming::new(
             source_timestamp,
-            frame.received_at(),
+            source_evidence.received_at(),
         )),
         None,
         evaluated_at,
@@ -330,24 +508,24 @@ where
     }
 
     let binding = LiveEvidenceBinding::new(
-        frame_binding.source_id().clone(),
-        frame_binding.session_id().as_source_identifier().clone(),
-        frame_binding.metadata_revision().clone(),
+        source_binding.source_id().clone(),
+        source_binding.session_id().as_source_identifier().clone(),
+        source_binding.metadata_revision().clone(),
         policy.static_authorization().basis().clone(),
         observation.venue().clone(),
         observation.instrument(),
-        frame_binding.connection_generation(),
+        source_binding.connection_generation(),
         policy.provider_product().clone(),
         policy.provider_channel().clone(),
         observation.event_class(),
         observation.source_identifier().clone(),
-        frame.payload_digest(),
+        source_evidence.payload_digest(),
         evidence.canonical_state_digest.clone(),
         evidence.book_state.clone(),
     )?;
     let binding_digest = digest_execution_binding(
         &binding,
-        current.frame_evidence().frame_id(),
+        source_evidence.coordinate_digest(),
         evidence.state_revision,
     );
     let assessment_id =
@@ -413,11 +591,11 @@ where
         .coverage()
         .result()
         .status_at(evaluated_at);
-    let payload_digest = frame.payload_digest();
+    let payload_digest = source_evidence.payload_digest();
     let provenance = LiveProvenance::recorded(RecordedLiveProvenanceInput::new(
         binding.clone(),
         source_timestamp,
-        frame.received_at(),
+        source_evidence.received_at(),
         evaluated_at,
         evaluated_at,
         assessment.recorded_quality(),
@@ -527,7 +705,7 @@ fn snapshot_evidence(
     current: &CurrentProviderObservation,
     evidence: &CommittedQualificationEvidence,
 ) -> Result<SnapshotEvidence, QualificationBuildError> {
-    let generation = current.frame_evidence().binding().connection_generation();
+    let generation = current.evidence().binding().connection_generation();
     let Some(origin) = &evidence.snapshot_origin else {
         return Ok(SnapshotEvidence::uninitialized(generation));
     };
@@ -548,7 +726,7 @@ fn snapshot_evidence(
 /// Hashes every complete binding dimension for nonce transplant resistance.
 fn digest_execution_binding(
     binding: &LiveEvidenceBinding,
-    frame_id: market_squawk_sources::FrameId,
+    source_coordinate: EvidenceDigest,
     state_revision: u64,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -604,7 +782,7 @@ fn digest_execution_binding(
     } else {
         hasher.update([0]);
     }
-    hasher.update(frame_id.get().to_be_bytes());
+    digest_evidence(&mut hasher, source_coordinate);
     hasher.update(state_revision.to_be_bytes());
     hasher.finalize().into()
 }
@@ -679,8 +857,8 @@ pub(crate) fn canonical_digest_from_sha256(
     Ok(CanonicalStateDigest::new(
         EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
         CanonicalizationRule::new(
-            SourceIdentifier::try_from("market-squawk-live-state-v1")?,
-            RuleVersion::new(1)?,
+            SourceIdentifier::try_from("market-squawk-live-state-v2")?,
+            RuleVersion::new(2)?,
         ),
     ))
 }

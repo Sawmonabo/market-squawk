@@ -21,6 +21,12 @@ pub enum LotDirection {
 pub enum LotSelection {
     /// Dispose the earliest acquired compatible lots first.
     Fifo,
+    /// Dispose the latest acquired compatible lots first.
+    Lifo,
+    /// Dispose proportionally across the complete compatible inventory pool.
+    ///
+    /// This is a server-held accounting policy; callers do not provide a calculated basis.
+    AverageCost,
     /// Dispose only the named opening transaction lots, in caller order.
     SpecificIdentification(Vec<SourceIdentifier>),
 }
@@ -121,6 +127,57 @@ pub(crate) fn dispose(
     let mut remaining = quantity;
     let mut removed_basis = Money::new(Decimal::ZERO, currency);
     let mut basis_complete = true;
+    if matches!(selection, LotSelection::AverageCost) {
+        // A source-authorized average-cost disposition is a proportional reduction of every
+        // compatible open lot. Iterating FIFO here would silently turn the stated pool method
+        // into FIFO; retain exact decimal arithmetic and fail closed on nonrepresentable values.
+        let ratio = quantity
+            .checked_div(available)
+            .ok_or(PortfolioError::Arithmetic)?
+            .normalize();
+        for index in indices {
+            let lot = lots
+                .get_mut(index)
+                .ok_or(PortfolioError::InvalidLotSelection)?;
+            let removed_quantity = lot
+                .quantity
+                .checked_mul(ratio)
+                .ok_or(PortfolioError::Arithmetic)?
+                .normalize();
+            let basis_amount = lot
+                .basis
+                .amount()
+                .checked_mul(ratio)
+                .ok_or(PortfolioError::Arithmetic)?
+                .normalize();
+            let allocation = Money::new(basis_amount, currency);
+            lot.quantity = lot
+                .quantity
+                .checked_sub(removed_quantity)
+                .ok_or(PortfolioError::Arithmetic)?
+                .normalize();
+            lot.basis = lot
+                .basis
+                .checked_sub(allocation)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+            removed_basis = removed_basis
+                .checked_add(allocation)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+            basis_complete &= lot.basis_complete;
+            remaining = remaining
+                .checked_sub(removed_quantity)
+                .ok_or(PortfolioError::Arithmetic)?
+                .normalize();
+        }
+        if !remaining.is_zero() {
+            return Err(PortfolioError::Arithmetic);
+        }
+        lots.retain(|lot| !lot.quantity.is_zero());
+        return Ok(Disposal {
+            basis: removed_basis,
+            basis_complete,
+        });
+    }
     for index in indices {
         if remaining.is_zero() {
             break;
@@ -176,6 +233,19 @@ fn selected_indices(
 ) -> Result<Vec<usize>, PortfolioError> {
     match selection {
         LotSelection::Fifo => Ok(lots
+            .iter()
+            .enumerate()
+            .filter(|(_, lot)| lot.instrument_id == instrument_id && lot.direction == direction)
+            .map(|(index, _)| index)
+            .collect()),
+        LotSelection::Lifo => Ok(lots
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, lot)| lot.instrument_id == instrument_id && lot.direction == direction)
+            .map(|(index, _)| index)
+            .collect()),
+        LotSelection::AverageCost => Ok(lots
             .iter()
             .enumerate()
             .filter(|(_, lot)| lot.instrument_id == instrument_id && lot.direction == direction)

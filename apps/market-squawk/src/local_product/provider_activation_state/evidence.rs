@@ -48,6 +48,15 @@ struct EvidenceIndexEntry {
 }
 
 impl DurableProviderActivationState {
+    pub(super) fn evidence_backup_target_is_absent(
+        &self,
+    ) -> Result<bool, DurableProviderActivationStateError> {
+        let index_absent = LocalAuthorityStateStore::try_open(self.evidence_index_root())?
+            .load()?
+            .is_none();
+        Ok(index_absent && self.inventory_evidence_objects()?.is_empty())
+    }
+
     /// Persists one complete evidence bundle under aggregate count and byte ceilings.
     ///
     /// Every candidate must already be named by a staged, desired, or quarantined recipe. This

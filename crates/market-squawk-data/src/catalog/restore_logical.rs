@@ -12,8 +12,10 @@ use super::types::MAX_SQLITE_RECORD_BYTES;
 use super::{Catalog, CatalogError, map_catalog_location_error};
 
 const AUTHORITY_EVENTS_TABLE: &str = "analytical_artifact_root_authority_events";
-const MAX_RESTORE_SCHEMA_OBJECTS: usize = 256;
-const MAX_RESTORE_TABLES: usize = 64;
+const MAX_RESTORE_SCHEMA_OBJECTS: usize = 1_024;
+// The current migration closure declares 138 tables, before SQLite's own metadata tables.
+// Keep the bounded schema inventory large enough to restore the catalog we actually publish.
+const MAX_RESTORE_TABLES: usize = 160;
 const MAX_RESTORE_COLUMNS_PER_TABLE: usize = 64;
 const MAX_RESTORE_IDENTIFIER_BYTES: usize = 255;
 const MAX_RESTORE_SCHEMA_SQL_BYTES: usize = 64 * 1024;

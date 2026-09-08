@@ -59,6 +59,32 @@ impl FairValueService {
         Ok(service)
     }
 
+    /// Recomputes the complete catalog identity and proves this writer retains the same head.
+    ///
+    /// This is the least-authority fair-value contribution to a product backup. The analytical
+    /// backup already contains the catalog database, so callers retain only this logical identity
+    /// and position rather than exporting the same payloads a second time.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the catalog cannot be read, its canonical digest cannot be computed, or
+    /// the durable head differs from the in-memory writer position.
+    pub fn backup_attestation(
+        &self,
+    ) -> Result<(FairValueCatalogPosition, [u8; 32]), FairValueError> {
+        let snapshot = self
+            .catalog
+            .fair_value_snapshot(self.limits.catalog_limits)
+            .map_err(|_| FairValueError::Persistence)?;
+        if snapshot.position() != self.position {
+            return Err(FairValueError::CorruptPersistence);
+        }
+        let digest = snapshot
+            .logical_digest()
+            .map_err(|_| FairValueError::CorruptPersistence)?;
+        Ok((snapshot.position(), digest.bytes()))
+    }
+
     /// Classifies and durably retains one immutable measurement and rules decision.
     pub fn classify(
         &mut self,
@@ -464,21 +490,11 @@ impl FairValueService {
             .approvals
             .get(&approval_id)
             .ok_or(FairValueError::ApprovalNotFound)?;
-        if at < approval.approved_at() {
-            return Ok(ApprovalStatus::NotYetEffective);
-        }
-        if self
-            .revocations
-            .get(&approval_id)
-            .is_some_and(|revocation| revocation.revoked_at() <= at)
-        {
-            return Ok(ApprovalStatus::Revoked);
-        }
-        if at > approval.expires_at() {
-            Ok(ApprovalStatus::Expired)
-        } else {
-            Ok(ApprovalStatus::Active)
-        }
+        Ok(super::queries::approval_status_at(
+            approval,
+            self.revocations.get(&approval_id).map(AsRef::as_ref),
+            at,
+        ))
     }
 
     /// Returns one immutable measurement by content identity.

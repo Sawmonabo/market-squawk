@@ -106,8 +106,8 @@ fn config() -> Option<CoinbaseExchangeConfig> {
         vec![mapping],
         vec![
             CoinbaseChannel::Level2,
-            CoinbaseChannel::Matches,
-            CoinbaseChannel::Heartbeat,
+            CoinbaseChannel::MarketTrades,
+            CoinbaseChannel::Heartbeats,
         ],
         FreshnessPolicy::try_new(
             5_000_000_000,

@@ -35,6 +35,7 @@ fn market_event() -> Result<MarketEvent, Box<dyn Error>> {
         PriceTicks::new(100),
         QuantityLots::new(2)?,
         AggressorSide::Buy,
+        None,
     )?))
 }
 

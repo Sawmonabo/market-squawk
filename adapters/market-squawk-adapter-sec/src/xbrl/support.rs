@@ -5,6 +5,12 @@ use thiserror::Error;
 /// Bounded filing XBRL parse failure.
 #[derive(Debug, Error)]
 pub enum SecXbrlError {
+    #[error("XBRL processing was cancelled")]
+    Cancelled,
+    #[error("XBRL taxonomy set is not a valid code-owned registry selection")]
+    InvalidTaxonomySet,
+    #[error("XBRL fact entity does not match the exact filing registrant CIK")]
+    EntityMismatch,
     #[error("XBRL input exceeds its decoded-byte bound")]
     ByteLimitExceeded,
     #[error("XBRL nesting exceeds its depth bound")]

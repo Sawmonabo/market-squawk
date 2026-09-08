@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         runner: benchmark_identity::EVIDENCE_TARGET.to_owned(),
         evidence_mode: benchmark_identity::FIXED_QUOTA_EVIDENCE_MODE.to_owned(),
         build_evidence_sha256: output.hash_file(Path::new("build-evidence.json"), 1024 * 1024)?,
-        measured_code_head: build_bindings::BUILD_GIT_HEAD.to_owned(),
+        measured_code_head: build_evidence.measured_code_head.clone(),
         backend: backend::EVIDENCE_BACKEND.to_owned(),
         queue_transport: backend::QUEUE_TRANSPORT.to_owned(),
         queue_private_storage_accounting: backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING.to_owned(),
@@ -279,7 +279,12 @@ fn finalize(
         if evidence.build_evidence_sha256 != build_evidence_sha256 {
             return Err("repetition does not bind the exact build evidence".into());
         }
-        validate_repetition(&evidence, repetition, &producer_cases)?;
+        validate_repetition(
+            &evidence,
+            repetition,
+            &build_evidence.measured_code_head,
+            &producer_cases,
+        )?;
         repetition_sha256.insert(
             format!("repetition-{repetition}.json"),
             output.hash_file(&path, 128 * 1024 * 1024)?,
@@ -374,7 +379,7 @@ fn finalize(
         runner: benchmark_identity::EVIDENCE_TARGET.to_owned(),
         evidence_mode: benchmark_identity::FIXED_QUOTA_EVIDENCE_MODE.to_owned(),
         criterion_evidence_mode: benchmark_identity::CRITERION_EVIDENCE_MODE.to_owned(),
-        measured_code_head: build_bindings::BUILD_GIT_HEAD.to_owned(),
+        measured_code_head: build_evidence.measured_code_head.clone(),
         build_evidence_sha256,
         build_environment_policy: build_evidence.build_environment_policy.clone(),
         build_command_sha256: build_evidence.build_command_sha256.clone(),
@@ -679,11 +684,11 @@ fn print_build_bindings() -> Result<(), Box<dyn Error>> {
         "queue_transport": backend::QUEUE_TRANSPORT,
         "queue_private_storage_accounting": backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING,
         "build_profile": "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols",
-        "measured_code_head": build_bindings::BUILD_GIT_HEAD,
         "clean_build_enforced": build_bindings::CLEAN_BUILD_ENFORCED,
         "build_environment_policy": build_bindings::BUILD_ENVIRONMENT_POLICY,
         "build_command_sha256": build_bindings::BUILD_COMMAND_SHA256,
         "build_environment_sha256": build_bindings::BUILD_ENVIRONMENT_SHA256,
+        "measured_source_closure_sha256": build_bindings::MEASURED_SOURCE_CLOSURE_SHA256,
         "source_inventory_sha256": build_bindings::SOURCE_INVENTORY_SHA256,
         "cargo_lock_sha256": build_bindings::CARGO_LOCK_SHA256,
         "workspace_manifest_sha256": build_bindings::WORKSPACE_MANIFEST_SHA256,
@@ -693,16 +698,6 @@ fn print_build_bindings() -> Result<(), Box<dyn Error>> {
         "cargo_executable_sha256": build_bindings::CARGO_EXECUTABLE_SHA256,
         "git_executable_sha256": build_bindings::GIT_EXECUTABLE_SHA256,
         "rustc_executable_sha256": build_bindings::RUSTC_EXECUTABLE_SHA256,
-        "host_gate_shell_sha256": build_bindings::HOST_GATE_SHELL_SHA256,
-        "host_gate_python_sha256": build_bindings::HOST_GATE_PYTHON_SHA256,
-        "host_gate_process_sha256": build_bindings::HOST_GATE_PROCESS_SHA256,
-        "host_gate_evidence_io_sha256": build_bindings::HOST_GATE_EVIDENCE_IO_SHA256,
-        "host_gate_cli_sha256": build_bindings::HOST_GATE_CLI_SHA256,
-        "host_gate_schema_sha256": build_bindings::HOST_GATE_SCHEMA_SHA256,
-        "host_gate_execution_sha256": build_bindings::HOST_GATE_EXECUTION_SHA256,
-        "host_gate_observation_sha256": build_bindings::HOST_GATE_OBSERVATION_SHA256,
-        "host_gate_measured_sha256": build_bindings::HOST_GATE_MEASURED_SHA256,
-        "build_evidence_python_sha256": build_bindings::BUILD_EVIDENCE_PYTHON_SHA256,
         "platform_source_sha256": build_bindings::PLATFORM_SOURCE_SHA256,
         "domain_source_sha256": build_bindings::DOMAIN_SOURCE_SHA256,
         "entrypoint_sha256": build_bindings::ENTRYPOINT_SHA256,

@@ -111,11 +111,11 @@ pub(super) fn load_latest(
     for name in staging {
         directory.remove_file(name)?;
     }
-    let mut latest: Option<(u64, BTreeMap<String, SecRepresentation>)> = None;
+    let mut latest: Option<(u64, BTreeMap<(SourceId, String), SecRepresentation>)> = None;
     for name in committed {
         let (name_generation, expected_digest) = parse_snapshot_name(&name)?;
         let bytes = read_bounded_regular(directory, &name, limits.max_snapshot_bytes)?;
-        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        let actual = snapshot_checksum(&bytes);
         if actual != expected_digest {
             return Err(SecRepresentationError::SnapshotDigestMismatch);
         }
@@ -130,7 +130,13 @@ pub(super) fn load_latest(
         for representation in wire.entries.0 {
             let representation = representation.validate(limits)?;
             if entries
-                .insert(representation.locator.clone(), representation)
+                .insert(
+                    (
+                        representation.source_id.clone(),
+                        representation.locator.clone(),
+                    ),
+                    representation,
+                )
                 .is_some()
             {
                 return Err(SecRepresentationError::DuplicateLocator);
@@ -169,7 +175,7 @@ pub(super) fn persist_snapshot(
     let mut writer = BoundedSnapshotWriter::new(maximum);
     serde_json::to_writer(&mut writer, snapshot)?;
     let bytes = writer.into_inner();
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let digest = snapshot_checksum(&bytes);
     let final_name = snapshot_name(snapshot.generation, digest);
     match read_bounded_regular(directory, &final_name, limits.max_snapshot_bytes) {
         Ok(existing) if existing == bytes => {
@@ -215,7 +221,7 @@ pub(super) fn persist_snapshot(
         limits.max_snapshot_bytes,
         cancellation,
     )?;
-    if verified != bytes || <[u8; 32]>::from(Sha256::digest(&verified)) != digest {
+    if verified != bytes || snapshot_checksum(&verified) != digest {
         return Err(SecRepresentationError::SnapshotDigestMismatch);
     }
     check_cancelled(cancellation)?;
@@ -370,6 +376,14 @@ fn snapshot_name(generation: u64, digest: [u8; 32]) -> String {
         "{SNAPSHOT_PREFIX}{generation:020}-{}{SNAPSHOT_SUFFIX}",
         encode_hex(digest)
     )
+}
+
+fn snapshot_checksum(bytes: &[u8]) -> [u8; 32] {
+    let mut checksum = Sha256::new();
+    checksum.update(SNAPSHOT_CHECKSUM_DOMAIN);
+    checksum.update((bytes.len() as u64).to_be_bytes());
+    checksum.update(bytes);
+    checksum.finalize().into()
 }
 
 fn parse_snapshot_name(name: &str) -> Result<(u64, [u8; 32]), SecRepresentationError> {

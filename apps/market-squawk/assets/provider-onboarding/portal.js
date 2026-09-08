@@ -44,6 +44,66 @@ const PROVIDER_COPY = Object.freeze({
       submitLabel: 'Save replacement and reconnect'
     }
   },
+  'alpaca.basic-market-data': {
+    mark: 'AL',
+    name: 'Alpaca Basic',
+    purpose:
+      'No-monthly-fee U.S. equity and ETF market data from Alpaca’s IEX feed, using your own Alpaca account credentials.',
+    examples: [
+      'Real-time IEX stock and ETF quotes',
+      'Up to 30 streamed symbols on the Basic plan',
+      'Delayed IEX historical market data'
+    ],
+    goals: ['live'],
+    effort: 'About 3 minutes',
+    access: 'API key required',
+    account:
+      'Alpaca’s Basic market-data option has no monthly data fee, but Alpaca still requires an account and Trading API key pair. Paper Trading is the recommended V1 realm and does not place real orders.',
+    handoffUrl: 'https://app.alpaca.markets/signup',
+    handoffInstruction:
+      'Create or sign in to Alpaca, open Paper Trading, generate an API key pair, and save the key ID and secret when Alpaca shows them. The secret is shown once. Return here instead of pasting either value into chat.',
+    setupSteps: [
+      'Open the official Alpaca dashboard and create or sign in to your account.',
+      'Choose Paper Trading for the recommended V1 setup.',
+      'Open API Keys and generate a new key pair.',
+      'Save the API key ID and secret key when Alpaca displays them; the secret is shown once.',
+      'Return here, choose the same Paper or Live realm, and submit both values once.'
+    ],
+    submitLabel: 'Save Alpaca key pair and activate',
+    renewal: {
+      manageLabel: 'Rotate API key pair',
+      title: 'Rotate the Alpaca API key pair',
+      description:
+        'Generate a replacement key pair in the same Alpaca Paper or Live realm, save the new secret when it is shown, and return with both replacement values.',
+      handoffUrl: 'https://app.alpaca.markets/',
+      continueLabel: 'I have the replacement key pair',
+      submitLabel: 'Save replacement and reconnect'
+    }
+  },
+  'schwab.trader-api-market-data': {
+    mark: 'SCH',
+    name: 'Charles Schwab',
+    purpose:
+      'Optional read-only multi-asset quotes, price history, options, market hours, movers, and streaming market data from your authorized Schwab connection.',
+    examples: [
+      'Provider-qualified stock and ETF quotes',
+      'Price history and option chains',
+      'Read-only streaming market data'
+    ],
+    goals: [],
+    effort: 'About 3 minutes',
+    access: 'Schwab authorization',
+    account:
+      'A Schwab brokerage relationship and an already configured Trader API application are required. Market Squawk reads the application key and secret only from its protected local credential store. This browser page never asks for or displays either value.',
+    handoffUrl: 'https://developer.schwab.com/products/trader-api--individual',
+    setupSteps: [
+      'Market Squawk confirms that the Schwab application credential is already stored locally.',
+      'Choose Authorize with Schwab. The Market Squawk backend opens the official Schwab authorization page in your default browser.',
+      'Sign in to Schwab and approve the read-only market-data connection on that official page.',
+      'Return here and choose I finished in Schwab to complete the protected token exchange.',
+      'Market Squawk retains only the protected authorization and its secret-free status; it does not request account, position, order, or money-movement access.'
+    ]
+  },
   'kraken.spot-public-market-data': {
     mark: 'KR',
     name: 'Kraken',
@@ -88,19 +148,19 @@ const PROVIDER_COPY = Object.freeze({
     purpose: 'Economic indicators and the historical revisions available at each point in time.',
     examples: ['Unemployment and inflation', 'Historical data vintages', 'Economic research inputs'],
     goals: [],
-    effort: 'Permission review',
-    access: 'Written permission + free API key',
+    effort: 'About 2 minutes',
+    access: 'Free API key',
     account:
-      'A free FRED account and API key provide access. Saving data or using it for model training also requires an exact written St. Louis Fed permission response and separate authority for each selected series.',
+      'A free FRED account and API key provide access. Market Squawk stores the key in its protected local secret store and binds each connection to one exact series and vintage range.',
     handoffUrl: 'https://fred.stlouisfed.org/docs/api/api_key.html',
     handoffInstruction:
-      'After importing and reviewing the written permission response below, create or sign in to a free FRED account and request a distinct Market Squawk API key.',
+      'Create or sign in to a free FRED account, request an API key, and return here without pasting the key into chat.',
     setupSteps: [
-      'If you only need unemployment data, use the recommended public BLS source instead.',
-      'Request written St. Louis Fed permission for Market Squawk’s exact FRED API use.',
-      'Import the exact response and record your local scope review below.',
       'Create or sign in to a free FRED account and request a distinct API key.',
-      'Return here and submit the API key once.'
+      'Choose current observations or historical vintages.',
+      'Enter the exact economic series and vintage range to retain.',
+      'Return here and submit the API key once.',
+      'Market Squawk verifies availability before activating the saved configuration.'
     ],
     credentialLabel: 'FRED API key',
     submitLabel: 'Save FRED API key and activate',
@@ -310,17 +370,17 @@ const ERROR_COPY = Object.freeze({
   ],
   operation_cancelled: [
     'The operation was cancelled',
-    'No incomplete authority was granted. You can safely continue from the saved provider state.'
+    'The connection was not changed. You can continue from the saved setup state.'
   ],
   invalid_adapter_request: [
     'The provider settings were not accepted',
-    'Review the date range, series details, and evidence fields, then try again.'
+    'Review the date range and series details, then try again.'
   ],
   adapter_activation_unavailable: [
     'This provider cannot be activated yet',
     'The required provider capability is not currently admitted. The setup remains visibly incomplete.'
   ],
-  adapter_state_unavailable: [
+  activation_state_unavailable: [
     'The local provider state could not be saved',
     'Nothing was silently activated. Check local storage and try again.'
   ],
@@ -348,6 +408,7 @@ const state = {
   notice: null,
   technical: null,
   pendingRequests: new Map(),
+  schwabOAuthViews: new Map(),
   advancedFilter: '',
   providerMode: 'guided',
   renewingProfile: null,
@@ -727,6 +788,8 @@ function renderProviderStep(profile) {
     body.append(renderRenewalAction(profile, session));
   } else if (isConnected(session)) {
     body.append(renderConnectedPanel(profile, session));
+  } else if (isSchwabProfile(profile)) {
+    body.append(renderSchwabProviderAction(profile, session));
   } else if (!releaseAllowsSetup(profile)) {
     body.append(renderUnavailablePanel(profile));
   } else {
@@ -788,7 +851,7 @@ function renderConnectedPanel(profile, session) {
         element(
           'p',
           '',
-          `${providerCopy(profile).name} is active through the current provider authority.`
+          `${providerCopy(profile).name} is connected and available for local research.`
         )
       );
       return copy;
@@ -818,6 +881,7 @@ function renderConnectedPanel(profile, session) {
   if (
     state.providerMode === 'advanced' &&
     session &&
+    !isSchwabProfile(profile) &&
     profile.credential_requirement === 'required_provider_controlled'
   ) {
     const renewal = renewalPresentation(profile);
@@ -899,6 +963,255 @@ function renderUnavailablePanel(profile) {
   return panel;
 }
 
+function renderSchwabProviderAction(profile, session) {
+  const root = element('section', 'secret-panel');
+  if (!session) {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab application setup is required',
+        'Market Squawk can begin Schwab authorization only after the installation has imported the application key and secret into its protected local credential store. This browser page never collects those credentials.'
+      )
+    );
+    return root;
+  }
+
+  if (session.next_action !== 'complete_oauth_authorization') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization is not available yet',
+        schwabOAuthUnavailableReason(session.next_action)
+      )
+    );
+    return root;
+  }
+
+  const view = schwabOAuthView(profile, session);
+  if (!view) {
+    root.append(
+      renderSetupSteps(profile),
+      element('h3', '', 'Authorize read-only Schwab market data'),
+      element(
+        'p',
+        'page-copy',
+        'Market Squawk will ask its backend to open the official Schwab authorization page. The authorization URL, callback, application credential, and protected tokens never pass through this browser page.'
+      ),
+      actionButton('Authorize with Schwab', 'button-primary', () =>
+        runSchwabOAuthAction(profile, session, 'begin')
+      )
+    );
+  } else if (view.state === 'awaiting_authorization') {
+    root.append(
+      schwabOAuthNotice(
+        'info',
+        'i',
+        'Waiting for Schwab authorization',
+        'The Market Squawk backend opened the official Schwab authorization page. Finish signing in and approving there, then return to this page.'
+      ),
+      schwabOAuthActions(
+        ['I finished in Schwab', 'button-primary', 'continue'],
+        ['Cancel this authorization', 'button-quiet', 'cancel'],
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'exchanging_authorization') {
+    root.append(
+      schwabOAuthNotice(
+        'info',
+        'i',
+        'Finishing Schwab authorization',
+        'Market Squawk is completing the protected token transition locally. No token is returned to this page.'
+      ),
+      schwabOAuthActions(
+        ['Check authorization completion', 'button-primary', 'continue'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'active') {
+    root.append(
+      schwabOAuthNotice(
+        'success',
+        '✓',
+        'Schwab authorization is complete',
+        'The read-only Schwab market-data authorization is active and protected locally. This page received only its secret-free lifecycle status; it has no account, position, order, or money-movement authority.'
+      )
+    );
+  } else if (view.state === 'reauthorization_required') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization must be renewed',
+        'The protected Schwab authority can no longer issue a current market-data token. Complete Schwab authorization again before this source can be used.'
+      ),
+      schwabOAuthActions(
+        ['Authorize with Schwab again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'cancelled') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization was cancelled',
+        'No incomplete Schwab authorization was granted. You may start a new authorization when you are ready.'
+      ),
+      schwabOAuthActions(
+        ['Start Schwab authorization again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else if (view.state === 'unlinked') {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization is unlinked',
+        'The prior protected Schwab token authority is no longer available to Market Squawk.'
+      ),
+      schwabOAuthActions(
+        ['Authorize Schwab again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  } else {
+    root.append(
+      schwabOAuthNotice(
+        'warning',
+        '!',
+        'Schwab authorization is unavailable',
+        'The local Schwab authorization runtime could not admit this operation. The saved onboarding session remains incomplete.'
+      ),
+      schwabOAuthActions(
+        ['Try Schwab authorization again', 'button-primary', 'begin'],
+        null,
+        profile,
+        session
+      )
+    );
+  }
+
+  if (state.busy) root.append(renderBusyLine('Updating protected Schwab authorization…'));
+  return root;
+}
+
+function schwabOAuthNotice(kind, mark, title, message) {
+  const notice = element('section', `notice notice-${kind}`);
+  notice.setAttribute('role', 'status');
+  const copy = element('div');
+  copy.append(element('h3', '', title), element('p', '', message));
+  notice.append(element('span', 'notice-mark', mark), copy);
+  return notice;
+}
+
+function schwabOAuthActions(primary, secondary, profile, session) {
+  const actions = element('div', 'button-row');
+  for (const specification of [primary, secondary]) {
+    if (!specification) continue;
+    const [label, className, action] = specification;
+    actions.append(
+      actionButton(label, className, () => runSchwabOAuthAction(profile, session, action))
+    );
+  }
+  return actions;
+}
+
+function schwabOAuthUnavailableReason(action) {
+  if (secretAction(action)) {
+    return 'The Schwab application credential has not completed protected local import. Import it through the installation-owned credential path; do not enter it in this browser.';
+  }
+  if (action === 'refresh_evidence' || action === 'resolve_rights') {
+    return 'The saved Schwab session still requires backend evidence or entitlement work before OAuth can continue. Nothing was silently activated.';
+  }
+  if (action === 'start_new_session' || action === 'none') {
+    return 'This saved Schwab session cannot continue. Preserve it for audit and begin a new installation-owned credential session.';
+  }
+  return 'The saved Schwab session does not currently admit OAuth authorization. Follow the next setup action reported by the backend.';
+}
+
+async function runSchwabOAuthAction(profile, session, action) {
+  await runAction(async () => {
+    try {
+      const view = await mutate(
+        `/api/v1/sessions/${session.session_id}/schwab-oauth-${action}`,
+        '{}',
+        'application/json'
+      );
+      const retained = retainSchwabOAuthView(session, action, view);
+      state.schwabOAuthViews.set(profile.id, retained);
+      state.technical = retained;
+      if (retained.state === 'active') {
+        state.notice = {
+          kind: 'success',
+          title: 'Schwab authorization completed',
+          message: 'The protected read-only market-data authorization is active locally.'
+        };
+      }
+    } catch (error) {
+      if (
+        error instanceof PortalError &&
+        (error.code === 'adapter_activation_unavailable' ||
+          error.code === 'activation_state_unavailable' ||
+          error.code === 'operation_unavailable')
+      ) {
+        state.schwabOAuthViews.set(profile.id, {
+          session_id: session.session_id,
+          action,
+          state: 'unavailable'
+        });
+      }
+      throw error;
+    }
+  });
+}
+
+function retainSchwabOAuthView(session, expectedAction, view) {
+  const actions = new Set(['begin', 'continue', 'cancel', 'unlink']);
+  const states = new Set([
+    'awaiting_authorization',
+    'exchanging_authorization',
+    'active',
+    'reauthorization_required',
+    'cancelled',
+    'unlinked'
+  ]);
+  if (
+    !view ||
+    view.session_id !== session.session_id ||
+    view.action !== expectedAction ||
+    !actions.has(view.action) ||
+    !states.has(view.state)
+  ) {
+    throw new PortalError('invalid_session_state', 409, view);
+  }
+  return {
+    session_id: view.session_id,
+    action: view.action,
+    state: view.state,
+    access_token_generation: view.access_token_generation ?? null,
+    access_expires_at: view.access_expires_at ?? null,
+    refresh_expires_at: view.refresh_expires_at ?? null
+  };
+}
+
+function schwabOAuthView(profile, session) {
+  const view = state.schwabOAuthViews.get(profile.id);
+  return view && session && view.session_id === session.session_id ? view : null;
+}
+
 function renderProviderAction(profile, session) {
   const root = element('section');
   if (session && secretAction(session.next_action)) {
@@ -917,14 +1230,7 @@ function renderProviderAction(profile, session) {
     return root;
   }
 
-  const steps = element('section');
-  steps.append(element('h3', '', 'What happens next'));
-  const list = element('ol', 'steps-list');
-  for (const step of setupSteps(profile)) {
-    list.append(element('li', '', step));
-  }
-  steps.append(list);
-  root.append(steps);
+  root.append(renderSetupSteps(profile));
 
   const configuration = buildConfiguration(profile, state.providerMode === 'advanced');
   if (!configuration) {
@@ -947,6 +1253,17 @@ function renderProviderAction(profile, session) {
   root.append(actions);
   if (state.busy) root.append(renderBusyLine('Checking the provider and saving local state…'));
   return root;
+}
+
+function renderSetupSteps(profile) {
+  const steps = element('section');
+  steps.append(element('h3', '', 'What happens next'));
+  const list = element('ol', 'steps-list');
+  for (const step of setupSteps(profile)) {
+    list.append(element('li', '', step));
+  }
+  steps.append(list);
+  return steps;
 }
 
 function renderSecretStep(profile, session, resumedConfiguration) {
@@ -994,6 +1311,15 @@ function renderSecretStep(profile, session, resumedConfiguration) {
       secretField('Coinbase API key', 'api-key', 1024),
       secretField('Coinbase passphrase', 'passphrase', 1024),
       secretField('Coinbase API secret key — shown once', 'signing-secret', 1024)
+    );
+  } else if (profile.id === 'alpaca.basic-market-data') {
+    fields.push(
+      secretField('Alpaca API key ID', 'alpaca-key-id', 4096),
+      secretField('Alpaca secret key — shown once', 'alpaca-secret-key', 4096),
+      selectField('Trading API realm', 'alpaca-trading-api-environment', [
+        ['paper', 'Paper Trading — recommended for V1'],
+        ['live', 'Live account credentials']
+      ])
     );
   } else {
     const label =
@@ -1048,6 +1374,13 @@ async function submitProviderSecret(profile, session, fields, resumedConfigurati
       passphrase: fields[1].input.value,
       signing_secret: fields[2].input.value
     });
+  } else if (profile.id === 'alpaca.basic-market-data') {
+    secret = JSON.stringify({
+      version: 1,
+      key_id: fields[0].input.value,
+      secret_key: fields[1].input.value,
+      trading_api_environment: fields[2].input.value
+    });
   } else {
     secret = fields[0].input.value;
   }
@@ -1073,6 +1406,7 @@ function buildConfiguration(profile, advanced) {
   if (
     profile.id === 'coinbase.public-market-data' ||
     profile.id === 'coinbase.exchange-direct-market-data' ||
+    profile.id === 'alpaca.basic-market-data' ||
     profile.id === 'kraken.spot-public-market-data'
   ) {
     return staticConfiguration({kind: 'source'});
@@ -1081,7 +1415,7 @@ function buildConfiguration(profile, advanced) {
     return secConfiguration();
   }
   if (profile.id === 'fred-alfred.api-v1-v2') {
-    return fredConfiguration(advanced);
+    return fredConfiguration();
   }
   if (profile.id === 'bls.v1-unregistered' || profile.id === 'bls.v2-registered') {
     return blsConfiguration(advanced);
@@ -1251,299 +1585,64 @@ function blsConfiguration(advanced) {
   };
 }
 
-function fredConfiguration(advanced) {
+function fredConfiguration() {
   const root = element('fieldset');
   root.append(
-    element('legend', 'field-label', 'Written permission and exact series authority')
+    element('legend', 'field-label', 'Economic series and vintage range'),
+    element(
+      'p',
+      'field-hint',
+      'Choose one exact series. Historical vintages preserve what was known at different points in time; current observations retain the latest published values.'
+    )
   );
 
-  const guidance = element('section', 'notice notice-info');
-  const guidanceCopy = element('div');
-  guidanceCopy.append(
-    element('h3', '', 'Start with BLS unless you need FRED vintages'),
+  const grid = element('div', 'form-grid');
+  const history = selectField('Data history', 'fred-history', [
+    ['alfred', 'Historical vintages — recommended for point-in-time research'],
+    ['fred', 'Current series observations']
+  ]);
+  const series = textField('Economic series ID', 'fred-series', 'UNRATE', 120);
+  series.input.pattern = '[A-Za-z0-9_.-]{1,120}';
+  series.input.autocomplete = 'off';
+  const vintageStart = dateField(
+    'First vintage date',
+    'fred-vintage-start',
+    '1776-07-04'
+  );
+  const vintageEnd = dateField(
+    'Last vintage date',
+    'fred-vintage-end',
+    '9999-12-31'
+  );
+  grid.append(history.root, series.root, vintageStart.root, vintageEnd.root);
+  root.append(grid);
+
+  const note = element('section', 'notice notice-info');
+  const noteCopy = element('div');
+  noteCopy.append(
+    element('h3', '', 'Exact point-in-time scope'),
     element(
       'p',
       '',
-      'The public BLS source provides unemployment data with no account or key. FRED is the advanced path for provider-reported vintages and requires a written St. Louis Fed permission response before Market Squawk can save or train on the data.'
-    ),
-    element(
-      'p',
-      'provider-legal-notice',
-      'This product uses the FRED® API but is not endorsed or certified by the Federal Reserve Bank of St. Louis.'
-    ),
-    externalLink(
-      'Read the FRED API terms',
-      'https://fred.stlouisfed.org/docs/api/terms_of_use.html'
-    ),
-    externalLink('Open the official St. Louis Fed permission form', 'https://fred.stlouisfed.org/contactus/')
-  );
-  guidance.append(element('span', 'notice-mark', 'i'), guidanceCopy);
-  root.append(guidance);
-
-  const requestTemplate = [
-    'Application: Market Squawk',
-    'Service: FRED API',
-    'Series: UNRATE',
-    'Requested operations: local persistence, caching, archival, and model training',
-    'Please confirm in writing whether the Federal Reserve Bank of St. Louis authorizes these exact operations for this application and series.'
-  ].join('\n');
-  const request = textareaField(
-    'Permission request template',
-    'fred-permission-template',
-    'Copy this into the official permission form, then import the exact response you receive.'
-  );
-  request.input.value = requestTemplate;
-  request.input.readOnly = true;
-  const copyTemplate = actionButton('Copy permission request', 'button-quiet', async () => {
-    try {
-      await navigator.clipboard.writeText(requestTemplate);
-      showNotice(
-        'success',
-        'Permission request copied',
-        'Paste it into the official St. Louis Fed form.'
-      );
-    } catch (_error) {
-      request.input.focus();
-      request.input.select();
-    }
-  });
-  root.append(request.root, copyTemplate);
-
-  const permission = element('fieldset');
-  permission.append(
-    element('legend', 'field-label', '1. Import the exact St. Louis Fed response'),
-    element(
-      'p',
-      'field-hint',
-      'Choose the exact response downloaded from its official stlouisfed.org HTTPS URL. Market Squawk reacquires that URL and compares every byte before activation.'
+      'Market Squawk saves the selected series and vintage interval with every raw capture, immutable publication, and later research read.'
     )
   );
-  const permissionFile = fileField(
-    'Exact permission response',
-    'fred-service-permission-file',
-    '.txt,.html,.pdf,text/plain,text/html,application/pdf,application/octet-stream'
-  );
-  const evidenceUrl = urlField('Exact response URL', 'fred-permission-evidence-url', '');
-  const authorityUrl = urlField(
-    'Official authority URL',
-    'fred-permission-authority-url',
-    'https://fred.stlouisfed.org/contactus/'
-  );
-  const channelGrid = element('div', 'form-grid');
-  channelGrid.append(
-    permissionFile.root,
-    evidenceUrl.root,
-    authorityUrl.root
-  );
-  permission.append(channelGrid);
-  evidenceUrl.input.required = true;
-  authorityUrl.input.required = true;
-  root.append(permission);
-
-  const review = element('fieldset');
-  review.append(
-    element('legend', 'field-label', '2. Record your local scope review'),
-    element(
-      'p',
-      'field-hint',
-      'Confirm only what the imported response actually authorizes. Market Squawk binds this decision to the response hash and current terms.'
-    )
-  );
-  const reviewer = textField(
-    'Reviewer identifier',
-    'fred-permission-reviewer',
-    'local-rights-reviewer',
-    256
-  );
-  const effectiveDate = dateField(
-    'Permission effective date',
-    'fred-permission-effective',
-    utcDateOffset(0)
-  );
-  const permissionExpiry = dateField(
-    'Permission expiry date (if stated)',
-    'fred-permission-expiry',
-    ''
-  );
-  permissionExpiry.input.required = false;
-  const revalidateDate = dateField(
-    'Review again by',
-    'fred-permission-revalidate',
-    utcDateOffset(2)
-  );
-  const conditions = textareaField(
-    'Conditions in the response (one per line)',
-    'fred-permission-conditions',
-    'Leave blank only when the response states no additional conditions.'
-  );
-  conditions.input.maxLength = 32768;
-  const reviewGrid = element('div', 'form-grid');
-  reviewGrid.append(
-    reviewer.root,
-    effectiveDate.root,
-    permissionExpiry.root,
-    revalidateDate.root
-  );
-  review.append(reviewGrid, conditions.root);
-  const scopeConfirmation = checkboxField(
-    'fred-permission-scope-confirmed',
-    'I reviewed the exact response and it explicitly covers Market Squawk, the FRED API, this series, local persistence, caching, archival, and model training.'
-  );
-  review.append(scopeConfirmation.root);
-  root.append(review);
-
-  const seriesSection = element('fieldset');
-  seriesSection.append(
-    element('legend', 'field-label', '3. Confirm the exact series'),
-    element(
-      'p',
-      'field-hint',
-      'The guided starter uses FRED series UNRATE with the code-reviewed BLS public-domain decision.'
-    )
-  );
-  const series = textField('FRED series ID', 'fred-series', 'UNRATE', 120);
-  const owner = textField(
-    'Series owner',
-    'fred-owner',
-    'us-bureau-of-labor-statistics',
-    256
-  );
-  series.input.readOnly = true;
-  owner.input.readOnly = true;
-  const basis = selectField('Series authority', 'fred-rights-basis', [
-    ['reviewed_unrate', 'Reviewed UNRATE public-domain decision']
-  ]);
-  const grantEffective = dateField(
-    'Series authority effective date',
-    'fred-grant-effective',
-    utcDateOffset(0)
-  );
-  const grantExpiry = dateField(
-    'Review series authority again by',
-    'fred-grant-expiry',
-    utcDateOffset(2)
-  );
-  const seriesGrid = element('div', 'form-grid');
-  seriesGrid.append(
-    series.root,
-    owner.root,
-    basis.root,
-    grantEffective.root,
-    grantExpiry.root
-  );
-  seriesSection.append(seriesGrid);
-  root.append(seriesSection);
+  note.append(element('span', 'notice-mark', 'i'), noteCopy);
+  root.append(note);
 
   return {
     root,
-    read: async () => {
-      requireFields([
-        permissionFile,
-        evidenceUrl,
-        authorityUrl,
-        reviewer,
-        effectiveDate,
-        revalidateDate,
-        series,
-        owner,
-        basis,
-        grantEffective,
-        grantExpiry
-      ]);
-      if (!scopeConfirmation.input.reportValidity()) throw new Error('invalid_input');
-      if (
-        basis.input.value !== 'reviewed_unrate' ||
-        series.input.value !== 'UNRATE' ||
-        owner.input.value !== 'us-bureau-of-labor-statistics'
-      ) {
+    read: () => {
+      requireFields([history, series, vintageStart, vintageEnd]);
+      if (vintageStart.input.value > vintageEnd.input.value) {
         throwInvalidRange(
-          series.input,
-          'The reviewed starter decision is available only for UNRATE and its BLS owner.'
-        );
-      }
-
-      const reviewedAt = currentUnixNanos();
-      const permissionEffective = dateUnixNanos(effectiveDate.input.value);
-      const revalidateBy = dateUnixNanos(revalidateDate.input.value);
-      const permissionExpires = permissionExpiry.input.value
-        ? dateUnixNanos(permissionExpiry.input.value)
-        : null;
-      const grantStarts = dateUnixNanos(grantEffective.input.value);
-      const grantEnds = dateUnixNanos(grantExpiry.input.value);
-      if (permissionEffective > reviewedAt || reviewedAt >= revalidateBy) {
-        throwInvalidRange(
-          revalidateDate.input,
-          'The permission must already be effective and the review deadline must be in the future.'
-        );
-      }
-      if (
-        permissionExpires !== null &&
-        (permissionExpires <= permissionEffective || permissionExpires <= reviewedAt)
-      ) {
-        throwInvalidRange(
-          permissionExpiry.input,
-          'The permission expiry must be after its effective date and still be in the future.'
-        );
-      }
-      if (grantStarts >= grantEnds || grantEnds <= reviewedAt) {
-        throwInvalidRange(
-          grantExpiry.input,
-          'The series-authority review deadline must be after its effective date and still be in the future.'
-        );
-      }
-
-      const permissionBytes = await exactPortalEvidence(permissionFile.input.files[0]);
-      const permissionChannel = {
-        kind: 'official_https',
-        evidence_url: evidenceUrl.input.value,
-        authority_url: authorityUrl.input.value
-      };
-      const grantEvidence = {kind: 'reviewed_unrate'};
-      const reviewedConditions = conditions.input.value
-        .split('\n')
-        .map((condition) => condition.trim())
-        .filter(Boolean);
-      if (
-        reviewedConditions.length > 32 ||
-        new Set(reviewedConditions).size !== reviewedConditions.length ||
-        reviewedConditions.some((condition) => condition.length > 1024)
-      ) {
-        throwInvalidRange(
-          conditions.input,
-          'Use at most 32 distinct conditions, each no longer than 1,024 characters.'
+          vintageStart.input,
+          'The first vintage date must not follow the last vintage date.'
         );
       }
       return {
         kind: 'fred_alfred',
-        service_permission: {
-          evidence: {
-            channel: permissionChannel,
-            ...permissionBytes
-          },
-          review: {
-            reviewer: reviewer.input.value,
-            reviewed_at_unix_nanos: reviewedAt.toString(),
-            issuer: 'federal-reserve-bank-of-st-louis',
-            application: 'market-squawk',
-            service: 'fred-api',
-            series: [series.input.value],
-            operations: ['persist', 'cache', 'archive', 'train'],
-            conditions: reviewedConditions,
-            effective_at_unix_nanos: permissionEffective.toString(),
-            expires_at_unix_nanos:
-              permissionExpires === null ? null : permissionExpires.toString(),
-            revalidate_by_unix_nanos: revalidateBy.toString()
-          }
-        },
-        grants: [
-          {
-            series: series.input.value,
-            owner: owner.input.value,
-            evidence: grantEvidence,
-            effective_at_unix_nanos: grantStarts.toString(),
-            expires_at_unix_nanos: grantEnds.toString()
-          }
-        ]
+        provider_dataset: `${history.input.value}:series-observations:${series.input.value}:${vintageStart.input.value}:${vintageEnd.input.value}`
       };
     }
   };
@@ -1719,7 +1818,12 @@ async function continueSession(profile, session, adapterRequest, depth) {
     );
     return continueSession(profile, next, adapterRequest, depth + 1);
   }
-  if (secretAction(action) || action === 'refresh_evidence' || action === 'resolve_rights') {
+  if (
+    secretAction(action) ||
+    action === 'complete_oauth_authorization' ||
+    action === 'refresh_evidence' ||
+    action === 'resolve_rights'
+  ) {
     return;
   }
   if (action === 'start_new_session') {
@@ -2069,10 +2173,12 @@ function renderAdvancedCard(profile) {
     technicalDetails(profile, session)
   );
   if (session && isConnected(session) && profile.credential_requirement === 'required_provider_controlled') {
-    const renewal = renewalPresentation(profile);
-    detailsBody.append(
-      actionButton(renewal.manageLabel, '', () => prepareRenewal(profile))
-    );
+    if (!isSchwabProfile(profile)) {
+      const renewal = renewalPresentation(profile);
+      detailsBody.append(
+        actionButton(renewal.manageLabel, '', () => prepareRenewal(profile))
+      );
+    }
   }
   if (session) {
     detailsBody.append(
@@ -2153,8 +2259,21 @@ function badge(text, className) {
 function statusBadge(profile) {
   const session = state.sessions.get(profile.id);
   if (isConnected(session)) return badge('Connected', 'status-connected');
-  if (profile.id === 'fred-alfred.api-v1-v2') {
-    return badge('Written permission needed', 'status-attention');
+  if (isSchwabProfile(profile)) {
+    const view = schwabOAuthView(profile, session);
+    if (view && view.state === 'active') return badge('Authorized', 'status-connected');
+    if (
+      view &&
+      (view.state === 'awaiting_authorization' || view.state === 'exchanging_authorization')
+    ) {
+      return badge('Authorization pending', 'status-attention');
+    }
+    if (view && view.state === 'reauthorization_required') {
+      return badge('Reauthorization needed', 'status-attention');
+    }
+    if (session && session.next_action === 'complete_oauth_authorization') {
+      return badge('Authorization needed', 'status-attention');
+    }
   }
   const release = releasePresentation(profile.release_state);
   return badge(release.label, release.className);
@@ -2277,6 +2396,10 @@ function isLocalProfile(profile) {
   return Object.prototype.hasOwnProperty.call(LOCAL_GUIDANCE, profile.id);
 }
 
+function isSchwabProfile(profile) {
+  return profile.id === 'schwab.trader-api-market-data';
+}
+
 function releaseAllowsSetup(profile) {
   return profile.release_state === 'available' || profile.release_state === 'rights_limited';
 }
@@ -2297,7 +2420,6 @@ function secretAction(action) {
 }
 
 function primarySetupLabel(profile) {
-  if (profile.id === 'fred-alfred.api-v1-v2') return 'Review permission and connect';
   if (requiresProviderHandoff(profile)) return 'Start guided connection';
   return 'Connect this source';
 }
@@ -2306,6 +2428,7 @@ function defaultActivationRequest(profile) {
   if (
     profile.id === 'coinbase.public-market-data' ||
     profile.id === 'coinbase.exchange-direct-market-data' ||
+    profile.id === 'alpaca.basic-market-data' ||
     profile.id === 'kraken.spot-public-market-data'
   ) {
     return {kind: 'source'};
@@ -2321,30 +2444,8 @@ function emailField(label, id, maximum) {
   return inputField(label, id, 'email', '', maximum);
 }
 
-function urlField(label, id, value) {
-  const field = inputField(label, id, 'url', value, 2048);
-  field.input.pattern = 'https://.*';
-  return field;
-}
-
 function dateField(label, id, value) {
   return inputField(label, id, 'date', value);
-}
-
-function fileField(label, id, accept) {
-  const field = inputField(label, id, 'file', '');
-  field.input.accept = accept;
-  return field;
-}
-
-function checkboxField(id, label) {
-  const root = element('label', 'checkbox-field field-full');
-  const input = document.createElement('input');
-  input.id = id;
-  input.type = 'checkbox';
-  input.required = true;
-  root.append(input, element('span', '', label));
-  return {root, input};
 }
 
 function numberField(label, id, value, minimum, maximum) {
@@ -2385,20 +2486,6 @@ function selectField(label, id, options) {
   return {root, input};
 }
 
-function textareaField(label, id, hint) {
-  const root = element('div', 'field field-full');
-  const labelNode = element('label', '', label);
-  labelNode.htmlFor = id;
-  const input = document.createElement('textarea');
-  input.id = id;
-  input.maxLength = 262144;
-  input.setAttribute('aria-describedby', `${id}-hint`);
-  const hintNode = element('p', 'field-hint', hint);
-  hintNode.id = `${id}-hint`;
-  root.append(labelNode, input, hintNode);
-  return {root, input};
-}
-
 function requireFields(fields) {
   for (const field of fields) {
     if (!field.input.reportValidity()) throw new Error('invalid_input');
@@ -2424,56 +2511,6 @@ function isoDate(date) {
   return `${year}-${month}-${day}`;
 }
 
-function utcDateOffset(days) {
-  const date = new Date();
-  date.setUTCHours(0, 0, 0, 0);
-  date.setUTCDate(date.getUTCDate() + days);
-  return isoDate(date);
-}
-
-function currentUnixNanos() {
-  return BigInt(Date.now()) * 1000000n;
-}
-
-function dateUnixNanos(value) {
-  const milliseconds = Date.parse(`${value}T00:00:00.000Z`);
-  if (!Number.isSafeInteger(milliseconds)) throw new Error('invalid_input');
-  return BigInt(milliseconds) * 1000000n;
-}
-
-async function exactPortalEvidence(file) {
-  const maximumBytes = 256 * 1024;
-  if (!(file instanceof File) || file.size === 0 || file.size > maximumBytes) {
-    throw new PortalError('invalid_adapter_request', 400, {
-      message: 'Evidence files must contain 1 to 262,144 bytes.'
-    });
-  }
-  let bytes;
-  let digest;
-  try {
-    bytes = new Uint8Array(await file.arrayBuffer());
-    digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-  } catch (_error) {
-    throw new PortalError('invalid_adapter_request', 400, {
-      message: 'The selected evidence file could not be read and hashed locally.'
-    });
-  }
-  return {
-    sha256: Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join(''),
-    byte_length: bytes.byteLength,
-    content_base64: bytesToBase64(bytes)
-  };
-}
-
-function bytesToBase64(bytes) {
-  const chunkSize = 32768;
-  let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-  }
-  return btoa(binary);
-}
-
 function applyBootstrap(data) {
   state.csrf = data.csrf_token;
   state.profiles = Array.isArray(data.profiles) ? data.profiles : [];
@@ -2482,6 +2519,16 @@ function applyBootstrap(data) {
       session.surface_id,
       session
     ])
+  );
+  state.schwabOAuthViews = new Map(
+    [...state.schwabOAuthViews].filter(([profileId, view]) => {
+      const session = state.sessions.get(profileId);
+      return (
+        session &&
+        session.session_id === view.session_id &&
+        session.next_action === 'complete_oauth_authorization'
+      );
+    })
   );
   state.providerDatasets = new Map(
     (Array.isArray(data.provider_datasets) ? data.provider_datasets : [])

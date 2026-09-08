@@ -1,21 +1,68 @@
 //! Lifecycle-owned transport-neutral portfolio imports, immutable reads, and analytics.
 
+mod account_catalog;
+mod advanced;
 mod analytics;
+mod backup;
+mod candidate;
 mod import;
 mod model;
+mod product;
 mod read;
+mod recommendation;
+
+pub(crate) use account_catalog::{
+    PortfolioAccountCatalogError, PortfolioAccountCatalogReadCapability,
+    PortfolioAccountCatalogSnapshot, PortfolioAccountHead,
+};
+pub(crate) use backup::{
+    PORTFOLIO_BACKUP_PRODUCER, PORTFOLIO_BACKUP_SCHEMA, PortfolioBackupAuthority,
+    PortfolioBackupComponent, RetainedPortfolioBackupSnapshot, TRANSACTION_BACKUP_SCHEMA,
+};
+pub(crate) use candidate::{
+    ImportedPortfolioRiskAdvisory, ImportedPortfolioRiskAdvisoryOutcome,
+    ImportedPortfolioRiskCheck, PortfolioAnalysisDepthAvailability, PortfolioAnalysisDepthLevel,
+    PortfolioAnalysisDepthLevelsInput, PortfolioAnalysisDepthSideEvidence,
+    PortfolioAnalysisDepthUnavailableReason, PortfolioAnalysisLiquidityEvidence,
+    PortfolioAnalysisLiquiditySide, PortfolioAnalysisMarketAvailability,
+    PortfolioAnalysisMarketEntry, PortfolioAnalysisMarketSet,
+    PortfolioAnalysisMarketUnavailableReason, PortfolioAnalysisSetupResolution,
+    PortfolioAnalysisSetupSnapshot, PortfolioCandidateAvailability, PortfolioCandidateCost,
+    PortfolioCandidateImpactPreview, PortfolioCandidateImpactReadCapability,
+    PortfolioCandidateImpactRequest, PortfolioCandidateMarkKind, PortfolioCandidateMarketEvidence,
+    PortfolioCandidateMarketObservation, PortfolioCandidatePositionState,
+    PortfolioCandidateResolution, PortfolioCandidateResolutionAuthority,
+    PortfolioCandidateSetupBinding, PortfolioCandidateSourceSelection,
+    PortfolioCandidateUnavailableReason,
+};
+pub(crate) use import::{
+    GovernedImportCommitReceipt, PortfolioImportInterpretation, PortfolioImportPreview,
+    ServerHeldPortfolioImportResolution,
+};
+pub(crate) use recommendation::{
+    PortfolioAnalysisCurrentPosition, PortfolioAnalysisHistoricalReturn,
+    PortfolioAnalysisHoldingSnapshot, PortfolioAnalysisLiquidityCapacityAvailability,
+    PortfolioAnalysisLiquidityCapacityEvidence, PortfolioAnalysisLiquidityCapacitySideEvidence,
+    PortfolioAnalysisLiquidityCapacityUnavailableReason, PortfolioAnalysisMarkedHolding,
+    PortfolioAnalysisMarkedPortfolioEvidence, PortfolioAnalysisPortfolioSnapshot,
+    PortfolioAnalysisPrerequisitePolicy, PortfolioAnalysisPrerequisiteResolution,
+    PortfolioAnalysisPrerequisiteUnavailableEvidence,
+    PortfolioAnalysisPrerequisiteUnavailableReason, PortfolioAnalysisRiskAvailability,
+    PortfolioAnalysisRiskEvidence, PortfolioAnalysisRiskUnavailableReason,
+    PortfolioRecommendationEvidence, resolve_portfolio_analysis_prerequisites,
+};
 
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use market_squawk_domain::AccountId;
+use market_squawk_domain::{AccountId, Money};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
 use market_squawk_portfolio::PortfolioRevision;
 use market_squawk_services::{
@@ -126,13 +173,22 @@ pub enum PortfolioApplicationServiceError {
     /// Immutable revision construction or publication failed.
     #[error("portfolio revision publication failed")]
     Publication,
+    /// A consistent backup cannot be retained while a governed import is pending.
+    #[error("portfolio backup snapshot is unavailable while an import is pending")]
+    SnapshotUnavailable,
+    /// The immutable portfolio image changed while a read-only calculation was in flight.
+    #[error("portfolio state changed during calculation")]
+    StateChanged,
+    /// Restore was directed at a workspace that already contains portfolio authority state.
+    #[error("portfolio restore target is not fresh")]
+    RestoreTargetNotFresh,
     /// A Task 12 analytical kernel rejected the available evidence.
     #[error("portfolio analytical calculation failed")]
     Analytics,
 }
 
 impl PortfolioApplicationServiceError {
-    fn as_service_error(&self) -> ServiceError {
+    pub(crate) fn as_service_error(&self) -> ServiceError {
         match self {
             Self::InvalidLimits | Self::InvalidRequest | Self::Import => {
                 ServiceError::InvalidRequest
@@ -141,7 +197,11 @@ impl PortfolioApplicationServiceError {
             Self::ResourceExhausted => ServiceError::ResourceExhausted,
             Self::Cancelled => ServiceError::Cancelled,
             Self::DeadlineExceeded => ServiceError::DeadlineExceeded,
-            Self::Path | Self::Authority => ServiceError::Unavailable,
+            Self::Path
+            | Self::Authority
+            | Self::SnapshotUnavailable
+            | Self::StateChanged
+            | Self::RestoreTargetNotFresh => ServiceError::Unavailable,
             Self::CorruptPublication | Self::Publication | Self::Analytics => {
                 ServiceError::Internal
             }
@@ -175,18 +235,68 @@ impl PortfolioApplicationService {
             .map_err(|_| PortfolioApplicationServiceError::Path)?;
         let (authority, image) =
             ImportAuthority::restore(artifacts.clone(), control.root(), limits)?;
-        Ok(Self {
+        Ok(Self::from_restored(artifacts, limits, authority, image))
+    }
+
+    fn from_restored(
+        artifacts: market_squawk_platform::ArtifactRoot,
+        limits: PortfolioApplicationLimits,
+        authority: ImportAuthority,
+        image: PortfolioReadImage,
+    ) -> Self {
+        Self {
             runtime: Arc::new(Runtime {
                 artifacts,
                 limits,
                 authority: std::sync::Mutex::new(authority),
                 image: ArcSwap::from(Arc::new(image)),
+                candidate_resolution: OnceLock::new(),
                 accepting: AtomicBool::new(true),
                 cancellation: CancellationToken::new(),
                 active: AtomicUsize::new(0),
                 idle: Notify::new(),
             }),
-        })
+        }
+    }
+
+    /// Returns a paired backup capability without exposing import or publication authority.
+    pub(crate) fn backup_authority(&self) -> PortfolioBackupAuthority {
+        PortfolioBackupAuthority {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
+    /// Maximum verified bytes the staged-input boundary may transfer to this authority.
+    pub(crate) fn maximum_staged_import_bytes(&self) -> usize {
+        self.runtime.limits.max_artifact_bytes
+    }
+
+    fn restore_backup(
+        paths: &LocalPaths,
+        limits: PortfolioApplicationLimits,
+        portfolios: &[u8],
+        transactions: &[u8],
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        let artifacts = paths
+            .artifacts()
+            .map_err(|_| PortfolioApplicationServiceError::Path)?
+            .clone();
+        let control = paths
+            .control_root()
+            .map_err(|_| PortfolioApplicationServiceError::Path)?;
+        control
+            .try_clone_directory()
+            .map_err(|_| PortfolioApplicationServiceError::Path)?
+            .create_dir_all("portfolio")
+            .map_err(|_| PortfolioApplicationServiceError::Path)?;
+        let (authority, image) = ImportAuthority::restore_backup(
+            artifacts.clone(),
+            control.root(),
+            limits,
+            portfolios,
+            transactions,
+        )?;
+        Ok(Self::from_restored(artifacts, limits, authority, image))
     }
 
     /// Returns read-only access to genuine immutable portfolio revisions.
@@ -196,6 +306,184 @@ impl PortfolioApplicationService {
         PortfolioFairValueReadCapability {
             runtime: Arc::clone(&self.runtime),
         }
+    }
+
+    /// Returns complete current account heads without import or publication authority.
+    pub(crate) fn account_catalog_reader(&self) -> PortfolioAccountCatalogReadCapability {
+        PortfolioAccountCatalogReadCapability {
+            runtime: Arc::downgrade(&self.runtime),
+        }
+    }
+
+    /// Returns read-only, current-revision candidate-impact access for the unified workspace.
+    ///
+    /// This capability accepts only typed, source-selected market evidence. It cannot import or
+    /// mutate holdings, approve risk, create an order, or reuse caller-authored public JSON as a
+    /// market mark.
+    pub(crate) fn candidate_impact_reader(&self) -> PortfolioCandidateImpactReadCapability {
+        PortfolioCandidateImpactReadCapability {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
+    /// Installs the sole server-owned selected-account and market-evidence resolver.
+    ///
+    /// Registration is one-time and confers no portfolio mutation or execution authority.
+    pub(crate) fn register_candidate_resolution_authority(
+        &self,
+        authority: Arc<dyn PortfolioCandidateResolutionAuthority>,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        self.runtime
+            .candidate_resolution
+            .set(authority)
+            .map_err(|_| PortfolioApplicationServiceError::Authority)
+    }
+
+    /// Prepares a non-mutating portfolio import from bytes already claimed by native input
+    /// staging. The caller must pass the server-derived ticket ID only for audit binding; this
+    /// method neither resolves a filesystem path nor accepts a client-provided artifact ID.
+    ///
+    /// The returned preview is canonical and server-held. Committing it is intentionally exposed
+    /// through a separate governed path so interpretation and approval evidence cannot be
+    /// smuggled into preview input.
+    pub(crate) fn prepare_staged_import(
+        &self,
+        account_id: AccountId,
+        input_ticket_id: String,
+        bytes: &[u8],
+        context: &RequestContext,
+    ) -> Result<PortfolioImportPreview, PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let preview = authority.prepare_staged_import(
+            &self.runtime.artifacts,
+            account_id,
+            input_ticket_id,
+            bytes,
+        )?;
+        ensure_live(&self.runtime, context)?;
+        Ok(preview)
+    }
+
+    /// Rebuilds the bounded projection for one exact server-held prepared import.
+    pub(crate) fn prepared_import_preview(
+        &self,
+        preview_id: &str,
+        context: &RequestContext,
+    ) -> Result<PortfolioImportPreview, PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let preview = authority.prepared_import_preview(&self.runtime.artifacts, preview_id)?;
+        ensure_live(&self.runtime, context)?;
+        Ok(preview)
+    }
+
+    /// Commits a prepared import using only server-held resolution evidence. The shared native
+    /// boundary must consume and validate the governance authorization handle before it can
+    /// construct `resolution`; the desktop never supplies its actor/time/rule, selected lots, or
+    /// corporate-action plan through this API.
+    pub(crate) fn commit_prepared_import(
+        &self,
+        preview_id: &str,
+        interpretations: &[PortfolioImportInterpretation],
+        resolution: &ServerHeldPortfolioImportResolution,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let image = authority.commit_prepared_import(
+            &self.runtime.artifacts,
+            preview_id,
+            interpretations,
+            resolution,
+        )?;
+        ensure_live(&self.runtime, context)?;
+        self.runtime.image.store(Arc::new(image));
+        Ok(())
+    }
+
+    /// Recovers a durable promotion that was interrupted after governance admission but before
+    /// portfolio publication. The caller must rehydrate the same server-held resolution evidence
+    /// from the governance authority; this method refuses newly supplied client interpretations.
+    pub(crate) fn recover_promoting_import(
+        &self,
+        preview_id: &str,
+        resolution: &ServerHeldPortfolioImportResolution,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let image =
+            authority.recover_promoting_import(&self.runtime.artifacts, preview_id, resolution)?;
+        ensure_live(&self.runtime, context)?;
+        self.runtime.image.store(Arc::new(image));
+        Ok(())
+    }
+
+    /// Resumes one approved import after a process interruption. The exact server-held approval
+    /// may be replayed only to finish the same durable transition; a completed publication is
+    /// recognized through its immutable governed receipt.
+    pub(crate) fn resume_approved_import(
+        &self,
+        preview_id: &str,
+        interpretations: &[PortfolioImportInterpretation],
+        resolution: &ServerHeldPortfolioImportResolution,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let image = authority.resume_approved_import(
+            &self.runtime.artifacts,
+            preview_id,
+            interpretations,
+            resolution,
+        )?;
+        ensure_live(&self.runtime, context)?;
+        self.runtime.image.store(Arc::new(image));
+        Ok(())
+    }
+
+    /// Discards an unapproved prepared import. A promotion that has consumed approval cannot be
+    /// discarded and must complete through recovery.
+    pub(crate) fn discard_prepared_import(
+        &self,
+        preview_id: &str,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        authority.discard_prepared_import(preview_id)?;
+        ensure_live(&self.runtime, context)
     }
 }
 
@@ -240,6 +528,68 @@ impl PortfolioFairValueReadCapability {
         }
         Ok(revision)
     }
+
+    /// Clones producer-owned price evidence from every current immutable account revision.
+    ///
+    /// The result grants no portfolio mutation authority and retains the exact instrument, money,
+    /// observation time, and source identities emitted by the portfolio owner.
+    pub fn current_price_evidence(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<market_squawk_portfolio::PriceEvidence>, PortfolioApplicationServiceError> {
+        if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        if !self.runtime.accepting.load(Ordering::Acquire) {
+            return Err(PortfolioApplicationServiceError::Authority);
+        }
+        if Instant::now() >= deadline {
+            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
+        }
+        let image = self.runtime.image.load();
+        let count = image
+            .accounts
+            .values()
+            .filter_map(|history| history.revisions.last())
+            .try_fold(0_usize, |count, revision| {
+                count.checked_add(revision.holdings.len())
+            })
+            .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
+        let mut prices = Vec::new();
+        prices
+            .try_reserve_exact(count)
+            .map_err(|_error| PortfolioApplicationServiceError::ResourceExhausted)?;
+        for revision in image
+            .accounts
+            .values()
+            .filter_map(|history| history.revisions.last())
+        {
+            for holding in &revision.holdings {
+                let quantity = holding.quantity().as_decimal().abs();
+                let amount = holding.market_value().amount().abs();
+                let unit_price = amount
+                    .checked_div(quantity)
+                    .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+                prices.push(
+                    market_squawk_portfolio::PriceEvidence::try_new(
+                        holding.instrument_id(),
+                        Money::new(unit_price, holding.currency()),
+                        holding.as_of(),
+                        holding.source_reference().clone(),
+                    )
+                    .map_err(|_error| PortfolioApplicationServiceError::CorruptPublication)?,
+                );
+            }
+        }
+        if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
+        }
+        Ok(prices)
+    }
 }
 
 impl fmt::Debug for PortfolioFairValueReadCapability {
@@ -270,6 +620,7 @@ struct Runtime {
     limits: PortfolioApplicationLimits,
     authority: std::sync::Mutex<ImportAuthority>,
     image: ArcSwap<PortfolioReadImage>,
+    candidate_resolution: OnceLock<Arc<dyn PortfolioCandidateResolutionAuthority>>,
     accepting: AtomicBool,
     cancellation: CancellationToken,
     active: AtomicUsize,
@@ -353,6 +704,21 @@ impl ApplicationDomainService for PortfolioApplicationService {
             })
             .await
             .map_err(|_| ServiceError::Internal)?
+            .map_err(|error| error.as_service_error());
+        }
+        if request.name() == "Portfolio.EvaluateCandidateImpact" {
+            let authority = self
+                .runtime
+                .candidate_resolution
+                .get()
+                .cloned()
+                .ok_or(ServiceError::Unavailable)?;
+            let reader = self.candidate_impact_reader();
+            let _guard = guard;
+            return candidate::call_resolved_candidate_impact(
+                &authority, &reader, &request, &context,
+            )
+            .await
             .map_err(|error| error.as_service_error());
         }
         let _guard = guard;

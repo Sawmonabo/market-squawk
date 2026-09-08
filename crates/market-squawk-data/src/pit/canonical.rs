@@ -1,8 +1,8 @@
 //! Explicit versioned canonical family, payload, provenance, and evidence encodings.
 
 use market_squawk_domain::{
-    AvailabilityEvidence, DataQuality, DigestAlgorithm, PayloadReference, PositionSide,
-    ResearchObservation, ResearchTemporalCoordinate,
+    AvailabilityEvidence, DataQuality, DigestAlgorithm, FundamentalPeriod, PayloadReference,
+    PositionSide, ResearchObservation, ResearchTemporalCoordinate,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -71,7 +71,9 @@ pub(super) fn payload_identity<'a>(
             encoder.u8(2).map_err(map_error)?;
             encoder.str(value.concept().as_str()).map_err(map_error)?;
             encode_decimal(&mut encoder, value.value()).map_err(map_error)?;
-            encoder.str(value.unit().as_str()).map_err(map_error)?;
+            encoder
+                .serializable(value.fact_context())
+                .map_err(map_error)?;
             encode_optional_serializable(&mut encoder, value.xbrl_evidence()).map_err(map_error)?;
         }
         ResearchObservation::Macro(value) => {
@@ -90,6 +92,80 @@ pub(super) fn payload_identity<'a>(
                 return Err(PointInTimeError::CanonicalEncoding);
             }
             encoder.str(value.unit().as_str()).map_err(map_error)?;
+        }
+        ResearchObservation::MarketBar(value) => {
+            encoder.u8(10).map_err(map_error)?;
+            encoder
+                .str(value.provider_instrument_id().as_str())
+                .map_err(map_error)?;
+            encoder.str(value.feed().as_str()).map_err(map_error)?;
+            encoder.str(value.interval().as_str()).map_err(map_error)?;
+            encoder
+                .u8(market_bar_adjustment_tag(value.adjustment()))
+                .map_err(map_error)?;
+            encode_market_bar_time(&mut encoder, value.time_semantics()).map_err(map_error)?;
+            encode_decimal(&mut encoder, value.open().amount()).map_err(map_error)?;
+            encode_decimal(&mut encoder, value.high().amount()).map_err(map_error)?;
+            encode_decimal(&mut encoder, value.low().amount()).map_err(map_error)?;
+            encode_decimal(&mut encoder, value.close().amount()).map_err(map_error)?;
+            encoder.str(value.currency().as_str()).map_err(map_error)?;
+            encode_decimal(&mut encoder, value.volume()).map_err(map_error)?;
+            match value.trade_count() {
+                Some(count) => {
+                    encoder.u8(1).map_err(map_error)?;
+                    encoder.u64(count).map_err(map_error)?;
+                }
+                None => encoder.u8(0).map_err(map_error)?,
+            }
+            match value.vwap() {
+                Some(vwap) => {
+                    encoder.u8(1).map_err(map_error)?;
+                    encode_decimal(&mut encoder, vwap.amount()).map_err(map_error)?;
+                }
+                None => encoder.u8(0).map_err(map_error)?,
+            }
+        }
+        ResearchObservation::FundNav(value) => {
+            encoder.u8(11).map_err(map_error)?;
+            encoder
+                .str(value.provider_instrument_id().as_str())
+                .map_err(map_error)?;
+            encoder
+                .str(
+                    value
+                        .instrument_reference_revision()
+                        .as_source_identifier()
+                        .as_str(),
+                )
+                .map_err(map_error)?;
+            encoder
+                .str(value.provider_product().as_source_identifier().as_str())
+                .map_err(map_error)?;
+            encoder
+                .str(value.provider_channel().as_source_identifier().as_str())
+                .map_err(map_error)?;
+            encode_calendar_date(&mut encoder, value.nav_date()).map_err(map_error)?;
+            encoder
+                .u8(fund_nav_valuation_basis_tag(value.valuation_basis()))
+                .map_err(map_error)?;
+            encoder.str(value.currency().as_str()).map_err(map_error)?;
+            match value.value() {
+                market_squawk_domain::FundNavValue::Observed(money) => {
+                    encoder.u8(1).map_err(map_error)?;
+                    encode_decimal(&mut encoder, money.amount()).map_err(map_error)?;
+                }
+                market_squawk_domain::FundNavValue::Missing(missing) => {
+                    encoder.u8(2).map_err(map_error)?;
+                    encoder
+                        .u8(fund_nav_missing_tag(missing))
+                        .map_err(map_error)?;
+                }
+            }
+            encode_timestamp(&mut encoder, value.canonical_published_at()).map_err(map_error)?;
+            encoder.serializable(value.lineage()).map_err(map_error)?;
+            encoder
+                .serializable(value.revision_evidence())
+                .map_err(map_error)?;
         }
         ResearchObservation::PortfolioPosition(value) => {
             encoder.u8(4).map_err(map_error)?;
@@ -266,16 +342,43 @@ fn encode_candidate_family(
             encoder.u8(2)?;
             encoder.str(provenance.source_id().as_str())?;
             encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
-            encoder.str(provenance.source_identifier().as_str())?;
             encoder.str(value.concept().as_str())?;
             encoder.str(value.unit().as_str())?;
-            encode_coordinate(encoder, context.time().effective())?;
+            encode_fundamental_family_context(encoder, value.fact_context())?;
         }
         ResearchObservation::Macro(value) => {
             encoder.u8(3)?;
             encoder.str(provenance.source_id().as_str())?;
             encoder.str(value.series().as_str())?;
             encode_coordinate(encoder, context.time().effective())?;
+        }
+        ResearchObservation::MarketBar(value) => {
+            encoder.u8(10)?;
+            encoder.str(provenance.source_id().as_str())?;
+            encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+            encoder.str(
+                provenance
+                    .venue_id()
+                    .ok_or(CanonicalEncodingError::Encoding)?
+                    .as_str(),
+            )?;
+            encoder.str(value.provider_instrument_id().as_str())?;
+            encoder.str(value.feed().as_str())?;
+            encoder.str(value.interval().as_str())?;
+            encoder.u8(market_bar_adjustment_tag(value.adjustment()))?;
+            encode_market_bar_series_semantics(encoder, value.time_semantics())?;
+            encode_coordinate(encoder, context.time().effective())?;
+        }
+        ResearchObservation::FundNav(value) => {
+            encoder.u8(11)?;
+            encoder.str(provenance.source_id().as_str())?;
+            encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+            encoder.str(value.provider_product().as_source_identifier().as_str())?;
+            encoder.str(value.provider_channel().as_source_identifier().as_str())?;
+            encoder.str(value.provider_instrument_id().as_str())?;
+            encode_calendar_date(encoder, value.nav_date())?;
+            encoder.u8(fund_nav_valuation_basis_tag(value.valuation_basis()))?;
+            encoder.str(value.currency().as_str())?;
         }
         ResearchObservation::PortfolioPosition(value) => {
             encoder.u8(4)?;
@@ -365,6 +468,38 @@ pub(super) fn encode_coordinate(
     }
 }
 
+fn encode_fundamental_period(
+    encoder: &mut CanonicalEncoder<'_>,
+    period: FundamentalPeriod,
+) -> Result<(), CanonicalEncodingError> {
+    match period {
+        FundamentalPeriod::Instant { instant } => {
+            encoder.u8(1)?;
+            encoder.u16(instant.year())?;
+            encoder.u8(instant.month())?;
+            encoder.u8(instant.day())
+        }
+        FundamentalPeriod::Duration { start, end } => {
+            encoder.u8(2)?;
+            encoder.u16(start.year())?;
+            encoder.u8(start.month())?;
+            encoder.u8(start.day())?;
+            encoder.u16(end.year())?;
+            encoder.u8(end.month())?;
+            encoder.u8(end.day())
+        }
+    }
+}
+
+fn encode_fundamental_family_context(
+    encoder: &mut CanonicalEncoder<'_>,
+    context: &market_squawk_domain::FundamentalFactContext,
+) -> Result<(), CanonicalEncodingError> {
+    encode_fundamental_period(encoder, context.period())?;
+    encoder.serializable(context.dimensions())?;
+    encoder.serializable(&context.consolidation())
+}
+
 fn encode_optional_coordinate(
     encoder: &mut CanonicalEncoder<'_>,
     coordinate: Option<&ResearchTemporalCoordinate>,
@@ -405,6 +540,101 @@ fn encode_decimal(
     let normalized = value.normalize();
     encoder.i128(normalized.mantissa())?;
     encoder.u32(normalized.scale())
+}
+
+fn encode_calendar_date(
+    encoder: &mut CanonicalEncoder<'_>,
+    date: market_squawk_domain::CalendarDate,
+) -> Result<(), CanonicalEncodingError> {
+    encoder.u16(date.year())?;
+    encoder.u8(date.month())?;
+    encoder.u8(date.day())
+}
+
+const fn fund_nav_valuation_basis_tag(basis: market_squawk_domain::FundNavValuationBasis) -> u8 {
+    match basis {
+        market_squawk_domain::FundNavValuationBasis::PerShare => 1,
+    }
+}
+
+const fn fund_nav_missing_tag(missing: market_squawk_domain::FundNavMissingState) -> u8 {
+    match missing {
+        market_squawk_domain::FundNavMissingState::NotYetPublished => 1,
+        market_squawk_domain::FundNavMissingState::Unsupported => 2,
+        market_squawk_domain::FundNavMissingState::SourceMissing => 3,
+        market_squawk_domain::FundNavMissingState::Invalid => 4,
+        market_squawk_domain::FundNavMissingState::Unavailable => 5,
+    }
+}
+
+const fn market_bar_adjustment_tag(adjustment: market_squawk_domain::MarketBarAdjustment) -> u8 {
+    match adjustment {
+        market_squawk_domain::MarketBarAdjustment::Raw => 1,
+        market_squawk_domain::MarketBarAdjustment::Split => 2,
+        market_squawk_domain::MarketBarAdjustment::Dividend => 3,
+        market_squawk_domain::MarketBarAdjustment::SpinOff => 4,
+        market_squawk_domain::MarketBarAdjustment::All => 5,
+    }
+}
+
+fn encode_market_bar_series_semantics(
+    encoder: &mut CanonicalEncoder<'_>,
+    semantics: &market_squawk_domain::BarTimeSemantics,
+) -> Result<(), CanonicalEncodingError> {
+    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
+    encode_market_bar_session_family(encoder, semantics.session())
+}
+
+fn encode_market_bar_time(
+    encoder: &mut CanonicalEncoder<'_>,
+    semantics: &market_squawk_domain::BarTimeSemantics,
+) -> Result<(), CanonicalEncodingError> {
+    encoder.i64(semantics.period_start().unix_nanos())?;
+    encoder.i64(semantics.period_end_exclusive().unix_nanos())?;
+    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
+    encode_market_bar_session(encoder, semantics.session())
+}
+
+fn encode_market_bar_session_family(
+    encoder: &mut CanonicalEncoder<'_>,
+    session: &market_squawk_domain::MarketBarSessionEvidence,
+) -> Result<(), CanonicalEncodingError> {
+    encoder.u8(market_bar_session_kind_tag(session.kind()))?;
+    encoder.str(session.ruleset().as_str())
+}
+
+fn encode_market_bar_session(
+    encoder: &mut CanonicalEncoder<'_>,
+    session: &market_squawk_domain::MarketBarSessionEvidence,
+) -> Result<(), CanonicalEncodingError> {
+    encoder.u8(market_bar_session_kind_tag(session.kind()))?;
+    encoder.str(session.ruleset().as_str())?;
+    let evidence = session.evidence();
+    encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
+    encoder.bytes(&evidence.bytes())
+}
+
+const fn bar_timestamp_basis_tag(basis: market_squawk_domain::BarTimestampBasis) -> u8 {
+    match basis {
+        market_squawk_domain::BarTimestampBasis::PeriodStart => 1,
+        market_squawk_domain::BarTimestampBasis::PeriodEnd => 2,
+    }
+}
+
+const fn market_bar_session_kind_tag(kind: market_squawk_domain::MarketBarSessionKind) -> u8 {
+    match kind {
+        market_squawk_domain::MarketBarSessionKind::Regular => 1,
+        market_squawk_domain::MarketBarSessionKind::Extended => 2,
+        market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+        market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
+    }
+}
+
+const fn digest_algorithm_tag(algorithm: DigestAlgorithm) -> u8 {
+    match algorithm {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }
 }
 
 fn encode_payload_reference(

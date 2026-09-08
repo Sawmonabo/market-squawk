@@ -1,5 +1,6 @@
 //! Bounded namespace-authoritative parser for XBRL and Inline XBRL occurrences.
 
+mod acquisition;
 mod model;
 mod normalize;
 mod support;
@@ -21,7 +22,13 @@ use quick_xml::events::Event;
 use quick_xml::name::NamespaceResolver;
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
+pub(crate) use acquisition::{SecTaxonomyAcquisitionRequest, SecTaxonomyClosure};
+pub(crate) use model::{
+    MAX_TAXONOMY_ARTIFACT_BYTES, SecPendingValidatedXbrlTaxonomySet, SecValidatedXbrlTaxonomySet,
+    SecXbrlTaxonomyArtifact, SecXbrlTaxonomyReference, SecXbrlTaxonomyRegistry,
+};
 pub use model::{
     ParsedXbrlDocument, XbrlDocumentContext, XbrlNonnumericOccurrence, XbrlNumericFact,
 };
@@ -82,6 +89,10 @@ impl RetainedOutputBudget {
                 .checked_add(dynamic_bytes)
                 .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
         )
+    }
+
+    const fn admitted(&self) -> usize {
+        self.admitted
     }
 }
 
@@ -158,11 +169,12 @@ fn unit_dynamic_bytes(unit: &XbrlUnitExpression) -> Result<usize, SecXbrlError> 
 pub struct XbrlDocumentParser;
 
 impl XbrlDocumentParser {
-    /// Parses one exact filing document using namespace-aware non-DOM pull processing.
-    pub fn parse(
+    /// Consumes one exact document context while parsing with cooperative per-event cancellation.
+    pub fn parse_with_cancellation(
         bytes: &[u8],
         limits: SecParserLimits,
         document: XbrlDocumentContext,
+        cancellation: &CancellationToken,
     ) -> Result<ParsedXbrlDocument, SecXbrlError> {
         if bytes.len() > limits.decoded_bytes() {
             return Err(SecXbrlError::ByteLimitExceeded);
@@ -172,6 +184,7 @@ impl XbrlDocumentParser {
         reader.config_mut().expand_empty_elements = true;
         let mut state = ParserState::new(limits, document);
         loop {
+            check_xbrl_cancelled(cancellation)?;
             let (resolution, event) = reader.read_resolved_event()?;
             match event {
                 Event::Start(start) => {
@@ -195,7 +208,15 @@ impl XbrlDocumentParser {
                 Event::Empty(_) => return Err(SecXbrlError::ParserInvariant),
             }
         }
-        state.finish()
+        state.finish(cancellation)
+    }
+}
+
+fn check_xbrl_cancelled(cancellation: &CancellationToken) -> Result<(), SecXbrlError> {
+    if cancellation.is_cancelled() {
+        Err(SecXbrlError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -819,7 +840,11 @@ impl ParserState {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<ParsedXbrlDocument, SecXbrlError> {
+    fn finish(
+        mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<ParsedXbrlDocument, SecXbrlError> {
+        check_xbrl_cancelled(cancellation)?;
         if self.depth != 0
             || self.current_context.is_some()
             || self.current_unit.is_some()
@@ -833,6 +858,7 @@ impl ParserState {
         }
         let mut occurrence_ids = BTreeSet::new();
         for fact in &self.facts {
+            check_xbrl_cancelled(cancellation)?;
             self.retained_output
                 .admit_btree_entry::<String, ()>(fact.occurrence_id.len())?;
             if !occurrence_ids.insert(fact.occurrence_id.clone()) {
@@ -840,9 +866,11 @@ impl ParserState {
             }
         }
         for fact in &mut self.facts {
+            check_xbrl_cancelled(cancellation)?;
             let mut next = fact.continued_at.take();
             let mut seen = BTreeSet::new();
             while let Some(continuation_id) = next {
+                check_xbrl_cancelled(cancellation)?;
                 self.retained_output
                     .admit_btree_entry::<String, ()>(continuation_id.len())?;
                 if !seen.insert(continuation_id.clone()) {
@@ -872,6 +900,7 @@ impl ParserState {
         let mut relationships = Vec::new();
         let mut relationship_clone_bytes = Vec::new();
         for relationship in self.relationships {
+            check_xbrl_cancelled(cancellation)?;
             let clone_bytes = relationship.evidence_dynamic_bytes()?;
             self.retained_output
                 .admit_vec_entry::<XbrlRelationshipEvidence>(clone_bytes)?;
@@ -880,6 +909,7 @@ impl ParserState {
             relationship_clone_bytes.push(clone_bytes);
         }
         for relationship in &relationships {
+            check_xbrl_cancelled(cancellation)?;
             if relationship
                 .from_refs()
                 .iter()
@@ -891,6 +921,7 @@ impl ParserState {
         }
         let mut children = BTreeMap::<String, Vec<SourceIdentifier>>::new();
         for fact in &self.facts {
+            check_xbrl_cancelled(cancellation)?;
             if let Some(parent) = &fact.parent_occurrence_id {
                 self.retained_output
                     .admit_vec_entry::<SourceIdentifier>(fact.occurrence_id.len())?;
@@ -907,10 +938,12 @@ impl ParserState {
         let mut occurrence_graph = BTreeMap::new();
         let mut occurrence_graph_clone_bytes = BTreeMap::new();
         for fact in &self.facts {
+            check_xbrl_cancelled(cancellation)?;
             let id = SourceIdentifier::try_from(fact.occurrence_id.clone())?;
             let mut incident = Vec::new();
             let mut incident_dynamic = 0usize;
             for (index, relationship) in relationships.iter().enumerate() {
+                check_xbrl_cancelled(cancellation)?;
                 if relationship.from_refs().contains(&id) || relationship.to_refs().contains(&id) {
                     let clone_bytes = *relationship_clone_bytes
                         .get(index)
@@ -985,6 +1018,7 @@ impl ParserState {
         }
         let mut normalized = Vec::new();
         for fact in self.facts {
+            check_xbrl_cancelled(cancellation)?;
             let context = self
                 .contexts
                 .get(&fact.context_id)
@@ -1038,6 +1072,7 @@ impl ParserState {
         }
         let mut groups = BTreeMap::<[u8; 32], Vec<usize>>::new();
         for (index, draft) in normalized.iter().enumerate() {
+            check_xbrl_cancelled(cancellation)?;
             if let NormalizedDraft::Numeric { evidence_input, .. } = draft {
                 let digest = semantic_aspect_digest(evidence_input);
                 if !groups.contains_key(&digest) {
@@ -1050,6 +1085,7 @@ impl ParserState {
         }
         let mut group_metadata = BTreeMap::new();
         for (digest, indices) in groups {
+            check_xbrl_cancelled(cancellation)?;
             let classification =
                 classify_duplicate_group(&normalized, &indices, &mut self.retained_output)?;
             let group_id = if indices.len() == 1 {
@@ -1072,6 +1108,7 @@ impl ParserState {
         let mut numeric_facts = Vec::new();
         let mut nonnumeric_occurrences = Vec::new();
         for draft in normalized {
+            check_xbrl_cancelled(cancellation)?;
             match draft {
                 NormalizedDraft::Nonnumeric(value) => {
                     self.retained_output
@@ -1116,6 +1153,12 @@ impl ParserState {
             }
         }
         Ok(ParsedXbrlDocument {
+            accession: self.document.accession,
+            expected_cik: self.document.expected_cik,
+            taxonomy_set: self.document.taxonomy_set,
+            source_payload: self.document.source_payload,
+            evaluated_at: self.document.evaluated_at,
+            retained_output_upper_bound: self.retained_output.admitted(),
             numeric_facts,
             nonnumeric_occurrences,
         })

@@ -22,10 +22,11 @@ fn snapshot_rejects_generation_whose_lineage_differs_from_ordered_objects()
         512,
         Sha256Digest::new([5; 32]),
     )?;
-    let plan = ManifestPlan::append(dataset.clone(), None, object.clone(), 8)?;
+    let plan = ManifestPlan::append(dataset.clone(), None, vec![object.clone()], 8)?;
     let artifact = ArtifactEvidenceRow::try_new(
         artifact_id,
         Uuid::new_v4(),
+        0,
         "objects/sha256/03/0303030303030303030303030303030303030303030303030303030303030303.parquet",
         object.content_hash(),
         object.size_bytes(),

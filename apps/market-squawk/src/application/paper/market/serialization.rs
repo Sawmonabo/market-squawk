@@ -10,6 +10,10 @@ use serde_json::{Value, json};
 
 use super::{MarketFilters, StreamView};
 use crate::application::domain_support::encode_hex;
+use crate::application::market_runtime::{
+    MarketDisplaySnapshotLease, MarketKrakenPriceProjectionLease, MarketSourceSnapshotFailure,
+    MarketSourceSnapshotFailureKind,
+};
 
 const MAXIMUM_LISTED_EVIDENCE_IDENTITIES: usize = 8;
 
@@ -28,10 +32,10 @@ pub(super) fn identity_value(view: &StreamView<'_>) -> Value {
             .provider_channel()
             .as_source_identifier()
             .as_str(),
-        "connectionGeneration": view.stream.connection_generation().get(),
-        "stateRevision": view.stream.state_revision(),
+        "connectionGeneration": view.stream.connection_generation().get().to_string(),
+        "stateRevision": view.stream.state_revision().to_string(),
         "shardId": view.shard.shard_id().to_string(),
-        "shardSnapshotRevision": view.shard.snapshot_revision().get()
+        "shardSnapshotRevision": view.shard.snapshot_revision().get().to_string()
     })
 }
 
@@ -102,10 +106,12 @@ pub(super) fn trade_value(
     let mut value = identity_value(view);
     value["sourceIdentifier"] = Value::String(trade.source_identifier().as_str().to_owned());
     value["stableTradeId"] = Value::String(trade.stable_trade_id().as_str().to_owned());
-    value["tradeConnectionGeneration"] = Value::from(trade.connection_generation().get());
-    value["priceTicks"] = Value::from(trade.price().get());
-    value["quantityLots"] = Value::from(trade.quantity().get());
+    value["tradeConnectionGeneration"] =
+        Value::String(trade.connection_generation().get().to_string());
+    value["priceTicks"] = Value::String(trade.price().get().to_string());
+    value["quantityLots"] = Value::String(trade.quantity().get().to_string());
     value["aggressorSide"] = json!(trade.aggressor_side());
+    value["takerOrderType"] = json!(trade.taker_order_type());
     value["sourceTimestamp"] = json!(trade.source_timestamp().map(timestamp_value));
     value["receivedAt"] = Value::String(timestamp_value(trade.received_at()));
     value["availableAt"] = Value::String(timestamp_value(trade.available_at()));
@@ -125,7 +131,7 @@ pub(super) fn trade_value(
     });
     value["bindingDigest"] = Value::String(encode_hex(trade.binding_digest()));
     value["tradeTradingStatus"] = json!(trade.trading_status());
-    value["committedStateRevision"] = Value::from(trade.committed_state_revision());
+    value["committedStateRevision"] = Value::String(trade.committed_state_revision().to_string());
     value["authority"] = Value::String("not_exposed".to_owned());
     value
 }
@@ -170,7 +176,7 @@ pub(super) fn comparison_value(
                     "numeratorTicks": (
                         i128::from(bid.price().get()) + i128::from(ask.price().get())
                     ).to_string(),
-                    "denominator": 2
+                    "denominator": "2"
                 })
             });
             json!({
@@ -266,19 +272,32 @@ fn dimension_value(dimension: &SnapshotDimension) -> Value {
 
 fn level_value(level: market_squawk_live::BookLevelSnapshot) -> Value {
     json!({
-        "priceTicks": level.price().get(),
-        "quantityLots": level.quantity().get()
+        "priceTicks": level.price().get().to_string(),
+        "quantityLots": level.quantity().get().to_string()
     })
 }
 
 pub(super) fn source_coverage_value(
     streams: &[StreamView<'_>],
+    failures: &[MarketSourceSnapshotFailure],
     filters: &MarketFilters<'_>,
+    display: &[&MarketDisplaySnapshotLease],
+    kraken: &[&MarketKrakenPriceProjectionLease],
 ) -> Value {
     let mut sources = streams
         .iter()
-        .map(|view| view.stream.source().as_str())
+        .map(|view| view.stream.source().as_str().to_owned())
         .collect::<Vec<_>>();
+    sources.extend(
+        display
+            .iter()
+            .map(|snapshot| snapshot.metadata().source_id().as_str().to_owned()),
+    );
+    sources.extend(
+        kraken
+            .iter()
+            .map(|snapshot| snapshot.metadata().source_id().as_str().to_owned()),
+    );
     sources.sort_unstable();
     sources.dedup();
     let source_count = sources.len();
@@ -286,16 +305,49 @@ pub(super) fn source_coverage_value(
 
     let mut venues = streams
         .iter()
-        .map(|view| view.route.route().venue().as_str())
+        .map(|view| view.route.route().venue().as_str().to_owned())
         .collect::<Vec<_>>();
+    venues.extend(
+        display
+            .iter()
+            .map(|snapshot| snapshot.lease().key().venue_id().as_str().to_owned()),
+    );
+    venues.extend(
+        kraken
+            .iter()
+            .map(|snapshot| snapshot.key().venue_id().as_str().to_owned()),
+    );
     venues.sort_unstable();
     venues.dedup();
     let venue_count = venues.len();
     venues.truncate(MAXIMUM_LISTED_EVIDENCE_IDENTITIES);
 
+    let failed_source_count = failures.len();
+    let failed_sources = failures
+        .iter()
+        .take(MAXIMUM_LISTED_EVIDENCE_IDENTITIES)
+        .map(|failure| {
+            json!({
+                "surfaceId": failure.surface_id().as_str(),
+                "reason": match failure.kind() {
+                    MarketSourceSnapshotFailureKind::ResourceExhausted => "resource_exhausted",
+                    MarketSourceSnapshotFailureKind::Unavailable => "unavailable",
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
     json!({
-        "mode": "current_live_runtime",
-        "consistency": "per_shard_current_non_atomic",
+        "mode": if display.is_empty() && kraken.is_empty() {
+            "current_live_runtime"
+        } else {
+            "unified_current_market_runtime"
+        },
+        "consistency": if failed_source_count == 0 {
+            "per_shard_current_non_atomic"
+        } else {
+            "partial_provider_set"
+        },
         "historicalDataset": Value::Null,
         "requestedSourceCount": filters.sources.len(),
         "listedRequestedSources": filters
@@ -312,8 +364,14 @@ pub(super) fn source_coverage_value(
         "observedVenueCount": venue_count,
         "listedVenues": venues,
         "listedVenuesComplete": venue_count <= MAXIMUM_LISTED_EVIDENCE_IDENTITIES,
+        "failedSourceCount": failed_source_count,
+        "failedSources": failed_sources,
+        "listedFailedSourcesComplete":
+            failed_source_count <= MAXIMUM_LISTED_EVIDENCE_IDENTITIES,
         "streamIdentityScope": "complete",
-        "bookDepthScope": "per_record_explicit"
+        "bookDepthScope": "per_record_explicit",
+        "displayObservationCount": display.len(),
+        "krakenOrderLevelProjectionCount": kraken.len()
     })
 }
 

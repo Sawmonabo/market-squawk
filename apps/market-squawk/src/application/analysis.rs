@@ -11,7 +11,8 @@ use market_squawk_analytics::{
 };
 use market_squawk_data::{
     AnalyticalFeatureDataset, AnalyticalFeatureDatasetSelection, AnalyticalReadCapability,
-    AnalyticalReadError, AnalyticalReadLimit, DatasetId, ManifestCatalogError, QueryError,
+    AnalyticalReadError, AnalyticalReadLimit, DatasetId, FeatureDatasetProductContract,
+    ManifestCatalogError, QueryError,
 };
 use market_squawk_domain::{DataQuality, InstrumentId, RoundingPolicy, SourceId, Timestamp};
 use market_squawk_services::{
@@ -31,28 +32,36 @@ mod backtest;
 mod catalog;
 mod serialization;
 
+pub(crate) use backtest::GovernedRecommendationBacktestEvidenceV1;
 pub use backtest::{
-    BacktestScope, GovernedBacktestAuthority, GovernedBacktestCommand,
-    GovernedBacktestCorporateActionsInput, GovernedBacktestInputAuthorityLimits,
+    BacktestPreparationCatalog, BacktestPreparationDatasetInput, BacktestPreparationError,
+    BacktestPreparationLimits, BacktestPreparationOptions, BacktestPreparationPreview,
+    BacktestPreparationReceipt, BacktestPreparationSelection, BacktestScope,
+    GovernedBacktestArtifactEvidence, GovernedBacktestAuthority,
+    GovernedBacktestCohortCandidateRegistrationInput, GovernedBacktestCohortDiagnosticsEvidence,
+    GovernedBacktestCohortEvaluationEvidence, GovernedBacktestCohortMemberRegistrationInput,
+    GovernedBacktestCohortRegistrationInput, GovernedBacktestCommand,
+    GovernedBacktestCorporateActionsInput, GovernedBacktestDiscoveryCompleteness,
+    GovernedBacktestDiscoveryEntry, GovernedBacktestDiscoveryPage, GovernedBacktestDiscoveryQuery,
+    GovernedBacktestEvidence, GovernedBacktestEvidenceGap, GovernedBacktestInputAuthorityLimits,
     GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
     GovernedBacktestInputRegistrationJsonError, GovernedBacktestInputRegistrationReceipt,
     GovernedBacktestInputResolver, GovernedBacktestPortfolioSeedInput,
-    GovernedBacktestQueryLimitsInput, GovernedBacktestRecord, GovernedBacktestRepository,
-    GovernedBacktestRepositoryLimits, MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES,
-    ProductionBacktestAuthority, ProductionGovernedBacktestInputAuthority,
-    ProductionGovernedBacktestInputAuthorityError, ProductionGovernedBacktestRepository,
-    ProductionGovernedBacktestRepositoryError, ResolvedGovernedBacktestInput,
+    GovernedBacktestPreparationAuthority, GovernedBacktestPrepublishAuthority,
+    GovernedBacktestQueryLimitsInput, GovernedBacktestRecommendationEvidence,
+    GovernedBacktestRecord, GovernedBacktestReportReference, GovernedBacktestRepository,
+    GovernedBacktestRepositoryLimits, GovernedBacktestSuccessfulTerminalEvidence,
+    MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES, ProductionBacktestAuthority,
+    ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
+    ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
+    ResolvedGovernedBacktestInput,
 };
 pub use catalog::{
     AnalysisCatalog, AnalysisCatalogError, AnalysisDataset, AnalysisDatasetScope,
-    FactorAnalysisInput, FeatureDatasetRegistration, ReturnAnalysisInput, ScenarioAnalysisInput,
-    ValuationAnalysisInput,
+    FactorAnalysisInput, ReturnAnalysisInput, ScenarioAnalysisInput, ValuationAnalysisInput,
 };
 
-use catalog::FeatureDatasetRegistration as FeatureDataset;
-use serialization::{
-    feature_dataset_value, feature_metadata_value, manifest_value, published_feature_dataset_value,
-};
+use serialization::{feature_metadata_value, manifest_value, published_feature_dataset_value};
 
 const GET_RETURNS: &str = "Analysis.GetReturns";
 const GET_FACTORS: &str = "Analysis.GetFactors";
@@ -276,28 +285,6 @@ impl AnalysisDomainService {
         }
         let continuation = after_dataset.is_some();
         let limits = admitted_result_limits(request, context)?;
-        let mut selected = self
-            .catalog
-            .feature_datasets()
-            .iter()
-            .filter(|dataset| {
-                let dataset_id = dataset.dataset().manifest().dataset_id();
-                requested_dataset
-                    .as_ref()
-                    .is_none_or(|requested| dataset_id == requested)
-                    && after_dataset
-                        .as_ref()
-                        .is_none_or(|after| dataset_id.as_str() > after.as_str())
-                    && scope.matches(dataset.scope())
-            })
-            .collect::<Vec<_>>();
-        selected.sort_unstable_by(|left, right| {
-            left.dataset()
-                .manifest()
-                .dataset_id()
-                .as_str()
-                .cmp(right.dataset().manifest().dataset_id().as_str())
-        });
         let context_available = if continuation {
             0
         } else {
@@ -311,37 +298,14 @@ impl AnalysisDomainService {
                 .saturating_sub(context_available)
                 .clamp(1, 64)
         };
-        let mut legacy_candidates = Vec::new();
-        legacy_candidates
-            .try_reserve_exact(selected.len())
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        legacy_candidates.extend(
-            selected
-                .iter()
-                .map(|dataset| dataset.dataset().manifest().dataset_id().clone()),
-        );
-        let (published, published_available, overlapping_legacy) = self
-            .published_feature_dataset_snapshot(
-                requested_dataset.as_ref(),
-                after_dataset.as_ref(),
-                &scope,
-                &legacy_candidates,
-                dataset_limit,
-                context,
-            )?;
-        selected.retain(|dataset| {
-            overlapping_legacy
-                .binary_search_by(|overlap| {
-                    overlap
-                        .as_str()
-                        .cmp(dataset.dataset().manifest().dataset_id().as_str())
-                })
-                .is_err()
-        });
-        let logical_available = selected
-            .len()
-            .checked_add(published_available)
-            .ok_or(ServiceError::ResourceExhausted)?;
+        let (published, published_available) = self.published_feature_dataset_snapshot(
+            requested_dataset.as_ref(),
+            after_dataset.as_ref(),
+            &scope,
+            dataset_limit,
+            context,
+        )?;
+        let logical_available = published_available;
         if requested_dataset.is_some() && logical_available == 0 {
             return Err(ServiceError::NotFound);
         }
@@ -366,30 +330,16 @@ impl AnalysisDomainService {
         if continuation && logical_available == 0 {
             return empty_feature_page_result(limits);
         }
-        let candidate_capacity = selected
-            .len()
-            .checked_add(published.len())
-            .ok_or(ServiceError::ResourceExhausted)?;
-        let mut candidates = Vec::new();
-        candidates
-            .try_reserve_exact(candidate_capacity)
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        candidates.extend(selected.into_iter().map(FeatureDatasetCandidate::Legacy));
-        candidates.extend(published.iter().map(FeatureDatasetCandidate::Durable));
-        candidates.sort_unstable_by(|left, right| {
-            left.dataset_id().as_str().cmp(right.dataset_id().as_str())
-        });
-        candidates.truncate(dataset_limit);
-        if candidates.is_empty() != (logical_available == 0) {
+        if published.is_empty() != (logical_available == 0) {
             return Err(ServiceError::InvalidResult);
         }
-        let dataset_items = candidates
+        let dataset_items = published
             .iter()
-            .map(FeatureDatasetCandidate::value)
+            .map(published_feature_dataset_value)
             .collect::<Vec<_>>();
-        let dataset_cursors = candidates
+        let dataset_cursors = published
             .iter()
-            .map(|dataset| dataset.dataset_id().as_str())
+            .map(|dataset| dataset.generation().manifest().dataset_id().as_str())
             .collect::<Vec<_>>();
         let minimum_datasets = usize::from(logical_available > 0);
         bounded_feature_page_result(
@@ -400,7 +350,7 @@ impl AnalysisDomainService {
             logical_available,
             limits,
             |dataset_count, returned| {
-                combined_feature_metadata(&candidates[..dataset_count], returned, available)
+                published_feature_metadata(&published[..dataset_count], returned, available)
             },
         )
     }
@@ -410,12 +360,11 @@ impl AnalysisDomainService {
         requested_dataset: Option<&DatasetId>,
         after_dataset: Option<&DatasetId>,
         scope: &ReadScope,
-        legacy_candidates: &[DatasetId],
         limit: usize,
         context: &RequestContext,
-    ) -> Result<(Vec<AnalyticalFeatureDataset>, usize, Vec<DatasetId>), ServiceError> {
+    ) -> Result<(Vec<AnalyticalFeatureDataset>, usize), ServiceError> {
         let Some(reader) = self.feature_reader.as_ref().filter(|_| !scope.has_filter()) else {
-            return Ok((Vec::new(), 0, Vec::new()));
+            return Ok((Vec::new(), 0));
         };
         let limit = AnalyticalReadLimit::try_new(limit).map_err(map_feature_read_error)?;
         let selection = requested_dataset.map_or(
@@ -426,18 +375,15 @@ impl AnalysisDomainService {
         );
         let page = reader
             .feature_dataset_snapshot(
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                 selection,
-                legacy_candidates,
+                &[],
                 limit,
                 context.deadline(),
                 context.cancellation(),
             )
             .map_err(map_feature_read_error)?;
-        Ok((
-            page.datasets().to_vec(),
-            page.available(),
-            page.overlapping_legacy_dataset_ids().to_vec(),
-        ))
+        Ok((page.datasets().to_vec(), page.available()))
     }
 
     async fn get_backtest(
@@ -500,13 +446,43 @@ impl AnalysisDomainService {
         request: &TypedToolRequest,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
-        let artifacts = self.artifacts.as_ref().ok_or(ServiceError::Unavailable)?;
         let artifact_id = required_string(request, "artifactId")?;
         let sha256 = required_string(request, "sha256")?;
         let media_type = required_string(request, "mediaType")?;
         let byte_count = required_usize(request, "byteCount")?;
         let offset = required_usize(request, "offset")?;
         let maximum_bytes = required_usize(request, "maximumBytes")?;
+        if artifact_id.starts_with("backtest-report-") {
+            let report = GovernedBacktestReportReference::try_new(
+                artifact_id,
+                sha256,
+                u64::try_from(byte_count).map_err(|_| ServiceError::InvalidRequest)?,
+                media_type,
+            )?;
+            let content = self
+                .backtests
+                .read_report(
+                    report.clone(),
+                    context.cancellation().clone(),
+                    context.deadline(),
+                )
+                .await?;
+            ensure_request_live(context, &self.lifecycle)?;
+            return bounded_artifact_read_result(
+                BoundedArtifactRead {
+                    artifact_id: report.artifact_id(),
+                    sha256,
+                    byte_count,
+                    media_type: report.media_type(),
+                    content: &content,
+                    offset,
+                    maximum_bytes,
+                },
+                request,
+                context,
+            );
+        }
+        let artifacts = self.artifacts.as_ref().ok_or(ServiceError::Unavailable)?;
         let complete_limit = NonZeroUsize::new(byte_count).ok_or(ServiceError::InvalidRequest)?;
         let reference = ArtifactReference::try_new(
             artifact_id.to_owned(),
@@ -524,44 +500,20 @@ impl AnalysisDomainService {
             .await
             .map_err(map_artifact_error)?;
         ensure_request_live(context, &self.lifecycle)?;
-        if offset > read.content().len() {
-            return Err(ServiceError::InvalidRequest);
-        }
-        let end = offset
-            .checked_add(maximum_bytes)
-            .map(|end| end.min(read.content().len()))
-            .ok_or(ServiceError::InvalidRequest)?;
-        let content_base64 = BASE64_STANDARD.encode(&read.content()[offset..end]);
         let reference = read.reference();
-        TypedToolResult::try_new(
-            json!({
-                "artifact": {
-                    "artifactId": reference.id(),
-                    "sha256": reference.sha256(),
-                    "byteCount": reference.byte_count(),
-                    "mediaType": reference.media_type(),
-                },
-                "offset": offset,
-                "returnedBytes": end - offset,
-                "contentBase64": content_base64,
-                "nextOffset": end,
-                "complete": end == read.content().len(),
-            }),
-            1,
-            ToolResultMetadata::complete_not_applicable(),
-            admitted_result_limits(request, context)?,
+        bounded_artifact_read_result(
+            BoundedArtifactRead {
+                artifact_id: reference.id(),
+                sha256: reference.sha256(),
+                byte_count: reference.byte_count(),
+                media_type: reference.media_type(),
+                content: read.content(),
+                offset,
+                maximum_bytes,
+            },
+            request,
+            context,
         )
-        .map_err(|error| match error {
-            ServiceContractError::TooManyItems
-            | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
-                ServiceError::ResourceExhausted
-            }
-            ServiceContractError::ZeroItemsForNonNullResult
-            | ServiceContractError::InvalidMetadata
-            | ServiceContractError::InvalidCompleteness
-            | ServiceContractError::SourceEvidencePolicy
-            | ServiceContractError::Json(_) => ServiceError::InvalidResult,
-        })
     }
 
     fn selected_dataset(
@@ -783,7 +735,7 @@ fn source_result(
     let metadata = dataset_metadata(scope, returned, available)?;
     TypedToolResult::try_new(
         content,
-        returned.max(1),
+        returned,
         metadata,
         admitted_result_limits(request, context)?,
     )
@@ -813,61 +765,22 @@ fn dataset_metadata(
     }
 }
 
-enum FeatureDatasetCandidate<'a> {
-    Legacy(&'a FeatureDataset),
-    Durable(&'a AnalyticalFeatureDataset),
-}
-
-impl FeatureDatasetCandidate<'_> {
-    fn dataset_id(&self) -> &DatasetId {
-        match self {
-            Self::Legacy(dataset) => dataset.dataset().manifest().dataset_id(),
-            Self::Durable(dataset) => dataset.generation().manifest().dataset_id(),
-        }
-    }
-
-    fn value(&self) -> Value {
-        match self {
-            Self::Legacy(dataset) => feature_dataset_value(dataset.dataset()),
-            Self::Durable(dataset) => published_feature_dataset_value(dataset),
-        }
-    }
-}
-
-fn combined_feature_metadata(
-    datasets: &[FeatureDatasetCandidate<'_>],
+fn published_feature_metadata(
+    datasets: &[AnalyticalFeatureDataset],
     returned: usize,
     available: usize,
 ) -> Result<ToolResultMetadata, FeaturePageCandidateError> {
     let mut sources = Vec::new();
-    let mut qualities = Vec::new();
     let mut source_set = HashSet::new();
-    let mut quality_set = HashSet::new();
     for dataset in datasets {
-        match dataset {
-            FeatureDatasetCandidate::Legacy(dataset) => {
-                for source in dataset.scope().sources() {
-                    if source_set.insert(source.clone()) {
-                        sources.push(source.clone());
-                    }
-                }
-                for quality in dataset.scope().qualities() {
-                    if quality_set.insert(*quality) {
-                        qualities.push(*quality);
-                    }
-                }
-            }
-            FeatureDatasetCandidate::Durable(dataset) => {
-                for source in dataset.source_ids() {
-                    if source_set.insert(source.clone()) {
-                        sources.push(source.clone());
-                    }
-                }
+        for source in dataset.source_ids() {
+            if source_set.insert(source.clone()) {
+                sources.push(source.clone());
             }
         }
     }
     sources.sort_unstable();
-    feature_page_metadata(sources, qualities, datasets.len(), returned, available)
+    feature_page_metadata(sources, Vec::new(), datasets.len(), returned, available)
 }
 
 fn empty_feature_page_result(limits: ServiceLimits) -> Result<TypedToolResult, ServiceError> {
@@ -883,8 +796,7 @@ fn empty_feature_page_result(limits: ServiceLimits) -> Result<TypedToolResult, S
         | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
             ServiceError::ResourceExhausted
         }
-        ServiceContractError::ZeroItemsForNonNullResult
-        | ServiceContractError::InvalidMetadata
+        ServiceContractError::InvalidMetadata
         | ServiceContractError::InvalidCompleteness
         | ServiceContractError::SourceEvidencePolicy
         | ServiceContractError::Json(_) => ServiceError::InvalidResult,
@@ -924,8 +836,7 @@ fn feature_page_metadata(
     };
     metadata.map_err(|error| match error {
         ServiceContractError::InvalidMetadata => FeaturePageCandidateError::DoesNotFit,
-        ServiceContractError::ZeroItemsForNonNullResult
-        | ServiceContractError::TooManyItems
+        ServiceContractError::TooManyItems
         | ServiceContractError::InvalidCompleteness
         | ServiceContractError::SourceEvidencePolicy
         | ServiceContractError::Json(_) => FeaturePageCandidateError::Invariant,
@@ -992,7 +903,7 @@ where
                 "hasMore": actual_has_more,
                 "nextAfterDataset": next_after_dataset
             }),
-            returned.max(1),
+            returned,
             metadata,
             limits,
         ) {
@@ -1002,8 +913,7 @@ where
                 | ServiceContractError::Json(JsonContractError::EncodingOrBytes),
             ) => {}
             Err(
-                ServiceContractError::ZeroItemsForNonNullResult
-                | ServiceContractError::InvalidMetadata
+                ServiceContractError::InvalidMetadata
                 | ServiceContractError::InvalidCompleteness
                 | ServiceContractError::SourceEvidencePolicy
                 | ServiceContractError::Json(_),
@@ -1018,7 +928,24 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
         AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
+        | AnalyticalReadError::UniverseMembershipReadMustBeExhaustive
+        | AnalyticalReadError::InvalidMarketBarLimit
+        | AnalyticalReadError::InvalidMarketBarEffectiveRange
+        | AnalyticalReadError::InvalidFundNavLimit
+        | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidMacroSeriesAllowlist
+        | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
+        | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,
+        AnalyticalReadError::MarketBarResultRequiresInline
+        | AnalyticalReadError::InvalidMarketBarResult
+        | AnalyticalReadError::FundNavResultRequiresInline
+        | AnalyticalReadError::InvalidFundNavResult
+        | AnalyticalReadError::MacroSnapshotResultRequiresInline
+        | AnalyticalReadError::MacroSnapshotCandidateSetSaturated
+        | AnalyticalReadError::MacroSnapshotRevisionConflict
+        | AnalyticalReadError::MacroSnapshotIncomplete
+        | AnalyticalReadError::InvalidMacroSnapshotResult => ServiceError::InvalidResult,
         AnalyticalReadError::Manifest(ManifestCatalogError::Cancelled)
         | AnalyticalReadError::Query(QueryError::Cancelled) => ServiceError::Cancelled,
         AnalyticalReadError::Manifest(ManifestCatalogError::DeadlineExceeded)
@@ -1044,9 +971,11 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
             | QueryError::ArtifactStoreRequired
             | QueryError::ArtifactAuthorityRequired,
         ) => ServiceError::ResourceExhausted,
-        AnalyticalReadError::Manifest(_) | AnalyticalReadError::Query(_) => {
-            ServiceError::Unavailable
-        }
+        AnalyticalReadError::ForecastDatasetUnavailable => ServiceError::NotFound,
+        AnalyticalReadError::Manifest(_)
+        | AnalyticalReadError::Parquet(_)
+        | AnalyticalReadError::PythonDataset(_)
+        | AnalyticalReadError::Query(_) => ServiceError::Unavailable,
     }
 }
 
@@ -1081,6 +1010,59 @@ const fn map_artifact_error(error: ArtifactError) -> ServiceError {
         ArtifactError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         ArtifactError::InvalidPublication => ServiceError::Internal,
     }
+}
+
+struct BoundedArtifactRead<'a> {
+    artifact_id: &'a str,
+    sha256: &'a str,
+    byte_count: usize,
+    media_type: &'a str,
+    content: &'a [u8],
+    offset: usize,
+    maximum_bytes: usize,
+}
+
+fn bounded_artifact_read_result(
+    read: BoundedArtifactRead<'_>,
+    request: &TypedToolRequest,
+    context: &RequestContext,
+) -> Result<TypedToolResult, ServiceError> {
+    if read.content.len() != read.byte_count || read.offset > read.content.len() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let end = read
+        .offset
+        .checked_add(read.maximum_bytes)
+        .map(|end| end.min(read.content.len()))
+        .ok_or(ServiceError::InvalidRequest)?;
+    TypedToolResult::try_new(
+        json!({
+            "artifact": {
+                "artifactId": read.artifact_id,
+                "sha256": read.sha256,
+                "byteCount": read.byte_count,
+                "mediaType": read.media_type,
+            },
+            "offset": read.offset,
+            "returnedBytes": end - read.offset,
+            "contentBase64": BASE64_STANDARD.encode(&read.content[read.offset..end]),
+            "nextOffset": end,
+            "complete": end == read.content.len(),
+        }),
+        1,
+        ToolResultMetadata::complete_not_applicable(),
+        admitted_result_limits(request, context)?,
+    )
+    .map_err(|error| match error {
+        ServiceContractError::TooManyItems
+        | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
+            ServiceError::ResourceExhausted
+        }
+        ServiceContractError::InvalidMetadata
+        | ServiceContractError::InvalidCompleteness
+        | ServiceContractError::SourceEvidencePolicy
+        | ServiceContractError::Json(_) => ServiceError::InvalidResult,
+    })
 }
 
 fn not_applicable_result(

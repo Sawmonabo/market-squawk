@@ -23,7 +23,7 @@ DEFAULT_MAX_ROWS = 100_000
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 MAX_PARQUET_ROW_GROUPS = 4_096
 SCHEMA_NAME = "market_squawk.feature_label_components"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DECODED_BYTES_PER_ROW = 1_024
 DECODED_ROW_GROUP_OVERHEAD = 64 * 1_024
 SELECTED_ROW_RETAINED_BYTES = 4_096
@@ -115,12 +115,42 @@ class DatasetIdentity:
 
 
 @dataclass(frozen=True, order=True)
+class LabelMeasurement:
+    """Closed measurement transported from verified Task 11 label rows."""
+
+    kind: str
+    currency: str | None = None
+
+    def mapping(self) -> Mapping[str, Any]:
+        value: dict[str, Any] = {"kind": self.kind}
+        if self.kind == "price":
+            value["currency"] = self.currency
+        return MappingProxyType(value)
+
+
+@dataclass(frozen=True, order=True)
+class LabelTarget:
+    """Closed target coordinate derived from exact effective-time dataset rows."""
+
+    kind: str
+    horizon_nanos: int | None = None
+
+    def mapping(self) -> Mapping[str, Any]:
+        value: dict[str, Any] = {"kind": self.kind}
+        if self.kind == "fixed_horizon_terminal":
+            value["horizon_nanos"] = self.horizon_nanos
+        return MappingProxyType(value)
+
+
+@dataclass(frozen=True)
 class ComponentIdentity:
     corporate_action_sensitivity: str
     kind: str
     name: str
     scope: str
     version: int
+    measurement: LabelMeasurement | None = None
+    target: LabelTarget = LabelTarget("not_applicable")
 
     def mapping(self) -> Mapping[str, Any]:
         return MappingProxyType(
@@ -223,7 +253,11 @@ def _export(raw: bytes) -> dict[str, Any]:
         "split_counts",
         "split_policy",
     }
-    if not isinstance(value, dict) or set(value) != top or value["schema_version"] != 2:
+    if (
+        not isinstance(value, dict)
+        or set(value) != top
+        or value["schema_version"] != 4
+    ):
         raise DatasetIntegrityError("Task 11 export version or shape is unsupported")
     dataset = value["dataset"]
     dataset_keys = {
@@ -272,7 +306,15 @@ def _export(raw: bytes) -> dict[str, Any]:
 
 
 def _validate_components(values: Any) -> None:
-    keys = {"corporate_action_sensitivity", "kind", "name", "scope", "version"}
+    keys = {
+        "corporate_action_sensitivity",
+        "kind",
+        "measurement",
+        "name",
+        "scope",
+        "target",
+        "version",
+    }
     if not isinstance(values, list) or not 1 < len(values) <= MAX_COMPONENTS:
         raise DatasetIntegrityError("Task 11 component contract count is invalid")
     identities: set[tuple[str, str, int]] = set()
@@ -344,12 +386,12 @@ def _validate_schema(schema: pa.Schema, dataset: Mapping[str, Any]) -> None:
         raise DatasetIntegrityError("dataset Arrow field schema is unsupported")
     expected_metadata = {
         b"market_squawk.build_sha256": dataset["build_spec_sha256"].encode(),
-        b"market_squawk.component_layout": b"fixed-width-long-form-v2",
+        b"market_squawk.component_layout": b"fixed-width-long-form-v3",
         b"market_squawk.dataset": dataset["dataset_id"].encode(),
         b"market_squawk.policy_sha256": dataset["policy_sha256"].encode(),
         b"market_squawk.schema": SCHEMA_NAME.encode(),
         b"market_squawk.schema_fingerprint_sha256": dataset["schema_sha256"].encode(),
-        b"market_squawk.schema_version": b"2",
+        b"market_squawk.schema_version": b"3",
         b"market_squawk.timestamp_timezone": b"UTC",
         b"market_squawk.universe_sha256": dataset["universe_sha256"].encode(),
     }
@@ -362,6 +404,9 @@ def _fixed_schema_shape(schema: pa.Schema) -> bool:
         ("example_id", pa.binary(256), False),
         ("instrument_id", pa.binary(16), False),
         ("cutoff_at", pa.timestamp("ns", tz="+00:00"), False),
+        ("observed_effective_at", pa.timestamp("ns", tz="+00:00"), True),
+        ("label_effective_at", pa.timestamp("ns", tz="+00:00"), True),
+        ("target_coordinate_kind", pa.uint8(), False),
         ("split", pa.uint8(), False),
         ("component_kind", pa.uint8(), False),
         ("component_name", pa.binary(256), False),
@@ -397,15 +442,30 @@ class _RowValidator:
             (item.kind, item.name, item.version) for item in components
         )
         self._previous: tuple[int, str, str] | None = None
-        self._current: tuple[int, str, str] | None = None
+        self._current: tuple[int, str, str, int, int | None, int | None] | None = None
         self._components: list[tuple[str, str, int]] = []
         self._counts = {"train": 0, "validation": 0, "test": 0}
+        self._expected_measurements = {
+            (item.kind, item.name, item.version): item.measurement
+            for item in components
+            if item.kind == "label"
+        }
+        self._observed_measurements: dict[
+            tuple[str, str, int], LabelMeasurement
+        ] = {}
+        self._expected_targets = {
+            (item.kind, item.name, item.version): item.target
+            for item in components
+            if item.kind == "label"
+        }
+        self._observed_horizons: dict[tuple[str, str, int], int] = {}
 
     def validate_table(self, table: pa.Table) -> None:
         required = (
             "example_id",
             "instrument_id",
             "cutoff_at",
+            "target_coordinate_kind",
             "split",
             "component_kind",
             "component_name",
@@ -417,7 +477,29 @@ class _RowValidator:
 
     def consume(self, row: Mapping[str, Any]) -> None:
         cutoff = row["cutoff_at"].unix_nanos
-        key = (cutoff, row["instrument_id"], row["example_id"])
+        observed_effective = row["observed_effective_at"]
+        label_effective = row["label_effective_at"]
+        target_kind = row["target_coordinate_kind"]
+        if target_kind == 1:
+            if (
+                not isinstance(observed_effective, UtcNanoseconds)
+                or not isinstance(label_effective, UtcNanoseconds)
+                or label_effective.unix_nanos <= observed_effective.unix_nanos
+            ):
+                raise DatasetIntegrityError("dataset exact terminal coordinates are invalid")
+            candidate_horizon = label_effective.unix_nanos - observed_effective.unix_nanos
+        elif target_kind == 2 and observed_effective is None and label_effective is None:
+            candidate_horizon = 0
+        else:
+            raise DatasetIntegrityError("dataset target coordinate tag is invalid")
+        key = (
+            cutoff,
+            row["instrument_id"],
+            row["example_id"],
+            target_kind,
+            None if observed_effective is None else observed_effective.unix_nanos,
+            None if label_effective is None else label_effective.unix_nanos,
+        )
         _canonical_uuid(row["instrument_id"])
         if not _identifier(row["example_id"]):
             raise DatasetIntegrityError("dataset example identity is invalid")
@@ -436,6 +518,28 @@ class _RowValidator:
             self._current = key
         self._components.append(component)
         _validate_value(row)
+        if row["component_kind"] == "label" and row["missing_reason"] is None:
+            measurement = _measurement_from_row(row)
+            if measurement.kind == "price" and not (
+                (row["value_f64"] is not None and row["value_f64"] > 0.0)
+                or (
+                    row["value_decimal_mantissa"] is not None
+                    and row["value_decimal_mantissa"] > 0
+                )
+            ):
+                raise DatasetIntegrityError("dataset price label must be positive")
+            retained = self._observed_measurements.get(component)
+            if retained is not None and retained != measurement:
+                raise DatasetIntegrityError(
+                    "dataset label rows carry conflicting measurements"
+                )
+            self._observed_measurements[component] = measurement
+            retained_horizon = self._observed_horizons.get(component)
+            self._observed_horizons[component] = (
+                candidate_horizon
+                if retained_horizon is None or retained_horizon == candidate_horizon
+                else 0
+            )
 
     def finish(self) -> None:
         if self._current is None:
@@ -447,18 +551,34 @@ class _RowValidator:
             "test": self._expected_counts.test,
         }:
             raise DatasetIntegrityError("dataset split counts differ from Task 11 export")
+        if any(
+            self._observed_measurements.get(identity) != measurement
+            for identity, measurement in self._expected_measurements.items()
+        ):
+            raise DatasetIntegrityError(
+                "dataset label measurement differs from Task 11 export"
+            )
+        if any(
+            self._observed_horizons.get(identity)
+            != (target.horizon_nanos if target.kind == "fixed_horizon_terminal" else 0)
+            for identity, target in self._expected_targets.items()
+            if self._expected_measurements.get(identity) is not None
+        ):
+            raise DatasetIntegrityError(
+                "dataset terminal horizon differs from Task 11 export"
+            )
 
     def _close_current(self) -> None:
         if self._current is None:
             raise DatasetIntegrityError("dataset example state is invalid")
         _close_example(
             self._previous,
-            self._current,
+            self._current[:3],
             self._components,
             self._expected_components,
         )
         self._counts[row_for_split(self._policy, self._current[0])] += 1
-        self._previous = self._current
+        self._previous = self._current[:3]
         self._components = []
 
 
@@ -490,8 +610,28 @@ def _validate_value(row: Mapping[str, Any]) -> None:
         or not isinstance(row["component_version"], int)
         or row["component_version"] <= 0
         or (row["missing_reason"] is not None and not _identifier(row["missing_reason"]))
+        or not _valid_unit(row["unit"])
+        or not _valid_currency(row["currency"])
+        or (
+            row["missing_reason"] is not None
+            and (row["unit"] is not None or row["currency"] is not None)
+        )
     ):
         raise DatasetIntegrityError("dataset component value is invalid")
+
+
+def _measurement_from_row(row: Mapping[str, Any]) -> LabelMeasurement:
+    unit = row["unit"]
+    currency = row["currency"]
+    if currency is not None:
+        if unit is not None:
+            raise DatasetIntegrityError("monetary label measurement is ambiguous")
+        return LabelMeasurement("price", currency)
+    if unit == "market-squawk.return":
+        return LabelMeasurement("return")
+    if unit == "market-squawk.probability":
+        return LabelMeasurement("probability")
+    return LabelMeasurement("other_regression")
 
 
 def row_for_split(policy: SplitPolicy, cutoff: int) -> str:
@@ -513,12 +653,72 @@ def _component(value: Mapping[str, Any]) -> ComponentIdentity:
         or value["version"] <= 0
     ):
         raise DatasetIntegrityError("Task 11 component contract is invalid")
+    measurement = None
+    target = _target(value["kind"], value["target"])
+    if value["kind"] == "feature" and value["measurement"] is not None:
+        raise DatasetIntegrityError("feature component cannot declare an output measurement")
+    if value["kind"] == "label" and value["measurement"] is not None:
+        measurement = _measurement(value["measurement"])
     return ComponentIdentity(
         corporate_action_sensitivity=value["corporate_action_sensitivity"],
         kind=value["kind"],
         name=value["name"],
         scope=value["scope"],
         version=value["version"],
+        measurement=measurement,
+        target=target,
+    )
+
+
+def _measurement(value: Any) -> LabelMeasurement:
+    if not isinstance(value, dict) or "kind" not in value:
+        raise DatasetIntegrityError("Task 11 label measurement is invalid")
+    kind = value["kind"]
+    if kind == "price":
+        if (
+            set(value) != {"kind", "currency"}
+            or not isinstance(value["currency"], str)
+            or not _valid_currency(value["currency"])
+        ):
+            raise DatasetIntegrityError("Task 11 price measurement is invalid")
+        return LabelMeasurement(kind, value["currency"])
+    if kind not in {"return", "probability", "other_regression"} or set(value) != {"kind"}:
+        raise DatasetIntegrityError("Task 11 label measurement is invalid")
+    return LabelMeasurement(kind)
+
+
+def _target(component_kind: str, value: Any) -> LabelTarget:
+    if not isinstance(value, dict) or "kind" not in value:
+        raise DatasetIntegrityError("Task 11 target contract is invalid")
+    kind = value["kind"]
+    if component_kind == "feature":
+        if value != {"kind": "not_applicable"}:
+            raise DatasetIntegrityError("feature component target must be not applicable")
+        return LabelTarget("not_applicable")
+    if kind == "unsupported" and value == {"kind": "unsupported"}:
+        return LabelTarget("unsupported")
+    if kind == "fixed_horizon_terminal" and set(value) == {"kind", "horizon_nanos"}:
+        horizon = value["horizon_nanos"]
+        if type(horizon) is int and 0 < horizon < 2**64:
+            return LabelTarget(kind, horizon)
+    raise DatasetIntegrityError("Task 11 label target contract is invalid")
+
+
+def _valid_unit(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, str)
+        and 0 < len(value.encode()) <= 32
+        and all(character.isalnum() or character in "-_./%" for character in value)
+    )
+
+
+def _valid_currency(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, str)
+        and len(value) == 3
+        and value.isascii()
+        and value.isalpha()
+        and value.isupper()
     )
 
 

@@ -1,4 +1,4 @@
-//! Versioned deterministic hierarchy classification.
+//! Deterministic current hierarchy classification.
 
 use std::mem::size_of;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ pub enum Predicate {
 }
 
 impl Predicate {
-    /// Canonical predicate order committed by ruleset v1.
+    /// Canonical predicate order committed by the current ruleset.
     pub const ALL: [Self; 15] = [
         Self::SignificantInput,
         Self::SubjectInstrumentMatches,
@@ -146,8 +146,6 @@ pub enum DecisionReasonCode {
     UnobservableSignificantInput,
     /// A separately governed override selected the hierarchy.
     OverrideApplied,
-    /// Legacy analytical evidence has no actor-attributed input-use assessment.
-    InputUseAssessmentMissing,
 }
 
 /// One reason tied to an input when applicable.
@@ -186,7 +184,6 @@ pub enum DecisionBasis {
 /// Code-owned converged ASC 820/IFRS 13 classification rules.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassificationRuleset {
-    version: u32,
     max_quote_age_nanos: u64,
     market_activity_policy: crate::MarketActivityPolicy,
     hash: RulesetHash,
@@ -199,25 +196,13 @@ impl ClassificationRuleset {
     ///
     /// Rejects zero or values above signed timestamp arithmetic range.
     pub fn current(max_quote_age_nanos: u64) -> Result<Self, FairValueError> {
-        Self::versioned(CURRENT_RULESET_VERSION, max_quote_age_nanos)
-    }
-
-    pub(crate) fn versioned(
-        version: u32,
-        max_quote_age_nanos: u64,
-    ) -> Result<Self, FairValueError> {
         if max_quote_age_nanos == 0 || max_quote_age_nanos > i64::MAX as u64 {
             return Err(FairValueError::InvalidRuleset);
         }
-        let domain = match version {
-            1 => b"market-squawk/asc820-ifrs13-ruleset/v1".as_slice(),
-            2 => b"market-squawk/asc820-ifrs13-ruleset/v2".as_slice(),
-            _ => return Err(FairValueError::InvalidRuleset),
-        };
         let market_activity_policy =
             crate::MarketActivityPolicy::try_new(10, 1_000, 4_096, 300_000_000_000)?;
-        let mut hash = CanonicalHasher::new(domain);
-        hash.u32(version);
+        let mut hash = CanonicalHasher::new(b"market-squawk/asc820-ifrs13-ruleset/v2");
+        hash.u32(CURRENT_RULESET_VERSION);
         hash.u64(max_quote_age_nanos);
         hash.fixed(market_activity_policy.hash().bytes());
         for predicate in Predicate::ALL {
@@ -227,7 +212,6 @@ impl ClassificationRuleset {
         hash.u8(1); // DirectVerified is admissible evidence.
         hash.u8(2); // DirectUnverified may be independently verified for fair-value use.
         Ok(Self {
-            version,
             max_quote_age_nanos,
             market_activity_policy,
             hash: RulesetHash(hash.finish()),
@@ -236,7 +220,7 @@ impl ClassificationRuleset {
 
     /// Returns code-owned semantic version.
     pub const fn version(&self) -> u32 {
-        self.version
+        CURRENT_RULESET_VERSION
     }
 
     /// Returns exact semantic and parameter identity.
@@ -304,14 +288,7 @@ impl ClassificationRuleset {
                 }),
                 _ => {}
             }
-            if self.version > 1 && input.is_legacy_unassessed_analytics() {
-                reasons.push(DecisionReason {
-                    input_id: Some(input.id()),
-                    code: DecisionReasonCode::InputUseAssessmentMissing,
-                });
-            }
-
-            let input_hierarchy = input_hierarchy(self.version, input, &results);
+            let input_hierarchy = input_hierarchy(input, &results);
             if input_hierarchy == FairValueHierarchy::Level3 {
                 reasons.push(DecisionReason {
                     input_id: Some(input.id()),
@@ -331,7 +308,7 @@ impl ClassificationRuleset {
         ClassificationDecision::new(ClassificationDecisionSpec {
             measurement_id: measurement.id(),
             evidence_hash: measurement.evidence_hash(),
-            ruleset_version: self.version,
+            ruleset_version: self.version(),
             ruleset_hash: self.hash,
             hierarchy,
             basis: DecisionBasis::Rules,
@@ -526,13 +503,9 @@ fn evaluate_input(
         input.market_access() == MarketAccess::Accessible,
         relevant,
         fresh,
-        if ruleset.version() == 1 {
-            input.evidence().verification() == crate::EvidenceVerification::Verified
-        } else {
-            input
-                .evidence()
-                .producer_verification_is_current_at(measurement.measurement_at())
-        },
+        input
+            .evidence()
+            .producer_verification_is_current_at(measurement.measurement_at()),
         input.evidence().origin().is_market() && input.evidence().origin().venue_id().is_some(),
         input.amount().money().currency() == measurement.amount().money().currency(),
         input.amount().scale() == measurement.amount().scale(),
@@ -547,7 +520,6 @@ fn evaluate_input(
 }
 
 fn input_hierarchy(
-    ruleset_version: u32,
     input: &ValuationInput,
     results: &[PredicateResult; Predicate::ALL.len()],
 ) -> FairValueHierarchy {
@@ -559,14 +531,12 @@ fn input_hierarchy(
     };
     let usable = pass(Predicate::SubjectInstrumentMatches)
         && pass(Predicate::MeasurementDateRelevant)
-        && (ruleset_version == 1
-            || (pass(Predicate::WithinFreshnessLimit) && pass(Predicate::SourceEvidenceVerified)))
+        && pass(Predicate::WithinFreshnessLimit)
+        && pass(Predicate::SourceEvidenceVerified)
         && pass(Predicate::CurrencyMatches)
         && pass(Predicate::ScaleMatches)
         && input.data_quality() != DataQuality::Quarantined
-        && (ruleset_version == 1
-            || (input.data_quality() != DataQuality::Stale
-                && !input.is_legacy_unassessed_analytics()));
+        && input.data_quality() != DataQuality::Stale;
     if !usable {
         FairValueHierarchy::Unclassified
     } else if Predicate::ALL

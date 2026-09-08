@@ -1,3 +1,4 @@
+import { Fragment } from "react"
 import { ChevronsUpDown, LockKeyhole } from "lucide-react"
 import { Link, useLocation } from "react-router-dom"
 
@@ -19,19 +20,21 @@ import {
 } from "@/components/ui/sidebar"
 import {
   type NavigationItem,
-  navigationAdmission,
-  operationsNavigation,
-  workspaceNavigation,
+  navigationSections,
 } from "@/lib/navigation"
-import type { DesktopBootstrap } from "@/lib/schemas"
 
 export function AppSidebar() {
   const location = useLocation()
   const product = useProduct()
+  const navigationDisabled = product.status === "loading"
   const localStatus =
-    product.status === "ready" ? product.bootstrap.storage.label : product.status
+    product.status === "ready"
+      ? "Ready"
+      : product.status === "loading"
+        ? "Starting"
+        : "Unavailable"
   const localStatusColor =
-    product.status === "ready" && product.bootstrap.storage.state === "ready"
+    product.status === "ready"
       ? "bg-[var(--success)]"
       : product.status === "error"
         ? "bg-destructive"
@@ -42,75 +45,55 @@ export function AppSidebar() {
       <SidebarHeader className="px-3 pt-4 pb-3">
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton
-              asChild
-              size="lg"
-              tooltip="Market Squawk workspace"
-              className="h-11 justify-center px-1 py-2 group-data-[collapsible=icon]:justify-center"
-            >
-              <Link to="/overview" aria-label="Market Squawk workspace">
-                <span className="flex min-w-0 items-center leading-none">
-                  <span className="text-[18px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
-                    Market
-                  </span>
-                  <img
-                    src={marketSquawkMarkUrl}
-                    alt=""
-                    aria-hidden="true"
-                    className="ml-0.5 h-[21px] w-auto shrink-0 group-data-[collapsible=icon]:ml-0 group-data-[collapsible=icon]:h-7"
-                  />
-                  <span
-                    className="text-[18px] font-bold tracking-[-0.045em] text-primary group-data-[collapsible=icon]:hidden"
-                    style={{ marginLeft: "-1px" }}
-                  >
-                    quawk
-                  </span>
-                </span>
-              </Link>
-            </SidebarMenuButton>
+            {navigationDisabled ? (
+              <div
+                aria-label="Market Squawk workspace"
+                className="flex h-11 items-center justify-center px-1 py-2"
+              >
+                <Brand />
+              </div>
+            ) : (
+              <SidebarMenuButton
+                asChild
+                size="lg"
+                tooltip="Market Squawk workspace"
+                className="h-11 justify-center px-1 py-2 group-data-[collapsible=icon]:justify-center"
+              >
+                <Link to="/home" aria-label="Market Squawk workspace">
+                  <Brand />
+                </Link>
+              </SidebarMenuButton>
+            )}
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
 
       <SidebarContent>
-        <nav aria-label="Market Squawk">
-          <SidebarGroup>
-            <SidebarGroupLabel>Workspace</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {workspaceNavigation.map((item) => (
-                  <ProductNavigationItem
-                    key={item.path}
-                    item={item}
-                    bootstrap={
-                      product.status === "ready" ? product.bootstrap : null
-                    }
-                    active={location.pathname === item.path}
-                  />
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
-
-          <SidebarSeparator />
-
-          <SidebarGroup>
-            <SidebarGroupLabel>Operations</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {operationsNavigation.map((item) => (
-                  <ProductNavigationItem
-                    key={item.path}
-                    item={item}
-                    bootstrap={
-                      product.status === "ready" ? product.bootstrap : null
-                    }
-                    active={location.pathname === item.path}
-                  />
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
+        <nav
+          aria-label="Market Squawk"
+          aria-disabled={navigationDisabled || undefined}
+        >
+          {navigationDisabled
+            ? null
+            : navigationSections.map((section, index) => (
+                <Fragment key={section.label}>
+                  {index > 0 ? <SidebarSeparator /> : null}
+                  <SidebarGroup>
+                    <SidebarGroupLabel>{section.label}</SidebarGroupLabel>
+                    <SidebarGroupContent>
+                      <SidebarMenu>
+                        {section.items.map((item) => (
+                          <ProductNavigationItem
+                            key={item.path}
+                            item={item}
+                            active={location.pathname === item.path}
+                          />
+                        ))}
+                      </SidebarMenu>
+                    </SidebarGroupContent>
+                  </SidebarGroup>
+                </Fragment>
+              ))}
         </nav>
       </SidebarContent>
 
@@ -145,55 +128,51 @@ export function AppSidebar() {
   )
 }
 
+function Brand() {
+  return (
+    <span className="flex min-w-0 items-center leading-none">
+      <span className="text-[18px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
+        Market
+      </span>
+      <img
+        src={marketSquawkMarkUrl}
+        alt=""
+        aria-hidden="true"
+        className="ml-0.5 h-[21px] w-auto shrink-0 group-data-[collapsible=icon]:ml-0 group-data-[collapsible=icon]:h-7"
+      />
+      <span
+        className="text-[18px] font-bold tracking-[-0.045em] text-primary group-data-[collapsible=icon]:hidden"
+        style={{ marginLeft: "-1px" }}
+      >
+        quawk
+      </span>
+    </span>
+  )
+}
+
 function ProductNavigationItem({
   item,
-  bootstrap,
   active,
 }: {
   item: NavigationItem
-  bootstrap: DesktopBootstrap | null
   active: boolean
 }) {
-  const admission = bootstrap
-    ? navigationAdmission(item, bootstrap)
-    : {
-        admitted: item.path === "/overview",
-        reason:
-          item.path === "/overview"
-            ? null
-            : "Wait for the local application to finish starting.",
-      }
   const className =
     "relative h-9 gap-3 px-2.5 text-[13px] data-[active=true]:before:absolute data-[active=true]:before:inset-y-1 data-[active=true]:before:-left-2 data-[active=true]:before:w-0.5 data-[active=true]:before:rounded-full data-[active=true]:before:bg-primary"
 
   return (
     <SidebarMenuItem>
-      {admission.admitted ? (
-        <SidebarMenuButton
-          asChild
-          isActive={active}
-          tooltip={item.label}
-          className={className}
-        >
-          <Link to={item.path}>
-            <item.icon aria-hidden="true" />
-            <span>{item.label}</span>
-          </Link>
-        </SidebarMenuButton>
-      ) : (
-        <SidebarMenuButton
-          type="button"
-          aria-disabled="true"
-          title={admission.reason ?? undefined}
-          tooltip={`${item.label} — ${admission.reason}`}
-          className={`${className} cursor-not-allowed opacity-55`}
-        >
+      <SidebarMenuButton
+        asChild
+        isActive={active}
+        tooltip={item.label}
+        className={className}
+      >
+        <Link to={item.path}>
           <item.icon aria-hidden="true" />
           <span>{item.label}</span>
-          <LockKeyhole className="ml-auto size-3" aria-hidden="true" />
-          <span className="sr-only">Unavailable: {admission.reason}</span>
-        </SidebarMenuButton>
-      )}
+        </Link>
+      </SidebarMenuButton>
     </SidebarMenuItem>
   )
 }

@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use market_squawk_domain::{InstrumentId, VenueId};
+use market_squawk_domain::{InstrumentId, SourceId, VenueId};
 use market_squawk_live::{
     LiveRouteConfig, QualifiedMarketObservationLease, QualifiedMarketObservationReceiver,
     QualifiedMarketPrice, RouteQualifiedMarketExport, ShardKey,
@@ -95,13 +95,14 @@ impl LiveFairValueObservationBuffer {
         Ok(())
     }
 
-    async fn clear(
+    async fn clear_source(
         &self,
+        source_id: &SourceId,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), LiveFairValueObservationBufferError> {
         let mut state = lock_before(&self.state, deadline, cancellation).await?;
-        state.clear();
+        state.retain(|key, _observation| &key.source_id != source_id);
         Ok(())
     }
 
@@ -120,10 +121,8 @@ impl LiveFairValueObservationBuffer {
         if Instant::now() >= deadline {
             return Err(LiveFairValueObservationBufferError::DeadlineExceeded);
         }
-        let key = ObservationKey {
-            route: ShardKey::new(venue, instrument),
-            kind: ObservationKind::from_selection(selection),
-        };
+        let route = ShardKey::new(venue, instrument);
+        let kind = ObservationKind::from_selection(selection);
         let deadline = tokio::time::Instant::from_std(deadline);
         let mut state = tokio::select! {
             biased;
@@ -135,6 +134,17 @@ impl LiveFairValueObservationBuffer {
             }
             state = self.state.lock() => state,
         };
+        let mut selected = None;
+        for key in state.keys() {
+            if key.route != route || key.kind != kind {
+                continue;
+            }
+            if selected.is_some() {
+                return Err(LiveFairValueObservationBufferError::AmbiguousSource);
+            }
+            selected = Some(key.clone());
+        }
+        let key = selected.ok_or(LiveFairValueObservationBufferError::NotFound)?;
         let observation = state
             .get(&key)
             .ok_or(LiveFairValueObservationBufferError::NotFound)?
@@ -154,6 +164,7 @@ impl LiveFairValueObservationBuffer {
 /// owner aborts any remaining consumer tasks, so a failed application shutdown cannot detach a
 /// receiver while the live sender continues operating.
 pub(super) struct LiveFairValueExportDrains {
+    source_id: SourceId,
     buffer: Arc<LiveFairValueObservationBuffer>,
     expected_close: Arc<AtomicBool>,
     failure: Arc<AtomicU8>,
@@ -168,6 +179,7 @@ impl LiveFairValueExportDrains {
     /// leases that may remain in the shared buffer. Existing observations are cleared before a new
     /// runtime incarnation can publish.
     pub(super) async fn try_start(
+        source_id: SourceId,
         routes: &[LiveRouteConfig],
         maximum_message_bytes: NonZeroU32,
         buffer: Arc<LiveFairValueObservationBuffer>,
@@ -211,7 +223,9 @@ impl LiveFairValueExportDrains {
             receivers.push((route.route().clone(), receiver));
         }
 
-        buffer.clear(deadline, &cancellation).await?;
+        buffer
+            .clear_source(&source_id, deadline, &cancellation)
+            .await?;
         let expected_close = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(AtomicU8::new(NO_DRAIN_FAILURE));
         let mut tasks = Vec::new();
@@ -221,6 +235,7 @@ impl LiveFairValueExportDrains {
         for (route, receiver) in receivers {
             tasks.push(tokio::spawn(drain_route(
                 route,
+                source_id.clone(),
                 receiver,
                 Arc::clone(&buffer),
                 Arc::clone(&expected_close),
@@ -231,6 +246,7 @@ impl LiveFairValueExportDrains {
         Ok((
             exports,
             Self {
+                source_id,
                 buffer,
                 expected_close,
                 failure,
@@ -280,7 +296,9 @@ impl LiveFairValueExportDrains {
                 record_failure(&self.failure, DRAIN_TASK_FAILURE, &self.cancellation);
             }
         }
-        self.buffer.clear(deadline, cancellation).await?;
+        self.buffer
+            .clear_source(&self.source_id, deadline, cancellation)
+            .await?;
         if self.failure.load(Ordering::Acquire) == NO_DRAIN_FAILURE {
             Ok(())
         } else {
@@ -320,6 +338,7 @@ impl std::fmt::Debug for LiveFairValueObservationBuffer {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ObservationKey {
+    source_id: SourceId,
     route: ShardKey,
     kind: ObservationKind,
 }
@@ -328,6 +347,7 @@ impl ObservationKey {
     fn from_lease(lease: &QualifiedMarketObservationLease) -> Self {
         let observation = lease.observation();
         Self {
+            source_id: observation.source_id().clone(),
             route: ShardKey::new(observation.venue_id().clone(), observation.instrument_id()),
             kind: ObservationKind::from_price(observation.price()),
         }
@@ -374,6 +394,7 @@ fn selection_available(price: QualifiedMarketPrice, selection: MarketPriceSelect
 
 async fn drain_route(
     route: ShardKey,
+    source_id: SourceId,
     mut receiver: QualifiedMarketObservationReceiver,
     buffer: Arc<LiveFairValueObservationBuffer>,
     expected_close: Arc<AtomicBool>,
@@ -393,7 +414,8 @@ async fn drain_route(
             return;
         };
         let observation = lease.observation();
-        if observation.venue_id() != route.venue()
+        if observation.source_id() != &source_id
+            || observation.venue_id() != route.venue()
             || observation.instrument_id() != route.instrument()
         {
             record_failure(&failure, DRAIN_ROUTE_MISMATCH, &cancellation);
@@ -470,6 +492,9 @@ pub enum LiveFairValueObservationBufferError {
     /// No compatible current route observation is retained.
     #[error("live fair-value observation was not found")]
     NotFound,
+    /// More than one qualified source currently owns the requested venue/instrument observation.
+    #[error("live fair-value observation source is ambiguous")]
+    AmbiguousSource,
     /// Buffer ownership was cancelled.
     #[error("live fair-value observation operation was cancelled")]
     Cancelled,

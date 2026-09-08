@@ -1,7 +1,9 @@
 //! Registration and message-atomic committed observation processing.
 
 use super::super::admission::{
-    RegistrationCommand, RegistrationFailure, RegistrationGrant, ShardCommand,
+    ActionHookControlFailure, ActionHookInstallCommand, ActionHookRemoveCommand,
+    ActorControlCommand, GenerationRevocationCommand, LiveIngressRevokeError, RegistrationCommand,
+    RegistrationFailure, RegistrationGrant, ShardCommand,
 };
 use super::super::system_timestamp;
 use super::{ActorError, RouteOwner, ShardActor};
@@ -13,16 +15,101 @@ use crate::{
 };
 
 impl ShardActor {
-    pub(super) fn register(&mut self, command: RegistrationCommand) {
-        let result = self.register_inner(&command).map(RegistrationGrant::new);
-        if result.is_err() {
+    pub(super) fn control(&mut self, command: ActorControlCommand) -> Result<(), ActorError> {
+        match command {
+            ActorControlCommand::Register(command) => {
+                return self.register(command);
+            }
+            ActorControlCommand::RevokeGeneration(command) => {
+                return self.revoke_generation(command);
+            }
+            ActorControlCommand::InstallActionHooks(mut command) => {
+                let result = self.install_action_hooks(&mut command);
+                if result.is_err() {
+                    self.health_revision = self.health_revision.saturating_add(1);
+                    self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
+                }
+                drop(command.response.send(result));
+            }
+            ActorControlCommand::RemoveActionHooks(command) => {
+                let result = self.remove_action_hooks(&command);
+                if result.is_err() {
+                    self.health_revision = self.health_revision.saturating_add(1);
+                    self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
+                }
+                drop(command.response.send(result));
+            }
+        }
+        Ok(())
+    }
+
+    fn revoke_generation(
+        &mut self,
+        command: GenerationRevocationCommand,
+    ) -> Result<(), ActorError> {
+        let result = match self.routes.get(&command.route) {
+            None => Err(LiveIngressRevokeError::UnknownRoute),
+            Some(owner) if !owner.generations.owns_revocation(&command.revocation) => {
+                Err(LiveIngressRevokeError::AuthorityMismatch)
+            }
+            Some(_owner) => {
+                command.revocation.invalidate();
+                self.dirty = true;
+                match self.publish_snapshot(ShardLifecycleSnapshot::Ready) {
+                    Ok(()) => {
+                        self.snapshot_pending = false;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let _ = command
+                            .response
+                            .send(Err(LiveIngressRevokeError::SnapshotPublication));
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let _ = command.response.send(result);
+        Ok(())
+    }
+
+    pub(super) fn register(&mut self, command: RegistrationCommand) -> Result<(), ActorError> {
+        let snapshot_plane = self.publisher.plane_revocation();
+        let result = self
+            .register_inner(&command)
+            .map(|admission| RegistrationGrant::new(admission, snapshot_plane));
+        if result.is_ok() {
+            // Registration may revoke an older connection generation before replacement data
+            // arrives. Publish that authority transition promptly so immutable snapshot readers
+            // cannot continue treating the superseded stream as current during resynchronization.
+            self.dirty = true;
+            if let Err(error) = self.publish_snapshot(ShardLifecycleSnapshot::Ready) {
+                let _ = command
+                    .response
+                    .send(Err(RegistrationFailure::SnapshotPublication));
+                return Err(error);
+            }
+            self.snapshot_pending = false;
+        } else {
             self.health_revision = self.health_revision.saturating_add(1);
             self.emit_health(
                 LiveRuntimeHealthKind::GenerationRejected,
                 Some(command.route.clone()),
             );
         }
-        drop(command.response.send(result));
+        if let Err(undelivered) = command.response.send(result)
+            && let Ok(grant) = undelivered
+        {
+            // The receiver can time out or cancel after enqueue. Dropping the transfer guard
+            // invalidates the actor-minted admission; republish that revocation before the actor
+            // accepts more work so the preceding successful registration snapshot cannot remain
+            // falsely current.
+            drop(grant);
+            self.dirty = true;
+            self.publish_snapshot(ShardLifecycleSnapshot::Ready)?;
+            self.snapshot_pending = false;
+        }
+        Ok(())
     }
 
     fn register_inner(
@@ -43,6 +130,94 @@ impl ShardActor {
             })
     }
 
+    fn install_action_hooks(
+        &mut self,
+        command: &mut ActionHookInstallCommand,
+    ) -> Result<usize, ActionHookControlFailure> {
+        if command.runtime_incarnation != self.runtime_incarnation {
+            return Err(ActionHookControlFailure::RuntimeMismatch);
+        }
+        command
+            .activation
+            .validate_prepared(command.runtime_incarnation, command.generation)
+            .map_err(|_| ActionHookControlFailure::InvalidActivation)?;
+        if command.hooks.is_empty() {
+            return Err(ActionHookControlFailure::EmptyGroup);
+        }
+        for (index, hook) in command.hooks.iter().enumerate() {
+            hook.validate_retained_bytes(self.maximum_action_hook_bytes_per_route)?;
+            if command.hooks[..index]
+                .iter()
+                .any(|prior| prior.route() == hook.route())
+            {
+                return Err(ActionHookControlFailure::DuplicateRoute);
+            }
+            let owner = self
+                .routes
+                .get(hook.route())
+                .ok_or(ActionHookControlFailure::UnknownRoute)?;
+            if owner.action_hook.is_some() {
+                return Err(ActionHookControlFailure::HookAlreadyInstalled);
+            }
+        }
+        let hooks = std::mem::take(&mut command.hooks);
+        let installed = hooks.len();
+        for hook in hooks {
+            let Some(owner) = self.routes.get_mut(hook.route()) else {
+                for owner in self.routes.values_mut() {
+                    if owner
+                        .action_hook
+                        .as_ref()
+                        .is_some_and(|hook| hook.belongs_to_dynamic_group(&command.activation))
+                    {
+                        owner.action_hook = None;
+                    }
+                }
+                return Err(ActionHookControlFailure::UnknownRoute);
+            };
+            owner.action_hook = Some(hook.into_prepared_dynamic(command.activation.clone()));
+        }
+        Ok(installed)
+    }
+
+    fn remove_action_hooks(
+        &mut self,
+        command: &ActionHookRemoveCommand,
+    ) -> Result<usize, ActionHookControlFailure> {
+        if command.runtime_incarnation != self.runtime_incarnation {
+            return Err(ActionHookControlFailure::RuntimeMismatch);
+        }
+        command
+            .activation
+            .validate_disabled(command.runtime_incarnation, command.generation)
+            .map_err(|_| ActionHookControlFailure::InvalidActivation)?;
+        let installed = self
+            .routes
+            .values()
+            .filter(|owner| {
+                owner
+                    .action_hook
+                    .as_ref()
+                    .is_some_and(|hook| hook.belongs_to_dynamic_group(&command.activation))
+            })
+            .count();
+        if installed != 0 && installed != command.expected_hooks {
+            return Err(ActionHookControlFailure::PartialGroup);
+        }
+        if installed == command.expected_hooks {
+            for owner in self.routes.values_mut() {
+                if owner
+                    .action_hook
+                    .as_ref()
+                    .is_some_and(|hook| hook.belongs_to_dynamic_group(&command.activation))
+                {
+                    owner.action_hook = None;
+                }
+            }
+        }
+        Ok(installed)
+    }
+
     pub(super) fn process(&mut self, command: ShardCommand) -> Result<(), ActorError> {
         let admission = command.admission.clone();
         match self.process_inner(command) {
@@ -51,7 +226,13 @@ impl ShardActor {
                 admission.invalidate_on_admission_failure();
                 self.health_revision = self.health_revision.saturating_add(1);
                 self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
-                if error.is_fatal() { Err(error) } else { Ok(()) }
+                if error.is_fatal() {
+                    Err(error)
+                } else {
+                    self.dirty = true;
+                    self.snapshot_pending = false;
+                    self.publish_snapshot(ShardLifecycleSnapshot::Ready)
+                }
             }
         }
     }
@@ -88,6 +269,8 @@ impl ShardActor {
                     return Err(error.into());
                 }
             };
+            let row_count = cursor.remaining_len();
+            let mut wire_ordinal = 0usize;
             loop {
                 let applied = match owner
                     .processor
@@ -100,8 +283,15 @@ impl ShardActor {
                         return Err(error.into());
                     }
                 };
-                let disposition =
-                    process_applied_observation(&key, owner, applied, _retained_bytes)?;
+                let disposition = process_applied_observation(
+                    &key,
+                    owner,
+                    applied,
+                    _retained_bytes,
+                    wire_ordinal,
+                    row_count,
+                )?;
+                wire_ordinal = wire_ordinal.saturating_add(1);
                 feature_unavailable |= disposition.feature_unavailable;
                 action_failed |= disposition.action_failed;
                 qualified_market_export_dropped |= disposition.qualified_market_export_dropped;
@@ -138,6 +328,8 @@ fn process_applied_observation(
     owner: &mut RouteOwner,
     applied: AppliedLiveObservation,
     conservative_retained_bytes: u32,
+    wire_ordinal: usize,
+    row_count: usize,
 ) -> Result<AppliedObservationDisposition, ActorError> {
     if let Some(authority) = applied.authority.as_ref() {
         owner.processor.validate_applied_current(authority)?;
@@ -150,6 +342,7 @@ fn process_applied_observation(
             features,
             action_hook: _,
             qualified_market_export: _,
+            committed_research_export: _,
             generations: _,
             cross_venue_publisher: _,
             cross_venue_reader: _,
@@ -224,6 +417,7 @@ fn process_applied_observation(
     if !unavailable
         && let Some(authority) = applied.authority.as_ref()
         && let Some(action_hook) = owner.action_hook.as_mut()
+        && action_hook.action_enabled()
     {
         let feature_view = owner
             .features
@@ -261,24 +455,55 @@ fn process_applied_observation(
             }
         }
     }
-    let qualified_market_export_dropped =
-        if let Some(exporter) = owner.qualified_market_export.as_ref() {
-            let observation = crate::CommittedQualifiedMarketObservation::from_committed(
-                applied.event,
-                applied.assessment,
-                applied.binding_digest,
-                applied.committed_state_revision,
-                owner.processor.execution_terms(),
-                applied.stable_trade_id,
-            );
-            observation.is_some_and(|observation| {
-                exporter
-                    .try_export(observation, conservative_retained_bytes)
-                    .is_err()
-            })
-        } else {
-            false
-        };
+    let (qualified_market_export_dropped, committed_research_export_dropped) = match quality {
+        market_squawk_domain::DataQuality::DirectVerified => {
+            let dropped = if let Some(exporter) = owner.qualified_market_export.as_ref() {
+                let observation = crate::CommittedQualifiedMarketObservation::from_committed(
+                    applied.event,
+                    applied.assessment,
+                    applied.binding_digest,
+                    applied.committed_state_revision,
+                    owner.processor.execution_terms(),
+                    applied.stable_trade_id,
+                );
+                observation.is_some_and(|observation| {
+                    exporter
+                        .try_export(observation, conservative_retained_bytes)
+                        .is_err()
+                })
+            } else {
+                false
+            };
+            (dropped, false)
+        }
+        market_squawk_domain::DataQuality::DirectUnverified => {
+            let dropped = if let Some(exporter) = owner.committed_research_export.as_ref() {
+                let observation = crate::CommittedResearchMarketObservation::from_committed(
+                    applied.event,
+                    applied.assessment,
+                    applied.binding_digest,
+                    applied.committed_state_revision,
+                    applied.generation,
+                    applied.source_evidence,
+                    wire_ordinal,
+                    row_count,
+                    applied.stable_trade_id,
+                );
+                observation.is_none_or(|observation| {
+                    exporter
+                        .try_export(observation, conservative_retained_bytes)
+                        .is_err()
+                })
+            } else {
+                false
+            };
+            (false, dropped)
+        }
+        _ => (false, false),
+    };
+    if committed_research_export_dropped {
+        return Err(ActorError::CommittedResearchMarketExportUnavailable);
+    }
     Ok(AppliedObservationDisposition {
         feature_unavailable: unavailable,
         action_failed,

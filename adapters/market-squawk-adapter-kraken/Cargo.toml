@@ -16,6 +16,7 @@ bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-live.workspace = true
 market-squawk-sources.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true

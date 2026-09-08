@@ -58,13 +58,23 @@ live, and execution Trybuild UI targets, a release build, rustdoc with warnings 
 deterministic 101-event offline mock, and a timeout-bounded local stdio MCP interaction. Cargo Deny,
 Cargo Audit, and Gitleaks run directly in the same local and CI entry point rather than through
 configuration-shape unit tests. `cargo doc` remains a separate warning-denied documentation build;
-it is not treated as a substitute for running doctests.
+it is not treated as a substitute for running doctests. The compiler-derived implementation
+inventory removes only `target/doc` before generation because Cargo documentation output is
+[cumulative by design](https://doc.rust-lang.org/cargo/commands/cargo-doc.html); release binaries
+and dependency caches remain intact.
 
 The wrapper rejects nonempty `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, exports
 `CARGO_INCREMENTAL=0`, and checks the default worktree-local `target/` against a 20 GiB hard ceiling
 before and after verification. Run it from the repository root without an external target or build
 directory. Ordinary `dev` and `test` work remains incremental with line-table debug information;
 use `cargo build --profile debugging` only when full workspace debug information is required.
+
+Ordinary non-authoritative all-feature builds do not embed or watch the current Git head through the
+capture-benchmark build script. They use an explicit zero-valued unverified benchmark-head sentinel,
+as they already do for unverified tool identities. Only the clean authoritative benchmark flow binds
+the exact commit and watches its Git metadata. The release/package evidence separately binds the
+exact commit, tree, source closure, and component manifest without forcing a product relink after an
+unrelated documentation or verification-script commit.
 
 The historical 24-test count above applies only to the pre-workspace artifact. Current harness and
 doctest counts are read from the fresh release-gate transcript and will be recorded in the

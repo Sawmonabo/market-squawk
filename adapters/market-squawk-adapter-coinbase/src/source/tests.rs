@@ -12,8 +12,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    DecodeOutcome, FreshnessPolicy, LiveSourceGeneration, MarketDecoder, ProviderBudgetPolicy,
-    RawMarketFrame, RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
+    DecodeOutcome, FreshnessPolicy, LiveSourceGeneration, ProviderBudgetPolicy, RawMarketFrame,
+    RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::CoinbaseExchangeSource;
 use crate::{
-    CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseExchangeDecoder, CoinbaseProductMapping,
-    CoinbaseTransportLimits,
+    CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseExchangeDecoder, CoinbaseMarketDecodeOutcome,
+    CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -56,15 +56,18 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
-        let subscription = socket
-            .next()
-            .await
-            .ok_or("subscription was not sent")??
-            .into_text()?;
-        assert_eq!(
-            subscription,
-            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["level2_batch","matches","heartbeat"]}"#
-        );
+        for expected in [
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channel":"level2"}"#,
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channel":"market_trades"}"#,
+            r#"{"type":"subscribe","channel":"heartbeats"}"#,
+        ] {
+            let subscription = socket
+                .next()
+                .await
+                .ok_or("subscription was not sent")??
+                .into_text()?;
+            assert_eq!(subscription, expected);
+        }
         socket
             .send(Message::Text(
                 include_str!("../../fixtures/subscriptions.json")
@@ -114,12 +117,12 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     );
     let mut decoder = CoinbaseExchangeDecoder::try_new(&config)?;
     assert!(matches!(
-        decoder.decode(&session.validate_live_frame(&sink.frames[0])?)?,
-        DecodeOutcome::Control(_)
+        decoder.decode_market_handoff(&session.validate_live_frame(&sink.frames[0])?)?,
+        CoinbaseMarketDecodeOutcome::Other(DecodeOutcome::Control(_))
     ));
     assert!(matches!(
-        decoder.decode(&session.validate_live_frame(&sink.frames[1])?)?,
-        DecodeOutcome::Data(_)
+        decoder.decode_market_handoff(&session.validate_live_frame(&sink.frames[1])?)?,
+        CoinbaseMarketDecodeOutcome::Market(_)
     ));
 
     let refusal = WebSocketError::Http(Box::new(
@@ -140,8 +143,15 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
         .remaining_wait(deadline)
         .map_err(|reason| format!("Coinbase budget wait failed: {reason:?}"))?;
     tokio::time::sleep(remaining).await;
-    let market_squawk_sources::BudgetDecision::Ready(permit) = source.budget.try_acquire() else {
+    let market_squawk_sources::BudgetReservationDecision::Ready(reservation) =
+        source.budget.try_reserve_request()
+    else {
         return Err("Coinbase budget remained unavailable after its exact deadline".into());
+    };
+    let market_squawk_sources::BudgetDispatchDecision::Ready(permit) =
+        reservation.commit_dispatch()
+    else {
+        return Err("Coinbase budget dispatch remained unavailable after reservation".into());
     };
     permit.release();
     source
@@ -163,7 +173,9 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
-        let _subscription = socket.next().await;
+        for _ in 0..3 {
+            let _subscription = socket.next().await;
+        }
         std::future::pending::<Result<(), Box<dyn Error + Send + Sync>>>().await
     });
     let stream = TcpStream::connect(address).await?;
@@ -288,7 +300,7 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
     CoinbaseExchangeConfig::try_new(
         SourceId::try_from("coinbase-exchange-public")?,
         RevisionBoundPayloadEvidence::new(
-            MetadataRevision::new(identifier("exchange-v1-2026-07-20")?),
+            MetadataRevision::new(identifier("advanced-trade-v1-2026-08-08")?),
             evidence(3),
         ),
         authorization,
@@ -300,8 +312,8 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
         )?],
         vec![
             CoinbaseChannel::Level2,
-            CoinbaseChannel::Matches,
-            CoinbaseChannel::Heartbeat,
+            CoinbaseChannel::MarketTrades,
+            CoinbaseChannel::Heartbeats,
         ],
         FreshnessPolicy::try_new(
             5_000_000_000,
@@ -312,7 +324,7 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
         )?,
         budget,
         CoinbaseTransportLimits::try_new(
-            256 * 1024,
+            market_squawk_sources::MAX_RAW_FRAME_BYTES,
             Duration::from_secs(5),
             Duration::from_secs(5),
         )?,

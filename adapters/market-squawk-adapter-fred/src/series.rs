@@ -5,6 +5,14 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
 
+pub(crate) fn valid_exact_series_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 120
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 /// Conservative parser admission limits for a FRED JSON page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FredParseLimits {
@@ -109,6 +117,9 @@ impl FredObservation {
 pub struct FredObservationPage {
     realtime_start: CalendarDate,
     realtime_end: CalendarDate,
+    observation_start: CalendarDate,
+    observation_end: CalendarDate,
+    units: String,
     count: usize,
     offset: usize,
     limit: usize,
@@ -135,6 +146,7 @@ impl FredObservationPage {
             limits,
         )?;
         if wire.output_type != 1
+            || wire.units != "lin"
             || wire.file_type != "json"
             || wire.order_by != "observation_date"
             || wire.sort_order != "asc"
@@ -151,9 +163,9 @@ impl FredObservationPage {
 
         let realtime_start = parse_date(&wire.realtime_start)?;
         let realtime_end = parse_date(&wire.realtime_end)?;
-        let _observation_start = parse_date(&wire.observation_start)?;
-        let _observation_end = parse_date(&wire.observation_end)?;
-        if realtime_start > realtime_end {
+        let observation_start = parse_date(&wire.observation_start)?;
+        let observation_end = parse_date(&wire.observation_end)?;
+        if realtime_start > realtime_end || observation_start > observation_end {
             return Err(FredProtocolError::InvalidField("realtime interval"));
         }
 
@@ -210,6 +222,9 @@ impl FredObservationPage {
         Ok(Self {
             realtime_start,
             realtime_end,
+            observation_start,
+            observation_end,
+            units: wire.units,
             count: wire.count,
             offset: wire.offset,
             limit: wire.limit,
@@ -251,6 +266,21 @@ impl FredObservationPage {
     /// Returns the page-level closed realtime interval end.
     pub const fn realtime_end(&self) -> CalendarDate {
         self.realtime_end
+    }
+
+    /// Returns the provider-declared first observation civil date for this response.
+    pub const fn observation_start(&self) -> CalendarDate {
+        self.observation_start
+    }
+
+    /// Returns the provider-declared final observation civil date for this response.
+    pub const fn observation_end(&self) -> CalendarDate {
+        self.observation_end
+    }
+
+    /// Returns the exact provider unit mode declared by the observation response.
+    pub fn units(&self) -> &str {
+        &self.units
     }
 }
 

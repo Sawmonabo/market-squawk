@@ -13,6 +13,8 @@ use market_squawk_sources::{
 use thiserror::Error;
 use url::Url;
 
+use crate::messages::PUBLIC_SUBSCRIPTION_REQUEST_ID;
+
 const KRAKEN_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 const MAX_SYMBOL_BYTES: usize = 64;
 
@@ -264,6 +266,34 @@ impl SourceMetadataProvider for KrakenConfig {
     }
 }
 
+pub(crate) fn public_subscription_payload(
+    symbol: &str,
+    channel: KrakenChannel,
+) -> Result<String, serde_json::Error> {
+    let (channel, depth) = match channel {
+        KrakenChannel::Book(depth) => ("book", Some(depth.get())),
+        KrakenChannel::Trades => ("trade", None),
+    };
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "channel".to_owned(),
+        serde_json::Value::String(channel.to_owned()),
+    );
+    params.insert(
+        "symbol".to_owned(),
+        serde_json::Value::Array(vec![serde_json::Value::String(symbol.to_owned())]),
+    );
+    params.insert("snapshot".to_owned(), serde_json::Value::Bool(true));
+    if let Some(depth) = depth {
+        params.insert("depth".to_owned(), serde_json::Value::from(depth));
+    }
+    serde_json::to_string(&serde_json::json!({
+        "method": "subscribe",
+        "params": params,
+        "req_id": PUBLIC_SUBSCRIPTION_REQUEST_ID,
+    }))
+}
+
 /// Kraken configuration error.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum KrakenConfigError {
@@ -279,4 +309,7 @@ pub enum KrakenConfigError {
     /// The per-message bound exceeds global capture limits.
     #[error("Kraken message bound is invalid")]
     MessageBound,
+    /// The exact bounded subscription request could not be encoded.
+    #[error("Kraken subscription request could not be encoded")]
+    SubscriptionSerialization,
 }

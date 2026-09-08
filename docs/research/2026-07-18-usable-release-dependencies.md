@@ -80,6 +80,26 @@ if another process component installed a provider first; see rustls's
 [`CryptoProvider`](https://docs.rs/rustls/0.23.42/rustls/crypto/struct.CryptoProvider.html)
 contract. This proves the selected in-process implementation, not any external provider identity.
 
+### 2026-08-04 `rust_decimal` and `rkyv` advisory refresh
+
+Market Squawk now pins the latest stable `rust_decimal` release, `1.42.1`, exactly. That release's
+manifest retains an optional dependency on `rkyv 0.7.46`, even though Market Squawk enables only
+`serde-with-str` and the resolved all-target product graph does not compile `rkyv`. RustSec advisory
+[`RUSTSEC-2026-0235`](https://rustsec.org/advisories/RUSTSEC-2026-0235.html) reports an out-of-bounds
+read in checked access or deserialization of crafted `Rc`/`Arc` archives, states that the 0.7 line
+is affected and unsupported, and identifies `rkyv >=0.8.17` as patched. The upstream
+[`rust_decimal 1.42.1` manifest](https://github.com/paupino/rust-decimal/blob/1.42.1/Cargo.toml)
+still selects the affected optional line; no later stable `rust_decimal` release was available at
+this review.
+
+**Decision.** Do not vendor or maintain a private decimal fork merely to delete an unselected
+compatibility feature. The audit exception is instead fail-closed: both local policy verification
+and CI first resolve the workspace's all-feature, all-target product graph and reject any active
+`rkyv 0.0` through `0.7` package before applying the lockfile-only advisory exception. Remove the
+exception as soon as a reviewed stable `rust_decimal` release removes the obsolete dependency or
+migrates it to a patched `rkyv` line. If Market Squawk ever needs archive serialization, it must
+admit a patched implementation independently; the current exception does not authorize that use.
+
 ### XBRL semantic authorities
 
 The SEC adapter's XBRL evidence contract was checked on 2026-07-20 against the primary XBRL

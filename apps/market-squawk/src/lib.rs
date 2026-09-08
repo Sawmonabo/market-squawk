@@ -9,12 +9,15 @@ pub mod application;
 mod artifact_repository;
 pub mod backtest_service;
 pub mod backtest_strategy;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+mod board_installed_fixture;
 pub mod bot;
 pub mod cli;
 pub mod diagnostic_engine;
 pub mod doctor;
 mod domain;
 pub mod features;
+pub mod jobs;
 pub mod live_runtime;
 mod live_source;
 pub mod local_product;
@@ -30,8 +33,10 @@ pub mod release;
 pub mod replay;
 pub mod research_service;
 pub mod risk;
+pub mod service;
 pub mod source;
 pub mod source_supervisor;
+pub mod termination;
 
 /// Platform journal compatibility facade retained for existing application imports.
 pub mod journal {
@@ -42,6 +47,8 @@ pub use backtest_service::{
     BacktestExperimentPlan, PinnedBacktestInput, ProductionBacktestService,
     ProductionBacktestServiceError,
 };
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+pub use board_installed_fixture::BoardInstalledFixtureBundle;
 pub use diagnostic_engine::{
     DiagnosticEngine, DiagnosticEngineSnapshot, DiagnosticProductSnapshot, SharedDiagnosticEngine,
 };
@@ -58,7 +65,12 @@ pub use live_source::{
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
 };
 pub use local_product::{
-    LocalMcpAvailabilityError, LocalProduct, LocalProductError, verified_installed_cli_program,
+    LocalMcpAvailabilityError, LocalProduct, LocalProductError, LocalServiceAvailabilityError,
+    verified_installed_cli_program, verified_installed_service_program,
+};
+#[cfg(debug_assertions)]
+pub use local_product::{
+    verified_development_mcp_relay_program, verified_development_service_program,
 };
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
@@ -89,6 +101,8 @@ pub use provider_onboarding::{
     ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
     ProviderPortalActivationError, ProviderPortalActivationRequest, ProviderPortalActivationView,
     ProviderPortalConfig, ProviderPortalError, ProviderProfileRegistration,
-    ProviderProfileRegistrationOutcome, ProviderProfileView, StartOnboardingRequest,
+    ProviderProfileRegistrationOutcome, ProviderProfileView,
+    SchwabOAuthInstallationCapabilityError, SchwabOAuthInstallationTrustAction,
+    SchwabOAuthInstallationTrustState, StartOnboardingRequest,
 };
 pub use research_service::{ResearchIngestRequest, ResearchService, ResearchServiceError};

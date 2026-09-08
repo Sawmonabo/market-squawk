@@ -1,11 +1,13 @@
-//! Revision-independent exact PIT-v1 observation payloads.
+//! Revision-independent exact PIT-v2 observation payloads.
 
 use market_squawk_domain::{
-    CorporateActionKind, DigestAlgorithm, EvidenceDigest, MacroMissingValue, PositionSide,
-    QuantityLots, ResearchObservation, SourceIdentifier, XbrlFactEvidence,
+    CorporateActionKind, DigestAlgorithm, EvidenceDigest, FundamentalFactContext,
+    MacroMissingValue, PositionSide, QuantityLots, ResearchObservation, SourceIdentifier,
+    XbrlFactEvidence,
 };
 use rust_decimal::Decimal;
 
+use super::super::{ProviderNativeLineageRow, ProviderNativeLineageSchema};
 use super::ObservedRevisionError;
 use super::evidence::ObservedSemanticPayload;
 
@@ -14,8 +16,9 @@ pub(super) mod serializer;
 use serializer::{PitV1CanonicalEncoder, PitV1EncodingControl, PitV1EncodingError};
 
 const PIT_PAYLOAD_DOMAIN: &str = "market-squawk/pit/payload";
+const PIT_PROVIDER_NATIVE_PAYLOAD_DOMAIN: &str = "market-squawk/pit/provider-native-payload";
 
-/// Exact PIT-v1 payload bytes excluding context, provenance, time, and revision.
+/// Exact PIT-v2 payload bytes excluding provenance, time, and assigned revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalObservationPayload {
     exact_bytes: Box<[u8]>,
@@ -39,14 +42,14 @@ impl CanonicalObservationPayload {
     pub fn fundamental(
         concept: &SourceIdentifier,
         value: Decimal,
-        unit: &SourceIdentifier,
+        fact_context: &FundamentalFactContext,
         xbrl_evidence: Option<&XbrlFactEvidence>,
     ) -> Result<Self, ObservedRevisionError> {
         Self::encode(&|encoder| {
             encoder.u8(2)?;
             encoder.str(concept.as_str())?;
             encode_decimal(encoder, value)?;
-            encoder.str(unit.as_str())?;
+            encoder.serializable(fact_context)?;
             encode_optional_serializable(encoder, xbrl_evidence)
         })
     }
@@ -165,7 +168,7 @@ impl CanonicalObservationPayload {
                     encoder.u8(2)?;
                     encoder.str(value.concept().as_str())?;
                     encode_decimal(encoder, value.value())?;
-                    encoder.str(value.unit().as_str())?;
+                    encoder.serializable(value.fact_context())?;
                     encode_optional_serializable(encoder, value.xbrl_evidence())
                 })
             }
@@ -183,6 +186,64 @@ impl CanonicalObservationPayload {
                     return Err(PitV1EncodingError::Encoding);
                 }
                 encoder.str(value.unit().as_str())
+            }),
+            ResearchObservation::MarketBar(value) => {
+                Self::encode_with_control(control, &|encoder| {
+                    encoder.u8(10)?;
+                    encoder.str(value.provider_instrument_id().as_str())?;
+                    encoder.str(value.feed().as_str())?;
+                    encoder.str(value.interval().as_str())?;
+                    encoder.u8(market_bar_adjustment_tag(value.adjustment()))?;
+                    encode_market_bar_time(encoder, value.time_semantics())?;
+                    encode_decimal(encoder, value.open().amount())?;
+                    encode_decimal(encoder, value.high().amount())?;
+                    encode_decimal(encoder, value.low().amount())?;
+                    encode_decimal(encoder, value.close().amount())?;
+                    encoder.str(value.currency().as_str())?;
+                    encode_decimal(encoder, value.volume())?;
+                    match value.trade_count() {
+                        Some(count) => {
+                            encoder.u8(1)?;
+                            encoder.u64(count)?;
+                        }
+                        None => encoder.u8(0)?,
+                    }
+                    match value.vwap() {
+                        Some(vwap) => {
+                            encoder.u8(1)?;
+                            encode_decimal(encoder, vwap.amount())
+                        }
+                        None => encoder.u8(0),
+                    }
+                })
+            }
+            ResearchObservation::FundNav(value) => Self::encode_with_control(control, &|encoder| {
+                encoder.u8(11)?;
+                encoder.str(value.provider_instrument_id().as_str())?;
+                encoder.str(
+                    value
+                        .instrument_reference_revision()
+                        .as_source_identifier()
+                        .as_str(),
+                )?;
+                encoder.str(value.provider_product().as_source_identifier().as_str())?;
+                encoder.str(value.provider_channel().as_source_identifier().as_str())?;
+                encode_calendar_date(encoder, value.nav_date())?;
+                encoder.u8(fund_nav_valuation_basis_tag(value.valuation_basis()))?;
+                encoder.str(value.currency().as_str())?;
+                match value.value() {
+                    market_squawk_domain::FundNavValue::Observed(money) => {
+                        encoder.u8(1)?;
+                        encode_decimal(encoder, money.amount())?;
+                    }
+                    market_squawk_domain::FundNavValue::Missing(missing) => {
+                        encoder.u8(2)?;
+                        encoder.u8(fund_nav_missing_tag(missing))?;
+                    }
+                }
+                encoder.i64(value.canonical_published_at().unix_nanos())?;
+                encoder.serializable(value.lineage())?;
+                encoder.serializable(value.revision_evidence())
             }),
             ResearchObservation::PortfolioPosition(value) => {
                 Self::encode_with_control(control, &|encoder| {
@@ -240,7 +301,7 @@ impl CanonicalObservationPayload {
         &self.exact_bytes
     }
 
-    /// Returns the PIT-v1 domain-separated SHA-256 payload identity.
+    /// Returns the PIT-v2 domain-separated SHA-256 payload identity.
     pub const fn identity(&self) -> EvidenceDigest {
         self.identity
     }
@@ -274,12 +335,117 @@ impl CanonicalObservationPayload {
     }
 }
 
+fn encode_calendar_date(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    date: market_squawk_domain::CalendarDate,
+) -> Result<(), PitV1EncodingError> {
+    encoder.u16(date.year())?;
+    encoder.u8(date.month())?;
+    encoder.u8(date.day())
+}
+
+const fn fund_nav_valuation_basis_tag(basis: market_squawk_domain::FundNavValuationBasis) -> u8 {
+    match basis {
+        market_squawk_domain::FundNavValuationBasis::PerShare => 1,
+    }
+}
+
+const fn fund_nav_missing_tag(missing: market_squawk_domain::FundNavMissingState) -> u8 {
+    match missing {
+        market_squawk_domain::FundNavMissingState::NotYetPublished => 1,
+        market_squawk_domain::FundNavMissingState::Unsupported => 2,
+        market_squawk_domain::FundNavMissingState::SourceMissing => 3,
+        market_squawk_domain::FundNavMissingState::Invalid => 4,
+        market_squawk_domain::FundNavMissingState::Unavailable => 5,
+    }
+}
+
+const fn market_bar_adjustment_tag(adjustment: market_squawk_domain::MarketBarAdjustment) -> u8 {
+    match adjustment {
+        market_squawk_domain::MarketBarAdjustment::Raw => 1,
+        market_squawk_domain::MarketBarAdjustment::Split => 2,
+        market_squawk_domain::MarketBarAdjustment::Dividend => 3,
+        market_squawk_domain::MarketBarAdjustment::SpinOff => 4,
+        market_squawk_domain::MarketBarAdjustment::All => 5,
+    }
+}
+
+fn encode_market_bar_time(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    semantics: &market_squawk_domain::BarTimeSemantics,
+) -> Result<(), PitV1EncodingError> {
+    encoder.i64(semantics.period_start().unix_nanos())?;
+    encoder.i64(semantics.period_end_exclusive().unix_nanos())?;
+    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
+    let session = semantics.session();
+    encoder.u8(market_bar_session_kind_tag(session.kind()))?;
+    encoder.str(session.ruleset().as_str())?;
+    let evidence = session.evidence();
+    encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
+    encoder.bytes(&evidence.bytes())
+}
+
+const fn bar_timestamp_basis_tag(basis: market_squawk_domain::BarTimestampBasis) -> u8 {
+    match basis {
+        market_squawk_domain::BarTimestampBasis::PeriodStart => 1,
+        market_squawk_domain::BarTimestampBasis::PeriodEnd => 2,
+    }
+}
+
+const fn market_bar_session_kind_tag(kind: market_squawk_domain::MarketBarSessionKind) -> u8 {
+    match kind {
+        market_squawk_domain::MarketBarSessionKind::Regular => 1,
+        market_squawk_domain::MarketBarSessionKind::Extended => 2,
+        market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+        market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
+    }
+}
+
+const fn digest_algorithm_tag(algorithm: DigestAlgorithm) -> u8 {
+    match algorithm {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }
+}
+
 impl TryFrom<&CanonicalObservationPayload> for ObservedSemanticPayload {
     type Error = ObservedRevisionError;
 
     fn try_from(value: &CanonicalObservationPayload) -> Result<Self, Self::Error> {
         Self::try_from_bytes(value.exact_bytes())
     }
+}
+
+impl ObservedSemanticPayload {
+    pub(super) fn try_from_canonical_and_native(
+        canonical: &CanonicalObservationPayload,
+        schema: ProviderNativeLineageSchema,
+        native_row: &ProviderNativeLineageRow,
+    ) -> Result<Self, ObservedRevisionError> {
+        let mut control = NoopEncodingControl;
+        let (exact_bytes, _) = encode_exact(
+            PIT_PROVIDER_NATIVE_PAYLOAD_DOMAIN,
+            "semantic_payload",
+            super::MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES,
+            &mut control,
+            &|encoder| {
+                encoder.bytes(canonical.exact_bytes())?;
+                encoder.u16(schema.version())?;
+                encoder.u8(schema.implementation().tag())?;
+                encode_digest(encoder, schema.fingerprint())?;
+                encode_digest(encoder, native_row.semantic_payload_digest())
+            },
+        )?;
+        Self::try_from_bytes(&exact_bytes)
+    }
+}
+
+fn encode_digest(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    digest: EvidenceDigest,
+) -> Result<(), PitV1EncodingError> {
+    encoder.u8(digest_algorithm_tag(digest.algorithm()))?;
+    encoder.bytes(&digest.bytes())
 }
 
 pub(super) fn encode_exact<F>(

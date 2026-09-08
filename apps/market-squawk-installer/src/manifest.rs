@@ -219,6 +219,25 @@ impl TargetRelease {
                 }
             }
         }
+        let update_roots = self
+            .components
+            .iter()
+            .filter(|component| component.role == ComponentRole::UpdateRoot)
+            .collect::<Vec<_>>();
+        if update_roots.len() > 1 {
+            return Err(ManifestError::ComponentSet);
+        }
+        if let Some(component) = update_roots.first()
+            && component.path.as_ref()
+                != ComponentRole::UpdateRoot
+                    .fixed_path(self.target)
+                    .ok_or(ManifestError::ComponentSet)?
+        {
+            return Err(ManifestError::RequiredRolePath {
+                role: ComponentRole::UpdateRoot,
+                expected: "share/market-squawk/update/1.root.json".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -285,6 +304,8 @@ impl ComponentIdentity {
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentRole {
     Desktop,
+    Service,
+    McpRelay,
     Cli,
     CaptureHelper,
     OnnxWorker,
@@ -294,14 +315,18 @@ pub enum ComponentRole {
     Uv,
     PythonRuntime,
     PythonEnvironment,
+    UpdateChannel,
+    UpdateRoot,
     DesktopResource,
     License,
     Notice,
 }
 
 impl ComponentRole {
-    pub(crate) const REQUIRED: [Self; 10] = [
+    pub(crate) const REQUIRED: [Self; 13] = [
         Self::Desktop,
+        Self::Service,
+        Self::McpRelay,
         Self::Cli,
         Self::CaptureHelper,
         Self::OnnxWorker,
@@ -311,12 +336,15 @@ impl ComponentRole {
         Self::Uv,
         Self::PythonRuntime,
         Self::PythonEnvironment,
+        Self::UpdateChannel,
     ];
 
     pub(crate) const fn requires_executable(self) -> bool {
         matches!(
             self,
             Self::Desktop
+                | Self::Service
+                | Self::McpRelay
                 | Self::Cli
                 | Self::CaptureHelper
                 | Self::OnnxWorker
@@ -332,6 +360,8 @@ impl ComponentRole {
         let suffix = target.executable_suffix();
         match self {
             Self::Desktop => Some(format!("bin/market-squawk-desktop{suffix}")),
+            Self::Service => Some(format!("bin/market-squawk-service{suffix}")),
+            Self::McpRelay => Some(format!("bin/market-squawk-mcp-relay{suffix}")),
             Self::Cli => Some(format!("bin/market-squawk{suffix}")),
             Self::CaptureHelper => Some(format!("bin/market-squawk-capture-helper{suffix}")),
             Self::OnnxWorker => Some(format!("bin/market-squawk-onnx-worker{suffix}")),
@@ -356,6 +386,8 @@ impl ComponentRole {
                 }
                 .to_owned(),
             ),
+            Self::UpdateChannel => Some("share/market-squawk/update/channel.json".to_owned()),
+            Self::UpdateRoot => Some("share/market-squawk/update/1.root.json".to_owned()),
             Self::PythonEnvironment | Self::DesktopResource | Self::License | Self::Notice => None,
         }
     }

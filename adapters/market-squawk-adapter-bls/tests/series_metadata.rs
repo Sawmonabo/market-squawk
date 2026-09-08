@@ -52,13 +52,13 @@ fn exact_user_authorized_metadata_is_required_and_bound_to_the_dataset() -> Test
     assert_eq!(percent.exact_payload(), PERCENT);
 
     let percent_config = BlsSourceConfig::try_new(
-        BlsAuthorization::PublicV1,
+        BlsAuthorization::public_v1(),
         vec![percent.clone()],
         2020,
         2026,
     )?;
     let index_config = BlsSourceConfig::try_new(
-        BlsAuthorization::PublicV1,
+        BlsAuthorization::public_v1(),
         vec![metadata(INDEX)?],
         2020,
         2026,
@@ -82,7 +82,7 @@ fn exact_user_authorized_metadata_is_required_and_bound_to_the_dataset() -> Test
     ));
     assert!(
         BlsSourceConfig::try_new(
-            BlsAuthorization::PublicV1,
+            BlsAuthorization::public_v1(),
             vec![percent.clone(), percent],
             2020,
             2026,

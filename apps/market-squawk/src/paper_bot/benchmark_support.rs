@@ -61,18 +61,19 @@ impl ReleasePaperBotBenchmarkComposition {
         let observer = Arc::new(ReleaseBenchmarkObserver::try_new()?);
         let strategy_observer = Arc::clone(&observer);
         let hook_overhead = ObservedExecutionHook::retained_overhead_bytes()?;
-        let inner = super::defaults::release_benchmark_paper_bot(
-            config,
-            source::instrument_definition()?,
-            hook_overhead,
-            move |route| {
-                let strategy = super::defaults::controlled_paper_strategy(route)?;
-                Ok(Box::new(ObservedStrategy::new(
-                    strategy,
-                    Arc::clone(&strategy_observer),
-                )) as Box<dyn Strategy>)
-            },
-        )?;
+        let inner =
+            super::defaults::release_benchmark_paper_bot(
+                config,
+                source::instrument_definition()?,
+                hook_overhead,
+                move |route| {
+                    let strategy = super::defaults::book_imbalance_paper_strategy(route)?;
+                    Ok(super::defaults::PaperRouteStrategy::automated(Box::new(
+                        ObservedStrategy::new(strategy, Arc::clone(&strategy_observer)),
+                    )
+                        as Box<dyn Strategy>))
+                },
+            )?;
         let mailbox_capacity = inner.runtime_config.mailbox_count_per_shard().get();
         Ok(Self {
             inner,

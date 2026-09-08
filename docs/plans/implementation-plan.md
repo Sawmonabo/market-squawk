@@ -4,18 +4,17 @@
 
 This stable repository path intentionally names exactly one executable delivery authority:
 
-- [Usable complete-release implementation plan](../superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md)
+- [V1 installed-product experience implementation plan](../superpowers/plans/2026-08-01-market-squawk-v1-installed-product-experience.md)
 
-That plan covers Tasks 0–20, the complete mandatory capability set, dependency-safe Stages and
-Waves, exact producer-to-consumer ownership, release gates, final local demonstration, publication,
-and worktree cleanup. It supersedes every earlier complete-remaining-work or Q-numbered production
-plan as execution authority. Historical filenames and finding identifiers remain immutable audit
-locators only.
+That plan governs the complete installed-product capability contract, dependency-safe Stage/Wave
+DAG, one per-user service, guided setup, permanent Desktop workspaces, CLI/MCP projections,
+cross-platform owner-test packages, and exact-head verification. Its current barrier is Task 25
+followed by Task 26: produce and verify an unpublished owner-test candidate, then hand that exact
+candidate to the owner through the existing draft PR and project. It does not authorize public
+release creation, a stable curl endpoint, merge to `main`, or release-branch integration.
 
-The current bounded correction for canonical Tasks 16–17 is the
-[Quarter 3 portfolio/backtest authority remediation plan](../superpowers/plans/2026-07-22-quarter-3-portfolio-backtest-authority-remediation.md).
-It is a task-scoped execution addendum to the canonical plan, not another release plan or delivery
-quarter.
+Historical filenames, Q-prefixed checkpoints, and finding identifiers remain immutable audit
+locators. They do not override the August 1 plan.
 
 ## Current execution rule
 
@@ -24,19 +23,22 @@ quarter.
 - Work continues to the usable complete local release terminal condition in
   [`project-memory.md`](../project-memory.md).
 - A Stage or Wave is an ordering boundary, not a partial-release stopping point.
-- A Release Gate freezes one clean exact commit for complete verification and independent review.
+- Task 26 freezes one clean exact feature commit for complete verification and the existing final
+  Quarter 4 grouped review.
 - No contracts, schemas, mocks, synthetic sources, diagnostic paths, plans, or focused tests count
   as a completed product vertical.
-- README capability state and release evidence are updated by the integration owner after the
-  corresponding producer-to-consumer vertical and its verification are committed.
-- The historical Q2/A4 live/capture closure is a one-time prerequisite gate, not an active delivery
-  quarter. The canonical plan defines its current executable procedure and requires an exact
-  approved SHA, tree, API, evidence, and truth refresh before Stage 1 integration.
+- Maintained product documentation is updated by the integration owner only from committed source
+  and exact package evidence. Mutable head, blocker, issue, evidence, and cleanup state lives only
+  in the delivery ledger.
+- Public publication and merge decisions require separate user authority after owner testing.
 
 ## Historical plan disposition
 
 The following documents are historical evidence and have no current execution authority:
 
+- [2026-07-17 usable complete-release plan](../superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md)
+- [2026-07-22 Quarter 3 portfolio/backtest remediation](../superpowers/plans/2026-07-22-quarter-3-portfolio-backtest-authority-remediation.md)
+- [2026-07-29 complete installation and public release](../superpowers/plans/2026-07-29-complete-installation-and-public-release.md)
 - [2026-07-16 complete remaining work](../superpowers/plans/2026-07-16-market-squawk-complete-remaining-work.md)
 - [2026-07-16 Q3 production plan](../superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md)
 

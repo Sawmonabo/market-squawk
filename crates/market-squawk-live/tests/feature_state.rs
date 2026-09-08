@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use market_squawk_analytics::{FeatureValidity, RequiredLiveFeature};
+use market_squawk_analytics::{
+    FeatureOutputType, FeatureUnit, FeatureValidity, RequiredLiveFeature,
+};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use market_squawk_live::{
     LiveFeatureSnapshot, LiveRuntime, SnapshotCompleteness, StreamPhaseSnapshot,
 };
@@ -36,7 +39,8 @@ async fn committed_trade_features_warm_then_reset_on_generation_replacement() ->
     ])?;
     ingress.try_publish(batch)?;
 
-    wait_for_feature(&runtime, ConnectionExpectation::GenerationOneReady).await?;
+    let generation_one =
+        wait_for_feature(&runtime, ConnectionExpectation::GenerationOneReady).await?;
 
     let mut source = source.rollover(2)?;
     let ingress = runtime
@@ -49,7 +53,9 @@ async fn committed_trade_features_warm_then_reset_on_generation_replacement() ->
         .await?;
     let (_, batch) = source.batch("trade-4", 1)?;
     ingress.try_publish(batch)?;
-    wait_for_feature(&runtime, ConnectionExpectation::GenerationTwoWarming).await?;
+    let generation_two =
+        wait_for_feature(&runtime, ConnectionExpectation::GenerationTwoWarming).await?;
+    assert_ne!(generation_one, generation_two);
 
     assert!(runtime.shutdown().await.is_complete());
     Ok(())
@@ -114,9 +120,12 @@ enum ConnectionExpectation {
     GenerationTwoWarming,
 }
 
-async fn wait_for_feature(runtime: &LiveRuntime, expectation: ConnectionExpectation) -> TestResult {
+async fn wait_for_feature(
+    runtime: &LiveRuntime,
+    expectation: ConnectionExpectation,
+) -> Result<EvidenceDigest, Box<dyn std::error::Error>> {
     let key = route(INSTRUMENT_ONE)?;
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let digest = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let snapshots = runtime.snapshots().try_load_all()?;
             let route = snapshots
@@ -146,7 +155,20 @@ async fn wait_for_feature(runtime: &LiveRuntime, expectation: ConnectionExpectat
                     }
                 };
                 if matches {
-                    return Ok::<_, Box<dyn std::error::Error>>(());
+                    assert!(
+                        set.values()
+                            .iter()
+                            .all(|value| value.observed_at() <= set.available_at())
+                    );
+                    assert!(set.values().iter().all(|value| {
+                        value.semantic_digest() != [0; 32]
+                            && value.implementation_digest() != [0; 32]
+                    }));
+                    assert_eq!(vwap.output_type(), FeatureOutputType::ExactRatio);
+                    assert_eq!(vwap.unit(), FeatureUnit::PriceTicks);
+                    assert_eq!(set.content_digest().algorithm(), DigestAlgorithm::Sha256);
+                    assert_ne!(set.content_digest().bytes(), [0; 32]);
+                    return Ok::<_, Box<dyn std::error::Error>>(set.content_digest());
                 }
             }
             drop(snapshots);
@@ -154,5 +176,5 @@ async fn wait_for_feature(runtime: &LiveRuntime, expectation: ConnectionExpectat
         }
     })
     .await??;
-    Ok(())
+    Ok(digest)
 }
