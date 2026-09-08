@@ -314,6 +314,9 @@ pub enum SourceCommand {
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
+        /// Explicitly open the protected browser fallback (never automatic for JSON output).
+        #[arg(long)]
+        open_browser: bool,
     },
     /// Activate one evidence-bound provider adapter after onboarding verification.
     Activate {

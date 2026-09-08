@@ -360,31 +360,20 @@ async fn run_product_command(
     let opens_onboarding_portal = matches!(
         &command,
         Command::Source {
-            command: SourceCommand::Setup { .. }
-        }
-    );
-    let connector = installed_service_connector(&config, installation_data_root)?;
-    let client = connector.connect(NamedClient::Cli, None)?;
-    let result = execute_installed_cli_command(&client, command).await;
-    let portal_outcome = match &result {
-        Ok(result) if opens_onboarding_portal => {
-            match emit_result(output, result.summary(), result.value()) {
-                Ok(()) => hold_onboarding_portal(result.value()).await,
-                Err(error) => Err(error),
+            command: SourceCommand::Setup {
+                open_browser: true,
+                ..
             }
         }
-        Ok(_) | Err(_) => Ok(()),
-    };
-    let result = match result {
-        Ok(result) => portal_outcome.map(|()| result),
-        Err(error) => Err(anyhow::Error::from(error)),
-    };
-    let result = result?;
+    ) && !matches!(output, OutputFormat::Json);
+    let connector = installed_service_connector(&config, installation_data_root)?;
+    let client = connector.connect(NamedClient::Cli, None)?;
+    let result = execute_installed_cli_command(&client, command).await?;
+    emit_result(output, result.summary(), result.value())?;
     if opens_onboarding_portal {
-        Ok(())
-    } else {
-        emit_result(output, result.summary(), result.value())
+        open_onboarding_portal(result.value())?;
     }
+    Ok(())
 }
 
 async fn run_service_command(
@@ -591,7 +580,7 @@ async fn reap_service_child(child: &mut std::process::Child, timeout: Duration) 
     }
 }
 
-async fn hold_onboarding_portal(result: &serde_json::Value) -> Result<()> {
+fn open_onboarding_portal(result: &serde_json::Value) -> Result<()> {
     let portal_url = result
         .pointer("/data/portal/url")
         .and_then(serde_json::Value::as_str)
@@ -608,30 +597,9 @@ async fn hold_onboarding_portal(result: &serde_json::Value) -> Result<()> {
     {
         anyhow::bail!("source setup returned a portal URL outside the loopback trust boundary");
     }
-    let lifetime_seconds = result
-        .pointer("/data/portal/expiresInSeconds")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|seconds| (30..=60 * 60).contains(seconds))
-        .ok_or_else(|| anyhow!("source setup returned an invalid portal lifetime"))?;
-
-    if let Err(error) = webbrowser::open(portal_url) {
-        warn!(
-            error = %error,
-            portal_url,
-            "could not launch the system browser; the bounded local portal remains available at the emitted URL"
-        );
-    }
-    info!(
-        portal_url,
-        lifetime_seconds,
-        "provider onboarding portal is active; press Ctrl-C after setup or wait for expiry"
-    );
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.context("failed to observe the provider-onboarding stop signal")
-        }
-        () = tokio::time::sleep(Duration::from_secs(lifetime_seconds)) => Ok(()),
-    }
+    webbrowser::open(portal_url)
+        .context("could not open the protected provider setup; use the emitted URL")?;
+    Ok(())
 }
 
 async fn run_doctor(config: AppConfig, output: OutputFormat) -> Result<()> {

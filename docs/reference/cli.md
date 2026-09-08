@@ -65,7 +65,7 @@ that name one; MCP never receives a filesystem path.
 
 | Command | Exact arguments and effect |
 | --- | --- |
-| `source register <provider> --confirm`; `source setup <provider> --confirm` | Register a code-supported profile or start/resume its bounded onboarding flow. |
+| `source register <provider> --confirm`; `source setup <provider> --confirm [--open-browser]` | Register a code-supported profile or start/resume its bounded onboarding flow. Setup emits the protected fallback URL and exits. Browser launch requires `--open-browser` with human output; JSON output never launches a browser or waits for the portal lifetime. |
 | `source status [provider]`; `source coverage [provider]`; `source health [provider]` | Bounded provider status, explicit coverage, or connection/integrity/freshness facts. |
 | `source discover <provider> --dataset <dataset>` | Bounded object list without ingestion authority. |
 | `source inspect <provider> --onboarding-session-id <UUID> --dataset-identifier <dataset> [--page-index 0..63] [--max-records 1..1024]` | One non-persisting provider page; defaults are `0` and `256`. |
