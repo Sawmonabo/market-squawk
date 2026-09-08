@@ -11,6 +11,8 @@ const LOWERCASE_IEEE754_HEX_PATTERN: &str = "^[0-9a-f]{16}$";
 const NANOSECOND_UTC_TIMESTAMP_PATTERN: &str =
     "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z$";
 const CALENDAR_DATE_PATTERN: &str = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
+const CALENDAR_MONTH_PATTERN: &str = "^[0-9]{4}-(?:0[1-9]|1[0-2])$";
+const SCALED_DECIMAL_PATTERN: &str = r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$";
 const CANONICAL_DECIMAL_PATTERN: &str = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
 const NON_WHITESPACE_PATTERN: &str = "\\S";
 const POSITIVE_DECIMAL_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
@@ -281,6 +283,8 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                 | LOWERCASE_IEEE754_HEX_PATTERN
                 | NANOSECOND_UTC_TIMESTAMP_PATTERN
                 | CALENDAR_DATE_PATTERN
+                | CALENDAR_MONTH_PATTERN
+                | SCALED_DECIMAL_PATTERN
                 | CANONICAL_DECIMAL_PATTERN
                 | NON_WHITESPACE_PATTERN
                 | POSITIVE_DECIMAL_PATTERN
@@ -444,10 +448,18 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
         Some(LOWERCASE_IEEE754_HEX_PATTERN) => lowercase_hex_matches(value, 16),
         Some(NANOSECOND_UTC_TIMESTAMP_PATTERN) => nanosecond_utc_timestamp_matches(value),
         Some(CALENDAR_DATE_PATTERN) => calendar_date_matches(value),
-        Some(CANONICAL_DECIMAL_PATTERN) => canonical_decimal_matches(value),
+        Some(CALENDAR_MONTH_PATTERN) => {
+            let bytes = value.as_bytes();
+            bytes.len() == 7
+                && bytes[..4].iter().all(u8::is_ascii_digit)
+                && bytes[4] == b'-'
+                && matches!(&bytes[5..], [b'0', b'1'..=b'9'] | [b'1', b'0'..=b'2'])
+        }
+        Some(CANONICAL_DECIMAL_PATTERN) => decimal_matches(value, false),
+        Some(SCALED_DECIMAL_PATTERN) => decimal_matches(value, true),
         Some(NON_WHITESPACE_PATTERN) => value.chars().any(|character| !character.is_whitespace()),
         Some(POSITIVE_DECIMAL_PATTERN) => {
-            canonical_decimal_matches(value) && !value.starts_with('-') && value != "0"
+            decimal_matches(value, false) && !value.starts_with('-') && value != "0"
         }
         Some(PERCENTAGE_PATTERN) => percentage_matches(value),
         Some(FORMATTED_PERCENTAGE_PATTERN) => formatted_percentage_matches(value),
@@ -491,7 +503,7 @@ fn calendar_date_matches(value: &str) -> bool {
         .is_ok_and(|parsed| parsed.format("%Y-%m-%d").to_string() == value)
 }
 
-fn canonical_decimal_matches(value: &str) -> bool {
+fn decimal_matches(value: &str, allow_trailing_fractional_zeroes: bool) -> bool {
     let unsigned = value.strip_prefix('-').unwrap_or(value);
     let mut components = unsigned.split('.');
     let Some(integer) = components.next() else {
@@ -508,12 +520,12 @@ fn canonical_decimal_matches(value: &str) -> bool {
     fraction.is_none_or(|fraction| {
         !fraction.is_empty()
             && fraction.bytes().all(|byte| byte.is_ascii_digit())
-            && !fraction.ends_with('0')
+            && (allow_trailing_fractional_zeroes || !fraction.ends_with('0'))
     })
 }
 
 fn percentage_matches(value: &str) -> bool {
-    if !canonical_decimal_matches(value) || value.starts_with('-') {
+    if !decimal_matches(value, false) || value.starts_with('-') {
         return false;
     }
     let mut components = value.split('.');
@@ -629,10 +641,11 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 #[cfg(test)]
 mod tests {
     use super::{
-        CALENDAR_DATE_PATTERN, CANONICAL_DECIMAL_PATTERN, FORMATTED_PERCENTAGE_PATTERN,
-        INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN, NON_WHITESPACE_PATTERN,
-        OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN, POSITIVE_DECIMAL_PATTERN,
-        UNSIGNED_INTEGER_PATTERN, validate_data, validate_data_schema,
+        CALENDAR_DATE_PATTERN, CALENDAR_MONTH_PATTERN, CANONICAL_DECIMAL_PATTERN,
+        FORMATTED_PERCENTAGE_PATTERN, INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN,
+        NON_WHITESPACE_PATTERN, OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN,
+        POSITIVE_DECIMAL_PATTERN, SCALED_DECIMAL_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data,
+        validate_data_schema,
     };
     use serde_json::json;
 
@@ -718,6 +731,8 @@ mod tests {
         assert!(!validate_data(&decimal_schema, &json!("01.0")));
 
         for (pattern, accepted, rejected) in [
+            (CALENDAR_MONTH_PATTERN, "2026-09", "2026-13"),
+            (SCALED_DECIMAL_PATTERN, "-1.50", "01.0"),
             (NON_WHITESPACE_PATTERN, "Investment", "   "),
             (POSITIVE_DECIMAL_PATTERN, "0.25", "-0.25"),
             (PERCENTAGE_PATTERN, "99.9", "100.1"),
