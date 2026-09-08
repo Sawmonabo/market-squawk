@@ -64,7 +64,7 @@ comparison policy, not evidence that dual-benchmark production is already comple
   source on 2026-09-08. Root inspected all seven data files and the two application call-site
   updates. No new test case, schema/table, CI or provider call was introduced. Financial workflow,
   corporate-action integration and installed whole-app acceptance remain open.
-- The current platform checkpoint adds separately locked, bounded authority namespaces in the
+- Pushed checkpoint `a6a715dfa56ed6e30d327db1164a974093503970` adds separately locked, bounded authority namespaces in the
   same retained directory. It reuses the existing two-copy writer and recovery path, allowing
   Desktop to preserve an unsupported profile payload before replacing its active settings.
   The existing `configuration_security` harness authority-state roundtrip case passed 1/1 on
@@ -73,6 +73,12 @@ comparison policy, not evidence that dual-benchmark production is already comple
   Root inspected the four platform file changes and updated the existing source-budget error
   mapping for the new typed invalid-namespace failure. This is scoped macOS persistence evidence;
   latest native Desktop integration and complete installed shutdown/restart remain unverified.
+- The current source-budget checkpoint removes the superseded budget-format decoder, conversion
+  types and its obsolete migration test. The single active bounded canonical representation and
+  existing recovery policy remain authoritative. The existing malformed/truncated/noncanonical
+  state rejection case passed 1/1 on unchanged source (2026-09-08, session 47370; no warnings).
+  Root inspected both file changes and verified their final hashes. No persisted application
+  state, provider credentials, backup or source snapshot was rewritten. No new test or CI ran.
 - Desktop profile/transport/brief work passed the pinned TypeScript check. Native orchestration,
   actual component policy validation, calibrated forecast production, realistic historical
   backtest evidence, valuation, persisted decision production and complete default/Advanced
