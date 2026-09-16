@@ -143,6 +143,10 @@ impl InstalledToolServiceRuntime {
 }
 
 impl InstalledToolServices {
+    pub(super) fn provider_setup_session_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.provider_credential_import.session_gate()
+    }
+
     pub(super) fn try_new(
         authorities: InstalledToolServiceAuthorities<'_>,
         runtime_resources: InstalledToolServiceRuntime,

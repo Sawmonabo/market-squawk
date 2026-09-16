@@ -33,7 +33,7 @@ pub use data::{
     EiaObservationClocks, EiaObservationFamily, EiaPageCompleteness, EiaPaginationTracker,
     EiaPeriod, EiaPeriodKind, EiaSeriesIdentity, EiaUnitSource, EiaValueKind,
 };
-pub use error::EiaError;
+pub use error::{EiaError, EiaStructureLimitKind, EiaStructureLimitReceipt};
 pub use lifecycle::{
     EiaActivatedProvider, EiaActivationRequirements, EiaDatasetProfile, EiaDoctorOutput,
     EiaDoctorReport, EiaLifecycleError, EiaPendingActivation, EiaPublicationMode, run_eia_doctor,
@@ -51,8 +51,9 @@ pub use request::{
 pub use transport::{
     EiaDataAcquisitionCursor, EiaDataPageMaterial, EiaDataPageSealRejoin, EiaDataPageTransition,
     EiaDataProbeRetrieval, EiaDataRetrieval, EiaDataRetrievalSealRejoin, EiaDataTransportReceipt,
-    EiaFacetMetadataRetrieval, EiaHttpReceipt, EiaPendingDataPage, EiaRawPageMaterial,
-    EiaRootPageJournalRejoin, EiaRouteMetadataRetrieval, EiaSourceTransport,
+    EiaFacetMetadataRetrieval, EiaHttpFailureClass, EiaHttpFailureReceipt, EiaHttpReceipt,
+    EiaPendingDataPage, EiaRawPageMaterial, EiaResponseStructureLimitReceipt, EiaResponseSurface,
+    EiaRetryAfterPresence, EiaRootPageJournalRejoin, EiaRouteMetadataRetrieval, EiaSourceTransport,
     EiaSourceTransportError, EiaTransportLimits, eia_api_endpoint_rules,
     eia_data_dataset_identifier,
 };

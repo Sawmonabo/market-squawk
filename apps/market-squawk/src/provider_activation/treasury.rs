@@ -1,22 +1,21 @@
 //! Asynchronous Treasury seal-first publication used by startup composition.
 
-use std::{num::NonZeroU16, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
-use market_squawk_adapter_treasury::TreasurySurface;
+use market_squawk_adapter_treasury::{
+    TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasurySurface,
+};
 use market_squawk_domain::SourceIdentifier;
 use market_squawk_services::{
-    JsonContractError, JsonStructureLimits, RequestContext, RequestId, ServiceLimits,
+    JsonContractError, JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
     ServiceLimitsError,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{
-    ProductionResearchIngestCoordinator, TreasuryApplicationClosure,
-    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
+    ResearchProviderRuntimeGeneration, TreasuryApplicationClosure, TreasuryMacroPublicationReceipt,
 };
-
-const MAXIMUM_DISCOVERY_OBJECTS: u16 = 64;
 
 /// Closed restart result for one exact configured Treasury surface.
 #[derive(Debug)]
@@ -40,14 +39,15 @@ pub(crate) enum TreasuryDurableRecovery {
 /// Missing datasets are returned separately from exact existing receipts. Invalid
 /// manifest/raw/native evidence is an error and must remain unavailable rather than falling
 /// through to reacquisition or another generation.
-pub(crate) fn reopen_treasury_latest_known(
+pub(crate) async fn reopen_treasury_latest_known(
     closure: Arc<TreasuryApplicationClosure>,
     surface: TreasurySurface,
     provider_datasets: Vec<SourceIdentifier>,
+    generation: ResearchProviderRuntimeGeneration,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<TreasuryDurableRecovery, TreasuryPublicationActivationError> {
-    validate_configured_datasets(&provider_datasets)?;
+    validate_configured_datasets(surface, &provider_datasets, true)?;
     let configured_dataset_count = provider_datasets.len();
     let mut receipts = Vec::new();
     receipts
@@ -58,13 +58,18 @@ pub(crate) fn reopen_treasury_latest_known(
         .try_reserve_exact(provider_datasets.len())
         .map_err(|_error| TreasuryPublicationActivationError::InvalidConfiguredDatasets)?;
     for provider_dataset in provider_datasets {
-        if cancellation.is_cancelled() || Instant::now() >= deadline {
-            return Err(TreasuryPublicationActivationError::ExistingPublicationUnavailable);
-        }
+        ensure_startup_live(deadline, &cancellation)?;
         let receipt = closure
-            .reopen_latest_published(surface, &provider_dataset, deadline, &cancellation)
+            .reopen_latest_published(
+                surface,
+                &provider_dataset,
+                &generation,
+                deadline,
+                &cancellation,
+            )
+            .await
             .map_err(|error| {
-                TreasuryPublicationActivationError::ExistingPublication(error.to_string())
+                TreasuryPublicationActivationError::ExistingPublication(Box::new(error))
             })?;
         if let Some(receipt) = receipt {
             receipts.push(receipt);
@@ -72,6 +77,7 @@ pub(crate) fn reopen_treasury_latest_known(
             missing.push(provider_dataset);
         }
     }
+    ensure_startup_live(deadline, &cancellation)?;
     if missing.is_empty() {
         if receipts.len() != configured_dataset_count {
             return Err(TreasuryPublicationActivationError::ExistingPublicationUnavailable);
@@ -94,17 +100,15 @@ pub(crate) fn reopen_treasury_latest_known(
 
 /// Publishes every exact configured dataset and returns only restart-verified receipts.
 pub(crate) async fn publish_treasury_latest_known(
-    coordinator: Arc<ProductionResearchIngestCoordinator>,
     closure: Arc<TreasuryApplicationClosure>,
     surface: TreasurySurface,
     provider_datasets: Vec<SourceIdentifier>,
+    generation: ResearchProviderRuntimeGeneration,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<Vec<TreasuryMacroPublicationReceipt>, TreasuryPublicationActivationError> {
-    validate_configured_datasets(&provider_datasets)?;
+    validate_configured_datasets(surface, &provider_datasets, false)?;
     let configured_dataset_count = provider_datasets.len();
-    let profile = SourceIdentifier::try_from(surface.profile_id())
-        .map_err(|_| TreasuryPublicationActivationError::InvalidCodeOwnedIdentity)?;
     let context = RequestContext::new(
         RequestId::String(Arc::from(match surface {
             TreasurySurface::FiscalData => "startup.treasury-fiscal.latest-known-publication",
@@ -114,69 +118,73 @@ pub(crate) async fn publish_treasury_latest_known(
         deadline,
         startup_limits()?,
     );
-    let maximum_objects = NonZeroU16::new(MAXIMUM_DISCOVERY_OBJECTS)
-        .ok_or(TreasuryPublicationActivationError::InvalidCodeOwnedLimit)?;
     let mut receipts = Vec::new();
     receipts
         .try_reserve_exact(configured_dataset_count)
         .map_err(|_error| TreasuryPublicationActivationError::InvalidConfiguredDatasets)?;
     for provider_dataset in provider_datasets {
-        let discovery = coordinator
-            .discover_registered_objects(
-                &profile,
-                &provider_dataset,
-                None,
-                maximum_objects,
-                &context,
-            )
-            .await
-            .map_err(|error| TreasuryPublicationActivationError::Publication(error.to_string()))?;
-        if discovery.objects().is_empty() {
-            return Err(TreasuryPublicationActivationError::IncompleteDiscovery);
-        }
-        let mut latest_receipt = None;
-        for object in discovery.objects() {
-            let selected = match surface {
-                TreasurySurface::FiscalData => TreasurySelectedObjectRequest::fiscal_data(
-                    provider_dataset.clone(),
-                    object.source_object().object_id().clone(),
-                    object.discovery_receipt().to_owned(),
-                ),
-                TreasurySurface::DailyRatesXml => TreasurySelectedObjectRequest::daily_rates(
-                    provider_dataset.clone(),
-                    object.source_object().object_id().clone(),
-                    object.discovery_receipt().to_owned(),
-                ),
-            }
-            .map_err(|error| TreasuryPublicationActivationError::Publication(error.to_string()))?;
-            let sealed = closure
-                .acquire_and_seal(selected, &context, deadline)
+        ensure_startup_live(deadline, context.cancellation())?;
+        let receipt = loop {
+            ensure_startup_live(deadline, context.cancellation())?;
+            if let Some(receipt) = closure
+                .publish_all_history(surface, &generation, &provider_dataset, &context)
                 .await
-                .map_err(|error| {
-                    TreasuryPublicationActivationError::Publication(error.to_string())
-                })?;
-            latest_receipt = Some(closure.publish(sealed, &context).await.map_err(|error| {
-                TreasuryPublicationActivationError::Publication(error.to_string())
-            })?);
-        }
-        receipts
-            .push(latest_receipt.ok_or(TreasuryPublicationActivationError::IncompleteDiscovery)?);
+                .map_err(|error| TreasuryPublicationActivationError::Publication(Box::new(error)))?
+            {
+                break receipt;
+            }
+        };
+        receipts.push(receipt);
     }
+    ensure_startup_live(deadline, context.cancellation())?;
     if receipts.len() != configured_dataset_count {
-        return Err(TreasuryPublicationActivationError::IncompleteDiscovery);
+        return Err(TreasuryPublicationActivationError::IncompletePublication);
     }
     Ok(receipts)
 }
 
-fn validate_configured_datasets(
-    provider_datasets: &[SourceIdentifier],
+fn ensure_startup_live(
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<(), TreasuryPublicationActivationError> {
+    if cancellation.is_cancelled() {
+        return Err(TreasuryPublicationActivationError::Publication(Box::new(
+            ServiceError::Cancelled,
+        )));
+    }
+    if Instant::now() >= deadline {
+        return Err(TreasuryPublicationActivationError::ExistingPublicationUnavailable);
+    }
+    Ok(())
+}
+
+fn validate_configured_datasets(
+    surface: TreasurySurface,
+    provider_datasets: &[SourceIdentifier],
+    require_complete: bool,
+) -> Result<(), TreasuryPublicationActivationError> {
+    let expected = match surface {
+        TreasurySurface::FiscalData => vec![
+            SourceIdentifier::try_from("treasury:fiscal-data:average-interest-rates-v2:all")
+                .map_err(|_| TreasuryPublicationActivationError::InvalidCodeOwnedIdentity)?,
+        ],
+        TreasurySurface::DailyRatesXml => TreasuryDailyRateFamily::ALL
+            .into_iter()
+            .map(|family| {
+                TreasuryDailyRateQuery::all_history(family)
+                    .map(|query| query.dataset().clone())
+                    .map_err(|_| TreasuryPublicationActivationError::InvalidCodeOwnedIdentity)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     if provider_datasets.is_empty()
-        || provider_datasets.len() > 32
+        || (require_complete && provider_datasets.len() != expected.len())
         || provider_datasets
             .iter()
             .enumerate()
-            .any(|(ordinal, dataset)| provider_datasets[..ordinal].contains(dataset))
+            .any(|(ordinal, dataset)| {
+                !expected.contains(dataset) || provider_datasets[..ordinal].contains(dataset)
+            })
     {
         return Err(TreasuryPublicationActivationError::InvalidConfiguredDatasets);
     }
@@ -195,18 +203,30 @@ pub(crate) enum TreasuryPublicationActivationError {
     InvalidConfiguredDatasets,
     #[error("the code-owned Treasury profile identity is invalid")]
     InvalidCodeOwnedIdentity,
-    #[error("the code-owned Treasury discovery limit is invalid")]
-    InvalidCodeOwnedLimit,
-    #[error("Treasury discovery returned no complete publication object")]
-    IncompleteDiscovery,
+    #[error("Treasury publication did not return the complete configured dataset set")]
+    IncompletePublication,
     #[error("an existing Treasury generation is unavailable before exact reopening completes")]
     ExistingPublicationUnavailable,
     #[error("an existing Treasury generation failed exact reopening: {0}")]
-    ExistingPublication(String),
+    ExistingPublication(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("the Treasury startup publication limits are invalid")]
     Limits(#[from] ServiceLimitsError),
     #[error("the Treasury startup publication structure limits are invalid")]
     Structure(#[from] JsonContractError),
     #[error("Treasury startup publication failed: {0}")]
-    Publication(String),
+    Publication(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl TreasuryPublicationActivationError {
+    pub(crate) fn is_terminal_cancellation(&self) -> bool {
+        match self {
+            Self::Publication(error) | Self::ExistingPublication(error) => {
+                matches!(
+                    error.downcast_ref::<ServiceError>(),
+                    Some(ServiceError::Cancelled)
+                ) || TreasuryApplicationClosure::is_terminal_cancellation(error.as_ref())
+            }
+            _ => false,
+        }
+    }
 }

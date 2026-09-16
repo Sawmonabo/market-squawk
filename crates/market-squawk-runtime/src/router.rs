@@ -102,6 +102,9 @@ pub enum DispatchError {
     /// Operation is not registered or its arguments are invalid.
     #[error("application operation was rejected")]
     Rejected,
+    /// An admitted result or execution resource limit was exceeded.
+    #[error("application operation exceeded an admitted resource limit")]
+    ResourceExhausted,
     /// Owned application authority is unavailable.
     #[error("application operation is unavailable")]
     Unavailable,
@@ -114,6 +117,7 @@ impl DispatchError {
     const fn code(self) -> &'static str {
         match self {
             Self::Rejected => "rejected",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::Unavailable => "unavailable",
             Self::Interrupted => "interrupted",
         }
@@ -522,6 +526,7 @@ async fn bootstrap(State(state): State<Arc<RouterState>>, request: Request<Body>
     match state.dispatcher.bootstrap() {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(DispatchError::Rejected) => rejected(StatusCode::BAD_REQUEST),
+        Err(DispatchError::ResourceExhausted) => rejected(StatusCode::TOO_MANY_REQUESTS),
         Err(DispatchError::Unavailable | DispatchError::Interrupted) => {
             rejected(StatusCode::SERVICE_UNAVAILABLE)
         }

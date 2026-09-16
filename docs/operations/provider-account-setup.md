@@ -52,6 +52,20 @@ Supply the normal explicit `--config <PATH>` option too when the installed servi
 non-default product configuration. Keep the source file until the secret-free receipt is retained;
 the importer does not delete it.
 
+If Settings → Onboarding reports locked encrypted credential storage, unlock that workspace's
+provider vault before importing. The installed CLI offers the same explicit action:
+
+```bash
+market-squawk source unlock-credentials --confirm
+```
+
+The command prompts without echo. For a protected pipe, add `--stdin`; input is limited to 4,096
+bytes and one trailing line ending is removed. Never put the password in a command argument or
+ordinary environment variable. The unlock is held only by the running service. This provider vault
+is separate from the installation's runtime-credential vault: `service bootstrap` unlocking the
+latter does not unlock provider storage. The action uses the existing authenticated staged setup
+operation and does not contact providers or activate collection.
+
 The 17 receipt-provider mappings are:
 
 | Receipt provider | Selected profile | Input mode |

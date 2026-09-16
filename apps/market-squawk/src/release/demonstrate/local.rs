@@ -84,6 +84,7 @@ pub(super) async fn run(
     let (training_root, training_environment_admitted) = verify_training_matrix(python_directory)?;
     let isolated = isolated_config(config, scratch.join("product"), training_root)?;
     let product = LocalProduct::try_new(isolated.clone())
+        .await
         .context("complete local product composition failed")?;
     let model_runtime_composed = product.model_runtime().is_some();
     if !model_runtime_composed {

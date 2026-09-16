@@ -188,6 +188,8 @@ fn map_cli_error(error: CliProviderActivationError) -> ServiceError {
         CliProviderActivationError::Onboarding(error) => map_onboarding_error(error),
         CliProviderActivationError::Activation(error) => map_activation_error(error),
         CliProviderActivationError::StateUnavailable
+        | CliProviderActivationError::TreasuryPublication(_)
+        | CliProviderActivationError::CancellationCleanup { .. }
         | CliProviderActivationError::InputUnavailable => ServiceError::Unavailable,
     }
 }

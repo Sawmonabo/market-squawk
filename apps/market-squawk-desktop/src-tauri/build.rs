@@ -21,7 +21,6 @@ fn main() {
         "model_control",
         "operations_control",
         "open_official_provider_page",
-        "open_protected_provider_setup",
         "paper_control",
         "preview_portfolio_import",
         "preview_research_file_import",

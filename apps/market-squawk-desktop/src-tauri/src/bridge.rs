@@ -21,7 +21,7 @@ use market_squawk_installer::{ProgramName, program_install_snapshot};
 use market_squawk_installer::{UninstallRequest, uninstall};
 use market_squawk_platform::{LocalPaths, SecretValue};
 use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient, RuntimeIdentity};
-use market_squawk_services::RequestId;
+use market_squawk_services::{JsonStructureLimits, RequestId, validate_json_contract};
 use serde_json::{Map, Value, json};
 use tauri::{Manager as _, State};
 use tokio_util::sync::CancellationToken;
@@ -53,8 +53,6 @@ const MAXIMUM_RESEARCH_PREPARATION_RECEIPTS: usize = 256;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
-const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
-const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
 const SCHWAB_PROVIDER_ID: &str = "schwab.trader-api-market-data";
 
 #[derive(Clone)]
@@ -1014,49 +1012,6 @@ impl DesktopGeneration {
         )
     }
 
-    async fn provider_sessions(
-        self: &Arc<Self>,
-        state: &DesktopState,
-    ) -> Result<Vec<Value>, DesktopCommandError> {
-        let result = invoke_application(
-            ApplicationInvocation {
-                operation: SOURCE_STATUS_OPERATION.to_owned(),
-                arguments: Map::new(),
-            },
-            state,
-            self,
-            InvocationAuthority::ReadOnly,
-        )
-        .await?;
-        Self::parse_provider_sessions(result)
-    }
-
-    fn parse_provider_sessions(result: Value) -> Result<Vec<Value>, DesktopCommandError> {
-        let rows = match result.get("data") {
-            Some(Value::Array(rows)) => rows,
-            Some(Value::Null) => return Ok(Vec::new()),
-            _ => return Err(DesktopCommandError::internal()),
-        };
-        let mut identities = BTreeSet::new();
-        let mut sessions = Vec::new();
-        for row in rows {
-            let Some(session) = row.get("currentSession") else {
-                return Err(DesktopCommandError::internal());
-            };
-            if session.is_null() {
-                continue;
-            }
-            let identity = session
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(DesktopCommandError::internal)?;
-            if identities.insert(identity.to_owned()) {
-                sessions.push(session.clone());
-            }
-        }
-        Ok(sessions)
-    }
-
     pub(crate) fn retain_governance_authorization(
         &self,
         window_label: &str,
@@ -1649,9 +1604,35 @@ async fn invoke_service_operation(
 async fn invoke_generation_operation(
     generation: &Arc<DesktopGeneration>,
     operation: &str,
+    arguments: Map<String, Value>,
+    authority: InvocationAuthority,
+    apply_desktop_result_limits: bool,
+) -> Result<Value, DesktopCommandError> {
+    let request_id = RequestId::try_string(format!("desktop-{}", Uuid::new_v4()))
+        .map_err(|_error| DesktopCommandError::internal())?;
+    let result = invoke_bounded_generation_operation(
+        generation,
+        operation,
+        arguments,
+        authority,
+        apply_desktop_result_limits,
+        request_id,
+        generation.cancellation(),
+    )
+    .await?;
+    let result = lossless_webview_value(result);
+    validate_desktop_json(&result, MAXIMUM_DESKTOP_RESULT_BYTES as usize, false)?;
+    Ok(result)
+}
+
+async fn invoke_bounded_generation_operation(
+    generation: &Arc<DesktopGeneration>,
+    operation: &str,
     mut arguments: Map<String, Value>,
     authority: InvocationAuthority,
     apply_desktop_result_limits: bool,
+    request_id: RequestId,
+    cancellation: CancellationToken,
 ) -> Result<Value, DesktopCommandError> {
     let descriptor = generation
         .service_bootstrap
@@ -1695,47 +1676,60 @@ async fn invoke_generation_operation(
         );
     }
     let arguments = Value::Object(arguments);
-    let argument_bytes =
-        serde_json::to_vec(&arguments).map_err(|_error| DesktopCommandError::internal())?;
-    if argument_bytes.len() > MAXIMUM_APPLICATION_ARGUMENT_BYTES {
-        return Err(DesktopCommandError::invalid_request(
-            "The operation input exceeds the desktop safety limits.",
-        ));
-    }
-    let request_id = RequestId::try_string(format!("desktop-{}", Uuid::new_v4()))
-        .map_err(|_error| DesktopCommandError::internal())?;
-    let response = generation
-        .application
+    validate_desktop_json(&arguments, MAXIMUM_APPLICATION_ARGUMENT_BYTES, true)?;
+    let setup_client = if operation == "Source.Onboarding.Apply" {
+        Some(
+            generation
+                .application
+                .with_transport_timeout(Duration::from_secs(120))
+                .map_err(map_application_client_error)?,
+        )
+    } else {
+        None
+    };
+    let application = setup_client
+        .as_ref()
+        .unwrap_or(generation.application.as_ref());
+    let response = application
         .invoke_operation(
             request_id,
             operation,
             arguments,
-            APPLICATION_REQUEST_TIMEOUT,
-            generation.cancellation(),
+            if setup_client.is_some() {
+                Duration::from_secs(120)
+            } else {
+                APPLICATION_REQUEST_TIMEOUT
+            },
+            cancellation,
         )
         .await
         .map_err(map_application_client_error)?;
     let result = decode_application_result(response.result())?;
-    let result_bytes =
-        serde_json::to_vec(&result).map_err(|_error| DesktopCommandError::internal())?;
-    let maximum_result_bytes = usize::try_from(MAXIMUM_DESKTOP_RESULT_BYTES)
-        .map_err(|_error| DesktopCommandError::internal())?;
-    if result_bytes.len() > maximum_result_bytes {
-        return Err(DesktopCommandError::new(
-            "resource_exhausted",
-            "The operation result exceeds the dashboard safety limit.",
-        ));
-    }
-    let result = lossless_webview_value(result);
-    let webview_bytes =
-        serde_json::to_vec(&result).map_err(|_error| DesktopCommandError::internal())?;
-    if webview_bytes.len() > maximum_result_bytes {
-        return Err(DesktopCommandError::new(
-            "resource_exhausted",
-            "The operation result exceeds the dashboard safety limit.",
-        ));
-    }
+    validate_desktop_json(&result, MAXIMUM_DESKTOP_RESULT_BYTES as usize, false)?;
     Ok(result)
+}
+
+fn validate_desktop_json(
+    value: &Value,
+    maximum_bytes: usize,
+    input: bool,
+) -> Result<(), DesktopCommandError> {
+    let structure = JsonStructureLimits::try_new(64, maximum_bytes, 100_000, 100_000)
+        .map_err(|_error| DesktopCommandError::internal())?;
+    validate_json_contract(value, structure, maximum_bytes)
+        .map(|_bytes| ())
+        .map_err(|_error| {
+            if input {
+                DesktopCommandError::invalid_request(
+                    "The operation input exceeds the desktop safety limits.",
+                )
+            } else {
+                DesktopCommandError::new(
+                    "resource_exhausted",
+                    "The operation result exceeds the dashboard safety limit.",
+                )
+            }
+        })
 }
 
 /// Preserves integers that JavaScript cannot represent exactly as decimal strings.
@@ -1781,42 +1775,74 @@ pub(crate) async fn provider_onboarding(
     if request.requires_confirmation() && !confirmed {
         return Err(DesktopCommandError::new(
             "confirmation_required",
-            "Confirm the provider change before continuing.",
+            "Confirm the connection change before continuing.",
         ));
     }
-    match request {
-        ProviderOnboardingCommand::Bootstrap => provider_bootstrap(&state, &generation).await,
-        ProviderOnboardingCommand::Start {
-            surface_id,
-            organization,
-            administrative_email,
-        } => reject_protected_provider_action((surface_id, organization, administrative_email)),
-        ProviderOnboardingCommand::Resume { session_id }
-        | ProviderOnboardingCommand::Renew { session_id }
-        | ProviderOnboardingCommand::Cleanup { session_id }
-        | ProviderOnboardingCommand::Cancel { session_id } => {
-            reject_protected_provider_action(session_id)
-        }
-        ProviderOnboardingCommand::UnlockFallback { secret } => {
-            reject_protected_provider_action(secret)
-        }
-        ProviderOnboardingCommand::LockFallback => reject_protected_provider_action(()),
-        ProviderOnboardingCommand::SubmitSecret { session_id, secret } => {
-            reject_protected_provider_action((session_id, secret))
-        }
-        ProviderOnboardingCommand::Activate {
-            session_id,
-            request,
-        } => reject_protected_provider_action((session_id, request)),
+    if matches!(request, ProviderOnboardingCommand::Bootstrap) {
+        return provider_bootstrap(&state, &generation).await;
     }
-}
-
-fn reject_protected_provider_action<T>(request: T) -> Result<Value, DesktopCommandError> {
-    drop(request);
-    Err(DesktopCommandError::new(
-        "protected_provider_setup_required",
-        "Continue this provider change in Market Squawk's protected local setup window.",
-    ))
+    if let ProviderOnboardingCommand::Inspect { session_id } = &request {
+        let response = invoke_private_application(
+            "Source.Onboarding.GetState",
+            Map::from_iter([(
+                "sessionId".to_owned(),
+                Value::String(session_id.to_string()),
+            )]),
+            &state,
+            &generation,
+            InvocationAuthority::ReadOnly,
+        )
+        .await?;
+        state.admit_current(&generation)?;
+        return response
+            .get("data")
+            .cloned()
+            .ok_or_else(DesktopCommandError::internal);
+    }
+    if matches!(
+        &request,
+        ProviderOnboardingCommand::SchwabOAuth {
+            lifecycle_action: market_squawk::provider_onboarding::SchwabOAuthLifecycleAction::Begin,
+            ..
+        }
+    ) {
+        ensure_schwab_callback_trust(&state, &generation).await?;
+    }
+    let mut arguments = Map::new();
+    arguments.insert(
+        "request".to_owned(),
+        serde_json::to_value(request).map_err(|_| DesktopCommandError::internal())?,
+    );
+    let response = invoke_private_application(
+        "Source.Onboarding.Apply",
+        arguments,
+        &state,
+        &generation,
+        InvocationAuthority::ExactConfirmed("Source.Onboarding.Apply"),
+    )
+    .await?;
+    let data = response
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(DesktopCommandError::internal)?;
+    match data.get("outcome").and_then(Value::as_str) {
+        Some("completed") => data
+            .get("value")
+            .cloned()
+            .ok_or_else(DesktopCommandError::internal),
+        Some("rejected") => {
+            let message = data
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| message.len() <= 512)
+                .ok_or_else(DesktopCommandError::internal)?;
+            Err(DesktopCommandError::new(
+                "connection_setup_rejected",
+                message,
+            ))
+        }
+        _ => Err(DesktopCommandError::internal()),
+    }
 }
 
 #[tauri::command]
@@ -1851,100 +1877,47 @@ pub(crate) fn open_official_provider_page(
     state.admit_current(&generation)
 }
 
-#[tauri::command]
-pub(crate) async fn open_protected_provider_setup(
-    provider_id: String,
-    state: State<'_, DesktopState>,
+async fn ensure_schwab_callback_trust(
+    state: &DesktopState,
+    generation: &Arc<DesktopGeneration>,
 ) -> Result<(), DesktopCommandError> {
-    let generation = state.generation()?;
-    let supported = generation
-        .service_bootstrap
-        .provider_profiles
-        .as_array()
-        .is_some_and(|profiles| {
-            profiles.iter().any(|profile| {
-                profile.get("id").and_then(Value::as_str) == Some(provider_id.as_str())
-            })
-        });
-    if !supported {
-        return Err(DesktopCommandError::invalid_request(
-            "The selected provider is not supported.",
-        ));
-    }
-    if provider_id == SCHWAB_PROVIDER_ID {
-        let authority = state.service_authority();
-        let status = authority
+    let authority = state.service_authority();
+    let status = authority
+        .schwab_oauth_installation_trust(
+            SchwabOAuthInstallationTrustAction::Status,
+            generation.cancellation(),
+        )
+        .await
+        .map_err(map_schwab_callback_trust_error)?;
+    let trust = match status {
+        SchwabOAuthInstallationTrustState::Trusted => status,
+        SchwabOAuthInstallationTrustState::SetupRequired => authority
             .schwab_oauth_installation_trust(
-                SchwabOAuthInstallationTrustAction::Status,
+                SchwabOAuthInstallationTrustAction::Enroll,
                 generation.cancellation(),
             )
             .await
-            .map_err(map_schwab_callback_trust_error)?;
-        let trust = match status {
-            SchwabOAuthInstallationTrustState::Trusted => status,
-            SchwabOAuthInstallationTrustState::SetupRequired => authority
-                .schwab_oauth_installation_trust(
-                    SchwabOAuthInstallationTrustAction::Enroll,
-                    generation.cancellation(),
-                )
-                .await
-                .map_err(map_schwab_callback_trust_error)?,
-            SchwabOAuthInstallationTrustState::RepairRequired => {
-                return Err(DesktopCommandError::new(
-                    "schwab_callback_repair_required",
-                    "Schwab's private local callback needs repair before setup can continue.",
-                ));
-            }
-            SchwabOAuthInstallationTrustState::Unsupported => {
-                return Err(DesktopCommandError::new(
-                    "schwab_callback_unsupported",
-                    "Secure Schwab browser setup is not available on this operating system yet.",
-                ));
-            }
-        };
-        if trust != SchwabOAuthInstallationTrustState::Trusted {
+            .map_err(map_schwab_callback_trust_error)?,
+        SchwabOAuthInstallationTrustState::RepairRequired => {
             return Err(DesktopCommandError::new(
-                "schwab_callback_trust_required",
-                "Schwab setup needs approval for Market Squawk's private local callback.",
+                "schwab_callback_repair_required",
+                "Schwab's private local callback needs repair before setup can continue.",
             ));
         }
+        SchwabOAuthInstallationTrustState::Unsupported => {
+            return Err(DesktopCommandError::new(
+                "schwab_callback_unsupported",
+                "Secure Schwab browser setup is not available on this operating system yet.",
+            ));
+        }
+    };
+    if trust != SchwabOAuthInstallationTrustState::Trusted {
+        return Err(DesktopCommandError::new(
+            "schwab_callback_trust_required",
+            "Schwab setup needs approval for Market Squawk's private local callback.",
+        ));
     }
-    let mut arguments = Map::new();
-    arguments.insert("provider".to_owned(), Value::String(provider_id));
-    arguments.insert("confirm".to_owned(), Value::Bool(true));
-    let result = invoke_application(
-        ApplicationInvocation {
-            operation: SOURCE_SETUP_OPERATION.to_owned(),
-            arguments,
-        },
-        &state,
-        &generation,
-        InvocationAuthority::ExactConfirmed(SOURCE_SETUP_OPERATION),
-    )
-    .await?;
-    let portal_url = result
-        .pointer("/data/portal/url")
-        .and_then(Value::as_str)
-        .ok_or_else(DesktopCommandError::internal)?;
-    let parsed = Url::parse(portal_url).map_err(|_error| DesktopCommandError::internal())?;
-    if parsed.scheme() != "http"
-        || parsed.host_str() != Some("127.0.0.1")
-        || parsed.port().is_none()
-        || parsed.username() != ""
-        || parsed.password().is_some()
-        || parsed.path() != "/"
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(DesktopCommandError::internal());
-    }
-    tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>).map_err(|_error| {
-        DesktopCommandError::new(
-            "open_failed",
-            "The protected provider setup could not be opened in the system browser.",
-        )
-    })?;
-    state.admit_current(&generation)
+    state.admit_current(generation)
 }
 
 fn map_schwab_callback_trust_error(error: DesktopServiceError) -> DesktopCommandError {
@@ -1987,7 +1960,18 @@ async fn provider_bootstrap(
     state: &DesktopState,
     generation: &Arc<DesktopGeneration>,
 ) -> Result<Value, DesktopCommandError> {
-    let sessions = generation.provider_sessions(state).await?;
+    let response = invoke_private_application(
+        "Source.Onboarding.GetState",
+        Map::new(),
+        state,
+        generation,
+        InvocationAuthority::ReadOnly,
+    )
+    .await?;
+    let current = response
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(DesktopCommandError::internal)?;
     let supports = |operation: &str| {
         generation
             .service_bootstrap
@@ -1997,9 +1981,10 @@ async fn provider_bootstrap(
     };
     state.admit_current(generation)?;
     Ok(json!({
-        "profiles": generation.service_bootstrap.provider_profiles,
-        "sessions": sessions,
-        "encryptedFileFallback": generation.service_bootstrap.encrypted_file_fallback,
+        "profiles": current.get("profiles").ok_or_else(DesktopCommandError::internal)?,
+        "sessions": current.get("sessions").ok_or_else(DesktopCommandError::internal)?,
+        "setup": current.get("setup").ok_or_else(DesktopCommandError::internal)?,
+        "encryptedFileFallback": current.get("encryptedFileFallback").ok_or_else(DesktopCommandError::internal)?,
         "capabilities": {
             "credentialImport": supports("Source.ImportCredentialBundle"),
             "health": supports("Source.GetHealth"),
@@ -2044,6 +2029,15 @@ pub(crate) fn decode_application_result(response: &Value) -> Result<Value, Deskt
     let object = response
         .as_object()
         .ok_or_else(DesktopCommandError::internal)?;
+    if object.len() == 2
+        && object.get("ok") == Some(&Value::Bool(false))
+        && object.get("error").and_then(Value::as_str) == Some("resource_exhausted")
+    {
+        return Err(DesktopCommandError::new(
+            "resource_exhausted",
+            "This request exceeds the app's processing limits. Try a smaller request.",
+        ));
+    }
     if object.len() != 2 || object.get("ok") != Some(&Value::Bool(true)) {
         return Err(DesktopCommandError::new(
             "operation_failed",

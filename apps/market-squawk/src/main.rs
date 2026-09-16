@@ -5,7 +5,6 @@
 
 use std::{
     ffi::OsString,
-    io::{IsTerminal as _, Read as _},
     path::Path,
     process::{Command as ProcessCommand, Stdio},
     sync::Arc,
@@ -18,7 +17,7 @@ use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
     cli::{
         Cli, Command, ConfigCommand, McpCommand, OutputFormat, ReleaseCommand,
-        ReleaseEvidenceCommand, ServiceCommand,
+        ReleaseEvidenceCommand, ServiceCommand, SourceCommand,
     },
     doctor,
     local_product::{execute_installed_cli_command, verified_installed_service_program},
@@ -41,7 +40,7 @@ use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
     CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy, ConfigOverrides,
-    ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter, SecretValue,
+    ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter,
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 use market_squawk_runtime::NamedClient;
@@ -52,7 +51,6 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const APPLICATION_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
-const MAXIMUM_BOOTSTRAP_UNLOCK_BYTES: u64 = 4 * 1024;
 
 fn main() -> Result<()> {
     let application = std::thread::Builder::new()
@@ -101,7 +99,7 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Init => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let product = LocalProduct::try_new(config)?;
+            let product = LocalProduct::try_new(config).await?;
             let initialization = (|| -> Result<()> {
                 if let Some(path) = product
                     .paths()
@@ -359,7 +357,18 @@ async fn run_product_command(
 ) -> Result<()> {
     let connector = installed_service_connector(&config, installation_data_root)?;
     let client = connector.connect(NamedClient::Cli, None)?;
-    let result = execute_installed_cli_command(&client, command).await?;
+    let setup_client = if matches!(
+        &command,
+        Command::Source {
+            command: SourceCommand::Activate { .. } | SourceCommand::UnlockCredentials { .. }
+        }
+    ) {
+        Some(client.with_transport_timeout(Duration::from_secs(120))?)
+    } else {
+        None
+    };
+    let client = setup_client.as_ref().unwrap_or(&client);
+    let result = execute_installed_cli_command(client, command).await?;
     emit_result(output, result.summary(), result.value())
 }
 
@@ -400,7 +409,10 @@ async fn run_service_command(
             } else {
                 serde_json::to_value(
                     connector
-                        .bootstrap_unlock(captured_status, read_bootstrap_unlock(stdin)?)
+                        .bootstrap_unlock(
+                            captured_status,
+                            market_squawk::cli::read_encrypted_storage_unlock(stdin)?,
+                        )
                         .await?,
                 )?
             };
@@ -435,33 +447,6 @@ async fn service_status(
         "installed service requires credential bootstrap",
         serde_json::json!({"status": "bootstrap_required", "bootstrap": status}),
     ))
-}
-
-fn read_bootstrap_unlock(explicit_stdin: bool) -> Result<SecretValue> {
-    if explicit_stdin {
-        let mut bytes = Vec::new();
-        std::io::stdin()
-            .take(MAXIMUM_BOOTSTRAP_UNLOCK_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("failed to read the bounded bootstrap unlock from standard input")?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAXIMUM_BOOTSTRAP_UNLOCK_BYTES {
-            anyhow::bail!("bootstrap unlock exceeds its input bound");
-        }
-        if bytes.last() == Some(&b'\n') {
-            bytes.pop();
-            if bytes.last() == Some(&b'\r') {
-                bytes.pop();
-            }
-        }
-        return SecretValue::from_utf8_bytes(bytes)
-            .context("bootstrap unlock is empty, invalid UTF-8, or outside its secret bound");
-    }
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!("bootstrap unlock requires a terminal or explicit --stdin");
-    }
-    let unlock = rpassword::prompt_password("Encrypted fallback unlock: ")
-        .context("failed to read the no-echo bootstrap unlock")?;
-    SecretValue::new(unlock).context("bootstrap unlock is empty or outside its secret bound")
 }
 
 async fn installed_service_snapshot(

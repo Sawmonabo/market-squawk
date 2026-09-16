@@ -26,17 +26,12 @@ use crate::provider_onboarding::{
 pub(super) use evidence::ActivationEvidenceCandidate;
 
 const RECIPE_SCHEMA_VERSION: u16 = 5;
-const EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION: u16 = 4;
-const PREDECESSOR_RECIPE_SCHEMA_VERSION: u16 = 3;
-const LEGACY_RECIPE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_RECORD_KIND: &str = "provider_activation_quarantine";
 const MAXIMUM_RECIPE_EVIDENCE_OBJECTS: usize = 1_024;
 const ACTIVATION_STATE_DIRECTORY: &str = "sources/provider-activation-v1";
 const SOURCE_LIFECYCLE_SCHEMA_VERSION: u16 = 2;
-const LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_METADATA_BACKUP_SCHEMA_VERSION: u16 = 2;
-const LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT: usize = 11;
 pub(super) const PROVIDER_METADATA_BACKUP_SCHEMA: &str = "market-squawk-provider-metadata-v1";
 pub(super) const PROVIDER_METADATA_BACKUP_PRODUCER: &str =
     "market-squawk.provider-metadata-authority";
@@ -44,7 +39,7 @@ const MAXIMUM_PROVIDER_METADATA_BACKUP_BYTES: usize = 160 * 1024 * 1024;
 const MAXIMUM_BACKUP_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024;
 const RESTORED_REQUIREMENT_SCHEMA_VERSION: u16 = 1;
 
-pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 10] = [
+pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 11] = [
     SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -55,8 +50,9 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 10] = [
     "federal-reserve-board.data-download-program",
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
+    "eia.api-v2",
 ];
-pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 11] = [
+pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 12] = [
     SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -68,6 +64,7 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 11] = [
     "federal-reserve-board.data-download-program",
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
+    "eia.api-v2",
 ];
 
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
@@ -79,8 +76,8 @@ const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
     ProviderMarketAccount::SchwabMarketData.surface_id(),
 ];
 
-// New lifecycle surfaces are appended so schema-v1 backups remain an exact prefix.
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 17] = [
+// The current backup records every lifecycle surface in this exact order.
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 18] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
@@ -98,6 +95,7 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 17] = [
     ProviderMarketAccount::SchwabMarketData.surface_id(),
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
+    "eia.api-v2",
 ];
 
 /// Least-authority owner seam for the protected provider-metadata component.
@@ -222,7 +220,7 @@ impl ProviderMetadataBackupAuthority {
         })
     }
 
-    /// Restores only into absent activation/evidence and registry authority stores.
+    /// Validates the current backup before restoring into absent authority stores.
     pub(super) fn restore_fresh(
         activation: &DurableProviderActivationState,
         registry_store: LocalAuthorityStateStore,
@@ -527,12 +525,17 @@ impl DurableProviderActivationState {
         Arc::clone(&self.activation_gate).lock_owned().await
     }
 
+    /// Reports control support from the same closed set admitted by the lifecycle owner.
+    pub(super) fn supports_source_lifecycle(surface_id: &str) -> bool {
+        SERIALIZED_LIFECYCLE_SURFACES.contains(&surface_id)
+    }
+
     /// Serializes lifecycle compare-and-apply for every code-owned source surface.
     pub(super) async fn acquire_source_lifecycle(
         &self,
         surface_id: &str,
     ) -> Result<OwnedMutexGuard<()>, DurableProviderActivationStateError> {
-        if !SERIALIZED_LIFECYCLE_SURFACES.contains(&surface_id) {
+        if !Self::supports_source_lifecycle(surface_id) {
             return Err(DurableProviderActivationStateError::UnknownSurface);
         }
         Ok(Arc::clone(&self.activation_gate).lock_owned().await)
@@ -1142,7 +1145,12 @@ impl DurableProviderActivationState {
                     | DurableSourceLifecyclePhase::ReconciliationRequired
             )
         {
-            return Ok(DurableActivationRecipeState::Missing);
+            // Quarantine is disabled audit state, not a recipe that can regain authority.
+            // Preserve it even when its derived lifecycle requires reconciliation.
+            return Ok(match self.load_recipe_for_lifecycle(surface_id) {
+                Ok(state @ DurableActivationRecipeState::Quarantined(_)) => state,
+                _ => DurableActivationRecipeState::Missing,
+            });
         }
         self.load_recipe_for_lifecycle(surface_id)
     }
@@ -1487,22 +1495,12 @@ fn validate_provider_metadata_backup(
     let wire: ProviderMetadataBackupWire =
         serde_json::from_slice(bytes).map_err(|_| ProviderMetadataBackupError::Invalid)?;
     if wire.schema != PROVIDER_METADATA_BACKUP_SCHEMA
+        || wire.schema_version != PROVIDER_METADATA_BACKUP_SCHEMA_VERSION
+        || wire.lifecycle_records.len() != SERIALIZED_LIFECYCLE_SURFACES.len()
         || serde_json::to_vec(&wire).map_err(|_| ProviderMetadataBackupError::Invalid)? != bytes
     {
         return Err(ProviderMetadataBackupError::Invalid);
     }
-    let backup_schema_version = wire.schema_version;
-    let expected_lifecycle_surfaces: &[&str] = match backup_schema_version {
-        PROVIDER_METADATA_BACKUP_SCHEMA_VERSION => &SERIALIZED_LIFECYCLE_SURFACES,
-        LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION => {
-            &SERIALIZED_LIFECYCLE_SURFACES[..LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT]
-        }
-        _ => return Err(ProviderMetadataBackupError::Invalid),
-    };
-    if wire.lifecycle_records.len() != expected_lifecycle_surfaces.len() {
-        return Err(ProviderMetadataBackupError::Invalid);
-    }
-
     let mut lifecycle_records = Vec::new();
     lifecycle_records
         .try_reserve_exact(SERIALIZED_LIFECYCLE_SURFACES.len())
@@ -1510,7 +1508,7 @@ fn validate_provider_metadata_backup(
     for (encoded, expected_surface) in wire
         .lifecycle_records
         .into_iter()
-        .zip(expected_lifecycle_surfaces.iter().copied())
+        .zip(SERIALIZED_LIFECYCLE_SURFACES)
     {
         if encoded.surface_id != expected_surface {
             return Err(ProviderMetadataBackupError::Invalid);
@@ -1521,27 +1519,6 @@ fn validate_provider_metadata_backup(
             return Err(ProviderMetadataBackupError::Invalid);
         }
         lifecycle_records.push((encoded.surface_id, bytes));
-    }
-    if backup_schema_version == LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION {
-        for surface_id in
-            &SERIALIZED_LIFECYCLE_SURFACES[LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT..]
-        {
-            let record = DurableSourceLifecycleRecord {
-                revision: NonZeroU64::MIN,
-                phase: DurableSourceLifecyclePhase::Stopped,
-                operation_id: None,
-                command_digest: None,
-                transition_digest: None,
-                session_id: None,
-                public_configuration_digest: None,
-                runtime_verification_receipt_digest: None,
-                credential_generation: None,
-            };
-            lifecycle_records.push((
-                (*surface_id).to_owned(),
-                encode_source_lifecycle(surface_id, &record)?,
-            ));
-        }
     }
 
     let mut activation_recipes = Vec::new();
@@ -1777,7 +1754,7 @@ fn quarantine_encoded(
     {
         return digest_from_lower_hex(&existing.state_sha256);
     }
-    let recipe = serde_json::from_slice::<RecipeWire>(encoded).ok();
+    let recipe = serde_json::from_slice::<QuarantineEvidenceFields>(encoded).ok();
     let session_id = recipe.as_ref().map(|recipe| recipe.session_id);
     let mut evidence_digests = recipe
         .map(|recipe| recipe.evidence_digests)
@@ -1842,19 +1819,25 @@ struct RecipeWire {
     predecessor_runtime_generation_sha256: Option<String>,
     bundle_sha256: String,
     request_json: String,
-    #[serde(default)]
     publication_state: RecipePublicationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     predecessor_recipe_json: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RecipePublicationState {
     Staged,
     Cutover,
-    #[default]
     Desired,
+}
+
+// Rejected payloads retain only bounded audit identity; these fields never authorize a recipe.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuarantineEvidenceFields {
+    session_id: Uuid,
+    evidence_digests: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1881,6 +1864,7 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
         "federal-reserve-board.data-download-program" => Ok("federal-reserve-board-h15"),
         "yahoo-finance.experimental-enrichment" => Ok("yahoo-enrichment"),
         "tiingo.starter-eod-nav" => Ok("tiingo-starter-eod-nav"),
+        "eia.api-v2" => Ok("eia-api-v2"),
         _ => Err(DurableProviderActivationStateError::UnknownSurface),
     }
 }
@@ -2046,22 +2030,11 @@ fn decode_recipe(
 ) -> Result<DurableActivationRecipeState, DurableProviderActivationStateError> {
     let recipe: RecipeWire = serde_json::from_slice(encoded)
         .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
-    if !matches!(
-        recipe.schema_version,
-        RECIPE_SCHEMA_VERSION
-            | EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION
-            | PREDECESSOR_RECIPE_SCHEMA_VERSION
-            | LEGACY_RECIPE_SCHEMA_VERSION
-    ) || recipe.surface_id != surface_id
+    if recipe.schema_version != RECIPE_SCHEMA_VERSION
+        || recipe.surface_id != surface_id
         || recipe.request_json.is_empty()
         || recipe.evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS
         || !strictly_ordered(&recipe.evidence_digests)
-        || recipe.schema_version == LEGACY_RECIPE_SCHEMA_VERSION
-            && recipe.publication_state != RecipePublicationState::Desired
-        || recipe.schema_version != RECIPE_SCHEMA_VERSION
-            && recipe.publication_state == RecipePublicationState::Cutover
-        || recipe.schema_version < EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION
-            && recipe.predecessor_recipe_json.is_some()
         || recipe.publication_state == RecipePublicationState::Desired
             && recipe.predecessor_recipe_json.is_some()
         || recipe.publication_state == RecipePublicationState::Cutover
@@ -2086,7 +2059,6 @@ fn decode_recipe(
     let request_bytes = recipe.request_json.as_bytes();
     if sha256_bytes(request_bytes) != recipe.request_sha256
         || bundle_digest(
-            recipe.schema_version,
             recipe.publication_state,
             surface_id,
             recipe.session_id,
@@ -2185,7 +2157,6 @@ fn encode_recipe(
         predecessor_runtime_generation_sha256: predecessor_runtime_generation_digest
             .map(|digest| lower_hex(&digest.bytes())),
         bundle_sha256: bundle_digest(
-            RECIPE_SCHEMA_VERSION,
             publication_state,
             surface_id,
             session_id,
@@ -2215,7 +2186,6 @@ fn digest_bytes(bytes: &[u8]) -> EvidenceDigest {
     reason = "independent digest schema and integrity inputs stay explicit"
 )]
 fn bundle_digest(
-    schema_version: u16,
     publication_state: RecipePublicationState,
     surface_id: &str,
     session_id: Uuid,
@@ -2226,40 +2196,12 @@ fn bundle_digest(
     predecessor_recipe: Option<&[u8]>,
 ) -> Result<String, DurableProviderActivationStateError> {
     let mut hasher = Sha256::new();
-    match schema_version {
-        LEGACY_RECIPE_SCHEMA_VERSION => {
-            hasher.update(b"market-squawk:durable-provider-activation:v2");
-        }
-        PREDECESSOR_RECIPE_SCHEMA_VERSION => {
-            hasher.update(b"market-squawk:durable-provider-activation:v3");
-            hasher.update([match publication_state {
-                RecipePublicationState::Staged => 0,
-                RecipePublicationState::Cutover => {
-                    return Err(DurableProviderActivationStateError::InvalidRecipe);
-                }
-                RecipePublicationState::Desired => 1,
-            }]);
-        }
-        EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION => {
-            hasher.update(b"market-squawk:durable-provider-activation:v4");
-            hasher.update([match publication_state {
-                RecipePublicationState::Staged => 0,
-                RecipePublicationState::Cutover => {
-                    return Err(DurableProviderActivationStateError::InvalidRecipe);
-                }
-                RecipePublicationState::Desired => 1,
-            }]);
-        }
-        RECIPE_SCHEMA_VERSION => {
-            hasher.update(b"market-squawk:durable-provider-activation:v5");
-            hasher.update([match publication_state {
-                RecipePublicationState::Staged => 0,
-                RecipePublicationState::Cutover => 1,
-                RecipePublicationState::Desired => 2,
-            }]);
-        }
-        _ => return Err(DurableProviderActivationStateError::InvalidRecipe),
-    }
+    hasher.update(b"market-squawk:durable-provider-activation:v5");
+    hasher.update([match publication_state {
+        RecipePublicationState::Staged => 0,
+        RecipePublicationState::Cutover => 1,
+        RecipePublicationState::Desired => 2,
+    }]);
     hash_field(&mut hasher, surface_id.as_bytes())?;
     hasher.update(session_id.as_bytes());
     hash_field(&mut hasher, request_bytes)?;
@@ -2277,19 +2219,12 @@ fn bundle_digest(
     for digest in evidence_digests {
         hash_field(&mut hasher, digest.as_bytes())?;
     }
-    if matches!(
-        schema_version,
-        EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION | RECIPE_SCHEMA_VERSION
-    ) {
-        match predecessor_recipe {
-            Some(encoded) => {
-                hasher.update([1]);
-                hash_field(&mut hasher, encoded)?;
-            }
-            None => hasher.update([0]),
+    match predecessor_recipe {
+        Some(encoded) => {
+            hasher.update([1]);
+            hash_field(&mut hasher, encoded)?;
         }
-    } else if predecessor_recipe.is_some() {
-        return Err(DurableProviderActivationStateError::InvalidRecipe);
+        None => hasher.update([0]),
     }
     Ok(lower_hex(&hasher.finalize()))
 }
@@ -2668,7 +2603,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let initial = crate::LocalProduct::try_new(config.clone())?;
+        let initial = crate::LocalProduct::try_new(config.clone()).await?;
         let state = initial.provider_activation_state().clone();
         let onboarding = initial.provider_onboarding();
         onboarding
@@ -2745,7 +2680,7 @@ mod tests {
             None,
         )?;
 
-        let recovered = crate::LocalProduct::try_new(config)?;
+        let recovered = crate::LocalProduct::try_new(config).await?;
         assert!(matches!(
             state.load_recipe_for_startup_recovery(credential_surface)?,
             DurableActivationRecipeState::Missing
@@ -2784,7 +2719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_provider_metadata_restores_with_stopped_account_lifecycles() -> TestResult {
+    async fn provider_metadata_rejects_legacy_backups_before_current_restore() -> TestResult {
         let source = tempfile::tempdir()?;
         let environment = BTreeMap::<OsString, OsString>::new();
         let config = AppConfig::load(ConfigSources::new(
@@ -2795,11 +2730,11 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config)?;
+        let product = crate::LocalProduct::try_new(config).await?;
         let state = product.provider_activation_state().clone();
         let surface_id = "treasury.fiscal-data";
         let retained_session = Uuid::new_v4();
-        let retained_request = br#"{"schema_version":2,"candidate":"retained"}"#;
+        let retained_request = br#"{"schema_version":6,"candidate":"retained"}"#;
         let retained_digest = state.publish_recipe(
             surface_id,
             None,
@@ -2817,18 +2752,26 @@ mod tests {
         let retained = authority
             .retain(&tokio_util::sync::CancellationToken::new())
             .await?;
-        let mut legacy_wire: ProviderMetadataBackupWire = serde_json::from_slice(retained.bytes())?;
-        legacy_wire.schema_version = LEGACY_PROVIDER_METADATA_BACKUP_SCHEMA_VERSION;
-        legacy_wire
-            .lifecycle_records
-            .truncate(LEGACY_PROVIDER_METADATA_LIFECYCLE_SURFACE_COUNT);
-        let legacy_backup = serde_json::to_vec(&legacy_wire)?;
+        let current_wire: ProviderMetadataBackupWire = serde_json::from_slice(retained.bytes())?;
+        assert_eq!(
+            current_wire.schema_version,
+            PROVIDER_METADATA_BACKUP_SCHEMA_VERSION
+        );
+        assert_eq!(
+            current_wire
+                .lifecycle_records
+                .iter()
+                .map(|record| record.surface_id.as_str())
+                .collect::<Vec<_>>(),
+            SERIALIZED_LIFECYCLE_SURFACES
+        );
+        let retained_sha256 = sha256_bytes(retained.bytes());
 
-        state.publish_recipe(
+        let later_digest = state.publish_recipe(
             surface_id,
             Some(retained_digest),
             Uuid::new_v4(),
-            br#"{"schema_version":2,"candidate":"later"}"#,
+            br#"{"schema_version":6,"candidate":"later"}"#,
             &[],
             generation_digest(22),
             Some(generation_digest(21)),
@@ -2837,13 +2780,40 @@ mod tests {
         let destination = tempfile::tempdir()?;
         let restored_state =
             DurableProviderActivationState::new(destination.path().join("control"));
-        let registry_store = LocalAuthorityStateStore::try_open(
-            destination.path().join("control/sources/research-runtime"),
-        )?;
+        let registry_root = destination.path().join("control/sources/research-runtime");
+        for (schema_version, lifecycle_count) in [
+            (1, SERIALIZED_LIFECYCLE_SURFACES.len()),
+            (1, 11),
+            (PROVIDER_METADATA_BACKUP_SCHEMA_VERSION, 11),
+        ] {
+            let mut rejected_wire: ProviderMetadataBackupWire =
+                serde_json::from_slice(retained.bytes())?;
+            rejected_wire.schema_version = schema_version;
+            rejected_wire.lifecycle_records.truncate(lifecycle_count);
+            let rejected_backup = serde_json::to_vec(&rejected_wire)?;
+            let rejected_sha256 = sha256_bytes(&rejected_backup);
+            assert!(matches!(
+                ProviderMetadataBackupAuthority::restore_fresh(
+                    &restored_state,
+                    LocalAuthorityStateStore::try_open(registry_root.clone())?,
+                    &rejected_backup,
+                ),
+                Err(ProviderMetadataBackupError::Invalid)
+            ));
+            assert!(!restored_state.root.exists());
+            assert!(
+                LocalAuthorityStateStore::try_open(registry_root.clone())?
+                    .load()?
+                    .is_none()
+            );
+            assert_eq!(sha256_bytes(&rejected_backup), rejected_sha256);
+            assert_eq!(sha256_bytes(retained.bytes()), retained_sha256);
+            assert_eq!(state.current_state_digest(surface_id)?, Some(later_digest));
+        }
         let requirements = ProviderMetadataBackupAuthority::restore_fresh(
             &restored_state,
-            registry_store,
-            &legacy_backup,
+            LocalAuthorityStateStore::try_open(registry_root.clone())?,
+            retained.bytes(),
         )?;
         assert!(requirements.iter().any(|requirement| {
             requirement.surface_id == surface_id
@@ -2868,25 +2838,30 @@ mod tests {
                     && recipe.request_bytes.as_ref() == retained_request
                     && recipe.state_digest == retained_digest
         ));
-        for account in ProviderMarketAccount::ALL {
-            let account_surface = account.surface_id();
-            let lifecycle_key = lifecycle_surface_key(account_surface)?;
-            assert!(
+        for encoded in &current_wire.lifecycle_records {
+            let lifecycle_key = lifecycle_surface_key(&encoded.surface_id)?;
+            let expected = decode_canonical_base64(&encoded.encoded_state_base64)?;
+            let restored =
                 LocalAuthorityStateStore::try_open(restored_state.lifecycle_root(lifecycle_key))?
                     .load()?
-                    .is_some()
+                    .ok_or("missing restored lifecycle record")?;
+            assert_eq!(restored, expected);
+            assert_eq!(
+                restored_state.source_lifecycle_record(&encoded.surface_id)?,
+                decode_source_lifecycle(&encoded.surface_id, &expected)?
             );
-            let record = restored_state.source_lifecycle_record(account_surface)?;
-            assert_eq!(record.revision(), NonZeroU64::MIN);
-            assert_eq!(record.phase(), DurableSourceLifecyclePhase::Stopped);
-            assert_eq!(record.session_id(), None);
         }
         market_squawk_sources::AuthoritativeSourceRegistry::try_new_durable(
-            LocalAuthorityStateStore::try_open(
-                destination.path().join("control/sources/research-runtime"),
-            )?,
+            LocalAuthorityStateStore::try_open(registry_root)?,
         )?
         .shutdown()?;
+        assert!(
+            product
+                .application
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
         Ok(())
     }
 }

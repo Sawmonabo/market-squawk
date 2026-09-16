@@ -1,1 +1,1 @@
-export { SourcesPage } from "./sources-page"
+export { ConnectionsWorkspace } from "./sources-page"

@@ -21,10 +21,12 @@ import {
 import {
   type NavigationItem,
   navigationSections,
+  navigationForPath,
 } from "@/lib/navigation"
 
 export function AppSidebar() {
   const location = useLocation()
+  const current = navigationForPath(location.pathname)
   const product = useProduct()
   const navigationDisabled = product.status === "loading"
   const localStatus =
@@ -86,7 +88,7 @@ export function AppSidebar() {
                           <ProductNavigationItem
                             key={item.path}
                             item={item}
-                            active={location.pathname === item.path}
+                            active={current.path === item.path}
                           />
                         ))}
                       </SidebarMenu>

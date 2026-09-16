@@ -54,20 +54,6 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ],
             &["profile", "outcome"],
         ),
-        "Source.Setup" => closed(
-            vec![
-                ("registration", record()),
-                ("officialHandoff", record()),
-                ("portal", record()),
-                ("currentSession", nullable(record())),
-            ],
-            &[
-                "registration",
-                "officialHandoff",
-                "portal",
-                "currentSession",
-            ],
-        ),
         "Source.GetStatus" => nullable_rows(closed(
             vec![
                 ("profile", record()),
@@ -1315,6 +1301,7 @@ fn provider_credential_import_disposition() -> Value {
                 "disposition",
                 enumeration(&[
                     "credential_stored_unverified",
+                    "saved_setup_reused",
                     "probe_required",
                     "disabled",
                     "profile_unavailable",
@@ -4111,7 +4098,7 @@ fn macro_context() -> Value {
             ("selection", macro_context_selection()),
             ("confidence", macro_context_confidence()),
             ("coverage", macro_context_coverage()),
-            ("observations", fixed_array(macro_context_observation(), 12)),
+            ("observations", fixed_array(macro_context_observation(), 13)),
         ],
         &[
             "availability",
@@ -4128,12 +4115,14 @@ fn macro_context_selection() -> Value {
         vec![
             ("knowledgeCutoff", canonical_market_timestamp()),
             ("effectiveDateCutoff", exact_calendar_date()),
+            ("effectiveMonthCutoff", nullable(macro_month_period())),
             ("evaluatedAt", canonical_market_timestamp()),
             ("complete", boolean()),
         ],
         &[
             "knowledgeCutoff",
             "effectiveDateCutoff",
+            "effectiveMonthCutoff",
             "evaluatedAt",
             "complete",
         ],
@@ -4156,10 +4145,10 @@ fn macro_context_confidence() -> Value {
 fn macro_context_coverage() -> Value {
     closed(
         vec![
-            ("requested", constant_unsigned(12)),
-            ("observed", bounded_unsigned(12)),
-            ("missing", bounded_unsigned(12)),
-            ("unavailable", bounded_unsigned(12)),
+            ("requested", constant_unsigned(13)),
+            ("observed", bounded_unsigned(13)),
+            ("missing", bounded_unsigned(13)),
+            ("unavailable", bounded_unsigned(13)),
         ],
         &["requested", "observed", "missing", "unavailable"],
     )
@@ -4202,6 +4191,7 @@ fn macro_context_observation() -> Value {
         "percent_of_labor_force",
         "Percent of labor force",
     ));
+    schemas.push(macro_energy_price_indicator());
     one_of(schemas)
 }
 
@@ -4297,6 +4287,30 @@ fn macro_context_value() -> Value {
             &["state", "reason", "explanation"],
         ),
     ])
+}
+
+fn macro_month_period() -> Value {
+    json!({"type":"string", "pattern":r"^[0-9]{4}-(?:0[1-9]|1[0-2])$"})
+}
+
+fn macro_energy_price_indicator() -> Value {
+    let mut schema = macro_context_indicator(
+        "us-residential-electricity-price",
+        "U.S. residential electricity price",
+        "energy_prices",
+        "monthly",
+        "not_supplied",
+        "native_energy_price",
+        "Native price unit",
+    );
+    schema["properties"]["unit"] = closed_complete(vec![
+        ("code", constant("native_energy_price")),
+        ("label", bounded_text(32 * 1024)),
+        ("symbol", null()),
+    ]);
+    schema["properties"]["effectiveDate"] = null();
+    schema["properties"]["effectivePeriod"] = macro_month_period();
+    schema
 }
 
 fn macro_dashboard() -> Value {

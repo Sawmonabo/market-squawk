@@ -77,9 +77,6 @@ fs2 = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
 hmac = { workspace = true }
-http-body-util = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 interprocess = { workspace = true }
 libc = { workspace = true }
 memory-stats = { workspace = true, optional = true }

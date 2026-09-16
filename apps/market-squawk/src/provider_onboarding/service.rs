@@ -39,8 +39,8 @@ use market_squawk_adapter_treasury::{
     FiscalDataParseLimits, TreasuryDailyRateFamily, TreasuryDailyRatePage, TreasuryDailyRateQuery,
 };
 use market_squawk_data::{
-    CatalogError, CatalogLimit, OnboardingCatalogCapability, OnboardingReservation,
-    OnboardingReservationRequest, ResumedProviderOnboarding,
+    CatalogAuthority, CatalogError, CatalogLimit, OnboardingCatalogCapability,
+    OnboardingReservation, OnboardingReservationRequest, ResumedProviderOnboarding,
 };
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
@@ -62,7 +62,8 @@ use market_squawk_sources::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::{
-    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedSemaphorePermit, Semaphore, oneshot,
+    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard, OwnedSemaphorePermit,
+    Semaphore, oneshot,
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -102,6 +103,7 @@ const KRAKEN_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/kraken-account-bind
 static SECRET_OPERATION_REAPER: LazyLock<SecretOperationReaper> =
     LazyLock::new(SecretOperationReaper::start);
 
+mod eia_doctor;
 mod lifecycle_runtime;
 mod rate_runtime;
 
@@ -222,7 +224,7 @@ pub struct ProviderOnboardingService {
     probe_rates: ProbeRateAuthority,
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     board_doctor_executor: Option<BoardScriptedDoctorExecutor>,
-    activation: AsyncMutex<()>,
+    activation: Arc<AsyncMutex<()>>,
     secret_operations: Arc<Semaphore>,
 }
 
@@ -271,6 +273,17 @@ pub(crate) struct ProviderOnboardingMutationAuthority<'a> {
     _guard: AsyncMutexGuard<'a, ()>,
 }
 
+/// Owned form of the same onboarding mutation authority for a bounded publication operation.
+///
+/// The guard is acquired after provider acquisition and retained through durable publication.
+/// It serializes against every existing activation mutation without borrowing a temporary
+/// runtime owner or creating another mutex.
+#[derive(Debug)]
+pub(crate) struct ProviderOnboardingOwnedMutationAuthority {
+    service: Arc<ProviderOnboardingService>,
+    _guard: OwnedMutexGuard<()>,
+}
+
 /// Exact durable runtime-session authority admitted during startup reconciliation.
 #[derive(Debug, Default)]
 pub(crate) struct ProviderRuntimeStartupAdmissions {
@@ -316,6 +329,18 @@ impl ProviderOnboardingService {
                 .activation
                 .try_lock()
                 .map_err(|_error| ProviderOnboardingError::ActivationUnavailable)?,
+        })
+    }
+
+    pub(crate) fn try_acquire_owned_runtime_mutation_authority(
+        self: &Arc<Self>,
+    ) -> Result<ProviderOnboardingOwnedMutationAuthority, ProviderOnboardingError> {
+        let guard = Arc::clone(&self.activation)
+            .try_lock_owned()
+            .map_err(|_error| ProviderOnboardingError::ActivationUnavailable)?;
+        Ok(ProviderOnboardingOwnedMutationAuthority {
+            service: Arc::clone(self),
+            _guard: guard,
         })
     }
 
@@ -993,7 +1018,7 @@ impl ProviderOnboardingService {
             probe_rates,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             board_doctor_executor,
-            activation: AsyncMutex::new(()),
+            activation: Arc::new(AsyncMutex::new(())),
             secret_operations: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_SECRET_OPERATIONS)),
         };
         for profile in service.profiles.iter() {
@@ -1088,6 +1113,15 @@ impl ProviderOnboardingService {
     ) -> Result<Vec<OnboardingSessionView>, ProviderOnboardingError> {
         let sessions = self.catalog.current_provider_onboarding_sessions(limit)?;
         self.session_views(sessions)
+    }
+
+    /// Reads one exact retained session without renewing, probing or changing its lifecycle.
+    pub(crate) fn retained_session_view(
+        &self,
+        session_id: Uuid,
+    ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        Ok(session_view(self.profile_for(&resumed)?, &resumed))
     }
 
     /// Starts a durable session and completes every safe automatic step.
@@ -1410,7 +1444,20 @@ impl ProviderOnboardingService {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
-        let _activation = self.activation.lock().await;
+        let eia_session = self
+            .catalog
+            .resume_provider_onboarding(session_id)?
+            .lifecycle()
+            .surface_id()
+            .as_str()
+            == "eia.api-v2";
+        let mut activation = Some(if eia_session {
+            self.activation
+                .try_lock()
+                .map_err(|_| ProviderOnboardingError::ActivationUnavailable)?
+        } else {
+            self.activation.lock().await
+        });
         loop {
             if cancellation.is_cancelled() {
                 return Err(ProviderOnboardingError::OperationCancelled);
@@ -1435,6 +1482,42 @@ impl ProviderOnboardingService {
                     return Err(ProviderOnboardingError::EvidenceRefreshRequired);
                 }
                 ProfileReleaseState::Available | ProfileReleaseState::RightsLimited => {}
+            }
+            if profile.capability().setup_mode() == market_squawk_sources::SetupMode::NoCredential {
+                if resumed.lifecycle().state() == OnboardingState::ActiveScoped {
+                    return self.lease_from_resumed(&resumed, profile);
+                }
+                if resumed.lifecycle().anonymous_runtime_digest().is_none()
+                    && matches!(
+                        resumed.lifecycle().state(),
+                        OnboardingState::AnonymousAvailable
+                            | OnboardingState::RightsAdmissionPending
+                            | OnboardingState::RuntimeVerificationPending
+                    )
+                {
+                    let configuration = resumed.public_configuration();
+                    let declared_user_agent = if profile.id() == SEC_EDGAR_PROFILE_ID {
+                        Some(format!(
+                            "{} {}",
+                            configuration
+                                .get("organization")
+                                .ok_or(ProviderOnboardingError::AdministrativeContactRequired)?,
+                            configuration
+                                .get("administrative_email")
+                                .ok_or(ProviderOnboardingError::AdministrativeContactRequired)?
+                        ))
+                    } else {
+                        None
+                    };
+                    self.activate_anonymous(
+                        profile,
+                        resumed.reservation(),
+                        declared_user_agent.as_deref(),
+                        cancellation.clone(),
+                    )
+                    .await?;
+                    continue;
+                }
             }
             if resumed.lifecycle().state() == OnboardingState::RuntimeVerificationPending
                 && resumed.lifecycle().candidate_generation().is_none()
@@ -1472,12 +1555,38 @@ impl ProviderOnboardingService {
                         },
                     )
                     .await?;
+                    // The EIA doctor performs provider I/O outside the onboarding mutex.
+                    // Its result is admitted only after reacquiring and checking this exact sequence.
+                    let eia_doctor = profile.id() == "eia.api-v2";
+                    if eia_doctor {
+                        drop(activation.take());
+                    }
                     let probe_evidence = if profile.id() == "alpaca.basic-market-data" {
                         alpaca_credential_shape_evidence(&resumed, profile, generation, &secret)?
                     } else {
                         self.run_credential_probe(profile, &secret, cancellation.clone())
                             .await?
                     };
+                    if eia_doctor {
+                        activation = Some(
+                            self.activation
+                                .try_lock()
+                                .map_err(|_| ProviderOnboardingError::ActivationUnavailable)?,
+                        );
+                        let current = self.catalog.resume_provider_onboarding(session_id)?;
+                        if cancellation.is_cancelled() {
+                            return Err(ProviderOnboardingError::OperationCancelled);
+                        }
+                        if current.next_sequence() != resumed.next_sequence()
+                            || current.lifecycle().candidate_generation() != Some(generation)
+                            || current.lifecycle().generation_state(generation)
+                                != Some(CredentialGenerationState::StoredUnverified)
+                            || current.lifecycle().capability_digest()
+                                != profile.capability().content_digest()
+                        {
+                            return Err(ProviderOnboardingError::InvalidSessionState);
+                        }
+                    }
                     let verified_at = system_timestamp()?;
                     let verification_validity_nanos = match profile.id() {
                         "bls.v2-registered" => Some(BLS_REGISTRATION_VALIDITY_NANOS),
@@ -1779,6 +1888,16 @@ impl ProviderOnboardingService {
         self.lease_from_resumed(&resumed, profile)
     }
 
+    fn activation_lease_in_catalog(
+        &self,
+        catalog: &CatalogAuthority,
+        session_id: Uuid,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        let resumed = catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.current_profile_for(&resumed)?;
+        self.lease_from_resumed(&resumed, profile)
+    }
+
     /// Disables one retained adapter recipe whose authority can no longer be reconstructed.
     ///
     /// The evidence digest names the exact quarantined durable state. Other provider sessions and
@@ -1932,32 +2051,49 @@ impl ProviderOnboardingService {
         declared_user_agent: Option<&str>,
         cancellation: CancellationToken,
     ) -> Result<(), ProviderOnboardingError> {
-        self.append(
-            reservation,
-            1,
-            OnboardingEvent::RightsAdmitted {
-                generation: None,
-                decision_digest: profile.rights_decision_digest(),
-            },
-        )?;
-        self.append(
-            reservation,
-            2,
-            OnboardingEvent::RatePolicyAdmitted {
-                generation: None,
-                policy_digest: profile.capability().rate_policy().evidence_digest(),
-            },
-        )?;
+        let mut resumed = self
+            .catalog
+            .resume_provider_onboarding(reservation.session_id())?;
+        if resumed.lifecycle().anonymous_rights_digest().is_none() {
+            self.append(
+                reservation,
+                resumed.next_sequence(),
+                OnboardingEvent::RightsAdmitted {
+                    generation: None,
+                    decision_digest: profile.rights_decision_digest(),
+                },
+            )?;
+            resumed = self
+                .catalog
+                .resume_provider_onboarding(reservation.session_id())?;
+        }
+        if resumed.lifecycle().anonymous_rate_policy_digest().is_none() {
+            self.append(
+                reservation,
+                resumed.next_sequence(),
+                OnboardingEvent::RatePolicyAdmitted {
+                    generation: None,
+                    policy_digest: profile.capability().rate_policy().evidence_digest(),
+                },
+            )?;
+            resumed = self
+                .catalog
+                .resume_provider_onboarding(reservation.session_id())?;
+        }
+        let sequence = resumed.next_sequence();
         match self
             .run_probe(profile, declared_user_agent, cancellation)
             .await
         {
-            Ok(evidence_digest) => {
-                self.append_digest_runtime_verification(reservation, 3, None, evidence_digest)
-            }
+            Ok(evidence_digest) => self.append_digest_runtime_verification(
+                reservation,
+                sequence,
+                None,
+                evidence_digest,
+            ),
             Err(ProviderOnboardingError::OperationCancelled) => self.append(
                 reservation,
-                3,
+                sequence,
                 OnboardingEvent::Cancelled {
                     evidence_digest: event_digest(
                         b"probe-cancelled",
@@ -1968,7 +2104,7 @@ impl ProviderOnboardingService {
             ),
             Err(_) => self.append(
                 reservation,
-                3,
+                sequence,
                 OnboardingEvent::Unavailable {
                     evidence_digest: event_digest(
                         b"probe-unavailable",
@@ -2114,6 +2250,11 @@ impl ProviderOnboardingService {
         secret: &SecretValue,
         cancellation: CancellationToken,
     ) -> Result<CredentialProbeEvidence, ProviderOnboardingError> {
+        if profile.id() == "eia.api-v2" {
+            return self
+                .run_eia_credential_doctor(profile, secret, cancellation)
+                .await;
+        }
         let expected_transport = match profile.id() {
             "bls.v2-registered" | "kraken.spot-authenticated-level3-market-data" => {
                 ProbeTransport::HttpPostJson
@@ -2880,6 +3021,29 @@ impl ProviderOnboardingService {
                     .map(|profile| session_view(profile, resumed))
             })
             .collect()
+    }
+}
+
+impl ProviderOnboardingOwnedMutationAuthority {
+    /// Validates the exact active lease before acquiring the publication catalog lock.
+    pub(crate) fn require_active(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let current = self.service.activation_lease(expected.session_id())?;
+        require_same_active_lease(&current, expected)
+    }
+
+    /// Validates durable currentness without reacquiring either retained mutation or catalog lock.
+    pub(crate) fn require_active_in_catalog(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let current = self
+            .service
+            .activation_lease_in_catalog(catalog, expected.session_id())?;
+        require_same_active_lease(&current, expected)
     }
 }
 
@@ -3742,6 +3906,10 @@ fn credential_assurance(
         "fred-alfred.api-v1-v2" => {
             SourceIdentifier::try_from("fred-unrate-series-read-key-verified").map_err(Into::into)
         }
+        "eia.api-v2" => SourceIdentifier::try_from(
+            "eia-metadata-and-bounded-price-read-verified-publication-pending",
+        )
+        .map_err(Into::into),
         _ => Err(ProviderOnboardingError::InvalidProfile),
     }
 }

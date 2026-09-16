@@ -80,7 +80,7 @@ export function OverviewPage() {
           investment guidance and availability.
         </p>
         <Button asChild className="mt-4" variant="outline">
-          <Link to="/connections/sources">Manage connections</Link>
+          <Link to="/system/settings/onboarding">Manage connections</Link>
         </Button>
       </section>
     </div>

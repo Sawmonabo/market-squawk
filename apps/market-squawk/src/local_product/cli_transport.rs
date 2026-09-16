@@ -70,6 +70,9 @@ impl CliProductResult {
 /// CLI admission, filesystem-boundary, or application-operation failure.
 #[derive(Debug, Error)]
 pub enum CliProductError {
+    /// Bounded foreground unlock input could not be read or admitted.
+    #[error(transparent)]
+    UnlockInput(#[from] crate::cli::CliUnlockInputError),
     /// The selected command belongs to another process composition.
     #[error("command is not a local product operation")]
     WrongCommand,
@@ -103,6 +106,11 @@ pub enum CliProductError {
     /// CLI-owned request limits are invalid.
     #[error("CLI request limits are invalid")]
     Limits,
+    /// The application exceeded its admitted result or execution resource envelope.
+    #[error(
+        "application operation exceeded an admitted resource limit; review the request result and work limits"
+    )]
+    ResourceExhausted,
     /// The shared application rejected or failed the operation.
     #[error("application operation failed: {0}")]
     Application(#[from] market_squawk_services::ServiceError),
@@ -219,7 +227,7 @@ async fn economic_context(
         authority,
         "Macro.GetContext",
         &mut arguments,
-        Some(12),
+        Some(13),
         "economic context read",
     )
     .await
@@ -288,6 +296,9 @@ async fn source(
     command: SourceCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
+        SourceCommand::UnlockCredentials { stdin, confirm } => {
+            return unlock_provider_credentials(authority, stdin, confirm).await;
+        }
         SourceCommand::ImportCredentials { bundle, confirm } => {
             return import_provider_credentials(authority, &bundle, confirm).await;
         }
@@ -346,17 +357,122 @@ async fn source(
             .await;
         }
         SourceCommand::Activate { request, confirm } => {
-            let value = cli_provider::activate_research_provider(
-                authority.local_for("Source.Activate")?,
+            require_confirmation(confirm)?;
+            let ticket = stage_bounded_input(
+                authority,
                 &request,
-                confirm,
-                CancellationToken::new(),
+                1024 * 1024,
+                "market-squawk.provider-setup.v1",
+                "Source.Onboarding.ApplyStaged",
             )
             .await?;
-            return direct_result(value, "source adapter activated");
+            let result = invoke_without_result_limits(
+                authority,
+                "Source.Onboarding.ApplyStaged",
+                json!({"inputTicketId": ticket, "confirm": true}),
+                "source setup applied",
+            )
+            .await?;
+            if result
+                .value()
+                .pointer("/data/outcome")
+                .and_then(Value::as_str)
+                != Some("completed")
+            {
+                return Err(CliProductError::Application(
+                    market_squawk_services::ServiceError::Unavailable,
+                ));
+            }
+            return Ok(result);
         }
     };
     invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn unlock_provider_credentials(
+    authority: CliAuthority<'_>,
+    explicit_stdin: bool,
+    confirm: bool,
+) -> Result<CliProductResult, CliProductError> {
+    use serde::Serialize;
+    use sha2::{Digest as _, Sha256};
+    use zeroize::Zeroizing;
+
+    require_confirmation(confirm)?;
+    let CliAuthority::Installed(client) = authority else {
+        return Err(CliProductError::InstalledServiceRequired {
+            operation: "Source.Onboarding.ApplyStaged",
+        });
+    };
+    let unlock = crate::cli::read_encrypted_storage_unlock(explicit_stdin)?;
+    #[derive(Serialize)]
+    struct UnlockRequest<'a> {
+        action: &'static str,
+        secret: &'a str,
+    }
+    #[derive(Serialize)]
+    struct StagedUnlock<'a> {
+        schema: &'static str,
+        request: UnlockRequest<'a>,
+    }
+    // Serialize borrowed secret material directly into a zeroizing buffer. The ordinary
+    // mutation envelope contains only the existing one-shot ticket, never the unlock itself.
+    let capacity = unlock
+        .expose_secret()
+        .len()
+        .checked_mul(6)
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or(CliProductError::Limits)?;
+    let mut encoded = Zeroizing::new(Vec::new());
+    encoded.try_reserve_exact(capacity).map_err(|_| {
+        CliProductError::Application(market_squawk_services::ServiceError::ResourceExhausted)
+    })?;
+    serde_json::to_writer(
+        &mut *encoded,
+        &StagedUnlock {
+            schema: "market-squawk.provider-setup.v1",
+            request: UnlockRequest {
+                action: "unlockFallback",
+                secret: unlock.expose_secret(),
+            },
+        },
+    )
+    .map_err(|_| CliProductError::RuntimeRequest)?;
+    drop(unlock);
+    let admission = InputAdmission::try_sha256(
+        "market-squawk.provider-setup.v1",
+        u64::try_from(encoded.len()).map_err(|_| CliProductError::RuntimeRequest)?,
+        Sha256::digest(encoded.as_slice()).into(),
+    )
+    .map_err(|_| CliProductError::RuntimeRequest)?;
+    let mut bytes = encoded.as_slice();
+    let ticket = client
+        .stage_input(admission, &mut bytes, CancellationToken::new())
+        .await?;
+    drop(encoded);
+    let result = invoke_without_result_limits(
+        authority,
+        "Source.Onboarding.ApplyStaged",
+        json!({"inputTicketId": ticket.id(), "confirm": true}),
+        "provider credential storage unlocked",
+    )
+    .await?;
+    if result
+        .value()
+        .pointer("/data/outcome")
+        .and_then(Value::as_str)
+        != Some("completed")
+        || result
+            .value()
+            .pointer("/data/value")
+            .and_then(Value::as_str)
+            != Some("ready")
+    {
+        return Err(CliProductError::Application(
+            market_squawk_services::ServiceError::Unavailable,
+        ));
+    }
+    Ok(result)
 }
 
 async fn import_provider_credentials(
@@ -2041,7 +2157,11 @@ async fn invoke_without_result_limits(
                     context.request_id().clone(),
                     operation,
                     arguments,
-                    CLI_INSTALLED_REQUEST_TIMEOUT,
+                    if operation == "Source.Onboarding.ApplyStaged" {
+                        Duration::from_secs(120)
+                    } else {
+                        CLI_INSTALLED_REQUEST_TIMEOUT
+                    },
                     CancellationToken::new(),
                 )
                 .await?;
@@ -2059,6 +2179,7 @@ fn unwrap_application_result(result: &Value) -> Result<Value, CliProductError> {
             .cloned()
             .ok_or(CliProductError::RuntimeRequest),
         Some(false) => match object.get("error").and_then(Value::as_str) {
+            Some("resource_exhausted") => Err(CliProductError::ResourceExhausted),
             Some("rejected") => Err(CliProductError::Client(ApplicationClientError::Rejected)),
             Some("interrupted") => {
                 Err(CliProductError::Client(ApplicationClientError::Interrupted))

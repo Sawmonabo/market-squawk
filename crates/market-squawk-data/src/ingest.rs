@@ -1463,6 +1463,17 @@ pub trait IngestPrecommitAuthority: fmt::Debug + Send + Sync {
     /// Revalidates the exact caller authority immediately before catalog and manifest commit.
     fn validate_precommit(&self) -> Result<(), IngestError>;
 
+    /// Revalidates against the publication catalog while its writer lock is held.
+    ///
+    /// Catalog-dependent authorities must override this method and use the borrowed catalog;
+    /// acquiring their catalog capability again would reenter the same lock. Any independent
+    /// mutation guard needed to keep the authority current must already be retained by `self`
+    /// for the complete publication operation. Implementations and composing wrappers must
+    /// preserve their cancellation, deadline, and exact-generation checks here.
+    fn validate_catalog_precommit(&self, _catalog: &CatalogAuthority) -> Result<(), IngestError> {
+        self.validate_precommit()
+    }
+
     /// Claims an optional one-shot SEC fund job binding at the final provider-logical boundary.
     ///
     /// Ordinary ingest authorities retain the default absence. The SEC job implementation must
@@ -1520,6 +1531,7 @@ pub struct AnalyticalDataService {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationOwnedProviderCaptureEvidence {
     pinned: PinnedDataset,
+    published_at: Timestamp,
     source_id: SourceId,
     objects: Box<[GenerationOwnedProviderCaptureObjectEvidence]>,
     receipt_digest: EvidenceDigest,
@@ -1543,6 +1555,11 @@ pub struct GenerationOwnedProviderCaptureInputEvidence {
 }
 
 impl GenerationOwnedProviderCaptureEvidence {
+    /// Actual creating generation catalog publication time, independent of source clocks.
+    pub const fn published_at(&self) -> Timestamp {
+        self.published_at
+    }
+
     /// Returns the exact immutable generation.
     pub const fn pinned(&self) -> &PinnedDataset {
         &self.pinned
@@ -1607,12 +1624,30 @@ fn verify_persisted_provider_capture_binding(
     evidence: &crate::PersistedProviderCaptureBindingEvidence,
     store: &market_squawk_platform::SealedResearchJournalStore,
 ) -> Result<(), IngestError> {
+    verify_persisted_provider_capture_binding_inner(evidence, store, None)
+}
+
+fn verify_persisted_provider_capture_binding_inner(
+    evidence: &crate::PersistedProviderCaptureBindingEvidence,
+    store: &market_squawk_platform::SealedResearchJournalStore,
+    control: Option<&MarketEventReadControl<'_>>,
+) -> Result<(), IngestError> {
+    if let Some(control) = control {
+        check_market_event_read(control.deadline, control.cancellation)?;
+    }
     evidence.verify_integrity()?;
     for physical in evidence.physical_claims() {
-        let verified = store.open_verified_claim(physical.claim())?;
+        let verified = match control {
+            Some(control) => store.open_verified_claim_with_control(physical.claim(), control),
+            None => store.open_verified_claim(physical.claim()),
+        }
+        .map_err(map_provider_recovery_store_error)?;
         if verified.receipt().claim() != physical.claim() {
             return Err(IngestError::ProviderCaptureRequired);
         }
+    }
+    if let Some(control) = control {
+        check_market_event_read(control.deadline, control.cancellation)?;
     }
     Ok(())
 }
@@ -2568,9 +2603,45 @@ impl AnalyticalDataService {
         manifest: &DatasetManifestRef,
         store: &market_squawk_platform::SealedResearchJournalStore,
     ) -> Result<GenerationOwnedProviderCaptureEvidence, IngestError> {
-        let owned = self
-            .manifests
-            .generation_owned_provider_captures(manifest)?;
+        self.generation_owned_provider_capture_evidence_inner(manifest, store, None)
+    }
+
+    /// Reopens an exact creating generation with bounded catalog and physical-object reads.
+    ///
+    /// This synchronous operation must run in the caller's supervised blocking worker. Catalog
+    /// guards are released before immutable raw objects are reopened under the same control.
+    pub fn generation_owned_provider_capture_evidence_bounded(
+        &self,
+        manifest: &DatasetManifestRef,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<GenerationOwnedProviderCaptureEvidence, IngestError> {
+        self.generation_owned_provider_capture_evidence_inner(
+            manifest,
+            store,
+            Some(&MarketEventReadControl {
+                deadline,
+                cancellation,
+            }),
+        )
+    }
+
+    fn generation_owned_provider_capture_evidence_inner(
+        &self,
+        manifest: &DatasetManifestRef,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        control: Option<&MarketEventReadControl<'_>>,
+    ) -> Result<GenerationOwnedProviderCaptureEvidence, IngestError> {
+        let owned = match control {
+            Some(control) => self.manifests.generation_owned_provider_captures_bounded(
+                manifest,
+                control.deadline,
+                control.cancellation,
+            ),
+            None => self.manifests.generation_owned_provider_captures(manifest),
+        }
+        .map_err(map_recovery_manifest_error)?;
         let object_count = owned
             .pinned
             .objects()
@@ -2586,18 +2657,29 @@ impl AnalyticalDataService {
             grouped_inputs.push(Vec::new());
         }
         {
-            let authority = self.lock_authority()?;
+            let authority = match control {
+                Some(control) => {
+                    self.market_recovery_authority(control.deadline, control.cancellation)?
+                }
+                None => self.lock_authority()?,
+            };
             for input in &owned.inputs {
-                let evidence = authority
-                    .provider_capture_binding_evidence(input.binding_digest)?
-                    .ok_or(IngestError::ProviderCaptureRequired)?;
+                let evidence = match control {
+                    Some(control) => authority.provider_capture_binding_evidence_bounded(
+                        input.binding_digest,
+                        control.deadline,
+                        control.cancellation,
+                    ),
+                    None => authority.provider_capture_binding_evidence(input.binding_digest),
+                }
+                .map_err(map_market_recovery_catalog_error)?
+                .ok_or(IngestError::ProviderCaptureRequired)?;
                 if evidence.binding_digest() != input.binding_digest
                     || evidence.capture().source_id() != &owned.source_id
                     || evidence.record_count() != input.record_count
                 {
                     return Err(IngestError::ProviderCaptureRequired);
                 }
-                verify_persisted_provider_capture_binding(&evidence, store)?;
                 let output = grouped_inputs
                     .get_mut(input.output_artifact_ordinal)
                     .ok_or(IngestError::ProviderCaptureRequired)?;
@@ -2610,6 +2692,10 @@ impl AnalyticalDataService {
                     binding: evidence,
                 });
             }
+        }
+        // The catalog authority is no longer held during physical integrity verification.
+        for input in grouped_inputs.iter().flatten() {
+            verify_persisted_provider_capture_binding_inner(&input.binding, store, control)?;
         }
         let mut objects = Vec::new();
         objects
@@ -2651,8 +2737,12 @@ impl AnalyticalDataService {
         if next_global_input != owned.inputs.len() {
             return Err(IngestError::ProviderCaptureRequired);
         }
+        if let Some(control) = control {
+            check_market_event_read(control.deadline, control.cancellation)?;
+        }
         Ok(GenerationOwnedProviderCaptureEvidence {
             pinned: owned.pinned,
+            published_at: owned.published_at,
             source_id: owned.source_id,
             objects: objects.into_boxed_slice(),
             receipt_digest: owned.receipt_digest,
@@ -4388,7 +4478,7 @@ impl AnalyticalDataService {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
         }
-        precommit_authority.validate_precommit()?;
+        precommit_authority.validate_catalog_precommit(&authority)?;
         let (manifest, catalog_receipt_digest) = self
             .manifests
             .commit_staged_provider_macro_plan_publication(
@@ -4679,7 +4769,6 @@ impl AnalyticalDataService {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
         }
-        precommit_authority.validate_precommit()?;
         let mut artifacts = Vec::new();
         artifacts
             .try_reserve_exact(published.len())
@@ -4707,6 +4796,7 @@ impl AnalyticalDataService {
             plan.content_hash().evidence(),
             created_at,
         );
+        precommit_authority.validate_catalog_precommit(&authority)?;
         let (manifest, catalog_receipt_digest) = self
             .manifests
             .commit_provider_macro_plan_publication(
@@ -5489,9 +5579,6 @@ impl AnalyticalDataService {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
         }
-        if let Some(precommit_authority) = precommit_authority {
-            precommit_authority.validate_precommit()?;
-        }
         if published.is_empty() || published.len() > 1024 {
             return Err(IngestError::InvalidDataset);
         }
@@ -5520,6 +5607,9 @@ impl AnalyticalDataService {
             plan.content_hash().evidence(),
             created_at,
         );
+        if let Some(precommit_authority) = precommit_authority {
+            precommit_authority.validate_catalog_precommit(authority)?;
+        }
         if kind == GenerationKind::Ingest {
             let sec_fund_job = match (&source_evidence, precommit_authority) {
                 (PublicationSourceEvidence::ProviderLogical(binding, _), Some(authority)) => {

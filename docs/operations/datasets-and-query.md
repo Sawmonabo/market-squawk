@@ -611,15 +611,21 @@ market-squawk \
 
 The default maximum is 1,000 rows. The command resolves the latest generation at request start,
 pins its exact manifest, and reads canonical observations using `Research.GetHistory`. The CLI
-does not expose the typed service's instrument or knowledge-time filters, so reduce
-`--maximum-rows` when inspecting an unfamiliar dataset.
+does not expose the typed service's instrument or knowledge-time filters. `--maximum-rows` is a
+complete-result ceiling, not a preview size: a dataset with 1,100 rows requires a ceiling of at
+least 1,100, and a ceiling of 2 fails without returning partial data. Deliberately raise the
+ceiling within the admitted process limits to read the complete generation. For an explicit
+preview, the local-only SQL path below can select a bounded result with `LIMIT`.
 
 This command uses the fixed-template application query path. That path derives its query
 inline-byte and complete-result ceilings from the caller's admitted service limits, admits four
 partitions, 2,048 syntax-tree nodes, 4,096 plan nodes, and at most 60 seconds, and gives the query
 four times its complete-result ceiling in memory within the code-owned clamp. The CLI supplies a
-16 MiB inline and complete-result ceiling, so `query dataset` itself has no overflow band: it
-returns `rows` plus `arrowIpcBytes` or fails closed at that limit.
+16 MiB complete-result byte ceiling. The installed service further caps inline bytes at 64 KiB;
+a larger admitted complete result can return an opaque Parquet artifact. The local composition
+uses its admitted inline ceiling. Both representations retain the complete row count, so an
+artifact does not bypass `--maximum-rows`. A resource-limit rejection is reported as
+`resource_exhausted`, separately from an unavailable application service.
 
 The same fixed-template service over production MCP starts with a 64 KiB inline ceiling and a
 64 MiB hard complete-result ceiling; the requested `resultLimits.maximumBytes` may narrow the

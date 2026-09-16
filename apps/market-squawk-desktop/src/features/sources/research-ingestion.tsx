@@ -1,7 +1,6 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { DatabaseZap, LoaderCircle, RefreshCw } from "lucide-react"
-import { Link } from "react-router-dom"
 
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -36,11 +35,13 @@ export function ResearchIngestion({
   connectedSourceIngestionAvailable,
   transport,
   onStarted,
+  onSetup,
 }: {
   bootstrap: DesktopSystemBootstrap
   connectedSourceIngestionAvailable: boolean
   transport: SystemTransport
   onStarted: () => void
+  onSetup: () => void
 }) {
   const queryClient = useQueryClient()
   const sourceKey = [
@@ -203,8 +204,8 @@ export function ResearchIngestion({
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
               Complete a research source setup before discovering provider objects.
             </p>
-            <Button asChild className="mt-3" size="sm">
-              <Link to="/connections/sources">Open Connections &amp; Sources</Link>
+            <Button className="mt-3" size="sm" onClick={onSetup}>
+              Set up connections
             </Button>
           </div>
         ) : (

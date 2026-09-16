@@ -18,9 +18,6 @@ const AdvancedOverviewPage = lazy(() =>
 const MarketsPage = lazy(() =>
   import("@/features/markets").then((module) => ({ default: module.MarketsPage })),
 )
-const SourcesPage = lazy(() =>
-  import("@/features/sources").then((module) => ({ default: module.SourcesPage })),
-)
 const ResearchPage = lazy(() =>
   import("@/features/research").then((module) => ({ default: module.ResearchPage })),
 )
@@ -82,13 +79,16 @@ export function AppRoutes() {
           <Route path="/advanced/backtests" element={<BacktestsPage />} />
           <Route path="/advanced/valuation-targets" element={<FairValuePage />} />
           <Route path="/advanced/risk-recommendation-policy" element={<RiskPage />} />
-          <Route path="/connections/sources" element={<SourcesPage />} />
           <Route path="/system/ai-connections" element={<McpPage />} />
           <Route path="/system/operations-jobs" element={<OperationsPage />} />
           <Route path="/system/updates-repair" element={<LifecyclePage />} />
           <Route path="/system/backup-recovery" element={<BackupRecoveryPage />} />
           <Route path="/system/logs-diagnostics" element={<LogsPage />} />
           <Route path="/system/settings" element={<SettingsPage />} />
+          <Route
+            path="/system/settings/onboarding"
+            element={<SettingsPage section="onboarding" />}
+          />
           <Route path="*" element={<Navigate to="/home" replace />} />
         </Routes>
       </Suspense>

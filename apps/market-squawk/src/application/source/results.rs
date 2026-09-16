@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 
 use super::{SourceRuntimeSnapshot, SourceRuntimeViewError};
 use crate::{
-    ProviderOnboardingError, ProviderPortalError, ProviderProfileRegistrationOutcome,
-    ProviderProfileView, application::domain_support::encode_hex,
+    ProviderOnboardingError, ProviderProfileRegistrationOutcome, ProviderProfileView,
+    application::domain_support::encode_hex,
 };
 
 #[derive(Clone, Copy)]
@@ -458,8 +458,4 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         | ProviderOnboardingError::Network(_)
         | ProviderOnboardingError::Tls(_) => ServiceError::Unavailable,
     }
-}
-
-pub(super) fn map_portal_error(_error: ProviderPortalError) -> ServiceError {
-    ServiceError::Unavailable
 }

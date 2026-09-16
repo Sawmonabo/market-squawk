@@ -35,6 +35,16 @@ No release, benchmark, checkpoint, or approval evidence may be produced with 1.9
 toolchain change requires current primary-source research, a recorded decision, exact CI/toolchain
 pins, inherited workspace MSRV enforcement, and a fresh locked all-feature verification run.
 
+## Native connection setup — owner correction, 2026-09-08
+
+Connection setup belongs entirely in Desktop Settings → Connections → Set up connections.
+Remove the separate localhost setup website, server, CLI command, and browser-launch fallback;
+keeping that website as an explicit option does not satisfy the owner correction. Reuse saved
+credentials and exact saved data selections. A prepared credential file is a one-time native
+import input, not a second startup configuration authority. Genuine official provider OAuth may
+retain its required authorization handoff and bounded callback transport. Earlier dated portal
+references below remain historical evidence and do not authorize an active setup website.
+
 ## Current upstream research before unfamiliar fixes
 
 When an unfamiliar platform, packaging, compiler, linker, dependency, CI, operating-system, or

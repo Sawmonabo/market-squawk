@@ -831,7 +831,7 @@ impl EiaPublicationCandidate {
             return Err(EiaError::Canonicalization);
         }
         let current_source = provider.source_metadata();
-        let provider_dataset = eia_data_dataset_identifier(provider.contract())
+        let provider_dataset = eia_data_dataset_identifier(provider.contract().query())
             .map_err(|_| EiaError::CaptureBinding)?;
         crate::transport::validate_terminal_data_rejoin(
             current_source,
@@ -1215,12 +1215,30 @@ pub enum EiaNativePublishedSeriesPrecision {
 pub struct EiaNativePublishedSeriesCoordinate {
     canonical_series: SourceIdentifier,
     precision: EiaNativePublishedSeriesPrecision,
+    native_unit: String,
+    canonical_unit: SourceIdentifier,
+    residential_monthly_electricity_price: bool,
 }
 
 impl EiaNativePublishedSeriesCoordinate {
     /// Returns the canonical series derived by the EIA adapter's own identity rule.
     pub const fn canonical_series(&self) -> &SourceIdentifier {
         &self.canonical_series
+    }
+
+    /// Returns the exact unit label retained from the provider row.
+    pub fn native_unit(&self) -> &str {
+        &self.native_unit
+    }
+
+    /// Returns the unit identity used by canonical normalization.
+    pub const fn canonical_unit(&self) -> &SourceIdentifier {
+        &self.canonical_unit
+    }
+
+    /// Returns whether the native row belongs to the U.S. residential monthly retail-price family.
+    pub const fn is_us_residential_monthly_electricity_price(&self) -> bool {
+        self.residential_monthly_electricity_price
     }
 
     /// Returns the exact effective-time precision retained by the native row.
@@ -1336,6 +1354,26 @@ pub fn decode_eia_native_published_series_coordinate(
     {
         return Err(EiaError::Canonicalization);
     }
+    let residential_monthly_electricity_price = route.as_str() == Some("electricity/retail-sales")
+        && data_field.as_str() == Some("price")
+        && series_frequency.as_str() == Some("monthly")
+        && period_frequency.as_str() == Some("monthly")
+        && matches!(&kind, EiaNativePeriodKindCoordinateV1::Month { .. })
+        && facets.len() == 2
+        && [("sectorid", "RES"), ("stateid", "US")]
+            .iter()
+            .all(|(field, value)| {
+                facets
+                    .iter()
+                    .filter(|facet| {
+                        facet.get("facet").and_then(serde_json::Value::as_str) == Some(*field)
+                            && facet.get("value").and_then(serde_json::Value::as_str)
+                                == Some(*value)
+                    })
+                    .count()
+                    == 1
+            });
+    let canonical_unit = source_identifier_from_digest("eia-unit", digest_bytes(unit.as_bytes()))?;
     let canonical_series = source_identifier_from_digest("eia-series", series_digest)?;
     let precision = match kind {
         EiaNativePeriodKindCoordinateV1::CalendarDate(value) if !value.is_null() => {
@@ -1374,6 +1412,9 @@ pub fn decode_eia_native_published_series_coordinate(
     Ok(EiaNativePublishedSeriesCoordinate {
         canonical_series,
         precision,
+        native_unit: unit,
+        canonical_unit,
+        residential_monthly_electricity_price,
     })
 }
 

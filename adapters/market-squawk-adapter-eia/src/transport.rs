@@ -40,7 +40,7 @@ use crate::{
     EIA_API_ROOT, EiaAcquisition, EiaApiKey, EiaAuthenticatedRequest, EiaDataPage,
     EiaDataPageReceipt, EiaDatasetContract, EiaDigest, EiaError, EiaFacetCatalog,
     EiaMetadataRequest, EiaPageCompleteness, EiaPaginationTracker, EiaParseLimits,
-    EiaRouteMetadata,
+    EiaRouteMetadata, EiaStructureLimitReceipt,
 };
 
 const USER_AGENT_VALUE: &str = concat!(
@@ -743,9 +743,21 @@ pub enum EiaSourceTransportError {
     /// Provider-native parsing, schema, pagination, unit, value, or clock failure.
     #[error(transparent)]
     Protocol(#[from] EiaError),
+    /// A complete response crossed one parser ceiling, classified without retaining its payload.
+    #[error("EIA provider response exceeded a structural parser limit: {receipt:?}")]
+    ResponseStructureLimit {
+        /// Closed response surface, byte count, and structural-limit evidence.
+        receipt: EiaResponseStructureLimitReceipt,
+    },
     /// Registry, provider-rate, cancellation, deadline, or network source failure.
     #[error(transparent)]
     Extraction(#[from] ExtractionSourceError),
+    /// Complete non-contract HTTP response classified without retaining status or header values.
+    #[error("EIA provider returned a non-contract HTTP response: {receipt:?}")]
+    HttpFailure {
+        /// Closed payload-free response classification available before any later retry.
+        receipt: EiaHttpFailureReceipt,
+    },
     /// Source-neutral capture receipt rejected the response set.
     #[error(transparent)]
     Capture(#[from] ProviderCaptureError),
@@ -769,9 +781,132 @@ pub enum EiaSourceTransportError {
     ClockUnavailable,
 }
 
+/// Closed EIA response surface on which a structural parser limit was observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EiaResponseSurface {
+    /// Route hierarchy, frequency, facet, and data-column metadata.
+    RouteMetadata,
+    /// One exact route-facet value catalog.
+    FacetMetadata,
+    /// One exact bounded data page.
+    DataPage,
+}
+
+/// Payload-free receipt for a structurally rejected complete EIA response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EiaResponseStructureLimitReceipt {
+    surface: EiaResponseSurface,
+    response_bytes: u64,
+    structure: EiaStructureLimitReceipt,
+}
+
+impl EiaResponseStructureLimitReceipt {
+    const fn new(
+        surface: EiaResponseSurface,
+        response_bytes: u64,
+        structure: EiaStructureLimitReceipt,
+    ) -> Self {
+        Self {
+            surface,
+            response_bytes,
+            structure,
+        }
+    }
+
+    /// Returns the closed response surface without retaining a request or provider payload.
+    pub const fn surface(self) -> EiaResponseSurface {
+        self.surface
+    }
+
+    /// Returns the complete response byte count observed before parsing.
+    pub const fn response_bytes(self) -> u64 {
+        self.response_bytes
+    }
+
+    /// Returns the exact structural dimension, observed value, and unchanged ceiling.
+    pub const fn structure(self) -> EiaStructureLimitReceipt {
+        self.structure
+    }
+}
+
+/// Closed class for a complete EIA HTTP response that did not satisfy the endpoint status contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EiaHttpFailureClass {
+    /// An informational response unexpectedly terminated the request.
+    Informational,
+    /// A successful status other than the endpoint's required HTTP 200 was returned.
+    UnexpectedSuccess,
+    /// Redirect following is disabled and the provider returned a redirect response.
+    Redirection,
+    /// A non-authentication, non-rate-limit client refusal was returned.
+    ClientRefusal,
+    /// The provider returned a server-error response.
+    ProviderFailure,
+    /// The numeric status was outside the standard HTTP status classes.
+    Unrecognized,
+}
+
+/// Payload-free presence evidence for an unconsumed `Retry-After` response field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EiaRetryAfterPresence {
+    /// No `Retry-After` field was present.
+    Absent,
+    /// A `Retry-After` field was present; its value is deliberately not retained here.
+    Present,
+}
+
+/// Safe typed evidence for one complete non-contract EIA HTTP response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EiaHttpFailureReceipt {
+    class: EiaHttpFailureClass,
+    retry_after: EiaRetryAfterPresence,
+}
+
+impl EiaHttpFailureReceipt {
+    const fn from_response(status: u16, retry_after_present: bool) -> Self {
+        let class = match status {
+            100..=199 => EiaHttpFailureClass::Informational,
+            200..=299 => EiaHttpFailureClass::UnexpectedSuccess,
+            300..=399 => EiaHttpFailureClass::Redirection,
+            400..=499 => EiaHttpFailureClass::ClientRefusal,
+            500..=599 => EiaHttpFailureClass::ProviderFailure,
+            _ => EiaHttpFailureClass::Unrecognized,
+        };
+        let retry_after = if retry_after_present {
+            EiaRetryAfterPresence::Present
+        } else {
+            EiaRetryAfterPresence::Absent
+        };
+        Self { class, retry_after }
+    }
+
+    /// Returns the closed HTTP response class without exposing the numeric status.
+    pub const fn class(self) -> EiaHttpFailureClass {
+        self.class
+    }
+
+    /// Returns whether `Retry-After` was present without exposing its field value.
+    pub const fn retry_after(self) -> EiaRetryAfterPresence {
+        self.retry_after
+    }
+}
+
 impl From<ExtractionAuthorityError> for EiaSourceTransportError {
     fn from(error: ExtractionAuthorityError) -> Self {
         Self::Extraction(ExtractionSourceError::Authority(error))
+    }
+}
+
+pub(crate) const fn map_response_parse_error(
+    surface: EiaResponseSurface,
+    response_bytes: u64,
+    error: EiaError,
+) -> EiaSourceTransportError {
+    match error {
+        EiaError::StructureLimit { receipt } => EiaSourceTransportError::ResponseStructureLimit {
+            receipt: EiaResponseStructureLimitReceipt::new(surface, response_bytes, receipt),
+        },
+        error => EiaSourceTransportError::Protocol(error),
     }
 }
 
@@ -884,6 +1019,10 @@ impl EiaSourceTransport {
         self.limits.max_pages
     }
 
+    pub(crate) const fn max_acquisition_bytes(&self) -> u64 {
+        self.limits.max_acquisition_bytes
+    }
+
     /// Binds one injected key and one immutable source registration to the hardened HTTP client.
     pub fn try_new(
         metadata: SourceMetadata,
@@ -948,6 +1087,7 @@ impl EiaSourceTransport {
             .fetch_parsed(
                 authority,
                 authenticated,
+                EiaResponseSurface::RouteMetadata,
                 deadline,
                 cancellation.clone(),
                 |bytes, received_at| {
@@ -993,6 +1133,7 @@ impl EiaSourceTransport {
             .fetch_parsed(
                 authority,
                 authenticated,
+                EiaResponseSurface::FacetMetadata,
                 deadline,
                 cancellation,
                 |bytes, received_at| {
@@ -1055,7 +1196,7 @@ impl EiaSourceTransport {
         {
             return Err(EiaSourceTransportError::InvalidConfiguration);
         }
-        let dataset = eia_data_dataset_identifier(contract)?;
+        let dataset = eia_data_dataset_identifier(contract.query())?;
         let publication_retained_bytes = cursor_base_publication_retained_bytes(
             &self.metadata,
             &dataset,
@@ -1358,7 +1499,7 @@ impl EiaSourceTransport {
         cursor: &EiaDataAcquisitionCursor,
     ) -> Result<(), EiaSourceTransportError> {
         self.validate_authority(authority)?;
-        let expected_dataset = eia_data_dataset_identifier(contract)?;
+        let expected_dataset = eia_data_dataset_identifier(contract.query())?;
         let tracker_is_current = match &cursor.pagination_tracker {
             None => cursor.next_ordinal == 0 && cursor.typed_pages.is_empty(),
             Some(tracker) => {
@@ -1473,7 +1614,7 @@ impl EiaSourceTransport {
         cancellation: CancellationToken,
     ) -> Result<EiaDataProbeRetrieval, EiaSourceTransportError> {
         self.validate_authority(authority)?;
-        let dataset = eia_data_dataset_identifier(contract)?;
+        let dataset = eia_data_dataset_identifier(contract.query())?;
         let fetched = self
             .fetch_data_page(
                 authority,
@@ -1533,6 +1674,7 @@ impl EiaSourceTransport {
             .fetch_parsed(
                 authority,
                 authenticated,
+                EiaResponseSurface::DataPage,
                 deadline,
                 cancellation,
                 |bytes, received_at| {
@@ -1577,6 +1719,7 @@ impl EiaSourceTransport {
         &self,
         authority: &ExtractionAuthority,
         request: EiaAuthenticatedRequest,
+        surface: EiaResponseSurface,
         deadline: Timestamp,
         cancellation: CancellationToken,
         parse: F,
@@ -1633,7 +1776,12 @@ impl EiaSourceTransport {
             return Err(ExtractionSourceError::Source(SourceError::Unauthorized).into());
         }
         if response.status != 200 {
-            return Err(ExtractionSourceError::Source(SourceError::ProviderUnavailable).into());
+            return Err(EiaSourceTransportError::HttpFailure {
+                receipt: EiaHttpFailureReceipt::from_response(
+                    response.status,
+                    response.retry_after.is_some(),
+                ),
+            });
         }
         if response
             .content_encoding
@@ -1647,7 +1795,8 @@ impl EiaSourceTransport {
         let response_bytes = u64::try_from(response.body.len())
             .map_err(|_| EiaSourceTransportError::InvalidConfiguration)?;
         in_flight.validate_response_size(response_bytes)?;
-        let parsed = parse(&response.body, response.received_at)?;
+        let parsed = parse(&response.body, response.received_at)
+            .map_err(|error| map_response_parse_error(surface, response_bytes, error))?;
         if parsed.request_digest != request_digest
             || parsed.received_at != response.received_at
             || parsed.transport_payload_digest != digest_bytes(&response.body)
@@ -1958,7 +2107,7 @@ fn validate_page_journal_rejoin(
     data: &EiaDataPageReceipt,
     rejoin: &EiaRootPageJournalRejoin,
 ) -> Result<(), EiaSourceTransportError> {
-    let expected_dataset = eia_data_dataset_identifier(contract)?;
+    let expected_dataset = eia_data_dataset_identifier(contract.query())?;
     let expected_request_token = (data.offset() != 0).then(|| offset_token_digest(data.offset()));
     let (expected_next_offset, expected_next_token) = match data.completeness() {
         EiaPageCompleteness::More { next_offset } => {
@@ -2084,7 +2233,7 @@ pub(crate) fn validate_terminal_data_rejoin(
     contract: &EiaDatasetContract,
     retrieval: &EiaDataRetrievalSealRejoin,
 ) -> Result<(), EiaSourceTransportError> {
-    let expected_dataset = eia_data_dataset_identifier(contract)?;
+    let expected_dataset = eia_data_dataset_identifier(contract.query())?;
     let acquisition_receipt = retrieval.acquisition.receipt();
     let full_capture = retrieval.ordered_capture.root_capture();
     if current_source
@@ -2262,11 +2411,11 @@ fn aggregate_transport_receipt(
     Ok(receipt)
 }
 
-/// Derives the stable capture dataset identity for one frozen EIA query contract.
+/// Derives the stable capture dataset identity for one exact EIA query before registration.
 pub fn eia_data_dataset_identifier(
-    contract: &EiaDatasetContract,
+    query: &crate::EiaDataQuery,
 ) -> Result<SourceIdentifier, EiaSourceTransportError> {
-    digest_identifier("eia-v2-data", contract.query().identity())
+    digest_identifier("eia-v2-data", query.identity())
 }
 
 fn metadata_dataset_identifier(

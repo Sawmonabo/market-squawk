@@ -31,6 +31,9 @@ use crate::{
     TreasuryProtocolError,
 };
 
+mod page_error;
+pub use page_error::{TreasuryPageError, TreasuryPageStage};
+
 mod backfill;
 pub(crate) mod lineage;
 mod native_lineage;
@@ -817,19 +820,23 @@ impl TreasurySource {
         limits: FiscalDataParseLimits,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<RetrievedFiscalDataPage, ExtractionSourceError> {
+    ) -> Result<RetrievedFiscalDataPage, TreasuryPageError> {
         let TreasurySourceConfig::AverageInterestRates(query) = &self.config else {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::Query,
+                TreasurySourceError::QueryBindingMismatch,
             ));
         };
         if query.query_digest() != request.query_digest() {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::Query,
+                TreasurySourceError::QueryBindingMismatch,
             ));
         }
-        self.validate_authority(authority)?;
-        self.record_attempt().map_err(map_adapter_error)?;
+        self.validate_authority(authority)
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::HttpAuthority, error))?;
+        self.record_attempt()
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Health, error))?;
         let result = self
             .client
             .fetch(
@@ -844,24 +851,30 @@ impl TreasurySource {
             .await
             .and_then(|response| {
                 let page =
-                    FiscalDataPage::parse(&response.bytes, request, limits).map_err(|_| {
-                        ExtractionSourceError::Source(SourceError::InvalidProtocolState)
+                    FiscalDataPage::parse(&response.bytes, request, limits).map_err(|error| {
+                        TreasuryPageError::new(TreasuryPageStage::FiscalParse, error)
                     })?;
-                let (bytes, received_at) = response.record_success()?;
+                let (bytes, received_at) = response
+                    .record_success()
+                    .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Capture, error))?;
                 Ok(RetrievedFiscalDataPage {
                     received_at,
                     capture: capture_material(
                         &self.metadata,
-                        fiscal_provider_dataset(query).map_err(map_adapter_error)?,
+                        fiscal_provider_dataset(query).map_err(|error| {
+                            TreasuryPageError::new(TreasuryPageStage::Query, error)
+                        })?,
                         request.request_digest(),
                         received_at,
                         bytes.clone(),
-                    )?,
+                    )
+                    .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Capture, error))?,
                     bytes,
                     page,
                 })
             });
-        self.record_extraction_result(&result, |page| page.page.response_payload_digest())?;
+        self.record_extraction_result(&result, |page| page.page.response_payload_digest())
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Health, error))?;
         result
     }
 
@@ -872,16 +885,26 @@ impl TreasurySource {
         limits: FiscalDataParseLimits,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<RetrievedFiscalDataPage, ExtractionSourceError> {
+    ) -> Result<RetrievedFiscalDataPage, TreasuryPageError> {
         loop {
             let result = self
                 .fetch_fiscal_page(authority, request, limits, deadline, cancellation)
                 .await;
             match result {
                 Ok(retrieved) => return Ok(retrieved),
-                Err(error) => {
-                    Self::wait_for_shared_budget(authority, error, deadline, cancellation).await?;
+                Err(error) if error.is_budget_wait() => {
+                    Self::wait_for_shared_budget(
+                        authority,
+                        error.into_extraction(),
+                        deadline,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(|error| {
+                        TreasuryPageError::new(TreasuryPageStage::HttpTransport, error)
+                    })?;
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -894,21 +917,26 @@ impl TreasurySource {
         limits: FiscalDataParseLimits,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<RetrievedDailyRatePage, ExtractionSourceError> {
-        let query = self
-            .config
-            .query(request.dataset())
-            .ok_or_else(invalid_protocol)?;
+    ) -> Result<RetrievedDailyRatePage, TreasuryPageError> {
+        let query = self.config.query(request.dataset()).ok_or_else(|| {
+            TreasuryPageError::new(
+                TreasuryPageStage::Query,
+                TreasurySourceError::QueryBindingMismatch,
+            )
+        })?;
         let expected = query
             .page(request.page_number())
-            .map_err(|_| invalid_protocol())?;
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Query, error))?;
         if expected.request_digest() != request.request_digest() {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::Query,
+                TreasurySourceError::QueryBindingMismatch,
             ));
         }
-        self.validate_authority(authority)?;
-        self.record_attempt().map_err(map_adapter_error)?;
+        self.validate_authority(authority)
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::HttpAuthority, error))?;
+        self.record_attempt()
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Health, error))?;
         let result = self
             .client
             .fetch(
@@ -923,9 +951,11 @@ impl TreasurySource {
             .await
             .and_then(|response| {
                 let page = TreasuryDailyRatePage::parse(&response.bytes, request, limits).map_err(
-                    |_| ExtractionSourceError::Source(SourceError::InvalidProtocolState),
+                    |error| TreasuryPageError::new(TreasuryPageStage::DailyParse, error),
                 )?;
-                let (bytes, received_at) = response.record_success()?;
+                let (bytes, received_at) = response
+                    .record_success()
+                    .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Capture, error))?;
                 Ok(RetrievedDailyRatePage {
                     received_at,
                     capture: capture_material(
@@ -934,12 +964,14 @@ impl TreasurySource {
                         request.request_digest(),
                         received_at,
                         bytes.clone(),
-                    )?,
+                    )
+                    .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Capture, error))?,
                     bytes,
                     page,
                 })
             });
-        self.record_extraction_result(&result, |page| page.page.response_payload_digest())?;
+        self.record_extraction_result(&result, |page| page.page.response_payload_digest())
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Health, error))?;
         result
     }
 
@@ -950,16 +982,26 @@ impl TreasurySource {
         limits: FiscalDataParseLimits,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<RetrievedDailyRatePage, ExtractionSourceError> {
+    ) -> Result<RetrievedDailyRatePage, TreasuryPageError> {
         loop {
             let result = self
                 .fetch_daily_rate_page(authority, request, limits, deadline, cancellation)
                 .await;
             match result {
                 Ok(retrieved) => return Ok(retrieved),
-                Err(error) => {
-                    Self::wait_for_shared_budget(authority, error, deadline, cancellation).await?;
+                Err(error) if error.is_budget_wait() => {
+                    Self::wait_for_shared_budget(
+                        authority,
+                        error.into_extraction(),
+                        deadline,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(|error| {
+                        TreasuryPageError::new(TreasuryPageStage::HttpTransport, error)
+                    })?;
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1512,9 +1554,9 @@ impl TreasurySource {
         Ok(())
     }
 
-    fn record_extraction_result<T>(
+    fn record_extraction_result<T, E>(
         &self,
-        result: &Result<T, ExtractionSourceError>,
+        result: &Result<T, E>,
         digest: impl FnOnce(&T) -> [u8; 32],
     ) -> Result<(), ExtractionSourceError> {
         let mut health = self

@@ -6,7 +6,6 @@ import {
   Boxes,
   BriefcaseBusiness,
   Crosshair,
-  Database,
   FileClock,
   FileTerminal,
   FlaskConical,
@@ -106,11 +105,6 @@ export const advancedNavigation: NavigationItem[] = [
 ]
 
 export const connectionsSystemNavigation: NavigationItem[] = [
-  {
-    label: "Connections & Sources",
-    path: "/connections/sources",
-    icon: Database,
-  },
   { label: "AI Connections", path: "/system/ai-connections", icon: Network },
   {
     label: "Operations & Jobs",
@@ -142,13 +136,18 @@ export const navigationSections: NavigationSection[] = [
 export const allNavigation = navigationSections.flatMap((section) => section.items)
 
 export function navigationForPath(pathname: string) {
-  return allNavigation.find((item) => item.path === pathname) ?? homeNavigation
+  return (
+    allNavigation.find((item) => item.path === pathname) ??
+    allNavigation.find((item) => pathname.startsWith(`${item.path}/`)) ??
+    homeNavigation
+  )
 }
 
 export function navigationSectionForPath(pathname: string) {
+  const current = navigationForPath(pathname)
   return (
     navigationSections.find((section) =>
-      section.items.some((item) => item.path === pathname),
+      section.items.some((item) => item.path === current.path),
     ) ?? everydaySection
   )
 }

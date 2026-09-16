@@ -1953,6 +1953,36 @@ impl AnalyticalReadCapability {
             }))
     }
 
+    /// Returns a newest-first bounded page of canonical research capture origins.
+    ///
+    /// The boolean reports another page; callers must bound total discovery work explicitly.
+    /// These references carry discovery identity only. Reopen and verify direct capture evidence
+    /// before interpreting source coverage or absent rows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exact dataset, cutoff, cursor and operation bounds stay explicit"
+    )]
+    pub fn provider_capture_origin_candidates(
+        &self,
+        dataset_id: &DatasetId,
+        knowledge_cutoff: Timestamp,
+        before_version: Option<u64>,
+        limit: AnalyticalReadLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<DatasetManifestRef>, bool), AnalyticalReadError> {
+        self.manifests
+            .provider_capture_origin_candidates(
+                dataset_id,
+                knowledge_cutoff,
+                before_version,
+                limit.get(),
+                deadline,
+                cancellation,
+            )
+            .map_err(Into::into)
+    }
+
     /// Resolves only the exact supplied immutable generation identity.
     pub fn exact(
         &self,

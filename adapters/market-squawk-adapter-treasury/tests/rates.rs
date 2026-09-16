@@ -27,7 +27,13 @@ fn official_average_rate_profile_preserves_exact_decimal_and_methodology_evidenc
     let profile = TreasuryRateProfile::average_interest_rates_v2();
     let rate = AverageInterestRate::try_from_record(&page.records()[0], &profile)?;
     assert_eq!(rate.record_date().to_string(), "2026-06-30");
-    assert_eq!(rate.rate_percent().to_string(), "3.706");
+    assert_eq!(
+        rate.rate_percent()
+            .map(|value| value.to_string())
+            .as_deref(),
+        Some("3.706")
+    );
+    assert_eq!(rate.missing_marker(), None);
     assert_eq!(rate.security_description(), "Treasury Bills");
     assert_eq!(rate.source_line_number(), "1");
     assert_eq!(rate.source_payload_digest(), page.response_payload_digest());

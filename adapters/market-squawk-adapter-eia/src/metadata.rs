@@ -11,7 +11,7 @@ use crate::types::digest_parts;
 use crate::wire::{object_schema_digest, parse_bounded_string, parse_count, parse_envelope};
 use crate::{
     EiaApiVersion, EiaDigest, EiaError, EiaFacetValue, EiaFieldId, EiaMetadataRequest,
-    EiaMetadataRequestKind, EiaParseLimits, EiaRoute,
+    EiaMetadataRequestKind, EiaParseLimits, EiaRoute, EiaStructureLimitKind,
 };
 
 /// One child route discovered at a metadata node.
@@ -771,7 +771,11 @@ fn ensure_unique_by<'a, T: Ord + 'a>(values: impl Iterator<Item = &'a T>) -> Res
 
 fn admit_items(count: usize, limits: EiaParseLimits) -> Result<(), EiaError> {
     if count > limits.max_metadata_items() {
-        Err(EiaError::StructureLimit)
+        Err(EiaError::structure_limit(
+            EiaStructureLimitKind::MetadataItems,
+            count,
+            limits.max_metadata_items(),
+        ))
     } else {
         Ok(())
     }

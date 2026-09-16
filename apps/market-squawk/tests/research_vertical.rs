@@ -27,9 +27,8 @@ use market_squawk::application::{
 };
 use market_squawk::jobs::ResearchJobRunner;
 use market_squawk::{
-    LocalProduct, ProviderOnboardingPortal, ProviderOnboardingService,
-    ProviderPortalActivationAuthority, ProviderPortalActivationError,
-    ProviderPortalActivationRequest, ProviderPortalActivationView, ProviderPortalConfig,
+    LocalProduct, ProviderOnboardingService, ProviderPortalActivationAuthority,
+    ProviderPortalActivationError, ProviderPortalActivationRequest, ProviderPortalActivationView,
     ProviderProfileRegistrationOutcome, ResearchService, ResearchServiceError,
     StartOnboardingRequest,
     cli::{Cli, Command, IngestCommand, QueryCommand},
@@ -72,7 +71,6 @@ use market_squawk_sources::{
     SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceMetadataProvider,
     SourceObject, SourceProtocolProfile,
 };
-use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
 use rust_decimal::Decimal;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -114,6 +112,10 @@ impl EphemeralSourceInspectionAuthority for UnusedAdapterActivation {
 
 #[async_trait]
 impl SourceLifecycleAuthority for UnusedAdapterActivation {
+    fn supports(&self, _provider: &SourceIdentifier) -> bool {
+        false
+    }
+
     async fn status(
         &self,
         _provider: &SourceIdentifier,
@@ -974,7 +976,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             ..ConfigOverrides::default()
         },
     ))?;
-    let product = LocalProduct::try_new(config)?;
+    let product = LocalProduct::try_new(config).await?;
     assert_eq!(
         product
             .provider_onboarding()
@@ -1031,7 +1033,8 @@ async fn one_shot_source_cli_mints_and_consumes_its_receipt_in_one_product_lifet
         source,
         fixture_rights(source_id, 101)?,
     )?;
-    let product = LocalProduct::try_new_with_prepublished_research_sources(config, [registration])?;
+    let product =
+        LocalProduct::try_new_with_prepublished_research_sources(config, [registration]).await?;
     let cli = Cli::try_parse_from([
         "market-squawk",
         "ingest",
@@ -1114,7 +1117,7 @@ async fn oversized_datafusion_result_returns_one_retrievable_opaque_parquet_refe
             ..ConfigOverrides::default()
         },
     ))?;
-    let product = LocalProduct::try_new(config)?;
+    let product = LocalProduct::try_new(config).await?;
     let ingested = execute_cli_command(
         &product,
         Command::Ingest {
@@ -1309,8 +1312,7 @@ async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_con
 }
 
 #[tokio::test]
-async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
--> Result<(), Box<dyn Error>> {
+async fn provider_onboarding_keeps_imported_secrets_write_only() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
     let catalog = CatalogConfig::try_new(
@@ -1321,7 +1323,7 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
     let provider_rate =
-        provider_rate_authority(&directory.path().join("portal-provider-rate.sqlite3"))?;
+        provider_rate_authority(&directory.path().join("onboarding-provider-rate.sqlite3"))?;
     let (fallback_research, fallback_service, _publisher) =
         ResearchService::open_or_initialize_with_provider_onboarding_service(
             &paths,
@@ -1341,53 +1343,19 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
         fallback_service.encrypted_file_fallback_status()?,
         EncryptedFileFallbackStatus::Locked
     );
-    let fallback_portal = ProviderOnboardingPortal::start(
-        Arc::clone(&fallback_service),
-        Arc::new(UnusedAdapterActivation),
-        ProviderPortalConfig::default(),
-    )
-    .await?;
-    let fallback_base_url = fallback_portal.base_url().to_owned();
-    let client = reqwest::Client::new();
-    let fallback_bootstrap_response = client
-        .get(format!("{fallback_base_url}/api/v1/bootstrap"))
-        .send()
+    let fallback_unlock = "onboarding unlock phrase must stay write-only";
+    let unlocked = fallback_service
+        .unlock_encrypted_file_fallback(
+            SecretValue::new(fallback_unlock.to_owned())?,
+            CancellationToken::new(),
+        )
         .await?;
-    let fallback_cookie = fallback_bootstrap_response
-        .headers()
-        .get(SET_COOKIE)
-        .ok_or("fallback portal did not issue a session cookie")?
-        .to_str()?
-        .split(';')
-        .next()
-        .ok_or("fallback portal session cookie was empty")?
-        .to_owned();
-    let fallback_bootstrap: serde_json::Value = fallback_bootstrap_response.json().await?;
-    let fallback_csrf = fallback_bootstrap["csrf_token"]
-        .as_str()
-        .ok_or("fallback portal did not issue a CSRF token")?;
-    assert_eq!(fallback_bootstrap["encrypted_file_fallback"], "locked");
-    let fallback_unlock = "portal unlock phrase must stay write-only";
-    let unlocked = client
-        .post(format!(
-            "{fallback_base_url}/api/v1/secrets/fallback/unlock"
-        ))
-        .header(COOKIE, &fallback_cookie)
-        .header(ORIGIN, &fallback_base_url)
-        .header("x-csrf-token", fallback_csrf)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(fallback_unlock.to_owned())
-        .send()
-        .await?;
-    let unlocked_status = unlocked.status();
-    let unlocked_body = unlocked.text().await?;
-    assert!(
-        unlocked_status == reqwest::StatusCode::OK
-            && !unlocked_body.contains(fallback_unlock)
-            && serde_json::from_str::<serde_json::Value>(&unlocked_body)?["encrypted_file_fallback"]
-                == "ready"
+    let unlocked_body = serde_json::to_string(&unlocked)?;
+    assert!(!unlocked_body.contains(fallback_unlock));
+    assert_eq!(
+        fallback_service.encrypted_file_fallback_status()?,
+        EncryptedFileFallbackStatus::Ready
     );
-    fallback_portal.shutdown().await?;
     drop(fallback_service);
     drop(fallback_research);
 
@@ -1407,117 +1375,35 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     let service = Arc::new(service);
     let registered = service.register_profile("bls.v2-registered")?;
     let replayed = service.register_profile("bls.v2-registered")?;
-    let portal = ProviderOnboardingPortal::start(
-        Arc::clone(&service),
-        Arc::new(UnusedAdapterActivation),
-        ProviderPortalConfig::default(),
-    )
-    .await?;
-    let base_url = portal.base_url().to_owned();
-    let stylesheet_response = client.get(format!("{base_url}/portal.css")).send().await?;
-    assert_eq!(stylesheet_response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        stylesheet_response
-            .headers()
-            .get(CONTENT_TYPE)
-            .ok_or("portal stylesheet did not declare a content type")?
-            .to_str()?,
-        "text/css; charset=utf-8"
-    );
-    assert_eq!(
-        stylesheet_response
-            .headers()
-            .get("cache-control")
-            .ok_or("portal stylesheet did not declare a cache policy")?
-            .to_str()?,
-        "no-store"
-    );
-    let content_security_policy = stylesheet_response
-        .headers()
-        .get("content-security-policy")
-        .ok_or("portal stylesheet did not declare a content security policy")?
-        .to_str()?;
-    assert!(content_security_policy.contains("style-src 'self'"));
-    assert!(!content_security_policy.contains("'unsafe-inline'"));
-    let bootstrap_response = client
-        .get(format!("{base_url}/api/v1/bootstrap"))
-        .send()
-        .await?;
-    let cookie = bootstrap_response
-        .headers()
-        .get(SET_COOKIE)
-        .ok_or("portal did not issue a session cookie")?
-        .to_str()?
-        .split(';')
-        .next()
-        .ok_or("portal session cookie was empty")?
-        .to_owned();
-    let bootstrap: serde_json::Value = bootstrap_response.json().await?;
-    let csrf = bootstrap["csrf_token"]
-        .as_str()
-        .ok_or("portal did not issue a CSRF token")?;
-    assert_eq!(bootstrap["encrypted_file_fallback"], "disabled");
-    let start_response = client
-        .post(format!("{base_url}/api/v1/sessions"))
-        .header(COOKIE, &cookie)
-        .header(ORIGIN, &base_url)
-        .header("x-csrf-token", csrf)
-        .json(&serde_json::json!({
-            "surface_id": "bls.v2-registered",
-            "organization": "Market Squawk",
-            "administrative_email": "operations@example.test"
-        }))
-        .send()
-        .await?;
-    let started: serde_json::Value = start_response.json().await?;
-    let session_id = Uuid::parse_str(
-        started["session_id"]
-            .as_str()
-            .ok_or("portal did not return a session identity")?,
-    )?;
+    let started = service.start_deferred(StartOnboardingRequest::try_new(
+        "bls.v2-registered",
+        None,
+        None,
+    )?)?;
+    let session_id = started.session_id();
     let secret = "sentinel-registration-key-never-echo";
-    let rejected = client
-        .post(format!("{base_url}/api/v1/sessions/{session_id}/secret"))
-        .header(COOKIE, &cookie)
-        .header(ORIGIN, &base_url)
-        .header("x-csrf-token", "wrong-token")
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(secret.to_owned())
-        .send()
-        .await?;
-    let accepted = client
-        .post(format!("{base_url}/api/v1/sessions/{session_id}/secret"))
-        .header(COOKIE, &cookie)
-        .header(ORIGIN, &base_url)
-        .header("x-csrf-token", csrf)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(secret.to_owned())
-        .send()
-        .await?;
-    let accepted_status = accepted.status();
-    let accepted_body = accepted.text().await?;
-    let resumed = service.resume(session_id)?;
-    let sec = service
-        .start(
-            StartOnboardingRequest::try_new(
-                "sec.edgar-public",
-                Some("Market Squawk".to_owned()),
-                Some("operations@example.test".to_owned()),
-            )?,
+    let accepted = service
+        .submit_secret(
+            session_id,
+            SecretValue::new(secret.to_owned())?,
             CancellationToken::new(),
         )
         .await?;
+    let accepted_body = serde_json::to_string(&accepted)?;
+    let resumed = service.resume(session_id)?;
+    let sec = service.start_deferred(StartOnboardingRequest::try_new(
+        "sec.edgar-public",
+        Some("Market Squawk".to_owned()),
+        Some("operations@example.test".to_owned()),
+    )?)?;
     let recovered_sec = service.resume(sec.session_id())?;
     let sessions = service.sessions(CatalogLimit::new(8)?)?;
     let current = service.current_sessions(CatalogLimit::new(8)?)?;
-    portal.shutdown().await?;
 
     assert!(
         registered.outcome() == ProviderProfileRegistrationOutcome::Replay
             && registered.profile().id() == "bls.v2-registered"
             && replayed.outcome() == ProviderProfileRegistrationOutcome::Replay
-            && rejected.status() == reqwest::StatusCode::FORBIDDEN
-            && accepted_status == reqwest::StatusCode::OK
             && !accepted_body.contains(secret)
             && resumed.credential_stored()
             && resumed.state() == market_squawk_sources::OnboardingState::StoredUnverified

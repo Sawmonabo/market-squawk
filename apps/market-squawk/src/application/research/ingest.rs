@@ -19,6 +19,7 @@ use market_squawk_data::{
 use market_squawk_domain::{
     CompanyIdentityObservation, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
 };
+use market_squawk_platform::SealedResearchJournalStore;
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
@@ -1312,6 +1313,7 @@ impl ProviderMacroOperationAuthority {
         revisions: ExtractionRevisionPlan,
         expected_implementation: ProviderNativeLineageImplementation,
         observed_at: Timestamp,
+        additional: Option<Arc<dyn IngestPrecommitAuthority>>,
     ) -> Result<ProviderMacroSinglePublication, ProviderMacroPublicationError> {
         self.ensure_live()?;
         binding.validate()?;
@@ -1328,8 +1330,20 @@ impl ProviderMacroOperationAuthority {
             return Err(ProviderMacroPublicationError::InvalidBinding);
         }
         let binding_digest = binding.evidence_digest().evidence();
+        let expected_source = capture.source_id().clone();
+        let expected_revision = capture.metadata_revision().as_source_identifier().clone();
+        let expected_dataset = capture.dataset().clone();
+        let expected_records = binding.record_count();
         let payload_digest = extraction_provider_payload_digest(binding.batch());
         let rights = self.rights_decision(payload_digest, observed_at)?;
+        let provider = self.publication_authority();
+        let precommit: Arc<dyn IngestPrecommitAuthority> = match additional {
+            Some(additional) => Arc::new(ChainedIngestPrecommitAuthority {
+                provider,
+                additional,
+            }),
+            None => provider,
+        };
         let ingest = ResearchIngestRequest::with_provider_publication(
             self.generation.metadata().clone(),
             rights,
@@ -1337,20 +1351,40 @@ impl ProviderMacroOperationAuthority {
             binding,
             revisions,
         )?
-        .with_precommit_authority(self.publication_authority());
+        .with_precommit_authority(precommit);
         let committed = self
             .research
             .ingest(ingest, self.cancellation.clone())
             .await?;
-        let restart = ProviderMacroRestartBinding::try_reopen(
-            self.research.as_ref(),
-            committed.manifest().clone(),
-            self.generation.metadata().source_id(),
-            expected_implementation,
-        )?;
-        if restart.binding_digest != binding_digest {
-            return Err(ProviderMacroPublicationError::RestartMismatch);
-        }
+        // The commit is already durable. Revalidate its creating inputs under the original read
+        // controls; an interrupted read cannot undo that commit or select a later generation.
+        let restart = self
+            .research
+            .read_provider_capture_generation(
+                committed.manifest().clone(),
+                self.operation_deadline,
+                &self.cancellation,
+                move |generation, _, _, _, _| {
+                    Ok(ProviderMacroRestartBinding::from_verified_generation(
+                        &generation,
+                        &expected_source,
+                        expected_implementation,
+                    )
+                    .and_then(|(restart, _)| {
+                        if restart.binding_digest != binding_digest
+                            || restart.metadata_revision != expected_revision
+                            || restart.provider_dataset != expected_dataset
+                            || restart.record_count != expected_records
+                            || restart.native_schema_version != schema.version()
+                            || restart.native_schema_fingerprint != schema.fingerprint()
+                        {
+                            return Err(ProviderMacroPublicationError::RestartMismatch);
+                        }
+                        Ok(restart)
+                    }))
+                },
+            )
+            .await??;
         Ok(ProviderMacroSinglePublication { committed, restart })
     }
 }
@@ -1377,6 +1411,52 @@ pub(super) struct ProviderMacroRestartBinding {
 }
 
 impl ProviderMacroRestartBinding {
+    /// Reconstructs a single-binding macro coordinate from the data owner's verified creating
+    /// generation. This pure projection cannot reopen a catalog or accept inherited lineage.
+    pub(super) fn from_verified_generation<'a>(
+        generation: &'a market_squawk_data::GenerationOwnedProviderCaptureEvidence,
+        expected_source: &SourceId,
+        expected_implementation: ProviderNativeLineageImplementation,
+    ) -> Result<(Self, &'a PersistedProviderCaptureBindingEvidence), ProviderMacroPublicationError>
+    {
+        let [object] = generation.objects() else {
+            return Err(ProviderMacroPublicationError::RestartMismatch);
+        };
+        let [input] = object.inputs() else {
+            return Err(ProviderMacroPublicationError::RestartMismatch);
+        };
+        let evidence = input.binding();
+        let implementation = macro_native_implementation_name(expected_implementation)
+            .ok_or(ProviderMacroPublicationError::InvalidBinding)?;
+        if generation.source_id() != expected_source
+            || evidence.capture().source_id() != expected_source
+            || evidence.record_count() == 0
+            || evidence.record_count() != evidence.rows().len()
+            || evidence.native_lineage().implementation() != implementation
+            || evidence.native_lineage().row_count() != evidence.record_count()
+        {
+            return Err(ProviderMacroPublicationError::RestartMismatch);
+        }
+        Ok((
+            Self {
+                manifest: generation.pinned().manifest().clone(),
+                binding_digest: evidence.binding_digest(),
+                source_id: expected_source.clone(),
+                metadata_revision: evidence
+                    .capture()
+                    .metadata_revision()
+                    .as_source_identifier()
+                    .clone(),
+                provider_dataset: evidence.capture().dataset().clone(),
+                record_count: evidence.record_count(),
+                native_implementation: implementation,
+                native_schema_version: evidence.native_lineage().version(),
+                native_schema_fingerprint: evidence.native_lineage().fingerprint(),
+            },
+            evidence,
+        ))
+    }
+
     pub(super) fn try_reopen(
         research: &ResearchService,
         manifest: DatasetManifestRef,
@@ -1510,6 +1590,10 @@ const fn macro_native_implementation_name(
 }
 
 impl ProductionResearchIngestCoordinator {
+    /// Finite lifetime for one retained Treasury all-history acquisition, including replay.
+    /// Individual HTTP requests retain their independent transport and provider-rate bounds.
+    pub(crate) const TREASURY_ALL_HISTORY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
     /// Binds restart-durable source authority to the sole analytical publication service.
     #[must_use]
     pub fn new(
@@ -1545,6 +1629,7 @@ impl ProductionResearchIngestCoordinator {
             generation,
             provider_dataset,
             context,
+            self.limits.operation_duration,
         )
         .await
         .map(|(operation, _capability)| operation)
@@ -1563,6 +1648,7 @@ impl ProductionResearchIngestCoordinator {
                 generation,
                 provider_dataset,
                 context,
+                Self::TREASURY_ALL_HISTORY_TIMEOUT,
             )
             .await?;
         let RegisteredTypedSourceCapability::TreasuryAllHistory(source) = capability else {
@@ -1573,11 +1659,101 @@ impl ProductionResearchIngestCoordinator {
         Ok(operation)
     }
 
+    /// Replays completion through the current registered source and the sealed raw store.
+    /// The adapter retains and joins its blocking worker before returning cancellation.
+    pub(crate) async fn restore_treasury_all_history_completion(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+        checkpoint: &[u8],
+        store: Arc<SealedResearchJournalStore>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<market_squawk_adapter_treasury::TreasuryAllHistoryAcquisitionCompletion, ServiceError>
+    {
+        if cancellation.is_cancelled() {
+            return Err(ServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(ServiceError::DeadlineExceeded);
+        }
+        let source = self.treasury_all_history_restore_source(generation, provider_dataset)?;
+        let restored = source
+            .restore_all_history_backfill(checkpoint, store, deadline, cancellation)
+            .await
+            .map_err(|error| match error {
+                market_squawk_adapter_treasury::TreasurySourceError::Cancelled => {
+                    ServiceError::Cancelled
+                }
+                market_squawk_adapter_treasury::TreasurySourceError::DeadlineExceeded => {
+                    ServiceError::DeadlineExceeded
+                }
+                _ => ServiceError::Unavailable,
+            })?;
+        if cancellation.is_cancelled() {
+            return Err(ServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(ServiceError::DeadlineExceeded);
+        }
+        let current = self.treasury_all_history_restore_source(generation, provider_dataset)?;
+        if !Arc::ptr_eq(&source, &current) {
+            return Err(ServiceError::Unavailable);
+        }
+        restored
+            .acquisition_completion()
+            .map_err(|_| ServiceError::Unavailable)
+    }
+
+    fn treasury_all_history_restore_source(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<Arc<market_squawk_adapter_treasury::TreasurySource>, ServiceError> {
+        if self.lifecycle.shutdown_token().is_cancelled() {
+            return Err(ServiceError::Unavailable);
+        }
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| ServiceError::Unavailable)?;
+        let registered = authority
+            .sources
+            .get(generation.profile())
+            .ok_or(ServiceError::NotFound)?;
+        if authority.registry.is_none()
+            || registered.generation.as_ref() != Some(generation)
+            || registered.metadata != *generation.metadata()
+            || registered.source.metadata() != generation.metadata()
+            || registered.registration.source_id() != generation.metadata().source_id()
+            || registered.registration.revision() != generation.metadata().revision()
+            || !registered
+                .admission
+                .admits_generation(generation)
+                .map_err(|_| ServiceError::Unavailable)?
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        registered.rights.validate_at(system_timestamp()?)?;
+        let subject = registered
+            .source
+            .rights_subject(provider_dataset)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        registered.rights.validate_subject(subject.as_ref())?;
+        let RegisteredTypedSourceCapability::TreasuryAllHistory(source) =
+            registered.typed_capability.clone()
+        else {
+            return Err(ServiceError::Unavailable);
+        };
+        Ok(source)
+    }
+
     async fn acquire_provider_macro_operation_with_registered_capability(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
         provider_dataset: &SourceIdentifier,
         context: &RequestContext,
+        maximum_duration: Duration,
     ) -> Result<
         (
             ProviderMacroOperationAuthority,
@@ -1586,7 +1762,7 @@ impl ProductionResearchIngestCoordinator {
         ServiceError,
     > {
         let call = DomainLifecycle::enter(&self.lifecycle, context)?;
-        let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
+        let operation_deadline = operation_deadline(context, maximum_duration)?;
         let (extraction, rights, admission, typed_capability) = {
             let authority = self
                 .authority
@@ -2634,7 +2810,7 @@ struct AuthorizedExtraction {
 
 struct ChainedIngestPrecommitAuthority {
     provider: Arc<dyn IngestPrecommitAuthority>,
-    additional: Arc<dyn ResearchIngestCommitAuthority>,
+    additional: Arc<dyn IngestPrecommitAuthority>,
 }
 
 impl fmt::Debug for ChainedIngestPrecommitAuthority {
@@ -2651,6 +2827,14 @@ impl IngestPrecommitAuthority for ChainedIngestPrecommitAuthority {
     fn validate_precommit(&self) -> Result<(), IngestError> {
         self.provider.validate_precommit()?;
         self.additional.validate_precommit()
+    }
+
+    fn validate_catalog_precommit(
+        &self,
+        catalog: &market_squawk_data::CatalogAuthority,
+    ) -> Result<(), IngestError> {
+        self.provider.validate_catalog_precommit(catalog)?;
+        self.additional.validate_catalog_precommit(catalog)
     }
 }
 
@@ -2699,7 +2883,7 @@ impl ProductionResearchIngestCoordinator {
         let precommit: Arc<dyn IngestPrecommitAuthority> = match &additional {
             Some(additional) => Arc::new(ChainedIngestPrecommitAuthority {
                 provider,
-                additional: Arc::clone(additional),
+                additional: additional.clone(),
             }),
             None => provider,
         };
@@ -2815,6 +2999,7 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
                 AlpacaHistoricalSourceSlotError::WaitCancelled => ServiceError::Cancelled,
                 _ => ServiceError::Unavailable,
             })?;
+        treasury::drain_before_registry_close(self, deadline).await?;
         self.close_registry()
     }
 }
@@ -3386,6 +3571,9 @@ pub enum ResearchIngestCompositionError {
     /// A replacement cannot publish while its predecessor still admits requests.
     #[error("research provider runtime generation is still callable")]
     RuntimeGenerationStillCallable,
+    /// A retained Treasury raw replay worker failed before generation replacement could drain.
+    #[error("Treasury raw replay drain failed: {0}")]
+    TreasuryReplay(#[source] market_squawk_adapter_treasury::TreasurySourceError),
     /// The restart-durable source registry rejected registration.
     #[error("research source registration failed: {0}")]
     Registry(#[from] RegistryError),

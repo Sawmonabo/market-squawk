@@ -35,7 +35,7 @@ use analytical_controller::{analytical_controller, analytical_product};
 use bridge::{
     DesktopBootstrapState, DesktopCompositionContext, DesktopState, desktop_bootstrap,
     desktop_service_bootstrap, desktop_service_reconnect, installation_control,
-    open_official_provider_page, open_protected_provider_setup, provider_onboarding,
+    open_official_provider_page, provider_onboarding,
 };
 use contracts::DesktopCommandError;
 use events::{DesktopEventSubscriptions, subscribe_service_events, unsubscribe_service_events};
@@ -289,7 +289,6 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             model_products,
             operations_control,
             open_official_provider_page,
-            open_protected_provider_setup,
             paper_control,
             preview_portfolio_import,
             preview_research_file_import,

@@ -28,8 +28,9 @@ pub use source::{
     RetrievedDailyRatePage, RetrievedFiscalDataPage, TreasuryAllHistoryAcquisitionCompletion,
     TreasuryAllHistoryBackfill, TreasuryAllHistoryCanonicalPage, TreasuryAllHistoryCheckpoint,
     TreasuryAllHistoryFetchedPage, TreasuryAllHistoryPageAdmission, TreasuryDailyRatesConfig,
-    TreasuryDoctorRun, TreasuryDoctorSealError, TreasuryExtractionOutput, TreasurySource,
-    TreasurySourceConfig, TreasurySourceError, TreasurySourceHealth,
+    TreasuryDoctorRun, TreasuryDoctorSealError, TreasuryExtractionOutput, TreasuryPageError,
+    TreasuryPageStage, TreasurySource, TreasurySourceConfig, TreasurySourceError,
+    TreasurySourceHealth,
 };
 pub use vertical::{
     TreasuryActivationIntent, TreasuryDashboardDatasetRead, TreasuryDashboardReadPlan,

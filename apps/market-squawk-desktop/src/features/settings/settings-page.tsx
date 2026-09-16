@@ -1,4 +1,5 @@
 import * as React from "react"
+import { NavLink } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   CheckCircle2,
@@ -55,6 +56,12 @@ import {
   type WorkspaceSwitchPreview,
 } from "./contracts"
 
+const ConnectionsWorkspace = React.lazy(() =>
+  import("@/features/sources").then((module) => ({
+    default: module.ConnectionsWorkspace,
+  })),
+)
+
 const WORKSPACE_PAGE_LIMIT = 64
 
 type DraftValues = Record<string, string>
@@ -64,7 +71,11 @@ type Confirmation =
   | { kind: "rollback"; preview: SettingsRollbackPreview }
   | { kind: "workspace"; preview: WorkspaceSwitchPreview }
 
-export function SettingsPage() {
+export function SettingsPage({
+  section = "general",
+}: {
+  section?: "general" | "onboarding"
+}) {
   const system = useSystem()
 
   if (system.status === "loading") return <SettingsFrame><SettingsSkeleton /></SettingsFrame>
@@ -84,6 +95,25 @@ export function SettingsPage() {
     return (
       <SettingsFrame>
         <Unavailable detail={system.error} />
+      </SettingsFrame>
+    )
+  }
+
+  if (section === "onboarding") {
+    return (
+      <SettingsFrame>
+        <React.Suspense
+          fallback={
+            <div role="status" aria-label="Loading connections">
+              <Skeleton className="h-96 rounded-xl" />
+            </div>
+          }
+        >
+          <ConnectionsWorkspace
+            bootstrap={system.bootstrap}
+            transport={system.transport}
+          />
+        </React.Suspense>
       </SettingsFrame>
     )
   }
@@ -562,7 +592,52 @@ function SecureStorageRecovery({ requiresUnlock, pending, error, onRecover }: { 
   return <section className="rounded-xl border border-amber-400/30 bg-amber-400/5 p-5"><div className="flex gap-3"><KeyRound className="mt-0.5 size-5 text-amber-300" aria-hidden="true" /><div><h2 className="font-semibold">Finish secure startup</h2><p className="mt-1 text-sm leading-6 text-muted-foreground">{requiresUnlock ? "Enter your local security password to unlock saved connection credentials." : "Continue once to let Market Squawk open your saved connections securely."}</p></div></div><form className="mt-5 flex max-w-xl flex-wrap items-end gap-3" onSubmit={recover}>{requiresUnlock ? <div className="min-w-56 flex-1"><Label htmlFor="service-fallback-unlock">Local security password</Label><Input id="service-fallback-unlock" name="unlock" type="password" autoComplete="current-password" spellCheck={false} className="mt-2 font-mono" disabled={pending} /></div> : null}<Button type="submit" disabled={pending}>{pending ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : null}{pending ? "Finishing startup…" : requiresUnlock ? "Unlock secure storage" : "Continue secure startup"}</Button></form>{error ? <InlineError>{error}</InlineError> : null}</section>
 }
 function Unavailable({ detail }: { detail: string }) { return <Alert className="mt-5"><CircleAlert aria-hidden="true" /><AlertTitle>Settings service is unavailable</AlertTitle><AlertDescription>{detail} Reconnect to the installed Market Squawk service and retry; no local fallback can edit these authorities.</AlertDescription></Alert> }
-function SettingsFrame({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) { return <div className="mx-auto w-full max-w-[1320px] p-5 lg:p-7"><header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between"><div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Service-owned configuration and workspace authority</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">Settings</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Review effective typed configuration, preview revision-fenced changes, and switch only through the service’s durable workspace transition workflow.</p></div>{action}</header><div className="mt-6">{children}</div></div> }
+function SettingsFrame({
+  children,
+  action,
+}: {
+  children: React.ReactNode
+  action?: React.ReactNode
+}) {
+  return (
+    <div className="mx-auto w-full max-w-[1320px] p-5 lg:p-7">
+      <header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between">
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">
+            Workspace preferences and connection setup
+          </p>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Settings</h1>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+            Manage your saved connections, data imports, and local workspace settings.
+          </p>
+        </div>
+        {action}
+      </header>
+      <nav className="mt-5 flex flex-wrap gap-2" aria-label="Settings sections">
+        {([
+          ["/system/settings", "General"],
+          ["/system/settings/onboarding", "Onboarding"],
+        ] as const).map(([path, label]) => (
+          <NavLink
+            key={path}
+            to={path}
+            end
+            className={({ isActive }) =>
+              `inline-flex h-9 items-center rounded-md border px-4 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary ${
+                isActive
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-border hover:bg-accent"
+              }`
+            }
+          >
+            {label}
+          </NavLink>
+        ))}
+      </nav>
+      <div className="mt-6">{children}</div>
+    </div>
+  )
+}
 function SettingsSkeleton() { return <><div className="grid gap-3 sm:grid-cols-3"><Skeleton className="h-32" /><Skeleton className="h-32" /><Skeleton className="h-32" /></div><div className="mt-6 grid gap-3 xl:grid-cols-2"><Skeleton className="h-72" /><Skeleton className="h-72" /></div></> }
 
 function entriesToDraft(entries: SettingEntry[]): DraftValues { return Object.fromEntries(entries.map((entry) => [entry.key, settingValueToText(entry)])) }

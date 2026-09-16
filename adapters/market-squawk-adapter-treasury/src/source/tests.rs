@@ -267,6 +267,27 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     };
     let terminal = terminal_feed(terminal_receipt_clock_floor);
     let future_terminal = terminal_feed(future_terminal_feed_at);
+    let display_property = r#"<d:BC_30YEARDISPLAY m:type="Edm.Double">0.00</d:BC_30YEARDISPLAY>"#;
+    let daily = std::str::from_utf8(include_bytes!("../../fixtures/daily_par_yield_curve.xml"))?
+        .replace(
+            "</m:properties>",
+            &format!("{display_property}</m:properties>"),
+        );
+    for invalid_property in [
+        display_property.replace("Edm.Double", "Edm.String"),
+        display_property.replace("0.00", "not-a-decimal"),
+    ] {
+        assert!(
+            crate::TreasuryDailyRatePage::parse(
+                daily
+                    .replace(display_property, &invalid_property)
+                    .as_bytes(),
+                &query.page(0)?,
+                crate::FiscalDataParseLimits::production_defaults(),
+            )
+            .is_err()
+        );
+    }
     let transport = Arc::new(ScriptedTransport {
         responses: Mutex::new(VecDeque::from([
             TreasuryHttpResponse {
@@ -274,9 +295,7 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
                 retry_after: None,
                 content_encoding: None,
                 content_type: Some(b"application/atom+xml".to_vec()),
-                body: Bytes::from_static(include_bytes!(
-                    "../../fixtures/daily_par_yield_curve.xml"
-                )),
+                body: Bytes::from(daily.clone()),
                 received_at: now,
             },
             TreasuryHttpResponse {
@@ -328,6 +347,23 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(!first.terminal());
     let canonical = first.canonical().ok_or("missing canonical data page")?;
     let first_content_identity = canonical.content_identity();
+    let thirty_year_ordinal = canonical
+        .batch()
+        .records()
+        .iter()
+        .position(|record| {
+            matches!(serde_json::from_slice::<ResearchObservation>(record.payload()),
+            Ok(ResearchObservation::Macro(observation))
+                if observation.series().as_str() == "treasury:daily-par-yield-curve:30y")
+        })
+        .ok_or("missing actual thirty-year yield")?;
+    assert_macro_record(
+        &canonical.batch().records()[thirty_year_ordinal],
+        "treasury:daily-par-yield-curve:30y",
+        "4.86",
+        DataQuality::OfficialDelayed,
+        Some("2026-07-21T06:54:08Z"),
+    )?;
     assert_eq!(
         canonical.accounting().aggregate_canonical_points(),
         u64::try_from(canonical.batch().records().len())?
@@ -344,6 +380,7 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
             .all(|ordinal| *ordinal == 0)
     );
     let (_, capture, admission) = first.into_parts();
+    assert_eq!(capture.records()[0].payload(), daily.as_bytes());
     let (expectation, seal_request) = capture.into_whole_seal_parts();
     let sealed = expectation
         .try_rejoin(seal_request.seal(&store)?)?
@@ -392,9 +429,7 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
                 CancellationToken::new(),
             )
             .await,
-        Err(market_squawk_sources::ExtractionSourceError::Source(
-            market_squawk_sources::SourceError::InvalidProtocolState
-        ))
+        Err(error) if error.stage() == super::TreasuryPageStage::Chronology
     ));
     let terminal = source
         .fetch_next_all_history_page(
@@ -438,6 +473,13 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     )?;
     assert_eq!(&reopened_seal, &completion.sealed_pages()[0]);
     assert_eq!(reopened.content_identity(), first_content_identity);
+    assert_macro_record(
+        &reopened.batch().records()[thirty_year_ordinal],
+        "treasury:daily-par-yield-curve:30y",
+        "4.86",
+        DataQuality::OfficialDelayed,
+        Some("2026-07-21T06:54:08Z"),
+    )?;
     reopened.native_lineage().validate(reopened.batch())?;
     assert_eq!(
         completion.native_lineage_batch_digests().next(),
@@ -583,6 +625,25 @@ async fn fiscal_all_history_restores_sealed_pages_and_retains_terminal_rows() ->
     last["data"][0]["record_calendar_quarter"] = serde_json::json!("3");
     last["data"][0]["record_calendar_month"] = serde_json::json!("07");
     last["data"][0]["record_calendar_day"] = serde_json::json!("01");
+    last["data"][0]["avg_interest_rate_amt"] = serde_json::json!("null");
+    // Only the documented marker becomes missing; other malformed tokens remain failures.
+    let profile = crate::TreasuryRateProfile::average_interest_rates_v2();
+    for invalid in ["", "NULL", " null ", "N/A", "3.706%", "NaN"] {
+        let mut malformed = first.clone();
+        malformed["data"][0]["avg_interest_rate_amt"] = serde_json::json!(invalid);
+        let page = crate::FiscalDataPage::parse(
+            &serde_json::to_vec(&malformed)?,
+            &match &config {
+                TreasurySourceConfig::AverageInterestRates(query) => query.page(1)?,
+                _ => return Err("expected Fiscal configuration".into()),
+            },
+            crate::FiscalDataParseLimits::production_defaults(),
+        )?;
+        assert!(matches!(
+            crate::AverageInterestRate::try_from_record(&page.records()[0], &profile),
+            Err(crate::TreasuryRateError::InvalidRate)
+        ));
+    }
     let mut responses = VecDeque::new();
     for body in [first, last] {
         responses.push_back(TreasuryHttpResponse {
@@ -638,6 +699,37 @@ async fn fiscal_all_history_restores_sealed_pages_and_retains_terminal_rows() ->
             .canonical()
             .ok_or("Fiscal terminal must retain canonical rows")?;
         assert_eq!(canonical.batch().records().len(), 1);
+        assert_eq!(
+            canonical.accounting().aggregate_observed_numeric_points(),
+            u64::from(number == 1)
+        );
+        assert_eq!(
+            canonical.accounting().aggregate_explicit_missing_points(),
+            u64::from(number == 2)
+        );
+        if number == 2 {
+            let ResearchObservation::Macro(observation) =
+                serde_json::from_slice(canonical.batch().records()[0].payload())?
+            else {
+                return Err("expected Fiscal Macro observation".into());
+            };
+            assert_eq!(observation.value().observed_value(), None);
+            let missing = observation
+                .value()
+                .missing_value()
+                .ok_or("missing Fiscal null evidence")?;
+            assert_eq!(missing.marker().as_str(), "null");
+            assert_eq!(missing.reason(), None);
+            assert_eq!(observation.unit().as_str(), "percent");
+            let native: serde_json::Value =
+                serde_json::from_slice(canonical.native_lineage().rows()[0].semantic_payload())?;
+            assert!(
+                native["fields"]
+                    .as_array()
+                    .ok_or("missing Fiscal native fields")?
+                    .contains(&serde_json::json!(["avg_interest_rate_amt", "null"]))
+            );
+        }
         canonical.native_lineage().validate(canonical.batch())?;
         assert_eq!(canonical.row_capture_page_ordinals(), [0]);
         contents.push(canonical.content_identity());
@@ -665,6 +757,8 @@ async fn fiscal_all_history_restores_sealed_pages_and_retains_terminal_rows() ->
     assert_eq!(completion.data_page_count(), 2);
     assert_eq!(completion.source_rows(), 2);
     assert_eq!(completion.canonical_points(), 2);
+    assert_eq!(completion.observed_numeric_points(), 1);
+    assert_eq!(completion.explicit_missing_points(), 1);
     assert_eq!(completion.canonical_series().len(), 1);
     assert_eq!(completion.data_source_objects().count(), 2);
     for (ordinal, content) in contents.iter().enumerate() {
@@ -676,6 +770,14 @@ async fn fiscal_all_history_restores_sealed_pages_and_retains_terminal_rows() ->
             &CancellationToken::new(),
         )?;
         assert_eq!(canonical.content_identity(), *content);
+        assert_eq!(
+            canonical.accounting().aggregate_observed_numeric_points(),
+            u64::from(ordinal == 0)
+        );
+        assert_eq!(
+            canonical.accounting().aggregate_explicit_missing_points(),
+            u64::from(ordinal == 1)
+        );
         assert_eq!(seal, completion.sealed_pages()[ordinal]);
         canonical.native_lineage().validate(canonical.batch())?;
     }

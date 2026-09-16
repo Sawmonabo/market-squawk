@@ -127,7 +127,7 @@ mod tests {
             },
         ))?;
         let dataset = SourceIdentifier::try_from(provider_dataset)?;
-        let product = LocalProduct::try_new(config.clone())?;
+        let product = LocalProduct::try_new(config.clone()).await?;
         let onboarding = product.provider_onboarding();
         onboarding
             .unlock_encrypted_file_fallback(
@@ -226,7 +226,7 @@ mod tests {
         }
         drop(product);
 
-        let reopened_product = LocalProduct::try_new(config)?;
+        let reopened_product = LocalProduct::try_new(config).await?;
         let reopened = reopen_fred_latest_known(
             reopened_product.research().as_ref(),
             dataset,

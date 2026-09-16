@@ -2,7 +2,6 @@
 
 use std::fmt;
 
-use market_squawk::ProviderPortalActivationRequest;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -1320,72 +1319,7 @@ impl InstallationControlCommand {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(
-    deny_unknown_fields,
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    tag = "action"
-)]
-pub(crate) enum ProviderOnboardingCommand {
-    Bootstrap,
-    Start {
-        surface_id: String,
-        organization: Option<String>,
-        administrative_email: Option<String>,
-    },
-    Resume {
-        session_id: Uuid,
-    },
-    UnlockFallback {
-        secret: String,
-    },
-    LockFallback,
-    SubmitSecret {
-        session_id: Uuid,
-        secret: String,
-    },
-    Activate {
-        session_id: Uuid,
-        request: ProviderPortalActivationRequest,
-    },
-    Renew {
-        session_id: Uuid,
-    },
-    Cleanup {
-        session_id: Uuid,
-    },
-    Cancel {
-        session_id: Uuid,
-    },
-}
-
-impl ProviderOnboardingCommand {
-    pub(crate) const fn requires_confirmation(&self) -> bool {
-        !matches!(self, Self::Bootstrap | Self::Resume { .. })
-    }
-}
-
-impl fmt::Debug for ProviderOnboardingCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let action = match self {
-            Self::Bootstrap => "bootstrap",
-            Self::Start { .. } => "start",
-            Self::Resume { .. } => "resume",
-            Self::UnlockFallback { .. } => "unlock_fallback",
-            Self::LockFallback => "lock_fallback",
-            Self::SubmitSecret { .. } => "submit_secret",
-            Self::Activate { .. } => "activate",
-            Self::Renew { .. } => "renew",
-            Self::Cleanup { .. } => "cleanup",
-            Self::Cancel { .. } => "cancel",
-        };
-        formatter
-            .debug_struct("ProviderOnboardingCommand")
-            .field("action", &action)
-            .finish_non_exhaustive()
-    }
-}
+pub(crate) use market_squawk::provider_onboarding::ProviderOnboardingRequest as ProviderOnboardingCommand;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

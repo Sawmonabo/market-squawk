@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use market_squawk_data::CatalogLimit;
+use market_squawk_domain::SourceIdentifier;
 use market_squawk_platform::SecretValue;
 use market_squawk_sources::{ProfileReleaseState, SEC_EDGAR_PROFILE_ID};
 use serde::Serialize;
@@ -9,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::contracts::{OnboardingNextAction, ProviderProfileView};
+use super::activation::ProviderPortalActivationAuthority;
+use super::contracts::{OnboardingNextAction, OnboardingSessionView, ProviderProfileView};
 use super::credential_bundle::{
     PROVIDER_CREDENTIAL_BUNDLE_SCHEMA, ProviderCredentialBundle, ProviderCredentialConfiguration,
     ProviderCredentialValue, ProviderCredentialValues,
@@ -61,7 +64,7 @@ const BLS_REGISTERED_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 const BEA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "bea.api-data",
     capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    release_state: ProfileReleaseState::Available,
 };
 const CENSUS_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "census.data-api",
@@ -70,13 +73,13 @@ const CENSUS_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 };
 const EIA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "eia.api-v2",
-    capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    capability_revision: 1,
+    release_state: ProfileReleaseState::RightsLimited,
 };
 const FRED_ALFRED_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "fred-alfred.api-v1-v2",
-    capability_revision: 5,
-    release_state: ProfileReleaseState::RightsLimited,
+    capability_revision: 1,
+    release_state: ProfileReleaseState::Available,
 };
 const SEC_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: SEC_EDGAR_PROFILE_ID,
@@ -263,6 +266,8 @@ pub enum ProviderCredentialDelegationDisposition {
     ProbeRequired,
     /// The credential is retained by the existing secret store but remains unverified.
     CredentialImported,
+    /// The existing saved credential or setup remains authoritative and was not replaced.
+    SavedSetupReused,
 }
 
 /// Secret-free result for one provider in the fixed V1 provider order.
@@ -311,6 +316,22 @@ impl ProviderCredentialDelegationResult {
     /// Returns the next bounded onboarding action; credential import never activates a provider.
     pub const fn next_action(&self) -> Option<OnboardingNextAction> {
         self.next_action
+    }
+
+    fn saved_setup_reused(
+        spec: ProviderDelegationSpec,
+        profile: MatchedProfile,
+        session: &OnboardingSessionView,
+    ) -> Self {
+        Self {
+            provider: spec.provider,
+            selected_surface_id: Some(profile.surface_id),
+            capability_revision: Some(profile.capability_revision),
+            release_state: Some(profile.release_state),
+            disposition: ProviderCredentialDelegationDisposition::SavedSetupReused,
+            session_id: Some(session.session_id()),
+            next_action: Some(session.next_action()),
+        }
     }
 
     fn disabled(spec: ProviderDelegationSpec) -> Self {
@@ -406,6 +427,9 @@ pub enum ProviderCredentialBundleDelegationError {
     /// Bounded result storage could not be reserved.
     #[error("provider credential delegation result storage is unavailable")]
     Allocation,
+    /// Existing saved setup could not be read without changing it.
+    #[error("provider saved setup state is unavailable")]
+    SavedStateUnavailable,
     /// A credential could not be represented in the existing secret-store format.
     #[error("provider credential for {provider:?} could not be encoded")]
     CredentialEncoding {
@@ -431,7 +455,7 @@ pub enum ProviderCredentialBundleDelegationError {
 
 /// Delegates one parsed V1 bundle into existing local onboarding and secret-store authorities.
 ///
-/// Every enabled, exactly mapped profile receives a durable local onboarding session. Credentialed
+/// Every enabled, exactly mapped profile reuses its saved setup before creating a session. Credentialed
 /// profiles store only the admitted write-only secret generation; no-credential profiles stop at
 /// an explicit probe-required state. This function never verifies a credential, probes a provider,
 /// or activates a runtime.
@@ -444,10 +468,17 @@ pub enum ProviderCredentialBundleDelegationError {
 /// catalog remains the recovery authority for those sessions.
 pub async fn delegate_provider_credential_bundle(
     service: &Arc<ProviderOnboardingService>,
+    activation: &dyn ProviderPortalActivationAuthority,
     bundle: ProviderCredentialBundle,
     cancellation: CancellationToken,
 ) -> Result<ProviderCredentialBundleDelegation, ProviderCredentialBundleDelegationError> {
     let profiles = service.profiles();
+    let current = service
+        .current_sessions(
+            CatalogLimit::new(32)
+                .map_err(|_| ProviderCredentialBundleDelegationError::Allocation)?,
+        )
+        .map_err(|_| ProviderCredentialBundleDelegationError::SavedStateUnavailable)?;
     let mut providers = Vec::new();
     providers
         .try_reserve_exact(PROVIDER_COUNT)
@@ -457,6 +488,65 @@ pub async fn delegate_provider_credential_bundle(
         if !provider_requested(spec.provider, &bundle.configuration) {
             providers.push(ProviderCredentialDelegationResult::disabled(spec));
             continue;
+        }
+
+        if cancellation.is_cancelled() {
+            return Err(onboarding_error(
+                spec.provider,
+                ProviderOnboardingError::OperationCancelled,
+            ));
+        }
+        let mut existing = None;
+        if let Ok(profile) = match_profile(&profiles, spec.profile) {
+            let surface = SourceIdentifier::try_from(profile.surface_id).map_err(|_| {
+                ProviderCredentialBundleDelegationError::ServiceInvariant {
+                    provider: spec.provider,
+                }
+            })?;
+            let saved = activation.retained_setup_session(&surface).map_err(|_| {
+                ProviderCredentialBundleDelegationError::ServiceInvariant {
+                    provider: spec.provider,
+                }
+            })?;
+            let session = match saved.or_else(|| {
+                current
+                    .iter()
+                    .find(|session| session.surface_id() == profile.surface_id)
+                    .map(OnboardingSessionView::session_id)
+            }) {
+                Some(session_id) => Some(
+                    service
+                        .retained_session_view(session_id)
+                        .map_err(|source| onboarding_error(spec.provider, source))?,
+                ),
+                None => None,
+            };
+            if let Some(session) = session {
+                if session.surface_id() != profile.surface_id {
+                    return Err(ProviderCredentialBundleDelegationError::ServiceInvariant {
+                        provider: spec.provider,
+                    });
+                }
+                // A bundle import never replaces an already retained generation or desired recipe.
+                // Explicit replacement and verification stay in the existing Settings lifecycle.
+                if saved.is_some()
+                    || session.credential_stored()
+                    || !matches!(
+                        session.next_action(),
+                        OnboardingNextAction::ImportSecret
+                            | OnboardingNextAction::StartNewSession
+                            | OnboardingNextAction::None
+                    )
+                {
+                    providers.push(ProviderCredentialDelegationResult::saved_setup_reused(
+                        spec, profile, &session,
+                    ));
+                    continue;
+                }
+                if session.next_action() == OnboardingNextAction::ImportSecret {
+                    existing = Some(session);
+                }
+            }
         }
 
         match spec.mode {
@@ -491,6 +581,7 @@ pub async fn delegate_provider_credential_bundle(
                                 spec,
                                 profile,
                                 kind,
+                                existing,
                                 &bundle.credentials,
                                 cancellation.child_token(),
                             )
@@ -515,6 +606,7 @@ async fn delegate_credential(
     spec: ProviderDelegationSpec,
     profile: MatchedProfile,
     kind: CredentialDelegationKind,
+    existing: Option<OnboardingSessionView>,
     credentials: &ProviderCredentialValues,
     cancellation: CancellationToken,
 ) -> Result<ProviderCredentialDelegationResult, ProviderCredentialBundleDelegationError> {
@@ -545,12 +637,15 @@ async fn delegate_credential(
             copy_secret(provider, &credentials.tiingo_api_token)?
         }
     };
-    let request = StartOnboardingRequest::try_new(profile.surface_id, None, None)
-        .map_err(|source| onboarding_error(provider, source))?;
-    let started = service
-        .start(request, cancellation.child_token())
-        .await
-        .map_err(|source| onboarding_error(provider, source))?;
+    let started = match existing {
+        Some(session) => session,
+        None => service
+            .start_deferred(
+                StartOnboardingRequest::try_new(profile.surface_id, None, None)
+                    .map_err(|source| onboarding_error(provider, source))?,
+            )
+            .map_err(|source| onboarding_error(provider, source))?,
+    };
     if started.surface_id() != profile.surface_id
         || started.credential_stored()
         || started.next_action() != OnboardingNextAction::ImportSecret

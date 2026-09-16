@@ -99,9 +99,9 @@ export function MacroContext({ bootstrap, transport }: MacroContextProps) {
           <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
             Economic context
           </p>
-          <h2 className="mt-2 text-xl font-semibold">Rates and labor conditions</h2>
+          <h2 className="mt-2 text-xl font-semibold">Rates, labor and energy prices</h2>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Use the rate curve and unemployment backdrop to understand the environment around an
+            Use rates, unemployment and household energy prices to understand the environment around an
             investment. These indicators are research context, not trading prices or a standalone
             buy or sell signal.
           </p>
@@ -143,6 +143,13 @@ export function MacroContext({ bootstrap, transport }: MacroContextProps) {
           detail="Unemployment helps frame household demand, business conditions, and recession risk."
           observations={data.observations.filter(
             (observation) => observation.category === "labor_market",
+          )}
+        />
+        <IndicatorSection
+          title="Household energy prices"
+          detail="Monthly electricity prices help explain household costs and inflation pressures."
+          observations={data.observations.filter(
+            (observation) => observation.category === "energy_prices",
           )}
         />
       </div>
@@ -295,8 +302,8 @@ function IndicatorCard({ observation }: { observation: MacroContextObservation }
       )}
       <dl className="mt-4 grid gap-3 border-t border-border pt-4">
         <MacroEvidenceFact
-          label="Effective date"
-          value={observation.effectiveDate ?? "Not available"}
+          label={observation.category === "energy_prices" ? "Effective month" : "Effective date"}
+          value={observation.effectivePeriod ?? observation.effectiveDate ?? "Not available"}
         />
         <MacroEvidenceFact
           label="Recorded date"

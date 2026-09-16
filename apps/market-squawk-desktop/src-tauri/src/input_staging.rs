@@ -89,6 +89,7 @@ enum ProviderCredentialBundleProvider {
 #[serde(rename_all = "snake_case")]
 enum ProviderCredentialImportDisposition {
     CredentialStoredUnverified,
+    SavedSetupReused,
     ProbeRequired,
     Disabled,
     ProfileUnavailable,

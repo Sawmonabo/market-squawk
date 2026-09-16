@@ -5,6 +5,8 @@ mod alpaca;
 mod bls;
 pub(crate) mod credentials;
 mod direct;
+mod eia;
+pub(crate) mod eia_configuration;
 mod fred;
 mod fred_read;
 mod kraken_l3;
@@ -63,14 +65,15 @@ use market_squawk_sources::{
 };
 use specs::BlsAdapterConfiguration;
 
-pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
+pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub(crate) use bls::{
     MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodLatestKnownRequest,
     MacroProviderPeriodOperationError,
 };
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
+pub use eia::EiaAdapterActivation;
 pub(crate) use fred::{
     FredPublicationActivationError, publish_fred_latest_known, reopen_fred_latest_known,
 };
@@ -310,6 +313,7 @@ pub struct ProviderAdapterActivation {
     provider_rate: ProviderRateAuthority,
     provider_control_root: PathBuf,
     bls: RwLock<Option<Arc<bls::BlsProductActivation>>>,
+    eia: RwLock<Option<Arc<eia::EiaProductActivation>>>,
     sec_fund: RwLock<Option<Arc<SecFundProductActivation>>>,
     yahoo_authority: Mutex<Option<Arc<yahoo::YahooProviderAuthority>>>,
     yahoo: RwLock<Option<Arc<yahoo::YahooProductActivation>>>,
@@ -553,6 +557,7 @@ impl ProviderAdapterActivation {
             provider_rate,
             provider_control_root,
             bls: RwLock::new(None),
+            eia: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo_authority: Mutex::new(None),
             yahoo: RwLock::new(None),
@@ -580,6 +585,7 @@ impl ProviderAdapterActivation {
             provider_rate,
             provider_control_root,
             bls: RwLock::new(None),
+            eia: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo_authority: Mutex::new(None),
             yahoo: RwLock::new(None),
@@ -844,6 +850,18 @@ impl ProviderAdapterActivation {
             self.research_mutation
                 .revoke_provider_generation(expected.profile(), expected)
                 .await?;
+            if expected.profile().as_str() == eia::EIA_SURFACE {
+                let mut retained = self
+                    .eia
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == expected)
+                {
+                    retained.take();
+                }
+            }
             if expected.profile().as_str() == yahoo::YAHOO_SURFACE {
                 let mut retained = self
                     .yahoo
@@ -1079,6 +1097,7 @@ impl ProviderAdapterActivation {
         }
         let lease = onboarding_authority.active_lease(committed.candidate().session_id())?;
         require_runtime_lease(committed.candidate(), &lease)?;
+        let expected_generation = committed.expected().clone();
         let transaction = committed
             .transaction
             .as_mut()
@@ -1087,6 +1106,9 @@ impl ProviderAdapterActivation {
         let specialized_authority = match committed.specialized.as_ref() {
             Some(SpecializedReplacementKind::Bls(activation)) => {
                 Some(SpecializedReplacementAuthority::Bls(Arc::clone(activation)))
+            }
+            Some(SpecializedReplacementKind::Eia(activation)) => {
+                Some(SpecializedReplacementAuthority::Eia(Arc::clone(activation)))
             }
             Some(SpecializedReplacementKind::Yahoo) => {
                 let rights =
@@ -1125,9 +1147,33 @@ impl ProviderAdapterActivation {
             }
             None => None,
         };
+        // Validate and retain the EIA slot before finalizing the shared replacement. No slot
+        // acquisition or predecessor check may fail after the shared transaction is finalized.
+        let eia_install = match specialized_authority.as_ref() {
+            Some(SpecializedReplacementAuthority::Eia(activation)) => {
+                if activation.generation() != &committed.candidate {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                let retained = self
+                    .eia
+                    .try_write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() != &expected_generation)
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                Some((retained, Arc::clone(activation)))
+            }
+            _ => None,
+        };
         let generation = self.research_mutation.finalize(transaction)?;
         if generation != committed.candidate {
             return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        if let Some((mut retained, activation)) = eia_install {
+            *retained = Some(activation);
         }
         match specialized_authority {
             Some(SpecializedReplacementAuthority::Bls(activation)) => {
@@ -1146,6 +1192,7 @@ impl ProviderAdapterActivation {
                 }
                 *retained = Some(activation);
             }
+            Some(SpecializedReplacementAuthority::Eia(_)) => {}
             Some(SpecializedReplacementAuthority::Yahoo(authority)) => {
                 *self
                     .yahoo
@@ -1183,6 +1230,10 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Bls(spec) => (
                 &spec.metadata,
                 provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
+            ProviderAdapterActivationRequest::Eia(spec) => (
+                spec.metadata(),
+                provider_research_rights(lease, spec.metadata().source_id())?,
             ),
             ProviderAdapterActivationRequest::Treasury(spec) => (
                 &spec.metadata,
@@ -1236,6 +1287,21 @@ impl ProviderAdapterActivation {
         let candidate = self.runtime_generation_for_request(&lease, &request)?;
         self.bind_authorization_subject(candidate.metadata())?;
         let (prepared, specialized) = match request {
+            ProviderAdapterActivationRequest::Eia(spec) => {
+                let (replacement, activation) = self
+                    .prepare_eia_replacement(
+                        &lease,
+                        expected,
+                        candidate.clone(),
+                        spec,
+                        cancellation.clone(),
+                    )
+                    .await?;
+                (
+                    replacement,
+                    Some(SpecializedReplacementKind::Eia(activation)),
+                )
+            }
             ProviderAdapterActivationRequest::Bls(spec) => {
                 require_surface(&lease, BLS_REGISTERED_SURFACE)?;
                 let BlsAdapterActivation {
@@ -1519,6 +1585,10 @@ impl ProviderAdapterActivation {
                 .activate_bls(lease, spec, cancellation)
                 .await
                 .map(Into::into),
+            ProviderAdapterActivationRequest::Eia(spec) => self
+                .activate_eia(lease, spec, cancellation)
+                .await
+                .map(Into::into),
             ProviderAdapterActivationRequest::Treasury(spec) => {
                 self.activate_treasury(lease, spec).map(Into::into)
             }
@@ -1566,6 +1636,10 @@ impl ProviderAdapterActivation {
             }
             ProviderAdapterActivationRequest::Bls(spec) => {
                 self.restore_bls(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Eia(_spec) => {
+                require_surface(&lease, eia::EIA_SURFACE)?;
+                Err(ProviderAdapterActivationError::ExplicitResumeRequired)
             }
             ProviderAdapterActivationRequest::Treasury(spec) => {
                 self.activate_treasury(lease, spec).map(Into::into)
@@ -2248,12 +2322,14 @@ pub(crate) struct CommittedProviderAdapterReplacement {
 
 enum SpecializedReplacementKind {
     Bls(Arc<bls::BlsProductActivation>),
+    Eia(Arc<eia::EiaProductActivation>),
     Yahoo,
     Tiingo,
 }
 
 enum SpecializedReplacementAuthority {
     Bls(Arc<bls::BlsProductActivation>),
+    Eia(Arc<eia::EiaProductActivation>),
     Yahoo(Arc<yahoo::YahooProductActivation>),
     Tiingo(Arc<tiingo::TiingoProductActivation>),
 }
@@ -2426,13 +2502,36 @@ fn provider_research_rights(
     source_id: &SourceId,
 ) -> Result<ResearchRightsAuthority, ProviderAdapterActivationError> {
     let basis = provider_research_rights_basis(lease)?;
-    ResearchRightsAuthority::try_new(
+    ResearchRightsAuthority::try_new_source_wide(
         source_id.clone(),
         basis,
         lease.rights_decision_digest(),
         lease.verification_expires_at(),
+        lease_research_operations(lease),
     )
     .map_err(Into::into)
+}
+
+fn lease_research_operations(lease: &ProviderActivationLease) -> Vec<SourceOperation> {
+    let mut operations = Vec::new();
+    for (provider_operation, research_operation) in [
+        (DataUseOperation::Retrieve, SourceOperation::Retrieve),
+        (DataUseOperation::Display, SourceOperation::Display),
+        (DataUseOperation::Persist, SourceOperation::Persist),
+        (DataUseOperation::ModelTraining, SourceOperation::Train),
+        (
+            DataUseOperation::Redistribute,
+            SourceOperation::Redistribute,
+        ),
+    ] {
+        if lease.admits(provider_operation) {
+            operations.push(research_operation);
+        }
+    }
+    if lease.admits(DataUseOperation::Persist) {
+        operations.push(SourceOperation::Cache);
+    }
+    operations
 }
 
 fn fred_research_rights(
@@ -2443,19 +2542,6 @@ fn fred_research_rights(
     require_surface(lease, FRED_SURFACE)?;
     let basis = provider_research_rights_basis(lease)?;
     let series = FredSource::series_identifier(provider_dataset)?;
-    let mut permitted_operations = Vec::new();
-    if lease.admits(DataUseOperation::Display) {
-        permitted_operations.push(SourceOperation::Display);
-    }
-    if lease.admits(DataUseOperation::Persist) {
-        permitted_operations.extend([SourceOperation::Persist, SourceOperation::Cache]);
-    }
-    if lease.admits(DataUseOperation::ModelTraining) {
-        permitted_operations.push(SourceOperation::Train);
-    }
-    if lease.admits(DataUseOperation::Redistribute) {
-        permitted_operations.push(SourceOperation::Redistribute);
-    }
     let authorization_evidence =
         fred_dataset_authorization_evidence(lease, provider_dataset, &series);
     ResearchRightsAuthority::try_new_scoped(
@@ -2467,7 +2553,7 @@ fn fred_research_rights(
             .verification_expires_at()
             .unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
         vec![series],
-        permitted_operations,
+        lease_research_operations(lease),
     )
     .map_err(Into::into)
 }
@@ -2527,11 +2613,12 @@ fn controlled_local_file_rights(
     if !lease.admits(DataUseOperation::Persist) {
         return Err(ProviderAdapterActivationError::InvalidRights);
     }
-    ResearchRightsAuthority::try_new(
+    ResearchRightsAuthority::try_new_source_wide(
         source_id.clone(),
         RightsBasis::imported_user_input(evidence.clone()),
         lease.capability_digest(),
         None,
+        lease_research_operations(lease),
     )
     .map_err(Into::into)
 }

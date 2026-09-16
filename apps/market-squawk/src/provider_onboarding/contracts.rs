@@ -1,10 +1,8 @@
-//! Secret-free status contracts shared by local portal and CLI transports.
+//! Secret-free status contracts shared by native Settings and installed CLI transports.
 
 use market_squawk_adapter_bls::BlsSeriesMetadataInput;
 use market_squawk_data::ResumedProviderOnboarding;
-use market_squawk_domain::{
-    CalendarDate, DataQuality, EvidenceDigest, SourceIdentifier, Timestamp,
-};
+use market_squawk_domain::{DataQuality, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
     CapabilityRegistrationOutcome, CredentialGenerationState, CredentialKind, DataUseOperation,
@@ -16,8 +14,9 @@ use market_squawk_sources::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-/// Serializable code-owned profile facts for CLI and portal clients.
+/// Serializable code-owned profile facts for native Settings and installed CLI clients.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderProfileView {
     id: &'static str,
@@ -329,7 +328,7 @@ pub enum SecCikInputError {
     Zero,
 }
 
-/// Closed provider-specific configuration accepted by the local onboarding portal.
+/// Closed provider-specific configuration accepted by the installed onboarding authority.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ProviderPortalActivationRequest {
@@ -349,26 +348,24 @@ pub enum ProviderPortalActivationRequest {
         /// Inclusive final observation year.
         end_year: u16,
     },
-    /// Treasury Fiscal Data average-interest-rate query.
+    /// Treasury Fiscal Data average-interest-rate all-history acquisition.
     TreasuryFiscal {
-        /// Inclusive first record date.
-        first_record_date: CalendarDate,
-        /// Inclusive final record date.
-        last_record_date: CalendarDate,
         /// Bounded provider page size.
         page_size: u16,
     },
-    /// Treasury daily rates across all five official XML families.
-    TreasuryDailyRates {
-        /// Inclusive first observation year.
-        start_year: u16,
-        /// Inclusive final observation year.
-        end_year: u16,
-    },
+    /// Complete published history across all five official Treasury daily-rate XML families.
+    TreasuryDailyRates,
     /// FRED/ALFRED using one exact configured series and vintage interval.
     FredAlfred {
         /// Exact provider discovery dataset retained through restart and immutable reads.
         provider_dataset: SourceIdentifier,
+    },
+    /// Bounded monthly US residential electricity prices, preserving native units and periods.
+    EiaElectricityPrice {
+        /// Inclusive first month in YYYY-MM form.
+        start_period: String,
+        /// Inclusive final month, within the admitted 24-month envelope.
+        end_period: String,
     },
     /// Federal Reserve Board H.15 current-definition Treasury constant-maturity rates.
     FederalReserveBoardH15,
@@ -382,6 +379,9 @@ pub enum ProviderPortalActivationRequest {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderPortalActivationView {
     profile: SourceIdentifier,
+    /// Durable activation was accepted; data remains unavailable until publication completes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    publication_pending: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_dataset_identifier: Option<SourceIdentifier>,
     session_id: Uuid,
@@ -397,6 +397,11 @@ pub struct ProviderPortalActivationView {
 }
 
 impl ProviderPortalActivationView {
+    pub(crate) fn with_pending_publication(mut self) -> Self {
+        self.publication_pending = true;
+        self
+    }
+
     pub(crate) fn from_lease(profile: SourceIdentifier, lease: &ProviderActivationLease) -> Self {
         Self::from_research_lease(profile, lease, None)
     }
@@ -408,6 +413,7 @@ impl ProviderPortalActivationView {
     ) -> Self {
         Self {
             profile,
+            publication_pending: false,
             provider_dataset_identifier,
             session_id: lease.session_id(),
             capability_revision: lease.capability_revision().get(),
@@ -423,7 +429,7 @@ impl ProviderPortalActivationView {
     }
 }
 
-/// Secret-free durable status returned by every service and portal operation.
+/// Secret-free durable status returned by every installed onboarding operation.
 #[derive(Clone, Debug, Serialize)]
 pub struct OnboardingSessionView {
     session_id: Uuid,
@@ -837,6 +843,12 @@ pub(super) fn session_view(
         OnboardingNextAction::RefreshEvidence
     } else {
         match lifecycle.state() {
+            OnboardingState::AnonymousAvailable | OnboardingState::RightsAdmissionPending
+                if profile.capability().setup_mode()
+                    == market_squawk_sources::SetupMode::NoCredential =>
+            {
+                OnboardingNextAction::VerifyAndActivate
+            }
             OnboardingState::UserActionRequired => OnboardingNextAction::ImportSecret,
             OnboardingState::SecretReconciliationRequired
                 if lifecycle.active_generation().is_some() =>
@@ -944,4 +956,115 @@ fn setup_mode_availability(selected: SetupMode) -> [SetupModeAvailability; 5] {
         supported: mode == selected,
         selected: mode == selected,
     })
+}
+
+/// Closed native connection setup request over the installed onboarding authority.
+#[derive(Deserialize, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
+pub enum ProviderOnboardingRequest {
+    Bootstrap,
+    Inspect {
+        session_id: Uuid,
+    },
+    Start {
+        surface_id: String,
+        organization: Option<String>,
+        administrative_email: Option<String>,
+    },
+    Resume {
+        session_id: Uuid,
+    },
+    UnlockFallback {
+        #[serde(with = "onboarding_secret")]
+        secret: Zeroizing<String>,
+    },
+    LockFallback,
+    SubmitSecret {
+        session_id: Uuid,
+        #[serde(with = "onboarding_secret")]
+        secret: Zeroizing<String>,
+    },
+    Activate {
+        session_id: Uuid,
+        request: ProviderPortalActivationRequest,
+    },
+    VerifySaved {
+        session_id: Uuid,
+    },
+    RestoreSaved {
+        session_id: Uuid,
+    },
+    ResumePublication {
+        session_id: Uuid,
+    },
+    SchwabOAuth {
+        session_id: Uuid,
+        lifecycle_action: SchwabOAuthLifecycleAction,
+    },
+    Renew {
+        session_id: Uuid,
+    },
+    Cleanup {
+        session_id: Uuid,
+    },
+    Cancel {
+        session_id: Uuid,
+    },
+}
+
+impl ProviderOnboardingRequest {
+    pub const fn requires_confirmation(&self) -> bool {
+        !matches!(self, Self::Bootstrap | Self::Inspect { .. })
+    }
+}
+
+impl std::fmt::Debug for ProviderOnboardingRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let action = match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Inspect { .. } => "inspect",
+            Self::Start { .. } => "start",
+            Self::Resume { .. } => "resume",
+            Self::UnlockFallback { .. } => "unlock_fallback",
+            Self::LockFallback => "lock_fallback",
+            Self::SubmitSecret { .. } => "submit_secret",
+            Self::Activate { .. } => "activate",
+            Self::VerifySaved { .. } => "verifySaved",
+            Self::RestoreSaved { .. } => "restoreSaved",
+            Self::ResumePublication { .. } => "resume_publication",
+            Self::SchwabOAuth { .. } => "schwab_oauth",
+            Self::Renew { .. } => "renew",
+            Self::Cleanup { .. } => "cleanup",
+            Self::Cancel { .. } => "cancel",
+        };
+        formatter
+            .debug_struct("ProviderOnboardingRequest")
+            .field("action", &action)
+            .finish_non_exhaustive()
+    }
+}
+
+// Keep the existing string wire representation while protecting every decoded request owner,
+// including rejected and cancelled requests that never reach SecretValue admission.
+mod onboarding_secret {
+    use super::*;
+
+    pub(super) fn serialize<S>(value: &Zeroizing<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(value.as_str())
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Zeroizing::new)
+    }
 }

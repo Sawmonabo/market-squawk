@@ -1,6 +1,11 @@
 //! Provider-neutral Macro product context over exact canonical point-in-time reads.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{borrow::Cow, fmt, sync::Arc, time::Duration};
+
+mod energy;
+
+pub(crate) const RESIDENTIAL_ELECTRICITY_PRICE_DATASET: &str =
+    "market_squawk.us_residential_electricity_price";
 
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use market_squawk_adapter_federal_reserve::{
@@ -40,20 +45,21 @@ const FRED_UNEMPLOYMENT_SERIES_ID: &str = "UNRATE";
 const FRED_UNEMPLOYMENT_UNIT_ID: &str = "fred-unit:v1:Percent";
 const TREASURY_PERCENT_UNIT_ID: &str = "percent";
 const H15_INDICATOR_COUNT: usize = 11;
-const MACRO_CONTEXT_INDICATOR_COUNT: usize = 12;
+const MACRO_CONTEXT_INDICATOR_COUNT: usize = 13;
+const MACRO_MODEL_INDICATOR_COUNT: usize = 12;
 const MAXIMUM_MACRO_CONTEXT_INPUTS: usize = 4_096;
 const MAXIMUM_TIMESTAMP_BYTES: usize = 64;
 const MACRO_CONTEXT_QUERY_BYTES: u64 = 256 * 1024;
 const MACRO_CONTEXT_QUERY_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
-const INTEREST_RATE_UNIT: MacroContextUnitDto = MacroContextUnitDto {
-    code: "percent_per_year",
-    label: "Percent per year",
+static INTEREST_RATE_UNIT: MacroContextUnitDto = MacroContextUnitDto {
+    code: Cow::Borrowed("percent_per_year"),
+    label: Cow::Borrowed("Percent per year"),
     symbol: Some("%"),
 };
-const UNEMPLOYMENT_UNIT: MacroContextUnitDto = MacroContextUnitDto {
-    code: "percent_of_labor_force",
-    label: "Percent of labor force",
+static UNEMPLOYMENT_UNIT: MacroContextUnitDto = MacroContextUnitDto {
+    code: Cow::Borrowed("percent_of_labor_force"),
+    label: Cow::Borrowed("Percent of labor force"),
     symbol: Some("%"),
 };
 
@@ -121,7 +127,7 @@ const UNEMPLOYMENT_INDICATOR: MacroContextIndicatorDefinition = MacroContextIndi
     category: MacroContextCategory::LaborMarket,
     frequency: MacroContextFrequency::Monthly,
     seasonal_adjustment: MacroContextSeasonalAdjustment::SeasonallyAdjusted,
-    unit: UNEMPLOYMENT_UNIT,
+    unit: &UNEMPLOYMENT_UNIT,
     source_slot: FRED_UNEMPLOYMENT_SERIES_ID,
 };
 
@@ -136,6 +142,7 @@ pub(crate) struct MacroContextReadCapability {
     fred: FredLatestKnownOperation,
     treasury_fiscal: Option<TreasuryLatestKnownOperation>,
     treasury_daily: Option<TreasuryLatestKnownOperation>,
+    energy_store: Option<Arc<crate::ResearchService>>,
 }
 
 impl MacroContextReadCapability {
@@ -147,6 +154,7 @@ impl MacroContextReadCapability {
             fred,
             treasury_fiscal: None,
             treasury_daily: None,
+            energy_store: None,
         }
     }
 
@@ -163,6 +171,7 @@ impl MacroContextReadCapability {
             fred,
             treasury_fiscal: Some(treasury_fiscal),
             treasury_daily: Some(treasury_daily),
+            energy_store: None,
         }
     }
 
@@ -215,9 +224,17 @@ impl MacroContextReadCapability {
             self.read_treasury(cutoffs, deadline, treasury_cancellation)
                 .await
         });
-        let (board, fred, (treasury_fiscal, treasury_daily)) =
-            tokio::try_join!(board, fred, treasury)?;
-        product_snapshot(cutoffs, board, fred, treasury_fiscal, treasury_daily)
+        let energy = self.read_energy(cutoffs, deadline, cancellation.child_token());
+        let (board, fred, (treasury_fiscal, treasury_daily), energy) =
+            tokio::try_join!(board, fred, treasury, energy)?;
+        product_snapshot(
+            cutoffs,
+            board,
+            fred,
+            treasury_fiscal,
+            treasury_daily,
+            energy,
+        )
     }
 
     async fn read_board(
@@ -386,6 +403,12 @@ impl MacroContextOperation {
         }
     }
 
+    /// Adds the existing rich-store owner for restart-safe energy publication reads.
+    pub(crate) fn with_energy_store(mut self, research: Arc<crate::ResearchService>) -> Self {
+        self.read.energy_store = Some(research);
+        self
+    }
+
     /// Returns the reusable typed read capability without granting provider mutation authority.
     #[must_use]
     pub(crate) fn read_capability(&self) -> MacroContextReadCapability {
@@ -485,7 +508,7 @@ struct MacroContextIndicatorDefinition {
     category: MacroContextCategory,
     frequency: MacroContextFrequency,
     seasonal_adjustment: MacroContextSeasonalAdjustment,
-    unit: MacroContextUnitDto,
+    unit: &'static MacroContextUnitDto,
     source_slot: &'static str,
 }
 
@@ -501,7 +524,7 @@ impl MacroContextIndicatorDefinition {
             category: MacroContextCategory::InterestRates,
             frequency: MacroContextFrequency::BusinessDaily,
             seasonal_adjustment: MacroContextSeasonalAdjustment::NotApplicable,
-            unit: INTEREST_RATE_UNIT,
+            unit: &INTEREST_RATE_UNIT,
             source_slot,
         }
     }
@@ -513,8 +536,9 @@ impl MacroContextIndicatorDefinition {
             category: self.category,
             frequency: self.frequency,
             seasonal_adjustment: self.seasonal_adjustment,
-            unit: self.unit,
+            unit: self.unit.clone(),
             effective_date: None,
+            effective_period: None,
             recorded: MacroContextRecordedDateDto::NotSupplied,
             available_at: None,
             revision: None,
@@ -544,6 +568,7 @@ pub(crate) struct MacroContextDto {
 pub(crate) struct MacroContextSelectionDto {
     knowledge_cutoff: String,
     effective_date_cutoff: String,
+    effective_month_cutoff: Option<String>,
     evaluated_at: String,
     complete: bool,
 }
@@ -605,6 +630,8 @@ pub(crate) struct MacroContextObservationDto {
     seasonal_adjustment: MacroContextSeasonalAdjustment,
     unit: MacroContextUnitDto,
     effective_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_period: Option<String>,
     recorded: MacroContextRecordedDateDto,
     available_at: Option<String>,
     revision: Option<u32>,
@@ -619,6 +646,7 @@ pub(crate) struct MacroContextObservationDto {
 pub(crate) enum MacroContextCategory {
     InterestRates,
     LaborMarket,
+    EnergyPrices,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -633,13 +661,14 @@ pub(crate) enum MacroContextFrequency {
 pub(crate) enum MacroContextSeasonalAdjustment {
     NotApplicable,
     SeasonallyAdjusted,
+    NotSupplied,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MacroContextUnitDto {
-    code: &'static str,
-    label: &'static str,
+    code: Cow<'static, str>,
+    label: Cow<'static, str>,
     symbol: Option<&'static str>,
 }
 
@@ -693,6 +722,7 @@ pub(crate) enum MacroContextInputRole {
     InflationAdjustedGovernmentRates,
     GovernmentBorrowingCost,
     LaborMarket,
+    ResidentialElectricityPrice,
 }
 
 /// One typed canonical input retained by the neutral selection snapshot.
@@ -751,6 +781,7 @@ enum MacroContextSelectionAuthority {
     Treasury,
     Board,
     Fred,
+    OfficialEnergyStatistics,
 }
 
 /// Reusable typed neutral Macro selection plus opaque exact evidence.
@@ -758,6 +789,7 @@ pub(crate) struct MacroContextSnapshot {
     dto: MacroContextDto,
     inputs: Box<[MacroContextInputObservation]>,
     selected: Box<[MacroContextSelectedObservation]>,
+    energy_selected: MacroContextSelectedObservation,
     evidence: MacroContextEvidenceReceipt,
 }
 
@@ -767,7 +799,7 @@ impl MacroContextSnapshot {
         &self.inputs
     }
 
-    /// Returns every requested product indicator, including explicit unavailable states.
+    /// Returns the fixed economic indicators consumed by the existing financial model vector.
     pub(crate) fn selected(&self) -> &[MacroContextSelectedObservation] {
         &self.selected
     }
@@ -778,6 +810,19 @@ impl MacroContextSnapshot {
     }
 
     fn into_tool_result(self, limits: ServiceLimits) -> Result<TypedToolResult, ServiceError> {
+        // Product consumption includes energy. Model evidence remains scoped to its fixed vector.
+        let mut product_selected = self.selected.to_vec();
+        product_selected.push(self.energy_selected.clone());
+        let product_evidence = MacroContextEvidenceReceipt::try_new(
+            MacroContextCutoffs {
+                knowledge_cutoff: self.evidence.knowledge_cutoff,
+                effective_date_cutoff: self.evidence.effective_date_cutoff,
+                evaluated_at: self.evidence.evaluated_at,
+            },
+            self.evidence.consulted_sources.to_vec(),
+            &product_selected,
+        )?;
+        require_sha256(product_evidence.consumed_digest())?;
         let availability = self.dto.availability;
         let selected_indicators = self
             .dto
@@ -825,6 +870,7 @@ fn product_snapshot(
     fred: Option<AnalyticalMacroLatestKnownOutput>,
     treasury_fiscal: Box<[TreasuryCurrentAnalyticalRead]>,
     treasury_daily: Box<[TreasuryCurrentAnalyticalRead]>,
+    energy: Option<energy::EnergyRead>,
 ) -> Result<MacroContextSnapshot, ServiceError> {
     let definitions = H15_INDICATORS
         .iter()
@@ -843,7 +889,7 @@ fn product_snapshot(
     );
     let mut selected = Vec::new();
     selected
-        .try_reserve_exact(MACRO_CONTEXT_INDICATOR_COUNT)
+        .try_reserve_exact(MACRO_MODEL_INDICATOR_COUNT)
         .map_err(|_| ServiceError::ResourceExhausted)?;
     selected.extend(
         definitions
@@ -869,6 +915,13 @@ fn product_snapshot(
                 count.checked_add(read.output().observations().len())
             })
         })
+        .and_then(|count| {
+            count.checked_add(
+                energy
+                    .as_ref()
+                    .map_or(0, |read| read.receipt.observations().len()),
+            )
+        })
         .filter(|count| *count <= MAXIMUM_MACRO_CONTEXT_INPUTS)
         .ok_or(ServiceError::ResourceExhausted)?;
     let mut inputs = Vec::new();
@@ -878,7 +931,7 @@ fn product_snapshot(
     let mut receipts = Vec::new();
     receipts
         .try_reserve_exact(
-            2_usize
+            3_usize
                 .checked_add(treasury_fiscal.len())
                 .and_then(|count| count.checked_add(treasury_daily.len()))
                 .ok_or(ServiceError::ResourceExhausted)?,
@@ -956,6 +1009,13 @@ fn product_snapshot(
         receipts.push(receipt);
     }
 
+    let energy_selected = energy::project_energy(
+        energy,
+        cutoffs,
+        &mut observations,
+        &mut inputs,
+        &mut receipts,
+    )?;
     let coverage = observations.iter().try_fold(
         MacroContextCoverageDto {
             requested: MACRO_CONTEXT_INDICATOR_COUNT,
@@ -1009,6 +1069,8 @@ fn product_snapshot(
     let selection = MacroContextSelectionDto {
         knowledge_cutoff: timestamp_text(cutoffs.knowledge_cutoff)?,
         effective_date_cutoff: cutoffs.effective_date_cutoff.to_string(),
+        effective_month_cutoff: energy::completed_month(cutoffs.effective_date_cutoff)?
+            .map(|(_, _, code)| code),
         evaluated_at: timestamp_text(cutoffs.evaluated_at)?,
         complete,
     };
@@ -1024,6 +1086,7 @@ fn product_snapshot(
         dto,
         inputs: inputs.into_boxed_slice(),
         selected: selected.into_boxed_slice(),
+        energy_selected,
         evidence,
     })
 }
@@ -1380,8 +1443,9 @@ fn project_observation(
         category: definition.category,
         frequency: definition.frequency,
         seasonal_adjustment: definition.seasonal_adjustment,
-        unit: definition.unit,
+        unit: definition.unit.clone(),
         effective_date: Some(effective_date.to_string()),
+        effective_period: None,
         recorded,
         available_at: Some(timestamp_text(available_at)?),
         revision: Some(time.revision().get()),
@@ -1651,6 +1715,7 @@ struct MacroContextSourceReceipt {
     query_identity: EvidenceDigest,
     result_digest: EvidenceDigest,
     selection_digest: EvidenceDigest,
+    native_binding_digest: Option<EvidenceDigest>,
 }
 
 impl MacroContextSourceReceipt {
@@ -1671,6 +1736,7 @@ impl MacroContextSourceReceipt {
             query_identity,
             result_digest,
             selection_digest,
+            native_binding_digest: None,
         })
     }
 }
@@ -1680,6 +1746,7 @@ enum MacroContextInternalSource {
     InterestRates,
     LaborMarket,
     FiscalConditions,
+    EnergyPrices,
 }
 
 impl MacroContextInternalSource {
@@ -1688,6 +1755,7 @@ impl MacroContextInternalSource {
             Self::InterestRates => 1,
             Self::LaborMarket => 2,
             Self::FiscalConditions => 3,
+            Self::EnergyPrices => 4,
         }
     }
 }
@@ -1698,6 +1766,7 @@ impl MacroContextSelectionAuthority {
             Self::Treasury => 1,
             Self::Board => 2,
             Self::Fred => 3,
+            Self::OfficialEnergyStatistics => 4,
         }
     }
 }
@@ -1767,6 +1836,10 @@ fn hash_source_receipt(hasher: &mut Sha256, source: &MacroContextSourceReceipt) 
     hash_digest(hasher, source.query_identity);
     hash_digest(hasher, source.result_digest);
     hash_digest(hasher, source.selection_digest);
+    if let Some(binding) = source.native_binding_digest {
+        hash_text(hasher, "market-squawk/macro-native-publication-binding/v1");
+        hash_digest(hasher, binding);
+    }
 }
 
 fn hash_digest(hasher: &mut Sha256, digest: EvidenceDigest) {

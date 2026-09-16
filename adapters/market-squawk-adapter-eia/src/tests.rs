@@ -34,9 +34,10 @@ use crate::{
     EiaDataFieldContractInput, EiaDataPage, EiaDataPageTransition, EiaDataQuery, EiaDataQueryInput,
     EiaDatasetContract, EiaDatasetContractInput, EiaDatasetProfile, EiaError, EiaFacetFilter,
     EiaFacetValue, EiaFieldId, EiaMetadataRequest, EiaMissingPolicy, EiaNativeValue,
-    EiaParseLimits, EiaRoute, EiaSort, EiaSortDirection, EiaSourceTransport, EiaTransportLimits,
-    EiaUnitSource, EiaValueKind, eia_api_endpoint_rules, eia_application_provider_budget,
-    parse_facet_metadata, parse_route_metadata, run_eia_doctor,
+    EiaParseLimits, EiaResponseSurface, EiaRoute, EiaSort, EiaSortDirection, EiaSourceTransport,
+    EiaSourceTransportError, EiaStructureLimitKind, EiaTransportLimits, EiaUnitSource,
+    EiaValueKind, eia_api_endpoint_rules, eia_application_provider_budget, parse_facet_metadata,
+    parse_route_metadata, run_eia_doctor,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -812,6 +813,50 @@ fn provider_facts_and_separate_application_limits_fail_closed() -> TestResult {
         crate::transport::validate_provider_page_total(3, 2, 1),
         Err(crate::EiaSourceTransportError::PageLimitExceeded { max: 1 })
     ));
+    Ok(())
+}
+
+#[test]
+fn route_structure_failure_preserves_only_safe_surface_and_numeric_receipt() -> TestResult {
+    let mut fixture: serde_json::Value = serde_json::from_slice(&route_metadata_bytes()?)?;
+    let response = fixture
+        .get_mut("response")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("route response object")?;
+    response.insert(
+        "description".to_owned(),
+        serde_json::Value::String("x".repeat(65)),
+    );
+    let body = serde_json::to_vec(&fixture)?;
+    let limits = EiaParseLimits::try_new(4_096, 5_000, 16_384, 512, 64, 24, 1_000_000)?;
+    let request = EiaMetadataRequest::route(EiaRoute::try_from("electricity/retail-sales")?);
+    let error = match parse_route_metadata(
+        &body,
+        &request,
+        Timestamp::from_unix_nanos(1_800_000_000_000_000_000),
+        limits,
+    ) {
+        Ok(_) => return Err("oversized route description was admitted".into()),
+        Err(error) => error,
+    };
+    let response_bytes = u64::try_from(body.len())?;
+    let failure = crate::transport::map_response_parse_error(
+        EiaResponseSurface::RouteMetadata,
+        response_bytes,
+        error,
+    );
+    let EiaSourceTransportError::ResponseStructureLimit { receipt } = failure else {
+        return Err("structure failure was not safely classified at the transport boundary".into());
+    };
+
+    assert_eq!(receipt.surface(), EiaResponseSurface::RouteMetadata);
+    assert_eq!(receipt.response_bytes(), response_bytes);
+    assert_eq!(
+        receipt.structure().kind(),
+        EiaStructureLimitKind::StringBytes
+    );
+    assert_eq!(receipt.structure().observed(), 65);
+    assert_eq!(receipt.structure().limit(), 64);
     Ok(())
 }
 

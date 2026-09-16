@@ -85,7 +85,7 @@ impl EiaActivationRequirements {
 }
 
 /// Static selected dataset input frozen against freshly discovered route metadata.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EiaDatasetProfile {
     query: EiaDataQuery,
     fields: Vec<EiaDataFieldContract>,
@@ -514,19 +514,20 @@ impl EiaDoctorOutput {
 /// Non-serializable candidate bound to freshly acquired metadata and a real data probe.
 #[derive(Debug)]
 pub(crate) struct EiaActivationCandidate {
-    transport: EiaSourceTransport,
+    transport: std::sync::Arc<EiaSourceTransport>,
     contract: EiaDatasetContract,
     report: EiaDoctorReport,
 }
 
 /// Runs metadata discovery and one real offset-zero request against the exact selected query.
 pub async fn run_eia_doctor(
-    transport: EiaSourceTransport,
+    transport: impl Into<std::sync::Arc<EiaSourceTransport>>,
     authority: &ExtractionAuthority,
     profile: EiaDatasetProfile,
     deadline: Timestamp,
     cancellation: CancellationToken,
 ) -> Result<EiaDoctorOutput, EiaLifecycleError> {
+    let transport = transport.into();
     let source_metadata = transport.metadata();
     let metadata_request = EiaMetadataRequest::route(profile.query().route().clone());
     let metadata = transport
@@ -548,6 +549,7 @@ pub async fn run_eia_doctor(
         .map_err(|_| EiaLifecycleError::InvalidEvidence)?;
     let mut response_bytes = metadata_raw.http_receipt().response_bytes();
     let mut retained_bytes = metadata_raw.http_receipt().retained_bytes();
+    validate_doctor_retained_bytes(&transport, retained_bytes)?;
     let mut latency = metadata_raw.http_receipt().latency();
     let mut observed_at = metadata_raw.http_receipt().received_at();
     for facet in profile.query().facets() {
@@ -563,6 +565,7 @@ pub async fn run_eia_doctor(
         retained_bytes = retained_bytes
             .checked_add(raw.http_receipt().retained_bytes())
             .ok_or(EiaLifecycleError::InvalidEvidence)?;
+        validate_doctor_retained_bytes(&transport, retained_bytes)?;
         latency = latency
             .checked_add(raw.http_receipt().latency())
             .ok_or(EiaLifecycleError::InvalidEvidence)?;
@@ -583,6 +586,7 @@ pub async fn run_eia_doctor(
     retained_bytes = retained_bytes
         .checked_add(probe_raw.http_receipt().retained_bytes())
         .ok_or(EiaLifecycleError::InvalidEvidence)?;
+    validate_doctor_retained_bytes(&transport, retained_bytes)?;
     latency = latency
         .checked_add(probe_raw.http_receipt().latency())
         .ok_or(EiaLifecycleError::InvalidEvidence)?;
@@ -710,9 +714,22 @@ pub async fn run_eia_doctor(
     Ok(output)
 }
 
+fn validate_doctor_retained_bytes(
+    transport: &EiaSourceTransport,
+    retained_bytes: u64,
+) -> Result<(), EiaLifecycleError> {
+    if retained_bytes > transport.max_acquisition_bytes() {
+        return Err(EiaSourceTransportError::AcquisitionTooLarge {
+            max: transport.max_acquisition_bytes(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Activated, credential-bearing provider boundary. Secrets remain solely inside its transport.
 pub struct EiaActivatedProvider {
-    transport: EiaSourceTransport,
+    transport: std::sync::Arc<EiaSourceTransport>,
     contract: EiaDatasetContract,
     report: EiaDoctorReport,
     doctor_capture_tokens: Box<[ProviderWholeCaptureToken]>,

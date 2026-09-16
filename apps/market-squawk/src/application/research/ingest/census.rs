@@ -263,6 +263,7 @@ impl CensusMacroApplicationClosure {
                 revisions,
                 ProviderNativeLineageImplementation::CensusTabularV1,
                 observed_at,
+                None,
             )
             .await?;
         let (committed, binding) = publication.into_parts();

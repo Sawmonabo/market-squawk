@@ -193,7 +193,7 @@ market-squawk --output json query dataset <DATASET_ID> --maximum-rows 100
 | FRED durable ingest is denied | Exact written St. Louis Fed service permission with a current local review, or independent exact-series authority, is absent or stale | Treat it as the tracked release blocker; an API key, contact receipt, or successful ephemeral extraction is not durable authority |
 | Dataset not found | No current catalog/manifest authority exists for that identity | Confirm ingest/build publication and use the exact returned dataset identity |
 | Point-in-time build rejects the request | Knowledge cutoff, revision, source closure, universe, corporate action, or fixed resource contract failed | Correct the governed request or inputs; do not remove cutoff/revision semantics to obtain output |
-| Query is truncated | Result ceiling is below available rows or bytes | Narrow time/instrument scope or deliberately raise `--maximum-rows` within the fixed process limits |
+| Dataset read exceeds a resource limit | The complete result or execution exceeds its admitted row, byte, or work ceiling; no partial dataset is returned | `query dataset --maximum-rows` must cover the full result. Deliberately raise it within fixed process limits, or use explicit `LIMIT` through the local-only SQL path for a preview; artifact spill does not bypass the row ceiling |
 | DataFusion query is rejected | SQL is not read-only/single-dataset or exceeds SQL, plan, work, time, memory, or result bounds | Reduce the statement against the pinned dataset; SQL is CLI-only |
 | Artifact publication is interrupted | Staged bytes did not become current authority | Restart through the owning service; orphan/publication recovery validates exact object and catalog evidence |
 

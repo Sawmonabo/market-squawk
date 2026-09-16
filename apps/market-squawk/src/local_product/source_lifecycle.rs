@@ -490,6 +490,29 @@ impl ProductionSourceLifecycleAuthority {
                 });
             }
         }
+        if outcome.phase == DurableSourceLifecyclePhase::Active
+            && matches!(
+                command.action(),
+                SourceLifecycleAction::Start
+                    | SourceLifecycleAction::Retry
+                    | SourceLifecycleAction::Reconfigure
+            )
+            && matches!(
+                provider.as_str(),
+                "treasury.fiscal-data" | "treasury.daily-rates-xml"
+            )
+        {
+            // The exact lifecycle transition is durable before ordinary callable-recipe
+            // admission resumes. Reuse the existing retained portal task; its acknowledgement
+            // means publication is pending, while Macro readiness still requires completion.
+            let session_id = record
+                .session_id()
+                .ok_or(SourceLifecycleError::InvalidResult)?;
+            self.portal
+                .resume_research_publication(session_id, command.cancellation().child_token())
+                .await
+                .map_err(|_| SourceLifecycleError::Unavailable)?;
+        }
         self.receipt_for_current(
             command,
             operation_id,
@@ -1166,6 +1189,16 @@ impl ProductionSourceLifecycleAuthority {
                         profile.as_str(),
                         lease.session_id(),
                         command.cancellation().child_token(),
+                        command.deadline(),
+                    )
+                    .await
+                    .map_err(|_| SourceLifecycleError::Unavailable)?;
+                } else if profile.as_str() == "eia.api-v2" {
+                    cli_provider::publish_eia_activated_data(
+                        &self.activation,
+                        &lease,
+                        command.cancellation().child_token(),
+                        command.deadline(),
                     )
                     .await
                     .map_err(|_| SourceLifecycleError::Unavailable)?;
@@ -1184,6 +1217,20 @@ impl ProductionSourceLifecycleAuthority {
                     if runtime.session_id() != retained.session_id {
                         return Err(SourceLifecycleError::Conflict);
                     }
+                    if profile.as_str() == "eia.api-v2" {
+                        let lease = self
+                            .onboarding
+                            .activation_lease(retained.session_id)
+                            .map_err(|_| SourceLifecycleError::Unavailable)?;
+                        cli_provider::publish_eia_activated_data(
+                            &self.activation,
+                            &lease,
+                            command.cancellation().child_token(),
+                            command.deadline(),
+                        )
+                        .await
+                        .map_err(|_| SourceLifecycleError::Unavailable)?;
+                    }
                 } else {
                     cli_provider::resume_exact_research_provider(
                         &self.paths,
@@ -1193,6 +1240,7 @@ impl ProductionSourceLifecycleAuthority {
                         profile.as_str(),
                         retained.session_id,
                         command.cancellation().child_token(),
+                        command.deadline(),
                     )
                     .await
                     .map_err(|_| SourceLifecycleError::Unavailable)?;
@@ -1838,6 +1886,10 @@ impl std::fmt::Debug for ProductionSourceLifecycleAuthority {
 
 #[async_trait]
 impl SourceLifecycleAuthority for ProductionSourceLifecycleAuthority {
+    fn supports(&self, provider: &SourceIdentifier) -> bool {
+        DurableProviderActivationState::supports_source_lifecycle(provider.as_str())
+    }
+
     fn active_source_count(&self) -> Result<usize, SourceLifecycleError> {
         let active_live = self.live.active_source_count().map_err(map_live_error)?;
         let active_research = self

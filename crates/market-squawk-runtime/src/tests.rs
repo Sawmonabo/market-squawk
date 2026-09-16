@@ -39,6 +39,11 @@ fn request_identity_mismatches_fail_closed_before_dispatch() -> TestResult {
     let structure = JsonStructureLimits::try_new(8, 1_024, 64, 64)?;
     let request = request_for(runtime_identity(4, 2, 3)?, structure)?;
     assert_eq!(
+        request.arguments()["secret"],
+        "native-credential-redaction-sentinel"
+    );
+    assert!(!format!("{request:?}").contains("native-credential-redaction-sentinel"));
+    assert_eq!(
         expected.admit(&request),
         Err(RuntimeAdmissionError::InstallationMismatch)
     );
@@ -251,7 +256,7 @@ fn request_for(
         Timestamp::from_unix_nanos(100),
         SourceIdentifier::try_from("Market.Snapshot")
             .map_err(|_| RuntimeContractError::InvalidPayload)?,
-        json!({}),
+        json!({"secret": "native-credential-redaction-sentinel"}),
         structure,
         1_024,
     )

@@ -24,7 +24,7 @@ use crate::provider_onboarding::schwab_market_doctor::{
     SchwabMarketDoctorRateObservation, SchwabMarketDoctorRatePermit,
 };
 
-const PROBE_OPERATION_DURATION: Duration = Duration::from_secs(15);
+pub(super) const PROBE_OPERATION_DURATION: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProbeRateScopeKey {

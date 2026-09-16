@@ -133,11 +133,21 @@ pub(crate) fn canonical_fiscal_records<'a>(
             rate.source_line_number(),
             lower_hex(record.row_identity()),
         ))?;
+        let value = match rate.rate_percent() {
+            Some(value) => CanonicalMacroValue::Observed(value),
+            None => CanonicalMacroValue::Missing(MacroMissingValue::new(
+                identifier(
+                    rate.missing_marker()
+                        .ok_or(TreasurySourceError::InvalidProtocol)?,
+                )?,
+                None,
+            )),
+        };
         canonical_record(
             source,
             DataQuality::OfficialDelayed,
             series,
-            CanonicalMacroValue::Observed(rate.rate_percent()),
+            value,
             revision,
             rate.record_date(),
             page.response_payload_digest(),

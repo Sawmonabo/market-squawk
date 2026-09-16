@@ -65,11 +65,11 @@ that name one; MCP never receives a filesystem path.
 
 | Command | Exact arguments and effect |
 | --- | --- |
-| `source register <provider> --confirm` | Register a code-supported profile. Configure connections in Desktop Settings → Onboarding. |
+| `source register <provider> --confirm` | Register a code-supported profile. Configure connections in Desktop Settings → Connections → Set up connections. |
 | `source status [provider]`; `source coverage [provider]`; `source health [provider]` | Bounded provider status, explicit coverage, or connection/integrity/freshness facts. |
 | `source discover <provider> --dataset <dataset>` | Bounded object list without ingestion authority. |
 | `source inspect <provider> --onboarding-session-id <UUID> --dataset-identifier <dataset> [--page-index 0..63] [--max-records 1..1024]` | One non-persisting provider page; defaults are `0` and `256`. |
-| `source activate <request> --confirm` | CLI-owned, confined, versioned provider activation request. |
+| `source activate <request> --confirm` | One-shot, bounded installed-service request using `market-squawk.provider-setup.v1`. Supports `activate`, `verifySaved`, `restoreSaved`, and `resumePublication` for an existing session; see [the exact envelope](../operations/source-operations.md#understand-the-source-activate-boundary). |
 | `ingest source <provider> <object> --dataset <dataset> --confirm` | Mints the exact discovery receipt then uses it for source ingestion. |
 | `ingest file <manifest> --object <id> --dataset <id> --confirm` | CLI-owned confined local-file manifest admission. |
 | `dataset list [--after-dataset <id>]`; `dataset manifest <dataset>` | Bounded immutable dataset inventory or one manifest. |

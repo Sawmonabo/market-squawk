@@ -1,9 +1,9 @@
-//! Local provider onboarding application service and hardened loopback portal.
+//! Provider onboarding and activation over the shared installed application authorities.
 
+mod activation;
 mod contracts;
 pub(crate) mod credential_bundle;
 mod credential_bundle_delegation;
-mod portal;
 mod schwab_market_doctor;
 mod schwab_market_doctor_probe;
 mod schwab_market_doctor_runtime;
@@ -25,16 +25,14 @@ pub use credential_bundle_delegation::{
     delegate_provider_credential_bundle,
 };
 
+pub use activation::{ProviderPortalActivationAuthority, ProviderPortalActivationError};
 pub use contracts::{
     OnboardingNextAction, OnboardingSessionView, ProviderActivationLease,
-    ProviderPortalActivationRequest, ProviderPortalActivationView, ProviderProfileRegistration,
-    ProviderProfileRegistrationOutcome, ProviderProfileView, SecCikInput, SecCikInputError,
+    ProviderOnboardingRequest, ProviderPortalActivationRequest, ProviderPortalActivationView,
+    ProviderProfileRegistration, ProviderProfileRegistrationOutcome, ProviderProfileView,
+    SecCikInput, SecCikInputError,
 };
-pub(crate) use contracts::{SchwabOAuthLifecycleAction, SchwabOAuthLifecycleView};
-pub use portal::{
-    ProviderOnboardingPortal, ProviderPortalActivationAuthority, ProviderPortalActivationError,
-    ProviderPortalConfig, ProviderPortalError,
-};
+pub use contracts::{SchwabOAuthLifecycleAction, SchwabOAuthLifecycleView};
 pub(crate) use schwab_market_doctor_runtime::{
     SchwabMarketDoctorRuntimeCoordinator, SchwabMarketDoctorRuntimeError,
     SchwabMarketDoctorRuntimeTerminal,
@@ -54,6 +52,6 @@ pub(crate) use schwab_oauth_runtime::{
 };
 pub use service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
 pub(crate) use service::{
-    ProviderOnboardingMutationAuthority, ProviderRuntimeStartupAdmissions,
-    SchwabMarketDoctorRunPreparation,
+    ProviderOnboardingMutationAuthority, ProviderOnboardingOwnedMutationAuthority,
+    ProviderRuntimeStartupAdmissions, SchwabMarketDoctorRunPreparation,
 };

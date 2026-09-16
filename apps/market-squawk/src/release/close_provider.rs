@@ -51,9 +51,6 @@ const SEC_COMPANY_FACTS_OPERATION: &str = "Fundamental.GetFacts";
 const FRED_SOURCE_ID: &str = "fred-fred-alfred.api-v1-v2";
 const MAXIMUM_FRED_RELEASE_ROWS: usize = 1_024;
 const MAXIMUM_FRED_RELEASE_ROW_BYTES: usize = 1024 * 1024;
-const MAXIMUM_TREASURY_FISCAL_RELEASE_PAGES: usize = 1_023;
-const MAXIMUM_TREASURY_FISCAL_RELEASE_ROWS: usize = 1_024;
-const MAXIMUM_TREASURY_FISCAL_RELEASE_ROW_BYTES: usize = 1024 * 1024;
 const TREASURY_FISCAL_SOURCE_ID: &str = "treasury-treasury.fiscal-data";
 
 pub(super) fn validate_provider_evidence(payload: &Value) -> Result<()> {
@@ -426,416 +423,417 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
 
 fn validate_treasury_fiscal_publication(runtime: &Value) -> Result<()> {
     let publications = runtime
-        .pointer("/publications")
+        .get("publications")
         .and_then(Value::as_array)
         .filter(|publications| publications.len() == 1)
         .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data publication evidence is absent"))?;
-    let publication = publications
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data publication evidence is absent"))?;
-    let fiscal = publication
-        .get("treasury_fiscal")
+    validate_treasury_all_history_publication(runtime, &publications[0], None)
+}
+
+fn validate_treasury_all_history_publication(
+    runtime: &Value,
+    publication: &Value,
+    family: Option<TreasuryDailyRateFamily>,
+) -> Result<()> {
+    let evidence = publication
+        .get("treasury_all_history")
         .and_then(Value::as_object)
-        .filter(|fiscal| {
-            fiscal.len() == 7
+        .filter(|evidence| {
+            evidence.len() == 17
                 && [
-                    "first_record_date",
-                    "last_record_date",
-                    "page_size",
-                    "query_digest",
-                    "provider_row_count",
+                    "session_id",
+                    "source_generation_digest",
+                    "adapter_completion_digest",
+                    "publication_digest",
+                    "catalog_receipt_digest",
+                    "checkpoint_digest",
+                    "response_count",
+                    "data_page_count",
+                    "source_rows",
+                    "canonical_points",
+                    "observed_numeric_points",
+                    "explicit_missing_points",
+                    "raw_body_bytes",
+                    "provider_snapshot_isolation_claimed",
+                    "fiscal_page_size",
                     "pages",
-                    "observation_query",
+                    "queries",
                 ]
-                .into_iter()
-                .all(|field| fiscal.contains_key(field))
+                .iter()
+                .all(|key| evidence.contains_key(*key))
         })
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Treasury Fiscal Data publication evidence contains unknown or missing fields"
-            )
+            anyhow::anyhow!("Treasury all-history completion evidence is absent or invalid")
         })?;
-    let first_record_date: CalendarDate = serde_json::from_value(
-        fiscal
-            .get("first_record_date")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data first date is absent"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data first date is invalid"))?;
-    let last_record_date: CalendarDate = serde_json::from_value(
-        fiscal
-            .get("last_record_date")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data final date is absent"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data final date is invalid"))?;
-    let page_size = fiscal
-        .get("page_size")
-        .and_then(Value::as_u64)
-        .and_then(|value| u16::try_from(value).ok())
-        .and_then(NonZeroU16::new)
-        .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data page size is invalid"))?;
-    let query = TreasuryFiscalQuery::average_interest_rates_v2(
-        first_record_date,
-        last_record_date,
-        page_size,
-    )
-    .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data query is invalid"))?;
-    let provider_dataset = query
-        .dataset()
-        .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data provider dataset is invalid"))?;
-    let analytical_dataset = query
-        .analytical_dataset()
-        .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data analytical dataset is invalid"))?;
-    let provider_row_count = fiscal
-        .get("provider_row_count")
-        .and_then(Value::as_u64)
-        .filter(|rows| *rows > 0)
-        .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data provider row count is invalid"))?;
-    if fiscal.get("query_digest").and_then(Value::as_str)
-        != Some(lower_hex(&query.query_digest()).as_str())
-        || publication.get("family").and_then(Value::as_str) != Some("average_interest_rates_v2")
-        || publication.get("provider_dataset").and_then(Value::as_str)
-            != Some(provider_dataset.as_str())
+    let surface = if family.is_some() {
+        "treasury.daily-rates-xml"
+    } else {
+        "treasury.fiscal-data"
+    };
+    if evidence
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .is_none_or(|id| id.is_nil())
+        || evidence.get("source_generation_digest") != runtime.get("runtime_generation_digest")
+        || [
+            "source_generation_digest",
+            "adapter_completion_digest",
+            "publication_digest",
+            "catalog_receipt_digest",
+            "checkpoint_digest",
+        ]
+        .iter()
+        .any(|key| {
+            evidence
+                .get(*key)
+                .is_none_or(|value| !nonzero_evidence_digest(value))
+        })
+        || evidence
+            .get("provider_snapshot_isolation_claimed")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || publication
+            .get("temporal_semantics")
+            .and_then(Value::as_str)
+            != Some("treasury_all_history_effective_observations")
+        || publication.get("sec").is_none_or(|value| !value.is_null())
+        || publication.get("fred").is_none_or(|value| !value.is_null())
+    {
+        bail!("Treasury all-history completion lost its exact runtime or publication authority");
+    }
+    let fiscal_query = match family {
+        Some(_) => {
+            if evidence
+                .get("fiscal_page_size")
+                .is_none_or(|value| !value.is_null())
+            {
+                bail!("Treasury daily completion contains Fiscal request fields");
+            }
+            None
+        }
+        None => {
+            let page_size = evidence
+                .get("fiscal_page_size")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .and_then(NonZeroU16::new)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Treasury Fiscal all-history page size is invalid")
+                })?;
+            Some(TreasuryFiscalQuery::average_interest_rates_v2_all_history(
+                page_size,
+            )?)
+        }
+    };
+    let daily_query = family
+        .map(TreasuryDailyRateQuery::all_history)
+        .transpose()?;
+    let (provider_dataset, analytical_dataset) = match (&fiscal_query, &daily_query) {
+        (Some(query), None) => (query.dataset()?, query.analytical_dataset()?),
+        (None, Some(query)) => (query.dataset().clone(), query.analytical_dataset().clone()),
+        _ => bail!("Treasury all-history surface selector is invalid"),
+    };
+    if publication.get("provider_dataset").and_then(Value::as_str)
+        != Some(provider_dataset.as_str())
         || publication
             .get("analytical_dataset_id")
             .and_then(Value::as_str)
             != Some(analytical_dataset.as_str())
         || DatasetId::try_from(analytical_dataset.as_str()).is_err()
-        || publication
-            .get("temporal_semantics")
-            .and_then(Value::as_str)
-            != Some("treasury_fiscal_effective_observations")
-        || publication.get("row_count").and_then(Value::as_u64) != Some(provider_row_count)
-        || publication
-            .get("observation_query_row_count")
-            .and_then(Value::as_u64)
-            != Some(provider_row_count)
-        || publication.get("sec").is_none_or(|value| !value.is_null())
-        || publication.get("fred").is_none_or(|value| !value.is_null())
+        || (family.is_none()
+            && publication.get("family").and_then(Value::as_str)
+                != Some("average_interest_rates_v2"))
     {
-        bail!("Treasury Fiscal Data publication lost its exact query or manifest authority");
+        bail!("Treasury all-history publication has a range, year, or mismatched dataset");
     }
-
-    let page_rows =
-        validate_treasury_fiscal_pages(publication, fiscal, &query, provider_row_count)?;
-    let observed_series = validate_treasury_fiscal_query_evidence(
-        fiscal.get("observation_query"),
-        &query,
-        &page_rows,
-        provider_row_count,
-    )?;
-    let declared_series = string_set(
-        publication
-            .get("series_ids")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data series evidence is absent"))?,
-        "Treasury Fiscal Data series",
-    )?;
-    if declared_series.is_empty() || declared_series != observed_series {
-        bail!("Treasury Fiscal Data series evidence does not match the canonical row set");
-    }
-    validate_research_publication(publication, "treasury.fiscal-data", false)
-}
-
-struct TreasuryFiscalPageAuthority {
-    request_digest: [u8; 32],
-    returned_rows: u64,
-}
-
-fn validate_treasury_fiscal_pages(
-    publication: &Value,
-    fiscal: &serde_json::Map<String, Value>,
-    query: &TreasuryFiscalQuery,
-    provider_row_count: u64,
-) -> Result<BTreeMap<[u8; 32], TreasuryFiscalPageAuthority>> {
-    let pages = fiscal
+    let pages = evidence
         .get("pages")
         .and_then(Value::as_array)
-        .filter(|pages| !pages.is_empty() && pages.len() <= MAXIMUM_TREASURY_FISCAL_RELEASE_PAGES)
-        .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data page-chain evidence is absent"))?;
-    if publication.get("object_count").and_then(Value::as_u64) != u64::try_from(pages.len()).ok() {
-        bail!("Treasury Fiscal Data object count does not match its complete page chain");
+        .filter(|pages| !pages.is_empty() && pages.len() <= 1024)
+        .ok_or_else(|| anyhow::anyhow!("Treasury retained page ledger is invalid"))?;
+    if evidence.get("response_count").and_then(Value::as_u64) != u64::try_from(pages.len()).ok() {
+        bail!("Treasury response count does not cover the retained terminal response");
     }
-    let mut source_objects = BTreeSet::new();
-    let mut page_rows = BTreeMap::new();
-    let mut accounted_rows = 0_u64;
-    let mut final_object = None;
-    let mut final_payload = None;
+    let mut totals = [0_u64; 5];
+    let mut data_pages = 0_u64;
+    let mut payloads = BTreeSet::new();
+    let mut seals = BTreeSet::new();
     for (index, page) in pages.iter().enumerate() {
         let page = page
             .as_object()
             .filter(|page| {
-                page.len() == 5
+                page.len() == 13
                     && [
-                        "source_object_id",
-                        "source_payload_digest",
                         "page_number",
+                        "source_object_id",
                         "request_digest",
-                        "returned_rows",
+                        "payload_digest",
+                        "sealed_capture_receipt_digest",
+                        "canonical_content_digest",
+                        "native_lineage_batch_digest",
+                        "source_rows",
+                        "canonical_points",
+                        "observed_numeric_points",
+                        "explicit_missing_points",
+                        "raw_body_bytes",
+                        "terminal",
                     ]
-                    .into_iter()
-                    .all(|field| page.contains_key(field))
+                    .iter()
+                    .all(|key| page.contains_key(*key))
             })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Treasury Fiscal Data page evidence contains unknown or missing fields"
-                )
-            })?;
-        let page_number = index
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data page number overflow"))?;
-        let expected_request = query
-            .page(page_number)
-            .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data page request is invalid"))?;
-        let request_digest_bytes = expected_request.request_digest();
-        let request_digest = lower_hex(&request_digest_bytes);
-        let source_object = page
-            .get("source_object_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data source object is invalid"))?;
-        let payload_digest = page
-            .get("source_payload_digest")
+            .ok_or_else(|| anyhow::anyhow!("Treasury page evidence is invalid"))?;
+        let page_number = if family.is_some() { index } else { index + 1 };
+        let request_digest = match (&fiscal_query, &daily_query) {
+            (Some(query), None) => query.page(page_number)?.request_digest(),
+            (None, Some(query)) => query.page(page_number)?.request_digest(),
+            _ => bail!("Treasury page query is invalid"),
+        };
+        let payload = page
+            .get("payload_digest")
             .and_then(evidence_digest_bytes)
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data page payload is invalid"))?;
-        let returned_rows = page
-            .get("returned_rows")
-            .and_then(Value::as_u64)
-            .filter(|rows| *rows > 0)
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data page row count is invalid"))?;
+            .ok_or_else(|| anyhow::anyhow!("Treasury page payload digest is invalid"))?;
+        let seal = page
+            .get("sealed_capture_receipt_digest")
+            .and_then(evidence_digest_bytes)
+            .ok_or_else(|| anyhow::anyhow!("Treasury sealed receipt digest is invalid"))?;
+        let terminal = index + 1 == pages.len();
+        let mut counts = [0_u64; 5];
+        for (target, key) in counts.iter_mut().zip([
+            "source_rows",
+            "canonical_points",
+            "observed_numeric_points",
+            "explicit_missing_points",
+            "raw_body_bytes",
+        ]) {
+            *target = page
+                .get(key)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("Treasury page accounting is invalid"))?;
+        }
+        let empty_terminal = family.is_some() && terminal;
+        let object = format!(
+            "treasury-page:{}:{page_number}:{}:{}",
+            if family.is_some() {
+                "daily-rate"
+            } else {
+                "fiscal-page"
+            },
+            lower_hex(&request_digest),
+            lower_hex(&payload)
+        );
         if page.get("page_number").and_then(Value::as_u64) != u64::try_from(page_number).ok()
-            || page.get("request_digest").and_then(Value::as_str) != Some(request_digest.as_str())
-            || !treasury_fiscal_source_object_matches(
-                source_object,
-                page_number,
-                &request_digest,
-                &lower_hex(&payload_digest),
-            )
-            || !source_objects.insert(source_object)
-            || page_rows
-                .insert(
-                    payload_digest,
-                    TreasuryFiscalPageAuthority {
-                        request_digest: request_digest_bytes,
-                        returned_rows,
-                    },
-                )
-                .is_some()
+            || page.get("source_object_id").and_then(Value::as_str) != Some(object.as_str())
+            || page.get("request_digest").and_then(evidence_digest_bytes) != Some(request_digest)
+            || page.get("terminal").and_then(Value::as_bool) != Some(terminal)
+            || !payloads.insert(payload)
+            || !seals.insert(seal)
+            || counts[2].checked_add(counts[3]) != Some(counts[1])
+            || counts[4] == 0
+            || (empty_terminal && counts[..4].iter().any(|count| *count != 0))
+            || (!empty_terminal && (counts[0] == 0 || counts[1] == 0))
+            || (family.is_none() && (counts[0] != counts[1] || counts[3] != 0))
         {
-            bail!("Treasury Fiscal Data page chain is duplicated or inconsistent");
+            bail!("Treasury page ledger lost exact request, row, seal, or terminal authority");
         }
-        accounted_rows = accounted_rows
-            .checked_add(returned_rows)
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data row count overflow"))?;
-        final_object = Some(source_object);
-        final_payload = Some(payload_digest);
-    }
-    if accounted_rows != provider_row_count
-        || publication.get("source_object_id").and_then(Value::as_str) != final_object
-        || publication
-            .get("source_payload_digest")
-            .and_then(evidence_digest_bytes)
-            != final_payload
-    {
-        bail!("Treasury Fiscal Data final publication does not bind its complete page chain");
-    }
-    Ok(page_rows)
-}
-
-fn validate_treasury_fiscal_query_evidence(
-    query_evidence: Option<&Value>,
-    query: &TreasuryFiscalQuery,
-    page_rows: &BTreeMap<[u8; 32], TreasuryFiscalPageAuthority>,
-    provider_row_count: u64,
-) -> Result<BTreeSet<String>> {
-    let query_evidence = query_evidence
-        .and_then(Value::as_object)
-        .filter(|query| {
-            query.len() == 3
-                && ["row_count", "content_sha256", "rows"]
-                    .into_iter()
-                    .all(|field| query.contains_key(field))
-        })
-        .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data inline query evidence is absent"))?;
-    let rows = query_evidence
-        .get("rows")
-        .and_then(Value::as_array)
-        .filter(|rows| !rows.is_empty() && rows.len() <= MAXIMUM_TREASURY_FISCAL_RELEASE_ROWS)
-        .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data inline query rows are invalid"))?;
-    let row_count = u64::try_from(rows.len())
-        .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data query row count overflow"))?;
-    let encoded = serde_json::to_vec(rows)
-        .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data rows are invalid"))?;
-    let digest: [u8; 32] = Sha256::digest(&encoded).into();
-    if encoded.len() > MAXIMUM_TREASURY_FISCAL_RELEASE_ROW_BYTES
-        || row_count != provider_row_count
-        || query_evidence.get("row_count").and_then(Value::as_u64) != Some(row_count)
-        || query_evidence.get("content_sha256").and_then(Value::as_str)
-            != Some(lower_hex(&digest).as_str())
-    {
-        bail!("Treasury Fiscal Data query count, size, or content digest is invalid");
-    }
-    validate_treasury_fiscal_rows(rows, query, page_rows)
-}
-
-fn validate_treasury_fiscal_rows(
-    rows: &[Value],
-    query: &TreasuryFiscalQuery,
-    expected_page_rows: &BTreeMap<[u8; 32], TreasuryFiscalPageAuthority>,
-) -> Result<BTreeSet<String>> {
-    let mut observed_page_rows = BTreeMap::<[u8; 32], u64>::new();
-    let mut identities = BTreeSet::new();
-    let mut series = BTreeSet::new();
-    for row in rows {
-        let row = row
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data query row is invalid"))?;
-        let payload =
-            required_lower_hex_bytes(row.get("payload_json"), "Treasury Fiscal Data payload")?;
-        let declared_payload_digest = required_lower_hex_bytes(
-            row.get("payload_sha256"),
-            "Treasury Fiscal Data payload digest",
-        )?;
-        let payload_digest: [u8; 32] = Sha256::digest(&payload).into();
-        if declared_payload_digest.as_slice() != payload_digest {
-            bail!("Treasury Fiscal Data canonical payload digest is invalid");
-        }
-        let observation: ResearchObservation = serde_json::from_slice(&payload)
-            .map_err(|_| anyhow::anyhow!("Treasury Fiscal Data canonical payload is invalid"))?;
-        let ResearchObservation::Macro(observation) = observation else {
-            bail!("Treasury Fiscal Data query returned a non-macro observation");
-        };
-        let request_digest =
-            required_lower_hex_bytes(row.get("request_sha256"), "Treasury Fiscal Data request")?;
-        let lineage = required_lower_hex_bytes(
-            row.get("extraction_lineage_json"),
-            "Treasury Fiscal Data extraction lineage",
-        )?;
-        let context = observation.context();
-        let provenance = context.provenance();
-        let effective = context
-            .time()
-            .effective()
-            .calendar_date_value()
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data effective date is absent"))?;
-        let source_identifier = provenance.source_identifier().as_str();
-        let expected_prefix = format!("treasury-fiscal-rate:{effective}:");
-        let observed_value = observation
-            .value()
-            .observed_value()
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data value is absent"))?;
-        if observation.value().missing_value().is_some() {
-            bail!("Treasury Fiscal Data value cannot be both observed and missing");
-        }
-        let received_at = row_timestamp_nanos(row.get("received_at"));
-        let available_at = row_timestamp_nanos(row.get("available_at"));
-        let ingested_at = row_timestamp_nanos(row.get("ingested_at"));
-        let page_digest = match provenance.payload_reference() {
-            PayloadReference::ContentHash(hash) if hash.algorithm() == DigestAlgorithm::Sha256 => {
-                hash.digest()
+        for key in ["canonical_content_digest", "native_lineage_batch_digest"] {
+            let value = page
+                .get(key)
+                .ok_or_else(|| anyhow::anyhow!("Treasury canonical page digest is absent"))?;
+            if (empty_terminal && !value.is_null())
+                || (!empty_terminal && !nonzero_evidence_digest(value))
+            {
+                bail!(
+                    "Treasury final-page disposition does not match its canonical/native evidence"
+                );
             }
-            _ => bail!("Treasury Fiscal Data row omitted exact provider-page evidence"),
-        };
-        let expected_page = expected_page_rows.get(&page_digest).ok_or_else(|| {
-            anyhow::anyhow!("Treasury Fiscal Data row references an unadmitted provider page")
-        })?;
-        let observed = observed_page_rows.entry(page_digest).or_default();
-        *observed = observed
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("Treasury Fiscal Data page row count overflow"))?;
-        if request_digest.as_slice() != expected_page.request_digest.as_slice()
-            || serde_json::from_slice::<Value>(&lineage)
-                .ok()
-                .is_none_or(|value| value.is_null())
-            || row.keys().any(|field| !fred_row_field_allowed(field))
-            || query
-                .first_record_date()
-                .is_some_and(|first| effective < first)
-            || query
-                .last_record_date()
-                .is_some_and(|last| effective > last)
-            || !source_identifier.starts_with(&expected_prefix)
-            || !treasury_fiscal_revision_matches(source_identifier, effective)
-            || provenance.source_id().as_str() != TREASURY_FISCAL_SOURCE_ID
-            || provenance.instrument_id().is_some()
-            || provenance.venue_id().is_some()
-            || provenance.source_timestamp().is_some()
-            || provenance.quality() != DataQuality::OfficialDelayed
-            || provenance.ingested_at() < provenance.received_at()
-            || !matches!(
-                provenance.availability(),
-                AvailabilityEvidence::LocalFirstObserved { observed_at }
-                    if *observed_at == provenance.received_at()
-            )
-            || context.time().published().is_some()
-            || context.time().superseded().is_some()
-            || context.time().revision().get() != 1
-            || !treasury_fiscal_series_valid(observation.series().as_str())
-            || observation.unit().as_str() != "percent"
-            || row.get("schema_version").and_then(Value::as_u64) != Some(3)
-            || received_at != Some(provenance.received_at().unix_nanos())
-            || available_at != Some(provenance.received_at().unix_nanos())
-            || ingested_at != Some(provenance.ingested_at().unix_nanos())
-            || row.get("observation_kind").and_then(Value::as_str) != Some("macro")
-            || row.get("source_id").and_then(Value::as_str) != Some(TREASURY_FISCAL_SOURCE_ID)
-            || row.get("source_identifier").and_then(Value::as_str) != Some(source_identifier)
-            || row.get("received_at") != row.get("available_at")
-            || row.get("availability_kind").and_then(Value::as_str) != Some("local_first_observed")
-            || row.get("effective_precision").and_then(Value::as_str) != Some("calendar_date")
-            || row.get("effective_date").and_then(Value::as_str)
-                != Some(effective.to_string().as_str())
-            || row.get("effective_at").is_some()
-            || row.get("effective_period_scheme").is_some()
-            || row.get("effective_period_year").is_some()
-            || row.get("effective_period_ordinal").is_some()
-            || row.get("effective_period_code").is_some()
-            || row.get("published_at").is_some()
-            || row.get("published_date").is_some()
-            || row.get("published_period_scheme").is_some()
-            || row.get("published_period_year").is_some()
-            || row.get("published_period_ordinal").is_some()
-            || row.get("published_period_code").is_some()
-            || row.get("superseded_at").is_some()
-            || row.get("superseded_date").is_some()
-            || row.get("superseded_period_scheme").is_some()
-            || row.get("superseded_period_year").is_some()
-            || row.get("superseded_period_ordinal").is_some()
-            || row.get("superseded_period_code").is_some()
-            || row.get("revision").and_then(Value::as_u64) != Some(1)
-            || row.get("quality").and_then(Value::as_str) != Some("official_delayed")
-            || row.get("value_state").and_then(Value::as_str) != Some("observed")
-            || row.get("value_mantissa").and_then(json_i128) != Some(observed_value.mantissa())
-            || row.get("value_scale").and_then(Value::as_u64)
-                != Some(u64::from(observed_value.scale()))
-            || row.get("missing_marker").is_some()
-            || row.get("missing_reason").is_some()
-            || row.get("unit").and_then(Value::as_str) != Some("percent")
-            || row.get("currency").is_some()
-            || row.get("instrument_id").is_some()
-            || row.get("venue_id").is_some()
-            || row.get("source_timestamp").is_some()
-            || row.get("availability_reported_or_inferred_at").is_some()
-            || row.get("availability_evidence").is_some()
-            || row.get("availability_method").is_some()
-            || row.get("published_precision").is_some()
-            || row.get("superseded_precision").is_some()
-            || !identities.insert((source_identifier.to_owned(), payload_digest))
-        {
-            bail!(
-                "Treasury Fiscal Data row lost exact source, time, quality, or payload authority"
-            );
         }
-        series.insert(observation.series().as_str().to_owned());
+        if !empty_terminal {
+            data_pages += 1;
+        }
+        for (total, count) in totals.iter_mut().zip(counts) {
+            *total = total
+                .checked_add(count)
+                .ok_or_else(|| anyhow::anyhow!("Treasury page accounting overflow"))?;
+        }
+        if terminal
+            && (publication.get("source_object_id").and_then(Value::as_str)
+                != Some(object.as_str())
+                || publication
+                    .get("source_payload_digest")
+                    .and_then(evidence_digest_bytes)
+                    != Some(payload))
+        {
+            bail!("Treasury publication does not bind the actual retained terminal response");
+        }
     }
-    if observed_page_rows.len() != expected_page_rows.len()
-        || expected_page_rows.iter().any(|(digest, authority)| {
-            observed_page_rows.get(digest) != Some(&authority.returned_rows)
-        })
-        || series.is_empty()
+    if data_pages == 0
+        || evidence.get("data_page_count").and_then(Value::as_u64) != Some(data_pages)
+        || publication.get("row_count").and_then(Value::as_u64) != Some(totals[1])
+        || totals[0] > 100_000
+        || totals[1] > 3_200_000
+        || totals[4] > 64 * 1024 * 1024
     {
-        bail!("Treasury Fiscal Data rows do not exactly cover every admitted provider page");
+        bail!("Treasury all-history publication accounting is incomplete or oversized");
     }
-    Ok(series)
+    for (expected, key) in totals.into_iter().zip([
+        "source_rows",
+        "canonical_points",
+        "observed_numeric_points",
+        "explicit_missing_points",
+        "raw_body_bytes",
+    ]) {
+        if evidence.get(key).and_then(Value::as_u64) != Some(expected) {
+            bail!("Treasury completed accounting does not equal its retained page ledger");
+        }
+    }
+    validate_treasury_typed_queries(publication, evidence, family, &payloads)?;
+    validate_research_publication(publication, surface, false)
+}
+
+fn validate_treasury_typed_queries(
+    publication: &Value,
+    evidence: &serde_json::Map<String, Value>,
+    family: Option<TreasuryDailyRateFamily>,
+    payloads: &BTreeSet<[u8; 32]>,
+) -> Result<()> {
+    let queries = evidence
+        .get("queries")
+        .and_then(Value::as_array)
+        .filter(|queries| queries.len() == 2)
+        .ok_or_else(|| anyhow::anyhow!("Treasury all-history typed query evidence is absent"))?;
+    let mut last_series = BTreeSet::new();
+    let mut previous_selection = None;
+    let mut knowledge = None;
+    for (index, query) in queries.iter().enumerate() {
+        let query = query
+            .as_object()
+            .filter(|query| {
+                query.len() == 4
+                    && [
+                        "knowledge_cutoff",
+                        "effective_date_cutoff",
+                        "selection_digest",
+                        "observations",
+                    ]
+                    .iter()
+                    .all(|key| query.contains_key(*key))
+            })
+            .ok_or_else(|| anyhow::anyhow!("Treasury typed query evidence is invalid"))?;
+        let cutoff: CalendarDate = serde_json::from_value(
+            query
+                .get("effective_date_cutoff")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Treasury typed effective cutoff is absent"))?,
+        )?;
+        let knowledge_text = query
+            .get("knowledge_cutoff")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Treasury typed knowledge cutoff is absent"))?;
+        let knowledge_nanos = chrono::DateTime::parse_from_rfc3339(knowledge_text)?
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow::anyhow!("Treasury knowledge cutoff overflow"))?;
+        let selection = query
+            .get("selection_digest")
+            .and_then(Value::as_str)
+            .filter(|digest| valid_nonzero_sha256_text(digest))
+            .ok_or_else(|| anyhow::anyhow!("Treasury typed selection digest is invalid"))?;
+        if (index == 0 && cutoff != CalendarDate::new(2024, 12, 31)?)
+            || (index == 1 && cutoff <= CalendarDate::new(2024, 12, 31)?)
+            || previous_selection
+                .replace(selection)
+                .is_some_and(|previous| previous == selection)
+            || knowledge
+                .replace(knowledge_text)
+                .is_some_and(|previous| previous != knowledge_text)
+        {
+            bail!("Treasury typed queries did not retain the two exact all-history cutoffs");
+        }
+        let rows = query
+            .get("observations")
+            .and_then(Value::as_array)
+            .filter(|rows| !rows.is_empty() && rows.len() <= 32)
+            .ok_or_else(|| anyhow::anyhow!("Treasury typed query row bound is invalid"))?;
+        let mut series = BTreeSet::new();
+        for row in rows {
+            let observation: MacroObservation = serde_json::from_value(row.clone())?;
+            let context = observation.context();
+            let provenance = context.provenance();
+            let effective = context
+                .time()
+                .effective()
+                .calendar_date_value()
+                .ok_or_else(|| anyhow::anyhow!("Treasury typed effective date is absent"))?;
+            let source = if family.is_some() {
+                "treasury-treasury.daily-rates-xml"
+            } else {
+                TREASURY_FISCAL_SOURCE_ID
+            };
+            let page_digest = match provenance.payload_reference() {
+                PayloadReference::ContentHash(hash)
+                    if hash.algorithm() == DigestAlgorithm::Sha256 =>
+                {
+                    hash.digest()
+                }
+                _ => bail!("Treasury typed observation omitted retained page provenance"),
+            };
+            if effective > cutoff
+                || provenance.received_at().unix_nanos() > knowledge_nanos
+                || provenance.ingested_at().unix_nanos() > knowledge_nanos
+                || provenance.source_id().as_str() != source
+                || provenance.quality() != DataQuality::OfficialDelayed
+                || provenance.instrument_id().is_some()
+                || provenance.venue_id().is_some()
+                || provenance.source_timestamp().is_some()
+                || !matches!(provenance.availability(), AvailabilityEvidence::LocalFirstObserved { observed_at } if *observed_at == provenance.received_at())
+                || context.time().published().is_some()
+                || context.time().superseded().is_some()
+                || !payloads.contains(&page_digest)
+                || observation.unit().as_str() != "percent"
+                || !series.insert(observation.series().as_str().to_owned())
+                || (family.is_none()
+                    && (!treasury_fiscal_series_valid(observation.series().as_str())
+                        || !treasury_fiscal_revision_matches(
+                            provenance.source_identifier().as_str(),
+                            effective,
+                        )
+                        || observation.value().observed_value().is_none()
+                        || observation.value().missing_value().is_some()))
+            {
+                bail!(
+                    "Treasury typed observation lost exact source, cutoff, series, or raw provenance"
+                );
+            }
+        }
+        if let Some(family) = family {
+            let expected = family
+                .dashboard_metrics()
+                .into_iter()
+                .filter(|metric| metric.first_schema_year() <= cutoff.year())
+                .map(|metric| metric.canonical_series().to_owned())
+                .collect::<BTreeSet<_>>();
+            if series != expected {
+                bail!("Treasury typed query omitted a schema-valid family series");
+            }
+        }
+        last_series = series;
+    }
+    let declared = string_set(
+        publication
+            .get("series_ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Treasury selected series are absent"))?,
+        "Treasury selected series",
+    )?;
+    if declared != last_series
+        || publication
+            .get("observation_query_row_count")
+            .and_then(Value::as_u64)
+            != u64::try_from(last_series.len()).ok()
+    {
+        bail!("Treasury typed query count does not match its exact series inventory");
+    }
+    Ok(())
 }
 
 fn treasury_fiscal_revision_matches(identity: &str, effective: CalendarDate) -> bool {
@@ -1002,84 +1000,34 @@ fn valid_sec_cik(value: &str) -> bool {
 
 fn validate_treasury_publications(runtime: &Value) -> Result<()> {
     let publications = runtime
-        .pointer("/publications")
+        .get("publications")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("Treasury publication evidence is absent"))?;
-    if publications.len() != TreasuryDailyRateFamily::ALL.len() {
-        bail!("Treasury publication evidence does not cover all five families");
-    }
+        .filter(|publications| publications.len() == TreasuryDailyRateFamily::ALL.len())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Treasury publication evidence does not cover all five families")
+        })?;
     let mut families = BTreeSet::new();
-    let mut provider_datasets = BTreeSet::new();
-    let mut analytical_datasets = BTreeSet::new();
-    let mut acceptance_year = None;
+    let mut datasets = BTreeSet::new();
     for publication in publications {
-        let family_name = publication
+        let family = publication
             .get("family")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Treasury publication family is invalid"))?;
-        let family = treasury_family(family_name)
-            .ok_or_else(|| anyhow::anyhow!("Treasury publication family is invalid"))?;
-        let provider_dataset = publication
-            .get("provider_dataset")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Treasury provider dataset is invalid"))?;
-        let year = treasury_dataset_year(family, provider_dataset)
-            .ok_or_else(|| anyhow::anyhow!("Treasury provider dataset is invalid"))?;
-        if acceptance_year
-            .replace(year)
-            .is_some_and(|other| other != year)
-        {
-            bail!("Treasury publications do not use one common configured acceptance year");
-        }
-        let query = TreasuryDailyRateQuery::year(family, year)?;
-        if query.dataset().as_str() != provider_dataset {
-            bail!("Treasury publication family is not bound to its canonical dataset");
-        }
-        let source_object = publication
-            .get("source_object_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Treasury source object identity is invalid"))?;
-        let payload_digest = publication
-            .get("source_payload_digest")
-            .and_then(evidence_digest_hex)
-            .ok_or_else(|| anyhow::anyhow!("Treasury source payload digest is absent"))?;
-        let request = query.page(0)?;
-        if !treasury_source_object_matches(source_object, request.request_digest(), &payload_digest)
-        {
-            bail!("Treasury source object is not bound to its dataset and exact payload");
-        }
-        let analytical_dataset = publication
+            .and_then(treasury_family)
+            .ok_or_else(|| anyhow::anyhow!("Treasury all-history family is invalid"))?;
+        let dataset = publication
             .get("analytical_dataset_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Treasury analytical dataset identity is invalid"))?;
-        if query.analytical_dataset().as_str() != analytical_dataset
-            || DatasetId::try_from(analytical_dataset).is_err()
-        {
-            bail!("Treasury analytical dataset is not bound to its provider selector");
+            .ok_or_else(|| anyhow::anyhow!("Treasury all-history analytical dataset is absent"))?;
+        if !families.insert(family) || !datasets.insert(dataset) {
+            bail!("Treasury all-history publication repeats a family or dataset");
         }
-        if source_object.is_empty()
-            || !families.insert(family)
-            || !provider_datasets.insert(provider_dataset)
-            || !analytical_datasets.insert(analytical_dataset)
-            || publication.get("object_count").and_then(Value::as_u64) != Some(1)
-            || publication
-                .get("temporal_semantics")
-                .and_then(Value::as_str)
-                != Some("effective_observations")
-            || publication
-                .get("series_ids")
-                .and_then(Value::as_array)
-                .is_none_or(|series| !series.is_empty())
-        {
-            bail!("Treasury publication evidence is incomplete");
-        }
-        validate_research_publication(publication, "treasury.daily-rates-xml", false)?;
+        validate_treasury_all_history_publication(runtime, publication, Some(family))?;
     }
     if TreasuryDailyRateFamily::ALL
         .into_iter()
         .any(|family| !families.contains(&family))
     {
-        bail!("Treasury publication evidence omitted a required family");
+        bail!("Treasury all-history publication omitted an official family");
     }
     Ok(())
 }
@@ -1772,14 +1720,18 @@ fn validate_research_publication(
             && !publication
                 .get("vintage_query_row_count")
                 .is_some_and(Value::is_null))
-        || (expected_surface == "treasury.fiscal-data"
-            && publication
-                .get("treasury_fiscal")
-                .is_none_or(Value::is_null))
-        || (expected_surface != "treasury.fiscal-data"
-            && publication
-                .get("treasury_fiscal")
-                .is_none_or(|value| !value.is_null()))
+        || (matches!(
+            expected_surface,
+            "treasury.fiscal-data" | "treasury.daily-rates-xml"
+        ) && publication
+            .get("treasury_all_history")
+            .is_none_or(Value::is_null))
+        || (!matches!(
+            expected_surface,
+            "treasury.fiscal-data" | "treasury.daily-rates-xml"
+        ) && publication
+            .get("treasury_all_history")
+            .is_none_or(|value| !value.is_null()))
     {
         bail!("research publication evidence is incomplete");
     }
@@ -1803,51 +1755,6 @@ fn treasury_family(value: &str) -> Option<TreasuryDailyRateFamily> {
         "real_long_term_rates" => Some(TreasuryDailyRateFamily::RealLongTermRates),
         _ => None,
     }
-}
-
-fn treasury_dataset_year(family: TreasuryDailyRateFamily, dataset: &str) -> Option<u16> {
-    let prefix = match family {
-        TreasuryDailyRateFamily::NominalParYieldCurve => "treasury:daily-par-yield-curve:",
-        TreasuryDailyRateFamily::BillRates => "treasury:daily-bill-rates:",
-        TreasuryDailyRateFamily::LongTermRates => "treasury:daily-long-term-rates:",
-        TreasuryDailyRateFamily::RealParYieldCurve => "treasury:daily-real-par-yield-curve:",
-        TreasuryDailyRateFamily::RealLongTermRates => "treasury:daily-real-long-term-rates:",
-    };
-    dataset
-        .strip_prefix(prefix)?
-        .parse::<u16>()
-        .ok()
-        .filter(|year| (family.start_year()..=9999).contains(year))
-}
-
-fn treasury_source_object_matches(
-    identity: &str,
-    request_digest: [u8; 32],
-    payload_digest: &str,
-) -> bool {
-    let request_digest = lower_hex(&request_digest);
-    let mut fields = identity.split(':');
-    fields.next() == Some("treasury-page")
-        && fields.next() == Some("daily-rate")
-        && fields.next() == Some("0")
-        && fields.next() == Some(request_digest.as_str())
-        && fields.next() == Some(payload_digest)
-        && fields.next().is_none()
-}
-
-fn treasury_fiscal_source_object_matches(
-    identity: &str,
-    page_number: usize,
-    request_digest: &str,
-    payload_digest: &str,
-) -> bool {
-    let mut fields = identity.split(':');
-    fields.next() == Some("treasury-page")
-        && fields.next() == Some("fiscal")
-        && fields.next().and_then(|value| value.parse::<usize>().ok()) == Some(page_number)
-        && fields.next() == Some(request_digest)
-        && fields.next() == Some(payload_digest)
-        && fields.next().is_none()
 }
 
 fn evidence_digest_hex(value: &Value) -> Option<String> {

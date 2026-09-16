@@ -1520,69 +1520,36 @@ async fn exercise_installed_board_vertical(
     assert_eq!(profile["credential_kind"], "none");
     assert_eq!(profile["release_state"], "available");
 
-    let setup = invoke_installed_board(
+    let bootstrap = invoke_installed_board(
         client,
-        "setup",
-        "Source.Setup",
-        json!({
-            "provider": BOARD_SURFACE,
-            "sourceCoverage": [BOARD_SURFACE],
-            "confirm": true,
-            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
-        }),
+        "setup-state",
+        "Source.Onboarding.GetState",
+        json!({}),
     )
     .await?;
-    let portal = setup["portal"]["url"]
-        .as_str()
-        .context("Board setup did not return its local portal")?;
-    let http = reqwest::Client::new();
-    let bootstrap_response = http
-        .get(format!("{portal}/api/v1/bootstrap"))
-        .send()
-        .await
-        .context("request Board portal bootstrap")?;
-    let cookie = bootstrap_response
-        .headers()
-        .get(reqwest::header::SET_COOKIE)
-        .context("Board portal bootstrap did not issue a session cookie")?
-        .to_str()
-        .context("decode Board portal session cookie")?
-        .split(';')
-        .next()
-        .context("Board portal session cookie was empty")?
-        .to_owned();
-    let bootstrap: Value = bootstrap_response
-        .json()
-        .await
-        .context("decode Board portal bootstrap")?;
-    let csrf = bootstrap["csrf_token"]
-        .as_str()
-        .context("Board portal bootstrap omitted its CSRF token")?;
     let board_profile = bootstrap["profiles"]
         .as_array()
         .and_then(|profiles| profiles.iter().find(|item| item["id"] == BOARD_SURFACE))
-        .context("Board portal bootstrap omitted the rev4 profile")?;
+        .context("Native setup omitted the rev4 Board profile")?;
     assert_eq!(board_profile["capability_revision"], 4);
     assert_eq!(board_profile["selected_setup_mode"], "no_credential");
     assert_eq!(board_profile["credential_kind"], "none");
 
-    let started_response = http
-        .post(format!("{portal}/api/v1/sessions"))
-        .header(reqwest::header::COOKIE, &cookie)
-        .header(reqwest::header::ORIGIN, portal)
-        .header("x-csrf-token", csrf)
-        .json(&json!({"surface_id": BOARD_SURFACE}))
-        .send()
-        .await
-        .context("run Board no-key doctor")?;
-    assert_eq!(started_response.status(), reqwest::StatusCode::OK);
-    let started: Value = started_response
-        .json()
-        .await
-        .context("decode Board no-key doctor result")?;
+    let started = invoke_installed_board(
+        client,
+        "setup-start",
+        "Source.Onboarding.Apply",
+        json!({
+            "request": {"action": "start", "surfaceId": BOARD_SURFACE},
+            "confirm": true,
+        }),
+    )
+    .await?;
+    assert_eq!(started["outcome"], "completed", "{started}");
+    let started = &started["value"];
     let session_id = started["session_id"]
         .as_str()
-        .context("Board doctor omitted its durable session")?;
+        .context("Native Board setup omitted its durable session")?;
     assert_eq!(started["surface_id"], BOARD_SURFACE);
     assert_eq!(started["capability_revision"], 4);
     assert_eq!(started["credential_stored"], false);
@@ -1590,22 +1557,25 @@ async fn exercise_installed_board_vertical(
     assert!(started["candidate_generation"].is_null());
     assert_eq!(started["generations"], json!([]));
     assert_eq!(started["public_configuration"], json!({}));
-    assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 0, 0);
+    assert_installed_board_transport_counts(fixture.transport_counters(), 0, 0, 0, 0);
 
-    let activated_response = http
-        .post(format!("{portal}/api/v1/sessions/{session_id}/activate"))
-        .header(reqwest::header::COOKIE, &cookie)
-        .header(reqwest::header::ORIGIN, portal)
-        .header("x-csrf-token", csrf)
-        .json(&json!({"kind": "federal_reserve_board_h15"}))
-        .send()
-        .await
-        .context("activate Board production source")?;
-    assert_eq!(activated_response.status(), reqwest::StatusCode::OK);
-    let activated: Value = activated_response
-        .json()
-        .await
-        .context("decode Board production activation")?;
+    let activated = invoke_installed_board(
+        client,
+        "setup-activate",
+        "Source.Onboarding.Apply",
+        json!({
+            "request": {
+                "action": "activate",
+                "sessionId": session_id,
+                "request": {"kind": "federal_reserve_board_h15"},
+            },
+            "confirm": true,
+        }),
+    )
+    .await?;
+    assert_eq!(activated["outcome"], "completed", "{activated}");
+    let activated = &activated["value"];
+    assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 0, 0);
     assert_eq!(activated["profile"], BOARD_SURFACE);
     assert_eq!(
         activated["provider_dataset_identifier"],
@@ -1959,7 +1929,7 @@ async fn installed_macro_context(
     request_suffix: &str,
     mut arguments: Value,
 ) -> TestResult<Value> {
-    arguments["resultLimits"] = json!({"maximumItems": 12, "maximumBytes": 1_048_576});
+    arguments["resultLimits"] = json!({"maximumItems": 13, "maximumBytes": 1_048_576});
     invoke_installed_board(
         client,
         &format!("economic-context-{request_suffix}"),
@@ -2023,19 +1993,24 @@ fn assert_installed_cli_rejects_unpaired_macro_cutoff(
 fn assert_installed_macro_context(context: &Value) -> TestResult {
     assert_eq!(context["availability"], "partial");
     assert_eq!(context["selection"]["complete"], false);
-    assert_eq!(context["coverage"]["requested"], 12);
+    assert_eq!(context["coverage"]["requested"], 13);
     assert_eq!(context["coverage"]["observed"], 10);
     assert_eq!(context["coverage"]["missing"], 1);
-    assert_eq!(context["coverage"]["unavailable"], 1);
+    assert_eq!(context["coverage"]["unavailable"], 2);
     let observations = context["observations"]
         .as_array()
         .context("economic context omitted its observations")?;
-    assert_eq!(observations.len(), 12);
+    assert_eq!(observations.len(), 13);
     assert_eq!(observations[0]["indicatorId"], "us-government-yield-1m");
     assert_eq!(observations[9]["indicatorId"], "us-government-yield-20y");
     assert_eq!(observations[9]["availability"], "missing");
     assert_eq!(observations[11]["indicatorId"], "us-unemployment-rate");
     assert_eq!(observations[11]["availability"], "unavailable");
+    assert_eq!(
+        observations[12]["indicatorId"],
+        "us-residential-electricity-price"
+    );
+    assert_eq!(observations[12]["availability"], "unavailable");
     assert_ordinary_investment_language(context, "economic context")?;
     Ok(())
 }
@@ -2078,7 +2053,7 @@ fn assert_installed_macro_context_matches_dashboard(
         .as_array()
         .context("manifest-bound rate dashboard omitted its observations")?;
     assert_eq!(dashboard_observations.len(), 11);
-    assert_eq!(context_observations.len(), 12);
+    assert_eq!(context_observations.len(), 13);
     for (dashboard_observation, context_observation) in dashboard_observations
         .iter()
         .zip(context_observations.iter())
@@ -3089,7 +3064,7 @@ async fn exercise_installed_relay_with_gate(
     );
     if let Some(expected) = macro_context {
         let mut arguments = expected.arguments.clone();
-        arguments["resultLimits"] = json!({"maximumItems": 12, "maximumBytes": 1_048_576});
+        arguments["resultLimits"] = json!({"maximumItems": 13, "maximumBytes": 1_048_576});
         write_message(
             &mut peer_writer,
             json!({
@@ -3222,7 +3197,6 @@ async fn exercise_installed_relay_with_gate(
     Ok(())
 }
 
-#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 async fn assert_installed_macro_context_resource<W, R>(
     writer: &mut W,
     reader: &mut BufReader<R>,

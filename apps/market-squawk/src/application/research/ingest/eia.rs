@@ -17,16 +17,18 @@ use std::{
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_eia::{
     EIA_MAX_CANONICAL_PUBLICATION_OBSERVATIONS, EiaActivatedProvider, EiaDataPageTransition,
-    EiaDataTransportReceipt, EiaError, EiaLifecycleError, EiaNativePublishedSeriesPrecision,
-    EiaPublicationCandidate, decode_eia_native_published_series_coordinate,
-    eia_data_dataset_identifier,
+    EiaDataTransportReceipt, EiaDatasetProfile, EiaError, EiaLifecycleError,
+    EiaNativePublishedSeriesPrecision, EiaPublicationCandidate, EiaPublicationMode,
+    EiaSourceTransport, decode_eia_native_published_series_coordinate, eia_data_dataset_identifier,
+    run_eia_doctor,
 };
 use market_squawk_data::{
     AnalyticalMacroLatestKnownOutput, AnalyticalMacroLatestKnownRequest,
     AnalyticalMacroProviderPeriodLatestKnownOutput,
     AnalyticalMacroProviderPeriodLatestKnownRequest, AnalyticalMacroSeriesAllowlist,
     AnalyticalMacroSourceQualifiedSeries, AnalyticalReadError, CommittedDataset, DatasetId,
-    DatasetManifestRef, PersistedProviderCaptureBindingEvidence, QueryLimits,
+    DatasetManifestRef, IngestPrecommitAuthority, PersistedProviderCaptureBindingEvidence,
+    QueryLimits,
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
@@ -105,12 +107,13 @@ impl EiaApplicationAcquisitionLimits {
 /// EIA source, rights, raw-store, and immutable research composition.
 pub(crate) struct EiaMacroApplicationClosure {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
-    provider: Arc<EiaActivatedProvider>,
+    provider: Arc<EiaSourceTransport>,
+    profile: EiaDatasetProfile,
     provider_dataset: SourceIdentifier,
     generation: ResearchProviderRuntimeGeneration,
 }
 
-/// Same-instance activated EIA registration and typed publication composition.
+/// Same-instance configured EIA registration and typed publication composition.
 pub(crate) struct EiaLiveComposition {
     registered_source: EiaRegisteredSource,
     closure: EiaMacroApplicationClosure,
@@ -119,10 +122,12 @@ pub(crate) struct EiaLiveComposition {
 impl EiaLiveComposition {
     pub(crate) fn try_new(
         coordinator: Arc<ProductionResearchIngestCoordinator>,
-        provider: EiaActivatedProvider,
+        provider: EiaSourceTransport,
+        profile: EiaDatasetProfile,
         generation: ResearchProviderRuntimeGeneration,
     ) -> Result<Self, EiaMacroApplicationError> {
-        if provider.source_metadata() != generation.metadata()
+        if provider.metadata() != generation.metadata()
+            || profile.publication_mode() != EiaPublicationMode::CanonicalMacro
             || !generation
                 .metadata()
                 .is_effective_at(generation.authority_effective_at())
@@ -130,7 +135,7 @@ impl EiaLiveComposition {
             return Err(EiaMacroApplicationError::AuthorityInvalid);
         }
         let provider_dataset =
-            eia_data_dataset_identifier(provider.contract()).map_err(EiaLifecycleError::from)?;
+            eia_data_dataset_identifier(profile.query()).map_err(EiaLifecycleError::from)?;
         let provider = Arc::new(provider);
         Ok(Self {
             registered_source: EiaRegisteredSource {
@@ -140,6 +145,7 @@ impl EiaLiveComposition {
             closure: EiaMacroApplicationClosure {
                 coordinator,
                 provider,
+                profile,
                 provider_dataset,
                 generation,
             },
@@ -153,13 +159,13 @@ impl EiaLiveComposition {
 
 /// Registry-facing activation wrapper. Typed EIA pagination remains in the paired closure.
 pub(crate) struct EiaRegisteredSource {
-    provider: Arc<EiaActivatedProvider>,
+    provider: Arc<EiaSourceTransport>,
     provider_dataset: SourceIdentifier,
 }
 
 impl SourceMetadataProvider for EiaRegisteredSource {
     fn metadata(&self) -> &SourceMetadata {
-        self.provider.source_metadata()
+        self.provider.metadata()
     }
 }
 
@@ -197,8 +203,10 @@ impl ManagedResearchExtractionSource for EiaRegisteredSource {
         }
         Ok(Some(
             self.provider
-                .doctor_report()
-                .authorization_subject()
+                .metadata()
+                .authorization()
+                .basis()
+                .as_source_identifier()
                 .clone(),
         ))
     }
@@ -207,7 +215,7 @@ impl ManagedResearchExtractionSource for EiaRegisteredSource {
         &self,
         batch: &ExtractionBatch,
     ) -> Result<Option<ExtractionRevisionPlan>, ResearchRevisionPlanError> {
-        if batch.request().object().source_id() != self.provider.source_metadata().source_id()
+        if batch.request().object().source_id() != self.provider.metadata().source_id()
             || batch.request().object().dataset() != &self.provider_dataset
         {
             return Err(ResearchRevisionPlanError);
@@ -230,28 +238,63 @@ impl std::fmt::Debug for EiaMacroApplicationClosure {
 }
 
 impl EiaMacroApplicationClosure {
-    /// Acquires every exact page, seals it before continuation, and publishes one generation.
+    /// Doctors the registered source, seals its evidence, and publishes one complete generation.
     ///
     /// The coordinator mints the current registry extraction authority for the paired activation.
     /// EIA's transport consumes that authority for its shared provider-rate permits before every
     /// authenticated send. A partial acquisition can leave only sealed raw pages; it can never
     /// publish a partial canonical generation.
-    pub(crate) async fn acquire_seal_publish(
+    pub(crate) async fn acquire_seal_publish<F>(
         &self,
         analytical_dataset: DatasetId,
         limits: EiaApplicationAcquisitionLimits,
         context: &RequestContext,
-    ) -> Result<EiaMacroPublicationReceipt, EiaMacroApplicationError> {
+        acquire_publication_authority: F,
+    ) -> Result<EiaMacroPublicationReceipt, EiaMacroApplicationError>
+    where
+        F: FnOnce(
+            Instant,
+            CancellationToken,
+        )
+            -> Result<Option<Arc<dyn IngestPrecommitAuthority>>, EiaMacroApplicationError>,
+    {
         let operation = self
             .coordinator
             .acquire_provider_macro_operation(&self.generation, &self.provider_dataset, context)
             .await?;
-        let provider = self.provider.as_ref();
-        self.validate_current(provider, &operation)?;
+        self.validate_current(&operation)?;
         let authority = operation.extraction();
         let provider_deadline = operation.provider_deadline()?;
         let cancellation = operation.cancellation().clone();
         let operation_deadline = operation.operation_deadline();
+
+        // Doctor requests use the same registered generation, shared provider budget, and
+        // revocation/deadline owner as acquisition. No second source registry is needed to
+        // bootstrap an activated provider, and no configured source is advertised as producing.
+        let doctor = run_eia_doctor(
+            Arc::clone(&self.provider),
+            &authority,
+            self.profile.clone(),
+            provider_deadline,
+            cancellation.clone(),
+        )
+        .await?;
+        let (pending_activation, seal_requests) = doctor.into_sealing_parts()?;
+        let mut sealed_doctor = Vec::new();
+        sealed_doctor
+            .try_reserve_exact(seal_requests.len())
+            .map_err(|_| EiaMacroApplicationError::InvalidCandidate)?;
+        for request in seal_requests {
+            sealed_doctor.push(
+                self.coordinator
+                    .research
+                    .seal_provider_capture(request, &CancellationToken::new(), operation_deadline)
+                    .await?,
+            );
+        }
+        self.validate_current(&operation)?;
+        let activated = EiaActivatedProvider::try_activate(pending_activation, sealed_doctor)?;
+        let provider = &activated;
 
         let max_publication_bytes = usize::try_from(limits.max_bytes())
             .map_err(|_| EiaMacroApplicationError::InvalidLimits)?;
@@ -373,6 +416,7 @@ impl EiaMacroApplicationClosure {
             analytical_dataset,
             limits,
             &operation,
+            acquire_publication_authority,
         )
         .await
     }
@@ -381,7 +425,7 @@ impl EiaMacroApplicationClosure {
         clippy::too_many_arguments,
         reason = "capture-bound candidate, transport evidence, immutable target, bounds, and commit authority remain explicit"
     )]
-    async fn publish_candidate(
+    async fn publish_candidate<F>(
         &self,
         provider: &EiaActivatedProvider,
         candidate: EiaPublicationCandidate,
@@ -389,8 +433,19 @@ impl EiaMacroApplicationClosure {
         analytical_dataset: DatasetId,
         limits: EiaApplicationAcquisitionLimits,
         operation: &ProviderMacroOperationAuthority,
-    ) -> Result<EiaMacroPublicationReceipt, EiaMacroApplicationError> {
-        self.validate_current(provider, operation)?;
+        acquire_publication_authority: F,
+    ) -> Result<EiaMacroPublicationReceipt, EiaMacroApplicationError>
+    where
+        F: FnOnce(
+            Instant,
+            CancellationToken,
+        )
+            -> Result<Option<Arc<dyn IngestPrecommitAuthority>>, EiaMacroApplicationError>,
+    {
+        self.validate_current(operation)?;
+        if provider.source_metadata() != self.provider.metadata() {
+            return Err(EiaMacroApplicationError::AuthorityInvalid);
+        }
         candidate.rejoin().validate(self.generation.metadata())?;
         let normalization_admitted_at = candidate.rejoin().normalization_admitted_at();
         if normalization_admitted_at < self.generation.authority_effective_at()
@@ -447,12 +502,27 @@ impl EiaMacroApplicationClosure {
                 .rows()
                 .iter()
                 .map(|row| row.semantic_payload().as_ref()),
+            operation.operation_deadline(),
+            operation.cancellation(),
         )
-        .map_err(|_error| EiaMacroApplicationError::InvalidCandidate)?;
+        .map_err(|error| match error {
+            EiaMacroApplicationError::Cancelled | EiaMacroApplicationError::DeadlineExceeded => {
+                error
+            }
+            _ => EiaMacroApplicationError::InvalidCandidate,
+        })?;
         if native_series_coordinates != series_coordinates {
             return Err(EiaMacroApplicationError::InvalidCandidate);
         }
 
+        // The configured product acquires its existing onboarding mutation guard only after
+        // provider work and normalization. The shared publisher retains this additional guard
+        // alongside its mandatory registry lease through both precommit checks.
+        self.validate_current(operation)?;
+        let additional = acquire_publication_authority(
+            operation.operation_deadline(),
+            operation.cancellation().clone(),
+        )?;
         let publication = operation
             .publish_single_binding(
                 analytical_dataset,
@@ -460,6 +530,7 @@ impl EiaMacroApplicationClosure {
                 revisions,
                 ProviderNativeLineageImplementation::EiaSeriesV1,
                 normalization_admitted_at,
+                additional,
             )
             .await?;
         let (committed, binding) = publication.into_parts();
@@ -474,10 +545,9 @@ impl EiaMacroApplicationClosure {
 
     fn validate_current(
         &self,
-        provider: &EiaActivatedProvider,
         operation: &ProviderMacroOperationAuthority,
     ) -> Result<(), EiaMacroApplicationError> {
-        if provider.source_metadata() != self.generation.metadata()
+        if self.provider.metadata() != self.generation.metadata()
             || operation.generation() != &self.generation
             || !self
                 .generation
@@ -582,20 +652,32 @@ fn published_series_coordinates(
 /// Reconstructs the selectable series/time-precision index from exact persisted native rows.
 fn persisted_series_coordinates(
     evidence: &PersistedProviderCaptureBindingEvidence,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<Box<[EiaPublishedSeriesCoordinate]>, EiaMacroApplicationError> {
     decoded_series_coordinates(
         evidence
             .rows()
             .iter()
             .map(|row| row.native_semantic_payload()),
+        deadline,
+        cancellation,
     )
 }
 
 fn decoded_series_coordinates<'a>(
     payloads: impl IntoIterator<Item = &'a [u8]>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<Box<[EiaPublishedSeriesCoordinate]>, EiaMacroApplicationError> {
     let mut coordinates = BTreeMap::new();
     for payload in payloads {
+        if cancellation.is_cancelled() {
+            return Err(EiaMacroApplicationError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(EiaMacroApplicationError::DeadlineExceeded);
+        }
         let decoded = decode_eia_native_published_series_coordinate(payload)
             .map_err(|_error| EiaMacroApplicationError::RestartInvalid)?;
         let canonical_series = decoded.canonical_series().clone();
@@ -673,30 +755,51 @@ pub(crate) struct EiaMacroRestartSelector {
 }
 
 impl EiaMacroRestartSelector {
-    pub(crate) fn try_reopen(
+    /// Reopens the exact creating generation in the retained ResearchService I/O lane.
+    pub(crate) async fn try_reopen(
         research: &ResearchService,
         manifest: DatasetManifestRef,
         expected_source: &SourceId,
-    ) -> Result<Self, EiaMacroApplicationError> {
-        let binding = ProviderMacroRestartBinding::try_reopen(
-            research,
-            manifest,
-            expected_source,
-            ProviderNativeLineageImplementation::EiaSeriesV1,
-        )?;
-        Self::from_binding(research, binding)
-    }
-
-    fn from_binding(
-        research: &ResearchService,
-        binding: ProviderMacroRestartBinding,
-    ) -> Result<Self, EiaMacroApplicationError> {
-        let evidence = binding.evidence(research)?;
-        let series_coordinates = persisted_series_coordinates(&evidence)?;
-        Ok(Self {
-            binding,
-            series_coordinates,
-        })
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(Self, PersistedProviderCaptureBindingEvidence), EiaMacroApplicationError> {
+        let expected_source = expected_source.clone();
+        research
+            .read_provider_capture_generation(
+                manifest,
+                deadline,
+                cancellation,
+                move |generation, _, _, _, cancellation| {
+                    let (binding, evidence) =
+                        ProviderMacroRestartBinding::from_verified_generation(
+                            &generation,
+                            &expected_source,
+                            ProviderNativeLineageImplementation::EiaSeriesV1,
+                        )
+                        .map_err(|_| ResearchServiceError::IngestAuthorityMismatch)?;
+                    let series_coordinates =
+                        persisted_series_coordinates(evidence, deadline, cancellation).map_err(
+                            |error| match error {
+                                EiaMacroApplicationError::Cancelled => {
+                                    market_squawk_data::IngestError::Cancelled.into()
+                                }
+                                EiaMacroApplicationError::DeadlineExceeded => {
+                                    market_squawk_data::IngestError::DeadlineExceeded.into()
+                                }
+                                _ => ResearchServiceError::IngestAuthorityMismatch,
+                            },
+                        )?;
+                    Ok((
+                        Self {
+                            binding,
+                            series_coordinates,
+                        },
+                        evidence.clone(),
+                    ))
+                },
+            )
+            .await
+            .map_err(map_restart_research_error)
     }
 
     fn from_published_binding(
@@ -727,6 +830,17 @@ impl EiaMacroRestartSelector {
     /// Returns the provider query-bound dataset identity.
     pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
         self.binding.provider_dataset()
+    }
+
+    /// Returns the complete sorted canonical series set available to neutral macro consumers.
+    ///
+    /// Provider route, facet, unit, and request details remain inside the persisted native
+    /// evidence. Callers receive only the canonical identifiers needed to construct a fixed typed
+    /// PIT request.
+    pub(crate) fn published_series(&self) -> impl ExactSizeIterator<Item = &SourceIdentifier> + '_ {
+        self.series_coordinates
+            .iter()
+            .map(|coordinate| &coordinate.canonical_series)
     }
 
     /// Returns whether an exact published series uses provider-supplied calendar dates.
@@ -798,7 +912,9 @@ impl EiaMacroRestartSelector {
         cancellation: CancellationToken,
     ) -> Result<EiaMacroRestartReceipt, EiaMacroApplicationError> {
         self.validate_request(&request)?;
-        let evidence = self.verify_persisted_binding(research)?;
+        let evidence = self
+            .verify_persisted_binding(research, deadline, &cancellation)
+            .await?;
         match request {
             EiaMacroPointInTimeRequest::Calendar(request) => {
                 let output = research
@@ -824,12 +940,21 @@ impl EiaMacroRestartSelector {
         }
     }
 
-    fn verify_persisted_binding(
+    async fn verify_persisted_binding(
         &self,
         research: &ResearchService,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<PersistedProviderCaptureBindingEvidence, EiaMacroApplicationError> {
-        let evidence = self.binding.evidence(research)?;
-        if persisted_series_coordinates(&evidence)? != self.series_coordinates {
+        let (reopened, evidence) = Self::try_reopen(
+            research,
+            self.manifest().clone(),
+            self.source_id(),
+            deadline,
+            cancellation,
+        )
+        .await?;
+        if reopened != *self {
             return Err(EiaMacroApplicationError::RestartInvalid);
         }
         Ok(evidence)
@@ -1042,6 +1167,14 @@ impl EiaMacroRestartReceipt {
         }
     }
 
+    /// Returns the non-forgeable pinned query evidence for this exact selection.
+    pub(crate) const fn output(&self) -> &market_squawk_data::PinnedQueryOutput {
+        match &self.inner {
+            EiaMacroRestartReceiptInner::Calendar { output, .. } => output.output(),
+            EiaMacroRestartReceiptInner::ProviderPeriod { output, .. } => output.output(),
+        }
+    }
+
     /// Returns the exact immutable parent generation used by downstream research work.
     pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
         match &self.inner {
@@ -1067,6 +1200,24 @@ impl EiaMacroRestartReceipt {
             EiaMacroRestartReceiptInner::Calendar { output, .. } => output.selection_digest(),
             EiaMacroRestartReceiptInner::ProviderPeriod { output, .. } => output.selection_digest(),
         }
+    }
+}
+
+fn map_restart_research_error(error: ResearchServiceError) -> EiaMacroApplicationError {
+    use market_squawk_data::IngestError;
+    use market_squawk_platform::{ResearchObjectControlError, SealedResearchJournalStoreError};
+    match error {
+        ResearchServiceError::Ingest(IngestError::Cancelled)
+        | ResearchServiceError::ProviderCaptureStore(
+            SealedResearchJournalStoreError::ObjectControl(ResearchObjectControlError::Cancelled),
+        ) => EiaMacroApplicationError::Cancelled,
+        ResearchServiceError::Ingest(IngestError::DeadlineExceeded)
+        | ResearchServiceError::ProviderCaptureStore(
+            SealedResearchJournalStoreError::ObjectControl(
+                ResearchObjectControlError::DeadlineExceeded,
+            ),
+        ) => EiaMacroApplicationError::DeadlineExceeded,
+        error => EiaMacroApplicationError::Research(error),
     }
 }
 

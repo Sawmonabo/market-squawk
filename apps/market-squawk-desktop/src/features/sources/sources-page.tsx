@@ -9,7 +9,7 @@ import {
   ShieldCheck,
 } from "lucide-react"
 
-import { messageFrom, useSystem } from "@/app/product-context"
+import { messageFrom } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import {
@@ -43,6 +43,7 @@ import {
 } from "./source-evidence"
 import { ProviderCredentialImport } from "./provider-credential-import"
 import { ResearchIngestion } from "./research-ingestion"
+import { ConnectionSetup, type ConnectionActivity } from "./connection-setup"
 
 const unavailableConnectionCapabilities: ProviderBootstrap["capabilities"] = {
   credentialImport: false,
@@ -53,28 +54,7 @@ const unavailableConnectionCapabilities: ProviderBootstrap["capabilities"] = {
   coverage: false,
 }
 
-export function SourcesPage() {
-  const system = useSystem()
-  if (system.status === "loading") return <SourcesLoading />
-  if (system.status !== "ready") {
-    return (
-      <PageFrame>
-        <EmptyState
-          title="Source service is unavailable"
-          detail={system.status === "unavailable" ? system.error : "Finish secure storage setup in Settings, then return to Connections."}
-        />
-      </PageFrame>
-    )
-  }
-  return (
-    <ReadySourcesPage
-      bootstrap={system.bootstrap}
-      transport={system.transport}
-    />
-  )
-}
-
-function ReadySourcesPage({
+export function ConnectionsWorkspace({
   bootstrap,
   transport,
 }: {
@@ -82,15 +62,59 @@ function ReadySourcesPage({
   transport: SystemTransport
 }) {
   const queryClient = useQueryClient()
+  const [tab, setTab] = React.useState<"setup" | "status" | "imports">("setup")
+  const [selectedProvider, setSelectedProvider] = React.useState("")
+  const [activity, setActivity] = React.useState<ConnectionActivity | null>(null)
+  const [visible, setVisible] = React.useState(() => document.visibilityState === "visible")
+  React.useEffect(() => {
+    const update = () => setVisible(document.visibilityState === "visible")
+    document.addEventListener("visibilitychange", update)
+    return () => document.removeEventListener("visibilitychange", update)
+  }, [])
   const connections = useQuery({
     queryKey: [
       ...productKeys.domain(bootstrap.productSessionToken, "source"),
       "connections-bootstrap",
     ],
     queryFn: () => transport.onboard({ action: "bootstrap" }),
+    refetchInterval: false,
   })
+  const selectedSetup = connections.data?.setup.find(
+    (setup) => setup.surfaceId === selectedProvider,
+  )
+  const selectedSession = connections.data?.sessions.find((session) => selectedSetup?.savedConfigurationSessionId
+    ? session.session_id === selectedSetup.savedConfigurationSessionId
+    : session.surface_id === selectedProvider)
+  const selectedSessionId = selectedSession?.session_id ?? null
+  const verificationPending = activity?.providerId === selectedProvider
+    && activity.sessionId === selectedSessionId
+    && activity.kind === "verification"
+  const inspection = useQuery({
+    queryKey: [...productKeys.domain(bootstrap.productSessionToken, "source"), "connection-state", selectedSessionId],
+    enabled: tab === "setup" && visible && selectedSessionId !== null,
+    queryFn: async () => {
+      if (selectedSessionId === null) throw new Error("No saved connection selected.")
+      const result = await transport.onboard({ action: "inspect", sessionId: selectedSessionId })
+      if (result.session.session_id !== selectedSessionId || result.session.surface_id !== selectedProvider) {
+        throw new Error("The saved connection state changed. Refresh before continuing.")
+      }
+      return result
+    },
+    refetchInterval: (query) => tab === "setup" && visible
+      && (verificationPending || query.state.data?.publicationPending === true)
+      ? 5_000 : false,
+    refetchIntervalInBackground: false,
+  })
+  const pendingSelectedWork = tab === "setup" && visible
+    && (verificationPending || inspection.data?.publicationPending === true)
+  React.useEffect(() => {
+    if (tab === "setup" && visible && selectedSessionId !== null && activity?.sessionId === selectedSessionId) {
+      void inspection.refetch()
+    }
+  }, [activity, selectedSessionId, tab, visible, inspection.refetch])
   const profiles = connections.data?.profiles ?? []
-  const sessions = connections.data?.sessions ?? []
+  const sessions = (connections.data?.sessions ?? []).map((session) => inspection.data?.session.session_id === session.session_id
+    ? inspection.data.session : session)
   const capabilities =
     connections.data?.capabilities ?? unavailableConnectionCapabilities
   const statusReads = useQueries({
@@ -102,6 +126,8 @@ function ReadySourcesPage({
             "Source.GetStatus",
             { sourceIds: [profile.id] },
           ),
+          refetchInterval: pendingSelectedWork && selectedProvider === profile.id ? 5_000 : false,
+          refetchIntervalInBackground: false,
           queryFn: async () =>
             parseSourceStatusResult(
               await transport.systemQuery({
@@ -162,6 +188,10 @@ function ReadySourcesPage({
     : []
   const manifestReads = useQueries({
     queries: providerDatasets.map((dataset) => ({
+      refetchInterval: pendingSelectedWork && sourceRows.some((source) =>
+        source.id === selectedProvider && source.providerDatasetIdentifier === dataset,
+      ) ? 5_000 : false,
+      refetchIntervalInBackground: false,
       queryKey: productKeys.operation(
         bootstrap.productSessionToken,
         "research",
@@ -175,6 +205,20 @@ function ReadySourcesPage({
         ),
     })),
   })
+  const previousPublication = React.useRef<{ sessionId: string; pending: boolean } | null>(null)
+  React.useEffect(() => {
+    if (tab !== "setup" || !visible || !inspection.data || selectedSessionId === null) return
+    const previous = previousPublication.current
+    const pending = inspection.data.publicationPending
+    previousPublication.current = { sessionId: selectedSessionId, pending }
+    if (previous?.sessionId !== selectedSessionId || !previous.pending || pending) return
+    const selectedStatus = statusReads[profiles.findIndex((profile) => profile.id === selectedProvider)]
+    if (selectedStatus) void selectedStatus.refetch()
+    const dataset = sourceRows.find((source) => source.id === selectedProvider)?.providerDatasetIdentifier
+    const selectedManifest = dataset ? manifestReads[providerDatasets.indexOf(dataset)] : undefined
+    if (selectedManifest) void selectedManifest.refetch()
+  }, [inspection.data, selectedSessionId, selectedProvider, tab, visible, statusReads,
+    profiles, sourceRows, manifestReads, providerDatasets])
   const sources = attachStoredData(
     sourceRows,
     manifestReads.flatMap((query) =>
@@ -239,17 +283,17 @@ function ReadySourcesPage({
   if (connections.isPending) return <SourcesLoading />
   if (connections.isError) {
     return (
-      <PageFrame>
+      <ConnectionsFrame>
         <EmptyState
           title="Connections could not be opened"
           detail={messageFrom(connections.error)}
         />
-      </PageFrame>
+      </ConnectionsFrame>
     )
   }
 
   return (
-    <PageFrame
+    <ConnectionsFrame
       action={
         <Button variant="outline" size="sm" onClick={refresh} disabled={refreshing}>
           <RefreshCw className={refreshing ? "animate-spin" : ""} aria-hidden="true" />
@@ -257,6 +301,28 @@ function ReadySourcesPage({
         </Button>
       }
     >
+      <div className="mb-5 flex flex-wrap gap-2" role="group" aria-label="Connections views">
+        {([["setup", "Set up connections"], ["status", "Connection status"], ["imports", "Data imports"]] as const).map(([id, label]) => (
+          <Button key={id} aria-pressed={tab === id} aria-controls={`connections-${id}`} variant={tab === id ? "default" : "outline"} onClick={() => setTab(id)}>{label}</Button>
+        ))}
+      </div>
+      {tab === "setup" ? <div id="connections-setup">
+        <ConnectionSetup
+          connections={{ ...connections.data, sessions }}
+          sources={sources}
+          selectedProvider={selectedProvider}
+          onSelect={setSelectedProvider}
+          transport={transport}
+          onActivity={setActivity}
+          publicationPending={inspection.data?.publicationPending === true}
+          onChanged={async () => {
+            await refreshLifecycleAuthorities()
+            await connections.refetch()
+            if (selectedSessionId !== null) await inspection.refetch()
+            await Promise.all(statusReads.map((query) => query.refetch()))
+            await Promise.all(manifestReads.map((query) => query.refetch()))
+          }}
+        />
       <ProviderCredentialImport
         available={credentialImportAvailable}
         transport={transport}
@@ -265,8 +331,11 @@ function ReadySourcesPage({
           refresh()
         }}
       />
+      </div> : null}
+      {tab === "imports" ? <div id="connections-imports">
       <ResearchIngestion
         bootstrap={bootstrap}
+        onSetup={() => setTab("setup")}
         connectedSourceIngestionAvailable={
           capabilities.researchIngestion
         }
@@ -282,6 +351,8 @@ function ReadySourcesPage({
           ])
         }}
       />
+      </div> : null}
+      {tab === "status" ? <div id="connections-status">
       {sources.length === 0 && totalReads > 0 && failedReads === totalReads ? (
         <EmptyState
           title="Source evidence could not be read"
@@ -323,12 +394,14 @@ function ReadySourcesPage({
                 source={source}
                 transport={transport}
                 onChanged={refreshLifecycleAuthorities}
+                onManage={() => { setSelectedProvider(source.id); setTab("setup") }}
               />
             ))}
           </div>
         </>
       )}
-    </PageFrame>
+      </div> : null}
+    </ConnectionsFrame>
   )
 }
 
@@ -347,10 +420,12 @@ function SourceCard({
   source,
   transport,
   onChanged,
+  onManage,
 }: {
   source: SourceEvidence
   transport: SystemTransport
   onChanged: () => Promise<void>
+  onManage: () => void
 }) {
   const [pending, setPending] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
@@ -391,12 +466,8 @@ function SourceCard({
     })
   }
 
-  const openSetup = async (action: "protected_setup" | "official_page") => {
-    await runAndRefresh(action, () =>
-      action === "protected_setup"
-        ? transport.openProtectedProviderSetup(source.id)
-        : transport.openOfficialProviderPage(source.id),
-    )
+  const openOfficial = async () => {
+    await runAndRefresh("official_page", () => transport.openOfficialProviderPage(source.id))
   }
 
   return (
@@ -534,15 +605,15 @@ function SourceCard({
         <Button
           size="sm"
           disabled={pending !== null}
-          onClick={() => void openSetup("protected_setup")}
+          onClick={onManage}
         >
-          {pending === "protected_setup" ? "Opening…" : "Manage setup"}
+          Manage setup
         </Button>
         <Button
           size="sm"
           variant="outline"
           disabled={pending !== null}
-          onClick={() => void openSetup("official_page")}
+          onClick={() => void openOfficial()}
         >
           {pending === "official_page" ? "Opening…" : "Open official page"}
         </Button>
@@ -758,7 +829,7 @@ function operationalDetail(source: SourceEvidence): string {
     return `Callable source blocked: ${humanize(source.lifecycle.blocker)}.`
   }
   if (source.lifecycleSupport === "not_applicable") {
-    return "This surface is managed by its product domain rather than source lifecycle controls."
+    return "Start and stop controls are not available for this connection."
   }
   if (!source.lifecycle) {
     return "Lifecycle evidence could not be verified."
@@ -835,15 +906,26 @@ function Summary({ label, value, icon: Icon }: { label: string; value: number; i
   )
 }
 
-function PageFrame({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) {
+function ConnectionsFrame({
+  children,
+  action,
+}: {
+  children: React.ReactNode
+  action?: React.ReactNode
+}) {
   return (
-    <div className="mx-auto w-full max-w-[1180px] p-5 lg:p-7">
+    <section aria-labelledby="onboarding-connections-heading">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            Market Squawk · Provider evidence
+            Onboarding
           </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Sources</h1>
+          <h2
+            id="onboarding-connections-heading"
+            className="mt-2 text-2xl font-semibold tracking-tight"
+          >
+            Connections
+          </h2>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
             Setup, runtime connection, coverage, freshness, integrity, and data quality remain
             separate so a configured source is never mistaken for a healthy market feed.
@@ -852,7 +934,7 @@ function PageFrame({ children, action }: { children: React.ReactNode; action?: R
         {action}
       </div>
       <div className="mt-6">{children}</div>
-    </div>
+    </section>
   )
 }
 
@@ -868,9 +950,9 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
 
 function SourcesLoading() {
   return (
-    <PageFrame>
+    <ConnectionsFrame>
       <SourceGridLoading />
-    </PageFrame>
+    </ConnectionsFrame>
   )
 }
 

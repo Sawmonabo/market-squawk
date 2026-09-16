@@ -547,6 +547,8 @@ pub enum ProviderAdapterActivationRequest {
     Sec(SecAdapterActivation),
     /// BLS public-v1 or registered-v2 research extraction.
     Bls(BlsAdapterActivation),
+    /// Protected route acquisition and durable canonical macro publication.
+    Eia(super::EiaAdapterActivation),
     /// Treasury Fiscal Data or daily-rate XML extraction.
     Treasury(TreasuryAdapterActivation),
     /// FRED/ALFRED extraction under the shared source authority.
@@ -570,6 +572,7 @@ impl ProviderAdapterActivationRequest {
     pub(crate) fn provider_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         match self {
             Self::Bls(specification) => specification.provider_dataset_identifier(),
+            Self::Eia(specification) => Some(specification.provider_dataset_identifier()),
             Self::Board(specification) => Some(specification.provider_dataset_identifier()),
             Self::Fred(specification) => Some(specification.provider_dataset_identifier()),
             Self::Live(_)

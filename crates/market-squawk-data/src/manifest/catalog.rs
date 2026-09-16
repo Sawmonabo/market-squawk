@@ -178,6 +178,7 @@ pub(crate) struct CatalogGenerationPage {
 #[derive(Debug)]
 pub(crate) struct CatalogGenerationOwnedProviderCaptures {
     pub(crate) pinned: PinnedDataset,
+    pub(crate) published_at: Timestamp,
     pub(crate) source_id: SourceId,
     pub(crate) suffix_start: usize,
     pub(crate) inputs: Vec<CatalogGenerationOwnedProviderCaptureInput>,
@@ -600,196 +601,96 @@ impl AnalyticalManifestCatalog {
         manifest: &DatasetManifestRef,
     ) -> Result<CatalogGenerationOwnedProviderCaptures, ManifestCatalogError> {
         let connection = self.lock()?;
-        let pinned = load_pinned(&connection, manifest, self.max_objects_per_generation)?;
-        if pinned.generation_kind() != GenerationKind::Ingest {
-            return Err(ManifestCatalogError::GenerationConflict);
-        }
-        let (generation_sequence, run_id, source_id): (i64, String, String) = connection
-            .query_row(
-                "SELECT generation.generation_sequence, source_input.run_id,
-                        source_input.source_id
-                 FROM analytical_generations AS generation
-                 JOIN analytical_generation_source_inputs AS source_input
-                   ON source_input.generation_sequence=generation.generation_sequence
-                 WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
-                   AND generation.schema_name=?3 AND generation.schema_version=?4
-                   AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
-                   AND generation.generation_kind='ingest'",
-                params![
-                    manifest.dataset_id().as_str(),
-                    to_i64(manifest.manifest_version())?,
-                    manifest.schema().name(),
-                    i64::from(manifest.schema().version().get()),
-                    manifest.schema().fingerprint().as_slice(),
-                    manifest.content_hash().bytes(),
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        load_generation_owned_provider_captures(
+            &connection,
+            manifest,
+            self.max_objects_per_generation,
+        )
+    }
+
+    pub(crate) fn generation_owned_provider_captures_bounded(
+        &self,
+        manifest: &DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogGenerationOwnedProviderCaptures, ManifestCatalogError> {
+        self.read_bounded(deadline, cancellation, |connection| {
+            load_generation_owned_provider_captures(
+                connection,
+                manifest,
+                self.max_objects_per_generation,
             )
-            .optional()?
-            .ok_or(ManifestCatalogError::GenerationConflict)?;
-        if generation_sequence <= 0 {
-            return Err(ManifestCatalogError::CorruptCatalog);
+        })
+    }
+
+    /// Lists direct creating generations, never inherited capture membership.
+    pub(crate) fn provider_capture_origin_candidates(
+        &self,
+        dataset_id: &DatasetId,
+        knowledge_cutoff: Timestamp,
+        before_version: Option<u64>,
+        limit: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<DatasetManifestRef>, bool), ManifestCatalogError> {
+        if !(1..=64).contains(&limit) {
+            return Err(ManifestCatalogError::CatalogAuthority(
+                CatalogError::InvalidLimit,
+            ));
         }
-        let run_id = Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-        let source_id = SourceId::try_from(source_id.as_str())
-            .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-        let artifact_count: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM artifacts WHERE run_id=?1",
-            [run_id.to_string()],
-            |row| row.get(0),
-        )?;
-        let artifact_count = usize::try_from(artifact_count)
-            .ok()
-            .filter(|count| (1..=1024).contains(count))
-            .ok_or(ManifestCatalogError::CorruptCatalog)?;
-        let suffix_start = pinned
-            .objects()
-            .len()
-            .checked_sub(artifact_count)
-            .ok_or(ManifestCatalogError::CorruptCatalog)?;
-        let mut artifact_statement = connection.prepare(
-            "SELECT output.publication_ordinal, output.artifact_id,
-                    output.content_algorithm, output.content_digest, output.size_bytes,
-                    object.ordinal, object.content_hash, object.row_count, object.size_bytes
-             FROM artifacts AS output
-             JOIN analytical_generation_objects AS object
-               ON object.dataset_id=?1 AND object.manifest_version=?2
-              AND object.artifact_id=output.artifact_id
-             WHERE output.run_id=?3
-             ORDER BY output.publication_ordinal LIMIT 1025",
-        )?;
-        let mut artifact_rows = artifact_statement.query(params![
-            manifest.dataset_id().as_str(),
-            to_i64(manifest.manifest_version())?,
-            run_id.to_string(),
-        ])?;
-        let mut output_ordinal = 0_usize;
-        while let Some(row) = artifact_rows.next()? {
-            if output_ordinal == artifact_count {
-                return Err(ManifestCatalogError::CorruptCatalog);
+        let schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
+        let before_version = before_version.map(to_i64).transpose()?;
+        self.read_bounded(deadline, cancellation, |connection| {
+            let mut statement = connection.prepare(
+                "SELECT generation.dataset_id, generation.manifest_version,
+                        generation.schema_name, generation.schema_version,
+                        generation.schema_fingerprint, generation.content_hash
+                 FROM analytical_generations AS generation
+                 WHERE generation.dataset_id=?1 AND generation.created_at_ns<=?2
+                   AND (?3 IS NULL OR generation.manifest_version<?3)
+                   AND generation.generation_kind='ingest'
+                   AND generation.schema_name=?4 AND generation.schema_version=?5
+                   AND generation.schema_fingerprint=?6
+                   AND EXISTS (
+                     SELECT 1 FROM analytical_generation_source_inputs AS source_input
+                     JOIN dataset_manifests AS anchor
+                       ON anchor.manifest_id=generation.anchor_manifest_id
+                      AND anchor.run_id=source_input.run_id
+                     JOIN analytical_generation_provider_capture_bindings AS binding
+                       ON binding.generation_sequence=source_input.generation_sequence
+                      AND binding.run_id=source_input.run_id
+                      AND binding.source_id=source_input.source_id
+                     JOIN ingest_run_provider_capture_bindings AS run_input
+                       ON run_input.run_id=binding.run_id
+                      AND run_input.binding_digest=binding.binding_digest
+                      AND run_input.source_id=binding.source_id
+                     WHERE source_input.generation_sequence=generation.generation_sequence
+                   )
+                 ORDER BY generation.manifest_version DESC LIMIT ?7",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    dataset_id.as_str(),
+                    knowledge_cutoff.unix_nanos(),
+                    before_version,
+                    schema.name(),
+                    i64::from(schema.version().get()),
+                    schema.fingerprint().as_slice(),
+                    i64::try_from(limit + 1).map_err(|_| ManifestCatalogError::CountOverflow)?
+                ],
+                manifest_reference_from_row,
+            )?;
+            let mut references = Vec::new();
+            references
+                .try_reserve_exact(limit + 1)
+                .map_err(|_| ManifestCatalogError::CountOverflow)?;
+            for row in rows {
+                check_read_operation(deadline, cancellation)?;
+                references.push(row??);
             }
-            let retained_output_ordinal: i64 = row.get(0)?;
-            let artifact_id: String = row.get(1)?;
-            let content_algorithm: i64 = row.get(2)?;
-            let artifact_digest: Vec<u8> = row.get(3)?;
-            let artifact_size: i64 = row.get(4)?;
-            let generation_ordinal: i64 = row.get(5)?;
-            let object_digest: Vec<u8> = row.get(6)?;
-            let object_rows: i64 = row.get(7)?;
-            let object_size: i64 = row.get(8)?;
-            let exact_generation_ordinal = suffix_start
-                .checked_add(output_ordinal)
-                .ok_or(ManifestCatalogError::CountOverflow)?;
-            let pinned_object = pinned
-                .objects()
-                .get(exact_generation_ordinal)
-                .ok_or(ManifestCatalogError::CorruptCatalog)?;
-            if retained_output_ordinal
-                != i64::try_from(output_ordinal).map_err(|_| ManifestCatalogError::CountOverflow)?
-                || generation_ordinal
-                    != i64::try_from(exact_generation_ordinal)
-                        .map_err(|_| ManifestCatalogError::CountOverflow)?
-                || Uuid::parse_str(&artifact_id)
-                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?
-                    != pinned_object.artifact_id()
-                || content_algorithm != 1
-                || parse_digest(&artifact_digest)? != pinned_object.object().content_hash()
-                || parse_digest(&object_digest)? != pinned_object.object().content_hash()
-                || u64::try_from(artifact_size).ok() != Some(pinned_object.object().size_bytes())
-                || u64::try_from(object_size).ok() != Some(pinned_object.object().size_bytes())
-                || u64::try_from(object_rows).ok() != Some(pinned_object.object().row_count())
-            {
-                return Err(ManifestCatalogError::CorruptCatalog);
-            }
-            output_ordinal += 1;
-        }
-        if output_ordinal != artifact_count {
-            return Err(ManifestCatalogError::CorruptCatalog);
-        }
-        let retained = ordered_provider_macro_plan_inputs(&connection, run_id)?;
-        if retained.is_empty() {
-            return Err(ManifestCatalogError::GenerationConflict);
-        }
-        let admitted_inputs: i64 = connection.query_row(
-            "SELECT COUNT(*)
-             FROM ingest_run_provider_capture_bindings AS run_input
-             JOIN analytical_generation_provider_capture_bindings AS generation_input
-               ON generation_input.generation_sequence=?1
-              AND generation_input.run_id=run_input.run_id
-              AND generation_input.binding_digest=run_input.binding_digest
-              AND generation_input.source_id=run_input.source_id
-             WHERE run_input.run_id=?2 AND run_input.source_id=?3",
-            params![generation_sequence, run_id.to_string(), source_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if usize::try_from(admitted_inputs).ok() != Some(retained.len()) {
-            return Err(ManifestCatalogError::CorruptCatalog);
-        }
-        let mut prior_coordinate = None;
-        let mut aggregate_rows = 0_u64;
-        for input in &retained {
-            if input.source_id != source_id.as_str()
-                || !input.coordinate_follows(prior_coordinate)
-                || input.output_artifact_ordinal >= artifact_count
-            {
-                return Err(ManifestCatalogError::CorruptCatalog);
-            }
-            aggregate_rows = aggregate_rows
-                .checked_add(
-                    u64::try_from(input.record_count)
-                        .map_err(|_| ManifestCatalogError::CountOverflow)?,
-                )
-                .ok_or(ManifestCatalogError::CountOverflow)?;
-            prior_coordinate = Some((input.output_artifact_ordinal, input.object_input_ordinal));
-        }
-        let mut expected_aggregate_rows = 0_u64;
-        for output_ordinal in 0..artifact_count {
-            let mapped_rows = retained
-                .iter()
-                .filter(|input| input.output_artifact_ordinal == output_ordinal)
-                .try_fold(0_u64, |total, input| {
-                    total
-                        .checked_add(
-                            u64::try_from(input.record_count)
-                                .map_err(|_| ManifestCatalogError::CountOverflow)?,
-                        )
-                        .ok_or(ManifestCatalogError::CountOverflow)
-                })?;
-            let object_rows = pinned.objects()[suffix_start + output_ordinal]
-                .object()
-                .row_count();
-            if mapped_rows == 0 || mapped_rows != object_rows {
-                return Err(ManifestCatalogError::CorruptCatalog);
-            }
-            expected_aggregate_rows = expected_aggregate_rows
-                .checked_add(object_rows)
-                .ok_or(ManifestCatalogError::CountOverflow)?;
-        }
-        if aggregate_rows != expected_aggregate_rows {
-            return Err(ManifestCatalogError::CorruptCatalog);
-        }
-        let mut inputs = Vec::new();
-        inputs
-            .try_reserve_exact(retained.len())
-            .map_err(|_| ManifestCatalogError::CountOverflow)?;
-        inputs.extend(
-            retained
-                .iter()
-                .map(StoredProviderMacroPlanInput::catalog_input),
-        );
-        let receipt_digest = generation_owned_provider_capture_receipt_digest(
-            &pinned,
-            run_id,
-            &source_id,
-            suffix_start,
-            &inputs,
-        )?;
-        Ok(CatalogGenerationOwnedProviderCaptures {
-            pinned,
-            source_id,
-            suffix_start,
-            inputs,
-            receipt_digest,
+            let has_more = references.len() > limit;
+            references.truncate(limit);
+            Ok((references, has_more))
         })
     }
 
@@ -2358,17 +2259,29 @@ impl AnalyticalManifestCatalog {
             .validate_identity()
             .map_err(ManifestCatalogError::from)?;
         check_read_operation(deadline, cancellation)?;
-        let token = cancellation.clone();
-        connection
-            .progress_handler(
-                SQLITE_PROGRESS_OPERATIONS,
-                Some(move || token.is_cancelled() || Instant::now() >= deadline),
-            )
+        // A SQLite busy timeout does not execute progress callbacks. Read scopes must fail
+        // promptly on contention, then restore the connection's configured waiting policy.
+        let busy_millis: u32 = connection
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
             .map_err(ManifestCatalogError::from)?;
-        let result = operation(&connection);
-        let cleanup = connection.progress_handler::<fn() -> bool>(0, None);
+        connection
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(ManifestCatalogError::from)?;
+        let token = cancellation.clone();
+        let install = connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        );
+        let result = install
+            .map_err(ManifestCatalogError::from)
+            .map_err(E::from)
+            .and_then(|()| operation(&connection));
+        let progress_cleanup = connection.progress_handler::<fn() -> bool>(0, None);
+        let busy_cleanup =
+            connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy_millis)));
         check_read_operation(deadline, cancellation)?;
-        cleanup.map_err(ManifestCatalogError::from)?;
+        progress_cleanup.map_err(ManifestCatalogError::from)?;
+        busy_cleanup.map_err(ManifestCatalogError::from)?;
         result
     }
 
@@ -2378,6 +2291,205 @@ impl AnalyticalManifestCatalog {
             .lock()
             .map_err(|_| ManifestCatalogError::LockPoisoned)
     }
+}
+
+fn load_generation_owned_provider_captures(
+    connection: &Connection,
+    manifest: &DatasetManifestRef,
+    max_objects_per_generation: usize,
+) -> Result<CatalogGenerationOwnedProviderCaptures, ManifestCatalogError> {
+    let pinned = load_pinned(connection, manifest, max_objects_per_generation)?;
+    if pinned.generation_kind() != GenerationKind::Ingest {
+        return Err(ManifestCatalogError::GenerationConflict);
+    }
+    let (generation_sequence, run_id, source_id, published_at_ns): (i64, String, String, i64) =
+        connection
+            .query_row(
+                "SELECT generation.generation_sequence, source_input.run_id,
+                    source_input.source_id, generation.created_at_ns
+             FROM analytical_generations AS generation
+             JOIN analytical_generation_source_inputs AS source_input
+               ON source_input.generation_sequence=generation.generation_sequence
+             WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
+               AND generation.schema_name=?3 AND generation.schema_version=?4
+               AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
+               AND generation.generation_kind='ingest'",
+                params![
+                    manifest.dataset_id().as_str(),
+                    to_i64(manifest.manifest_version())?,
+                    manifest.schema().name(),
+                    i64::from(manifest.schema().version().get()),
+                    manifest.schema().fingerprint().as_slice(),
+                    manifest.content_hash().bytes(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or(ManifestCatalogError::GenerationConflict)?;
+    if generation_sequence <= 0 {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let run_id = Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    let source_id =
+        SourceId::try_from(source_id.as_str()).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    let artifact_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM artifacts WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let artifact_count = usize::try_from(artifact_count)
+        .ok()
+        .filter(|count| (1..=1024).contains(count))
+        .ok_or(ManifestCatalogError::CorruptCatalog)?;
+    let suffix_start = pinned
+        .objects()
+        .len()
+        .checked_sub(artifact_count)
+        .ok_or(ManifestCatalogError::CorruptCatalog)?;
+    let mut artifact_statement = connection.prepare(
+        "SELECT output.publication_ordinal, output.artifact_id,
+                output.content_algorithm, output.content_digest, output.size_bytes,
+                object.ordinal, object.content_hash, object.row_count, object.size_bytes
+         FROM artifacts AS output
+         JOIN analytical_generation_objects AS object
+           ON object.dataset_id=?1 AND object.manifest_version=?2
+          AND object.artifact_id=output.artifact_id
+         WHERE output.run_id=?3
+         ORDER BY output.publication_ordinal LIMIT 1025",
+    )?;
+    let mut artifact_rows = artifact_statement.query(params![
+        manifest.dataset_id().as_str(),
+        to_i64(manifest.manifest_version())?,
+        run_id.to_string(),
+    ])?;
+    let mut output_ordinal = 0_usize;
+    while let Some(row) = artifact_rows.next()? {
+        if output_ordinal == artifact_count {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        let retained_output_ordinal: i64 = row.get(0)?;
+        let artifact_id: String = row.get(1)?;
+        let content_algorithm: i64 = row.get(2)?;
+        let artifact_digest: Vec<u8> = row.get(3)?;
+        let artifact_size: i64 = row.get(4)?;
+        let generation_ordinal: i64 = row.get(5)?;
+        let object_digest: Vec<u8> = row.get(6)?;
+        let object_rows: i64 = row.get(7)?;
+        let object_size: i64 = row.get(8)?;
+        let exact_generation_ordinal = suffix_start
+            .checked_add(output_ordinal)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        let pinned_object = pinned
+            .objects()
+            .get(exact_generation_ordinal)
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
+        if retained_output_ordinal
+            != i64::try_from(output_ordinal).map_err(|_| ManifestCatalogError::CountOverflow)?
+            || generation_ordinal
+                != i64::try_from(exact_generation_ordinal)
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?
+            || Uuid::parse_str(&artifact_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?
+                != pinned_object.artifact_id()
+            || content_algorithm != 1
+            || parse_digest(&artifact_digest)? != pinned_object.object().content_hash()
+            || parse_digest(&object_digest)? != pinned_object.object().content_hash()
+            || u64::try_from(artifact_size).ok() != Some(pinned_object.object().size_bytes())
+            || u64::try_from(object_size).ok() != Some(pinned_object.object().size_bytes())
+            || u64::try_from(object_rows).ok() != Some(pinned_object.object().row_count())
+        {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        output_ordinal += 1;
+    }
+    if output_ordinal != artifact_count {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let retained = ordered_provider_macro_plan_inputs(connection, run_id)?;
+    if retained.is_empty() {
+        return Err(ManifestCatalogError::GenerationConflict);
+    }
+    let admitted_inputs: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM ingest_run_provider_capture_bindings AS run_input
+         JOIN analytical_generation_provider_capture_bindings AS generation_input
+           ON generation_input.generation_sequence=?1
+          AND generation_input.run_id=run_input.run_id
+          AND generation_input.binding_digest=run_input.binding_digest
+          AND generation_input.source_id=run_input.source_id
+         WHERE run_input.run_id=?2 AND run_input.source_id=?3",
+        params![generation_sequence, run_id.to_string(), source_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(admitted_inputs).ok() != Some(retained.len()) {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let mut prior_coordinate = None;
+    let mut aggregate_rows = 0_u64;
+    for input in &retained {
+        if input.source_id != source_id.as_str()
+            || !input.coordinate_follows(prior_coordinate)
+            || input.output_artifact_ordinal >= artifact_count
+        {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        aggregate_rows = aggregate_rows
+            .checked_add(
+                u64::try_from(input.record_count)
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?,
+            )
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        prior_coordinate = Some((input.output_artifact_ordinal, input.object_input_ordinal));
+    }
+    let mut expected_aggregate_rows = 0_u64;
+    for output_ordinal in 0..artifact_count {
+        let mapped_rows = retained
+            .iter()
+            .filter(|input| input.output_artifact_ordinal == output_ordinal)
+            .try_fold(0_u64, |total, input| {
+                total
+                    .checked_add(
+                        u64::try_from(input.record_count)
+                            .map_err(|_| ManifestCatalogError::CountOverflow)?,
+                    )
+                    .ok_or(ManifestCatalogError::CountOverflow)
+            })?;
+        let object_rows = pinned.objects()[suffix_start + output_ordinal]
+            .object()
+            .row_count();
+        if mapped_rows == 0 || mapped_rows != object_rows {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        expected_aggregate_rows = expected_aggregate_rows
+            .checked_add(object_rows)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+    }
+    if aggregate_rows != expected_aggregate_rows {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(retained.len())
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    inputs.extend(
+        retained
+            .iter()
+            .map(StoredProviderMacroPlanInput::catalog_input),
+    );
+    let receipt_digest = generation_owned_provider_capture_receipt_digest(
+        &pinned,
+        run_id,
+        &source_id,
+        suffix_start,
+        &inputs,
+    )?;
+    Ok(CatalogGenerationOwnedProviderCaptures {
+        pinned,
+        published_at: Timestamp::from_unix_nanos(published_at_ns),
+        source_id,
+        suffix_start,
+        inputs,
+        receipt_digest,
+    })
 }
 
 fn load_provider_publication_bindings(

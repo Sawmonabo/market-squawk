@@ -5,7 +5,7 @@ use std::{
     fmt,
     num::{NonZeroU16, NonZeroU64},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -22,11 +22,7 @@ use market_squawk_services::{
 use market_squawk_sources::{DiscoveryRequestId, MAX_DISCOVERY_OBJECTS, SourceMetadata};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::{
-    sync::Mutex,
-    task::JoinHandle,
-    time::{Instant as TokioInstant, timeout_at},
-};
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -36,8 +32,7 @@ use super::{
     domain_support::{DomainLifecycle, admitted_result_limits, encode_hex, ensure_request_live},
 };
 use crate::{
-    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
-    ProviderPortalActivationError, ProviderPortalConfig, ProviderPortalError,
+    ProviderOnboardingService, ProviderPortalActivationAuthority, ProviderPortalActivationError,
 };
 
 mod lifecycle;
@@ -59,16 +54,15 @@ pub use runtime::{
 
 use results::{
     SourceReadKind, bounded_source_result, data_quality_name, ensure_exact_provider_scope,
-    ensure_provider_scope, inactive_row, map_onboarding_error, map_portal_error, map_runtime_error,
+    ensure_provider_scope, inactive_row, map_onboarding_error, map_runtime_error,
     not_applicable_result, registration_value, requested_sources, required_identifier,
-    required_profile_field, required_provider, runtime_row, to_json,
+    required_provider, runtime_row, to_json,
 };
 
 const SOURCE_REGISTER: &str = "Source.Register";
 const SOURCE_GET_STATUS: &str = "Source.GetStatus";
 const SOURCE_GET_COVERAGE: &str = "Source.GetCoverage";
 const SOURCE_GET_HEALTH: &str = "Source.GetHealth";
-const SOURCE_SETUP: &str = "Source.Setup";
 const SOURCE_LIST_OBJECTS: &str = "Source.ListObjects";
 const SOURCE_DISCOVER: &str = "Source.Discover";
 const SOURCE_INSPECT: &str = "Source.Inspect";
@@ -83,11 +77,6 @@ const SOURCE_REMOVE: &str = "Source.Remove";
 const MAX_CURRENT_SESSIONS: usize = 32;
 const MAXIMUM_INSPECTION_PAGE_INDEX: u16 = 63;
 const MAXIMUM_INSPECTION_RECORDS: u16 = 1_024;
-const PORTAL_LIFETIME: Duration = Duration::from_secs(15 * 60);
-const PORTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const PORTAL_MAX_REQUESTS: u64 = 512;
-const PORTAL_MAX_CONNECTIONS: usize = 16;
-const LOCAL_PAPER_EXECUTION_SURFACE: &str = "local.paper-execution";
 
 /// Validated authority request for one non-persistent provider page inspection.
 pub struct EphemeralSourceInspectionRequest {
@@ -257,7 +246,7 @@ impl SourceDomainService {
     ///
     /// # Errors
     ///
-    /// Returns [`SourceApplicationError::AsyncRuntimeUnavailable`] outside a Tokio runtime.
+    /// Returns an error when a code-owned result bound is invalid.
     pub fn try_new(
         onboarding: Arc<ProviderOnboardingService>,
         runtime: Arc<dyn SourceRuntimeView>,
@@ -266,14 +255,6 @@ impl SourceDomainService {
         inspection: Arc<dyn EphemeralSourceInspectionAuthority>,
         source_lifecycle: Arc<dyn SourceLifecycleAuthority>,
     ) -> Result<Self, SourceApplicationError> {
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_error| SourceApplicationError::AsyncRuntimeUnavailable)?;
-        let portal_state = Arc::new(Mutex::new(PortalState::Empty));
-        let portal_cancellation = CancellationToken::new();
-        let portal_task = handle.spawn(portal_shutdown_worker(
-            Arc::clone(&portal_state),
-            portal_cancellation.clone(),
-        ));
         Ok(Self {
             controller: Arc::new(SourceController {
                 onboarding,
@@ -285,9 +266,6 @@ impl SourceDomainService {
                 lifecycle: DomainLifecycle::new(),
                 session_limit: CatalogLimit::new(MAX_CURRENT_SESSIONS)
                     .map_err(|_error| SourceApplicationError::InvalidCodeOwnedLimit)?,
-                portal_state,
-                portal_cancellation,
-                portal_task: Mutex::new(PortalTaskState::Running(portal_task)),
             }),
         })
     }
@@ -317,7 +295,6 @@ impl ApplicationDomainService for SourceDomainService {
         let limits = admitted_result_limits(&request, &context)?;
         match request.name() {
             SOURCE_REGISTER => self.controller.register(&request, &context, limits),
-            SOURCE_SETUP => self.controller.setup(&request, &context, limits).await,
             SOURCE_LIST_OBJECTS => {
                 self.controller
                     .list_objects(&request, &context, limits)
@@ -422,9 +399,6 @@ struct SourceController {
     source_lifecycle: Arc<dyn SourceLifecycleAuthority>,
     lifecycle: Arc<DomainLifecycle>,
     session_limit: CatalogLimit,
-    portal_state: Arc<Mutex<PortalState>>,
-    portal_cancellation: CancellationToken,
-    portal_task: Mutex<PortalTaskState>,
 }
 
 impl SourceController {
@@ -809,50 +783,6 @@ impl SourceController {
         not_applicable_result(registration_value(&registered)?, limits)
     }
 
-    async fn setup(
-        &self,
-        request: &TypedToolRequest,
-        context: &RequestContext,
-        limits: ServiceLimits,
-    ) -> Result<TypedToolResult, ServiceError> {
-        ensure_request_live(context, &self.lifecycle)?;
-        let provider = required_provider(request)?;
-        ensure_provider_scope(request, provider)?;
-        let registered = self
-            .onboarding
-            .register_profile(provider)
-            .map_err(map_onboarding_error)?;
-        let current = self
-            .onboarding
-            .current_sessions(self.session_limit)
-            .map_err(map_onboarding_error)?
-            .into_iter()
-            .find(|session| session.surface_id() == provider);
-        let portal = self.ensure_portal(context).await?;
-        ensure_request_live(context, &self.lifecycle)?;
-
-        let profile = to_json(registered.profile())?;
-        let handoff_url = required_profile_field(&profile, "official_handoff_url")?;
-        let handoff_instruction = required_profile_field(&profile, "handoff_instruction")?;
-        let current = current.as_ref().map(to_json).transpose()?;
-        not_applicable_result(
-            json!({
-                "registration": registration_value(&registered)?,
-                "officialHandoff": {
-                    "url": handoff_url,
-                    "instruction": handoff_instruction,
-                },
-                "portal": {
-                    "url": portal.base_url,
-                    "expiresInSeconds": portal.expires_in_seconds,
-                    "secretInput": "local_portal_only",
-                },
-                "currentSession": current,
-            }),
-            limits,
-        )
-    }
-
     async fn read(
         &self,
         request: &TypedToolRequest,
@@ -934,7 +864,9 @@ impl SourceController {
                 .map(|identifier| self.discovery.registered_discovery_dataset(identifier))
                 .transpose()?
                 .flatten();
-            let lifecycle_managed = profile.id() != LOCAL_PAPER_EXECUTION_SURFACE;
+            let lifecycle_managed = profile_identifier
+                .as_ref()
+                .is_some_and(|identifier| self.source_lifecycle.supports(identifier));
             let lifecycle_status = match profile_identifier.as_ref() {
                 Some(identifier) if lifecycle_managed => Some(
                     self.current_source_lifecycle_status(identifier, context)
@@ -1054,114 +986,9 @@ impl SourceController {
         Ok(status)
     }
 
-    async fn ensure_portal(
-        &self,
-        context: &RequestContext,
-    ) -> Result<PortalLocation, ServiceError> {
-        let deadline = TokioInstant::from_std(context.deadline());
-        let mut state = tokio::select! {
-            biased;
-            () = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
-            () = self.lifecycle.shutdown_token().cancelled() => {
-                return Err(ServiceError::Unavailable);
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(ServiceError::DeadlineExceeded);
-            }
-            state = self.portal_state.lock() => state,
-        };
-        let config = ProviderPortalConfig::try_new(
-            PORTAL_LIFETIME,
-            PORTAL_REQUEST_TIMEOUT,
-            PORTAL_MAX_REQUESTS,
-            PORTAL_MAX_CONNECTIONS,
-        )
-        .map_err(map_portal_error)?;
-        loop {
-            ensure_request_live(context, &self.lifecycle)?;
-            if let PortalState::Running(slot) = &*state {
-                let now = Instant::now();
-                if now < slot.expires_at {
-                    return Ok(slot.location(now));
-                }
-
-                let expired = std::mem::replace(&mut *state, PortalState::Empty);
-                let PortalState::Running(expired) = expired else {
-                    return Err(ServiceError::Internal);
-                };
-                *state = PortalState::Retiring(tokio::spawn(expired.portal.shutdown()));
-                continue;
-            }
-
-            match &mut *state {
-                PortalState::Empty => {
-                    let onboarding = Arc::clone(&self.onboarding);
-                    let activation = Arc::clone(&self.portal_activation);
-                    *state = PortalState::Starting(tokio::spawn(async move {
-                        ProviderOnboardingPortal::start(onboarding, activation, config).await
-                    }));
-                }
-                PortalState::Starting(task) => {
-                    let joined = tokio::select! {
-                        biased;
-                        () = context.cancellation().cancelled() => {
-                            return Err(ServiceError::Cancelled);
-                        }
-                        () = self.lifecycle.shutdown_token().cancelled() => {
-                            return Err(ServiceError::Unavailable);
-                        }
-                        () = tokio::time::sleep_until(deadline) => {
-                            return Err(ServiceError::DeadlineExceeded);
-                        }
-                        result = task => result,
-                    };
-                    let portal = match joined {
-                        Ok(Ok(portal)) => portal,
-                        Ok(Err(error)) => {
-                            *state = PortalState::Empty;
-                            return Err(map_portal_error(error));
-                        }
-                        Err(_error) => {
-                            *state = PortalState::Empty;
-                            return Err(ServiceError::Unavailable);
-                        }
-                    };
-                    let Some(expires_at) = Instant::now().checked_add(PORTAL_LIFETIME) else {
-                        *state = PortalState::Retiring(tokio::spawn(portal.shutdown()));
-                        return Err(ServiceError::Internal);
-                    };
-                    *state = PortalState::Running(PortalSlot { portal, expires_at });
-                }
-                PortalState::Retiring(task) => {
-                    let joined = tokio::select! {
-                        biased;
-                        () = context.cancellation().cancelled() => {
-                            return Err(ServiceError::Cancelled);
-                        }
-                        () = self.lifecycle.shutdown_token().cancelled() => {
-                            return Err(ServiceError::Unavailable);
-                        }
-                        () = tokio::time::sleep_until(deadline) => {
-                            return Err(ServiceError::DeadlineExceeded);
-                        }
-                        result = task => result,
-                    };
-                    *state = PortalState::Empty;
-                    match joined {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Err(map_portal_error(error)),
-                        Err(_error) => return Err(ServiceError::Unavailable),
-                    }
-                }
-                PortalState::Running(_) => {}
-            }
-        }
-    }
-
     fn begin_shutdown(&self) {
         self.portal_activation.begin_shutdown();
         self.lifecycle.begin_shutdown();
-        self.portal_cancellation.cancel();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
@@ -1172,26 +999,7 @@ impl SourceController {
             .await
             .map_err(map_portal_activation_shutdown_error);
         let lifecycle = self.lifecycle.finish_shutdown(deadline).await;
-        let portal = self.finish_portal_shutdown(deadline).await;
-        activation.and(lifecycle).and(portal)
-    }
-
-    async fn finish_portal_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
-        let deadline = TokioInstant::from_std(deadline);
-        let mut state = timeout_at(deadline, self.portal_task.lock())
-            .await
-            .map_err(|_error| ServiceError::DeadlineExceeded)?;
-        let joined = match &mut *state {
-            PortalTaskState::Running(task) => timeout_at(deadline, task)
-                .await
-                .map_err(|_error| ServiceError::DeadlineExceeded)?,
-            PortalTaskState::Complete(outcome) => return *outcome,
-        };
-        let outcome = joined
-            .map_err(|_error| ServiceError::Unavailable)?
-            .map_err(map_portal_error);
-        *state = PortalTaskState::Complete(outcome);
-        outcome
+        activation.and(lifecycle)
     }
 }
 
@@ -1221,24 +1029,6 @@ impl fmt::Debug for SourceController {
 impl Drop for SourceController {
     fn drop(&mut self) {
         self.begin_shutdown();
-    }
-}
-
-struct PortalSlot {
-    portal: ProviderOnboardingPortal,
-    expires_at: Instant,
-}
-
-impl PortalSlot {
-    fn location(&self, now: Instant) -> PortalLocation {
-        let remaining = self.expires_at.saturating_duration_since(now);
-        let expires_in_seconds = remaining
-            .as_secs()
-            .saturating_add(u64::from(remaining.subsec_nanos() != 0));
-        PortalLocation {
-            base_url: self.portal.base_url().to_owned(),
-            expires_in_seconds,
-        }
     }
 }
 
@@ -1951,53 +1741,9 @@ impl Drop for DiscoveryPublicationGuard {
     }
 }
 
-struct PortalLocation {
-    base_url: String,
-    expires_in_seconds: u64,
-}
-
-enum PortalState {
-    Empty,
-    Starting(JoinHandle<Result<ProviderOnboardingPortal, ProviderPortalError>>),
-    Running(PortalSlot),
-    Retiring(JoinHandle<Result<(), ProviderPortalError>>),
-}
-
-enum PortalTaskState {
-    Running(JoinHandle<Result<(), ProviderPortalError>>),
-    Complete(Result<(), ServiceError>),
-}
-
-async fn portal_shutdown_worker(
-    state: Arc<Mutex<PortalState>>,
-    cancellation: CancellationToken,
-) -> Result<(), ProviderPortalError> {
-    cancellation.cancelled().await;
-    let owned = {
-        let mut state = state.lock().await;
-        std::mem::replace(&mut *state, PortalState::Empty)
-    };
-    match owned {
-        PortalState::Empty => Ok(()),
-        PortalState::Starting(task) => {
-            let portal = task
-                .await
-                .map_err(|_error| ProviderPortalError::ServerTask)??;
-            portal.shutdown().await
-        }
-        PortalState::Running(slot) => slot.portal.shutdown().await,
-        PortalState::Retiring(task) => task
-            .await
-            .map_err(|_error| ProviderPortalError::ServerTask)?,
-    }
-}
-
 /// Source application construction failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SourceApplicationError {
-    /// Source lifecycle tasks require a current Tokio runtime.
-    #[error("source application requires an asynchronous runtime")]
-    AsyncRuntimeUnavailable,
     /// A code-owned internal result ceiling was invalid.
     #[error("source application code-owned limit is invalid")]
     InvalidCodeOwnedLimit,

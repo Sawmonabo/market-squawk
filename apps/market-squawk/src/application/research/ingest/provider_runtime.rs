@@ -839,6 +839,7 @@ impl PreparedResearchProviderReplacement {
             admission
         };
         admission.revoke_and_drain().await;
+        super::treasury::drain_generation_replay(&self.coordinator, &self.expected).await?;
         Ok(())
     }
 
@@ -2329,6 +2330,7 @@ impl ResearchProviderRuntimeMutationAuthority {
             }
         };
         admission.revoke_and_drain().await;
+        super::treasury::drain_generation_replay(&self.coordinator, expected).await?;
         Ok(())
     }
 }

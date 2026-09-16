@@ -32,6 +32,7 @@ const providerCredentialDispositionSchema = z.strictObject({
   enabled: z.boolean(),
   disposition: z.enum([
     "credential_stored_unverified",
+    "saved_setup_reused",
     "probe_required",
     "disabled",
     "profile_unavailable",
@@ -119,12 +120,11 @@ export function ProviderCredentialImport({
               Protected credential import
             </p>
           </div>
-          <h2 className="mt-2 text-lg font-semibold">Import provider credentials</h2>
+          <h2 className="mt-2 text-lg font-semibold">Use an existing credential file</h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Select one filled Market Squawk provider-credentials .env file. The native app stages
-            it through a bounded one-time ticket and returns only provider dispositions. Importing
-            stores selected credentials or setup intent; it does not verify, activate, or start a
-            provider.
+            Already have a Market Squawk provider-credentials .env file? Select it here once.
+            Saved credentials and data selections are reused. New credentials are stored securely;
+            continue their verification above without signing up again or entering the keys by hand.
           </p>
         </div>
         <Button
@@ -140,7 +140,7 @@ export function ProviderCredentialImport({
             ? "Importing safely…"
             : result
               ? "Select another bundle"
-              : "Choose credential bundle"}
+              : "Choose existing credential file"}
         </Button>
       </div>
 
@@ -206,6 +206,8 @@ function dispositionLabel(
   disposition: ProviderCredentialImportResult["providers"][number]["disposition"],
 ) {
   switch (disposition) {
+    case "saved_setup_reused":
+      return "Saved setup reused; existing credentials and data selection were kept."
     case "credential_stored_unverified":
       return "Credential stored; verification and activation are still required."
     case "probe_required":

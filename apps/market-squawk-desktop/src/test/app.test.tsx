@@ -253,7 +253,6 @@ function transport(
     }),
     onboard,
     openOfficialProviderPage: async () => undefined,
-    openProtectedProviderSetup: async () => undefined,
   }
   const product: ProductTransport = {
     query: bridge.query,
@@ -289,7 +288,6 @@ function transport(
     subscribe: bridge.subscribe,
     onboard: bridge.onboard,
     openOfficialProviderPage: bridge.openOfficialProviderPage,
-    openProtectedProviderSetup: bridge.openProtectedProviderSetup,
   }
   return { product, system }
 }
@@ -384,30 +382,34 @@ const marketInstrumentResult = marketResult(marketOverviewRow)
 const macroKnowledgeCutoff = "2026-08-28T14:30:00Z"
 const macroEffectiveDateCutoff = "2026-08-27"
 const macroIndicatorDefinitions = [
-  ["us-government-yield-1m", "1-month government yield", "4.32"],
-  ["us-government-yield-3m", "3-month government yield", "4.28"],
-  ["us-government-yield-6m", "6-month government yield", "4.18"],
-  ["us-government-yield-1y", "1-year government yield", "4.02"],
-  ["us-government-yield-2y", "2-year government yield", "3.88"],
-  ["us-government-yield-3y", "3-year government yield", "3.82"],
-  ["us-government-yield-5y", "5-year government yield", "3.86"],
-  ["us-government-yield-7y", "7-year government yield", "3.98"],
-  ["us-government-yield-10y", "10-year government yield", "4.12"],
-  ["us-government-yield-20y", "20-year government yield", "4.48"],
-  ["us-government-yield-30y", "30-year government yield", "4.39"],
-  ["us-unemployment-rate", "Unemployment rate", "4.2"],
+  ["us-government-yield-1m", "1-month government bond yield", "4.32"],
+  ["us-government-yield-3m", "3-month government bond yield", "4.28"],
+  ["us-government-yield-6m", "6-month government bond yield", "4.18"],
+  ["us-government-yield-1y", "1-year government bond yield", "4.02"],
+  ["us-government-yield-2y", "2-year government bond yield", "3.88"],
+  ["us-government-yield-3y", "3-year government bond yield", "3.82"],
+  ["us-government-yield-5y", "5-year government bond yield", "3.86"],
+  ["us-government-yield-7y", "7-year government bond yield", "3.98"],
+  ["us-government-yield-10y", "10-year government bond yield", "4.12"],
+  ["us-government-yield-20y", "20-year government bond yield", "4.48"],
+  ["us-government-yield-30y", "30-year government bond yield", "4.39"],
+  ["us-unemployment-rate", "U.S. unemployment rate", "4.2"],
+  ["us-residential-electricity-price", "U.S. residential electricity price", "17.47"],
 ] as const
 
 function macroContextResult(cutoffs = {
   knowledgeCutoff: macroKnowledgeCutoff,
   effectiveDateCutoff: macroEffectiveDateCutoff,
 }): ApplicationResult {
+  const knowledgeCutoff = new Date(cutoffs.knowledgeCutoff).toISOString().replace(/\.[0-9]{3}Z$/, ".000000000Z")
   return {
     data: {
       availability: "available",
       selection: {
         ...cutoffs,
-        evaluatedAt: "2026-08-28T14:30:01Z",
+        knowledgeCutoff,
+        effectiveMonthCutoff: "2026-07",
+        evaluatedAt: "2026-08-28T14:30:01.000000000Z",
         complete: true,
       },
       confidence: {
@@ -415,8 +417,8 @@ function macroContextResult(cutoffs = {
         summary: "All requested economic indicators are available for the selected dates.",
       },
       coverage: {
-        requested: 12,
-        observed: 12,
+        requested: 13,
+        observed: 13,
         missing: 0,
         unavailable: 0,
       },
@@ -424,19 +426,20 @@ function macroContextResult(cutoffs = {
         ([indicatorId, label, decimal], index) => ({
           indicatorId,
           label,
-          category: index < 11 ? "interest_rates" : "labor_market",
+          category: index < 11 ? "interest_rates" : index === 12 ? "energy_prices" : "labor_market",
           frequency: index < 11 ? "business_daily" : "monthly",
           seasonalAdjustment:
-            index < 11 ? "not_applicable" : "seasonally_adjusted",
+            index < 11 ? "not_applicable" : index === 12 ? "not_supplied" : "seasonally_adjusted",
           unit: {
             code:
-              index < 11 ? "percent_per_year" : "percent_of_labor_force",
-            label: index < 11 ? "Percent per year" : "Percent of labor force",
-            symbol: "%",
+              index < 11 ? "percent_per_year" : index === 12 ? "native_energy_price" : "percent_of_labor_force",
+            label: index < 11 ? "Percent per year" : index === 12 ? "cents per kilowatthour" : "Percent of labor force",
+            symbol: index === 12 ? null : "%",
           },
-          effectiveDate: index < 11 ? "2026-08-27" : "2026-07-01",
-          recorded: { state: "known", date: "2026-08-27" },
-          availableAt: "2026-08-28T12:00:00Z",
+          effectiveDate: index < 11 ? cutoffs.effectiveDateCutoff : index === 12 ? null : "2026-07-01",
+          ...(index === 12 ? { effectivePeriod: "2026-07" } : {}),
+          recorded: { state: "known", date: cutoffs.effectiveDateCutoff },
+          availableAt: knowledgeCutoff,
           revision: 1,
           supersededAfter: null,
           value: { state: "observed", decimal },
@@ -450,8 +453,8 @@ function macroContextResult(cutoffs = {
     },
     metadata: {
       completeness: "complete",
-      returnedItems: 12,
-      availableItems: 12,
+      returnedItems: 13,
+      availableItems: 13,
     },
   }
 }
@@ -674,14 +677,14 @@ describe("Market Squawk desktop boundary", () => {
     )
 
     const macroHeading = await screen.findByRole("heading", {
-      name: "Rates and labor conditions",
+      name: "Rates, labor and energy prices",
     })
     const macroSection = macroHeading.closest("section")
     expect(macroSection).toBeInstanceOf(HTMLElement)
     if (!(macroSection instanceof HTMLElement)) {
       throw new Error("The economic context is absent")
     }
-    expect(within(macroSection).getByText("12 of 12 available")).toBeTruthy()
+    expect(within(macroSection).getByText("13 of 13 available")).toBeTruthy()
     expect(
       within(macroSection)
         .getAllByRole("heading", { level: 4 })
@@ -710,7 +713,10 @@ describe("Market Squawk desktop boundary", () => {
       ])
     })
 
-    const renderedMacro = macroSection.textContent ?? ""
+    const refreshedMacro = await screen.findByRole("heading", {
+      name: "Rates, labor and energy prices",
+    })
+    const renderedMacro = refreshedMacro.closest("section")?.textContent ?? ""
     expect(renderedMacro).not.toMatch(
       /Federal Reserve|FRED|ALFRED|H\.?15|Macro\.GetContext|\bprovider\b|\bsource\b|\bmanifest\b|\bdigest\b/i,
     )
@@ -777,7 +783,7 @@ describe("Market Squawk desktop boundary", () => {
     } satisfies DesktopTransport
 
     render(
-      <MemoryRouter initialEntries={["/system/settings"]}>
+      <MemoryRouter initialEntries={["/system/settings/onboarding"]}>
         <App transport={bootstrapTransport} />
       </MemoryRouter>,
     )
@@ -794,7 +800,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(screen.getByRole("heading", { name: "Settings" })).toBeTruthy()
   })
 
-  it("keeps provider plumbing behind Connections", async () => {
+  it("keeps provider plumbing behind Settings onboarding", async () => {
     const providerSentinel = "Privileged provider sentinel"
     const onboardingRequests: Parameters<SystemTransport["onboard"]>[0][] = []
     const boundaryTransport = transport(
@@ -820,6 +826,7 @@ describe("Market Squawk desktop boundary", () => {
             },
           ],
           sessions: [],
+          setup: [],
           encryptedFileFallback: "locked",
           capabilities: {
             credentialImport: false,
@@ -871,7 +878,8 @@ describe("Market Squawk desktop boundary", () => {
     expect(document.body.textContent).not.toContain("Source.GetStatus")
     expect(onboardingRequests).toHaveLength(0)
 
-    fireEvent.click(screen.getByRole("link", { name: "Connections & Sources" }))
+    fireEvent.click(screen.getByRole("link", { name: "Settings" }))
+    fireEvent.click(await screen.findByRole("link", { name: "Onboarding" }))
     expect(await screen.findByText(providerSentinel)).toBeTruthy()
     expect(onboardingRequests).toEqual([{ action: "bootstrap" }])
   })

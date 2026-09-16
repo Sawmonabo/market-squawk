@@ -22,7 +22,7 @@ export function MacroAvailabilityNotice({
         <p>{detail}</p>
         {showSetup ? (
           <Button asChild className="mt-3" size="sm">
-            <Link to="/connections/sources">Open setup</Link>
+            <Link to="/system/settings/onboarding">Open setup</Link>
           </Button>
         ) : null}
       </AlertDescription>

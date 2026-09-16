@@ -142,6 +142,11 @@ export const providerSessionSchema = z
   })
   .loose()
 
+export const providerSetupInspectionSchema = z.strictObject({
+  session: providerSessionSchema,
+  publicationPending: z.boolean(),
+})
+
 export const providerActivationSchema = z
   .object({
     profile: z.string(),
@@ -149,6 +154,15 @@ export const providerActivationSchema = z
     capability_revision: z.number().int().nonnegative(),
   })
   .loose()
+
+export const providerOAuthSchema = z.object({
+  session_id: z.string().uuid(),
+  action: z.enum(["begin", "continue", "cancel", "unlink"]),
+  state: z.enum(["awaiting_authorization", "exchanging_authorization", "active", "reauthorization_required", "cancelled", "unlinked"]),
+  access_token_generation: z.union([z.number().int().positive(), z.string().regex(/^[1-9][0-9]*$/)]).nullable(),
+  access_expires_at: z.union([z.number().int(), z.string()]).nullable(),
+  refresh_expires_at: z.union([z.number().int(), z.string()]).nullable(),
+}).strict()
 
 export const encryptedFileFallbackSchema = z.enum([
   "disabled",
@@ -267,6 +281,11 @@ export const governanceProvisioningStatusSchema = z.object({
 export const providerBootstrapSchema = z.object({
   profiles: z.array(providerProfileSchema),
   sessions: z.array(providerSessionSchema),
+  setup: z.array(z.object({
+    surfaceId: z.string().min(1),
+    savedConfigurationSessionId: z.string().uuid().nullable(),
+    activationKind: z.enum(["source", "sec", "bls", "bea", "census", "treasury_fiscal", "treasury_daily_rates", "fred_alfred", "eia_electricity_price", "federal_reserve_board_h15", "yahoo_enrichment", "tiingo_starter_eod_nav"]).nullable(),
+  }).strict()).max(32),
   encryptedFileFallback: encryptedFileFallbackSchema,
   capabilities: z.object({
     credentialImport: z.boolean(),
@@ -481,7 +500,9 @@ export type GovernanceProvisioningStatus = z.infer<
   typeof governanceProvisioningStatusSchema
 >
 export type McpClientsStatus = z.infer<typeof mcpClientsStatusSchema>
+export type ProviderOAuth = z.infer<typeof providerOAuthSchema>
 export type ProviderActivation = z.infer<typeof providerActivationSchema>
 export type ProviderBootstrap = z.infer<typeof providerBootstrapSchema>
 export type ProviderProfile = z.infer<typeof providerProfileSchema>
+export type ProviderSetupInspection = z.infer<typeof providerSetupInspectionSchema>
 export type ProviderSession = z.infer<typeof providerSessionSchema>

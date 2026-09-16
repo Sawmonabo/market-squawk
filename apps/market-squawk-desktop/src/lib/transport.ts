@@ -15,7 +15,9 @@ import type {
   NativeEvidenceApplicationResult,
   ProviderActivation,
   ProviderBootstrap,
+  ProviderOAuth,
   ProviderSession,
+  ProviderSetupInspection,
 } from "@/lib/schemas"
 
 export type DesktopEventSubscriptionRequest = {
@@ -249,6 +251,7 @@ export type DesktopServiceBootstrapRequest =
 
 export type ProviderOnboardingRequest =
   | { action: "bootstrap" }
+  | { action: "inspect"; sessionId: string }
   | {
       action: "start"
       surfaceId: string
@@ -264,6 +267,10 @@ export type ProviderOnboardingRequest =
       sessionId: string
       request: Record<string, unknown>
     }
+  | { action: "verifySaved"; sessionId: string }
+  | { action: "restoreSaved"; sessionId: string }
+  | { action: "resumePublication"; sessionId: string }
+  | { action: "schwabOAuth"; sessionId: string; lifecycleAction: "begin" | "continue" | "cancel" | "unlink" }
   | { action: "renew"; sessionId: string }
   | { action: "cleanup"; sessionId: string }
   | { action: "cancel"; sessionId: string }
@@ -272,11 +279,15 @@ export type ProviderOnboardingResult<
   Request extends ProviderOnboardingRequest,
 > = Request extends { action: "bootstrap" }
   ? ProviderBootstrap
-  : Request extends { action: "unlockFallback" | "lockFallback" }
+  : Request extends { action: "inspect" }
+    ? ProviderSetupInspection
+    : Request extends { action: "unlockFallback" | "lockFallback" }
     ? EncryptedFileFallback
-    : Request extends { action: "activate" }
+    : Request extends { action: "activate" | "verifySaved" | "resumePublication" }
       ? ProviderActivation
-      : ProviderSession
+      : Request extends { action: "schwabOAuth" }
+        ? ProviderOAuth
+        : ProviderSession
 
 export type ModelProductRequest =
   | { action: "list" }
@@ -418,7 +429,6 @@ export interface SystemTransport {
     request: Request,
   ): Promise<ProviderOnboardingResult<Request>>
   openOfficialProviderPage(providerId: string): Promise<void>
-  openProtectedProviderSetup(providerId: string): Promise<void>
 }
 
 export interface DesktopTransport {

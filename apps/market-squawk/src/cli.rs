@@ -6,6 +6,67 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use market_squawk_platform::JournalFileFormat;
 use uuid::Uuid;
 
+const MAXIMUM_CLI_UNLOCK_BYTES: u64 = 4 * 1024;
+
+/// Secret-free failure from the shared bounded CLI unlock reader.
+#[derive(Debug, thiserror::Error)]
+pub enum CliUnlockInputError {
+    /// Interactive input must not silently consume a pipe without explicit admission.
+    #[error("secure storage unlock requires a terminal or explicit --stdin")]
+    TerminalRequired,
+    /// Reading a bounded input or no-echo terminal failed.
+    #[error("failed to read the secure storage unlock")]
+    Read,
+    /// The input was empty, malformed or exceeded the existing bootstrap secret bound.
+    #[error("secure storage unlock is empty, invalid UTF-8, or exceeds 4096 bytes")]
+    Invalid,
+}
+
+/// Reads explicit standard input or a no-echo terminal for either existing encrypted store.
+///
+/// # Errors
+/// Returns a value-free error for unavailable input, invalid UTF-8 or exceeded bounds.
+pub fn read_encrypted_storage_unlock(
+    explicit_stdin: bool,
+) -> Result<market_squawk_platform::SecretValue, CliUnlockInputError> {
+    use market_squawk_platform::SecretValue;
+    use std::io::{IsTerminal as _, Read as _};
+    use zeroize::Zeroizing;
+
+    if explicit_stdin {
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact((MAXIMUM_CLI_UNLOCK_BYTES + 1) as usize)
+            .map_err(|_| CliUnlockInputError::Read)?;
+        std::io::stdin()
+            .take(MAXIMUM_CLI_UNLOCK_BYTES + 1)
+            .read_to_end(&mut *bytes)
+            .map_err(|_| CliUnlockInputError::Read)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAXIMUM_CLI_UNLOCK_BYTES {
+            return Err(CliUnlockInputError::Invalid);
+        }
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        return SecretValue::from_utf8_bytes(std::mem::take(&mut *bytes))
+            .map_err(|_| CliUnlockInputError::Invalid);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliUnlockInputError::TerminalRequired);
+    }
+    let mut unlock = Zeroizing::new(
+        rpassword::prompt_password("Encrypted storage unlock: ")
+            .map_err(|_| CliUnlockInputError::Read)?,
+    );
+    if u64::try_from(unlock.len()).unwrap_or(u64::MAX) > MAXIMUM_CLI_UNLOCK_BYTES {
+        return Err(CliUnlockInputError::Invalid);
+    }
+    SecretValue::new(std::mem::take(&mut *unlock)).map_err(|_| CliUnlockInputError::Invalid)
+}
+
 /// Market Squawk's complete local command-line surface.
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk")]
@@ -276,6 +337,15 @@ pub enum ConfigCommand {
 /// Provider-source operation.
 #[derive(Debug, Subcommand)]
 pub enum SourceCommand {
+    /// Unlock this workspace's encrypted provider credential storage for the running service.
+    UnlockCredentials {
+        /// Read the bounded unlock from standard input instead of a no-echo terminal prompt.
+        #[arg(long)]
+        stdin: bool,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Import the exact provider credential bundle through the protected installed service.
     ImportCredentials {
         /// Filled copy of `market-squawk-provider-credentials.env.example`.
@@ -483,11 +553,11 @@ pub enum QueryCommand {
         #[arg(long, default_value_t = 1_000)]
         maximum_rows: usize,
     },
-    /// Read one dataset through its immutable manifest authority.
+    /// Read all canonical observations through the latest immutable manifest authority.
     Dataset {
         /// Dataset identity.
         dataset: String,
-        /// Maximum returned rows.
+        /// Complete-result row ceiling; a larger dataset fails rather than returning a preview.
         #[arg(long, default_value_t = 1_000)]
         maximum_rows: usize,
     },

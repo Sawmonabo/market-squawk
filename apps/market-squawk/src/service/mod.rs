@@ -20,6 +20,7 @@ mod operations_bootstrap;
 mod operations_composition;
 mod portfolio_import;
 mod provider_credential_import;
+mod provider_setup;
 mod ready_admission;
 mod recommendation_setup;
 mod research_dataset;
@@ -724,14 +725,14 @@ impl InstalledService {
                     installation_id,
                     secret_backend_policy,
                     fixture,
-                )?,
+                ).await?,
                 None => LocalProduct::try_new_at_selected_workspace(
                     config.clone(),
                     &selected_workspace_guard,
                     &installation_paths,
                     installation_id,
                     secret_backend_policy,
-                )?,
+                ).await?,
             };
             #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
             let product = LocalProduct::try_new_at_selected_workspace(
@@ -740,31 +741,7 @@ impl InstalledService {
                 &installation_paths,
                 installation_id,
                 secret_backend_policy,
-            )?;
-            let provider_capture_recovery = CancellationToken::new();
-            let research = product.research();
-            let provider_capture_report = match tokio::time::timeout(
-                CLIENT_TIMEOUT,
-                research.recover_provider_capture_store(&provider_capture_recovery),
-            )
-            .await
-            {
-                Ok(Ok(report)) => report,
-                Ok(Err(error)) => {
-                    return Err(InstalledServiceError::ProviderCaptureRecovery(error));
-                }
-                Err(_elapsed) => {
-                    provider_capture_recovery.cancel();
-                    return Err(InstalledServiceError::ProviderCaptureRecoveryDeadline);
-                }
-            };
-            tracing::info!(
-                quarantined_staging = provider_capture_report.quarantined_staging().len(),
-                quarantined_objects = provider_capture_report.quarantined_objects().len(),
-                retained_quarantine_entries =
-                    provider_capture_report.retained_quarantine_entries(),
-                "verified retained provider captures before provider runtime restoration"
-            );
+            ).await?;
             let source_recovery_deadline = std::time::Instant::now()
                 .checked_add(CLIENT_TIMEOUT)
                 .ok_or(InstalledServiceError::InvalidComposition)?;
@@ -1226,6 +1203,9 @@ async fn compose_transport(
         product.provider_onboarding(),
         Arc::clone(&inputs),
         runtime.runtime(),
+        product.provider_portal_activation(),
+        desktop_registration.client_id(),
+        runtime.registration(NamedClient::Cli)?.client_id(),
     );
     let services = Arc::new(
         InstalledToolServices::try_new(
@@ -1285,6 +1265,9 @@ async fn compose_transport(
             InstalledDispatcherComposition {
                 services: Arc::clone(&services),
                 runtime: runtime.runtime(),
+                desktop_client: desktop_registration.client_id(),
+                cli_client: runtime.registration(NamedClient::Cli)?.client_id(),
+                inputs: Arc::clone(&inputs),
                 workspace_generation: operations
                     .workspaces()
                     .active()

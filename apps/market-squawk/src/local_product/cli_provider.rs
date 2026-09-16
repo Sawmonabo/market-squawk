@@ -5,17 +5,20 @@ mod ephemeral;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
-use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata};
+use market_squawk_adapter_bls::{
+    BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata, bls_application_provider_budget,
+};
+use market_squawk_adapter_eia::{EiaParseLimits, EiaTransportLimits, eia_api_endpoint_rules};
 use market_squawk_adapter_federal_reserve::{
     BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
     BoardDatasetProfile,
@@ -30,20 +33,21 @@ use market_squawk_adapter_sec::{
     RawEvidenceStore, SecParserLimits, SecRepresentationLimits, SecRepresentationRegistry,
 };
 use market_squawk_adapter_tiingo::tiingo_provider_rate_declaration;
-use market_squawk_adapter_treasury::{TreasuryFiscalQuery, TreasurySourceConfig};
+use market_squawk_adapter_treasury::{
+    TreasuryDailyRateFamily, TreasuryFiscalQuery, TreasurySourceConfig, TreasurySurface,
+};
 use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
 use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{
-    AssetClass, AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
+    AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     InstrumentId, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityLocator,
     ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
     ProviderInstrumentId, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability,
     SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_platform::{
-    BoundedInput, LocalPaths, LocalSecretStoreError, UserAuthorizedInputRoot,
-};
+use market_squawk_platform::{LocalPaths, LocalSecretStoreError};
+use market_squawk_services::{JsonStructureLimits, RequestContext, RequestId, ServiceLimits};
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
     BudgetWindowSemantics, CoverageDomain, CoverageTopology, EndpointPolicy,
@@ -63,7 +67,12 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::application::ResearchProviderRuntimeGeneration;
+use crate::application::{
+    ResearchApplicationServices, ResearchProviderRuntimeGeneration, TreasuryApplicationClosure,
+};
+use crate::provider_activation::eia_configuration::{
+    electricity_price_profile, electricity_price_query,
+};
 use crate::provider_activation::{
     BoardAdapterActivation, CommittedProviderAdapterReplacement,
     ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
@@ -77,7 +86,7 @@ use crate::provider_onboarding::{
     SchwabOAuthRuntimeError,
 };
 use crate::{
-    BlsAdapterActivation, FredAdapterActivation, ProviderActivationLease,
+    BlsAdapterActivation, EiaAdapterActivation, FredAdapterActivation, ProviderActivationLease,
     ProviderActivationOutcome, ProviderAdapterActivation, ProviderAdapterActivationError,
     ProviderAdapterActivationRequest, ProviderOnboardingError, ProviderOnboardingService,
     ProviderPortalActivationAuthority, ProviderPortalActivationError,
@@ -91,9 +100,6 @@ use super::provider_activation_state::{
     DurableProviderActivationState, RESTORABLE_RESEARCH_SURFACES, SERIALIZED_RESEARCH_SURFACES,
 };
 
-const LEGACY_REQUEST_SCHEMA_VERSION: u16 = 2;
-const EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION: u16 = 3;
-const PREVIOUS_REQUEST_SCHEMA_VERSION: u16 = 5;
 const REQUEST_SCHEMA_VERSION: u16 = 6;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
 const SCHWAB_MARKET_DOCTOR_DURATION: Duration = Duration::from_secs(5 * 60);
@@ -134,11 +140,22 @@ pub(crate) struct ProviderResearchActivationService {
     activation: Arc<ProviderAdapterActivation>,
     state: DurableProviderActivationState,
     tasks: Arc<ProviderActivationTaskAuthority>,
+    treasury_publication: Arc<OnceLock<TreasuryPublicationRuntime>>,
     schwab_doctor_tasks: Arc<SchwabMarketDoctorTaskAuthority>,
     schwab_oauth_lifecycle: Arc<SchwabOAuthServiceLifecycle>,
     schwab_oauth: Arc<OnceCell<Arc<SchwabOAuthRuntime>>>,
     schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
     schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
+}
+
+enum ResearchSetupInput {
+    Selected(ProviderPortalActivationRequest),
+    Saved { surface: String },
+}
+
+struct TreasuryPublicationRuntime {
+    closure: Arc<TreasuryApplicationClosure>,
+    domains: Weak<ResearchApplicationServices>,
 }
 
 pub(crate) type SchwabOAuthRuntimeFactory = Arc<
@@ -172,11 +189,143 @@ impl ProviderResearchActivationService {
             activation,
             state,
             tasks: Arc::new(ProviderActivationTaskAuthority::new()),
+            treasury_publication: Arc::new(OnceLock::new()),
             schwab_doctor_tasks: Arc::new(SchwabMarketDoctorTaskAuthority::new()),
             schwab_oauth_lifecycle: Arc::new(SchwabOAuthServiceLifecycle::new()),
             schwab_oauth: Arc::new(OnceCell::new()),
             schwab_oauth_factory,
             schwab_doctor,
+        }
+    }
+
+    pub(super) fn bind_treasury_publication(
+        &self,
+        closure: Arc<TreasuryApplicationClosure>,
+        domains: &Arc<ResearchApplicationServices>,
+    ) -> Result<(), CliProviderActivationError> {
+        self.treasury_publication
+            .set(TreasuryPublicationRuntime {
+                closure,
+                domains: Arc::downgrade(domains),
+            })
+            .map_err(|_| CliProviderActivationError::StateUnavailable)
+    }
+
+    fn prepare_treasury_publication(
+        &self,
+        surface_id: &str,
+    ) -> Result<bool, CliProviderActivationError> {
+        let surface = match surface_id {
+            TREASURY_FISCAL_SURFACE => TreasurySurface::FiscalData,
+            TREASURY_XML_SURFACE => TreasurySurface::DailyRatesXml,
+            _ => return Ok(false),
+        };
+        self.tasks.require_admission()?;
+        let domains = self
+            .treasury_publication
+            .get()
+            .and_then(|runtime| runtime.domains.upgrade())
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        match surface {
+            TreasurySurface::FiscalData => domains.configure_treasury_fiscal_unavailable(),
+            TreasurySurface::DailyRatesXml => domains.configure_treasury_daily_unavailable(),
+        }
+        .map_err(|error| CliProviderActivationError::TreasuryPublication(Box::new(error)))?;
+        Ok(true)
+    }
+
+    pub(super) async fn publish_treasury_for_startup(
+        &self,
+        surface: TreasurySurface,
+        cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        self.tasks.require_admission()?;
+        let deadline = treasury_publication_deadline()?;
+        let guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            _ = self.tasks.cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            result = tokio::time::timeout_at(
+                TokioInstant::from_std(deadline),
+                self.state.acquire_activation(surface.profile_id()),
+            ) => result
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+        };
+        // Read the desired recipe and runtime only after acquiring the fence: a replacement
+        // may have completed while this startup task waited.
+        self.publish_treasury_under_activation_guard(
+            surface.profile_id(),
+            &guard,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn publish_treasury_under_activation_guard(
+        &self,
+        surface_id: &str,
+        _guard: &tokio::sync::OwnedMutexGuard<()>,
+        deadline: Instant,
+        request_cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        let surface = match surface_id {
+            TREASURY_FISCAL_SURFACE => TreasurySurface::FiscalData,
+            TREASURY_XML_SURFACE => TreasurySurface::DailyRatesXml,
+            _ => return Ok(()),
+        };
+        self.tasks.require_admission()?;
+        let runtime = self
+            .treasury_publication
+            .get()
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        let domains = runtime
+            .domains
+            .upgrade()
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        let (provider_datasets, expected_generation) = match surface {
+            TreasurySurface::FiscalData => {
+                let (query, generation) = treasury_fiscal_release_query(&self.state)?;
+                (
+                    vec![
+                        query
+                            .dataset()
+                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+                    ],
+                    generation,
+                )
+            }
+            TreasurySurface::DailyRatesXml => {
+                treasury_daily_rate_all_history_datasets(&self.state)?
+            }
+        };
+        let configuration = super::TreasuryStartupConfiguration {
+            provider_datasets,
+            generation: super::treasury_runtime_generation(
+                &self.activation,
+                surface,
+                expected_generation,
+            )?,
+        };
+        let cancellation = self.tasks.cancellation.child_token();
+        let publication = super::publish_treasury_surface(
+            Arc::clone(&runtime.closure),
+            domains,
+            surface,
+            configuration,
+            deadline,
+            cancellation.clone(),
+        );
+        tokio::pin!(publication);
+        tokio::select! {
+            biased;
+            _ = request_cancellation.cancelled() => {
+                cancellation.cancel();
+                // Keep polling the actual publication through its blocking replay join.
+                publication.await
+            }
+            result = &mut publication => result,
         }
     }
 
@@ -285,8 +434,12 @@ impl ProviderResearchActivationService {
                     .await
             }
             request => {
-                self.activate_research_from_portal(session_id, request, cancellation)
-                    .await
+                self.activate_research_from_portal(
+                    session_id,
+                    ResearchSetupInput::Selected(request),
+                    cancellation,
+                )
+                .await
             }
         }
     }
@@ -344,37 +497,83 @@ impl ProviderResearchActivationService {
     async fn activate_research_from_portal(
         &self,
         session_id: Uuid,
-        request: ProviderPortalActivationRequest,
+        request: ResearchSetupInput,
         cancellation: CancellationToken,
     ) -> Result<ProviderPortalActivationView, CliProviderActivationError> {
         self.tasks.require_admission()?;
         if cancellation.is_cancelled() {
             return Err(CliProviderActivationError::Cancelled);
         }
+        let publication_cancellation = self.tasks.cancellation.child_token();
+        let treasury_import = match &request {
+            ResearchSetupInput::Selected(ProviderPortalActivationRequest::TreasuryFiscal {
+                ..
+            }) => Some(TreasurySurface::FiscalData),
+            ResearchSetupInput::Selected(ProviderPortalActivationRequest::TreasuryDailyRates) => {
+                Some(TreasurySurface::DailyRatesXml)
+            }
+            ResearchSetupInput::Saved { surface } if surface == TREASURY_FISCAL_SURFACE => {
+                Some(TreasurySurface::FiscalData)
+            }
+            ResearchSetupInput::Saved { surface } if surface == TREASURY_XML_SURFACE => {
+                Some(TreasurySurface::DailyRatesXml)
+            }
+            _ => None,
+        }
+        .map(|surface| TreasuryImportControl {
+            key: TreasuryImportKey {
+                session_id,
+                surface,
+            },
+            cancellation: publication_cancellation.clone(),
+            admitted: Arc::new(OnceLock::new()),
+        });
+        let treasury_admitted = treasury_import
+            .as_ref()
+            .map(|control| Arc::clone(&control.admitted));
         let paths = self.paths.clone();
         let state = self.state.clone();
         let activation_authority = Arc::clone(&self.activation);
         let onboarding = Arc::clone(&self.onboarding);
-        let response = self
+        let publication_service = self.clone();
+        let (registered, registration) = oneshot::channel();
+        let mut response = self
             .tasks
-            .spawn(Box::pin(async move {
+            .spawn_with_import(Box::pin(async move {
                 let completion = CancellationToken::new();
                 let lease = onboarding
                     .prepare_runtime_activation_target(session_id, completion.clone())
                     .await
                     .map_err(CliProviderActivationError::Onboarding)?;
-                let (provider, evidence) = portal_provider_request(&lease, request)?;
-                require_surface(&lease, provider.surface())?;
                 let surface_id = lease.surface_id().as_str().to_owned();
-                let _activation_guard = state
-                    .acquire_activation(&surface_id)
-                    .await
-                    .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-                let request = ActivationRequest {
-                    schema_version: REQUEST_SCHEMA_VERSION,
-                    session_id,
-                    provider,
+                let _activation_guard = tokio::select! {
+                    biased;
+                    _ = publication_cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                    _ = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                    _ = publication_service.tasks.cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                    result = state.acquire_activation(&surface_id) =>
+                        result.map_err(|_| CliProviderActivationError::StateUnavailable)?,
                 };
+                let (request, evidence) = match request {
+                    ResearchSetupInput::Selected(selected) => {
+                        let (provider, evidence) = portal_provider_request(&lease, selected)?;
+                        (ActivationRequest { schema_version: REQUEST_SCHEMA_VERSION, session_id, provider }, evidence)
+                    }
+                    ResearchSetupInput::Saved { surface } => {
+                        if surface != surface_id { return Err(CliProviderActivationError::SurfaceMismatch); }
+                        let DurableActivationRecipeState::Desired(recipe) = state.load_recipe_for_lifecycle(&surface_id)
+                            .map_err(|_| CliProviderActivationError::StateUnavailable)? else {
+                                return Err(CliProviderActivationError::StateUnavailable);
+                            };
+                        if recipe.session_id != session_id { return Err(CliProviderActivationError::SurfaceMismatch); }
+                        let request = decode_request(&recipe.request_bytes)?;
+                        if request.session_id != session_id { return Err(CliProviderActivationError::InvalidRequest); }
+                        let evidence = LoadedActivationEvidence::from_durable(&state, &request)?;
+                        if evidence.digests() != recipe.evidence_digests { return Err(CliProviderActivationError::InvalidRequest); }
+                        (request, evidence)
+                    }
+                };
+                require_surface(&lease, request.provider.surface())?;
                 let request_bytes = serde_json::to_vec(&request)
                     .map_err(|_error| CliProviderActivationError::InvalidRequest)?;
                 if request_bytes.is_empty()
@@ -404,16 +603,130 @@ impl ProviderResearchActivationService {
                 let active = onboarding
                     .activation_lease(session_id)
                     .map_err(CliProviderActivationError::Onboarding)?;
-                Ok(ProviderPortalActivationView::from_research_lease(
+                let view = ProviderPortalActivationView::from_research_lease(
                     active.surface_id().clone(),
                     &active,
                     provider_dataset_identifier,
-                ))
-            }))
+                );
+                if publication_service.prepare_treasury_publication(&surface_id)? {
+                    let admitted = TreasuryPublicationBinding::try_current(&publication_service, active)?;
+                    treasury_admitted.as_ref().ok_or(CliProviderActivationError::StateUnavailable)?
+                        .set(admitted).map_err(|_| CliProviderActivationError::StateUnavailable)?;
+                    // The durable user intent is committed and the actual task already has
+                    // retained custody. A short portal request owns only this acknowledgement;
+                    // application shutdown and source revocation still cancel the publication.
+                    let _registered = registered.send(view.clone().with_pending_publication());
+                    publication_service
+                        .publish_treasury_under_activation_guard(
+                            &surface_id,
+                            &_activation_guard,
+                            treasury_publication_deadline()?,
+                            publication_cancellation,
+                        )
+                        .await?;
+                }
+                Ok(view)
+            }), treasury_import)
             .await?;
-        response
-            .await
-            .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+        tokio::select! {
+            biased;
+            outcome = &mut response => outcome
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            acknowledgement = registration => match acknowledgement {
+                Ok(view) => Ok(view),
+                Err(_) => response.await
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            },
+        }
+    }
+
+    async fn resume_treasury_publication(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, CliProviderActivationError> {
+        self.tasks.require_admission()?;
+        if cancellation.is_cancelled() {
+            return Err(CliProviderActivationError::Cancelled);
+        }
+        let lease = self
+            .onboarding
+            .activation_lease(session_id)
+            .map_err(CliProviderActivationError::Onboarding)?;
+        let key = TreasuryImportKey::from_surface(session_id, lease.surface_id().as_str())
+            .ok_or(CliProviderActivationError::SurfaceMismatch)?;
+        let current = TreasuryPublicationBinding::try_current(self, lease.clone())?;
+        if self.tasks.has_pending_import(key, &current).await {
+            return Ok(ProviderPortalActivationView::from_lease(
+                lease.surface_id().clone(),
+                &lease,
+            )
+            .with_pending_publication());
+        }
+        let publication_cancellation = self.tasks.cancellation.child_token();
+        let treasury_import = TreasuryImportControl {
+            key,
+            cancellation: publication_cancellation.clone(),
+            admitted: Arc::new(OnceLock::new()),
+        };
+        let admitted = Arc::clone(&treasury_import.admitted);
+        let service = self.clone();
+        let (registered, registration) = oneshot::channel();
+        let mut response = self.tasks.spawn_with_import(Box::pin(async move {
+            let lease = service.onboarding.activation_lease(session_id)
+                .map_err(CliProviderActivationError::Onboarding)?;
+            let surface_id = lease.surface_id().as_str();
+            if !matches!(surface_id, TREASURY_FISCAL_SURFACE | TREASURY_XML_SURFACE) {
+                return Err(CliProviderActivationError::SurfaceMismatch);
+            }
+            let deadline = treasury_publication_deadline()?;
+            let guard = tokio::select! {
+                biased;
+                _ = publication_cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                _ = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                _ = service.tasks.cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                result = tokio::time::timeout_at(TokioInstant::from_std(deadline),
+                    service.state.acquire_activation(surface_id)) => result
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            };
+            let DurableActivationRecipeState::Desired(recipe) = service.state.load_recipe(surface_id)
+                .map_err(|_| CliProviderActivationError::StateUnavailable)? else {
+                return Err(CliProviderActivationError::StateUnavailable);
+            };
+            if recipe.session_id != session_id {
+                return Err(CliProviderActivationError::StateUnavailable);
+            }
+            let runtime = service.activation.research_runtime_generation(lease.surface_id())
+                .map_err(CliProviderActivationError::Activation)?
+                .ok_or(CliProviderActivationError::StateUnavailable)?;
+            if runtime.session_id() != session_id
+                || runtime.generation_digest()
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                    != recipe.runtime_generation_digest
+            {
+                return Err(CliProviderActivationError::StateUnavailable);
+            }
+            service.prepare_treasury_publication(surface_id)?;
+            let view = ProviderPortalActivationView::from_lease(lease.surface_id().clone(), &lease);
+            admitted.set(TreasuryPublicationBinding::try_current(&service, lease.clone())?)
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+            let _registered = registered.send(view.clone().with_pending_publication());
+            service.publish_treasury_under_activation_guard(
+                surface_id, &guard, deadline, publication_cancellation,
+            ).await?;
+            Ok(view)
+        }), Some(treasury_import)).await?;
+        tokio::select! {
+            biased;
+            outcome = &mut response => outcome
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            acknowledgement = registration => match acknowledgement {
+                Ok(view) => Ok(view),
+                Err(_) => response.await
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            },
+        }
     }
 
     async fn cancel_from_portal(
@@ -430,7 +743,10 @@ impl ProviderResearchActivationService {
             .resume(session_id)
             .map_err(CliProviderActivationError::Onboarding)?;
         let surface_id = session.surface_id().to_owned();
-        let _activation_guard = if SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
+        let cancel_import = TreasuryImportKey::from_surface(session_id, &surface_id);
+        let _activation_guard = if cancel_import.is_none()
+            && SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str())
+        {
             Some(
                 self.state
                     .acquire_activation(&surface_id)
@@ -446,57 +762,86 @@ impl ProviderResearchActivationService {
         let completion = CancellationToken::new();
         let response = self
             .tasks
-            .spawn(Box::pin(async move {
-                let _activation_guard = _activation_guard;
-                if SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
-                    let profile = SourceIdentifier::try_from(surface_id.as_str())
-                        .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?;
-                    if let Some(runtime) = activation
-                        .research_runtime_generation(&profile)
-                        .map_err(CliProviderActivationError::Activation)?
-                        .filter(|runtime| runtime.session_id() == session_id)
-                    {
-                        activation
-                            .revoke_research_runtime(&runtime)
-                            .await
-                            .map_err(CliProviderActivationError::Activation)?;
-                    }
-                    if RESTORABLE_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
-                        match state
-                            .load_recipe_for_lifecycle(&surface_id)
-                            .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+            .spawn_cancellation(
+                Box::pin(async move {
+                    // Startup publication belongs to the existing startup owner, outside this
+                    // portal slot. Exact-generation revocation cancels its source authority
+                    // before waiting for the activation fence, as Source.Stop already does.
+                    if cancel_import.is_some() {
+                        let profile = SourceIdentifier::try_from(surface_id.as_str())
+                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+                        if let Some(runtime) = activation
+                            .research_runtime_generation(&profile)
+                            .map_err(CliProviderActivationError::Activation)?
+                            .filter(|runtime| runtime.session_id() == session_id)
                         {
-                            DurableActivationRecipeState::Desired(recipe)
-                            | DurableActivationRecipeState::Staged(recipe)
-                            | DurableActivationRecipeState::Cutover(recipe)
-                                if recipe.session_id == session_id =>
-                            {
-                                if !state
-                                    .quarantine_recipe_if_current(
-                                        &surface_id,
-                                        recipe.state_digest,
-                                        DurableActivationQuarantineReason::Cancelled,
-                                    )
-                                    .map_err(|_error| {
-                                        CliProviderActivationError::StateUnavailable
-                                    })?
-                                {
-                                    return Err(CliProviderActivationError::StateUnavailable);
-                                }
-                            }
-                            DurableActivationRecipeState::Missing
-                            | DurableActivationRecipeState::Desired(_)
-                            | DurableActivationRecipeState::Staged(_)
-                            | DurableActivationRecipeState::Cutover(_)
-                            | DurableActivationRecipeState::Quarantined(_) => {}
+                            activation
+                                .revoke_research_runtime(&runtime)
+                                .await
+                                .map_err(CliProviderActivationError::Activation)?;
                         }
                     }
-                }
-                onboarding
-                    .cancel(session_id, completion)
-                    .await
-                    .map_err(CliProviderActivationError::Onboarding)
-            }))
+                    let _activation_guard = if cancel_import.is_some() {
+                        Some(
+                            state
+                                .acquire_activation(&surface_id)
+                                .await
+                                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+                        )
+                    } else {
+                        _activation_guard
+                    };
+                    if SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
+                        let profile = SourceIdentifier::try_from(surface_id.as_str())
+                            .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?;
+                        if let Some(runtime) = activation
+                            .research_runtime_generation(&profile)
+                            .map_err(CliProviderActivationError::Activation)?
+                            .filter(|runtime| runtime.session_id() == session_id)
+                        {
+                            activation
+                                .revoke_research_runtime(&runtime)
+                                .await
+                                .map_err(CliProviderActivationError::Activation)?;
+                        }
+                        if RESTORABLE_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
+                            match state
+                                .load_recipe_for_lifecycle(&surface_id)
+                                .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+                            {
+                                DurableActivationRecipeState::Desired(recipe)
+                                | DurableActivationRecipeState::Staged(recipe)
+                                | DurableActivationRecipeState::Cutover(recipe)
+                                    if recipe.session_id == session_id =>
+                                {
+                                    if !state
+                                        .quarantine_recipe_if_current(
+                                            &surface_id,
+                                            recipe.state_digest,
+                                            DurableActivationQuarantineReason::Cancelled,
+                                        )
+                                        .map_err(|_error| {
+                                            CliProviderActivationError::StateUnavailable
+                                        })?
+                                    {
+                                        return Err(CliProviderActivationError::StateUnavailable);
+                                    }
+                                }
+                                DurableActivationRecipeState::Missing
+                                | DurableActivationRecipeState::Desired(_)
+                                | DurableActivationRecipeState::Staged(_)
+                                | DurableActivationRecipeState::Cutover(_)
+                                | DurableActivationRecipeState::Quarantined(_) => {}
+                            }
+                        }
+                    }
+                    onboarding
+                        .cancel(session_id, completion)
+                        .await
+                        .map_err(CliProviderActivationError::Onboarding)
+                }),
+                cancel_import,
+            )
             .await?;
         response
             .await
@@ -605,15 +950,116 @@ impl SchwabOAuthServiceLifecycle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TreasuryImportKey {
+    session_id: Uuid,
+    surface: TreasurySurface,
+}
+
+impl TreasuryImportKey {
+    fn from_surface(session_id: Uuid, surface_id: &str) -> Option<Self> {
+        let surface = match surface_id {
+            TREASURY_FISCAL_SURFACE => TreasurySurface::FiscalData,
+            TREASURY_XML_SURFACE => TreasurySurface::DailyRatesXml,
+            _ => return None,
+        };
+        Some(Self {
+            session_id,
+            surface,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct TreasuryImportControl {
+    key: TreasuryImportKey,
+    cancellation: CancellationToken,
+    admitted: Arc<OnceLock<TreasuryPublicationBinding>>,
+}
+
+/// Exact authority populated only after the source and durable recipe are registered.
+struct TreasuryPublicationBinding {
+    lease: ProviderActivationLease,
+    runtime_generation_digest: EvidenceDigest,
+    recipe_state_digest: EvidenceDigest,
+}
+
+impl TreasuryPublicationBinding {
+    fn try_current(
+        service: &ProviderResearchActivationService,
+        lease: ProviderActivationLease,
+    ) -> Result<Self, CliProviderActivationError> {
+        let surface = lease.surface_id();
+        if TreasuryImportKey::from_surface(lease.session_id(), surface.as_str()).is_none() {
+            return Err(CliProviderActivationError::SurfaceMismatch);
+        }
+        let DurableActivationRecipeState::Desired(recipe) = service
+            .state
+            .load_recipe(surface.as_str())
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?
+        else {
+            return Err(CliProviderActivationError::StateUnavailable);
+        };
+        let runtime = service
+            .activation
+            .research_runtime_generation(surface)
+            .map_err(CliProviderActivationError::Activation)?
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        let runtime_generation_digest = runtime_generation_digest(&runtime)?;
+        if recipe.session_id != lease.session_id()
+            || runtime.session_id() != lease.session_id()
+            || runtime.profile() != surface
+            || runtime.capability_revision() != lease.capability_revision()
+            || runtime.capability_digest() != lease.capability_digest()
+            || runtime.credential_generation() != lease.generation()
+            || runtime.secret_reference() != lease.secret_reference()
+            || runtime.authority_effective_at() != lease.authority_effective_at()
+            || runtime.parent_rights_authorization_evidence() != lease.rights_decision_digest()
+            || runtime_generation_digest != recipe.runtime_generation_digest
+            || service
+                .state
+                .current_state_digest(surface.as_str())
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                != Some(recipe.state_digest)
+        {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        Ok(Self {
+            lease,
+            runtime_generation_digest,
+            recipe_state_digest: recipe.state_digest,
+        })
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        self.lease.same_authority_as(&current.lease)
+            && self.runtime_generation_digest == current.runtime_generation_digest
+            && self.recipe_state_digest == current.recipe_state_digest
+    }
+}
+
+struct RetainedProviderActivationTask {
+    task: JoinHandle<Result<(), CliProviderActivationError>>,
+    treasury_import: Option<TreasuryImportControl>,
+}
+
+impl RetainedProviderActivationTask {
+    fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
 struct ProviderActivationTaskAuthority {
     accepting: AtomicBool,
-    task: AsyncMutex<Option<JoinHandle<()>>>,
+    cancellation: CancellationToken,
+    task: AsyncMutex<Option<RetainedProviderActivationTask>>,
 }
 
 impl ProviderActivationTaskAuthority {
     fn new() -> Self {
         Self {
             accepting: AtomicBool::new(true),
+            cancellation: CancellationToken::new(),
             task: AsyncMutex::new(None),
         }
     }
@@ -627,34 +1073,132 @@ impl ProviderActivationTaskAuthority {
     }
 
     async fn spawn<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
+    where
+        T: Send + 'static,
+    {
+        self.spawn_owned(work, None, None).await
+    }
+
+    async fn has_pending_import(
         &self,
-        work: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
-    ) -> Result<oneshot::Receiver<T>, CliProviderActivationError>
+        key: TreasuryImportKey,
+        current: &TreasuryPublicationBinding,
+    ) -> bool {
+        self.task.lock().await.as_ref().is_some_and(|task| {
+            !task.is_finished()
+                && task.treasury_import.as_ref().is_some_and(|import| {
+                    import.key == key
+                        && import
+                            .admitted
+                            .get()
+                            .is_some_and(|admitted| admitted.matches(current))
+                })
+        })
+    }
+
+    async fn spawn_with_import<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+        treasury_import: Option<TreasuryImportControl>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
+    where
+        T: Send + 'static,
+    {
+        self.spawn_owned(work, treasury_import, None).await
+    }
+
+    async fn spawn_cancellation<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+        cancel_import: Option<TreasuryImportKey>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
+    where
+        T: Send + 'static,
+    {
+        self.spawn_owned(work, None, cancel_import).await
+    }
+
+    async fn spawn_owned<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+        treasury_import: Option<TreasuryImportControl>,
+        cancel_import: Option<TreasuryImportKey>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
     where
         T: Send + 'static,
     {
         self.require_admission()?;
         let mut task = self.task.lock().await;
-        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+        let matching_import = task
+            .as_ref()
+            .and_then(|task| task.treasury_import.as_ref())
+            .is_some_and(|import| Some(import.key) == cancel_import);
+        if matching_import {
+            // Signal only this exact Treasury session/surface before its activation fence.
+            if let Some(import) = task.as_ref().and_then(|task| task.treasury_import.as_ref()) {
+                import.cancellation.cancel();
+            }
+        } else if task.as_ref().is_some_and(|task| !task.is_finished()) {
             return Err(CliProviderActivationError::StateUnavailable);
         }
-        if let Some(previous) = task.take() {
-            previous
-                .await
-                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        }
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(CliProviderActivationError::StateUnavailable);
-        }
+        self.require_admission()?;
         let (sender, receiver) = oneshot::channel();
-        *task = Some(tokio::spawn(async move {
-            let _response_waiter = sender.send(work.await);
-        }));
+        let retained_owner = Arc::clone(self);
+        // Transfer the original handle directly into the retained successor before any
+        // further await. Dropping the HTTP waiter cannot lose the admitted cancellation
+        // cleanup, the predecessor's actual join, or its original failure.
+        let predecessor = task.take();
+        *task = Some(RetainedProviderActivationTask {
+            treasury_import,
+            task: tokio::spawn(async move {
+                let mut publication_failure = None;
+                if let Some(mut previous) = predecessor {
+                    let outcome = (&mut previous.task)
+                        .await
+                        .map_err(|_| CliProviderActivationError::StateUnavailable);
+                    let failure = match outcome {
+                        Ok(Err(error)) | Err(error) => Some(error),
+                        Ok(Ok(())) => None,
+                    };
+                    if let Some(error) = failure {
+                        if matching_import && !error.is_cancellation() {
+                            publication_failure = Some(error);
+                        } else if !error.is_cancellation() {
+                            tracing::warn!(error = ?error, "previous provider activation/publication failed");
+                        }
+                    }
+                }
+                let cleanup = work.await;
+                let outcome = match (publication_failure, cleanup) {
+                    (None, outcome) => outcome,
+                    (Some(publication), Ok(_)) => Err(publication),
+                    (Some(publication), Err(cleanup)) => {
+                        Err(CliProviderActivationError::CancellationCleanup {
+                            publication: Box::new(publication),
+                            cleanup: Box::new(cleanup),
+                        })
+                    }
+                };
+                if let Err(error) = &outcome {
+                    tracing::warn!(error = ?error, "provider activation/publication failed");
+                }
+                let retained_outcome = match sender.send(outcome) {
+                    Ok(()) | Err(Ok(_)) => Ok(()),
+                    Err(Err(error)) => Err(error),
+                };
+                drop(retained_owner);
+                retained_outcome
+            }),
+        });
         Ok(receiver)
     }
 
     fn begin_shutdown(&self) {
         self.accepting.store(false, Ordering::Release);
+        self.cancellation.cancel();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), CliProviderActivationError> {
@@ -663,21 +1207,18 @@ impl ProviderActivationTaskAuthority {
         let mut slot = tokio::time::timeout_at(deadline, self.task.lock())
             .await
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        let Some(mut task) = slot.take() else {
+        let Some(task) = slot.as_mut() else {
             return Ok(());
         };
-        drop(slot);
-        match tokio::time::timeout_at(deadline, &mut task).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_error)) => Err(CliProviderActivationError::StateUnavailable),
-            Err(_elapsed) => {
-                let mut slot = self.task.lock().await;
-                if slot.is_some() {
-                    return Err(CliProviderActivationError::StateUnavailable);
-                }
-                *slot = Some(task);
-                Err(CliProviderActivationError::StateUnavailable)
-            }
+        // Poll in the authority's slot. Cancelling this shutdown waiter cannot detach the
+        // activation or the blocking replay it is still draining.
+        let outcome = tokio::time::timeout_at(deadline, &mut task.task)
+            .await
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        *slot = None;
+        match outcome.map_err(|_| CliProviderActivationError::StateUnavailable)? {
+            Err(error) if error.is_cancellation() => Ok(()),
+            outcome => outcome,
         }
     }
 }
@@ -820,6 +1361,9 @@ async fn publish_research_activation(
     request: ProviderAdapterActivationRequest,
     cancellation: CancellationToken,
 ) -> Result<(), CliProviderActivationError> {
+    let publication_deadline = Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .ok_or(CliProviderActivationError::ProviderConfiguration)?;
     let surface_id = lease.surface_id().as_str();
     let evidence_digests = evidence.digests();
     let candidate = activation_authority
@@ -844,7 +1388,13 @@ async fn publish_research_activation(
                         != Some(candidate_runtime_digest)
                     && current_state_digest == Some(recipe.state_digest) =>
             {
-                Ok(())
+                publish_eia_activated_data(
+                    activation_authority,
+                    lease,
+                    cancellation,
+                    publication_deadline,
+                )
+                .await
             }
             Ok(DurableActivationRecipeState::Missing)
             | Ok(DurableActivationRecipeState::Quarantined(_))
@@ -891,7 +1441,12 @@ async fn publish_research_activation(
         };
         let predecessor_state_digest = Some(predecessor_recipe.state_digest);
         let prepared = activation_authority
-            .prepare_research_replacement(lease.clone(), request, expected.clone(), cancellation)
+            .prepare_research_replacement(
+                lease.clone(),
+                request,
+                expected.clone(),
+                cancellation.clone(),
+            )
             .await
             .map_err(CliProviderActivationError::Activation)?;
         if prepared.candidate() != &candidate {
@@ -928,7 +1483,10 @@ async fn publish_research_activation(
                 reason,
                 caller_error,
             } = failure;
-            reconcile_failed_replacement(
+            // Keep the large compensation future off this publisher's inline state,
+            // matching the forward replacement boundary above. The same caller still
+            // owns and polls compensation through its original terminal result.
+            Box::pin(reconcile_failed_replacement(
                 state,
                 activation_authority,
                 onboarding,
@@ -937,14 +1495,20 @@ async fn publish_research_activation(
                 published_state_digest,
                 candidate_state_digest,
                 reason,
-            )
+            ))
             .await?;
             return Err(caller_error);
         }
         state
             .reconcile_evidence_objects()
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        return Ok(());
+        return publish_eia_activated_data(
+            activation_authority,
+            lease,
+            cancellation,
+            publication_deadline,
+        )
+        .await;
     }
 
     let published = state
@@ -995,7 +1559,7 @@ async fn publish_research_activation(
         return Err(error);
     }
     let outcome = match activation_authority
-        .activate_exact_research_profile(&candidate, request, cancellation)
+        .activate_exact_research_profile(&candidate, request, cancellation.clone())
         .await
     {
         Ok(outcome) => outcome,
@@ -1073,6 +1637,38 @@ async fn publish_research_activation(
     state
         .reconcile_evidence_objects()
         .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+    publish_eia_activated_data(
+        activation_authority,
+        lease,
+        cancellation,
+        publication_deadline,
+    )
+    .await
+}
+
+pub(super) async fn publish_eia_activated_data(
+    activation: &ProviderAdapterActivation,
+    lease: &ProviderActivationLease,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<(), CliProviderActivationError> {
+    if lease.surface_id().as_str() != "eia.api-v2" {
+        return Ok(());
+    }
+    let structure = JsonStructureLimits::try_new(16, 4096, 64, 64)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let limits = ServiceLimits::try_new(4096, 8, 4096, 8, structure)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let context = RequestContext::new(
+        RequestId::String(Arc::from("source.energy-data.publication")),
+        cancellation,
+        deadline,
+        limits,
+    );
+    activation
+        .publish_eia_macro(&context)
+        .await
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     Ok(())
 }
 
@@ -1581,7 +2177,7 @@ fn quarantine_failed_candidate(
         .map_err(|_error| CliProviderActivationError::StateUnavailable)?
     {
         let quarantine = state
-            .load_recipe(surface_id)
+            .load_recipe_for_lifecycle(surface_id)
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
         let DurableActivationRecipeState::Quarantined(quarantine) = quarantine else {
             return Err(CliProviderActivationError::StateUnavailable);
@@ -1610,6 +2206,16 @@ fn require_same_activation_lease(
 
 #[async_trait]
 impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
+    async fn setup_publication_pending(&self, session_id: Uuid) -> bool {
+        let task = self.tasks.task.lock().await;
+        task.as_ref().is_some_and(|task| {
+            !task.is_finished()
+                && task.treasury_import.as_ref().is_some_and(|import| {
+                    import.key.session_id == session_id && import.admitted.get().is_some()
+                })
+        })
+    }
+
     async fn activate(
         &self,
         session_id: Uuid,
@@ -1619,6 +2225,64 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         self.activate_from_portal(session_id, request, cancellation)
             .await
             .map_err(map_portal_activation_error)
+    }
+
+    async fn resume_research_publication(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError> {
+        self.resume_treasury_publication(session_id, cancellation)
+            .await
+            .map_err(map_portal_activation_error)
+    }
+
+    async fn verify_saved_setup(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError> {
+        let session = self
+            .onboarding
+            .resume(session_id)
+            .map_err(|_| ProviderPortalActivationError::Unavailable)?;
+        let surface = SourceIdentifier::try_from(session.surface_id())
+            .map_err(|_| ProviderPortalActivationError::InvalidRequest)?;
+        if self.retained_setup_session(&surface)? != Some(session_id) {
+            return Err(ProviderPortalActivationError::InvalidRequest);
+        }
+        self.activate_research_from_portal(
+            session_id,
+            ResearchSetupInput::Saved {
+                surface: surface.as_str().to_owned(),
+            },
+            cancellation,
+        )
+        .await
+        .map_err(map_portal_activation_error)
+    }
+
+    fn retained_setup_session(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<Option<Uuid>, ProviderPortalActivationError> {
+        // Only research selections have an activation recipe. Account connections retain their
+        // session and credential generation in onboarding and use the account lifecycle owner.
+        // Returning no recipe lets setup and credential import reuse that current session.
+        if !RESTORABLE_RESEARCH_SURFACES.contains(&profile.as_str()) {
+            return Ok(None);
+        }
+        match self
+            .state
+            .load_recipe_for_lifecycle(profile.as_str())
+            .map_err(|_| ProviderPortalActivationError::StateUnavailable)?
+        {
+            DurableActivationRecipeState::Desired(recipe) => Ok(Some(recipe.session_id)),
+            DurableActivationRecipeState::Missing
+            | DurableActivationRecipeState::Staged(_)
+            | DurableActivationRecipeState::Cutover(_)
+            | DurableActivationRecipeState::Quarantined(_) => Ok(None),
+        }
     }
 
     fn provider_dataset_identifier(
@@ -1833,76 +2497,6 @@ async fn run_schwab_market_doctor_task(
     }
 }
 
-/// Activates one already-onboarded research provider from a closed, no-follow request.
-///
-/// The request never carries credential bytes or caller-made rights evidence. Provider-specific
-/// inputs are read beneath the request's retained input-root capability. Persistence authority
-/// comes only from the active code-owned onboarding lease.
-pub(super) async fn activate_research_provider(
-    product: &LocalProduct,
-    request_path: &Path,
-    confirm: bool,
-    cancellation: CancellationToken,
-) -> Result<Value, CliProviderActivationError> {
-    if !confirm {
-        return Err(CliProviderActivationError::ConfirmationRequired);
-    }
-    if cancellation.is_cancelled() {
-        return Err(CliProviderActivationError::Cancelled);
-    }
-    let (root, input, request) = read_request(request_path)?;
-    let onboarding = product.provider_onboarding();
-    let lease = onboarding
-        .prepare_runtime_activation_target(request.session_id, cancellation.clone())
-        .await
-        .map_err(CliProviderActivationError::Onboarding)?;
-    require_surface(&lease, request.provider.surface())?;
-    validate_file_fred_request_scope(&lease, &request)?;
-    let evidence = LoadedActivationEvidence::from_user(&root, &request)?;
-    if cancellation.is_cancelled() {
-        return Err(CliProviderActivationError::Cancelled);
-    }
-    let surface_id = lease.surface_id().as_str().to_owned();
-    let _activation_guard = product
-        .provider_activation_state()
-        .acquire_activation(&surface_id)
-        .await
-        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-    let session_id = request.session_id;
-    let activation = build_research_activation(
-        product.paths(),
-        &lease,
-        input.as_bytes(),
-        request,
-        &evidence,
-    )?;
-    let provider_dataset_identifier = activation.provider_dataset_identifier().cloned();
-    if cancellation.is_cancelled() {
-        return Err(CliProviderActivationError::Cancelled);
-    }
-    publish_research_activation(
-        product.provider_activation_state(),
-        product.provider_activation().as_ref(),
-        product.provider_onboarding().as_ref(),
-        &lease,
-        input.as_bytes(),
-        &evidence,
-        activation,
-        cancellation.clone(),
-    )
-    .await?;
-    product
-        .provider_onboarding()
-        .reconcile_cleanup(session_id, cancellation)
-        .await
-        .map_err(CliProviderActivationError::Onboarding)?;
-    Ok(activation_result(
-        lease.surface_id(),
-        &lease,
-        provider_dataset_identifier.as_ref(),
-    ))
-}
-
 pub(super) fn restore_research_providers(
     paths: &LocalPaths,
     onboarding: &crate::ProviderOnboardingService,
@@ -2002,6 +2596,7 @@ pub(super) async fn resume_exact_research_provider(
     surface_id: &str,
     expected_session_id: Uuid,
     cancellation: CancellationToken,
+    deadline: Instant,
 ) -> Result<ResearchProviderRuntimeGeneration, CliProviderActivationError> {
     if cancellation.is_cancelled() {
         return Err(CliProviderActivationError::Cancelled);
@@ -2036,7 +2631,7 @@ pub(super) async fn resume_exact_research_provider(
     }
     let expected = prepared.generation.clone();
     let outcome = activation_authority
-        .activate_exact_research_profile(&expected, prepared.request, cancellation)
+        .activate_exact_research_profile(&expected, prepared.request, cancellation.clone())
         .await
         .map_err(CliProviderActivationError::Activation)?;
     let Some(activated_generation) = provider_activation_generation(&outcome) else {
@@ -2045,6 +2640,13 @@ pub(super) async fn resume_exact_research_provider(
     if activated_generation != &expected {
         return Err(CliProviderActivationError::ProviderConfiguration);
     }
+    publish_eia_activated_data(
+        activation_authority,
+        &prepared.lease,
+        cancellation,
+        deadline,
+    )
+    .await?;
     Ok(expected)
 }
 
@@ -2556,7 +3158,9 @@ fn recovery_quarantine_reason(
             DurableActivationQuarantineReason::AdapterRejected
         }
         CliProviderActivationError::StateUnavailable
-        | CliProviderActivationError::InputUnavailable => {
+        | CliProviderActivationError::InputUnavailable
+        | CliProviderActivationError::TreasuryPublication(_)
+        | CliProviderActivationError::CancellationCleanup { .. } => {
             DurableActivationQuarantineReason::StateInvalid
         }
         CliProviderActivationError::ConfirmationRequired
@@ -2635,7 +3239,7 @@ fn build_research_activation(
                 .iter()
                 .map(|metadata| metadata.series_id().to_owned())
                 .collect();
-            let plan = BlsRequestPlan::try_new(tier, series_ids, start_year, end_year)
+            BlsRequestPlan::try_new(tier, series_ids, start_year, end_year)
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let endpoint = match tier {
                 BlsAccessTier::PublicV1 => "https://api.bls.gov/publicAPI/v1/timeseries/data/",
@@ -2656,26 +3260,19 @@ fn build_research_activation(
                 HistoricalCapability::Historical,
                 metadata_effective,
                 exact_endpoint_policy(endpoint, 16 * 1024 * 1024)?,
-                bls_budget(lease, authorization_mode, plan.limits().daily_queries())?,
+                bls_application_provider_budget(tier)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
             )?;
             ProviderAdapterActivationRequest::Bls(
                 BlsAdapterActivation::try_new(metadata, tier, series, start_year, end_year)
                     .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?,
             )
         }
-        ProviderRequest::TreasuryFiscal {
-            first_record_date,
-            last_record_date,
-            page_size,
-        } => {
+        ProviderRequest::TreasuryFiscal { page_size } => {
             let page_size = NonZeroU16::new(page_size)
                 .ok_or(CliProviderActivationError::ProviderConfiguration)?;
-            let query = TreasuryFiscalQuery::average_interest_rates_v2(
-                first_record_date,
-                last_record_date,
-                page_size,
-            )
-            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let query = TreasuryFiscalQuery::average_interest_rates_v2_all_history(page_size)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let config = TreasurySourceConfig::average_interest_rates(query);
             let metadata =
                 treasury_metadata(lease, activation_evidence, metadata_effective, &config)?;
@@ -2683,12 +3280,9 @@ fn build_research_activation(
                 metadata, config,
             ))
         }
-        ProviderRequest::TreasuryDailyRates {
-            year,
-            start_year,
-            end_year,
-        } => {
-            let config = treasury_daily_rates_config(year, start_year, end_year)?;
+        ProviderRequest::TreasuryDailyRates => {
+            let config = TreasurySourceConfig::daily_rates_all_history()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let metadata =
                 treasury_metadata(lease, activation_evidence, metadata_effective, &config)?;
             ProviderAdapterActivationRequest::Treasury(TreasuryAdapterActivation::new(
@@ -2714,6 +3308,62 @@ fn build_research_activation(
             ProviderAdapterActivationRequest::Fred(
                 FredAdapterActivation::try_new(metadata, provider_dataset)
                     .map_err(CliProviderActivationError::Activation)?,
+            )
+        }
+        ProviderRequest::EiaElectricityPrice {
+            start_period,
+            end_period,
+        } => {
+            require_surface(lease, ProviderSurface::Exact("eia.api-v2"))?;
+            let query = electricity_price_query(start_period, end_period)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let network = EndpointPolicy::try_from_api_rules(
+                eia_api_endpoint_rules(&query)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                request_bounds(1024 * 1024)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+            let policy = lease
+                .provider_budget_policy()
+                .cloned()
+                .ok_or(CliProviderActivationError::InvalidMetadata)?;
+            let declaration = ProviderRateDeclaration::try_for_authorization_subject(
+                policy,
+                &authorization_subject(lease)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+            let metadata = metadata(
+                lease,
+                activation_evidence,
+                "eia",
+                "us-eia",
+                SourceClass::OfficialAgency,
+                CoverageDomain::Macroeconomic,
+                AuthorizationMode::UserAuthorized,
+                HistoricalCapability::RevisionPreserving,
+                metadata_effective,
+                network,
+                declaration.policy().clone(),
+            )?;
+            let profile = electricity_price_profile(query)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let limits = EiaTransportLimits::try_new(
+                EiaParseLimits::production_defaults(),
+                1024 * 1024,
+                1,
+                1024 * 1024,
+            )
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            ProviderAdapterActivationRequest::Eia(
+                EiaAdapterActivation::try_new(
+                    metadata,
+                    profile,
+                    limits,
+                    NonZeroU16::new(1).ok_or(CliProviderActivationError::ProviderConfiguration)?,
+                    NonZeroU32::new(24).ok_or(CliProviderActivationError::ProviderConfiguration)?,
+                    nonzero_u64(1024 * 1024)?,
+                )
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
             )
         }
         ProviderRequest::FederalReserveBoardH15 => {
@@ -2801,30 +3451,6 @@ fn build_research_activation(
     Ok(activation)
 }
 
-fn activation_result(
-    profile: &SourceIdentifier,
-    lease: &ProviderActivationLease,
-    provider_dataset_identifier: Option<&SourceIdentifier>,
-) -> Value {
-    json!({
-        "profile": profile.as_str(),
-        "providerDatasetIdentifier": provider_dataset_identifier
-            .map(SourceIdentifier::as_str),
-        "sessionId": lease.session_id().to_string(),
-        "capabilityRevision": lease.capability_revision().get(),
-        "capabilityEvidence": lease.capability_digest(),
-        "rightsDecisionEvidence": lease.rights_decision_digest(),
-        "persistenceRightsEvidence": lease.persistence_evidence(),
-        "publicConfigurationEvidence": lease.public_configuration_digest(),
-        "credentialGeneration": lease.generation().map(|generation| generation.get()),
-        "verificationExpiresAtUnixNanos": lease
-            .verification_expires_at()
-            .map(Timestamp::unix_nanos),
-        "authorityEffectiveAtUnixNanos": lease.authority_effective_at().unix_nanos(),
-        "issuedAtUnixNanos": lease.issued_at().unix_nanos(),
-    })
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ActivationRequest {
@@ -2837,7 +3463,6 @@ struct ActivationRequest {
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum ProviderRequest {
     Sec {
-        #[serde(default)]
         identities: Vec<SecIdentityMappingRequest>,
     },
     Bls {
@@ -2846,20 +3471,15 @@ enum ProviderRequest {
         end_year: u16,
     },
     TreasuryFiscal {
-        first_record_date: CalendarDate,
-        last_record_date: CalendarDate,
         page_size: u16,
     },
-    TreasuryDailyRates {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        year: Option<u16>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        start_year: Option<u16>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        end_year: Option<u16>,
-    },
+    TreasuryDailyRates,
     FredAlfred {
         configuration: Box<FredProviderRequest>,
+    },
+    EiaElectricityPrice {
+        start_period: String,
+        end_period: String,
     },
     FederalReserveBoardH15,
     YahooEnrichment,
@@ -2895,81 +3515,13 @@ impl ProviderRequest {
             Self::Sec { .. } => ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID),
             Self::Bls { .. } => ProviderSurface::Either(BLS_PUBLIC_SURFACE, BLS_REGISTERED_SURFACE),
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
-            Self::TreasuryDailyRates { .. } => ProviderSurface::Exact(TREASURY_XML_SURFACE),
+            Self::TreasuryDailyRates => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
+            Self::EiaElectricityPrice { .. } => ProviderSurface::Exact("eia.api-v2"),
             Self::FederalReserveBoardH15 => ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE),
             Self::YahooEnrichment => ProviderSurface::Exact(YAHOO_SURFACE),
             Self::TiingoStarterEodNav => ProviderSurface::Exact(TIINGO_SURFACE),
             Self::ControlledLocalFiles { .. } => ProviderSurface::Exact(LOCAL_FILES_SURFACE),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyActivationRequest {
-    schema_version: u16,
-    session_id: Uuid,
-    provider: LegacyProviderRequest,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-enum LegacyProviderRequest {
-    Sec,
-    Bls {
-        series_metadata: Vec<ExactInputReference>,
-        start_year: u16,
-        end_year: u16,
-    },
-    TreasuryFiscal {
-        first_record_date: CalendarDate,
-        last_record_date: CalendarDate,
-        page_size: u16,
-    },
-    TreasuryDailyRates {
-        #[serde(default)]
-        year: Option<u16>,
-        #[serde(default)]
-        start_year: Option<u16>,
-        #[serde(default)]
-        end_year: Option<u16>,
-    },
-}
-
-impl From<LegacyProviderRequest> for ProviderRequest {
-    fn from(request: LegacyProviderRequest) -> Self {
-        match request {
-            LegacyProviderRequest::Sec => Self::Sec {
-                identities: Vec::new(),
-            },
-            LegacyProviderRequest::Bls {
-                series_metadata,
-                start_year,
-                end_year,
-            } => Self::Bls {
-                series_metadata,
-                start_year,
-                end_year,
-            },
-            LegacyProviderRequest::TreasuryFiscal {
-                first_record_date,
-                last_record_date,
-                page_size,
-            } => Self::TreasuryFiscal {
-                first_record_date,
-                last_record_date,
-                page_size,
-            },
-            LegacyProviderRequest::TreasuryDailyRates {
-                year,
-                start_year,
-                end_year,
-            } => Self::TreasuryDailyRates {
-                year,
-                start_year,
-                end_year,
-            },
         }
     }
 }
@@ -2980,6 +3532,23 @@ fn portal_provider_request(
 ) -> Result<(ProviderRequest, LoadedActivationEvidence), CliProviderActivationError> {
     match request {
         ProviderPortalActivationRequest::Source => Err(CliProviderActivationError::SurfaceMismatch),
+        ProviderPortalActivationRequest::EiaElectricityPrice {
+            start_period,
+            end_period,
+        } => {
+            require_surface(lease, ProviderSurface::Exact("eia.api-v2"))?;
+            electricity_price_query(start_period.clone(), end_period.clone())
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            Ok((
+                ProviderRequest::EiaElectricityPrice {
+                    start_period,
+                    end_period,
+                },
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
         ProviderPortalActivationRequest::FederalReserveBoardH15 => {
             require_surface(lease, ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE))?;
             Ok((
@@ -3021,34 +3590,19 @@ fn portal_provider_request(
                 },
             ))
         }
-        ProviderPortalActivationRequest::TreasuryFiscal {
-            first_record_date,
-            last_record_date,
-            page_size,
-        } => {
+        ProviderPortalActivationRequest::TreasuryFiscal { page_size } => {
             require_surface(lease, ProviderSurface::Exact(TREASURY_FISCAL_SURFACE))?;
             Ok((
-                ProviderRequest::TreasuryFiscal {
-                    first_record_date,
-                    last_record_date,
-                    page_size,
-                },
+                ProviderRequest::TreasuryFiscal { page_size },
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
                 },
             ))
         }
-        ProviderPortalActivationRequest::TreasuryDailyRates {
-            start_year,
-            end_year,
-        } => {
+        ProviderPortalActivationRequest::TreasuryDailyRates => {
             require_surface(lease, ProviderSurface::Exact(TREASURY_XML_SURFACE))?;
             Ok((
-                ProviderRequest::TreasuryDailyRates {
-                    year: None,
-                    start_year: Some(start_year),
-                    end_year: Some(end_year),
-                },
+                ProviderRequest::TreasuryDailyRates,
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
                 },
@@ -3233,25 +3787,9 @@ fn require_current_fred_revision(
     Ok(())
 }
 
-fn treasury_daily_rates_config(
-    legacy_year: Option<u16>,
-    start_year: Option<u16>,
-    end_year: Option<u16>,
-) -> Result<TreasurySourceConfig, CliProviderActivationError> {
-    match (legacy_year, start_year, end_year) {
-        (Some(year), None, None) => TreasurySourceConfig::daily_par_yield_curve(year)
-            .map_err(|_| CliProviderActivationError::ProviderConfiguration),
-        (None, Some(start), Some(end)) if start <= end => {
-            TreasurySourceConfig::daily_rates_all_families(start, end)
-                .map_err(|_| CliProviderActivationError::ProviderConfiguration)
-        }
-        _ => Err(CliProviderActivationError::ProviderConfiguration),
-    }
-}
-
-pub(super) fn treasury_daily_rate_release_year(
+pub(super) fn treasury_daily_rate_all_history_datasets(
     state: &DurableProviderActivationState,
-) -> Result<u16, CliProviderActivationError> {
+) -> Result<(Vec<SourceIdentifier>, EvidenceDigest), CliProviderActivationError> {
     let recipe = state
         .load_recipe(TREASURY_XML_SURFACE)
         .map_err(|_| CliProviderActivationError::StateUnavailable)?;
@@ -3262,17 +3800,28 @@ pub(super) fn treasury_daily_rate_release_year(
     if request.session_id != recipe.session_id {
         return Err(CliProviderActivationError::StateUnavailable);
     }
-    let ProviderRequest::TreasuryDailyRates {
-        year: None,
-        start_year: Some(start_year),
-        end_year: Some(end_year),
-    } = request.provider
-    else {
+    let ProviderRequest::TreasuryDailyRates = request.provider else {
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
-    TreasurySourceConfig::daily_rates_all_families(start_year, end_year)
+    let config = TreasurySourceConfig::daily_rates_all_history()
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-    Ok(end_year)
+    let catalog = config
+        .dataset_catalog()
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let datasets = catalog
+        .datasets()
+        .iter()
+        .map(|descriptor| descriptor.provider_dataset().clone())
+        .collect::<Vec<_>>();
+    if datasets.len() != TreasuryDailyRateFamily::ALL.len()
+        || !catalog.complete_selected_family_coverage()
+        || datasets.iter().enumerate().any(|(index, dataset)| {
+            !dataset.as_str().ends_with(":all") || datasets[..index].contains(dataset)
+        })
+    {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
+    Ok((datasets, recipe.runtime_generation_digest))
 }
 
 pub(super) fn treasury_fiscal_release_query(
@@ -3288,22 +3837,13 @@ pub(super) fn treasury_fiscal_release_query(
     if request.session_id != recipe.session_id {
         return Err(CliProviderActivationError::StateUnavailable);
     }
-    let ProviderRequest::TreasuryFiscal {
-        first_record_date,
-        last_record_date,
-        page_size,
-    } = request.provider
-    else {
+    let ProviderRequest::TreasuryFiscal { page_size } = request.provider else {
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
     let page_size =
         NonZeroU16::new(page_size).ok_or(CliProviderActivationError::ProviderConfiguration)?;
-    let query = TreasuryFiscalQuery::average_interest_rates_v2(
-        first_record_date,
-        last_record_date,
-        page_size,
-    )
-    .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let query = TreasuryFiscalQuery::average_interest_rates_v2_all_history(page_size)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     Ok((query, recipe.runtime_generation_digest))
 }
 
@@ -3369,22 +3909,6 @@ struct LoadedActivationEvidence {
 }
 
 impl LoadedActivationEvidence {
-    fn from_user(
-        root: &UserAuthorizedInputRoot,
-        request: &ActivationRequest,
-    ) -> Result<Self, CliProviderActivationError> {
-        let mut objects = BTreeMap::new();
-        for bounded in evidence_references(request)? {
-            let input = read_exact_input(root, bounded.reference, bounded.maximum_bytes)?;
-            let exact = ExactActivationInput {
-                bytes: Arc::from(input.as_bytes()),
-                digest: input.digest(),
-            };
-            insert_evidence(&mut objects, bounded.reference, exact)?;
-        }
-        Ok(Self { objects })
-    }
-
     fn from_durable(
         state: &DurableProviderActivationState,
         request: &ActivationRequest,
@@ -3468,11 +3992,18 @@ fn evidence_references(
             }
         }
         ProviderRequest::TreasuryFiscal { .. }
-        | ProviderRequest::TreasuryDailyRates { .. }
+        | ProviderRequest::TreasuryDailyRates
         | ProviderRequest::FederalReserveBoardH15
         | ProviderRequest::YahooEnrichment
         | ProviderRequest::TiingoStarterEodNav
         | ProviderRequest::ControlledLocalFiles { .. } => {}
+        ProviderRequest::EiaElectricityPrice {
+            start_period,
+            end_period,
+        } => {
+            electricity_price_query(start_period.clone(), end_period.clone())
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+        }
         ProviderRequest::Bls {
             series_metadata, ..
         } => {
@@ -3521,120 +4052,18 @@ fn validate_reference_digest(
     decode_lower_hex_sha256(&reference.sha256)
 }
 
-fn read_request(
-    path: &Path,
-) -> Result<(UserAuthorizedInputRoot, BoundedInput, ActivationRequest), CliProviderActivationError>
-{
-    let absolute =
-        std::path::absolute(path).map_err(|_| CliProviderActivationError::InputUnavailable)?;
-    if absolute
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(CliProviderActivationError::InputUnavailable);
-    }
-    let parent = absolute
-        .parent()
-        .ok_or(CliProviderActivationError::InputUnavailable)?;
-    let name = absolute
-        .file_name()
-        .ok_or(CliProviderActivationError::InputUnavailable)?;
-    let root = UserAuthorizedInputRoot::open(parent)
-        .map_err(|_| CliProviderActivationError::InputUnavailable)?;
-    let input = read_input(&root, Path::new(name), REQUEST_MAXIMUM_BYTES)?;
-    let request = decode_request(input.as_bytes())?;
-    Ok((root, input, request))
-}
-
 fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivationError> {
-    #[derive(Deserialize)]
-    struct SchemaProbe {
-        schema_version: u16,
-    }
-
-    let schema: SchemaProbe =
-        serde_json::from_slice(bytes).map_err(|_| CliProviderActivationError::InvalidRequest)?;
-    match schema.schema_version {
-        REQUEST_SCHEMA_VERSION => {
-            let request: ActivationRequest = serde_json::from_slice(bytes)
-                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
-            if request.schema_version != REQUEST_SCHEMA_VERSION {
-                return Err(CliProviderActivationError::InvalidRequest);
-            }
-            Ok(request)
-        }
-        PREVIOUS_REQUEST_SCHEMA_VERSION => {
-            let mut request: ActivationRequest = serde_json::from_slice(bytes)
-                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
-            if request.schema_version != PREVIOUS_REQUEST_SCHEMA_VERSION
-                || matches!(
-                    &request.provider,
-                    ProviderRequest::FredAlfred { .. }
-                        | ProviderRequest::YahooEnrichment
-                        | ProviderRequest::TiingoStarterEodNav
-                )
-            {
-                return Err(CliProviderActivationError::InvalidRequest);
-            }
-            request.schema_version = REQUEST_SCHEMA_VERSION;
-            Ok(request)
-        }
-        EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION => {
-            let mut request: ActivationRequest = serde_json::from_slice(bytes)
-                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
-            if request.schema_version != EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION
-                || matches!(
-                    &request.provider,
-                    ProviderRequest::FredAlfred { .. }
-                        | ProviderRequest::FederalReserveBoardH15
-                        | ProviderRequest::YahooEnrichment
-                        | ProviderRequest::TiingoStarterEodNav
-                        | ProviderRequest::ControlledLocalFiles { .. }
-                )
-            {
-                return Err(CliProviderActivationError::InvalidRequest);
-            }
-            request.schema_version = REQUEST_SCHEMA_VERSION;
-            Ok(request)
-        }
-        LEGACY_REQUEST_SCHEMA_VERSION => {
-            let request: LegacyActivationRequest = serde_json::from_slice(bytes)
-                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
-            if request.schema_version != LEGACY_REQUEST_SCHEMA_VERSION {
-                return Err(CliProviderActivationError::InvalidRequest);
-            }
-            Ok(ActivationRequest {
-                schema_version: REQUEST_SCHEMA_VERSION,
-                session_id: request.session_id,
-                provider: request.provider.into(),
-            })
-        }
-        _ => Err(CliProviderActivationError::InvalidRequest),
-    }
-}
-
-fn read_input(
-    root: &UserAuthorizedInputRoot,
-    reference: &Path,
-    maximum_bytes: u64,
-) -> Result<BoundedInput, CliProviderActivationError> {
-    root.resolve(reference)
-        .and_then(|input| input.open_bounded(maximum_bytes))
-        .and_then(|input| input.read_bounded())
-        .map_err(|_| CliProviderActivationError::InputUnavailable)
-}
-
-fn read_exact_input(
-    root: &UserAuthorizedInputRoot,
-    reference: &ExactInputReference,
-    maximum_bytes: u64,
-) -> Result<BoundedInput, CliProviderActivationError> {
-    let input = read_input(root, &reference.path, maximum_bytes)?;
-    let expected = validate_reference_digest(reference)?;
-    if input.digest().algorithm() != DigestAlgorithm::Sha256 || input.digest().bytes() != expected {
+    if bytes.is_empty()
+        || u64::try_from(bytes.len()).map_or(true, |length| length > REQUEST_MAXIMUM_BYTES)
+    {
         return Err(CliProviderActivationError::InvalidRequest);
     }
-    Ok(input)
+    let request: ActivationRequest =
+        serde_json::from_slice(bytes).map_err(|_| CliProviderActivationError::InvalidRequest)?;
+    if request.schema_version != REQUEST_SCHEMA_VERSION {
+        return Err(CliProviderActivationError::InvalidRequest);
+    }
+    Ok(request)
 }
 
 fn require_surface(
@@ -4106,6 +4535,7 @@ fn authorization_subject(
         BLS_REGISTERED_SURFACE => "us-bls",
         FRED_SURFACE => "fred",
         TIINGO_SURFACE => TIINGO_SOURCE_ID,
+        "eia.api-v2" => "us-eia",
         _ => return Err(CliProviderActivationError::InvalidMetadata),
     };
     let provider = SourceIdentifier::try_from(provider)
@@ -4224,48 +4654,6 @@ fn bls_series(
             .map_err(|_| CliProviderActivationError::ProviderConfiguration)
         })
         .collect()
-}
-
-fn bls_budget(
-    lease: &ProviderActivationLease,
-    mode: AuthorizationMode,
-    daily_queries: u16,
-) -> Result<ProviderBudgetPolicy, CliProviderActivationError> {
-    let provider = SourceIdentifier::try_from("us-bls")
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    let account = match mode {
-        AuthorizationMode::PublicInterface => None,
-        AuthorizationMode::UserAuthorized => Some(authorization_subject(lease)?),
-        AuthorizationMode::Licensed | AuthorizationMode::UserOwnedLocal => {
-            return Err(CliProviderActivationError::InvalidMetadata);
-        }
-    };
-    let scope = match account {
-        Some(account) => BudgetScope::with_authorization_account(provider, account),
-        None => BudgetScope::new(provider),
-    };
-    let windows = [
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(50).ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(10 * SECOND_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(u32::from(daily_queries))
-                .ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(DAY_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-    ];
-    ProviderBudgetPolicy::try_new_conjunctive(
-        scope,
-        &windows,
-        NonZeroU16::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
-        backoff()?,
-    )
-    .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
 fn sec_state(
@@ -4516,11 +4904,19 @@ const fn lower_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
+fn treasury_publication_deadline() -> Result<Instant, CliProviderActivationError> {
+    Instant::now()
+        .checked_add(super::TREASURY_ANALYTICAL_STARTUP_TIMEOUT)
+        .ok_or(CliProviderActivationError::StateUnavailable)
+}
+
 fn map_portal_activation_error(error: CliProviderActivationError) -> ProviderPortalActivationError {
     match error {
         CliProviderActivationError::Cancelled => ProviderPortalActivationError::Cancelled,
         CliProviderActivationError::StateUnavailable
-        | CliProviderActivationError::InputUnavailable => {
+        | CliProviderActivationError::InputUnavailable
+        | CliProviderActivationError::TreasuryPublication(_)
+        | CliProviderActivationError::CancellationCleanup { .. } => {
             ProviderPortalActivationError::StateUnavailable
         }
         CliProviderActivationError::InvalidRequest
@@ -4605,10 +5001,36 @@ pub enum CliProviderActivationError {
     StateUnavailable,
     #[error("provider activation was cancelled")]
     Cancelled,
+    #[error("Treasury publication failed before cancellation cleanup also failed")]
+    CancellationCleanup {
+        publication: Box<CliProviderActivationError>,
+        #[source]
+        cleanup: Box<CliProviderActivationError>,
+    },
+    #[error("Treasury publication is unavailable")]
+    TreasuryPublication(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Onboarding(crate::ProviderOnboardingError),
     #[error(transparent)]
     Activation(crate::ProviderAdapterActivationError),
+}
+
+impl CliProviderActivationError {
+    fn is_cancellation(&self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            Self::TreasuryPublication(error) => {
+                matches!(
+                    error.downcast_ref::<market_squawk_services::ServiceError>(),
+                    Some(market_squawk_services::ServiceError::Cancelled)
+                ) || error
+                    .downcast_ref::<crate::provider_activation::TreasuryPublicationActivationError>(
+                    )
+                    .is_some_and(|error| error.is_terminal_cancellation())
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4698,7 +5120,7 @@ mod tests {
             configuration.provider_dataset.as_str(),
             "alfred:series-observations:CPIAUCSL:1947-01-01:9999-12-31"
         );
-        request["schema_version"] = json!(PREVIOUS_REQUEST_SCHEMA_VERSION);
+        request["schema_version"] = json!(5);
         assert!(matches!(
             decode_request(&serde_json::to_vec(&request)?),
             Err(CliProviderActivationError::InvalidRequest)
@@ -4726,7 +5148,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config.clone())?;
+        let product = crate::LocalProduct::try_new(config.clone()).await?;
         let predecessor_lease = prepared_treasury_lease(&product, "predecessor").await?;
         let (predecessor_bytes, predecessor_evidence, predecessor_request) =
             treasury_activation(&product, &predecessor_lease)?;
@@ -5038,7 +5460,7 @@ mod tests {
         );
         drop(product);
 
-        let recovered = crate::LocalProduct::try_new(config.clone())?;
+        let recovered = crate::LocalProduct::try_new(config.clone()).await?;
         assert!(matches!(
             recovered
                 .provider_activation_state()
@@ -5123,7 +5545,7 @@ mod tests {
         );
         drop(recovered);
 
-        let recovered = crate::LocalProduct::try_new(config)?;
+        let recovered = crate::LocalProduct::try_new(config).await?;
         assert!(matches!(
             recovered
                 .provider_activation_state()
@@ -5209,7 +5631,7 @@ mod tests {
                 .is_complete()
         );
 
-        let tasks = ProviderActivationTaskAuthority::new();
+        let tasks = Arc::new(ProviderActivationTaskAuthority::new());
         let held_activation = recovered
             .provider_activation_state()
             .acquire_activation(TREASURY_FISCAL_SURFACE)
@@ -5225,16 +5647,31 @@ mod tests {
                     .await
                     .is_ok();
                 let _completed = completed.send(acquired);
+                Ok(())
             }))
             .await?;
         retained_started.await?;
         assert!(matches!(
-            tasks.spawn(Box::pin(async {})).await,
+            tasks.spawn(Box::pin(async { Ok(()) })).await,
             Err(CliProviderActivationError::StateUnavailable)
         ));
         drop(response_waiter);
-        drop(held_activation);
         tasks.begin_shutdown();
+        assert!(tasks.cancellation.is_cancelled());
+        assert!(matches!(
+            tasks.finish_shutdown(Instant::now()).await,
+            Err(CliProviderActivationError::StateUnavailable)
+        ));
+        assert!(
+            tasks
+                .task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|task| !task.is_finished()),
+            "timed-out shutdown lost custody of the retained activation"
+        );
+        drop(held_activation);
         tasks
             .finish_shutdown(Instant::now() + Duration::from_secs(5))
             .await?;
@@ -5243,7 +5680,7 @@ mod tests {
             "retained activation did not survive waiter drop and gate contention"
         );
         assert!(matches!(
-            tasks.spawn(Box::pin(async {})).await,
+            tasks.spawn(Box::pin(async { Ok(()) })).await,
             Err(CliProviderActivationError::StateUnavailable)
         ));
         Ok(())
@@ -5260,7 +5697,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config)?;
+        let product = crate::LocalProduct::try_new(config).await?;
         let lease = prepared_sec_lease(&product, "sec-identity-recipe").await?;
         let cik = SecCikInput::try_new("0000320193".to_owned())?;
         let expected_instrument = sec_instrument_id(&cik)?;
@@ -5293,19 +5730,22 @@ mod tests {
         ));
 
         let legacy = serde_json::to_vec(&json!({
-            "schema_version": LEGACY_REQUEST_SCHEMA_VERSION,
+            "schema_version": 2,
             "session_id": lease.session_id(),
             "provider": {"kind": "sec"}
         }))?;
-        let legacy = decode_request(&legacy)?;
         assert!(matches!(
-            &legacy.provider,
-            ProviderRequest::Sec { identities } if identities.is_empty()
+            decode_request(&legacy),
+            Err(CliProviderActivationError::InvalidRequest)
         ));
-        assert!(matches!(
-            evidence_references(&legacy),
-            Err(CliProviderActivationError::ProviderConfiguration)
-        ));
+        for schema_version in [2, 3, 5] {
+            let mut unsupported: Value = serde_json::from_slice(&request_bytes)?;
+            unsupported["schema_version"] = json!(schema_version);
+            assert!(matches!(
+                decode_request(&serde_json::to_vec(&unsupported)?),
+                Err(CliProviderActivationError::InvalidRequest)
+            ));
+        }
         assert!(
             product
                 .application()
@@ -5327,7 +5767,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config)?;
+        let product = crate::LocalProduct::try_new(config).await?;
         let source_lease = prepared_anonymous_lease(
             &product,
             "kraken.spot-public-market-data",
@@ -5391,7 +5831,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config.clone())?;
+        let product = crate::LocalProduct::try_new(config.clone()).await?;
         let lease = prepared_lease(
             &product,
             BLS_PUBLIC_SURFACE,
@@ -5424,9 +5864,19 @@ mod tests {
             None,
         );
 
+        // Bootstrap and credential import enumerate the full profile catalogue, including
+        // account and reference connections that do not belong to the research recipe owner.
+        for profile in product.provider_onboarding().profiles() {
+            let surface = SourceIdentifier::try_from(profile.id())?;
+            assert_eq!(
+                activation.retained_setup_session(&surface).map_err(|error| format!("fresh setup lookup for {surface}: {error:?}"))?,
+                None,
+                "fresh setup unexpectedly retained a research selection for {surface}"
+            );
+        }
         let activated = activation
             .activate_from_portal(lease.session_id(), request, CancellationToken::new())
-            .await?;
+            .await.map_err(|error| format!("BLS activation: {error:?}"))?;
         let value = serde_json::to_value(activated)?;
         let dataset = value
             .get("provider_dataset_identifier")
@@ -5456,7 +5906,7 @@ mod tests {
                 ProviderPortalActivationRequest::FederalReserveBoardH15,
                 CancellationToken::new(),
             )
-            .await?;
+            .await.map_err(|error| format!("Board activation: {error:?}"))?;
         let board_value = serde_json::to_value(board_activated)?;
         let board_dataset = board_value
             .get("provider_dataset_identifier")
@@ -5483,6 +5933,14 @@ mod tests {
                 .research_ingest()
                 .is_profile_registered(board_lease.surface_id())?
         );
+        assert_eq!(
+            activation.retained_setup_session(lease.surface_id()).map_err(|error| format!("saved BLS setup lookup: {error:?}"))?,
+            Some(lease.session_id())
+        );
+        assert_eq!(
+            activation.retained_setup_session(board_lease.surface_id()).map_err(|error| format!("saved Board setup lookup: {error:?}"))?,
+            Some(board_lease.session_id())
+        );
         drop(activation);
         assert!(
             product
@@ -5493,7 +5951,7 @@ mod tests {
         );
         drop(product);
 
-        let recovered = crate::LocalProduct::try_new(config)?;
+        let recovered = crate::LocalProduct::try_new(config).await?;
         let recovered_activation = ProviderResearchActivationService::new(
             recovered.paths().clone(),
             recovered.provider_onboarding(),
@@ -5510,11 +5968,19 @@ mod tests {
             recovered_activation.provider_dataset_identifier(board_lease.surface_id())?,
             Some(board_dataset.clone())
         );
+        assert_eq!(
+            recovered_activation.retained_setup_session(lease.surface_id()).map_err(|error| format!("restored BLS setup lookup: {error:?}"))?,
+            Some(lease.session_id())
+        );
+        assert_eq!(
+            recovered_activation.retained_setup_session(board_lease.surface_id()).map_err(|error| format!("restored Board setup lookup: {error:?}"))?,
+            Some(board_lease.session_id())
+        );
         let status = crate::local_product::execute_cli_command(
             &recovered,
             crate::cli::Command::Source {
                 command: crate::cli::SourceCommand::Status {
-                    provider: Some(BLS_PUBLIC_SURFACE.to_owned()),
+                    provider: None,
                 },
             },
         )
@@ -5525,11 +5991,27 @@ mod tests {
             .and_then(Value::as_array)
             .ok_or("source status did not return rows")?;
         assert_eq!(
-            rows.first()
+            rows.iter()
+                .find(|row| row["profile"]["id"] == BLS_PUBLIC_SURFACE)
                 .and_then(|row| row.get("providerDatasetIdentifier"))
                 .and_then(Value::as_str),
             Some(dataset.as_str())
         );
+        let reference = rows
+            .iter()
+            .find(|row| row["profile"]["id"] == "nasdaq-trader-symbol-directory-reference")
+            .ok_or("source status omitted the registered reference profile")?;
+        assert_eq!(reference["lifecycleSupport"], "not_applicable");
+        assert!(reference["lifecycle"].is_null());
+        assert_eq!(reference["runtime"]["state"], "not_active");
+        for account in ["schwab.trader-api-market-data", "alpaca.basic-market-data"] {
+            let row = rows
+                .iter()
+                .find(|row| row["profile"]["id"] == account)
+                .ok_or("source status omitted an account profile")?;
+            assert_eq!(row["lifecycleSupport"], "managed");
+            assert!(row["lifecycle"].is_object());
+        }
         drop(recovered_activation);
         assert!(
             recovered
@@ -5600,11 +6082,7 @@ mod tests {
     ) -> Result<TreasuryActivation, Box<dyn std::error::Error>> {
         let (provider, evidence) = portal_provider_request(
             lease,
-            ProviderPortalActivationRequest::TreasuryFiscal {
-                first_record_date: CalendarDate::new(2025, 1, 1)?,
-                last_record_date: CalendarDate::new(2025, 1, 31)?,
-                page_size: 100,
-            },
+            ProviderPortalActivationRequest::TreasuryFiscal { page_size: 100 },
         )?;
         let request = ActivationRequest {
             schema_version: REQUEST_SCHEMA_VERSION,

@@ -986,14 +986,6 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         NO_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
-    mutation(
-        "Source.Setup",
-        "Start or resume capability-gated local provider onboarding.",
-        ServiceDomain::Source,
-        SOURCE_SCOPE,
-        PROVIDER_ARGUMENT,
-        ToolAuthorization::LocalConfirmation,
-    ),
     source_listing(
         "Source.ListObjects",
         "List bounded exact provider objects without minting ingestion authority.",
@@ -2320,7 +2312,9 @@ pub fn application_capabilities() -> Result<ServiceCapabilities, ServiceCapabili
             maximum: OPERATION_SPECS.len(),
         })?;
     for spec in OPERATION_SPECS {
-        descriptors.push(descriptor_for(*spec)?);
+        descriptors.push(descriptor_for(*spec).inspect_err(|error| {
+            tracing::error!(operation = spec.name, %error, "application operation contract could not be registered");
+        })?);
     }
     ServiceCapabilities::try_new(descriptors)
 }

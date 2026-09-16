@@ -259,7 +259,7 @@ impl ApplicationProtocolVersion {
 }
 
 /// Closed transport-neutral request admitted by the installed service.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppRequestEnvelope {
     request_id: RequestId,
@@ -273,6 +273,25 @@ pub struct AppRequestEnvelope {
     deadline: Timestamp,
     operation: SourceIdentifier,
     arguments: Value,
+}
+
+impl std::fmt::Debug for AppRequestEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppRequestEnvelope")
+            .field("request_id", &self.request_id)
+            .field("installation_id", &self.installation_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("service_generation", &self.service_generation)
+            .field("client_id", &self.client_id)
+            .field("credential_generation", &self.credential_generation)
+            .field("correlation_id", &self.correlation_id)
+            .field("protocol", &self.protocol)
+            .field("deadline", &self.deadline)
+            .field("operation", &self.operation)
+            .field("arguments", &"[REDACTED NATIVE INPUT]")
+            .finish()
+    }
 }
 
 /// Fixed identity and payload limits used by a native client to construct requests.

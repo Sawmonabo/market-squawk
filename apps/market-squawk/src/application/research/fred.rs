@@ -58,6 +58,7 @@ pub(crate) struct FredLatestKnownOperation {
 }
 
 enum FredLatestKnownState {
+    Shutdown,
     SetupRequired,
     Unavailable {
         capability: FredPointInTimeReadCapability,
@@ -69,6 +70,12 @@ enum FredLatestKnownState {
 }
 
 impl FredLatestKnownOperation {
+    /// Permanently closes replacement before startup publication is cancelled and drained.
+    pub(crate) fn begin_shutdown(&self) {
+        if let Ok(mut state) = self.state.write() {
+            *state = Arc::new(FredLatestKnownState::Shutdown);
+        }
+    }
     /// Creates the truthful state used when no durable desired activation exists.
     #[must_use]
     pub(crate) fn setup_required() -> Self {
@@ -132,10 +139,14 @@ impl FredLatestKnownOperation {
             .read()
             .map_err(|_| FredLatestKnownCompositionError::StateUnavailable)?
             .clone();
-        *self
+        let mut state = self
             .state
             .write()
-            .map_err(|_| FredLatestKnownCompositionError::StateUnavailable)? = replacement;
+            .map_err(|_| FredLatestKnownCompositionError::StateUnavailable)?;
+        if matches!(state.as_ref(), FredLatestKnownState::Shutdown) {
+            return Err(FredLatestKnownCompositionError::StateUnavailable);
+        }
+        *state = replacement;
         Ok(())
     }
 
@@ -146,6 +157,7 @@ impl FredLatestKnownOperation {
             return FredLatestKnownAvailability::Unavailable;
         };
         match state.as_ref() {
+            FredLatestKnownState::Shutdown => FredLatestKnownAvailability::Unavailable,
             FredLatestKnownState::SetupRequired => FredLatestKnownAvailability::SetupRequired,
             FredLatestKnownState::Unavailable { .. } => FredLatestKnownAvailability::Unavailable,
             FredLatestKnownState::Ready { .. } => FredLatestKnownAvailability::Ready,
@@ -171,6 +183,7 @@ impl FredLatestKnownOperation {
             .map_err(|_| ServiceError::Unavailable)?
             .clone();
         match state.as_ref() {
+            FredLatestKnownState::Shutdown => Err(ServiceError::Unavailable),
             FredLatestKnownState::SetupRequired => setup_required_result(limits),
             FredLatestKnownState::Unavailable { capability } => {
                 unavailable_result(capability, limits)

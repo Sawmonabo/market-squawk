@@ -12,8 +12,10 @@ import {
   mcpClientsStatusSchema,
   nativeEvidenceApplicationResultSchema,
   providerActivationSchema,
+  providerOAuthSchema,
   providerBootstrapSchema,
   providerSessionSchema,
+  providerSetupInspectionSchema,
 } from "@/lib/schemas"
 import type {
   DesktopTransport,
@@ -89,8 +91,6 @@ function systemPort(transport: SystemTransport): SystemTransport {
     subscribe: transport.subscribe.bind(transport),
     onboard: transport.onboard.bind(transport),
     openOfficialProviderPage: transport.openOfficialProviderPage.bind(transport),
-    openProtectedProviderSetup:
-      transport.openProtectedProviderSetup.bind(transport),
   })
 }
 
@@ -321,7 +321,7 @@ class TauriTransport implements ProductTransport, SystemTransport {
   async onboard<Request extends ProviderOnboardingRequest>(
     request: Request,
   ): Promise<ProviderOnboardingResult<Request>> {
-    const confirmed = !["bootstrap", "resume"].includes(request.action)
+    const confirmed = request.action !== "bootstrap" && request.action !== "inspect"
     const value = await invoke("provider_onboarding", { request, confirmed })
     return parseProviderResult(request, value)
   }
@@ -330,9 +330,6 @@ class TauriTransport implements ProductTransport, SystemTransport {
     await invoke("open_official_provider_page", { providerId })
   }
 
-  async openProtectedProviderSetup(providerId: string) {
-    await invoke("open_protected_provider_setup", { providerId })
-  }
 }
 
 function mapPreparationAction(
@@ -362,11 +359,17 @@ function parseProviderResult<Request extends ProviderOnboardingRequest>(
     switch (request.action) {
       case "bootstrap":
         return providerBootstrapSchema.parse(value)
+      case "inspect":
+        return providerSetupInspectionSchema.parse(value)
       case "unlockFallback":
       case "lockFallback":
         return encryptedFileFallbackSchema.parse(value)
+      case "verifySaved":
       case "activate":
+      case "resumePublication":
         return providerActivationSchema.parse(value)
+      case "schwabOAuth":
+        return providerOAuthSchema.parse(value)
       default:
         return providerSessionSchema.parse(value)
     }
@@ -505,7 +508,4 @@ class UnavailableBrowserTransport implements ProductTransport, SystemTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
-  openProtectedProviderSetup(): Promise<never> {
-    return Promise.reject(new Error("The local application is not connected."))
-  }
 }

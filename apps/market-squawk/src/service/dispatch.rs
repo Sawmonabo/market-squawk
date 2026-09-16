@@ -19,6 +19,7 @@ use crate::local_product::operations::ProductionSettingsOperations;
 use super::{
     governance::InstalledGovernanceOperations,
     mcp_control::{InstalledMcpControl, McpControlError},
+    provider_setup::InstalledProviderSetup,
     tool_services::InstalledToolServices,
 };
 
@@ -30,11 +31,15 @@ pub(super) struct InstalledApplicationDispatcher {
     governance: Arc<InstalledGovernanceOperations>,
     settings: Arc<ProductionSettingsOperations>,
     bootstrap: Value,
+    provider_setup: InstalledProviderSetup,
 }
 
 pub(super) struct InstalledDispatcherComposition {
     pub(super) services: Arc<InstalledToolServices>,
     pub(super) runtime: market_squawk_runtime::RuntimeIdentity,
+    pub(super) desktop_client: market_squawk_runtime::ClientId,
+    pub(super) cli_client: market_squawk_runtime::ClientId,
+    pub(super) inputs: Arc<market_squawk_runtime::InputStager>,
     pub(super) workspace_generation: u64,
     pub(super) workspace_placement: &'static str,
     pub(super) endpoint: SocketAddr,
@@ -51,6 +56,9 @@ impl InstalledApplicationDispatcher {
         let InstalledDispatcherComposition {
             services,
             runtime,
+            desktop_client,
+            cli_client,
+            inputs,
             workspace_generation,
             workspace_placement,
             endpoint,
@@ -93,6 +101,15 @@ impl InstalledApplicationDispatcher {
             })
             .collect::<Vec<_>>();
         operations.extend(governance.desktop_capabilities());
+        operations.extend(InstalledProviderSetup::desktop_capabilities());
+        let provider_setup = InstalledProviderSetup::new(
+            product,
+            runtime,
+            desktop_client,
+            cli_client,
+            inputs,
+            services.provider_setup_session_gate(),
+        );
         let onboarding = product.provider_onboarding();
         let profiles = serde_json::to_value(onboarding.profiles())
             .map_err(|_error| DispatchError::Unavailable)?;
@@ -148,6 +165,7 @@ impl InstalledApplicationDispatcher {
             governance,
             settings,
             bootstrap,
+            provider_setup,
         })
     }
 }
@@ -205,6 +223,9 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
         &self,
         operation: &market_squawk_domain::SourceIdentifier,
     ) -> Result<OperationEffect, DispatchError> {
+        if let Some(effect) = InstalledProviderSetup::effect(operation.as_str()) {
+            return Ok(effect);
+        }
         if let Some(effect) = InstalledMcpControl::effect(operation.as_str()) {
             return Ok(effect);
         }
@@ -250,6 +271,13 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
         let Value::Object(arguments) = request.arguments() else {
             return Err(DispatchError::Rejected);
         };
+        if InstalledProviderSetup::effect(request.operation().as_str()).is_some() {
+            return self
+                .provider_setup
+                .call(request.operation().as_str(), arguments, &context)
+                .await
+                .map_err(map_service_error);
+        }
         if InstalledGovernanceOperations::owns(request.operation().as_str()) {
             return self
                 .governance
@@ -306,8 +334,8 @@ fn map_service_error(error: ServiceError) -> DispatchError {
         ServiceErrorClass::Cancelled | ServiceErrorClass::DeadlineExceeded => {
             DispatchError::Interrupted
         }
+        ServiceErrorClass::ResourceExhausted => DispatchError::ResourceExhausted,
         ServiceErrorClass::Unauthorized
-        | ServiceErrorClass::ResourceExhausted
         | ServiceErrorClass::Unavailable
         | ServiceErrorClass::InvalidResult
         | ServiceErrorClass::Internal => DispatchError::Unavailable,

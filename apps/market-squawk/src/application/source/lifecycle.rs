@@ -811,6 +811,10 @@ pub enum SourceLifecycleError {
 /// Sole source lifecycle owner injected by live/paper application composition.
 #[async_trait]
 pub trait SourceLifecycleAuthority: Send + Sync {
+    /// Reports whether this owner implements lifecycle controls for the provider.
+    /// This describes control support only; it does not establish data or runtime readiness.
+    fn supports(&self, provider: &SourceIdentifier) -> bool;
+
     /// Returns the exact number of currently active source runtimes when the owner can sample a
     /// coherent synchronous view.
     ///

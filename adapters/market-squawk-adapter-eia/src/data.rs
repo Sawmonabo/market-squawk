@@ -21,7 +21,7 @@ use crate::types::digest_parts;
 use crate::wire::{parse_bounded_string, parse_count, parse_envelope};
 use crate::{
     EiaApiVersion, EiaDataQuery, EiaDigest, EiaError, EiaFacetFilter, EiaFacetValue, EiaFieldId,
-    EiaParseLimits, EiaRoute, EiaSortDirection,
+    EiaParseLimits, EiaRoute, EiaSortDirection, EiaStructureLimitKind,
 };
 
 const MAX_DESCRIPTOR_FIELDS: usize = 128;
@@ -1947,8 +1947,19 @@ fn parse_value(
     }
     let lexical = match value {
         Value::String(value) => {
-            if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
-                return Err(EiaError::StructureLimit);
+            if value.len() > limits.max_string_bytes() {
+                return Err(EiaError::structure_limit(
+                    EiaStructureLimitKind::StringBytes,
+                    value.len(),
+                    limits.max_string_bytes(),
+                ));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(EiaError::structure_limit(
+                    EiaStructureLimitKind::ControlCharacter,
+                    1,
+                    0,
+                ));
             }
             value.clone()
         }

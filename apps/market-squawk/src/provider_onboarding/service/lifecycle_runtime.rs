@@ -144,7 +144,11 @@ impl ProviderOnboardingService {
             resumed = self.catalog.resume_provider_onboarding(session_id)?;
             profile = self.profile_for(&resumed)?;
         }
+        // The reservation deadline bounds initial setup, not an already activated runtime.
+        // Anonymous ActiveScoped sessions intentionally have no credential generation; their
+        // current capability, rights and runtime-evidence expiry remain checked by the lease.
         if capability_is_current
+            && resumed.lifecycle().state() != OnboardingState::ActiveScoped
             && resumed.lifecycle().active_generation().is_none()
             && !schwab_oauth_bootstrap_retained(resumed.lifecycle())
             && !matches!(

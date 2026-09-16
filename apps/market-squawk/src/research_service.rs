@@ -1,5 +1,9 @@
 //! Application-owned composition for research ingestion and immutable analytical generations.
 
+mod worker;
+
+use worker::ResearchIoWorker;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,7 +33,6 @@ use market_squawk_sources::{
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ProviderOnboardingError, ProviderOnboardingService};
@@ -291,9 +294,9 @@ fn encode_lower_hex(bytes: [u8; 32]) -> String {
 /// Single application authority for local analytical storage and dataset construction.
 #[derive(Debug)]
 pub struct ResearchService {
-    analytical: AnalyticalDataService,
+    analytical: Arc<AnalyticalDataService>,
     provider_captures: Arc<SealedResearchJournalStore>,
-    provider_capture_seal_gate: Arc<Semaphore>,
+    provider_capture_worker: ResearchIoWorker,
 }
 
 impl ResearchService {
@@ -484,9 +487,9 @@ impl ResearchService {
         analytical: AnalyticalDataService,
     ) -> Result<Self, ResearchServiceError> {
         Ok(Self {
-            analytical,
+            analytical: Arc::new(analytical),
             provider_captures: Arc::new(paths.sealed_research_journal_store()?),
-            provider_capture_seal_gate: Arc::new(Semaphore::new(1)),
+            provider_capture_worker: ResearchIoWorker::new(),
         })
     }
 
@@ -517,40 +520,109 @@ impl ResearchService {
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<SealedProviderCaptureMaterial, ResearchServiceError> {
-        let deadline = tokio::time::Instant::from_std(deadline);
-        let permit = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                return Err(ResearchServiceError::Ingest(IngestError::Cancelled));
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded));
-            }
-            permit = Arc::clone(&self.provider_capture_seal_gate).acquire_owned() => {
-                permit.map_err(|_error| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?
-            }
-        };
         let store = Arc::clone(&self.provider_captures);
-        let mut worker = ProviderCaptureSealWorker::new(tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            request.seal(store.as_ref())
-        }));
-        let join = worker.join()?;
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        self.run_owned_research_io(deadline, cancellation, move |cancellation| {
+            if cancellation.is_cancelled() {
+                return Err(IngestError::Cancelled.into());
             }
-            () = tokio::time::sleep_until(deadline) => {
-                Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded))
+            if Instant::now() >= deadline {
+                return Err(IngestError::DeadlineExceeded.into());
             }
-            result = join => {
-                worker.disarm();
-                result
-                    .map_err(|_error| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?
-                    .map_err(map_provider_capture_seal_error)
-            }
-        }
+            request
+                .seal(store.as_ref())
+                .map_err(map_provider_capture_seal_error)
+        })
+        .await?
+    }
+
+    /// Runs synchronous capture, verification or source-preparation work on the existing lane.
+    ///
+    /// The closure must retain only the exact data capabilities it needs, never an Arc to this
+    /// service, and must check the supplied cancellation token and original deadline. Its typed
+    /// result is returned only after the original blocking handle joins. Domain errors carried
+    /// by `T` are operation results, separate from failure to join the worker itself.
+    pub(crate) async fn run_owned_research_io<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.provider_capture_worker
+            .run(deadline, cancellation, operation)
+            .await
+    }
+
+    /// Closes admission and cancels original reads without discarding their blocking handles.
+    pub(crate) fn begin_owned_io_shutdown(&self) {
+        self.provider_capture_worker.begin_shutdown();
+    }
+
+    /// Joins the original capture/read worker; a timed-out caller can retry the same owner.
+    pub(crate) async fn finish_owned_io_shutdown(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ResearchServiceError> {
+        self.provider_capture_worker.finish_shutdown(deadline).await
+    }
+
+    /// Reopens one original generation and performs a bounded typed read in the existing raw
+    /// worker lane. The callback cannot mint publication authority or use another object store.
+    pub(crate) async fn read_provider_capture_generation<T, F>(
+        &self,
+        manifest: market_squawk_data::DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        read: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                market_squawk_data::GenerationOwnedProviderCaptureEvidence,
+                &SealedResearchJournalStore,
+                &dyn market_squawk_platform::ResearchObjectControl,
+                &AnalyticalDataService,
+                &CancellationToken,
+            ) -> Result<T, ResearchServiceError>
+            + Send
+            + 'static,
+    {
+        use market_squawk_platform::{ResearchObjectControl as _, ResearchObjectControlPoint};
+        let analytical = Arc::clone(&self.analytical);
+        let store = Arc::clone(&self.provider_captures);
+        self.run_owned_research_io(deadline, cancellation, move |worker_cancellation| {
+            let control = ProviderCaptureReadControl {
+                deadline,
+                cancellation: worker_cancellation,
+            };
+            control
+                .checkpoint(ResearchObjectControlPoint::BeforeVerification)
+                .map_err(SealedResearchJournalStoreError::ObjectControl)?;
+            let evidence = analytical.generation_owned_provider_capture_evidence_bounded(
+                &manifest,
+                store.as_ref(),
+                deadline,
+                &control.cancellation,
+            )?;
+            control
+                .checkpoint(ResearchObjectControlPoint::BeforeVerification)
+                .map_err(SealedResearchJournalStoreError::ObjectControl)?;
+            let result = read(
+                evidence,
+                store.as_ref(),
+                &control,
+                &analytical,
+                &control.cancellation,
+            )?;
+            control
+                .checkpoint(ResearchObjectControlPoint::BeforeCommit)
+                .map_err(SealedResearchJournalStoreError::ObjectControl)?;
+            Ok(result)
+        })
+        .await?
     }
 
     /// Executes one rights-reserved ingest through durable revision and publication authority.
@@ -651,7 +723,7 @@ impl ResearchService {
     }
 
     /// Returns the manifest-pinned analytical service for bounded query composition.
-    pub const fn analytical(&self) -> &AnalyticalDataService {
+    pub fn analytical(&self) -> &AnalyticalDataService {
         &self.analytical
     }
 
@@ -738,62 +810,22 @@ fn map_provider_capture_seal_error(
     }
 }
 
-fn reap_provider_capture_seal(
-    worker: tokio::task::JoinHandle<
-        Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
-    >,
-) {
-    tokio::spawn(async move {
-        let _late_result = worker.await;
-    });
+struct ProviderCaptureReadControl {
+    deadline: Instant,
+    cancellation: CancellationToken,
 }
 
-/// Drop-safe owner for one blocking capture-seal worker.
-///
-/// Any caller cancellation or outer future drop transfers the worker to the runtime reaper rather
-/// than detaching a still-mutating filesystem operation. A normally joined worker is disarmed only
-/// after Tokio has returned its terminal result.
-struct ProviderCaptureSealWorker {
-    worker: Option<
-        tokio::task::JoinHandle<
-            Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
-        >,
-    >,
-}
-
-impl ProviderCaptureSealWorker {
-    fn new(
-        worker: tokio::task::JoinHandle<
-            Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
-        >,
-    ) -> Self {
-        Self {
-            worker: Some(worker),
-        }
-    }
-
-    fn join(
-        &mut self,
-    ) -> Result<
-        &mut tokio::task::JoinHandle<
-            Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
-        >,
-        ResearchServiceError,
-    > {
-        self.worker
-            .as_mut()
-            .ok_or(ResearchServiceError::ProviderCaptureSealWorkerUnavailable)
-    }
-
-    fn disarm(&mut self) {
-        self.worker = None;
-    }
-}
-
-impl Drop for ProviderCaptureSealWorker {
-    fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            reap_provider_capture_seal(worker);
+impl market_squawk_platform::ResearchObjectControl for ProviderCaptureReadControl {
+    fn checkpoint(
+        &self,
+        _point: market_squawk_platform::ResearchObjectControlPoint,
+    ) -> Result<(), market_squawk_platform::ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            Err(market_squawk_platform::ResearchObjectControlError::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Err(market_squawk_platform::ResearchObjectControlError::DeadlineExceeded)
+        } else {
+            Ok(())
         }
     }
 }

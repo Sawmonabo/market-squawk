@@ -909,6 +909,9 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
     if spec.id == FRED_PROFILE {
         return build_current_fred(spec);
     }
+    if spec.id == EIA_PROFILE {
+        return build_current_eia(spec);
+    }
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
     let prior_credential_kind = initial_credential_kind(spec.id, credentialed);
     let legacy_capability = build_capability_with_rights_state(
@@ -1209,6 +1212,26 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
     finish_profile(spec, historical_capabilities, capability)
 }
 
+fn build_current_eia(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
+    let revision = ProviderCapabilityRevision::new(1)?;
+    let capability = build_capability(
+        &spec,
+        revision,
+        CredentialKind::ApiKey,
+        RatePolicyDescriptor::try_new_enforced(
+            SourceIdentifier::try_from(spec.rate_policy)?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            true,
+            revision,
+            SourceIdentifier::try_from("eia.api-v2.onboarding-probe")?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            eia_current_budget()?,
+            true,
+        )?,
+    )?;
+    finish_profile(spec, Vec::new(), capability)
+}
+
 fn build_current_fred(
     spec: BuiltInSpec,
 ) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
@@ -1378,7 +1401,7 @@ fn capability_evidence(
 ) -> Result<Vec<EvidenceBinding>, ProviderProfileError> {
     let (report_source, report_digest) = if (revision.get() >= 3
         && has_provider_release_revision(spec.id))
-        || spec.id == FRED_PROFILE
+        || matches!(spec.id, FRED_PROFILE | EIA_PROFILE)
     {
         (
             "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25",
@@ -1397,7 +1420,8 @@ fn capability_evidence(
             COINBASE_DIRECT_COMPOSITION_DIGEST,
         ));
     }
-    if is_selected_architecture_profile(spec.id) && (revision.get() >= 3 || spec.id == FRED_PROFILE)
+    if is_selected_architecture_profile(spec.id)
+        && (revision.get() >= 3 || matches!(spec.id, FRED_PROFILE | EIA_PROFILE))
     {
         evidence.push(EvidenceBinding::new(
             SourceIdentifier::try_from(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE)?,
@@ -1573,14 +1597,6 @@ fn built_in_budget(
             backoff,
         ),
         CENSUS_PROFILE => census_budget(backoff),
-        EIA_PROFILE => simple_budget(
-            "us-eia",
-            Some("eia.api-key-template"),
-            1,
-            SECOND_NANOS,
-            1,
-            backoff,
-        ),
         // No numeric Board ceiling is published. This single-flight one-per-minute bound is a
         // Market Squawk application policy shared by the doctor and later H.15 retrieval.
         FEDERAL_RESERVE_BOARD_PROFILE => {
@@ -1647,6 +1663,23 @@ fn fred_budget(
         &windows,
         NonZeroU16::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
         backoff,
+    )?)
+}
+
+fn eia_current_budget() -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    let windows = [ProviderBudgetWindow::try_new(
+        NonZeroU32::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+        nonzero_u64(SECOND_NANOS)?,
+        BudgetWindowSemantics::Sliding,
+    )?];
+    Ok(ProviderBudgetPolicy::try_new_conjunctive(
+        BudgetScope::with_authorization_account(
+            SourceIdentifier::try_from("us-eia")?,
+            SourceIdentifier::try_from("eia.api-key-template")?,
+        ),
+        &windows,
+        NonZeroU16::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+        BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)?,
     )?)
 }
 
@@ -2166,15 +2199,19 @@ fn eia() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
         account: Requirement::RequiredProviderControlled,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::RightsLimited,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("eia.data.read"),
         permissions: &["data.read"],
-        coverage: "Credentialed metadata-driven API v2 target for petroleum, natural-gas, electricity, inventory, production, consumption, and price observations; JSON pages have an official 5,000-row maximum and XML pages 300, while no numeric provider request rate is established and the application ceiling is one shared request per second; provider-native route metadata, request construction, bounded pagination, exact transport/capture, revision planning, and canonical-mapping core are present, while an application redacted doctor, activation, durable checkpoints/publication, PIT typed read, product composition, and restart/release proof remain absent",
+        coverage: "Credentialed API v2 metadata and bounded monthly US residential electricity-price verification; activation requires observed route/facet metadata and a validated data page under one shared application request per sliding second, while every publication independently seals its exact selected-contract doctor and raw pages before canonical publication; product and release proof remain separate",
         quality: DataQuality::OfficialDelayed,
-        probe: VerificationProbe::local(
-            "EIA route-metadata, request, bounded pagination, transport/capture, revision, and canonical-mapping core is installed, but the application redacted doctor, activation, durable checkpoints/publisher, PIT read, and product proof are not; activation remains refresh_required",
-        ),
+        probe: VerificationProbe::network_secret_query(
+            ProbeTransport::HttpGet,
+            "https://api.eia.gov/v2/electricity/retail-sales/data/",
+            &[("frequency", "monthly"), ("data[0]", "price")],
+            "api_key",
+            1024,
+        )?,
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "import the API key as one protected value and redact the complete secret-bearing query from every URL, log, trace, error, receipt, and diagnostic",
@@ -2187,9 +2224,9 @@ fn eia() -> Result<BuiltInSpec, ProviderProfileError> {
         revocation: "remove the exact local credential generation and disable the provider; use provider support for any remote key action",
         recovery: REFRESH_RECOVERY,
         evidence: EIA_EVIDENCE,
-        rate_policy: "eia.api-v2.pending-rate-policy.v1",
+        rate_policy: "eia.api-v2.application-rate-policy.v1",
         refresh_trigger: "EIA-API-V2",
-        handoff_instruction: "Import the configured EIA API key. The provider-native metadata, request, transport/capture, pagination, revision, and mapping core is present; the profile remains unavailable until an application redacted doctor, activation, durable checkpoints/canonical publication, PIT read, product composition, and restart/release proof are implemented.",
+        handoff_instruction: "Import the protected API key, then run bounded provider verification. A successful route/facet/data doctor admits only the exact credential generation and reviewed local-personal-research rights. Select at most 24 monthly US residential electricity-price observations through the existing source setup recipe; publication and typed reads retain their separate evidence gates.",
     })
 }
 

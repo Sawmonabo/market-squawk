@@ -611,6 +611,13 @@ impl IngestPrecommitAuthority for SecLiveFundJobPrecommitAuthority {
         self.provider.validate_precommit()
     }
 
+    fn validate_catalog_precommit(
+        &self,
+        catalog: &market_squawk_data::CatalogAuthority,
+    ) -> Result<(), IngestError> {
+        self.provider.validate_catalog_precommit(catalog)
+    }
+
     fn claim_sec_fund_job_commit(
         &self,
         binding_digest: EvidenceDigest,

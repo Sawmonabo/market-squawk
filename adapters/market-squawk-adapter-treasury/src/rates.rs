@@ -53,7 +53,7 @@ pub struct AverageInterestRate {
     record_date: CalendarDate,
     security_type_description: String,
     security_description: String,
-    rate_percent: Decimal,
+    rate_percent: Option<Decimal>,
     source_line_number: String,
     schema_digest: [u8; 32],
     source_payload_digest: [u8; 32],
@@ -70,8 +70,14 @@ impl AverageInterestRate {
         require_schema(record, "security_desc", "STRING", "String")?;
         require_schema(record, "avg_interest_rate_amt", "PERCENTAGE", "10.2%")?;
         require_schema(record, "src_line_nbr", "INTEGER", "10")?;
-        let rate_percent = Decimal::from_str_exact(required(record, "avg_interest_rate_amt")?)
-            .map_err(|_| TreasuryRateError::InvalidRate)?;
+        // Fiscal Data documents missing values as the exact string "null".
+        // https://fiscaldata.treasury.gov/api-documentation/#data-types
+        let rate_percent = match required(record, "avg_interest_rate_amt")? {
+            "null" => None,
+            value => {
+                Some(Decimal::from_str_exact(value).map_err(|_| TreasuryRateError::InvalidRate)?)
+            }
+        };
         Ok(Self {
             record_date: parse_date(required(record, "record_date")?)?,
             security_type_description: required(record, "security_type_desc")?.to_owned(),
@@ -88,9 +94,17 @@ impl AverageInterestRate {
         self.record_date
     }
 
-    /// Returns the exact percentage amount.
-    pub const fn rate_percent(&self) -> Decimal {
+    /// Returns the exact percentage amount when the provider supplied a numeric value.
+    pub const fn rate_percent(&self) -> Option<Decimal> {
         self.rate_percent
+    }
+
+    /// Returns the exact documented Fiscal Data marker when no rate was reported.
+    pub const fn missing_marker(&self) -> Option<&'static str> {
+        match self.rate_percent {
+            Some(_) => None,
+            None => Some("null"),
+        }
     }
 
     /// Returns the security type description.

@@ -116,7 +116,7 @@ function ResearchWorkspace({
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Research</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
             Prepare dated information, review its history and limitations, and use it in analysis
-            or model work. Connections manages information access; Operations &amp; Jobs tracks
+            or model work. Settings manages information access; Operations &amp; Jobs tracks
             longer work.
           </p>
         </div>
@@ -287,11 +287,11 @@ function EmptyResearch() {
       <Database className="mx-auto size-7 text-primary" aria-hidden="true" />
       <h2 className="mt-4 text-lg font-semibold">No research collections yet</h2>
       <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
-        Add the information you want from Connections. Completed research will appear here when it
-        is ready to use.
+        Add the information you want in Settings → Onboarding. Completed research will appear
+        here when it is ready to use.
       </p>
       <Button asChild className="mt-5">
-        <Link to="/connections/sources">Manage connections</Link>
+        <Link to="/system/settings/onboarding">Manage connections</Link>
       </Button>
     </section>
   )
@@ -303,10 +303,10 @@ function UnavailableResearch() {
       <AlertCircle aria-hidden="true" />
       <AlertTitle>Research is not ready</AlertTitle>
       <AlertDescription>
-        Add or reconnect research information from Connections, then return here.
+        Add or reconnect research information in Settings → Onboarding, then return here.
       </AlertDescription>
       <Button asChild className="mt-3" size="sm" variant="outline">
-        <Link to="/connections/sources">Open Connections</Link>
+        <Link to="/system/settings/onboarding">Open onboarding</Link>
       </Button>
     </Alert>
   )

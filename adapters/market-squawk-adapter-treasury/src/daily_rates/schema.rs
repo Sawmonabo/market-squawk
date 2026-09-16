@@ -175,17 +175,10 @@ fn nominal_points(
             ));
         }
     }
-    let display = optional_decimal(properties, "BC_30YEARDISPLAY")?;
-    let thirty_year = points
-        .iter()
-        .find(|point| {
-            point.metric()
-                == TreasuryDailyRateMetric::NominalParYield(TreasuryMaturity::ThirtyYears)
-        })
-        .and_then(TreasuryDailyRatePoint::rate_percent);
-    if display.is_some() && display != thirty_year {
-        return Err(TreasuryProtocolError::SchemaDrift);
-    }
+    // This auxiliary field need not equal the published BC_30YEAR yield: Treasury's
+    // historical responses contain display 0.00 alongside nonzero BC_30YEAR values.
+    // Validate its declared numeric type; retain its exact token in the captured raw page.
+    let _display = optional_decimal(properties, "BC_30YEARDISPLAY")?;
     Ok(points)
 }
 

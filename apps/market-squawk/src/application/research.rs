@@ -86,7 +86,10 @@ pub(crate) use ingest::{
     BlsSealFirstExtractionLimits, BlsWholePlanApplicationHandoff, CoinbaseMarketApplicationOutcome,
     CryptoCommittedRowIngress, CryptoMarketPublicationAuthority, CryptoMarketPublicationClosure,
     CryptoMarketPublicationError, CryptoMarketSurface, CryptoPendingFrameIngress,
-    CryptoPublicationRendezvousLimits, FredPublishedGenerationHandoff, IexHistApplicationError,
+    CryptoPublicationRendezvousLimits, EiaApplicationAcquisitionLimits, EiaLiveComposition,
+    EiaMacroApplicationClosure, EiaMacroApplicationError, EiaMacroEffectiveCutoff,
+    EiaMacroPointInTimeRequest, EiaMacroPublicationReceipt, EiaMacroRestartReceipt,
+    EiaMacroRestartSelector, FredPublishedGenerationHandoff, IexHistApplicationError,
     IexHistApplicationLane, IexHistCaptureSealHandoff, IexHistCaptureSealRequirements,
     IexHistCatalogSealHandoff, IexHistClockStatus, IexHistExactJobPreview,
     IexHistExplicitJobRequest, IexHistInstrumentIdentityBlocker, IexHistInstrumentIdentityStatus,
@@ -125,8 +128,11 @@ pub(crate) use instrument_context::{
 };
 pub(crate) use macro_context::{
     MACRO_GET_CONTEXT, MacroContextOperation, MacroContextReadCapability,
+    RESIDENTIAL_ELECTRICITY_PRICE_DATASET,
 };
-pub(crate) use macro_features::{MacroFeatureVector, read_macro_feature_vector};
+pub(crate) use macro_features::{
+    MacroFeatureVector, read_macro_feature_vector,
+};
 pub(crate) use market_history::{
     LatestMarketHistoryReadRequest, MAX_MARKET_HISTORY_BARS, MarketHistoryAdjustmentPolicy,
     MarketHistoryBar, MarketHistoryCoverage, MarketHistoryMissingReason,
@@ -348,7 +354,8 @@ impl ResearchApplicationServices {
             fred_latest_known.clone(),
             treasury_fiscal_latest_known.clone(),
             treasury_daily_latest_known.clone(),
-        );
+        )
+        .with_energy_store(Arc::clone(&service));
         let company_research = CompanyResearchReadCapability::new(Arc::clone(&service));
         let instrument_identity =
             InstrumentIdentityReadCapability::new(service.market_data_instruments());
@@ -479,6 +486,11 @@ impl ResearchApplicationServices {
             )
             .await
             .map_err(map_read_error)
+    }
+
+    /// Closes startup publication routes without cancelling their active source workers.
+    pub(crate) fn begin_startup_shutdown(&self) {
+        self.controller.begin_startup_shutdown();
     }
 
     /// Installs the exact restart-verified FRED publication into the replaceable Macro route.
@@ -952,14 +964,40 @@ impl ResearchController {
     }
 
     fn begin_shutdown(&self) {
+        self.begin_startup_shutdown();
         self.lifecycle.begin_shutdown();
         self.ingest.begin_shutdown();
     }
 
+    fn begin_startup_shutdown(&self) {
+        self.fred_latest_known.begin_shutdown();
+        self.treasury_fiscal_latest_known.begin_shutdown();
+        self.treasury_daily_latest_known.begin_shutdown();
+    }
+
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
         let drained = self.lifecycle.finish_shutdown(deadline).await;
+        // Admitted source work must finish sealing completed responses before the raw lane closes.
+        // A timed-out ingest drain retains that lane for the original worker and shutdown retry.
         let ingest = self.ingest.finish_shutdown(deadline).await;
-        drained.and(ingest)
+        if let Err(error) = ingest {
+            return drained.and(Err(error));
+        }
+        self.authority.begin_owned_io_shutdown();
+        let io = self
+            .authority
+            .finish_owned_io_shutdown(deadline)
+            .await
+            .map_err(|error| match error {
+                crate::ResearchServiceError::Ingest(market_squawk_data::IngestError::Cancelled) => {
+                    ServiceError::Cancelled
+                }
+                crate::ResearchServiceError::Ingest(
+                    market_squawk_data::IngestError::DeadlineExceeded,
+                ) => ServiceError::DeadlineExceeded,
+                _ => ServiceError::Unavailable,
+            });
+        drained.and(io)
     }
 }
 

@@ -10,6 +10,7 @@ use market_squawk_services::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::provider_onboarding::{
     PROVIDER_CREDENTIAL_BUNDLE_SCHEMA, ProviderCredentialBundleDelegationError,
@@ -28,19 +29,34 @@ pub(super) struct InstalledProviderCredentialImport {
     onboarding: Arc<ProviderOnboardingService>,
     inputs: Arc<InputStager>,
     runtime: RuntimeIdentity,
+    activation: Arc<dyn crate::ProviderPortalActivationAuthority>,
+    desktop_client: ClientId,
+    cli_client: ClientId,
+    import_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl InstalledProviderCredentialImport {
-    pub(super) const fn new(
+    pub(super) fn new(
         onboarding: Arc<ProviderOnboardingService>,
         inputs: Arc<InputStager>,
         runtime: RuntimeIdentity,
+        activation: Arc<dyn crate::ProviderPortalActivationAuthority>,
+        desktop_client: ClientId,
+        cli_client: ClientId,
     ) -> Self {
         Self {
             onboarding,
             inputs,
             runtime,
+            activation,
+            desktop_client,
+            cli_client,
+            import_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub(super) fn session_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.import_gate)
     }
 
     pub(super) async fn call(
@@ -50,6 +66,12 @@ impl InstalledProviderCredentialImport {
     ) -> Result<TypedToolResult, ServiceError> {
         self.authorize(context)?;
         ensure_live(context)?;
+        let _guard = tokio::select! {
+            biased;
+            () = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
+            () = tokio::time::sleep_until(context.deadline().into()) => return Err(ServiceError::DeadlineExceeded),
+            guard = self.import_gate.lock() => guard,
+        };
         let input: ImportRequest = serde_json::from_value(Value::Object(
             super::business_arguments(request.arguments()),
         ))
@@ -68,14 +90,17 @@ impl InstalledProviderCredentialImport {
             .map_err(|_error| ServiceError::Unauthorized)?;
         let bytes = claimed
             .read_verified(MAXIMUM_PROVIDER_CREDENTIAL_BUNDLE_BYTES)
+            .map(Zeroizing::new)
             .map_err(|_error| ServiceError::InvalidRequest)?;
         let bundle =
             crate::provider_onboarding::credential_bundle::parse_provider_credential_bundle_bytes(
                 &bytes,
             )
             .map_err(|_error| ServiceError::InvalidRequest)?;
+        drop(bytes);
         let result = delegate_provider_credential_bundle(
             &self.onboarding,
+            self.activation.as_ref(),
             bundle,
             context.cancellation().child_token(),
         )
@@ -91,6 +116,9 @@ impl InstalledProviderCredentialImport {
                     ProviderCredentialDelegationDisposition::Disabled => (false, "disabled"),
                     ProviderCredentialDelegationDisposition::ProbeRequired => {
                         (true, "probe_required")
+                    }
+                    ProviderCredentialDelegationDisposition::SavedSetupReused => {
+                        (true, "saved_setup_reused")
                     }
                     ProviderCredentialDelegationDisposition::CredentialImported => {
                         (true, "credential_stored_unverified")
@@ -124,7 +152,10 @@ impl InstalledProviderCredentialImport {
 
     fn authorize(&self, context: &RequestContext) -> Result<(), ServiceError> {
         let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
-        if origin.workspace_id() != self.runtime.workspace_id().as_uuid() {
+        if origin.workspace_id() != self.runtime.workspace_id().as_uuid()
+            || (origin.client_id() != self.desktop_client.as_uuid()
+                && origin.client_id() != self.cli_client.as_uuid())
+        {
             return Err(ServiceError::Unauthorized);
         }
         Ok(())
@@ -149,13 +180,60 @@ struct ImportRequest {
 }
 
 fn map_delegation_error(error: ProviderCredentialBundleDelegationError) -> ServiceError {
+    // Transport deliberately collapses authority failures. Retain only code-owned labels here
+    // so a failed import can be diagnosed without logging the bundle, paths, references or keys.
     match error {
-        ProviderCredentialBundleDelegationError::Allocation => ServiceError::ResourceExhausted,
-        ProviderCredentialBundleDelegationError::CredentialEncoding { .. }
-        | ProviderCredentialBundleDelegationError::ServiceInvariant { .. } => {
+        ProviderCredentialBundleDelegationError::Allocation => {
+            tracing::warn!(failure = "allocation", "provider credential import failed");
+            ServiceError::ResourceExhausted
+        }
+        ProviderCredentialBundleDelegationError::CredentialEncoding { provider } => {
+            tracing::warn!(
+                provider = provider.as_str(),
+                failure = "credential_encoding",
+                "provider credential import failed"
+            );
             ServiceError::InvalidRequest
         }
-        ProviderCredentialBundleDelegationError::Onboarding { .. } => ServiceError::Unavailable,
+        ProviderCredentialBundleDelegationError::ServiceInvariant { provider } => {
+            tracing::warn!(
+                provider = provider.as_str(),
+                failure = "service_invariant",
+                "provider credential import failed"
+            );
+            ServiceError::InvalidRequest
+        }
+        ProviderCredentialBundleDelegationError::SavedStateUnavailable => {
+            tracing::warn!(failure = "saved_state", "provider credential import failed");
+            ServiceError::Unavailable
+        }
+        ProviderCredentialBundleDelegationError::Onboarding { provider, source } => {
+            use crate::provider_onboarding::ProviderOnboardingError;
+            if let ProviderOnboardingError::SecretStore(error) = &source {
+                // LocalSecretStoreError is a closed enum with fixed, value-free messages.
+                tracing::warn!(provider = provider.as_str(), failure = "secret_store", reason = %error, "provider credential import failed");
+            } else {
+                let failure = match source {
+                    ProviderOnboardingError::Catalog(_) => "catalog",
+                    ProviderOnboardingError::InvalidSessionState => "invalid_session_state",
+                    ProviderOnboardingError::SecretImportUnavailable => "secret_import_unavailable",
+                    ProviderOnboardingError::InvalidSecretShape => "invalid_secret_shape",
+                    ProviderOnboardingError::EvidenceRefreshRequired => "evidence_refresh_required",
+                    ProviderOnboardingError::OperationCancelled => "cancelled",
+                    ProviderOnboardingError::SecretOperationUnavailable => {
+                        "secret_operation_unavailable"
+                    }
+                    ProviderOnboardingError::Clock => "clock",
+                    _ => "onboarding_contract",
+                };
+                tracing::warn!(
+                    provider = provider.as_str(),
+                    failure,
+                    "provider credential import failed"
+                );
+            }
+            ServiceError::Unavailable
+        }
     }
 }
 

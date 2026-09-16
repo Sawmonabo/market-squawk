@@ -101,6 +101,29 @@ impl LoopbackApplicationClient {
         })
     }
 
+    /// Creates a native request-scoped transport with the same authenticated identity and limits.
+    /// Callers use this only for explicitly selected work; the original client's deadlines remain
+    /// unchanged, and the runtime still enforces the request's own lifetime and cancellation.
+    pub fn with_transport_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Self, ApplicationClientError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(5 * 60) {
+            return Err(ApplicationClientError::Rejected);
+        }
+        Ok(Self {
+            http: self.http.clone(),
+            endpoint: self.endpoint.clone(),
+            host: self.host.clone(),
+            scope: self.scope.clone(),
+            credential: Arc::clone(&self.credential),
+            origin: self.origin.clone(),
+            maximum_response_bytes: self.maximum_response_bytes,
+            response_structure: self.response_structure,
+            transport_timeout: timeout,
+        })
+    }
+
     /// Bound request factory for advanced relay and CLI adapters.
     #[must_use]
     pub const fn request_scope(&self) -> &ApplicationRequestScope {
@@ -204,6 +227,7 @@ impl LoopbackApplicationClient {
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.endpoint))
+            .timeout(self.transport_timeout)
             .header(reqwest::header::HOST, &self.host)
             .header(
                 CLIENT_ID_HEADER,

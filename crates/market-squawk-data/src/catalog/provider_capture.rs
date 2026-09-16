@@ -706,6 +706,17 @@ impl Catalog {
         load_provider_capture_binding_evidence(&self.connection, binding_digest)
     }
 
+    pub(crate) fn provider_capture_binding_evidence_bounded(
+        &self,
+        binding_digest: EvidenceDigest,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<PersistedProviderCaptureBindingEvidence>, CatalogError> {
+        self.market_recovery_read(deadline, cancellation, || {
+            load_provider_capture_binding_evidence(&self.connection, binding_digest)
+        })
+    }
+
     pub(crate) fn provider_capture_for_run(
         &self,
         run_id: Uuid,
@@ -1518,7 +1529,10 @@ pub(crate) fn load_provider_capture_binding_evidence(
     {
         return Err(CatalogError::CorruptCatalog);
     }
-    let record_count = usize::try_from(count).map_err(|_| CatalogError::CorruptCatalog)?;
+    let record_count = usize::try_from(count)
+        .ok()
+        .filter(|count| *count <= MAX_PROVIDER_CAPTURE_ROWS)
+        .ok_or(CatalogError::ResultRowLimitExceeded)?;
     let mut out = Vec::new();
     out.try_reserve_exact(record_count)
         .map_err(|_| CatalogError::Allocation)?;

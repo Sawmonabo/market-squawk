@@ -14,7 +14,7 @@ use reqwest::header::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::TreasurySourceError;
+use crate::{TreasuryPageError, TreasuryPageStage, TreasurySourceError};
 
 pub(crate) const JSON_MEDIA_TYPE: &str = "application/json";
 pub(crate) const XML_MEDIA_TYPE: &str = "application/atom+xml, application/xml, text/xml";
@@ -83,18 +83,41 @@ impl TreasuryHttpClient {
         parser_max_bytes: usize,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<RetrievedResponse, ExtractionSourceError> {
-        let now = system_timestamp().map_err(map_adapter_error)?;
-        authority.validate_current()?;
-        if authority.metadata() != metadata || !metadata.is_effective_at(now) {
-            return Err(ExtractionSourceError::Source(
+    ) -> Result<RetrievedResponse, TreasuryPageError> {
+        let now = system_timestamp()
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::HttpAuthority, error))?;
+        authority.validate_current().map_err(|error| {
+            TreasuryPageError::new(
+                TreasuryPageStage::HttpAuthority,
+                ExtractionSourceError::from(error),
+            )
+        })?;
+        if authority.metadata() != metadata {
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::HttpMetadata,
                 SourceError::InvalidProtocolState,
             ));
         }
-        let timeout =
-            remaining_timeout(deadline, now, self.total_timeout).map_err(map_adapter_error)?;
-        let permit = authority.try_network_request(url)?;
-        let in_flight = permit.authorize_send(url)?;
+        if !metadata.is_effective_at(now) {
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::HttpEffectiveTime,
+                SourceError::InvalidProtocolState,
+            ));
+        }
+        let timeout = remaining_timeout(deadline, now, self.total_timeout)
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::HttpTransport, error))?;
+        let permit = authority.try_network_request(url).map_err(|error| {
+            TreasuryPageError::new(
+                TreasuryPageStage::HttpAuthority,
+                ExtractionSourceError::from(error),
+            )
+        })?;
+        let in_flight = permit.authorize_send(url).map_err(|error| {
+            TreasuryPageError::new(
+                TreasuryPageStage::HttpAuthority,
+                ExtractionSourceError::from(error),
+            )
+        })?;
         let max_response_bytes = parser_max_bytes.min(self.max_response_bytes);
         let response = self
             .transport
@@ -108,36 +131,61 @@ impl TreasuryHttpClient {
                 cancellation.clone(),
             )
             .await
-            .map_err(map_adapter_error)?;
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::HttpTransport, error))?;
         if response.status == 429 || response.status == 503 {
-            let deadline =
-                in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
-            return Err(ExtractionSourceError::Source(
-                SourceError::BudgetWaitUntil { deadline },
+            let deadline = in_flight
+                .apply_retry_after_header(response.retry_after.as_deref(), 0)
+                .map_err(|error| {
+                    TreasuryPageError::new(
+                        TreasuryPageStage::HttpResponse,
+                        ExtractionSourceError::from(error),
+                    )
+                })?;
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::HttpResponse,
+                ExtractionSourceError::Source(SourceError::BudgetWaitUntil { deadline }),
             ));
         }
         if response.status == 401 || response.status == 403 {
-            return Err(ExtractionSourceError::Source(SourceError::Unauthorized));
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::HttpResponse,
+                ExtractionSourceError::Source(SourceError::Unauthorized),
+            ));
         }
         if response.status != 200 {
-            return Err(ExtractionSourceError::Source(
-                SourceError::ProviderUnavailable,
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::HttpResponse,
+                ExtractionSourceError::Source(SourceError::ProviderUnavailable),
             ));
         }
         if response
             .content_encoding
             .as_deref()
             .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
-            || !content_type_matches(response.content_type.as_deref(), accept)
         {
-            return Err(ExtractionSourceError::Source(
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::HttpEncoding,
                 SourceError::InvalidProtocolState,
             ));
         }
-        in_flight.validate_response_size(
-            u64::try_from(response.body.len())
-                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
-        )?;
+        if !content_type_matches(response.content_type.as_deref(), accept) {
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::HttpContentType,
+                SourceError::InvalidProtocolState,
+            ));
+        }
+        in_flight
+            .validate_response_size(
+                u64::try_from(response.body.len()).map_err(|_| {
+                    ExtractionSourceError::Source(SourceError::InvalidProtocolState)
+                })?,
+            )
+            .map_err(|error| {
+                TreasuryPageError::new(
+                    TreasuryPageStage::HttpResponse,
+                    ExtractionSourceError::from(error),
+                )
+            })?;
         Ok(RetrievedResponse {
             bytes: response.body,
             received_at: response.received_at,
@@ -290,28 +338,6 @@ fn bounded_success_header(value: &[u8]) -> Result<Vec<u8>, TreasurySourceError> 
         return Err(TreasurySourceError::InvalidProtocol);
     }
     Ok(value.to_vec())
-}
-
-fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
-    match error {
-        TreasurySourceError::Cancelled => ExtractionSourceError::Cancelled,
-        TreasurySourceError::DeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
-        TreasurySourceError::Source(error) => ExtractionSourceError::Source(error),
-        TreasurySourceError::InvalidMetadata
-        | TreasurySourceError::InvalidBackfillCheckpoint
-        | TreasurySourceError::BackfillIncomplete
-        | TreasurySourceError::QueryBindingMismatch
-        | TreasurySourceError::InvalidProtocol
-        | TreasurySourceError::Protocol(_)
-        | TreasurySourceError::Rate(_)
-        | TreasurySourceError::HealthUnavailable
-        | TreasurySourceError::RestoreWorkerUnavailable
-        | TreasurySourceError::ReplayStore(_)
-        | TreasurySourceError::RevisionAuthority(_) => {
-            ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-        }
-        TreasurySourceError::BodyTooLarge => ExtractionSourceError::Source(SourceError::Network),
-    }
 }
 
 pub(crate) struct RetrievedResponse {

@@ -40,7 +40,7 @@ use super::normalize::{
     CanonicalRecordAdmission, CanonicalTreasuryRecord, canonical_daily_rate_records,
     canonical_fiscal_records,
 };
-use super::{TreasurySource, TreasurySourceConfig};
+use super::{TreasuryPageError, TreasuryPageStage, TreasurySource, TreasurySourceConfig};
 
 const CHECKPOINT_POLICY_VERSION: &str = "treasury-all-history-checkpoint-v1";
 const MAX_ALL_HISTORY_PAGES: usize = 1_024;
@@ -1233,9 +1233,9 @@ impl TreasurySource {
         authority: market_squawk_sources::ExtractionAuthority,
         discovery: DiscoveryRequest,
         cancellation: CancellationToken,
-    ) -> Result<TreasuryAllHistoryFetchedPage, ExtractionSourceError> {
+    ) -> Result<TreasuryAllHistoryFetchedPage, TreasuryPageError> {
         validate_checkpoint_source(self.replay_binding(), &backfill.checkpoint)
-            .map_err(|_| invalid_protocol())?;
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Checkpoint, error))?;
         if backfill.checkpoint.terminal_observed
             || backfill.verified_seals.len() != backfill.checkpoint.pages.len()
             || backfill.checkpoint.pages.len() >= MAX_ALL_HISTORY_PAGES
@@ -1243,13 +1243,18 @@ impl TreasurySource {
             || discovery.dataset() != backfill.checkpoint.descriptor.provider_dataset()
             || discovery.max_results() != 1
         {
-            return Err(invalid_protocol());
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::Admission,
+                invalid_protocol(),
+            ));
         }
         let query = all_history_query(self.replay_binding(), discovery.dataset())
-            .map_err(|_| invalid_protocol())?;
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Query, error))?;
         let page_number =
             usize::try_from(backfill.checkpoint.next_page).map_err(|_| invalid_protocol())?;
-        let page_request = query.page(page_number).map_err(|_| invalid_protocol())?;
+        let page_request = query
+            .page(page_number)
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Query, error))?;
         let (received_at, payload, page, capture) = match &page_request {
             TreasuryHistoryRequest::Daily(request) => {
                 let (received_at, payload, page, capture) = self
@@ -1289,14 +1294,20 @@ impl TreasurySource {
             }
         };
         let mut next_tracker = backfill.tracker.clone();
-        let terminal = next_tracker.accept(&page).map_err(|_| invalid_protocol())?;
-        let validated_at = system_timestamp().map_err(super::map_adapter_error)?;
+        let terminal = next_tracker
+            .accept(&page)
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Pagination, error))?;
+        let validated_at = system_timestamp()
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Chronology, error))?;
         if page
             .provider_published_at()
             .is_some_and(|published| published > received_at)
             || validated_at < received_at
         {
-            return Err(invalid_protocol());
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::Chronology,
+                invalid_protocol(),
+            ));
         }
         let source_rows = page.source_rows();
         let raw_body_bytes = u64::try_from(payload.len()).map_err(|_| invalid_protocol())?;
@@ -1308,11 +1319,15 @@ impl TreasurySource {
             received_at,
             history_media_type(backfill.checkpoint.descriptor.surface()),
             history_object_kind(backfill.checkpoint.descriptor.surface()),
-        )?;
+        )
+        .map_err(|error| TreasuryPageError::new(TreasuryPageStage::SourceObject, error))?;
         let expected_capture = capture.receipt().clone();
         let canonical = if source_rows == 0 {
             if !terminal {
-                return Err(invalid_protocol());
+                return Err(TreasuryPageError::new(
+                    TreasuryPageStage::Accounting,
+                    invalid_protocol(),
+                ));
             }
             None
         } else {
@@ -1343,7 +1358,10 @@ impl TreasurySource {
             .transpose()?
             .unwrap_or((0, 0, 0));
         if observed_numeric_points.checked_add(explicit_missing_points) != Some(canonical_points) {
-            return Err(invalid_protocol());
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::Accounting,
+                invalid_protocol(),
+            ));
         }
         backfill
             .checkpoint
@@ -1429,7 +1447,7 @@ struct CanonicalPagePreparation<'a> {
 fn prepare_canonical_page(
     source: TreasuryReplayBinding<'_>,
     input: CanonicalPagePreparation<'_>,
-) -> Result<TreasuryAllHistoryCanonicalPage, ExtractionSourceError> {
+) -> Result<TreasuryAllHistoryCanonicalPage, TreasuryPageError> {
     let CanonicalPagePreparation {
         descriptor,
         object,
@@ -1469,11 +1487,17 @@ fn prepare_canonical_page(
     };
     for record in records {
         let record = canonical_admission
-            .admit(record.map_err(super::map_adapter_error)?)
-            .map_err(super::map_adapter_error)?;
+            .admit(
+                record
+                    .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Canonical, error))?,
+            )
+            .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Canonical, error))?;
         series.insert(record.series.clone());
         if series.len() > MAX_ALL_HISTORY_SERIES {
-            return Err(invalid_protocol());
+            return Err(TreasuryPageError::new(
+                TreasuryPageStage::Canonical,
+                invalid_protocol(),
+            ));
         }
         batch.push(ExtractionRecord::try_new_with_time(
             &request,
@@ -1506,7 +1530,7 @@ fn prepare_canonical_page(
         provider_published_at: page.provider_published_at(),
         terminal_for_query: page.is_terminal(),
     })
-    .map_err(|_| invalid_protocol())?;
+    .map_err(|error| TreasuryPageError::new(TreasuryPageStage::Accounting, error))?;
     let batch = batch.finish()?.try_bind_provider_capture(capture)?;
     let content_identity = ExtractionContentIdentity::try_from_batch(&batch)?;
     let native_plan = match page {
@@ -1516,7 +1540,10 @@ fn prepare_canonical_page(
         ),
         TreasuryHistoryPage::Fiscal(page) => {
             let TreasurySourceConfig::AverageInterestRates(query) = source.config else {
-                return Err(invalid_protocol());
+                return Err(TreasuryPageError::new(
+                    TreasuryPageStage::NativeLineage,
+                    invalid_protocol(),
+                ));
             };
             TreasuryNativeLineagePlan::fiscal_page(
                 descriptor.provider_dataset().clone(),
@@ -1525,16 +1552,19 @@ fn prepare_canonical_page(
             )
         }
     }
-    .map_err(super::map_adapter_error)?;
+    .map_err(|error| TreasuryPageError::new(TreasuryPageStage::NativeLineage, error))?;
     let (native_lineage, row_capture_page_ordinals) = native_plan
         .try_encode(&batch)
-        .map_err(super::map_adapter_error)?;
+        .map_err(|error| TreasuryPageError::new(TreasuryPageStage::NativeLineage, error))?;
     if row_capture_page_ordinals.len() != batch.records().len()
         || row_capture_page_ordinals
             .iter()
             .any(|ordinal| *ordinal != 0)
     {
-        return Err(invalid_protocol());
+        return Err(TreasuryPageError::new(
+            TreasuryPageStage::NativeLineage,
+            invalid_protocol(),
+        ));
     }
     Ok(TreasuryAllHistoryCanonicalPage {
         batch,

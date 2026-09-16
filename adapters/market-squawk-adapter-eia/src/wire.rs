@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value};
 
 use crate::types::{digest_bytes, digest_parts};
-use crate::{EiaApiVersion, EiaDigest, EiaError, EiaParseLimits};
+use crate::{EiaApiVersion, EiaDigest, EiaError, EiaParseLimits, EiaStructureLimitKind};
+
+const MAX_SCHEMA_SHAPE_DEPTH: usize = 64;
 
 pub(crate) struct EiaEnvelope {
     pub(crate) response: Map<String, Value>,
@@ -111,8 +113,19 @@ pub(crate) fn parse_bounded_string(
     limits: EiaParseLimits,
 ) -> Result<String, EiaError> {
     let value = value.as_str().ok_or(EiaError::InvalidProtocol)?;
-    if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
-        return Err(EiaError::StructureLimit);
+    if value.len() > limits.max_string_bytes() {
+        return Err(EiaError::structure_limit(
+            EiaStructureLimitKind::StringBytes,
+            value.len(),
+            limits.max_string_bytes(),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(EiaError::structure_limit(
+            EiaStructureLimitKind::ControlCharacter,
+            1,
+            0,
+        ));
     }
     Ok(value.to_owned())
 }
@@ -133,18 +146,44 @@ fn validate_structure(root: &Value, limits: EiaParseLimits) -> Result<(), EiaErr
     let mut stack = vec![(root, 1_usize)];
     let mut nodes = 0_usize;
     while let Some((value, depth)) = stack.pop() {
-        nodes = nodes.checked_add(1).ok_or(EiaError::StructureLimit)?;
-        if nodes > limits.max_json_nodes() || depth > limits.max_json_depth() {
-            return Err(EiaError::StructureLimit);
+        nodes = nodes.checked_add(1).ok_or(EiaError::InvalidLimit)?;
+        if nodes > limits.max_json_nodes() {
+            return Err(EiaError::structure_limit(
+                EiaStructureLimitKind::JsonNodes,
+                nodes,
+                limits.max_json_nodes(),
+            ));
+        }
+        if depth > limits.max_json_depth() {
+            return Err(EiaError::structure_limit(
+                EiaStructureLimitKind::JsonDepth,
+                depth,
+                limits.max_json_depth(),
+            ));
         }
         match value {
             Value::Object(object) => {
                 if object.len() > limits.max_fields_per_object() {
-                    return Err(EiaError::StructureLimit);
+                    return Err(EiaError::structure_limit(
+                        EiaStructureLimitKind::ObjectFields,
+                        object.len(),
+                        limits.max_fields_per_object(),
+                    ));
                 }
                 for (key, value) in object {
-                    if key.len() > limits.max_string_bytes() || key.chars().any(char::is_control) {
-                        return Err(EiaError::StructureLimit);
+                    if key.len() > limits.max_string_bytes() {
+                        return Err(EiaError::structure_limit(
+                            EiaStructureLimitKind::KeyBytes,
+                            key.len(),
+                            limits.max_string_bytes(),
+                        ));
+                    }
+                    if key.chars().any(char::is_control) {
+                        return Err(EiaError::structure_limit(
+                            EiaStructureLimitKind::ControlCharacter,
+                            1,
+                            0,
+                        ));
                     }
                     stack.push((value, depth.saturating_add(1)));
                 }
@@ -155,7 +194,11 @@ fn validate_structure(root: &Value, limits: EiaParseLimits) -> Result<(), EiaErr
                 }
             }
             Value::String(value) if value.len() > limits.max_string_bytes() => {
-                return Err(EiaError::StructureLimit);
+                return Err(EiaError::structure_limit(
+                    EiaStructureLimitKind::StringBytes,
+                    value.len(),
+                    limits.max_string_bytes(),
+                ));
             }
             Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
         }
@@ -170,14 +213,18 @@ fn redact_api_keys(
     redacted: &mut usize,
 ) -> Result<(), EiaError> {
     if depth > max_depth {
-        return Err(EiaError::StructureLimit);
+        return Err(EiaError::structure_limit(
+            EiaStructureLimitKind::RedactionDepth,
+            depth,
+            max_depth,
+        ));
     }
     match value {
         Value::Object(object) => {
             for (key, value) in object {
                 if key.eq_ignore_ascii_case("api_key") {
                     *value = Value::String("[REDACTED]".to_owned());
-                    *redacted = redacted.checked_add(1).ok_or(EiaError::StructureLimit)?;
+                    *redacted = redacted.checked_add(1).ok_or(EiaError::InvalidLimit)?;
                 } else {
                     redact_api_keys(value, depth.saturating_add(1), max_depth, redacted)?;
                 }
@@ -205,8 +252,12 @@ fn schema_shape_digest(value: &Value) -> Result<EiaDigest, EiaError> {
 }
 
 fn append_shape(value: &Value, depth: usize, tokens: &mut Vec<Vec<u8>>) -> Result<(), EiaError> {
-    if depth > 64 {
-        return Err(EiaError::StructureLimit);
+    if depth > MAX_SCHEMA_SHAPE_DEPTH {
+        return Err(EiaError::structure_limit(
+            EiaStructureLimitKind::ShapeDepth,
+            depth,
+            MAX_SCHEMA_SHAPE_DEPTH,
+        ));
     }
     match value {
         Value::Null => tokens.push(b"null".to_vec()),

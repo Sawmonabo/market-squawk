@@ -211,21 +211,29 @@ impl Catalog {
         })
     }
 
-    fn market_recovery_read<T>(
+    pub(super) fn market_recovery_read<T>(
         &self,
         deadline: Instant,
         cancellation: &CancellationToken,
         operation: impl FnOnce() -> Result<T, CatalogError>,
     ) -> Result<T, CatalogError> {
         check_read(deadline, cancellation)?;
+        // Busy waiting is outside SQLite's progress handler. This read scope cannot wait
+        // on another connection while its cancellation or deadline goes unobserved.
+        self.connection.busy_timeout(std::time::Duration::ZERO)?;
         let token = cancellation.clone();
-        self.connection.progress_handler(
+        let install = self.connection.progress_handler(
             SQLITE_PROGRESS_OPERATIONS,
             Some(move || token.is_cancelled() || Instant::now() >= deadline),
-        )?;
-        let result = operation();
-        self.connection.progress_handler::<fn() -> bool>(0, None)?;
+        );
+        let result = install
+            .map_err(CatalogError::from)
+            .and_then(|()| operation());
+        let progress_cleanup = self.connection.progress_handler::<fn() -> bool>(0, None);
+        let busy_cleanup = self.connection.busy_timeout(self.busy_timeout);
         check_read(deadline, cancellation)?;
+        progress_cleanup?;
+        busy_cleanup?;
         result
     }
 }
