@@ -197,6 +197,24 @@ branches after proving their commits are merged, patch-equivalent, or superseded
 integration. Preserve active branches, open dependency-update branches, and any unique unintegrated
 commit until its disposition is explicit.
 
+Unique historical code is not evidence that it belongs in the current product. Before integrating
+or retiring a branch, compare its intended behavior with the current V1 contract, later owner
+corrections, rejected findings, and the accepted replacement design. Record each change as still
+required, already replaced, obsolete/rejected, or unresolved with specific evidence. Do not restore
+an abandoned design merely because its patch differs from the current tree. Preserve the evidence
+and unique WIP while making that disposition; preservation does not imply product acceptance.
+This applies equally to local and remote `codex/`, `dependabot/`, and other lane branches. Report
+actual removals separately from inventories and outstanding reconciliation; an audit alone does
+not complete cleanup.
+
+Historical cleanup must not orphan current agent work. Keep one current integration queue with
+each task's owner, exact candidate and base, dependencies, review/integration status, next action,
+and branch/worktree retirement trigger. The lead owns acceptance and serialized shared-file/Git
+integration; a delegated coordinator may track readiness but cannot substitute a completion report
+for inspected changes and relevant verification. Reconcile completed candidates before dispatching
+replacement work, explicitly disposition superseded packets, and close the associated worktree
+lifecycle after integration instead of letting finished lanes accumulate.
+
 Update the README only when runnable or release-blocking product truth changes. Update the local
 delivery ledger at every integration barrier with the exact pushed heads, active worktree, open
 blocker, next release event, issue state, and cleanup disposition. Repository prose is tracking and
