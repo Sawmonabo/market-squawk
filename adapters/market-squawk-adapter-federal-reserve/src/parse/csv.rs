@@ -24,6 +24,33 @@ pub fn parse_csv(
     bytes: &[u8],
     limits: BoardParseLimits,
 ) -> Result<ParsedBoardDataset, BoardAdapterError> {
+    parse_csv_inner(contract, bytes, limits, None)
+}
+
+pub(crate) fn parse_csv_controlled(
+    contract: &BoardDatasetContract,
+    bytes: &[u8],
+    limits: BoardParseLimits,
+    control: &dyn market_squawk_platform::ResearchObjectControl,
+) -> Result<ParsedBoardDataset, BoardAdapterError> {
+    parse_csv_inner(contract, bytes, limits, Some(control))
+}
+
+fn parse_csv_inner(
+    contract: &BoardDatasetContract,
+    bytes: &[u8],
+    limits: BoardParseLimits,
+    control: Option<&dyn market_squawk_platform::ResearchObjectControl>,
+) -> Result<ParsedBoardDataset, BoardAdapterError> {
+    let checkpoint = || -> Result<(), BoardAdapterError> {
+        if let Some(control) = control {
+            control.checkpoint(
+                market_squawk_platform::ResearchObjectControlPoint::BeforeVerification,
+            )?;
+        }
+        Ok(())
+    };
+    checkpoint()?;
     if contract.format() != BoardFileFormat::DdpCsvSeriesColumnV1 {
         return Err(BoardAdapterError::FormatMismatch);
     }
@@ -47,6 +74,7 @@ pub fn parse_csv(
         .try_reserve_exact(HEADER_LABELS.len())
         .map_err(|_| BoardAdapterError::AllocationFailed)?;
     for label in HEADER_LABELS {
+        checkpoint()?;
         let record = records
             .next()
             .ok_or(BoardAdapterError::CsvSchemaDrift)?
@@ -60,6 +88,7 @@ pub fn parse_csv(
     let mut periods = BTreeSet::new();
     let mut observation_count = 0_usize;
     for result in records {
+        checkpoint()?;
         let record = result.map_err(|error| BoardAdapterError::InvalidCsv(error.to_string()))?;
         if record.len() != expected.len() + 1 {
             return Err(BoardAdapterError::CsvSchemaDrift);
@@ -97,6 +126,7 @@ pub fn parse_csv(
         .try_reserve_exact(expected.len())
         .map_err(|_| BoardAdapterError::AllocationFailed)?;
     for (index, (series_contract, observations)) in expected.iter().zip(columns).enumerate() {
+        checkpoint()?;
         let description = descriptions
             .get(index + 1)
             .ok_or(BoardAdapterError::CsvSchemaDrift)?;
@@ -111,6 +141,7 @@ pub fn parse_csv(
         bytes.len(),
         payload_digest,
     )?;
+    checkpoint()?;
     ParsedBoardDataset::try_new(
         contract,
         &contract.request(),
@@ -120,6 +151,198 @@ pub fn parse_csv(
         vec![artifact],
         parsed_series,
     )
+}
+
+/// A private subset, never a complete original or publication authority. Global ordinals are
+/// retained separately because omitted series/observations must not renumber native row maps.
+pub(crate) struct SelectedBoardCsv {
+    pub(crate) parsed: ParsedBoardDataset,
+    pub(crate) global_ordinals: Vec<u64>,
+}
+
+/// The caller physically authenticates the original file and its committed transport receipt.
+/// Scan only period coordinates, then seek exact CSV record boundaries for selected *complete*
+/// partitions. No unselected value is normalized and no whole-history typed parse is retained.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_csv_selected_partitions(
+    contract: &BoardDatasetContract,
+    bytes: &[u8],
+    limits: BoardParseLimits,
+    original_observation_count: u64,
+    selected_series: &str,
+    dates: &[market_squawk_domain::CalendarDate; 11],
+    rows_per_partition: u32,
+    control: &dyn market_squawk_platform::ResearchObjectControl,
+) -> Result<SelectedBoardCsv, BoardAdapterError> {
+    let checkpoint = || {
+        control
+            .checkpoint(market_squawk_platform::ResearchObjectControlPoint::BeforeVerification)
+            .map_err(BoardAdapterError::from)
+    };
+    checkpoint()?;
+    if contract.format() != BoardFileFormat::DdpCsvSeriesColumnV1
+        || dates.windows(2).any(|pair| pair[0] >= pair[1])
+        || rows_per_partition == 0
+    {
+        return Err(BoardAdapterError::InvalidContract);
+    }
+    if bytes.is_empty() || bytes.len() > limits.max_source_bytes() {
+        return Err(BoardAdapterError::ByteLimitExceeded);
+    }
+    let expected = contract
+        .series_scope()
+        .exact_series()
+        .ok_or(BoardAdapterError::InvalidContract)?;
+    if expected.len() != 11
+        || expected.len() > limits.max_series()
+        || original_observation_count == 0
+        || original_observation_count > limits.max_observations() as u64
+        || original_observation_count % expected.len() as u64 != 0
+    {
+        return Err(BoardAdapterError::StructuralLimitExceeded);
+    }
+    let selected_series_index = expected
+        .iter()
+        .position(|series| series.unique_id() == selected_series)
+        .ok_or(BoardAdapterError::SeriesMismatch)?;
+    let row_count = original_observation_count / expected.len() as u64;
+    let mut reader = ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(false)
+        .from_reader(std::io::Cursor::new(bytes));
+    let mut metadata = Vec::with_capacity(HEADER_LABELS.len());
+    let mut record = StringRecord::new();
+    for label in HEADER_LABELS {
+        checkpoint()?;
+        if !reader
+            .read_record(&mut record)
+            .map_err(|error| BoardAdapterError::InvalidCsv(error.to_string()))?
+        {
+            return Err(BoardAdapterError::CsvSchemaDrift);
+        }
+        require_width_and_label(&record, expected.len(), label)?;
+        metadata.push(record.clone());
+    }
+    validate_metadata(&metadata, expected)?;
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve_exact(row_count as usize)
+        .map_err(|_| BoardAdapterError::AllocationFailed)?;
+    let mut selected_rows = [None; 11];
+    let mut previous_period = None;
+    loop {
+        checkpoint()?;
+        if !reader
+            .read_record(&mut record)
+            .map_err(|error| BoardAdapterError::InvalidCsv(error.to_string()))?
+        {
+            break;
+        }
+        if record.len() != expected.len() + 1 || offsets.len() as u64 >= row_count {
+            return Err(BoardAdapterError::CsvSchemaDrift);
+        }
+        let period = BoardPeriod::parse(
+            record.get(0).ok_or(BoardAdapterError::CsvSchemaDrift)?,
+            contract.frequency(),
+        )?;
+        if previous_period
+            .as_ref()
+            .is_some_and(|previous| previous >= &period)
+        {
+            return Err(BoardAdapterError::DuplicateIdentity);
+        }
+        let crate::BoardPeriodValue::CalendarDate { date } = period.value() else {
+            return Err(BoardAdapterError::FormatMismatch);
+        };
+        if let Ok(index) = dates.binary_search(date) {
+            selected_rows[index] = Some(offsets.len() as u64);
+        }
+        offsets.push(
+            record
+                .position()
+                .ok_or(BoardAdapterError::CsvSchemaDrift)?
+                .byte(),
+        );
+        previous_period = Some(period);
+    }
+    if offsets.len() as u64 != row_count || selected_rows.iter().any(Option::is_none) {
+        return Err(BoardAdapterError::SeriesMismatch);
+    }
+    let partition_size = u64::from(rows_per_partition);
+    let mut partitions = BTreeSet::new();
+    for row in selected_rows {
+        let ordinal = selected_series_index as u64 * row_count
+            + row.ok_or(BoardAdapterError::SeriesMismatch)?;
+        partitions.insert(ordinal / partition_size);
+    }
+    let mut columns = vec![Vec::new(); expected.len()];
+    let mut global_ordinals = Vec::new();
+    global_ordinals
+        .try_reserve_exact(partitions.len() * rows_per_partition as usize)
+        .map_err(|_| BoardAdapterError::AllocationFailed)?;
+    for partition in partitions {
+        let first = partition * partition_size;
+        let end = (first + partition_size).min(original_observation_count);
+        for ordinal in first..end {
+            checkpoint()?;
+            let series_index = (ordinal / row_count) as usize;
+            let observation_index = (ordinal % row_count) as usize;
+            let mut position = csv::Position::new();
+            position.set_byte(offsets[observation_index]);
+            reader
+                .seek(position)
+                .map_err(|error| BoardAdapterError::InvalidCsv(error.to_string()))?;
+            if !reader
+                .read_record(&mut record)
+                .map_err(|error| BoardAdapterError::InvalidCsv(error.to_string()))?
+                || record.len() != expected.len() + 1
+            {
+                return Err(BoardAdapterError::CsvSchemaDrift);
+            }
+            let period = BoardPeriod::parse(
+                record.get(0).ok_or(BoardAdapterError::CsvSchemaDrift)?,
+                contract.frequency(),
+            )?;
+            let raw = record
+                .get(series_index + 1)
+                .ok_or(BoardAdapterError::CsvSchemaDrift)?;
+            let value = BoardValue::parse(Some(raw), if raw == "ND" { "ND" } else { "A" })?;
+            columns[series_index].push(BoardObservation::try_new(period, value, BTreeMap::new())?);
+            global_ordinals.push(ordinal);
+        }
+    }
+    let mut series = Vec::new();
+    for (index, (contract, observations)) in expected.iter().zip(columns).enumerate() {
+        checkpoint()?;
+        if !observations.is_empty() {
+            series.push(build_series(
+                contract,
+                field(&metadata, 0, index + 1)?,
+                observations,
+            )?);
+        }
+    }
+    let payload_digest = sha256(bytes);
+    let artifact = BoardArtifactReceipt::new(
+        "response.csv",
+        BoardArtifactKind::DataCsv,
+        bytes.len(),
+        payload_digest,
+    )?;
+    let parsed = ParsedBoardDataset::try_new(
+        contract,
+        &contract.request(),
+        payload_digest,
+        csv_schema_digest(&metadata, contract.frequency()),
+        None,
+        vec![artifact],
+        series,
+    )?;
+    checkpoint()?;
+    Ok(SelectedBoardCsv {
+        parsed,
+        global_ordinals,
+    })
 }
 
 fn require_width_and_label(

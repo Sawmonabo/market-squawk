@@ -23,7 +23,7 @@ use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
     IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER, USER_AGENT,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -514,7 +514,8 @@ fn validate_scripted_h15_response(
 }
 
 /// Opaque HTTP validators retained exactly and admitted only after bounded syntax checks.
-#[derive(Clone, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoardHttpValidators {
     etag: Option<Box<[u8]>>,
     last_modified: Option<Box<str>>,
@@ -568,7 +569,8 @@ impl BoardHttpValidators {
 }
 
 /// Conditional request bound to the exact previously retained representation digest.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoardConditionalRequest {
     validators: BoardHttpValidators,
     prior_payload_digest: [u8; 32],
@@ -601,7 +603,8 @@ impl BoardConditionalRequest {
 }
 
 /// Complete exact-response receipt for one modified Board file.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoardHttpReceipt {
     contract_digest: [u8; 32],
     contract_request_digest: [u8; 32],
@@ -754,6 +757,37 @@ impl BoardNotModifiedReceipt {
     pub const fn latency_nanos(&self) -> u64 {
         self.latency_nanos
     }
+}
+
+/// Exact source transport result awaiting bounded parsing on the existing owned I/O lane.
+#[derive(Debug)]
+pub(crate) struct BoardRetrievedBody {
+    bytes: Bytes,
+    receipt: BoardHttpReceipt,
+}
+impl BoardRetrievedBody {
+    pub(crate) const fn receipt(&self) -> &BoardHttpReceipt {
+        &self.receipt
+    }
+    pub(crate) fn into_parts(self) -> (Bytes, BoardHttpReceipt) {
+        (self.bytes, self.receipt)
+    }
+    fn telemetry(&self) -> BoardAttemptTelemetry {
+        BoardAttemptTelemetry {
+            attempted: true,
+            status: Some(self.receipt.status()),
+            body_bytes: self.receipt.body_bytes(),
+            body_digest: Some(self.receipt.body_digest()),
+            received_at: self.receipt.received_at(),
+            latency_nanos: self.receipt.latency_nanos(),
+            retry_after_present: false,
+        }
+    }
+}
+#[derive(Debug)]
+pub(crate) enum BoardRawRetrievalOutcome {
+    Modified(Box<BoardRetrievedBody>),
+    NotModified(Box<BoardNotModifiedReceipt>),
 }
 
 /// Parsed exact file plus its complete HTTP receipt.
@@ -971,6 +1005,56 @@ impl BoardHttpClient {
         deadline: Timestamp,
         cancellation: &CancellationToken,
     ) -> Result<BoardRetrievalOutcome, BoardFetchFailure> {
+        match self
+            .fetch_raw(
+                metadata,
+                authority,
+                profile,
+                conditional,
+                deadline,
+                cancellation,
+            )
+            .await?
+        {
+            BoardRawRetrievalOutcome::NotModified(receipt) => {
+                Ok(BoardRetrievalOutcome::NotModified(receipt))
+            }
+            BoardRawRetrievalOutcome::Modified(raw) => {
+                let telemetry = raw.telemetry();
+                validate_parse_continuation(deadline, cancellation)
+                    .map_err(|error| BoardFetchFailure { error, telemetry })?;
+                let parsed = profile.parse(&raw.bytes).map_err(|_| BoardFetchFailure {
+                    error: SourceError::InvalidProtocolState.into(),
+                    telemetry,
+                })?;
+                validate_parse_continuation(deadline, cancellation)
+                    .map_err(|error| BoardFetchFailure { error, telemetry })?;
+                if parsed.source_payload_digest() != raw.receipt.body_digest() {
+                    return Err(BoardFetchFailure {
+                        error: SourceError::InvalidProtocolState.into(),
+                        telemetry,
+                    });
+                }
+                Ok(BoardRetrievalOutcome::Modified(Box::new(
+                    BoardRetrievedFile {
+                        bytes: raw.bytes,
+                        parsed,
+                        receipt: raw.receipt,
+                    },
+                )))
+            }
+        }
+    }
+
+    pub(crate) async fn fetch_raw(
+        &self,
+        metadata: &SourceMetadata,
+        authority: &ExtractionAuthority,
+        profile: &BoardDatasetProfile,
+        conditional: Option<&BoardConditionalRequest>,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<BoardRawRetrievalOutcome, BoardFetchFailure> {
         let started_at = system_timestamp()
             .map_err(|error| failure_without_response(map_source_error(error)))?;
         authority
@@ -1106,7 +1190,7 @@ impl BoardHttpClient {
                 });
             }
             in_flight.release();
-            return Ok(BoardRetrievalOutcome::NotModified(Box::new(
+            return Ok(BoardRawRetrievalOutcome::NotModified(Box::new(
                 BoardNotModifiedReceipt {
                     contract_digest: request.contract_digest(),
                     contract_request_digest: request.request_digest(),
@@ -1143,33 +1227,11 @@ impl BoardHttpClient {
             in_flight.release();
             return Err(BoardFetchFailure { error, telemetry });
         }
-        let parsed = match profile.parse(&response.body) {
-            Ok(value) => value,
-            Err(_) => {
-                in_flight.release();
-                return Err(BoardFetchFailure {
-                    error: SourceError::InvalidProtocolState.into(),
-                    telemetry,
-                });
-            }
-        };
-        if let Err(error) = validate_parse_continuation(deadline, cancellation) {
-            in_flight.release();
-            return Err(BoardFetchFailure { error, telemetry });
-        }
-        let body_digest = parsed.source_payload_digest();
-        if body_digest != sha256(&response.body) {
-            in_flight.release();
-            return Err(BoardFetchFailure {
-                error: SourceError::InvalidProtocolState.into(),
-                telemetry,
-            });
-        }
+        let body_digest = sha256(&response.body);
         in_flight.release();
-        Ok(BoardRetrievalOutcome::Modified(Box::new(
-            BoardRetrievedFile {
+        Ok(BoardRawRetrievalOutcome::Modified(Box::new(
+            BoardRetrievedBody {
                 bytes: response.body,
-                parsed,
                 receipt: BoardHttpReceipt {
                     contract_digest: request.contract_digest(),
                     contract_request_digest: request.request_digest(),
@@ -1486,7 +1548,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn request_identity(
+pub(crate) fn request_identity(
     base_request_digest: [u8; 32],
     conditional: Option<&BoardConditionalRequest>,
 ) -> [u8; 32] {

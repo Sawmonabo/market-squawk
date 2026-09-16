@@ -5,6 +5,9 @@ use thiserror::Error;
 /// A bounded Federal Reserve Board file-contract, parser, or publication failure.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum BoardAdapterError {
+    /// Original cancellation or deadline interrupted a full-file parse on the retained I/O owner.
+    #[error(transparent)]
+    ControlledRead(#[from] market_squawk_platform::ResearchObjectControlError),
     /// A configured contract is empty, inconsistent, or outside its code-owned bounds.
     #[error("invalid Federal Reserve Board dataset contract")]
     InvalidContract,

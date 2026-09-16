@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::{BoardAdapterError, BoardDatasetContract, BoardFileFormat, ParsedBoardDataset};
 
 pub use csv::parse_csv;
+pub(crate) use csv::{parse_csv_controlled, parse_csv_selected_partitions};
 pub use sdmx::{parse_sdmx_xml, parse_sdmx_zip};
 
 /// Independent source, archive, and structural ceilings for one parse.
@@ -53,6 +54,19 @@ impl BoardParseLimits {
             max_source_bytes: 1024 * 1024,
             max_series: 11,
             max_observations: 1_100,
+            ..Self::default()
+        }
+    }
+
+    /// Closed complete-file H.15 budget. This remains a bounded parsed native input; canonical
+    /// output is admitted in deterministic partitions, never one enlarged extraction batch.
+    pub fn h15_treasury_constant_maturities_full_history() -> Self {
+        Self {
+            max_source_bytes: 16 * 1024 * 1024,
+            max_series: 11,
+            max_observations: 262_144,
+            max_attributes: 16,
+            max_text_bytes: 4 * 1024,
             ..Self::default()
         }
     }

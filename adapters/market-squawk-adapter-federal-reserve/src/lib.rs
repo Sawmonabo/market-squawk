@@ -44,8 +44,11 @@ pub use publication::{
     BoardRevisionEvidence, BoardSeriesReplacement, BoardVintageCapability,
 };
 pub use source::{
-    BoardDatasetProfile, BoardExtractionError, BoardPendingExtractionSeal, BoardSealedPublication,
-    BoardSource, BoardSourceError, BoardSourceHealth, BoardStructuralArtifact,
+    BoardDatasetProfile, BoardExtractionError, BoardFullHistoryCanonicalCursor,
+    BoardFullHistoryCanonicalPartition, BoardFullHistoryError, BoardFullHistoryOriginal,
+    BoardFullHistoryPending, BoardFullHistorySelectedReplay, BoardPendingExtractionSeal,
+    BoardPreparedFullHistory, BoardSealedPublication, BoardSource, BoardSourceError,
+    BoardSourceHealth, BoardStructuralArtifact,
 };
 pub use transport::{
     BoardConditionalRequest, BoardHttpReceipt, BoardHttpValidators, BoardNotModifiedReceipt,

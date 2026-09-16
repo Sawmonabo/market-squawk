@@ -603,6 +603,224 @@ async fn authority_transport_preserves_exact_repost_and_conditional_evidence() -
     Ok(())
 }
 
+#[tokio::test]
+async fn selected_h15_replay_matches_complete_partitions_across_series_boundaries() -> TestResult {
+    use market_squawk_domain::{CalendarDate, ResearchObservation};
+    use market_squawk_platform::{
+        ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+        SealedResearchJournalStoreError,
+    };
+    use market_squawk_sources::LogicalPartitionFamily;
+    use rust_decimal::Decimal;
+
+    struct Control(CancellationToken);
+    impl ResearchObjectControl for Control {
+        fn checkpoint(
+            &self,
+            _: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            if self.0.is_cancelled() {
+                Err(ResearchObjectControlError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    // The native 10y series is column 8. Its 400 rows occupy ordinals 3200..3600.
+    // Both selected partitions cross series boundaries and partition 13 must be skipped.
+    let body = h15_dashboard_csv(400)
+        .lines()
+        .enumerate()
+        .map(|(line, row)| {
+            if line < 6 {
+                row.to_owned()
+            } else {
+                row.replace(",4.008", &format!(",5.{:03}", line - 6))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let harness = source_harness(ScriptedBoardResponse {
+        status: 200,
+        content_type: Some(b"text/csv; charset=utf-8".to_vec()),
+        etag: Some(b"\"h15-full-selected-replay\"".to_vec()),
+        last_modified: None,
+        body: Bytes::from(body),
+    })?;
+    let temporary = TemporaryDirectory::new();
+    let paths = LocalPaths::prepare(temporary.path())?;
+    let store = paths.sealed_research_journal_store()?;
+    let control = Control(CancellationToken::new());
+    let deadline = system_timestamp()?.checked_add_nanos(60_000_000_000)?;
+    let original = harness
+        .source
+        .retrieve_h15_full_history(&harness.authority, deadline, &control.0)
+        .await?
+        .seal_original(&store, &control)?;
+    let original_digest = original.original_digest();
+    let prepared = original.prepare(
+        EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            sha256(b"h15-replay-test-canonical-schema"),
+        ),
+        &store,
+        &control,
+    )?;
+    let (_, binding, checkpoint) = prepared.into_parts();
+    let mut complete = BoardFullHistoryOriginal::reopen_checkpoint(&checkpoint, &store, &control)?
+        .into_canonical_cursor()?;
+    assert_eq!(binding.terminal().total_canonical_rows(), 4400);
+    let dates = [
+        CalendarDate::new(2025, 1, 1)?,
+        CalendarDate::new(2025, 1, 2)?,
+        CalendarDate::new(2025, 1, 3)?,
+        CalendarDate::new(2025, 1, 4)?,
+        CalendarDate::new(2025, 1, 5)?,
+        CalendarDate::new(2026, 1, 30)?,
+        CalendarDate::new(2026, 1, 31)?,
+        CalendarDate::new(2026, 2, 1)?,
+        CalendarDate::new(2026, 2, 2)?,
+        CalendarDate::new(2026, 2, 3)?,
+        CalendarDate::new(2026, 2, 4)?,
+    ];
+    let selected =
+        BoardFullHistoryOriginal::reopen_annual_checkpoint(&checkpoint, &dates, &store, &control)?;
+    assert_eq!(selected.original_digest(), original_digest);
+    assert_eq!(selected.original_observation_count(), 4400);
+    assert_eq!(selected.objects().len(), binding.objects().len());
+    for (selected_object, original_object) in selected.objects().iter().zip(binding.objects()) {
+        assert_eq!(selected_object.role(), original_object.role());
+        assert_eq!(
+            selected_object.semantic_identity(),
+            original_object.semantic_identity()
+        );
+        assert_eq!(
+            selected_object.object().claim(),
+            original_object.object().claim()
+        );
+    }
+    let mut selected = selected.into_canonical_cursor();
+    let mut selected_ordinals = Vec::new();
+    let mut selected_values = Vec::new();
+    let mut total_rows = 0_u64;
+    while let Some(full_partition) = complete.next_partition(&control)? {
+        total_rows += u64::from(full_partition.range().item_count().get());
+        if ![12, 14].contains(&full_partition.ordinal()) {
+            continue;
+        }
+        let partition = selected
+            .next_partition(&control)?
+            .ok_or("missing selected partition")?;
+        assert_eq!(partition.ordinal(), full_partition.ordinal());
+        assert_eq!(partition.range(), full_partition.range());
+        assert_eq!(partition.digest(), full_partition.digest());
+        assert_eq!(partition.range().item_count().get(), 256);
+        let expected = &binding.canonical_partitions()[partition.ordinal() as usize];
+        assert_eq!(partition.range(), expected.row_range());
+        assert_eq!(partition.digest(), expected.semantic_digest());
+        for family in [
+            LogicalPartitionFamily::ProviderNative,
+            LogicalPartitionFamily::CanonicalRowMap,
+        ] {
+            let retained = binding
+                .partitions()
+                .iter()
+                .find(|candidate| {
+                    candidate.family() == family
+                        && candidate.partition_ordinal() == partition.ordinal()
+                })
+                .ok_or("missing original native/map partition")?;
+            let mut object = store.open_verified_logical_object(retained.object(), &control)?;
+            partition.verify_retained_frames(family, &mut object, &control)?;
+        }
+        let ordinal = partition.ordinal();
+        selected_ordinals.push(ordinal);
+        let (actual_batch, actual_native, actual_revisions) = partition.into_parts();
+        let (full_batch, full_native, full_revisions) = full_partition.into_parts();
+        assert_eq!(actual_native, full_native);
+        assert_eq!(actual_revisions, full_revisions);
+        assert_eq!(actual_batch.records().len(), full_batch.records().len());
+        for (index, (actual, full)) in actual_batch
+            .records()
+            .iter()
+            .zip(full_batch.records())
+            .enumerate()
+        {
+            // Payload equality binds dates, values, units, original bytes and all source clocks;
+            // request-attempt IDs are deliberately outside replay's semantic identity.
+            assert_eq!(actual.payload(), full.payload());
+            let ResearchObservation::Macro(value) = serde_json::from_slice(actual.payload())?
+            else {
+                return Err("unexpected non-macro original row".into());
+            };
+            let expected_series = match (ordinal, index) {
+                (12, 0..128) => "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY07_N.B",
+                (12, 128..256) | (14, 0..16) => {
+                    "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY10_N.B"
+                }
+                (14, 16..256) => "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY20_N.B",
+                _ => return Err("unexpected original partition range".into()),
+            };
+            assert_eq!(value.series().as_str(), expected_series);
+            assert_eq!(
+                value.unit().as_str(),
+                "federal-reserve-board-unit:Percent%3A_Per_Year:multiplier:1"
+            );
+            let date = value
+                .context()
+                .time()
+                .effective()
+                .calendar_date_value()
+                .ok_or("source date")?;
+            if expected_series.ends_with("RIFLGFCY10_N.B") && dates.contains(&date) {
+                selected_values.push((
+                    date,
+                    value
+                        .value()
+                        .observed_value()
+                        .ok_or("selected observed value")?,
+                ));
+            }
+        }
+    }
+    assert_eq!(total_rows, 4400);
+    assert_eq!(selected_ordinals, [12, 14]);
+    assert!(selected.next_partition(&control)?.is_none());
+    let expected_values = [
+        5000, 5001, 5002, 5003, 5004, 5394, 5395, 5396, 5397, 5398, 5399,
+    ];
+    assert_eq!(selected_values.len(), dates.len());
+    for ((actual_date, value), (date, expected)) in selected_values
+        .iter()
+        .zip(dates.iter().zip(expected_values))
+    {
+        assert_eq!(actual_date, date);
+        assert_eq!(*value, Decimal::new(expected, 3));
+    }
+    let mut missing_date = dates;
+    missing_date[10] = CalendarDate::new(2026, 2, 5)?;
+    assert!(matches!(
+        BoardFullHistoryOriginal::reopen_annual_checkpoint(
+            &checkpoint,
+            &missing_date,
+            &store,
+            &control
+        ),
+        Err(BoardFullHistoryError::Parse(
+            BoardAdapterError::SeriesMismatch
+        ))
+    ));
+    control.0.cancel();
+    assert!(matches!(
+        BoardFullHistoryOriginal::reopen_annual_checkpoint(&checkpoint, &dates, &store, &control),
+        Err(BoardFullHistoryError::Store(
+            SealedResearchJournalStoreError::ObjectControl(ResearchObjectControlError::Cancelled)
+        ))
+    ));
+    Ok(())
+}
+
 async fn extract_once(
     harness: &BoardSourceHarness,
     store: &market_squawk_platform::SealedResearchJournalStore,
@@ -710,8 +928,32 @@ fn board_metadata(now: Timestamp) -> TestResult<SourceMetadata> {
         8,
         1_024,
     )?;
+    let mut full_history_query = Vec::new();
+    for (key, value) in [
+        ("filetype", "csv"),
+        ("label", "include"),
+        ("layout", "seriescolumn"),
+        ("rel", "H15"),
+        ("series", "bf17364827e38702b42a58cf8eaa3f78"),
+        ("type", "package"),
+    ] {
+        full_history_query.push(QueryParameterRule::try_new_exact_public(
+            SourceIdentifier::try_from(key)?,
+            SourceIdentifier::try_from(value)?,
+        )?);
+    }
+    full_history_query.push(QueryParameterRule::try_new_exact_empty_public(
+        SourceIdentifier::try_from("lastObs")?,
+    )?);
+    let full_history_endpoint = ApiEndpointRule::try_new(
+        "https://www.federalreserve.gov/datadownload/Download.aspx",
+        PathScope::Exact,
+        full_history_query,
+        7,
+        256,
+    )?;
     let network = EndpointPolicy::try_from_api_rules(
-        vec![endpoint],
+        vec![endpoint, full_history_endpoint],
         market_squawk_sources::HttpRequestBounds::default(),
     )?;
     let budget = ProviderBudgetPolicy::try_new(

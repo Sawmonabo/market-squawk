@@ -1,5 +1,12 @@
 //! Shared-authority extraction source for one exact selected Board release file.
 
+mod full_history;
+pub use full_history::{
+    BoardFullHistoryCanonicalCursor, BoardFullHistoryCanonicalPartition, BoardFullHistoryError,
+    BoardFullHistoryOriginal, BoardFullHistoryPending, BoardFullHistorySelectedReplay,
+    BoardPreparedFullHistory,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
 use std::sync::Arc;
@@ -117,6 +124,17 @@ impl BoardDatasetProfile {
             BoardDatasetContract::h15_treasury_constant_maturities_rolling_dashboard_csv()
                 .map_err(BoardSourceError::Protocol)?,
             BoardParseLimits::h15_treasury_constant_maturities_rolling_dashboard(),
+            Vec::new(),
+        )
+    }
+
+    /// Exact complete-file identity with closed native parse bounds. The ordinary extraction
+    /// constructor still rejects this profile; only the full-history logical owner may use it.
+    pub fn h15_treasury_constant_maturities_full_history() -> Result<Self, BoardSourceError> {
+        Self::try_new(
+            BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+                .map_err(BoardSourceError::Protocol)?,
+            BoardParseLimits::h15_treasury_constant_maturities_full_history(),
             Vec::new(),
         )
     }
