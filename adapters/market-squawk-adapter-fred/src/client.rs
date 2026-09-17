@@ -1047,6 +1047,25 @@ impl FredSource {
         })
     }
 
+    fn remaining_transport_timeout(
+        &self,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<Duration, ExtractionSourceError> {
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        let fresh_now = system_timestamp().map_err(map_adapter_error)?;
+        let remaining = deadline
+            .unix_nanos()
+            .checked_sub(fresh_now.unix_nanos())
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .filter(|nanos| *nanos > 0)
+            .map(Duration::from_nanos)
+            .ok_or(ExtractionSourceError::DeadlineExceeded)?;
+        Ok(self.request_timeout.min(remaining))
+    }
+
     async fn fetch_page(
         &self,
         authority: &ExtractionAuthority,
@@ -1091,18 +1110,7 @@ impl FredSource {
             cancellation.clone(),
         )
         .await?;
-        if cancellation.is_cancelled() {
-            return Err(ExtractionSourceError::Cancelled.into());
-        }
-        let fresh_now = system_timestamp().map_err(map_adapter_error)?;
-        let wall_remaining = deadline
-            .unix_nanos()
-            .checked_sub(fresh_now.unix_nanos())
-            .and_then(|nanos| u64::try_from(nanos).ok())
-            .filter(|nanos| *nanos > 0)
-            .map(Duration::from_nanos)
-            .ok_or(ExtractionSourceError::DeadlineExceeded)?;
-        let timeout = self.request_timeout.min(wall_remaining);
+        let timeout = self.remaining_transport_timeout(deadline, &cancellation)?;
         let in_flight = permit.authorize_send(authorization_target.as_str())?;
         drop(authorization_target);
         let response = self

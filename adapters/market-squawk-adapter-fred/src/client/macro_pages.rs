@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::num::{NonZeroU16, NonZeroU32};
-use std::time::Duration;
 
 use market_squawk_domain::{CalendarDate, ExactPayloadEvidence, SourceIdentifier, Timestamp};
 use market_squawk_sources::{
@@ -712,13 +711,8 @@ impl FredSource {
             cancellation.clone(),
         )
         .await?;
+        let timeout = self.remaining_transport_timeout(deadline, &cancellation)?;
         let in_flight = permit.authorize_send(authorization_target.as_str())?;
-        let wall_remaining = deadline
-            .unix_nanos()
-            .checked_sub(now.unix_nanos())
-            .and_then(|nanos| u64::try_from(nanos).ok())
-            .map(Duration::from_nanos)
-            .ok_or(ExtractionSourceError::DeadlineExceeded)?;
         let response = self
             .transport
             .execute(
@@ -728,7 +722,7 @@ impl FredSource {
                     authorization,
                 },
                 self.response_limit,
-                self.request_timeout.min(wall_remaining),
+                timeout,
                 cancellation,
             )
             .await
