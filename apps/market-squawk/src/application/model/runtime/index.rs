@@ -88,6 +88,9 @@ pub(super) enum StoredRuntimePolicy {
 
 impl StoredRuntimePolicy {
     pub(super) fn try_onnx(policy: OnnxModelPolicy) -> Result<Self, ModelRuntimeIndexError> {
+        if !policy.output_semantics_bound() {
+            return Err(ModelRuntimeIndexError::InvalidRecord);
+        }
         let inference_deadline_nanos = u64::try_from(policy.inference_deadline().as_nanos())
             .map_err(|_| ModelRuntimeIndexError::InvalidRecord)?;
         Ok(Self::Onnx {
@@ -114,6 +117,7 @@ pub(super) struct IndexAdmission {
     pub(super) artifact_sha256: Sha256Digest,
     pub(super) training_run_sha256: Sha256Digest,
     pub(super) training_environment_sha256: Sha256Digest,
+    pub(super) output_binding_sha256: Sha256Digest,
     pub(super) runtime_policy: StoredRuntimePolicy,
 }
 
@@ -133,6 +137,7 @@ impl IndexAdmission {
                 self.artifact_sha256,
                 self.training_run_sha256,
                 self.training_environment_sha256,
+                self.output_binding_sha256,
             ]
             .iter()
             .any(|digest| digest.bytes() == [0; 32])
@@ -141,6 +146,7 @@ impl IndexAdmission {
         }
         if let StoredRuntimePolicy::Onnx { policy, .. } = &self.runtime_policy
             && (policy.model_digest() != self.artifact_sha256
+                || !policy.output_semantics_bound()
                 || policy.fallback() != OnnxFallbackPolicy::NoAction)
         {
             return Err(ModelRuntimeIndexError::InvalidRecord);
@@ -355,6 +361,7 @@ struct EntryView<'a> {
     artifact_sha256: String,
     training_run_sha256: String,
     training_environment_sha256: String,
+    output_binding_sha256: String,
     runtime_policy: RuntimePolicyView<'a>,
 }
 
@@ -376,6 +383,7 @@ impl<'a> From<&'a IndexAdmission> for EntryView<'a> {
             artifact_sha256: encode_hex(value.artifact_sha256.bytes()),
             training_run_sha256: encode_hex(value.training_run_sha256.bytes()),
             training_environment_sha256: encode_hex(value.training_environment_sha256.bytes()),
+            output_binding_sha256: encode_hex(value.output_binding_sha256.bytes()),
             runtime_policy: RuntimePolicyView::from(&value.runtime_policy),
         }
     }
@@ -390,8 +398,7 @@ enum RuntimePolicyView<'a> {
         opset: u32,
         input_shape: &'a [usize],
         output_shape: &'a [usize],
-        #[serde(skip_serializing_if = "Option::is_none")]
-        output_semantics: Option<&'static str>,
+        output_semantics: &'static str,
         inference_deadline_nanos: u64,
         fallback: &'static str,
         policy_sha256: String,
@@ -410,12 +417,10 @@ impl<'a> From<&'a StoredRuntimePolicy> for RuntimePolicyView<'a> {
                 opset: policy.opset(),
                 input_shape: policy.input_shape(),
                 output_shape: policy.output_shape(),
-                output_semantics: policy.output_semantics_bound().then_some(
-                    match policy.output_semantics() {
-                        ModelOutputSemantics::Regression => "regression",
-                        ModelOutputSemantics::BinaryProbability => "binary_probability",
-                    },
-                ),
+                output_semantics: match policy.output_semantics() {
+                    ModelOutputSemantics::Regression => "regression",
+                    ModelOutputSemantics::BinaryProbability => "binary_probability",
+                },
                 inference_deadline_nanos: *inference_deadline_nanos,
                 fallback: "no_action",
                 policy_sha256: encode_hex(policy.policy_digest()),
@@ -449,6 +454,7 @@ struct EntryWire {
     artifact_sha256: String,
     training_run_sha256: String,
     training_environment_sha256: String,
+    output_binding_sha256: String,
     runtime_policy: RuntimePolicyWire,
 }
 
@@ -481,6 +487,7 @@ impl EntryWire {
             training_environment_sha256: Sha256Digest::new(decode_hex(
                 &self.training_environment_sha256,
             )?),
+            output_binding_sha256: Sha256Digest::new(decode_hex(&self.output_binding_sha256)?),
             runtime_policy: self.runtime_policy.into_policy(artifact_sha256)?,
         })
     }
@@ -495,7 +502,7 @@ enum RuntimePolicyWire {
         opset: u32,
         input_shape: Vec<usize>,
         output_shape: Vec<usize>,
-        output_semantics: Option<String>,
+        output_semantics: String,
         inference_deadline_nanos: u64,
         fallback: String,
         policy_sha256: String,
@@ -525,16 +532,8 @@ impl RuntimePolicyWire {
                     return Err(ModelRuntimeIndexError::InvalidRecord);
                 }
                 let deadline = Duration::from_nanos(inference_deadline_nanos);
-                let policy = match output_semantics.as_deref() {
-                    None => OnnxModelPolicy::try_new(
-                        artifact_sha256,
-                        opset,
-                        &input_shape,
-                        &output_shape,
-                        deadline,
-                        OnnxFallbackPolicy::NoAction,
-                    ),
-                    Some("regression") => OnnxModelPolicy::try_new_with_output_semantics(
+                let policy = match output_semantics.as_str() {
+                    "regression" => OnnxModelPolicy::try_new_with_output_semantics(
                         artifact_sha256,
                         opset,
                         &input_shape,
@@ -543,7 +542,7 @@ impl RuntimePolicyWire {
                         deadline,
                         OnnxFallbackPolicy::NoAction,
                     ),
-                    Some("binary_probability") => OnnxModelPolicy::try_new_with_output_semantics(
+                    "binary_probability" => OnnxModelPolicy::try_new_with_output_semantics(
                         artifact_sha256,
                         opset,
                         &input_shape,
@@ -552,7 +551,7 @@ impl RuntimePolicyWire {
                         deadline,
                         OnnxFallbackPolicy::NoAction,
                     ),
-                    Some(_) => return Err(ModelRuntimeIndexError::InvalidRecord),
+                    _ => return Err(ModelRuntimeIndexError::InvalidRecord),
                 }
                 .map_err(|_| ModelRuntimeIndexError::InvalidRecord)?;
                 if policy.policy_digest() != decode_hex(&policy_sha256)? {
@@ -637,7 +636,11 @@ pub enum ModelRuntimeIndexError {
 #[cfg(test)]
 impl IndexAdmission {
     fn fixture(directory: u8) -> Result<Self, ModelRuntimeIndexError> {
-        let authority_bytes = br#"{"schema_version":5}"#.to_vec().into_boxed_slice();
+        // This proof exercises opaque index retention, not model-authority admission. Keep the
+        // fixture deliberately non-semantic so it cannot masquerade as an obsolete authority wire.
+        let authority_bytes = b"opaque-current-authority-fixture"
+            .to_vec()
+            .into_boxed_slice();
         let authority_sha256 = Sha256Digest::new(Sha256::digest(&authority_bytes).into());
         let catalog_identity = CatalogEndpointIdentity::try_from_bytes([3; 32])
             .ok_or(ModelRuntimeIndexError::InvalidRecord)?;
@@ -659,6 +662,7 @@ impl IndexAdmission {
             artifact_sha256: Sha256Digest::new([7; 32]),
             training_run_sha256: Sha256Digest::new([8; 32]),
             training_environment_sha256: Sha256Digest::new([9; 32]),
+            output_binding_sha256: Sha256Digest::new([10; 32]),
             runtime_policy: StoredRuntimePolicy::Native,
         })
     }

@@ -17,6 +17,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::DFParserBuilder;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use futures_util::StreamExt as _;
+use futures_util::future::BoxFuture;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use sha2::Digest as _;
 use thiserror::Error;
@@ -663,7 +664,8 @@ impl ResearchQueryEngine {
         let execution_durable_bound = Arc::clone(&durable_bound);
         let io_supervisor = BlockingIoSupervisor::new(operation_cancellation.clone());
         let execution_io_supervisor = io_supervisor.clone();
-        let execution = async {
+        // Check the recursive planner state at its owner, before composing caller futures.
+        let mut execution: BoxFuture<'_, Result<ExecutedQuery, QueryError>> = Box::pin(async {
             let _planning_admission = planning_receipt.acquire(&execution_cancellation).await?;
             let memory = planning_receipt.execution_bytes(limits.max_memory_bytes)?;
             let object_store_registry = Arc::new(PinnedObjectStoreRegistry::default());
@@ -863,8 +865,7 @@ impl ResearchQueryEngine {
                 },
                 result_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, ipc.get_ref().digest()),
             })
-        };
-        tokio::pin!(execution);
+        });
         let deadline = tokio::time::sleep_until(deadline_at);
         tokio::pin!(deadline);
         let result = tokio::select! {

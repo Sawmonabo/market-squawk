@@ -130,6 +130,7 @@ impl PaperWorker {
     pub(super) fn snapshot(&self) -> PaperExecutionSnapshot {
         PaperExecutionSnapshot::from_state(
             self.config.digest(),
+            &self.config,
             self.state.sequence,
             self.state.reconciliation_required,
             &self.state.orders,

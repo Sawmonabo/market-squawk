@@ -12,11 +12,14 @@ mod database;
 mod excel;
 #[cfg(feature = "fuzzing")]
 mod fuzzing;
+mod guided_manifest;
 mod json;
 mod manifest;
 mod manifest_bounds;
 mod ofx;
 mod parquet;
+mod parse;
+mod preview;
 mod representation;
 mod source;
 mod xml;
@@ -27,6 +30,15 @@ pub use clock::{
 pub use contracts::{ExtractionLimits, ExtractionLimitsInput, FileAdapterError, ParserLimit};
 #[cfg(feature = "fuzzing")]
 pub use fuzzing::{FuzzFileFormat, fuzz_parse_bytes};
+pub use guided_manifest::{
+    GuidedInstrumentBinding, GuidedManifest, GuidedManifestInput, GuidedManifestObject,
+    GuidedObjectTime, GuidedRecordTimeFallback, GuidedRowTimeMapping, GuidedUniverseBinding,
+    GuidedValueMapping, build_guided_manifest, build_guided_manifest_collection,
+};
+pub use preview::{
+    FilePreview, FilePreviewCell, FilePreviewColumn, FilePreviewColumnKind, FilePreviewFormat,
+    FilePreviewLimits, FilePreviewRow, preview_bytes,
+};
 pub use source::FileExtractionSource;
 
 pub(crate) use contracts::{CellValue, ParseBudget, ParsedRow};

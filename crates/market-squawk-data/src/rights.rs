@@ -13,6 +13,9 @@ use uuid::Uuid;
 const MAX_TERMS_URL_BYTES: usize = 2_048;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
 const SOURCE_RIGHTS_V2_DOMAIN: &[u8] = b"market-squawk/source-rights/v2";
+const IMPORTED_USER_INPUT_BINDING_DOMAIN: &[u8] = b"market-squawk/imported-user-input-binding/v1";
+const IMPORTED_USER_INPUT_BINDING_SCHEMA_VERSION: u16 = 1;
+const IMPORTED_USER_INPUT_REFERENCE_PREFIX: &str = "imported-user-input-v1:sha256:";
 
 /// Composition-held capability for durable rights registration.
 pub(crate) struct RightsRegistrar {
@@ -30,12 +33,18 @@ impl fmt::Debug for RightsRegistrar {
 pub struct RegisteredRightsGrant {
     pub(crate) catalog_id: Uuid,
     pub(crate) rights_id: [u8; 32],
+    pub(crate) payload_digest: EvidenceDigest,
 }
 
 impl RegisteredRightsGrant {
     /// Returns the durable grant identity for local control-plane persistence.
     pub const fn rights_id(&self) -> [u8; 32] {
         self.rights_id
+    }
+
+    /// Returns the exact retrieved payload covered by this sealed grant.
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
     }
 }
 
@@ -105,6 +114,8 @@ pub enum RightsBasis {
     ReviewedTerms(ReviewedTermsBasis),
     /// Exact user-owned manifest read beneath an explicitly authorized local input root.
     UserOwnedLocal(UserOwnedLocalBasis),
+    /// Exact guided import admitted into one authenticated local workspace.
+    ImportedUserInput(ImportedUserInputBasis),
 }
 
 /// Validated published-terms evidence with no local-root implication.
@@ -122,10 +133,108 @@ pub struct UserOwnedLocalBasis {
     root_identity_digest: EvidenceDigest,
 }
 
+/// Path-free exact evidence for one guided user-input import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedUserInputEvidence {
+    admitted_input_set_digest: EvidenceDigest,
+    generated_manifest_digest: EvidenceDigest,
+    local_admission_evidence: EvidenceDigest,
+    workspace_receipt_evidence: EvidenceDigest,
+    import_receipt_evidence: EvidenceDigest,
+    binding_digest: EvidenceDigest,
+}
+
+/// Durable path-free basis for one exact guided user-input import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedUserInputBasis {
+    reference: String,
+    evidence: ImportedUserInputEvidence,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RightsBasisKind {
     ReviewedTerms,
     UserOwnedLocal,
+    ImportedUserInput,
+}
+
+impl ImportedUserInputEvidence {
+    /// Constructs an exact guided-import binding from authenticated local evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an all-zero digest in any required evidence coordinate.
+    pub fn try_new(
+        admitted_input_set_digest: EvidenceDigest,
+        generated_manifest_digest: EvidenceDigest,
+        local_admission_evidence: EvidenceDigest,
+        workspace_receipt_evidence: EvidenceDigest,
+        import_receipt_evidence: EvidenceDigest,
+    ) -> Result<Self, RightsError> {
+        if [
+            admitted_input_set_digest,
+            generated_manifest_digest,
+            local_admission_evidence,
+            workspace_receipt_evidence,
+            import_receipt_evidence,
+        ]
+        .into_iter()
+        .any(|digest| digest.bytes() == [0; 32])
+        {
+            return Err(RightsError::InvalidImportedUserInputEvidence);
+        }
+        let binding_digest = imported_user_input_binding_digest(
+            admitted_input_set_digest,
+            generated_manifest_digest,
+            local_admission_evidence,
+            workspace_receipt_evidence,
+            import_receipt_evidence,
+        );
+        Ok(Self {
+            admitted_input_set_digest,
+            generated_manifest_digest,
+            local_admission_evidence,
+            workspace_receipt_evidence,
+            import_receipt_evidence,
+            binding_digest,
+        })
+    }
+
+    /// Returns the deterministic digest of the exact admitted raw-input set.
+    pub const fn admitted_input_set_digest(&self) -> EvidenceDigest {
+        self.admitted_input_set_digest
+    }
+
+    /// Returns the digest of the exact generated schema-v5 manifest.
+    pub const fn generated_manifest_digest(&self) -> EvidenceDigest {
+        self.generated_manifest_digest
+    }
+
+    /// Returns the authenticated local admission-evidence digest.
+    pub const fn local_admission_evidence(&self) -> EvidenceDigest {
+        self.local_admission_evidence
+    }
+
+    /// Returns the authenticated workspace-receipt evidence digest.
+    pub const fn workspace_receipt_evidence(&self) -> EvidenceDigest {
+        self.workspace_receipt_evidence
+    }
+
+    /// Returns the authenticated import-receipt evidence digest.
+    pub const fn import_receipt_evidence(&self) -> EvidenceDigest {
+        self.import_receipt_evidence
+    }
+
+    pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
+        self.binding_digest
+    }
+}
+
+impl ImportedUserInputBasis {
+    /// Returns the complete exact, path-free imported-input evidence.
+    pub const fn evidence(&self) -> &ImportedUserInputEvidence {
+        &self.evidence
+    }
 }
 
 impl RightsBasis {
@@ -153,11 +262,21 @@ impl RightsBasis {
         })
     }
 
+    /// Binds an exact guided user import to its generated manifest and authenticated receipts.
+    pub fn imported_user_input(evidence: ImportedUserInputEvidence) -> Self {
+        let reference = imported_user_input_reference(evidence.binding_digest());
+        Self::ImportedUserInput(ImportedUserInputBasis {
+            reference,
+            evidence,
+        })
+    }
+
     /// Returns the path-free canonical basis reference retained durably.
     pub fn reference(&self) -> &str {
         match self {
             Self::ReviewedTerms(basis) => &basis.url,
             Self::UserOwnedLocal(basis) => &basis.manifest_reference,
+            Self::ImportedUserInput(basis) => &basis.reference,
         }
     }
 
@@ -166,14 +285,29 @@ impl RightsBasis {
         match self {
             Self::ReviewedTerms(basis) => basis.digest,
             Self::UserOwnedLocal(basis) => basis.manifest_digest,
+            Self::ImportedUserInput(basis) => basis.evidence.generated_manifest_digest,
         }
     }
 
-    /// Returns the path-free input-root identity for user-owned local evidence only.
+    /// Returns the path-free auxiliary local binding stored in the compatible rights envelope.
+    ///
+    /// For [`Self::UserOwnedLocal`] this is the retained input-root identity. For
+    /// [`Self::ImportedUserInput`] it is the exact aggregate binding of the admitted raw-input set,
+    /// manifest, and three authenticated receipt digests; the independently typed coordinates are
+    /// retained in the imported-input rights schema.
     pub const fn root_identity_digest(&self) -> Option<EvidenceDigest> {
         match self {
             Self::ReviewedTerms(_) => None,
             Self::UserOwnedLocal(basis) => Some(basis.root_identity_digest),
+            Self::ImportedUserInput(basis) => Some(basis.evidence.binding_digest),
+        }
+    }
+
+    /// Returns typed imported-input evidence only for the guided-import basis.
+    pub const fn imported_user_input_evidence(&self) -> Option<&ImportedUserInputEvidence> {
+        match self {
+            Self::ImportedUserInput(basis) => Some(&basis.evidence),
+            Self::ReviewedTerms(_) | Self::UserOwnedLocal(_) => None,
         }
     }
 
@@ -181,6 +315,7 @@ impl RightsBasis {
         match self {
             Self::ReviewedTerms(_) => RightsBasisKind::ReviewedTerms,
             Self::UserOwnedLocal(_) => RightsBasisKind::UserOwnedLocal,
+            Self::ImportedUserInput(_) => RightsBasisKind::ImportedUserInput,
         }
     }
 
@@ -189,10 +324,11 @@ impl RightsBasis {
         reference: String,
         digest: EvidenceDigest,
         root_identity_digest: Option<EvidenceDigest>,
+        imported_evidence: Option<ImportedUserInputEvidence>,
     ) -> Result<Self, RightsError> {
-        match (kind, root_identity_digest) {
-            (RightsBasisKind::ReviewedTerms, None) => Self::reviewed_terms(reference, digest),
-            (RightsBasisKind::UserOwnedLocal, Some(root_identity_digest))
+        match (kind, root_identity_digest, imported_evidence) {
+            (RightsBasisKind::ReviewedTerms, None, None) => Self::reviewed_terms(reference, digest),
+            (RightsBasisKind::UserOwnedLocal, Some(root_identity_digest), None)
                 if reference == encode_lower_hex(digest.bytes())
                     && root_identity_digest.bytes() != [0; 32] =>
             {
@@ -200,6 +336,19 @@ impl RightsBasis {
                     manifest_reference: reference,
                     manifest_digest: digest,
                     root_identity_digest,
+                }))
+            }
+            (
+                RightsBasisKind::UserOwnedLocal | RightsBasisKind::ImportedUserInput,
+                Some(binding_digest),
+                Some(evidence),
+            ) if evidence.generated_manifest_digest == digest
+                && evidence.binding_digest == binding_digest
+                && reference == imported_user_input_reference(binding_digest) =>
+            {
+                Ok(Self::ImportedUserInput(ImportedUserInputBasis {
+                    reference,
+                    evidence,
                 }))
             }
             _ => Err(RightsError::InvalidStoredBasis),
@@ -212,6 +361,9 @@ impl RightsBasisKind {
         match self {
             Self::ReviewedTerms => "reviewed_terms",
             Self::UserOwnedLocal => "user_owned_local",
+            // The immutable v2 source-rights envelope admits two historical wire kinds. Exact
+            // imported coordinates are distinguished and enforced by the companion v1 table.
+            Self::ImportedUserInput => "user_owned_local",
         }
     }
 
@@ -400,6 +552,7 @@ impl SourceRightsDecision {
         hasher.update([match self.basis.kind() {
             RightsBasisKind::ReviewedTerms => 1,
             RightsBasisKind::UserOwnedLocal => 2,
+            RightsBasisKind::ImportedUserInput => 3,
         }]);
         update_length_prefixed(&mut hasher, self.basis.reference().as_bytes());
         update_digest(&mut hasher, self.basis.digest());
@@ -409,6 +562,13 @@ impl SourceRightsDecision {
                 update_digest(&mut hasher, digest);
             }
             None => hasher.update([0]),
+        }
+        if let Some(evidence) = self.basis.imported_user_input_evidence() {
+            update_digest(&mut hasher, evidence.admitted_input_set_digest);
+            update_digest(&mut hasher, evidence.generated_manifest_digest);
+            update_digest(&mut hasher, evidence.local_admission_evidence);
+            update_digest(&mut hasher, evidence.workspace_receipt_evidence);
+            update_digest(&mut hasher, evidence.import_receipt_evidence);
         }
         update_digest(&mut hasher, self.authorization_evidence);
         match self.authorization_expires_at {
@@ -519,6 +679,9 @@ pub enum RightsError {
     /// Stored basis fields do not reconstruct one closed evidence variant.
     #[error("stored rights basis is invalid")]
     InvalidStoredBasis,
+    /// Imported input evidence contains an all-zero required digest.
+    #[error("imported user-input evidence is invalid")]
+    InvalidImportedUserInputEvidence,
     /// Authorization expiry must be strictly after retrieval.
     #[error("rights authorization expiry is invalid")]
     InvalidAuthorizationExpiry,
@@ -559,6 +722,36 @@ fn update_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
 fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(value);
+}
+
+fn imported_user_input_binding_digest(
+    admitted_input_set_digest: EvidenceDigest,
+    generated_manifest_digest: EvidenceDigest,
+    local_admission_evidence: EvidenceDigest,
+    workspace_receipt_evidence: EvidenceDigest,
+    import_receipt_evidence: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    update_length_prefixed(&mut hasher, IMPORTED_USER_INPUT_BINDING_DOMAIN);
+    hasher.update(IMPORTED_USER_INPUT_BINDING_SCHEMA_VERSION.to_be_bytes());
+    for (tag, digest) in [
+        (1_u8, admitted_input_set_digest),
+        (2, generated_manifest_digest),
+        (3, local_admission_evidence),
+        (4, workspace_receipt_evidence),
+        (5, import_receipt_evidence),
+    ] {
+        hasher.update([tag]);
+        update_digest(&mut hasher, digest);
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+}
+
+fn imported_user_input_reference(binding_digest: EvidenceDigest) -> String {
+    let mut reference = String::with_capacity(IMPORTED_USER_INPUT_REFERENCE_PREFIX.len() + 64);
+    reference.push_str(IMPORTED_USER_INPUT_REFERENCE_PREFIX);
+    reference.push_str(&encode_lower_hex(binding_digest.bytes()));
+    reference
 }
 
 fn validate_terms_url(value: &str) -> Result<(), RightsError> {

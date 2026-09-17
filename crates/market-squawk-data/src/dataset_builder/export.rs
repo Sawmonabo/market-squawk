@@ -7,7 +7,8 @@ use sha2::{Digest as _, Sha256};
 use super::DatasetBuildError;
 use super::model::{
     ComponentKind, ComponentScope, CorporateActionSensitivity, DatasetSplitCounts,
-    FeatureLabelComponentSpec, FeatureLabelDataset, MissingValuePolicy,
+    FeatureLabelComponentSpec, FeatureLabelDataset, FeatureLabelMeasurement,
+    FeatureLabelMeasurementBinding, MissingValuePolicy,
 };
 use crate::{DatasetManifestRef, GenerationParentRelation, PointInTimeRevisionMode, Sha256Digest};
 
@@ -41,7 +42,11 @@ pub(super) fn encode(
     let manifest = dataset.manifest();
     let [train_end, validation_end, test_end] = dataset.split_policy.boundaries();
     let wire = ExportWire {
-        components: dataset.component_specs.iter().map(component_wire).collect(),
+        components: dataset
+            .component_specs
+            .iter()
+            .map(|spec| component_wire(spec, &dataset.label_measurements))
+            .collect(),
         dataset: DatasetWire {
             build_spec_sha256: hex(dataset.build_spec_digest.digest()),
             dataset_id: manifest.dataset_id().as_str(),
@@ -84,7 +89,7 @@ pub(super) fn encode(
             },
             version: dataset.point_in_time_policy.version().get(),
         },
-        schema_version: 2,
+        schema_version: 4,
         split_counts: split_counts_wire(dataset.split_counts),
         split_policy: SplitPolicyWire {
             test_end_unix_nanos: nanos(test_end),
@@ -159,9 +164,35 @@ struct ObjectWire<'a> {
 struct ComponentWire<'a> {
     corporate_action_sensitivity: &'static str,
     kind: &'static str,
+    measurement: Option<MeasurementWire>,
     name: &'a str,
     scope: &'static str,
+    target: TargetWire,
     version: u32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind")]
+enum MeasurementWire {
+    #[serde(rename = "price")]
+    Price { currency: String },
+    #[serde(rename = "return")]
+    Return,
+    #[serde(rename = "probability")]
+    Probability,
+    #[serde(rename = "other_regression")]
+    OtherRegression,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind")]
+enum TargetWire {
+    #[serde(rename = "not_applicable")]
+    NotApplicable,
+    #[serde(rename = "fixed_horizon_terminal")]
+    FixedHorizonTerminal { horizon_nanos: u64 },
+    #[serde(rename = "unsupported")]
+    Unsupported,
 }
 
 #[derive(Serialize)]
@@ -195,7 +226,19 @@ fn manifest_wire(manifest: &DatasetManifestRef) -> ManifestWire<'_> {
     }
 }
 
-fn component_wire(spec: &FeatureLabelComponentSpec) -> ComponentWire<'_> {
+fn component_wire<'a>(
+    spec: &'a FeatureLabelComponentSpec,
+    bindings: &'a [FeatureLabelMeasurementBinding],
+) -> ComponentWire<'a> {
+    let binding = bindings.iter().find(|binding| binding.label() == spec);
+    let measurement = binding.map(|binding| match binding.measurement() {
+        FeatureLabelMeasurement::Price { currency } => MeasurementWire::Price {
+            currency: currency.as_str().to_owned(),
+        },
+        FeatureLabelMeasurement::Return => MeasurementWire::Return,
+        FeatureLabelMeasurement::Probability => MeasurementWire::Probability,
+        FeatureLabelMeasurement::OtherRegression => MeasurementWire::OtherRegression,
+    });
     ComponentWire {
         corporate_action_sensitivity: match spec.corporate_actions() {
             CorporateActionSensitivity::NotApplicable => "not_applicable",
@@ -205,11 +248,22 @@ fn component_wire(spec: &FeatureLabelComponentSpec) -> ComponentWire<'_> {
             ComponentKind::Feature => "feature",
             ComponentKind::Label => "label",
         },
+        measurement,
         name: spec.name(),
         scope: match spec.scope() {
             ComponentScope::Instrument => "instrument",
             ComponentScope::Account => "account",
             ComponentScope::Global => "global",
+        },
+        target: match (
+            spec.kind(),
+            binding.and_then(|value| value.fixed_horizon_nanos()),
+        ) {
+            (ComponentKind::Feature, _) => TargetWire::NotApplicable,
+            (ComponentKind::Label, Some(horizon)) => TargetWire::FixedHorizonTerminal {
+                horizon_nanos: horizon.get(),
+            },
+            (ComponentKind::Label, None) => TargetWire::Unsupported,
         },
         version: spec.version().get(),
     }

@@ -9,8 +9,7 @@ order, complete release boundary, and recovery surfaces.
 | Document type | Deployment architecture |
 | Audience | Operators, maintainers, security reviewers, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-30 |
-| Implementation review base | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
+| Last substantive review | 2026-08-03 |
 
 ## Contents
 
@@ -40,28 +39,35 @@ operate and why.
 
 ## Supported topology
 
-The baseline topology is one operator-owned machine:
+The implementation topology is one operator-owned machine and one installed service for each
+signed-in operating-system user:
 
-- `market-squawk-desktop` is the Tauri 2 interactive application. Its bundled React WebView owns
-  presentation only; a five-command bridge composes the existing `LocalProduct` and `Application`
-  services in the same process. Native packages also install the exact CLI, capture helper, and
-  ONNX worker as sibling executables;
-- `market-squawk` is the CLI and local MCP application process;
-- Tokio tasks inside that process own source supervision, live shards, research services,
-  application requests, risk, paper execution, and lifecycle;
+- `market-squawk-service` owns the selected workspace, `LocalProduct`, durable jobs, source
+  supervision, live shards, research services, risk, paper execution, audit, and lifecycle;
+- `market-squawk-desktop` is the Tauri 2 interactive client. Its bundled React WebView owns
+  rendering and transient form state only; the closed Rust bridge uses the private authenticated
+  application route and never transfers that credential to the WebView;
+- `market-squawk` is the CLI client and named-client MCP stdio-relay host. It connects to the
+  service rather than constructing an alternative `LocalProduct` owner;
+- Claude Code and Codex receive separate credential-owning, stateless stdio relays that exchange
+  bounded MCP requests with the service's authenticated loopback endpoint;
+- Tokio tasks inside the service own source supervision, live shards, research services,
+  application requests, risk, paper execution, durable jobs, and lifecycle;
 - a validated sibling `market-squawk-capture-helper` process performs killable durable raw-capture
   I/O for a production live generation;
 - a validated sibling `market-squawk-onnx-worker` process may execute an admitted bounded ONNX
   model when that model generation requires it;
-- the installed sealed CPython 3.14.6 environment performs optional research, visualization, and
-  training outside the live path; and
+- the managed Python environment performs optional research, visualization, and training outside
+  the live path when the active product release supplies and verifies it; and
 - SQLite, journals, authority records, Parquet datasets, model/backtest/portfolio/paper artifacts,
   and audits remain under local operator control.
 
-CLI commands usually create a process for the duration of one operation. `market-squawk mcp serve`
-keeps the same `LocalProduct` and `Application` alive for the stdio session. Production live
-capture or paper-bot commands own their source/runtime workers until cancellation and bounded
-shutdown complete.
+The service publishes its rendezvous only after it proves the bound routes are ready. Native
+clients resolve the exact service generation and use bounded application envelopes. The named
+`market-squawk mcp serve --client <claude-code|codex>` relay is intentionally stateless: it does
+not own a catalog, model, source connection, job, paper controller, or workspace, and it terminates
+without stopping the service. Production live capture or paper work remains service-owned until
+cancellation and bounded shutdown complete.
 
 The desktop loads only bundled application assets and opens official provider pages in the system
 browser. Providers whose supported workflow uses the protected browser fallback start the same
@@ -78,20 +84,24 @@ runtime?
 flowchart LR
     DesktopUser["Desktop user"]
     Operator["Operator shell"]
-    McpClient["Local MCP client"]
+    Claude["Claude Code"]
+    Codex["Codex"]
     Browser["System browser"]
     Python["Optional sealed CPython"]
 
     subgraph Host["Operator-controlled machine"]
-        subgraph DesktopProcess["market-squawk-desktop process"]
+        subgraph DesktopProcess["market-squawk-desktop client"]
             WebView["Bundled React WebView"]
             Bridge["Closed Tauri presentation bridge"]
-            DesktopMain["LocalProduct and Application runtime"]
-            WebView --> Bridge --> DesktopMain
+            WebView --> Bridge
         end
-        subgraph CliProcess["market-squawk process"]
-            CliMain["CLI or stdio MCP runtime"]
+        subgraph ServiceProcess["market-squawk-service"]
+            Runtime["Authenticated loopback\n/app/v1 and /mcp"]
+            ServiceMain["LocalProduct, jobs, audit,\napplication and domain authorities"]
+            Runtime --> ServiceMain
         end
+        CliMain["market-squawk CLI client"]
+        Relays["Named MCP stdio relays"]
         Loopback["Ephemeral loopback portal task"]
         Capture["capture helper process"]
         Onnx["ONNX worker process"]
@@ -113,97 +123,82 @@ flowchart LR
 
     DesktopUser --> WebView
     Operator -->|"CLI"| CliMain
-    McpClient <-->|"stdio"| CliMain
+    Claude <-->|"stdio"| Relays
+    Codex <-->|"stdio"| Relays
+    Bridge -->|"private typed request"| Runtime
+    CliMain -->|"private typed request"| Runtime
+    Relays -->|"separate credentialed MCP request"| Runtime
     Browser <-->|"HTTP on 127.0.0.1 only"| Loopback
-    DesktopMain -->|"bounded setup owner"| Loopback
-    CliMain -->|"bounded setup owner"| Loopback
-    DesktopMain -->|"exact official URL"| Browser
+    ServiceMain -->|"bounded setup owner"| Loopback
+    ServiceMain -->|"exact official URL"| Browser
     Python <-->|"admitted exports and candidates"| Artifacts
-    DesktopMain <-->|"configured WSS"| Coinbase
-    DesktopMain <-->|"configured WSS"| Kraken
-    DesktopMain <-->|"configured HTTPS"| Official
-    CliMain <-->|"configured provider interfaces"| Coinbase
-    CliMain <-->|"configured provider interfaces"| Kraken
-    CliMain <-->|"configured provider interfaces"| Official
-    Inputs -->|"controlled reads"| DesktopMain
-    Inputs -->|"controlled reads"| CliMain
-    DesktopMain <-->|"opaque secret references"| Keyring
-    CliMain <-->|"opaque secret references"| Keyring
-    DesktopMain -->|"bounded capture protocol"| Capture
-    CliMain -->|"bounded capture protocol"| Capture
+    ServiceMain <-->|"configured provider interfaces"| Coinbase
+    ServiceMain <-->|"configured provider interfaces"| Kraken
+    ServiceMain <-->|"configured provider interfaces"| Official
+    Inputs -->|"controlled reads"| ServiceMain
+    ServiceMain <-->|"opaque secret references"| Keyring
+    ServiceMain -->|"bounded capture protocol"| Capture
     Capture --> Journal
-    DesktopMain -->|"bounded model protocol"| Onnx
-    CliMain -->|"bounded model protocol"| Onnx
-    DesktopMain <--> Catalog
-    DesktopMain <--> Control
-    DesktopMain <--> Authority
-    DesktopMain <--> Artifacts
-    CliMain <--> Catalog
-    CliMain <--> Control
-    CliMain <--> Authority
-    CliMain <--> Artifacts
+    ServiceMain -->|"bounded model protocol"| Onnx
+    ServiceMain <--> Catalog
+    ServiceMain <--> Control
+    ServiceMain <--> Authority
+    ServiceMain <--> Artifacts
 ```
 
-The desktop and CLI are alternative process owners and must not concurrently claim the same
-single-writer data root. MCP uses stdio, Tauri uses window-scoped IPC, helper IPC is private to the
-parent process, and the sole HTTP listener is the loopback-scoped onboarding task. Source endpoints
-are selected through immutable adapter metadata and validated configuration. Local structured logs
-and explicit provider operations account for the product's operational output and network
-activity.
+The service is the only process that opens mutable workspace authority. Desktop and CLI use their
+separate private application credentials; Claude Code and Codex use separate MCP credentials. MCP
+uses Streamable HTTP only on the service's loopback listener, while the named stdio relay is the
+client compatibility transport. Tauri retains window-scoped IPC, helper IPC is private to the
+service, and the onboarding portal is a separate ephemeral loopback listener. Source endpoints are
+selected through immutable adapter metadata and validated configuration. Local structured logs and
+explicit provider operations account for the product's operational output and network activity.
 
-The desktop exposes local MCP only after validating the installed CLI and bounded tool contract.
-Installed formats generate client JSON with the absolute CLI path. A portable Linux AppImage uses
-its durable outer image path and a hidden typed dispatch that `exec`-replaces the payload with the
-fixed CLI before Tauri or local state opens; it never persists the temporary AppImage mount path.
-Both forms include the canonical workspace, optional explicit configuration and training-release
-paths. Generation starts no server, establishes no client identity, and does not infer Paper
-runtime authority from the legacy diagnostic-capture setting. The operator must close the desktop
-before the client starts MCP against that workspace. Other policy supplied only through environment
-variables is not serialized and must be supplied to the client separately.
+The desktop's MCP page and guided setup can discover supported clients, preview the owned
+registration, and verify a safe exchange with the shared service. An installed registration points
+to the named `market-squawk mcp serve --client` relay, which resolves the current service
+rendezvous and its own credential at invocation time. It starts no product server and establishes
+no authority merely from registration. Desktop and MCP clients may run concurrently because the
+service, rather than either client, owns the workspace. AppImage-specific dispatch and package
+entrypoint behavior remain package-evidence concerns and are documented only when a verified
+candidate proves them.
 
 The ONNX worker is not a generic executable hook. When a verified training release is selected,
 startup verifies that the installed `market-squawk` application identity and bounded regular
 sibling worker are the canonical installed paths and match the release-manifest digests.
-When the desktop owns the runtime, it selects that packaged CLI sibling rather than substituting
-the desktop executable's digest. Model admission then fixes graph/operator/tensor/resource policy
-before publication. The capture helper is likewise a validated sibling and receives one confined
-journal destination.
+The service selects the verified application/helper identities when a release-bound training root
+is configured. Model admission then fixes graph/operator/tensor/resource policy before publication.
+The capture helper is likewise a validated sibling and receives one confined journal destination.
 
 ## Release and installation topology
 
-The v1.0.0 release transaction produces one closed component manifest for each supported target
-and one cross-platform index. Native packages and the terminal bootstrap consume the same complete
-target bundle. The application cannot compose a partial desktop-only or Python-free installation.
+The installer and release builders define a closed-component model: a complete package, when
+constructed and independently verified, must bind its desktop, service, CLI, helpers, managed
+runtime, notices, manifest, and lifecycle tooling as one versioned product. This architectural
+contract does not assert that a native package, terminal bootstrap, signing result, or public asset
+is currently available; the delivery ledger and package evidence own those claims.
 
 ```mermaid
 flowchart LR
     Source["Frozen Git commit and tree"]
-    Build["Target-native Rust, Tauri, and Python builders"]
-    Bundle["Closed complete ZIP and component manifest"]
-    Native["DMG · NSIS/MSI · AppImage/DEB"]
-    Curl["Verified POSIX bootstrap"]
-    Attest["Checksums · GitHub attestations · declared native trust"]
+    Build["Target-native release builders"]
+    Bundle["Candidate closed component manifest"]
+    Verify["Target-specific package and clean-machine evidence"]
     Stage["Private staging"]
     Version["Immutable version directory"]
-    Selector["Atomic installation.json selector"]
-    Entry["OS app entrypoint or verified Unix bin entrypoints"]
-    Runtime["Desktop · CLI · MCP · helpers · CPython 3.14.6"]
+    Selector["Atomic installation selector"]
+    Entry["OS app entrypoint or verified Unix entrypoints"]
+    Runtime["Desktop · service · CLI · MCP relays · helpers"]
 
-    Source --> Build --> Bundle
-    Bundle --> Native
-    Bundle --> Curl
-    Bundle --> Attest
-    Native --> Stage
-    Curl --> Stage
-    Attest --> Stage
+    Source --> Build --> Bundle --> Verify --> Stage
     Stage --> Version --> Selector --> Entry --> Runtime
 ```
 
-The installer retains the active version, at most one previous known-good version, and each
-version's exact manifest and bundle. Update, repair, rollback, and status operate under one
-exclusive installation lock. Repair may reconstruct only the exact selected version. Update may
-activate only a strictly newer admitted release. Rollback must revalidate the retained previous
-version before selection.
+The lifecycle authority operates on immutable versioned releases, an atomic active selector, and a
+bounded retained rollback generation. Update, repair, rollback, and status use one exclusive
+installation lock. Repair reconstructs only the selected version; update admits only a newer
+verified release; rollback revalidates the retained version before selection. Candidate-package
+success, signing state, and publication remain evidence claims outside this page.
 
 Program state and mutable financial data have separate roots. Ordinary uninstall removes the
 program store and managed entrypoints while preserving configuration, credentials, catalogs,
@@ -241,11 +236,13 @@ The supported package-build matrix is:
 | macOS 15 Intel | Application bundle and DMG |
 | Windows Server 2025 x86-64 | NSIS and MSI installers |
 
-Each native package carries the desktop shell plus an embedded complete release: CLI, capture
-helper, ONNX worker, model validator, training driver, versioned installer, uv 0.12.0, managed
-CPython 3.14.6, the locked Python environment, licenses, notices, checksums, and manifest. First
-desktop launch admits that embedded release into the program store before composing
-`LocalProduct`.
+The candidate release-component manifest is the authority for exact external component versions.
+For its current `0.12.1` uv and `3.14.6` CPython entries, a native package is designed to carry the
+desktop shell plus the embedded complete release: CLI, capture helper, ONNX worker, model
+validator, training driver, versioned installer, managed runtime, locked Python environment,
+licenses, notices, checksums, and manifest. First desktop launch admits that embedded release into
+the program store before composing `LocalProduct`; actual package construction and installation
+remain separate evidence claims.
 
 Native publisher signing is conditional release evidence. A macOS linker-created ad-hoc Mach-O
 signature is not Developer ID distribution signing. The workflow verifies the exact declared mode
@@ -342,7 +339,7 @@ onboarding acceptance remain tracked in the [delivery ledger](../plans/delivery-
 
 ### Application startup
 
-For a production product command or MCP session, startup proceeds in authority order:
+The installed service starts in authority order:
 
 1. load and validate safe defaults, optional file, supplied `MARKET_SQUAWK_*` environment, and CLI
    overrides;
@@ -352,8 +349,9 @@ For a production product command or MCP session, startup proceeds in authority o
 4. require the configured verified training release if durable model admissions exist, and when one
    is configured verify the running application and sibling ONNX worker against it;
 5. construct every required application-domain service;
-6. admit the exact complete application descriptor; and
-7. expose the CLI operation or MCP transport only after composition succeeds.
+6. bind and readiness-probe the private application route and authenticated MCP route;
+7. recover durable job authority and bind service-owned operations; and
+8. publish the owner-only authenticated rendezvous as the final startup step.
 
 Partial composition is not published. Corrupt or unverifiable durable state produces a typed
 startup failure or quarantines only the affected provider where that isolation is safe.
@@ -366,21 +364,16 @@ non-AppImage context or validates the canonical image/mount/current-program rela
 command or trailing arguments, does not initialize Tauri or `LocalProduct`, and is absent from
 ordinary help. It is a package transport, not a user configuration option or WebView command.
 
-The desktop follows the same composition order with a presentation boundary around it:
+The desktop is a client with a presentation boundary around the service:
 
 1. parse the three user-facing desktop options and construct the Tauri application runtime without
    publishing its window;
-2. admit, install, update, or repair the complete packaged release and obtain its active immutable
-   root;
-3. resolve the operating-system application-local data directory and load normal validated
+2. resolve the operating-system application-local data directory and load normal validated
    configuration precedence with that value only as the desktop safe default;
-4. remove CLI logging and release-evidence environment controls from ambient desktop
-   configuration;
-5. supply the active complete release as the default training/modeling authority;
-6. construct `LocalProduct` and install its state before the Tauri event loop begins;
-7. register the closed presentation commands and the main-window capability;
-8. load the bundled React application under the configured content-security policy; and
-9. publish setup, navigation, and bootstrap facts only after the owning Rust authorities return
+3. locate or start the verified sibling service and authenticate its exact rendezvous generation;
+4. register the closed presentation commands and the main-window capability;
+5. load the bundled React application under the configured content-security policy; and
+6. publish setup, navigation, and bootstrap facts only after the owning Rust authorities return
    them.
 
 If argument parsing, configuration, path preparation, authority recovery, or application
@@ -403,13 +396,14 @@ Production live startup adds a stricter sequence:
 
 Shutdown is ownership-driven:
 
-1. stop accepting new CLI/MCP/domain work;
+1. stop accepting new application, MCP, and job work;
 2. cancel provider and portal admission;
 3. invalidate live and execution authority before queues drain;
 4. stop source producers, finish route workers, flush or terminate capture under deadline;
 5. reconcile and checkpoint paper/execution state;
-6. join or transfer bounded ownership of helper and blocking tasks; and
-7. return success only when the relevant shutdown report is complete.
+6. stop durable jobs at their declared boundary and flush durable job/audit state;
+7. join or transfer bounded ownership of helper and blocking tasks, retire the rendezvous; and
+8. return success only when the relevant shutdown report is complete.
 
 Dropping an incomplete helper owner initiates termination and retains a terminal owner; it does
 not intentionally detach the child. If termination cannot be proved, the affected resource remains
@@ -511,7 +505,7 @@ must be produced on documented hardware by the final release evidence lane descr
 | [Apache DataFusion introduction](https://datafusion.apache.org/user-guide/introduction.html) | DataFusion is embedded in the local process and operates over Arrow and admitted local data. | 2026-07-23 |
 | [Tokio runtime documentation](https://docs.rs/tokio/latest/tokio/) | Defines asynchronous tasks, timers, cancellation-related primitives, and blocking-work separation used by the process topology. | 2026-07-23 |
 | [Tauri architecture](https://v2.tauri.app/concept/architecture/) | Defines the Rust core, system WebView, and IPC boundaries used by the desktop process. | 2026-07-28 |
-| [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped permission composition for the five-command presentation bridge. | 2026-07-28 |
+| [Tauri capabilities](https://github.com/tauri-apps/tauri-docs/blob/ed68dc003ed3ff777b5aa7398b11386412a60bf3/src/content/docs/security/capabilities.mdx) | Defines window-scoped permission composition for the five-command presentation bridge. | 2026-08-03 |
 | [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the CSP control applied to bundled desktop content. | 2026-07-28 |
 | [Tauri distribution](https://v2.tauri.app/distribute/) | Defines platform packaging and the separate signing/distribution lifecycle. | 2026-07-30 |
 | [Tauri sidecars](https://v2.tauri.app/develop/sidecar/) | Defines target-triple external-program staging and native-bundle placement. | 2026-07-28 |

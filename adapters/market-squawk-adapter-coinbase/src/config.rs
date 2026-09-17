@@ -18,34 +18,38 @@ use market_squawk_sources::{
 use serde::Serialize;
 use thiserror::Error;
 
-/// Sole production endpoint accepted by this protocol profile.
-pub const COINBASE_EXCHANGE_ENDPOINT: &str = "wss://ws-feed.exchange.coinbase.com";
+/// Sole public Advanced Trade market-data endpoint accepted by this protocol profile.
+pub const COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT: &str =
+    "wss://advanced-trade-ws.coinbase.com";
 const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
-const CONFIGURED_PRODUCTS: &str = "coinbase-exchange-configured-products-v1";
-const CONFIGURED_CHANNELS: &str = "level2_batch+matches+heartbeat";
-const MAX_PRODUCTS: usize = 100;
+const CONFIGURED_PRODUCTS: &str = "coinbase-advanced-trade-configured-products-v1";
+const CONFIGURED_CHANNELS: &str = "level2+market_trades+heartbeats";
+// Coinbase recommends distributing high-volume products across connections. The live application
+// also owns one deterministic route per source generation, so this public profile is deliberately
+// one product per connection rather than overstating multi-product routing support.
+const MAX_PRODUCTS: usize = 1;
 const MAX_PRODUCT_BYTES: usize = 64;
 const MAX_SUBSCRIPTION_BYTES: usize = 16 * 1024;
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Closed channel set supported by the pinned Exchange v1 adapter.
+/// Closed public channel set supported by the pinned Advanced Trade adapter.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CoinbaseChannel {
-    /// Unauthenticated batched price-level snapshot followed by absolute-size updates.
+    /// Public price-level snapshot followed by absolute-size updates.
     Level2,
-    /// Match and initial `last_match` trade messages.
-    Matches,
-    /// Feed-health heartbeat; never market-price freshness.
-    Heartbeat,
+    /// Public batched market-trade messages.
+    MarketTrades,
+    /// Feed-health heartbeats; never market-price freshness.
+    Heartbeats,
 }
 
 impl CoinbaseChannel {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Level2 => "level2_batch",
-            Self::Matches => "matches",
-            Self::Heartbeat => "heartbeat",
+            Self::Level2 => "level2",
+            Self::MarketTrades => "market_trades",
+            Self::Heartbeats => "heartbeats",
         }
     }
 }
@@ -143,11 +147,11 @@ pub struct CoinbaseExchangeConfig {
     mappings: Box<[CoinbaseProductMapping]>,
     channels: Box<[CoinbaseChannel]>,
     limits: CoinbaseTransportLimits,
-    subscription: Box<str>,
+    subscriptions: Box<[Box<str>]>,
 }
 
 impl CoinbaseExchangeConfig {
-    /// Builds the exact Exchange v1 source profile.
+    /// Builds the exact public Advanced Trade source profile.
     ///
     /// # Errors
     ///
@@ -177,11 +181,11 @@ impl CoinbaseExchangeConfig {
         validate_channels(&channels)?;
 
         let venue = VenueId::try_from(COINBASE_VENUE)?;
-        let decoder_rule = rule("coinbase-exchange-v1-decoder")?;
-        let timestamp_rule = rule("coinbase-exchange-rfc3339-timestamp")?;
-        let sequence_rule = rule("coinbase-exchange-level2-sequence-unsupported")?;
-        let checksum_rule = rule("coinbase-exchange-checksum-unsupported")?;
-        let no_snapshot_rule = rule("coinbase-exchange-trade-snapshot-not-applicable")?;
+        let decoder_rule = rule("coinbase-advanced-trade-v1-decoder")?;
+        let timestamp_rule = rule("coinbase-advanced-trade-rfc3339-timestamp")?;
+        let sequence_rule = rule("coinbase-advanced-trade-envelope-sequence-unbound")?;
+        let checksum_rule = rule("coinbase-advanced-trade-checksum-unsupported")?;
+        let no_snapshot_rule = rule("coinbase-advanced-trade-trade-snapshot-not-applicable")?;
         let live = LiveCoverageDeclaration::try_new(
             ProviderProduct::new(SourceIdentifier::try_from(CONFIGURED_PRODUCTS)?),
             ProviderChannel::new(SourceIdentifier::try_from(CONFIGURED_CHANNELS)?),
@@ -230,7 +234,7 @@ impl CoinbaseExchangeConfig {
             coverage,
             DataQuality::DirectUnverified,
             NetworkAccessPolicy::Allowlisted(market_squawk_sources::EndpointPolicy::try_new([
-                COINBASE_EXCHANGE_ENDPOINT,
+                COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT,
             ])?),
             freshness,
             Some(budget),
@@ -245,10 +249,10 @@ impl CoinbaseExchangeConfig {
             SourceProtocolProfile::Live(Box::new(LiveProtocolProfile::new(
                 decoder_rule,
                 SemanticInterpretationProfile::new(
-                    rule("coinbase-exchange-maker-side-aggressor")?,
-                    rule("coinbase-exchange-auction-unused")?,
-                    rule("coinbase-exchange-status-unused")?,
-                    rule("coinbase-exchange-corporate-action-unused")?,
+                    rule("coinbase-advanced-trade-maker-side-aggressor")?,
+                    rule("coinbase-advanced-trade-auction-unused")?,
+                    rule("coinbase-advanced-trade-status-unused")?,
+                    rule("coinbase-advanced-trade-corporate-action-unused")?,
                 ),
                 timestamp_rule,
                 SequenceValidationProfile::Unsupported {
@@ -261,13 +265,13 @@ impl CoinbaseExchangeConfig {
                 ProviderNumericPolicy::ExactDecimalLexeme,
             ))),
         ))?;
-        let subscription = subscription_payload(&mappings, &channels)?;
+        let subscriptions = subscription_payloads(&mappings, &channels)?;
         Ok(Self {
             metadata,
             mappings: mappings.into_boxed_slice(),
             channels: channels.into_boxed_slice(),
             limits,
-            subscription,
+            subscriptions,
         })
     }
 
@@ -278,7 +282,7 @@ impl CoinbaseExchangeConfig {
 
     /// Returns the only production endpoint.
     pub const fn endpoint(&self) -> &'static str {
-        COINBASE_EXCHANGE_ENDPOINT
+        COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT
     }
 
     /// Returns configured product mappings in subscription order.
@@ -296,8 +300,8 @@ impl CoinbaseExchangeConfig {
         self.limits
     }
 
-    pub(crate) fn subscription(&self) -> &str {
-        &self.subscription
+    pub(crate) fn subscriptions(&self) -> &[Box<str>] {
+        &self.subscriptions
     }
 }
 
@@ -305,32 +309,45 @@ impl CoinbaseExchangeConfig {
 struct Subscription<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
-    product_ids: Vec<&'a str>,
-    channels: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    product_ids: Option<Vec<&'a str>>,
+    channel: &'static str,
 }
 
-fn subscription_payload(
+fn subscription_payloads(
     mappings: &[CoinbaseProductMapping],
     channels: &[CoinbaseChannel],
-) -> Result<Box<str>, CoinbaseConfigError> {
-    let subscription = Subscription {
-        kind: "subscribe",
-        product_ids: mappings
-            .iter()
-            .map(|mapping| mapping.product.as_source_identifier().as_str())
-            .collect(),
-        channels: channels
-            .iter()
-            .copied()
-            .map(CoinbaseChannel::as_str)
-            .collect(),
-    };
-    let payload =
-        serde_json::to_string(&subscription).map_err(|_| CoinbaseConfigError::Serialization)?;
-    if payload.len() > MAX_SUBSCRIPTION_BYTES {
-        return Err(CoinbaseConfigError::SubscriptionTooLarge);
+) -> Result<Box<[Box<str>]>, CoinbaseConfigError> {
+    let products = mappings
+        .iter()
+        .map(|mapping| mapping.product.as_source_identifier().as_str())
+        .collect::<Vec<_>>();
+    let mut payloads = Vec::new();
+    payloads
+        .try_reserve_exact(channels.len())
+        .map_err(|_error| CoinbaseConfigError::AllocationFailed)?;
+    let mut total_bytes = 0_usize;
+    for channel in channels {
+        let subscription = Subscription {
+            kind: "subscribe",
+            product_ids: if *channel == CoinbaseChannel::Heartbeats {
+                None
+            } else {
+                Some(products.clone())
+            },
+            channel: channel.as_str(),
+        };
+        let payload =
+            serde_json::to_string(&subscription).map_err(|_| CoinbaseConfigError::Serialization)?;
+        total_bytes = total_bytes
+            .checked_add(payload.len())
+            .ok_or(CoinbaseConfigError::SubscriptionTooLarge)?;
+        if payload.len() > MAX_SUBSCRIPTION_BYTES || total_bytes > MAX_SUBSCRIPTION_BYTES {
+            return Err(CoinbaseConfigError::SubscriptionTooLarge);
+        }
+        payloads.push(payload.into_boxed_str());
     }
-    Ok(payload.into_boxed_str())
+    Ok(payloads.into_boxed_slice())
 }
 
 fn validate_product(value: &str) -> Result<(), CoinbaseConfigError> {
@@ -366,8 +383,8 @@ fn validate_channels(channels: &[CoinbaseChannel]) -> Result<(), CoinbaseConfigE
     let actual = channels.iter().copied().collect::<BTreeSet<_>>();
     let required = BTreeSet::from([
         CoinbaseChannel::Level2,
-        CoinbaseChannel::Matches,
-        CoinbaseChannel::Heartbeat,
+        CoinbaseChannel::MarketTrades,
+        CoinbaseChannel::Heartbeats,
     ]);
     if actual != required || channels.len() != required.len() {
         return Err(CoinbaseConfigError::InvalidChannelProfile);
@@ -414,7 +431,7 @@ pub enum CoinbaseConfigError {
     #[error("Coinbase internal instrument mapping is duplicated")]
     DuplicateInstrument,
     /// The required exact channel profile was missing, duplicated, or extended.
-    #[error("Coinbase channel profile must be exactly level2_batch, matches, and heartbeat")]
+    #[error("Coinbase channel profile must be exactly level2, market_trades, and heartbeats")]
     InvalidChannelProfile,
     /// Frame or operation timeout bounds were invalid.
     #[error("Coinbase transport limits are invalid")]
@@ -425,6 +442,9 @@ pub enum CoinbaseConfigError {
     /// Subscription bytes exceeded the fixed outbound ceiling.
     #[error("Coinbase subscription exceeds its byte ceiling")]
     SubscriptionTooLarge,
+    /// Subscription payload storage could not be reserved within its fixed channel count.
+    #[error("Coinbase subscription allocation failed")]
+    AllocationFailed,
     /// Validated source metadata did not expose the exact live protocol invariants.
     #[error("Coinbase source metadata is missing its validated live protocol profile")]
     InvalidProtocolProfile,

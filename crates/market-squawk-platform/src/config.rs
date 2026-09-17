@@ -20,11 +20,13 @@ pub use report::{EffectiveConfigView, EffectiveSettingView};
 
 mod instruments;
 
+use instruments::{recommended_coinbase_public_config, recommended_kraken_public_config};
+
 pub use instruments::{
-    COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation, CoinbaseConfigurationError,
-    CoinbaseControlLimits, CoinbaseInstrumentMapping, CoinbaseSourceConfig,
-    KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation, KrakenConfigurationError,
-    KrakenInstrumentMapping, KrakenSourceConfig,
+    COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseAuthorizationAttestation,
+    CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,
+    CoinbaseSourceConfig, KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation,
+    KrakenConfigurationError, KrakenInstrumentMapping, KrakenSourceConfig,
 };
 
 const ENV_PREFIX: &str = "MARKET_SQUAWK_";
@@ -479,7 +481,7 @@ pub struct ConfigOverrides {
     pub source_secret: Option<SecretReference>,
     /// Complete validated production Coinbase source profile.
     pub coinbase: Option<CoinbaseSourceConfig>,
-    /// Complete validated production Kraken book-v2 source profile.
+    /// Complete validated production Kraken public book-and-trade source profile.
     pub kraken: Option<KrakenSourceConfig>,
 }
 
@@ -678,6 +680,36 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Adds the reviewed zero-credential public market profiles used by the installed product.
+    ///
+    /// Explicit file, environment, or CLI profiles retain precedence. This only fills absent
+    /// profiles; it does not open a network connection or start a source runtime.
+    pub fn with_installed_public_market_profiles(mut self) -> Result<Self, ConfigError> {
+        if self.coinbase.is_none() {
+            self.coinbase = Some(
+                recommended_coinbase_public_config()
+                    .map_err(|_error| ConfigError::InternalComposition)?,
+            );
+        }
+        if self.kraken.is_none() {
+            self.kraken = Some(
+                recommended_kraken_public_config()
+                    .map_err(|_error| ConfigError::InternalComposition)?,
+            );
+        }
+        Ok(self)
+    }
+
+    /// Binds workspace-owned runtime artifacts to the already validated selected workspace.
+    ///
+    /// Configuration provenance continues to describe how the installation/bootstrap root was
+    /// selected. The managed-workspace authority owns the derived exact workspace path.
+    #[must_use]
+    pub fn bind_selected_workspace(mut self, workspace_root: PathBuf) -> Self {
+        self.data_dir = workspace_root;
+        self
+    }
+
     /// Returns the local data root.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
@@ -743,7 +775,7 @@ impl AppConfig {
         self.coinbase.as_ref()
     }
 
-    /// Returns the optional strict production Kraken book-v2 source profile.
+    /// Returns the optional strict production Kraken public book-and-trade source profile.
     pub const fn kraken(&self) -> Option<&KrakenSourceConfig> {
         self.kraken.as_ref()
     }

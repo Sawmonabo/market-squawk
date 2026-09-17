@@ -11,6 +11,8 @@ use std::sync::Mutex;
 
 use thiserror::Error;
 
+use crate::paths::{ControlRoot, LocalPaths};
+
 pub use self::envelope::{AuthorityCommitContext, AuthorityStateSnapshot};
 use self::envelope::{Envelope, next_context, validate_payload_size};
 use self::filesystem::{LifetimeLock, Slot, StateFiles};
@@ -26,6 +28,91 @@ pub struct LocalAuthorityStateStore {
     files: StateFiles,
     _lock: LifetimeLock,
     gate: Mutex<StoreGate>,
+}
+
+/// Exclusive lifetime guard for one selected installation's service process.
+///
+/// Unlike a general [`LocalAuthorityStateStore`], this capability can only be acquired at the
+/// code-owned `installed-service/instance` authority beneath a prepared control root. Holding it
+/// proves that no other service process owns that installation authority for the guard's lifetime.
+pub struct InstalledServiceInstanceGuard {
+    _store: LocalAuthorityStateStore,
+}
+
+/// One installation-global service instance bound linearly to one selected workspace.
+///
+/// The private fields and consuming bind prevent a caller from retaining the unbound installation
+/// lock, substituting a second workspace, or supplying an unrelated source-authority store after
+/// the workspace has been selected.
+pub struct InstalledServiceSelectedWorkspaceGuard {
+    _instance: InstalledServiceInstanceGuard,
+    workspace_paths: LocalPaths,
+}
+
+impl fmt::Debug for InstalledServiceInstanceGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledServiceInstanceGuard")
+            .field("authority", &"[INSTALLATION SERVICE INSTANCE]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InstalledServiceInstanceGuard {
+    /// Acquires the exact installed-service instance authority under `installation_control`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalAuthorityStateStoreError`] when the authority root is unsafe, unavailable,
+    /// corrupt, or already owned by another service process.
+    pub fn try_acquire(
+        installation_control: &ControlRoot,
+    ) -> Result<Self, LocalAuthorityStateStoreError> {
+        const SERVICE_DIRECTORY: &str = "installed-service";
+        const INSTANCE_DIRECTORY: &str = "instance";
+
+        let store = LocalAuthorityStateStore::try_open(
+            installation_control
+                .root()
+                .join(SERVICE_DIRECTORY)
+                .join(INSTANCE_DIRECTORY),
+        )?;
+        Ok(Self { _store: store })
+    }
+
+    /// Consumes the installation instance and binds it to one already selected workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::PathError`] when the selected workspace no longer exposes its exact
+    /// prepared control-directory capability.
+    pub fn bind_selected_workspace(
+        self,
+        workspace_paths: LocalPaths,
+    ) -> Result<InstalledServiceSelectedWorkspaceGuard, crate::PathError> {
+        workspace_paths.control_root()?.try_clone_directory()?;
+        Ok(InstalledServiceSelectedWorkspaceGuard {
+            _instance: self,
+            workspace_paths,
+        })
+    }
+}
+
+impl fmt::Debug for InstalledServiceSelectedWorkspaceGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledServiceSelectedWorkspaceGuard")
+            .field("authority", &"[INSTALLATION-BOUND SELECTED WORKSPACE]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InstalledServiceSelectedWorkspaceGuard {
+    /// Returns the exact prepared workspace capability bound to the installation instance.
+    #[must_use]
+    pub const fn workspace_paths(&self) -> &LocalPaths {
+        &self.workspace_paths
+    }
 }
 
 struct StoreGate {
@@ -48,6 +135,9 @@ pub enum LocalAuthorityStateStoreError {
     /// The configured root is a symbolic link, reparse point, or non-directory.
     #[error("authority-state root is not a safe directory")]
     UnsafeRoot,
+    /// A namespace is empty, too long, or contains characters outside its bounded filename grammar.
+    #[error("authority-state namespace is not a safe bounded name")]
+    InvalidNamespace,
     /// A reserved authority-state name is not a regular single-link file.
     #[error("authority-state file has an unsafe or ambiguous type")]
     UnsafeFileType,
@@ -124,6 +214,31 @@ impl LocalAuthorityStateStore {
     /// missing or invalid peer before returning.
     pub fn try_open(root: impl AsRef<Path>) -> Result<Self, LocalAuthorityStateStoreError> {
         let (files, lock) = StateFiles::try_open(root.as_ref())?;
+        Self::from_files(files, lock)
+    }
+
+    /// Opens an independently locked authority namespace in this store's retained directory.
+    ///
+    /// Names contain 1–64 lowercase ASCII letters, digits, or hyphens and begin with a letter or
+    /// digit. Namespaces are peers within the same directory, including when opened from another
+    /// namespace; the directory capability is retained and no child directory is created. Windows
+    /// continues to verify the retained root against its recorded path before publication. The
+    /// unnamed authority's filenames remain unchanged. Every namespace uses the same publication, recovery,
+    /// and platform durability contract as the unnamed authority: directory synchronization on
+    /// Unix and the existing synchronized-file/atomic-publication contract on Windows.
+    /// Invalid namespace names return [`LocalAuthorityStateStoreError::InvalidNamespace`].
+    pub fn try_open_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Self, LocalAuthorityStateStoreError> {
+        let (files, lock) = self.files.try_open_namespace(namespace)?;
+        Self::from_files(files, lock)
+    }
+
+    fn from_files(
+        files: StateFiles,
+        lock: LifetimeLock,
+    ) -> Result<Self, LocalAuthorityStateStoreError> {
         let store = Self {
             files,
             _lock: lock,

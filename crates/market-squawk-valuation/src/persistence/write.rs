@@ -47,7 +47,7 @@ pub(crate) fn classify_operation(
             version: PAYLOAD_VERSION,
             measurement_id: measurement.id().bytes(),
             max_quote_age_nanos: ruleset.max_quote_age_nanos(),
-            ruleset_version: Some(ruleset.version()),
+            ruleset_version: ruleset.version(),
         },
     )?);
     links.push(link(

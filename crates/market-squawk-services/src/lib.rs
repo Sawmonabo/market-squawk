@@ -12,9 +12,10 @@ mod response;
 mod traits;
 
 pub use artifact::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
-    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
-    PARQUET_ARTIFACT_MEDIA_TYPE,
+    ArtifactAuthority, ArtifactError, ArtifactPublication, ArtifactPublicationContext,
+    ArtifactRead, ArtifactReadContext, ArtifactReadRequest, ArtifactReference,
+    ArtifactReferenceResolver, ArtifactRepository, ArtifactResolveRequest,
+    NDJSON_ARTIFACT_MEDIA_TYPE, PARQUET_ARTIFACT_MEDIA_TYPE,
 };
 pub use contract::{
     ScopeRequirement, ServiceDomain, SourceEvidencePolicy, TOOL_CONFIRMATION_FIELD,
@@ -29,9 +30,12 @@ pub use progress::{
 
 pub use request::{
     JsonContractError, JsonStructureLimits, RequestContext, RequestId, RequestIdError,
-    ServiceLimits, ServiceLimitsError, validate_json_contract,
+    RequestOrigin, RequestOriginError, ServiceLimits, ServiceLimitsError, validate_json_contract,
 };
-pub use response::{ResultCompleteness, ServiceContractError, ToolResultMetadata, TypedToolResult};
+pub use response::{
+    ResultCompleteness, ResultEnvelopeProjection, ServiceContractError, ToolResultMetadata,
+    TypedToolResult,
+};
 pub use traits::{
     ServiceCapabilities, ServiceCapabilityError, ServiceError, ServiceErrorClass, ToolDescriptor,
     ToolEffects, ToolInputAdmission, ToolInputError, ToolServices, TypedToolRequest,

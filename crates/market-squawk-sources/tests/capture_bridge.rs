@@ -151,6 +151,7 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
                 Some(source_identifier("BUY")?),
                 rule("coinbase-aggressor")?,
             ),
+            taker_order_type: None,
         },
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;

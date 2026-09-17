@@ -185,6 +185,7 @@ fn in_flight_refusal_applies_shared_bounded_retry_after_without_budget_access() 
     )?)?;
     metadata_wire["network"]["allowlisted"]["endpoints"] =
         serde_json::json!(["https://retry-after-source.example.test/data"]);
+    metadata_wire["budget"]["max_concurrent"] = serde_json::json!(2);
     let metadata: crate::SourceMetadata = serde_json::from_value(metadata_wire)?;
     let adapter = TestExtractionAdapter {
         metadata: metadata.clone(),
@@ -194,8 +195,12 @@ fn in_flight_refusal_applies_shared_bounded_retry_after_without_budget_access() 
     let in_flight = authority
         .try_network_request("https://retry-after-source.example.test/data")?
         .authorize_send("https://retry-after-source.example.test/data")?;
+    let successful = authority
+        .try_network_request("https://retry-after-source.example.test/data")?
+        .authorize_send("https://retry-after-source.example.test/data")?;
 
     let deadline = in_flight.apply_retry_after_header(Some(b"2"), 0)?;
+    assert_eq!(successful.record_success(), Ok(()));
     assert!(matches!(
         authority.try_network_request("https://retry-after-source.example.test/data"),
         Err(crate::ExtractionAuthorityError::BudgetWaitUntil { deadline: actual })

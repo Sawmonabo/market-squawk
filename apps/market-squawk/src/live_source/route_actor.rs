@@ -6,7 +6,8 @@ use std::{
 };
 
 use market_squawk_live::{
-    BoundShardIngress, DormantRouteIngress, LiveIngressBindError, LiveRuntimeIngress, ShardKey,
+    BoundShardIngress, DormantRouteIngress, LiveIngressBindError, LiveIngressRevokeError,
+    LiveRuntimeIngress, ShardKey,
 };
 use market_squawk_sources::CurrentDecodedProviderBatch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -213,13 +214,13 @@ pub(super) fn spawn_route_activation(
             initial: Some(dormant),
             active: None,
         };
-        loop {
+        let run_result = loop {
             let command = tokio::select! {
                 biased;
-                () = cancellation.cancelled() => break,
+                () = cancellation.cancelled() => break Ok(()),
                 command = command_receiver.recv() => match command {
                     Some(command) => command,
-                    None => break,
+                    None => break Ok(()),
                 }
             };
             match actor.process(command, cancellation.clone()).await {
@@ -227,15 +228,23 @@ pub(super) fn spawn_route_activation(
                 Err(RouteActivationFailure::Bind(LiveIngressBindError::Cancelled))
                     if cancellation.is_cancelled() =>
                 {
-                    break;
+                    break Ok(());
                 }
                 Err(failure) => {
                     status_sender.send_replace(Some(failure));
-                    return Err(failure);
+                    break Err(failure);
                 }
             }
+        };
+        let revoke_result = actor
+            .revoke_active_generation()
+            .await
+            .map_err(RouteActivationFailure::Revoke);
+        match (run_result, revoke_result) {
+            (_, Err(revoke)) => Err(revoke),
+            (Err(run), Ok(())) => Err(run),
+            (Ok(()), Ok(())) => Ok(()),
         }
-        Ok(())
     });
     (
         RouteActivationPublisher {
@@ -270,9 +279,13 @@ impl RouteActor {
                     .activate(batch.current_lease().clone(), cancellation)
                     .await
                     .map_err(RouteActivationFailure::Bind)?;
-                ingress
-                    .try_publish(batch)
-                    .map_err(RouteActivationFailure::Ingress)?;
+                if let Err(error) = ingress.try_publish(batch) {
+                    ingress
+                        .revoke_generation()
+                        .await
+                        .map_err(RouteActivationFailure::Revoke)?;
+                    return Err(RouteActivationFailure::Ingress(error));
+                }
                 self.active = Some(ingress);
                 Ok(())
             }
@@ -285,5 +298,12 @@ impl RouteActor {
         };
         drop(_ticket);
         outcome
+    }
+
+    async fn revoke_active_generation(&mut self) -> Result<(), LiveIngressRevokeError> {
+        match self.active.take() {
+            Some(active) => active.revoke_generation().await,
+            None => Ok(()),
+        }
     }
 }

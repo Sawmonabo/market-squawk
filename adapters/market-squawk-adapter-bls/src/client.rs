@@ -1,12 +1,20 @@
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::sync::Mutex;
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt};
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use market_squawk_platform::SecretRef;
 use market_squawk_sources::{
-    ExtractionAuthority, ExtractionSourceError, NetworkAccessPolicy, SourceError, SourceMetadata,
+    ExtractionAuthority, ExtractionAuthorityError, ExtractionRequestPermit, ExtractionSourceError,
+    NetworkAccessPolicy, SourceError, SourceMetadata,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
@@ -26,7 +34,6 @@ const BLS_V2_ENDPOINT: &str = "https://api.bls.gov/publicAPI/v2/timeseries/data/
 const USER_AGENT_VALUE: &str = "market-squawk/0.1 bls-adapter";
 
 /// User-owned BLS v2 registration credential retained only in zeroizing memory.
-#[derive(Clone)]
 pub struct BlsRegistrationKey(Zeroizing<String>);
 
 impl BlsRegistrationKey {
@@ -36,13 +43,14 @@ impl BlsRegistrationKey {
     ///
     /// Rejects empty, oversized, whitespace-containing, or non-ASCII credentials.
     pub fn try_new(value: String) -> Result<Self, BlsSourceError> {
+        let value = Zeroizing::new(value);
         if value.is_empty()
             || value.len() > MAX_REGISTRATION_KEY_BYTES
             || !value.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err(BlsSourceError::InvalidRegistrationKey);
         }
-        Ok(Self(Zeroizing::new(value)))
+        Ok(Self(value))
     }
 
     pub(crate) fn expose(&self) -> &str {
@@ -56,37 +64,208 @@ impl std::fmt::Debug for BlsRegistrationKey {
     }
 }
 
-/// Authorization mode for the public v1 or user-registered v2 BLS interface.
-#[derive(Clone, Debug)]
-pub enum BlsAuthorization {
-    /// Public unregistered v1 access under provider-published limits.
-    PublicV1,
-    /// Registered v2 access using a user-supplied key.
-    RegisteredV2(BlsRegistrationKey),
+/// Secret-free root credential coordinate retained by activation and publication evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "generation_digest")]
+pub enum BlsCredentialRejoin {
+    /// Public v1 intentionally uses no provider credential.
+    PublicNoCredential,
+    /// Registered v2 used the exact protected root credential generation identified here.
+    RegisteredGeneration(EvidenceDigest),
+}
+
+impl BlsCredentialRejoin {
+    /// Derives and verifies the secret-free coordinate for one protected registered-v2 key.
+    ///
+    /// The complete opaque [`SecretRef`] is domain-separated before hashing so activation and
+    /// publication can independently rejoin the exact managed-store generation without receiving
+    /// key bytes or accepting a caller-selected digest.
+    pub fn for_registered_v2(credential_reference: &SecretRef) -> Result<Self, BlsSourceError> {
+        let encoded = serde_json::to_vec(credential_reference)
+            .map_err(|_| BlsSourceError::InvalidRegistrationKey)?;
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/bls-protected-registration-generation/v1\0");
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| BlsSourceError::InvalidRegistrationKey)?
+                .to_be_bytes(),
+        );
+        digest.update(encoded);
+        let rejoin = Self::RegisteredGeneration(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            digest.finalize().into(),
+        ));
+        rejoin.validate()?;
+        Ok(rejoin)
+    }
+
+    fn validate(self) -> Result<(), BlsSourceError> {
+        match self {
+            Self::PublicNoCredential => Ok(()),
+            Self::RegisteredGeneration(digest)
+                if digest.algorithm() == DigestAlgorithm::Sha256 && digest.bytes() != [0; 32] =>
+            {
+                Ok(())
+            }
+            Self::RegisteredGeneration(_) => Err(BlsSourceError::InvalidRegistrationKey),
+        }
+    }
+}
+
+/// Non-cloneable authorization for one exact public or registered BLS runtime instance.
+///
+/// Registered key bytes have one owner, are never included in `Debug`, and cannot be separated
+/// from the protected root generation coordinate used by doctor and publication rejoin evidence.
+pub struct BlsAuthorization {
+    tier: BlsAccessTier,
+    registration_key: Option<BlsRegistrationKey>,
+    credential_rejoin: BlsCredentialRejoin,
+    response_shape_policy: BlsResponseShapePolicyV1,
+}
+
+/// Exact response-shape-affecting option policy for the current BLS timeseries request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BlsResponseShapePolicyV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calculations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annualaverage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspects: Option<bool>,
+}
+
+impl BlsResponseShapePolicyV1 {
+    const fn for_tier(tier: BlsAccessTier) -> Self {
+        match tier {
+            BlsAccessTier::PublicV1 => Self {
+                catalog: None,
+                calculations: None,
+                annualaverage: None,
+                aspects: None,
+            },
+            BlsAccessTier::RegisteredV2 => Self {
+                catalog: Some(false),
+                calculations: Some(false),
+                annualaverage: Some(false),
+                aspects: Some(false),
+            },
+        }
+    }
+
+    /// Returns the fixed-order, omission-preserving current V1 identity projection.
+    pub(crate) const fn identity_projection(self) -> [u8; 4] {
+        [
+            option_identity(self.catalog),
+            option_identity(self.calculations),
+            option_identity(self.annualaverage),
+            option_identity(self.aspects),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_aspects_for_test(mut self, aspects: Option<bool>) -> Self {
+        self.aspects = aspects;
+        self
+    }
+}
+
+const fn option_identity(value: Option<bool>) -> u8 {
+    match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
 }
 
 impl BlsAuthorization {
+    /// Constructs the explicit no-credential public-v1 mode.
+    pub const fn public_v1() -> Self {
+        Self {
+            tier: BlsAccessTier::PublicV1,
+            registration_key: None,
+            credential_rejoin: BlsCredentialRejoin::PublicNoCredential,
+            response_shape_policy: BlsResponseShapePolicyV1::for_tier(BlsAccessTier::PublicV1),
+        }
+    }
+
+    /// Binds one zeroizing registered-v2 key to its exact managed-store reference.
+    ///
+    /// The adapter derives its secret-free generation coordinate from the complete opaque
+    /// [`SecretRef`]. Callers cannot substitute a dataset identity, provider response digest, or
+    /// another freely chosen digest for protected-store authority.
+    pub fn registered_v2(
+        registration_key: BlsRegistrationKey,
+        credential_reference: &SecretRef,
+    ) -> Result<Self, BlsSourceError> {
+        let credential_rejoin = BlsCredentialRejoin::for_registered_v2(credential_reference)?;
+        Ok(Self {
+            tier: BlsAccessTier::RegisteredV2,
+            registration_key: Some(registration_key),
+            credential_rejoin,
+            response_shape_policy: BlsResponseShapePolicyV1::for_tier(BlsAccessTier::RegisteredV2),
+        })
+    }
+
     /// Returns the exact provider tier selected by this authorization mode.
     pub const fn tier(&self) -> BlsAccessTier {
-        match self {
-            Self::PublicV1 => BlsAccessTier::PublicV1,
-            Self::RegisteredV2(_) => BlsAccessTier::RegisteredV2,
-        }
+        self.tier
     }
 
     /// Returns the exact official JSON POST endpoint that metadata must allowlist.
     pub const fn endpoint(&self) -> &'static str {
-        match self {
-            Self::PublicV1 => BLS_V1_ENDPOINT,
-            Self::RegisteredV2(_) => BLS_V2_ENDPOINT,
+        match self.tier {
+            BlsAccessTier::PublicV1 => BLS_V1_ENDPOINT,
+            BlsAccessTier::RegisteredV2 => BLS_V2_ENDPOINT,
         }
     }
 
+    /// Returns the explicit no-credential marker or registered root generation coordinate.
+    pub const fn credential_rejoin(&self) -> BlsCredentialRejoin {
+        self.credential_rejoin
+    }
+
+    /// Returns the exact response-shape option policy serialized for this authorization.
+    pub(crate) const fn response_shape_policy(&self) -> BlsResponseShapePolicyV1 {
+        self.response_shape_policy
+    }
+
     fn registration_key(&self) -> Option<&str> {
-        match self {
-            Self::PublicV1 => None,
-            Self::RegisteredV2(key) => Some(key.expose()),
+        self.registration_key
+            .as_ref()
+            .map(BlsRegistrationKey::expose)
+    }
+
+    fn validate(&self) -> Result<(), BlsSourceError> {
+        self.credential_rejoin.validate()?;
+        if self.response_shape_policy != BlsResponseShapePolicyV1::for_tier(self.tier) {
+            return Err(BlsSourceError::InvalidRegistrationKey);
         }
+        match (self.tier, &self.registration_key, self.credential_rejoin) {
+            (BlsAccessTier::PublicV1, None, BlsCredentialRejoin::PublicNoCredential)
+            | (
+                BlsAccessTier::RegisteredV2,
+                Some(_),
+                BlsCredentialRejoin::RegisteredGeneration(_),
+            ) => Ok(()),
+            _ => Err(BlsSourceError::InvalidRegistrationKey),
+        }
+    }
+}
+
+impl std::fmt::Debug for BlsAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlsAuthorization")
+            .field("tier", &self.tier)
+            .field("credential_rejoin", &self.credential_rejoin)
+            .field(
+                "registration_key",
+                &self.registration_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
     }
 }
 
@@ -99,6 +278,9 @@ pub enum BlsSourceError {
     /// Series, year, or deterministic request-plan configuration is invalid.
     #[error("invalid BLS source configuration")]
     InvalidConfiguration,
+    /// Raw capture or canonical handoff evidence is not publication-safe.
+    #[error("invalid BLS publication evidence")]
+    InvalidPublication,
     /// Exact user-authorized BLS series metadata is missing, malformed, or unverified.
     #[error("invalid BLS series metadata")]
     InvalidSeriesMetadata,
@@ -127,6 +309,8 @@ struct BlsProviderRequest<'a> {
     seriesid: &'a [String],
     startyear: String,
     endyear: String,
+    #[serde(flatten)]
+    response_shape_policy: BlsResponseShapePolicyV1,
     #[serde(rename = "registrationkey", skip_serializing_if = "Option::is_none")]
     registration_key: Option<&'a str>,
 }
@@ -135,13 +319,34 @@ struct BlsProviderRequest<'a> {
 pub(crate) struct RetrievedBlsPage {
     pub(crate) bytes: Bytes,
     pub(crate) response: BlsResponse,
-    pub(crate) received_at: Timestamp,
+    pub(crate) response_received_at: Timestamp,
+    pub(crate) locally_available_at: Timestamp,
     pub(crate) sha256_hex: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct RetainedBlsPage {
+    pub(crate) bytes: Bytes,
+    pub(crate) response_received_at: Timestamp,
+    pub(crate) locally_available_at: Timestamp,
+    pub(crate) sha256_hex: String,
+}
+
+impl RetrievedBlsPage {
+    pub(crate) fn into_retained(self) -> RetainedBlsPage {
+        RetainedBlsPage {
+            bytes: self.bytes,
+            response_received_at: self.response_received_at,
+            locally_available_at: self.locally_available_at,
+            sha256_hex: self.sha256_hex,
+        }
+    }
 }
 
 pub(crate) struct BlsHttpClient {
     transport: Arc<dyn BlsTransport>,
-    authorization: BlsAuthorization,
+    tier: BlsAccessTier,
+    endpoint: &'static str,
     max_response_bytes: usize,
     total_timeout: Duration,
 }
@@ -150,7 +355,8 @@ impl std::fmt::Debug for BlsHttpClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BlsHttpClient")
-            .field("authorization", &self.authorization)
+            .field("tier", &self.tier)
+            .field("endpoint", &self.endpoint)
             .field("transport", &self.transport)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("total_timeout", &self.total_timeout)
@@ -161,8 +367,9 @@ impl std::fmt::Debug for BlsHttpClient {
 impl BlsHttpClient {
     pub(crate) fn try_new(
         metadata: &SourceMetadata,
-        authorization: BlsAuthorization,
+        authorization: &BlsAuthorization,
     ) -> Result<Self, BlsSourceError> {
+        authorization.validate()?;
         metadata
             .network_policy()
             .authorize(authorization.endpoint())
@@ -178,18 +385,20 @@ impl BlsHttpClient {
         let transport = Arc::new(ReqwestBlsTransport::try_new(bounds)?);
         Ok(Self {
             transport,
-            authorization,
+            tier: authorization.tier(),
+            endpoint: authorization.endpoint(),
             max_response_bytes,
             total_timeout,
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "scripted-transport-fixture", debug_assertions)))]
     pub(crate) fn try_new_with_transport(
         metadata: &SourceMetadata,
-        authorization: BlsAuthorization,
+        authorization: &BlsAuthorization,
         transport: Arc<dyn BlsTransport>,
     ) -> Result<Self, BlsSourceError> {
+        authorization.validate()?;
         metadata
             .network_policy()
             .authorize(authorization.endpoint())
@@ -200,7 +409,8 @@ impl BlsHttpClient {
         let bounds = endpoint_policy.request_bounds();
         Ok(Self {
             transport,
-            authorization,
+            tier: authorization.tier(),
+            endpoint: authorization.endpoint(),
             max_response_bytes: usize::try_from(bounds.max_response_bytes())
                 .map_err(|_| BlsSourceError::InvalidMetadata)?
                 .min(MAX_RESPONSE_BYTES),
@@ -211,6 +421,7 @@ impl BlsHttpClient {
     pub(crate) async fn fetch(
         &self,
         metadata: &SourceMetadata,
+        authorization: &BlsAuthorization,
         authority: &ExtractionAuthority,
         chunk: &BlsRequestChunk,
         deadline: Timestamp,
@@ -224,27 +435,42 @@ impl BlsHttpClient {
         if authority.metadata() != metadata || !metadata.is_effective_at(now) {
             return Err(SourceError::InvalidProtocolState.into());
         }
+        authorization
+            .validate()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        if authorization.tier() != self.tier || authorization.endpoint() != self.endpoint {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
         metadata
             .network_policy()
-            .authorize(self.authorization.endpoint())
+            .authorize(self.endpoint)
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        let timeout = remaining_timeout(deadline, now, self.total_timeout)?;
         let request = BlsProviderRequest {
             seriesid: chunk.series(),
             startyear: chunk.start_year().to_string(),
             endyear: chunk.end_year().to_string(),
-            registration_key: self.authorization.registration_key(),
+            // This adapter currently admits the authenticated base-timeseries v2 shape only.
+            // Explicit false values prevent registered mode from silently changing response
+            // semantics if provider defaults evolve; enrichment requires a separately bounded
+            // parser and provider-native publication contract.
+            response_shape_policy: authorization.response_shape_policy(),
+            registration_key: authorization.registration_key(),
         };
-        let request_body = serde_json::to_vec(&request)
-            .map(Bytes::from)
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        let permit = authority.try_network_request(self.authorization.endpoint())?;
-        let in_flight = permit.authorize_send(self.authorization.endpoint())?;
+        let request_body = Zeroizing::new(
+            serde_json::to_vec(&request).map_err(|_| SourceError::InvalidProtocolState)?,
+        );
+        let request_body = Bytes::from_owner(request_body);
+        let permit =
+            acquire_request_permit(authority, self.endpoint, deadline, cancellation.clone())
+                .await?;
+        let now = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
+        let timeout = remaining_timeout(deadline, now, self.total_timeout)?;
+        let in_flight = permit.authorize_send(self.endpoint)?;
         let response = self
             .transport
             .execute(
                 BlsHttpRequest {
-                    url: self.authorization.endpoint().to_owned(),
+                    url: self.endpoint.to_owned(),
                     body: request_body,
                 },
                 self.max_response_bytes,
@@ -252,6 +478,9 @@ impl BlsHttpClient {
                 cancellation.clone(),
             )
             .await?;
+        if response.response_received_at > response.locally_available_at {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
         if response.status == 429 || response.status == 503 {
             let deadline =
                 in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
@@ -281,19 +510,22 @@ impl BlsHttpClient {
             .collect::<Vec<_>>();
         let parsed = BlsResponse::parse_for_request(
             &response.body,
-            self.authorization.tier(),
+            self.tier,
             &requested,
             chunk.start_year(),
             chunk.end_year(),
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
         let digest = Sha256::digest(&response.body);
-        Ok(RetrievedBlsPage {
+        let page = RetrievedBlsPage {
             bytes: response.body,
             response: parsed,
-            received_at: response.received_at,
+            response_received_at: response.response_received_at,
+            locally_available_at: response.locally_available_at,
             sha256_hex: format!("{digest:x}"),
-        })
+        };
+        in_flight.record_success()?;
+        Ok(page)
     }
 }
 
@@ -319,7 +551,8 @@ pub(crate) struct BlsHttpResponse {
     pub(crate) content_encoding: Option<Vec<u8>>,
     pub(crate) content_type: Option<Vec<u8>>,
     pub(crate) body: Bytes,
-    pub(crate) received_at: Timestamp,
+    pub(crate) response_received_at: Timestamp,
+    pub(crate) locally_available_at: Timestamp,
 }
 
 pub(crate) trait BlsTransport: std::fmt::Debug + Send + Sync {
@@ -330,6 +563,195 @@ pub(crate) trait BlsTransport: std::fmt::Debug + Send + Sync {
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<BlsHttpResponse, ExtractionSourceError>>;
+}
+
+/// Debug-only bounded successful BLS response used to exercise the real source pipeline.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug)]
+pub struct BlsScriptedResponse {
+    body: Bytes,
+    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BlsScriptedResponse {
+    /// Validates one JSON response and its exact receipt/availability clocks.
+    pub fn try_new(
+        body: Bytes,
+        response_received_at: Timestamp,
+        locally_available_at: Timestamp,
+    ) -> Result<Self, BlsSourceError> {
+        if body.is_empty()
+            || body.len() > MAX_RESPONSE_BYTES
+            || response_received_at > locally_available_at
+            || !serde_json::from_slice::<serde_json::Value>(&body)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(BlsSourceError::Protocol);
+        }
+        Ok(Self {
+            body,
+            response_received_at,
+            locally_available_at,
+        })
+    }
+}
+
+/// Observed request accounting for the debug-only scripted BLS transport.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlsScriptedTransportCounters {
+    /// Requests admitted to the scripted HTTP boundary.
+    pub attempts: usize,
+    /// Successful responses returned to the production adapter.
+    pub completed: usize,
+    /// Validated responses not yet consumed.
+    pub remaining: usize,
+}
+
+/// Debug-only FIFO of exact one-shot BLS responses.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Debug)]
+struct BlsScriptedQueue {
+    responses: Mutex<VecDeque<BlsScriptedResponse>>,
+    attempts: AtomicUsize,
+    completed: AtomicUsize,
+}
+
+/// Debug-only source factory that scripts only the final HTTP exchange.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug)]
+pub struct BlsScriptedTransportFactory {
+    queue: Arc<BlsScriptedQueue>,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BlsScriptedTransportFactory {
+    /// Retains a non-empty bounded FIFO of already validated responses.
+    pub fn try_new(responses: Vec<BlsScriptedResponse>) -> Result<Self, BlsSourceError> {
+        if responses.is_empty() || responses.len() > 64 {
+            return Err(BlsSourceError::InvalidConfiguration);
+        }
+        Ok(Self {
+            queue: Arc::new(BlsScriptedQueue {
+                responses: Mutex::new(responses.into()),
+                attempts: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    /// Returns request, completion, and unconsumed-response counts without response contents.
+    pub fn counters(&self) -> Result<BlsScriptedTransportCounters, BlsSourceError> {
+        let remaining = self
+            .queue
+            .responses
+            .lock()
+            .map_err(|_| BlsSourceError::Protocol)?
+            .len();
+        Ok(BlsScriptedTransportCounters {
+            attempts: self.queue.attempts.load(Ordering::Relaxed),
+            completed: self.queue.completed.load(Ordering::Relaxed),
+            remaining,
+        })
+    }
+
+    pub(crate) fn transport(&self) -> Arc<dyn BlsTransport> {
+        Arc::new(BlsScriptedTransport {
+            queue: Arc::clone(&self.queue),
+        })
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Debug)]
+struct BlsScriptedTransport {
+    queue: Arc<BlsScriptedQueue>,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BlsTransport for BlsScriptedTransport {
+    fn execute(
+        &self,
+        request: BlsHttpRequest,
+        max_bytes: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<BlsHttpResponse, ExtractionSourceError>> {
+        Box::pin(async move {
+            self.queue.attempts.fetch_add(1, Ordering::Relaxed);
+            if cancellation.is_cancelled() {
+                return Err(ExtractionSourceError::Cancelled);
+            }
+            if timeout.is_zero() || !scripted_request_is_valid(&request) {
+                return Err(SourceError::InvalidProtocolState.into());
+            }
+            let response = self
+                .queue
+                .responses
+                .lock()
+                .map_err(|_| SourceError::InvalidProtocolState)?
+                .pop_front()
+                .ok_or(SourceError::InvalidProtocolState)?;
+            if response.body.len() > max_bytes {
+                return Err(SourceError::FrameTooLarge { max: max_bytes }.into());
+            }
+            self.queue.completed.fetch_add(1, Ordering::Relaxed);
+            Ok(BlsHttpResponse {
+                status: 200,
+                retry_after: None,
+                content_encoding: Some(b"identity".to_vec()),
+                content_type: Some(b"application/json".to_vec()),
+                body: response.body,
+                response_received_at: response.response_received_at,
+                locally_available_at: response.locally_available_at,
+            })
+        })
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+fn scripted_request_is_valid(request: &BlsHttpRequest) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let common = object
+        .get("seriesid")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|series| {
+            !series.is_empty()
+                && series
+                    .iter()
+                    .all(|series| series.as_str().is_some_and(|series| !series.is_empty()))
+        })
+        && object
+            .get("startyear")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|year| year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()))
+        && object
+            .get("endyear")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|year| year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()));
+    if !common {
+        return false;
+    }
+    match request.url.as_str() {
+        BLS_V1_ENDPOINT => !object.contains_key("registrationkey"),
+        BLS_V2_ENDPOINT => {
+            object
+                .get("registrationkey")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|key| !key.is_empty())
+                && ["catalog", "calculations", "annualaverage", "aspects"]
+                    .iter()
+                    .all(|field| object.get(*field) == Some(&serde_json::Value::Bool(false)))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
@@ -381,6 +803,8 @@ impl BlsTransport for ReqwestBlsTransport {
                     .send()
                     .await
                     .map_err(|_| SourceError::Network)?;
+                let response_received_at =
+                    system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
                 if response.content_length().is_some_and(|length| {
                     usize::try_from(length).map_or(true, |length| length > max_bytes)
                 }) {
@@ -402,14 +826,16 @@ impl BlsTransport for ReqwestBlsTransport {
                 let body = collect_bounded_stream(response.bytes_stream(), max_bytes)
                     .await
                     .map_err(|error| map_source_error(error, max_bytes))?;
+                let locally_available_at =
+                    system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
                 Ok(BlsHttpResponse {
                     status,
                     retry_after,
                     content_encoding,
                     content_type,
                     body,
-                    received_at: system_timestamp()
-                        .map_err(|_| SourceError::TrustedTimeUnavailable)?,
+                    response_received_at,
+                    locally_available_at,
                 })
             };
             tokio::select! {
@@ -428,6 +854,40 @@ fn content_type_is_json(value: Option<&[u8]>) -> bool {
         .and_then(|value| std::str::from_utf8(value).ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+}
+
+async fn acquire_request_permit(
+    authority: &ExtractionAuthority,
+    target: &str,
+    deadline: Timestamp,
+    cancellation: CancellationToken,
+) -> Result<ExtractionRequestPermit, ExtractionSourceError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        match authority.try_network_request(target) {
+            Ok(permit) => return Ok(permit),
+            Err(ExtractionAuthorityError::BudgetWaitUntil {
+                deadline: wait_until,
+            }) => {
+                let wait = authority.remaining_budget_wait(wait_until)?;
+                let now = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
+                let remaining = remaining_timeout(deadline, now, Duration::MAX)?;
+                if wait > remaining {
+                    return Err(ExtractionSourceError::DeadlineExceeded);
+                }
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(ExtractionSourceError::Cancelled);
+                    }
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 async fn collect_bounded_stream<S, E>(
@@ -460,6 +920,7 @@ fn map_source_error(error: BlsSourceError, max_response_bytes: usize) -> SourceE
         BlsSourceError::Network => SourceError::Network,
         BlsSourceError::InvalidRegistrationKey
         | BlsSourceError::InvalidConfiguration
+        | BlsSourceError::InvalidPublication
         | BlsSourceError::InvalidSeriesMetadata
         | BlsSourceError::Protocol
         | BlsSourceError::InvalidMetadata
@@ -506,10 +967,82 @@ fn remaining_timeout(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
     use bytes::Bytes;
     use futures_util::stream;
+    use market_squawk_platform::{
+        EncryptedFileSecretStore, SecretCancellation, SecretGeneration, SecretInteractionPolicy,
+        SecretKey, SecretOperationControl, SecretStore, SecretValue,
+    };
+    use uuid::Uuid;
 
-    use super::{BlsProviderRequest, collect_bounded_stream};
+    use super::{
+        BlsAuthorization, BlsCredentialRejoin, BlsProviderRequest, BlsRegistrationKey,
+        collect_bounded_stream,
+    };
+
+    #[test]
+    fn registered_generation_is_derived_from_the_exact_protected_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct TemporarySecretRoot(PathBuf);
+
+        impl Drop for TemporarySecretRoot {
+            fn drop(&mut self) {
+                let _ignored = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = TemporarySecretRoot(
+            std::env::temp_dir().join(format!("market-squawk-bls-secret-{}", Uuid::new_v4())),
+        );
+        let store = EncryptedFileSecretStore::try_open(
+            &root.0,
+            SecretValue::new("bls-test-unlock".to_owned())?,
+        )?;
+        let key = SecretKey::try_new("market-squawk.bls", "registered-v2")?;
+        let control = SecretOperationControl::try_new(
+            "bls-adapter-test",
+            Instant::now() + Duration::from_secs(60),
+            0,
+            SecretInteractionPolicy::Forbid,
+            SecretCancellation::new(),
+        )?;
+        let first_reference = store.create(
+            &key,
+            SecretGeneration::new(7)?,
+            SecretValue::new("same-provider-key".to_owned())?,
+            &control,
+        )?;
+        let second_reference = store.replace(
+            &key,
+            &first_reference,
+            SecretGeneration::new(8)?,
+            SecretValue::new("same-provider-key".to_owned())?,
+            &control,
+        )?;
+
+        let first = BlsAuthorization::registered_v2(
+            BlsRegistrationKey::try_new("same-provider-key".to_owned())?,
+            &first_reference,
+        )?;
+        let second = BlsAuthorization::registered_v2(
+            BlsRegistrationKey::try_new("same-provider-key".to_owned())?,
+            &second_reference,
+        )?;
+
+        assert_eq!(
+            first.credential_rejoin(),
+            BlsCredentialRejoin::for_registered_v2(&first_reference)?,
+        );
+        assert_eq!(
+            second.credential_rejoin(),
+            BlsCredentialRejoin::for_registered_v2(&second_reference)?,
+        );
+        assert_ne!(first.credential_rejoin(), second.credential_rejoin());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn response_body_limit_applies_across_streamed_chunks() {
@@ -527,10 +1060,17 @@ mod tests {
             seriesid: &series,
             startyear: "2020".to_owned(),
             endyear: "2026".to_owned(),
+            response_shape_policy: super::BlsResponseShapePolicyV1::for_tier(
+                crate::BlsAccessTier::RegisteredV2,
+            ),
             registration_key: Some("secret"),
         };
         let value = serde_json::to_value(request)?;
         assert_eq!(value["registrationkey"], "secret");
+        assert_eq!(value["catalog"], false);
+        assert_eq!(value["calculations"], false);
+        assert_eq!(value["annualaverage"], false);
+        assert_eq!(value["aspects"], false);
         assert!(value.get("registrationKey").is_none());
         Ok(())
     }

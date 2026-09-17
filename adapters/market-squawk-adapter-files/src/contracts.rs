@@ -425,6 +425,13 @@ pub(crate) struct SourceRowLimit {
 }
 
 impl SourceRowLimit {
+    pub(crate) const fn from_adapter_limit(adapter_maximum: usize) -> Self {
+        Self {
+            maximum: adapter_maximum,
+            request_maximum: None,
+        }
+    }
+
     pub(crate) fn from_output_limit(
         request_maximum: u32,
         outputs_per_row: usize,

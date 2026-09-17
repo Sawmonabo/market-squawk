@@ -241,6 +241,7 @@ impl ReleaseBenchmarkSource {
                     Some(metadata::identifier("BUY")?),
                     metadata::rule("release-benchmark-aggressor")?,
                 ),
+                taker_order_type: None,
             },
             BatchKind::DispatchDelta => ProviderObservationPayload::book_delta(
                 MarketDepth::PriceLevel,

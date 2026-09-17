@@ -23,6 +23,13 @@ pub(super) struct PublicationEntry {
     pub(super) account_id: AccountId,
     pub(super) artifact_reference: String,
     pub(super) artifact_sha256: [u8; 32],
+    /// Immutable governed interpretation/authorization receipt for a V1 two-phase import.
+    /// Legacy one-step publications have no such receipt and remain readable only as legacy
+    /// history; new governed publications always populate both fields together.
+    #[serde(default)]
+    pub(super) governance_receipt_reference: Option<String>,
+    #[serde(default)]
+    pub(super) governance_receipt_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -266,6 +266,48 @@ fn preferred_store_requires_explicit_memory_only_fallback_unlock() -> TestResult
 }
 
 #[test]
+fn forbid_policy_plans_a_new_generation_without_platform_interaction() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let control = SecretOperationControl::try_new(
+        "provider-unattended-planning",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )?;
+    let fallback = EncryptedFileSecretFallback::try_open(
+        directory.path().join("preferred-planning"),
+        EncryptedFileUnlockCapability::new(SecretValue::new(
+            "explicit fallback unlock phrase".to_owned(),
+        )?),
+        &control,
+    )?;
+    let store = PreferredSecretStore::try_new("market-squawk-planning-test", Some(fallback))?;
+    let generation = SecretGeneration::new(1)?;
+
+    let plan = store.plan_create(
+        &SecretKey::try_new("provider", "unattended-create")?,
+        generation,
+        &control,
+    )?;
+
+    assert_eq!(plan.target().generation(), generation);
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        plan.target().backend(),
+        SecretBackend::WindowsCredentialManager
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(plan.target().backend(), SecretBackend::EncryptedFile);
+    #[cfg(target_os = "macos")]
+    assert!(matches!(
+        plan.target().backend(),
+        SecretBackend::AppleKeychain | SecretBackend::EncryptedFile
+    ));
+    Ok(())
+}
+
+#[test]
 fn encrypted_store_confines_authenticates_redacts_and_rotates_secrets() -> TestResult {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("secrets");

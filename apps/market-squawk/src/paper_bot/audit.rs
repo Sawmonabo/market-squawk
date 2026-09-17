@@ -1,9 +1,10 @@
 //! Owned durable consumers for mandatory execution and paper audit streams.
 
 use std::{
+    collections::VecDeque,
     fs::File,
     io::Write as _,
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -21,12 +22,186 @@ use market_squawk_execution::{
 use serde::Serialize;
 use thiserror::Error;
 
+// Version 2 is retained intentionally: target-reference evidence is an optional additive field on
+// the existing append-only execution record. Audit output is never replayed for recovery, so old
+// v2 records remain valid historical evidence and require no rewrite or migration.
 const EXECUTION_AUDIT_SCHEMA_VERSION: u16 = 2;
 const PAPER_AUDIT_SCHEMA_VERSION: u16 = 1;
 const MAXIMUM_ENCODED_RECORD_BYTES: usize = 64 * 1024;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const EXECUTION_AUDIT_FILE: &str = "paper-execution-audit-v2.jsonl";
 const PAPER_AUDIT_FILE: &str = "paper-state-audit-v1.jsonl";
+const MAXIMUM_RETAINED_EXECUTION_AUDIT_RECORDS: usize = 256;
+
+/// One durable execution-audit decision retained for the bounded application read image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductionExecutionAuditRecord {
+    sequence: u64,
+    event: ExecutionAuditEvent,
+}
+
+impl ProductionExecutionAuditRecord {
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub const fn event(&self) -> ExecutionAuditEvent {
+        self.event
+    }
+}
+
+/// Immutable bounded page of decisions already committed to the production audit file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionExecutionAuditSnapshot {
+    records: Box<[ProductionExecutionAuditRecord]>,
+    returned_items: usize,
+    available_items: usize,
+    total_published: u64,
+    oldest_sequence: Option<u64>,
+    latest_sequence: Option<u64>,
+    cursor_expired: bool,
+    next_cursor: Option<u64>,
+}
+
+impl ProductionExecutionAuditSnapshot {
+    pub const fn records(&self) -> &[ProductionExecutionAuditRecord] {
+        &self.records
+    }
+    pub const fn returned_items(&self) -> usize {
+        self.returned_items
+    }
+    pub const fn available_items(&self) -> usize {
+        self.available_items
+    }
+    pub const fn total_published(&self) -> u64 {
+        self.total_published
+    }
+    pub const fn oldest_sequence(&self) -> Option<u64> {
+        self.oldest_sequence
+    }
+    pub const fn latest_sequence(&self) -> Option<u64> {
+        self.latest_sequence
+    }
+    pub const fn cursor_expired(&self) -> bool {
+        self.cursor_expired
+    }
+    pub const fn next_cursor(&self) -> Option<u64> {
+        self.next_cursor
+    }
+}
+
+/// Failure to obtain an immutable audit read image without touching its sole stream consumer.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProductionExecutionAuditReadError {
+    #[error("production execution-audit read image is unavailable")]
+    Unavailable,
+    #[error("production execution-audit read image allocation failed")]
+    Allocation,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ProductionExecutionAuditReadView {
+    image: Arc<Mutex<ExecutionAuditReadImage>>,
+}
+
+impl ProductionExecutionAuditReadView {
+    fn try_new() -> Result<Self, ProductionExecutionAuditReadError> {
+        let mut records = VecDeque::new();
+        records
+            .try_reserve_exact(MAXIMUM_RETAINED_EXECUTION_AUDIT_RECORDS)
+            .map_err(|_| ProductionExecutionAuditReadError::Allocation)?;
+        Ok(Self {
+            image: Arc::new(Mutex::new(ExecutionAuditReadImage {
+                records,
+                total_published: 0,
+            })),
+        })
+    }
+
+    pub(super) fn snapshot_after(
+        &self,
+        cursor: Option<u64>,
+        maximum_items: usize,
+    ) -> Result<ProductionExecutionAuditSnapshot, ProductionExecutionAuditReadError> {
+        self.image
+            .lock()
+            .map_err(|_| ProductionExecutionAuditReadError::Unavailable)?
+            .snapshot_after(cursor, maximum_items)
+    }
+
+    fn publish(&self, event: ExecutionAuditEvent) -> Result<(), ProductionExecutionAuditReadError> {
+        self.image
+            .lock()
+            .map_err(|_| ProductionExecutionAuditReadError::Unavailable)?
+            .publish(event)
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionAuditReadImage {
+    records: VecDeque<ProductionExecutionAuditRecord>,
+    total_published: u64,
+}
+
+impl ExecutionAuditReadImage {
+    fn publish(
+        &mut self,
+        event: ExecutionAuditEvent,
+    ) -> Result<(), ProductionExecutionAuditReadError> {
+        let sequence = self
+            .total_published
+            .checked_add(1)
+            .ok_or(ProductionExecutionAuditReadError::Unavailable)?;
+        if self.records.len() == MAXIMUM_RETAINED_EXECUTION_AUDIT_RECORDS {
+            self.records.pop_front();
+        }
+        self.records
+            .push_back(ProductionExecutionAuditRecord { sequence, event });
+        self.total_published = sequence;
+        Ok(())
+    }
+
+    fn snapshot_after(
+        &self,
+        cursor: Option<u64>,
+        maximum_items: usize,
+    ) -> Result<ProductionExecutionAuditSnapshot, ProductionExecutionAuditReadError> {
+        let oldest_sequence = self.records.front().map(|record| record.sequence());
+        let latest_sequence = self.records.back().map(|record| record.sequence());
+        let cursor_expired = cursor.is_some_and(|cursor| {
+            oldest_sequence
+                .is_some_and(|oldest| cursor.checked_add(1).is_none_or(|next| next < oldest))
+        });
+        let start = if cursor_expired {
+            oldest_sequence
+        } else {
+            cursor.and_then(|value| value.checked_add(1))
+        };
+        let matching = self
+            .records
+            .iter()
+            .filter(|record| start.is_none_or(|start| record.sequence() >= start));
+        let available_items = matching.clone().count();
+        let returned_items = available_items.min(maximum_items);
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(returned_items)
+            .map_err(|_| ProductionExecutionAuditReadError::Allocation)?;
+        records.extend(matching.take(returned_items).copied());
+        let next_cursor = (returned_items < available_items)
+            .then(|| records.last().map(|record| record.sequence()))
+            .flatten();
+        Ok(ProductionExecutionAuditSnapshot {
+            records: records.into_boxed_slice(),
+            returned_items,
+            available_items,
+            total_published: self.total_published,
+            oldest_sequence,
+            latest_sequence,
+            cursor_expired,
+            next_cursor,
+        })
+    }
+}
 
 /// Sole owner of both mandatory production audit consumers and their durable files.
 #[derive(Debug)]
@@ -34,6 +209,7 @@ pub(super) struct ProductionAuditService {
     control: mpsc::SyncSender<AuditControl>,
     worker: Option<JoinHandle<Result<ProductionAuditEvidence, ProductionAuditError>>>,
     drop_deadline: Duration,
+    execution_read_view: ProductionExecutionAuditReadView,
 }
 
 #[derive(Debug)]
@@ -51,18 +227,33 @@ impl ProductionAuditService {
     ) -> Result<Self, ProductionAuditError> {
         let execution_file = open_audit_file(&directory, EXECUTION_AUDIT_FILE)?;
         let paper_file = open_audit_file(&directory, PAPER_AUDIT_FILE)?;
+        let execution_read_view =
+            ProductionExecutionAuditReadView::try_new().map_err(ProductionAuditError::ReadImage)?;
+        let worker_read_view = execution_read_view.clone();
         let (control, commands) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(String::from("market-squawk-paper-audit"))
             .spawn(move || {
-                run_audit_service(execution, paper, execution_file, paper_file, commands)
+                run_audit_service(
+                    execution,
+                    paper,
+                    execution_file,
+                    paper_file,
+                    commands,
+                    worker_read_view,
+                )
             })
             .map_err(ProductionAuditError::Io)?;
         Ok(Self {
             control,
             worker: Some(worker),
             drop_deadline,
+            execution_read_view,
         })
+    }
+
+    pub(super) fn execution_read_view(&self) -> ProductionExecutionAuditReadView {
+        self.execution_read_view.clone()
     }
 
     pub(super) async fn flush(
@@ -160,6 +351,7 @@ fn run_audit_service(
     execution_file: File,
     paper_file: File,
     commands: mpsc::Receiver<AuditControl>,
+    execution_read_view: ProductionExecutionAuditReadView,
 ) -> Result<ProductionAuditEvidence, ProductionAuditError> {
     let mut worker = AuditWorker {
         execution,
@@ -170,6 +362,7 @@ fn run_audit_service(
         paper_closed: false,
         execution_records: 0,
         paper_records: 0,
+        execution_read_view,
     };
     let result = run_audit_worker(&mut worker, &commands);
     if result.is_err() {
@@ -188,6 +381,7 @@ struct AuditWorker {
     paper_closed: bool,
     execution_records: u64,
     paper_records: u64,
+    execution_read_view: ProductionExecutionAuditReadView,
 }
 
 impl AuditWorker {
@@ -198,6 +392,7 @@ impl AuditWorker {
             &mut self.execution_file,
             &mut self.execution_closed,
             &mut self.execution_records,
+            &self.execution_read_view,
         )? {
             progressed = true;
         }
@@ -246,13 +441,20 @@ fn drain_execution_once(
     execution_file: &mut File,
     execution_closed: &mut bool,
     execution_records: &mut u64,
+    read_view: &ProductionExecutionAuditReadView,
 ) -> Result<bool, ProductionAuditError> {
     if *execution_closed {
         return Ok(false);
     }
     match execution.try_next_record() {
         Ok(Some(record)) => {
+            let event = record.execution_event();
             append_durable(execution_file, &ExecutionAuditEnvelopeV2::try_from(record)?)?;
+            if let Some(event) = event {
+                read_view
+                    .publish(event)
+                    .map_err(ProductionAuditError::ReadImage)?;
+            }
             *execution_records = execution_records
                 .checked_add(1)
                 .ok_or(ProductionAuditError::RecordCountOverflow)?;
@@ -378,6 +580,7 @@ struct ExecutionAuditEventV2 {
     assessment_digest_sha256: Option<String>,
     evidence_binding_digest_sha256: Option<String>,
     execution_identity_digest_sha256: Option<String>,
+    target_reference_digest_sha256: Option<String>,
     risk_policy_digest_sha256: String,
     risk_policy_ruleset_version: u32,
     market_observed_at_unix_nanos: i64,
@@ -401,6 +604,7 @@ impl From<&ExecutionAuditEvent> for ExecutionAuditEventV2 {
             assessment_digest_sha256: event.assessment_digest().map(hex),
             evidence_binding_digest_sha256: event.evidence_binding_digest().map(hex),
             execution_identity_digest_sha256: event.execution_identity_digest().map(hex),
+            target_reference_digest_sha256: event.target_reference_digest().map(hex),
             risk_policy_digest_sha256: hex(policy.digest()),
             risk_policy_ruleset_version: policy.ruleset_version().get(),
             market_observed_at_unix_nanos: event.market_observed_at().unix_nanos(),
@@ -571,6 +775,8 @@ pub enum ProductionAuditError {
     RecordTooLarge,
     #[error("production audit record count overflowed")]
     RecordCountOverflow,
+    #[error("production execution-audit read image failed: {0}")]
+    ReadImage(ProductionExecutionAuditReadError),
     #[error("production execution audit reader failed: {0}")]
     ExecutionReader(ExecutionAuditError),
     #[error("production audit I/O failed: {0}")]
@@ -627,17 +833,20 @@ mod tests {
 
         let mut closed = false;
         let mut records = 0;
+        let read_view = ProductionExecutionAuditReadView::try_new()?;
         assert!(drain_execution_once(
             &mut reader,
             &mut file,
             &mut closed,
             &mut records,
+            &read_view,
         )?);
         assert!(drain_execution_once(
             &mut reader,
             &mut file,
             &mut closed,
             &mut records,
+            &read_view,
         )?);
         assert_eq!(records, 2);
         assert!(!closed);
@@ -664,7 +873,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_joins_a_naturally_completed_worker_before_sending_stop() {
+    async fn shutdown_joins_a_naturally_completed_worker_before_sending_stop()
+    -> Result<(), ProductionExecutionAuditReadError> {
         let expected = ProductionAuditEvidence {
             execution_records: 7,
             paper_records: 11,
@@ -682,10 +892,12 @@ mod tests {
             control,
             worker: Some(worker),
             drop_deadline: Duration::from_secs(1),
+            execution_read_view: ProductionExecutionAuditReadView::try_new()?,
         };
         let shutdown = service.shutdown(tokio::time::Instant::now(), true).await;
 
         assert!(shutdown.is_complete());
         assert_eq!(shutdown.evidence(), Some(expected));
+        Ok(())
     }
 }

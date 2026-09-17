@@ -145,6 +145,15 @@ jobs:
         if: runner.os == 'Windows'
         with:
           arch: x64
+      - name: Pin the exact MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\link.exe'
+          if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
+            throw "The configured MSVC linker is unavailable: $linker"
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
       # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
@@ -382,7 +391,10 @@ jobs:
           cargo build --release --locked --offline --target "$TARGET" \
             -p market-squawk-desktop --features tauri/custom-protocol
           cargo build --release --locked --offline --target "$TARGET" \
-            -p market-squawk --bin market-squawk-capture-helper
+            -p market-squawk \
+            --bin market-squawk-capture-helper \
+            --bin market-squawk-service \
+            --bin market-squawk-mcp-relay
           cargo build --release --locked --offline --target "$TARGET" \
             -p market-squawk-installer
           native="$RUNNER_TEMP/native-input"
@@ -392,6 +404,10 @@ jobs:
             "$native/market-squawk-desktop$EXE"
           cp "target/$TARGET/release/market-squawk-capture-helper$EXE" \
             "$native/market-squawk-capture-helper$EXE"
+          cp "target/$TARGET/release/market-squawk-service$EXE" \
+            "$native/market-squawk-service$EXE"
+          cp "target/$TARGET/release/market-squawk-mcp-relay$EXE" \
+            "$native/market-squawk-mcp-relay$EXE"
           cp "target/$TARGET/release/market-squawk-installer$EXE" \
             "$native/market-squawk-installer$EXE"
           cp "$MARKET_SQUAWK_COMPONENT_ROOT/expanded/uv/$UV_RELATIVE" \
@@ -422,7 +438,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $files = Get-ChildItem -File (Join-Path $env:RUNNER_TEMP "native-input")
-          if ($files.Count -ne 4) {
+          if ($files.Count -ne 6) {
             throw "The complete native input set is not closed."
           }
           foreach ($file in $files) {
@@ -606,7 +622,8 @@ jobs:
             --output json
           "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
-          python3 scripts/smoke_mcp.py "$application"
+          python3 scripts/smoke_mcp.py "$application" --client claude-code
+          python3 scripts/smoke_mcp.py "$application" --client codex
           "$bootstrap" --root "$install_root" uninstall
       - name: Verify the macOS package and declared trust
         if: runner.os == 'macOS'
@@ -1096,6 +1113,7 @@ jobs:
           wait "$desktop_pid" || true
 
           root="$(dirname "$state")"
+          data_root="$(dirname "$root")"
           installer="$(
             find "$root/versions" -type f \
               -path '*/bin/market-squawk-installer' -print
@@ -1103,20 +1121,31 @@ jobs:
           application_cli="$(
             find "$root/versions" -type f -path '*/bin/market-squawk' -print
           )"
+          relay="$(
+            find "$root/versions" -type f \
+              -path '*/bin/market-squawk-mcp-relay' -print
+          )"
           runtime="$(
             find "$root/versions" -type f -path '*/bin/python' -print
           )"
           [[ -n "$installer" && "$installer" != *$'\n'* ]]
           [[ -n "$application_cli" && "$application_cli" != *$'\n'* ]]
+          [[ -n "$relay" && "$relay" != *$'\n'* ]]
           [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
           "$installer" --root "$root" status --json
           "$installer" --root "$root" repair
+          "$installer" --root "$root" service status --json
           "$application_cli" doctor \
-            --data-dir "$RUNNER_TEMP/doctor-data" \
+            --data-dir "$data_root" \
             --output json
           "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
-          python3 scripts/smoke_mcp.py "$application_cli"
+          python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client claude-code
+          python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client codex
           HOME="$home" \
             "$application/Contents/MacOS/market-squawk-desktop" \
             --native-uninstall
@@ -1271,6 +1300,7 @@ jobs:
 
           $statePath = $state[0].FullName
           $root = $state[0].DirectoryName
+          $dataRoot = Split-Path $root -Parent
           $installer = @(
             Get-ChildItem `
               -Path (Join-Path $root "versions") `
@@ -1285,6 +1315,13 @@ jobs:
               -File `
               -Recurse
           )
+          $relay = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter market-squawk-mcp-relay.exe `
+              -File `
+              -Recurse
+          )
           $runtime = @(
             Get-ChildItem `
               -Path (Join-Path $root "versions") `
@@ -1295,6 +1332,7 @@ jobs:
           if (
             $installer.Count -ne 1 -or
             $application.Count -ne 1 -or
+            $relay.Count -ne 1 -or
             $runtime.Count -ne 1
           ) {
             throw "The installed Windows product component set is incomplete."
@@ -1303,14 +1341,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed-product status failed." }
           & $installer[0].FullName --root $root repair
           if ($LASTEXITCODE -ne 0) { throw "Installed-product repair failed." }
+          & $installer[0].FullName --root $root service status --json
+          if ($LASTEXITCODE -ne 0) { throw "Installed-service health failed." }
           & $application[0].FullName doctor `
-            --data-dir (Join-Path $env:RUNNER_TEMP "doctor-data") `
+            --data-dir $dataRoot `
             --output json
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI doctor failed." }
           & $runtime[0].FullName -I -B -c `
             "import market_squawk, pyarrow; print(pyarrow.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Managed Python admission failed." }
-          python scripts/smoke_mcp.py $application[0].FullName
+          python scripts/smoke_mcp.py $relay[0].FullName `
+            --installed-relay --running-service --data-dir $dataRoot `
+            --client claude-code
+          if ($LASTEXITCODE -ne 0) { throw "Installed Claude Code MCP smoke failed." }
+          python scripts/smoke_mcp.py $relay[0].FullName `
+            --installed-relay --running-service --data-dir $dataRoot `
+            --client codex
           if ($LASTEXITCODE -ne 0) { throw "Installed MCP smoke failed." }
 
           if ($env:PACKAGE_KIND -eq "nsis") {
@@ -1421,6 +1467,7 @@ jobs:
           wait "$desktop_pid" || true
 
           root="$(dirname "$state")"
+          data_root="$(dirname "$root")"
           installer="$(
             find "$root/versions" -type f \
               -path '*/bin/market-squawk-installer' -print
@@ -1428,20 +1475,31 @@ jobs:
           application="$(
             find "$root/versions" -type f -path '*/bin/market-squawk' -print
           )"
+          relay="$(
+            find "$root/versions" -type f \
+              -path '*/bin/market-squawk-mcp-relay' -print
+          )"
           runtime="$(
             find "$root/versions" -type f -path '*/bin/python' -print
           )"
           [[ -n "$installer" && "$installer" != *$'\n'* ]]
           [[ -n "$application" && "$application" != *$'\n'* ]]
+          [[ -n "$relay" && "$relay" != *$'\n'* ]]
           [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
           "$installer" --root "$root" status --json
           "$installer" --root "$root" repair
+          "$installer" --root "$root" service status --json
           "$application" doctor \
-            --data-dir "$RUNNER_TEMP/doctor-data" \
+            --data-dir "$data_root" \
             --output json
           "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
-          python3 scripts/smoke_mcp.py "$application"
+          python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client claude-code
+          python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client codex
           if [[ "$PACKAGE_KIND" == "appimage" ]]; then
             APPIMAGE_EXTRACT_AND_RUN=1 \
               HOME="$home" \

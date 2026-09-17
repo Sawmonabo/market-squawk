@@ -11,13 +11,14 @@ use market_squawk_sources::{AuthorizationMode, DataUseOperation, ProviderRateAut
 
 use crate::{ProviderActivationLease, ProviderOnboardingService};
 
+use super::CoinbaseMarketPublicationPackage;
 use super::specs::{
     COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
     CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
     ProviderAdapterActivationError,
 };
 
-const COINBASE_DIRECT_SURFACE: &str = "coinbase.exchange-direct-market-data";
+pub(super) const COINBASE_DIRECT_SURFACE: &str = "coinbase.exchange-direct-market-data";
 const COINBASE_DIRECT_PROVIDER: &str = "coinbase-exchange";
 const COINBASE_DIRECT_ACCOUNT_ROOT: &str = "coinbase-direct-account-authority";
 const COINBASE_DIRECT_ACCOUNT_SUBJECT_PREFIX: &str = "coinbase-direct-account-";
@@ -84,6 +85,8 @@ pub struct CoinbaseDirectAccountActivation {
     admission: CoinbaseDirectRuntimeAdmission,
     product_count: usize,
     products: [Option<CoinbaseDirectProductActivation>; COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS],
+    publication_packages: Vec<CoinbaseMarketPublicationPackage>,
+    publication_cancellation: Option<tokio_util::sync::CancellationToken>,
     _account_authority: LocalAuthorityStateStore,
 }
 
@@ -151,6 +154,27 @@ impl CoinbaseDirectAccountActivation {
         self.product_count = 0;
         std::array::from_fn(|index| self.products[index].take())
     }
+
+    pub(crate) fn take_market_publication(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<CoinbaseMarketPublicationPackage>,
+            tokio_util::sync::CancellationToken,
+        ),
+        ProviderAdapterActivationError,
+    > {
+        let cancellation = self
+            .publication_cancellation
+            .take()
+            .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+        let packages = std::mem::take(&mut self.publication_packages);
+        if packages.is_empty() {
+            cancellation.cancel();
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok((packages, cancellation))
+    }
 }
 
 impl fmt::Debug for CoinbaseDirectAccountActivation {
@@ -167,12 +191,22 @@ impl fmt::Debug for CoinbaseDirectAccountActivation {
     }
 }
 
+impl Drop for CoinbaseDirectAccountActivation {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.publication_cancellation.as_ref() {
+            cancellation.cancel();
+        }
+    }
+}
+
 pub(super) fn activate_coinbase_direct(
     onboarding: Arc<ProviderOnboardingService>,
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
     lease: ProviderActivationLease,
     spec: CoinbaseDirectAdapterActivation,
+    publication_packages: Vec<CoinbaseMarketPublicationPackage>,
+    publication_cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<CoinbaseDirectAccountActivation, ProviderAdapterActivationError> {
     validate_direct_lease(&lease)?;
     let admission = checked_runtime_admission(&spec)?;
@@ -220,6 +254,8 @@ pub(super) fn activate_coinbase_direct(
         admission,
         product_count,
         products,
+        publication_packages,
+        publication_cancellation: Some(publication_cancellation),
         _account_authority: account_authority,
     })
 }

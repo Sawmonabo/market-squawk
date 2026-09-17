@@ -122,6 +122,17 @@ impl BacktestRequest {
         self.dataset.object_graph_digest()
     }
 
+    /// Returns the exact decision-time interval that was admitted for this request.
+    ///
+    /// This is intentionally derived from the sealed dataset rather than caller input so cohort
+    /// generation can bind each member to the same partition the engine will execute.
+    #[must_use]
+    pub fn dataset_partition(&self) -> Option<crate::TrialDatasetPartition> {
+        let starts_at = self.dataset.observations.first()?.decision_at;
+        let ends_at = self.dataset.observations.last()?.decision_at;
+        crate::TrialDatasetPartition::try_new(starts_at, ends_at).ok()
+    }
+
     /// Returns the exact research execution-assumption identity.
     #[must_use]
     pub const fn assumption_digest(&self) -> Sha256Digest {
@@ -336,10 +347,28 @@ pub(crate) struct BacktestPerformanceStatistics {
     pub(crate) observations: usize,
     pub(crate) skewness: f64,
     pub(crate) excess_kurtosis: f64,
+    pub(crate) maximum_drawdown: Decimal,
 }
 
 impl BacktestPerformanceStatistics {
     fn from_equity_marks(marks: &[Decimal]) -> Result<Self, BacktestError> {
+        let mut peak = marks
+            .first()
+            .copied()
+            .filter(|mark| *mark > Decimal::ZERO)
+            .ok_or(BacktestError::PerformanceMetrics)?;
+        let mut maximum_drawdown = Decimal::ZERO;
+        for mark in marks.iter().copied().skip(1) {
+            if mark > peak {
+                peak = mark;
+                continue;
+            }
+            let drawdown = peak
+                .checked_sub(mark)
+                .and_then(|decline| decline.checked_div(peak))
+                .ok_or(BacktestError::PerformanceMetrics)?;
+            maximum_drawdown = maximum_drawdown.max(drawdown);
+        }
         let returns = marks
             .windows(2)
             .map(|window| {
@@ -361,6 +390,7 @@ impl BacktestPerformanceStatistics {
                 observations: returns.len(),
                 skewness: 0.0,
                 excess_kurtosis: 0.0,
+                maximum_drawdown,
             });
         }
         let count = returns.len() as f64;
@@ -405,6 +435,7 @@ impl BacktestPerformanceStatistics {
                 observations: returns.len(),
                 skewness,
                 excess_kurtosis,
+                maximum_drawdown,
             })
         } else {
             Err(BacktestError::PerformanceMetrics)

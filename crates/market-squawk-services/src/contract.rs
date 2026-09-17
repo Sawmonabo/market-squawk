@@ -18,6 +18,12 @@ pub const TOOL_TIME_RANGE_FIELD: &str = "timeRange";
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceDomain {
+    /// Durable background-work admission, progress, recovery, and control.
+    Job,
+    /// Screens, dossiers, investment targets, reviews, and invalidation state.
+    Decision,
+    /// Backup, restore, updates, workspaces, settings, logs, and local lifecycle authority.
+    Operations,
     /// Source registration, status, coverage, and health.
     Source,
     /// Live and historical market observations.
@@ -47,6 +53,9 @@ impl ServiceDomain {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Job => "job",
+            Self::Decision => "decision",
+            Self::Operations => "operations",
             Self::Source => "source",
             Self::Market => "market",
             Self::Research => "research",

@@ -327,6 +327,7 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
                     Some(id("BUY")?),
                     rule("coinbase-aggressor")?,
                 ),
+                taker_order_type: None,
             },
         )?;
         let batch = DecodedProviderBatch::try_new(decoder, vec![observation])?;
@@ -410,7 +411,7 @@ fn qualify(
         current,
         evidence,
         current
-            .frame_evidence()
+            .evidence()
             .received_at()
             .checked_add_nanos(EVALUATED_AT - FRAME_AT)
             .map_err(|_| QualificationBuildError::ExpiredWindow)?,
@@ -420,6 +421,7 @@ fn qualify(
                 PriceTicks::new(10_000),
                 QuantityLots::new(100).map_err(|_| MarketEventError::ZeroQuantity)?,
                 AggressorSide::Buy,
+                None,
             )?))
         },
     )
@@ -456,8 +458,24 @@ fn assessment_and_execution_digest_bind_exact_frame_ordinal_and_committed_revisi
     assert!(assessment_id.starts_with("live-v2-"));
     assert_eq!(assessment_id.len(), "live-v2-".len() + 64);
     assert_eq!(first.binding_digest.len(), 32);
-    assert_eq!(fixture.observations[0].frame_evidence().frame_id().get(), 1);
-    assert_eq!(fixture.observations[1].frame_evidence().frame_id().get(), 2);
+    assert_eq!(
+        fixture.observations[0]
+            .evidence()
+            .transport_frame()
+            .expect("fixture transport frame")
+            .frame_id()
+            .get(),
+        1
+    );
+    assert_eq!(
+        fixture.observations[1]
+            .evidence()
+            .transport_frame()
+            .expect("fixture transport frame")
+            .frame_id()
+            .get(),
+        2
+    );
     assert_ne!(first.binding_digest, second_frame.binding_digest);
     assert_ne!(
         first.assessment.assessment_id(),

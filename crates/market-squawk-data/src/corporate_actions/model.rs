@@ -6,14 +6,17 @@ use market_squawk_domain::{
     CorporateActionObservation, EvidenceDigest, InstrumentId, MergerConsideration, Money,
     Timestamp, VenueId, VenueSymbol,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{DatasetManifestRef, Sha256Digest};
+use crate::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest};
 
 /// Fixed process ceiling for corporate-action candidates in one plan.
 pub const MAX_CORPORATE_ACTIONS: usize = 1_000_000;
 /// Fixed process ceiling for Rust-visible bytes retained by one plan.
 pub const MAX_CORPORATE_ACTION_RETAINED_BYTES: usize = 512 * 1024 * 1024;
+/// Schema version for durable, self-validating corporate-action plan recovery material.
+pub(super) const CORPORATE_ACTION_PLAN_CODEC_VERSION: u16 = 1;
 
 /// Closed economic treatment applied by one versioned adjustment policy.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -333,11 +336,176 @@ impl CorporateActionPlan {
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
+
+    /// Encodes the exact source records and policy required to reconstruct this plan after a
+    /// process restart. Derived steps, exclusions, and hashes are rebuilt rather than trusted
+    /// from storage; both persisted identities are retained only as integrity assertions.
+    pub fn encode_recovery_material(&self) -> Result<Vec<u8>, CorporateActionError> {
+        let records = self
+            .admitted
+            .iter()
+            .chain(self.exclusions.iter().map(|value| &value.record))
+            .map(RecoveryRecord::from_record)
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&RecoveryPlan {
+            schema_version: CORPORATE_ACTION_PLAN_CODEC_VERSION,
+            adjustment: RecoveryAdjustment::from(self.policy.adjustment),
+            policy_version: self.policy.version.get(),
+            knowledge_cutoff_unix_nanos: self.knowledge_cutoff.unix_nanos().to_string(),
+            valuation_cutoff_unix_nanos: self.valuation_cutoff.unix_nanos().to_string(),
+            records,
+            content_hash: self.content_hash.bytes(),
+            audit_hash: self.audit_hash.bytes(),
+        })
+        .map_err(|_| CorporateActionError::RecoveryCodec)
+    }
+
+    /// Reconstructs a plan exclusively through the normal checked plan builder and verifies both
+    /// source-manifest and plan identities. Unknown codec/schema versions, altered source
+    /// evidence, or a policy output that no longer hashes identically fail closed.
+    pub fn decode_recovery_material(
+        bytes: &[u8],
+        limits: CorporateActionLimits,
+    ) -> Result<Self, CorporateActionError> {
+        let wire: RecoveryPlan =
+            serde_json::from_slice(bytes).map_err(|_| CorporateActionError::RecoveryCodec)?;
+        if wire.schema_version != CORPORATE_ACTION_PLAN_CODEC_VERSION {
+            return Err(CorporateActionError::RecoveryCodec);
+        }
+        let policy_version =
+            NonZeroU32::new(wire.policy_version).ok_or(CorporateActionError::RecoveryCodec)?;
+        let knowledge_cutoff = parse_recovery_timestamp(&wire.knowledge_cutoff_unix_nanos)?;
+        let valuation_cutoff = parse_recovery_timestamp(&wire.valuation_cutoff_unix_nanos)?;
+        let records = wire
+            .records
+            .into_iter()
+            .map(RecoveryRecord::into_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = Self::try_build(
+            CorporateActionPolicy::new(wire.adjustment.into(), policy_version),
+            knowledge_cutoff,
+            valuation_cutoff,
+            records,
+            limits,
+        )?;
+        if plan.content_hash.bytes() != wire.content_hash
+            || plan.audit_hash.bytes() != wire.audit_hash
+        {
+            return Err(CorporateActionError::RecoveryCodec);
+        }
+        Ok(plan)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPlan {
+    schema_version: u16,
+    adjustment: RecoveryAdjustment,
+    policy_version: u32,
+    knowledge_cutoff_unix_nanos: String,
+    valuation_cutoff_unix_nanos: String,
+    records: Vec<RecoveryRecord>,
+    content_hash: [u8; 32],
+    audit_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryAdjustment {
+    Raw,
+    SplitAdjusted,
+    TotalReturn,
+}
+
+impl From<CorporateActionAdjustment> for RecoveryAdjustment {
+    fn from(value: CorporateActionAdjustment) -> Self {
+        match value {
+            CorporateActionAdjustment::Raw => Self::Raw,
+            CorporateActionAdjustment::SplitAdjusted => Self::SplitAdjusted,
+            CorporateActionAdjustment::TotalReturn => Self::TotalReturn,
+        }
+    }
+}
+
+impl From<RecoveryAdjustment> for CorporateActionAdjustment {
+    fn from(value: RecoveryAdjustment) -> Self {
+        match value {
+            RecoveryAdjustment::Raw => Self::Raw,
+            RecoveryAdjustment::SplitAdjusted => Self::SplitAdjusted,
+            RecoveryAdjustment::TotalReturn => Self::TotalReturn,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryRecord {
+    observation: CorporateActionObservation,
+    dataset_id: String,
+    manifest_version: u64,
+    schema_name: String,
+    schema_version: u16,
+    schema_fingerprint: [u8; 32],
+    content_hash: [u8; 32],
+    evidence_digest: EvidenceDigest,
+}
+
+impl RecoveryRecord {
+    fn from_record(record: &CorporateActionRecord) -> Self {
+        Self {
+            observation: record.observation.clone(),
+            dataset_id: record.source_manifest.dataset_id().as_str().to_owned(),
+            manifest_version: record.source_manifest.manifest_version(),
+            schema_name: record.source_manifest.schema().name().to_owned(),
+            schema_version: record.source_manifest.schema_version().get(),
+            schema_fingerprint: record.source_manifest.schema().fingerprint(),
+            content_hash: record.source_manifest.content_hash().bytes(),
+            evidence_digest: record.evidence_digest,
+        }
+    }
+
+    fn into_record(self) -> Result<CorporateActionRecord, CorporateActionError> {
+        let schema = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| CorporateActionError::RecoveryCodec)?;
+        if schema.name() != self.schema_name
+            || schema.version().get() != self.schema_version
+            || schema.fingerprint() != self.schema_fingerprint
+        {
+            return Err(CorporateActionError::RecoveryCodec);
+        }
+        let dataset_id = DatasetId::try_from(self.dataset_id.as_str())
+            .map_err(|_| CorporateActionError::RecoveryCodec)?;
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            dataset_id,
+            self.manifest_version,
+            schema,
+            Sha256Digest::new(self.content_hash),
+        )
+        .map_err(|_| CorporateActionError::RecoveryCodec)?;
+        Ok(CorporateActionRecord::new(
+            self.observation,
+            manifest,
+            self.evidence_digest,
+        ))
+    }
+}
+
+fn parse_recovery_timestamp(value: &str) -> Result<Timestamp, CorporateActionError> {
+    value
+        .parse::<i64>()
+        .ok()
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(CorporateActionError::RecoveryCodec)
 }
 
 /// Corporate-action planning, canonicalization, allocation, or retained-size failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CorporateActionError {
+    /// Durable plan-recovery material is malformed, unsupported, or fails identity validation.
+    #[error("corporate-action recovery material is invalid")]
+    RecoveryCodec,
     /// Caller-selected limits exceed fixed process ceilings.
     #[error("corporate-action limits exceed fixed process ceilings")]
     InvalidLimits,

@@ -129,13 +129,14 @@ pub(crate) struct SustainedEpochEvidence {
 pub(crate) fn validate_repetition(
     evidence: &RepetitionEvidence,
     expected_repetition: u8,
+    expected_measured_code_head: &str,
     producer_cases: &[ProducerCase],
 ) -> Result<(), String> {
     if evidence.schema_version != RESULT_SCHEMA_VERSION
         || evidence.runner != super::benchmark_identity::EVIDENCE_TARGET
         || evidence.evidence_mode != super::benchmark_identity::FIXED_QUOTA_EVIDENCE_MODE
         || !is_digest(&evidence.build_evidence_sha256)
-        || evidence.measured_code_head != super::build_bindings::BUILD_GIT_HEAD
+        || evidence.measured_code_head != expected_measured_code_head
         || evidence.backend != super::backend::EVIDENCE_BACKEND
         || evidence.queue_transport != super::backend::QUEUE_TRANSPORT
         || evidence.queue_private_storage_accounting
@@ -639,6 +640,7 @@ pub(crate) struct BuildEvidence {
     pub(crate) executable_sha256: String,
     pub(crate) cargo_json_path: String,
     pub(crate) cargo_json_sha256: String,
+    pub(crate) measured_source_closure_sha256: String,
     pub(crate) source_inventory_sha256: String,
     pub(crate) cargo_lock_sha256: String,
     pub(crate) workspace_manifest_sha256: String,
@@ -690,7 +692,6 @@ impl BuildEvidence {
             || self.benchmark_feature != "capture-benchmark"
             || self.build_profile
                 != "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols"
-            || self.measured_code_head != super::build_bindings::BUILD_GIT_HEAD
             || !is_git_sha(&self.measured_code_head)
             || !self.clean_build_enforced
             || !super::build_bindings::CLEAN_BUILD_ENFORCED
@@ -720,25 +721,14 @@ impl BuildEvidence {
             || !self.release
             || self.executable_path != "./capture_admission_evidence-exe"
             || self.cargo_json_path != "./capture-bench-build.json"
+            || self.measured_source_closure_sha256
+                != super::build_bindings::MEASURED_SOURCE_CLOSURE_SHA256
             || self.source_inventory_sha256 != super::build_bindings::SOURCE_INVENTORY_SHA256
             || self.cargo_lock_sha256 != super::build_bindings::CARGO_LOCK_SHA256
             || self.workspace_manifest_sha256 != super::build_bindings::WORKSPACE_MANIFEST_SHA256
             || self.package_manifest_sha256 != super::build_bindings::PACKAGE_MANIFEST_SHA256
             || self.build_script_sha256 != super::build_bindings::BUILD_SCRIPT_SHA256
             || self.build_support_sha256 != super::build_bindings::BUILD_SUPPORT_TREE_SHA256
-            || self.host_gate_shell_sha256 != super::build_bindings::HOST_GATE_SHELL_SHA256
-            || self.host_gate_python_sha256 != super::build_bindings::HOST_GATE_PYTHON_SHA256
-            || self.host_gate_process_sha256 != super::build_bindings::HOST_GATE_PROCESS_SHA256
-            || self.host_gate_evidence_io_sha256
-                != super::build_bindings::HOST_GATE_EVIDENCE_IO_SHA256
-            || self.host_gate_cli_sha256 != super::build_bindings::HOST_GATE_CLI_SHA256
-            || self.host_gate_schema_sha256 != super::build_bindings::HOST_GATE_SCHEMA_SHA256
-            || self.host_gate_execution_sha256 != super::build_bindings::HOST_GATE_EXECUTION_SHA256
-            || self.host_gate_observation_sha256
-                != super::build_bindings::HOST_GATE_OBSERVATION_SHA256
-            || self.host_gate_measured_sha256 != super::build_bindings::HOST_GATE_MEASURED_SHA256
-            || self.build_evidence_python_sha256
-                != super::build_bindings::BUILD_EVIDENCE_PYTHON_SHA256
             || self.platform_source_sha256 != super::build_bindings::PLATFORM_SOURCE_SHA256
             || self.domain_source_sha256 != super::build_bindings::DOMAIN_SOURCE_SHA256
             || self.entrypoint_sha256 != super::build_bindings::ENTRYPOINT_SHA256
@@ -766,6 +756,7 @@ impl BuildEvidence {
         for digest in [
             &self.executable_sha256,
             &self.cargo_json_sha256,
+            &self.measured_source_closure_sha256,
             &self.build_command_sha256,
             &self.build_environment_sha256,
             &self.cargo_executable_sha256,

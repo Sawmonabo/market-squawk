@@ -4,7 +4,6 @@
 
 [![GitHub Actions](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml/badge.svg)](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml)
 [![Rust 1.97.1](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](rust-toolchain.toml)
-[![Version 1.0.0](https://img.shields.io/badge/version-1.0.0-2563eb)](Cargo.toml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-2563eb)](#license)
 
 Market Squawk is a self-hosted platform for live market data, investment research, financial
@@ -13,10 +12,11 @@ keeps its catalog, analytical datasets, models, artifacts, and audit records on 
 machine and requires no paid software, paid API, cloud service, hosted database, container runtime,
 or telemetry service.
 
-The Obsidian Signal desktop application is the primary interactive experience. The same Rust
-application services remain available through the complete command-line interface and local stdio
-[Model Context Protocol (MCP)](docs/reference/mcp.md) server. Provider setup runs inside the
-desktop where supported and can open the protected, temporary loopback portal as a fallback.
+The Obsidian Signal desktop application is the primary interactive experience. One per-user Market
+Squawk service owns the selected workspace, live and research runtimes, durable jobs, risk,
+artifacts, and audit state. The Desktop and CLI connect to that service; Claude Code and Codex use
+separate authenticated stdio relays into its shared local
+[Model Context Protocol (MCP)](docs/reference/mcp.md) endpoint.
 
 ## Table of contents
 
@@ -37,11 +37,11 @@ desktop where supported and can open the protected, temporary loopback portal as
 | --- | --- |
 | Live markets | Coinbase and Kraken adapters, trades, quotes, price-level books, source integrity, online features, deterministic instrument sharding, freshness checks, and fail-closed quality transitions |
 | Research data | Local files, SEC EDGAR, BLS, US Treasury, FRED/ALFRED inspection, versioned Arrow interchange, Parquet datasets, DataFusion queries, lineage, revisions, and point-in-time filtering |
-| Analytics and models | Returns, risk, regression, fundamentals, macro features, native and ONNX inference, optional Python research and training, and governed point-in-time backtesting |
+| Analytics and models | Returns, risk, regression, fundamentals, macro features, native and ONNX inference, managed Python research and training, and governed point-in-time backtesting |
 | Portfolios | Holdings and transaction imports, cost basis, gains, income, performance, exposure, attribution, scenarios, and portfolio risk |
 | Risk and execution | Typed order intents, mandatory central risk checks, realistic local paper execution, fees, latency, slippage, partial fills, cancellation, reconciliation, and recovery |
 | Fair value | Evidence-backed ASC 820 and IFRS 13 measurements with separate Level 1, Level 2, Level 3, and unclassified outcomes |
-| Local interfaces | The Obsidian Signal Tauri desktop, a cohesive CLI, and a typed local stdio MCP server over the same Rust application services |
+| Local interfaces | The Obsidian Signal Tauri desktop, a cohesive CLI, and distinct Claude Code/Codex stdio relays into one authenticated local MCP service |
 
 Provider coverage, authentication needs, data quality, and current limitations are documented in
 [Source coverage](docs/reference/source-coverage.md). Only observations that satisfy the complete
@@ -56,13 +56,19 @@ data pipeline.
 
 ```mermaid
 flowchart TB
-    Operator["Operator or local application"]
+    Operator["Operator"]
+    Claude["Claude Code relay"]
+    Codex["Codex relay"]
     LiveSources["Venue and broker interfaces"]
     ResearchSources["Files, filings, macro, portfolios, and historical providers"]
 
     subgraph Local["Market Squawk on the local machine"]
-        Control["Tauri desktop · CLI · local stdio MCP"]
-        Services["Shared application services"]
+        Desktop["Obsidian Signal desktop"]
+        CLI["Market Squawk CLI"]
+        Service["One per-user installed service<br/>authenticated rendezvous · selected workspace"]
+        MCP["Stateless local /mcp endpoint"]
+        Jobs["Durable jobs and lifecycle authority"]
+        Services["Shared application services and audit"]
         Domain["Shared domain contracts<br/>identity · time · money · quality · provenance"]
 
         subgraph Live["Live execution plane"]
@@ -82,8 +88,15 @@ flowchart TB
         end
     end
 
-    Operator --> Control
-    Control --> Services
+    Operator --> Desktop
+    Operator --> CLI
+    Desktop -->|"authenticated /app/v1"| Service
+    CLI -->|"authenticated /app/v1"| Service
+    Claude -->|"stdio"| MCP
+    Codex -->|"stdio"| MCP
+    MCP --> Service
+    Service --> Jobs
+    Service --> Services
     Services --> LiveAdapters
     Services --> Extractors
     Domain --> LiveAdapters
@@ -103,63 +116,41 @@ runtime boundaries, failure behavior, and links to the focused architecture page
 
 ## Quick start
 
-### Install the complete product
+### Installation
 
-On macOS or x64 Linux, the verified terminal installer detects the platform and installs one
-complete release:
+Public V1 installation packages have not been published. Until they are available from GitHub
+Releases, run Market Squawk from source using [Development](#development). Do not run
+`distribution/install.sh` from the source tree; it is a release-builder template and intentionally
+exits before publication.
 
-```bash
-curl -fsSL \
-  https://github.com/Sawmonabo/market-squawk/releases/latest/download/install.sh | sh
-```
+The complete distribution contains the Obsidian Signal desktop, CLI, per-user service, MCP relay,
+capture helper, ONNX worker, model validator, training driver, installer/maintenance authority, uv,
+managed CPython 3.14.6 and its locked analytics/modeling environment, schemas, notices, trust/update
+metadata, and lifecycle assets. Ordinary users do not need Rust, Node.js, pnpm, system Python, a
+database, a container runtime, or a paid service preinstalled.
 
-No existing Rust, Node.js, Python, database, or container installation is required. The release
-includes the Obsidian Signal desktop, CLI, capture and inference helpers, uv, managed CPython
-3.14.6, the locked Python analytics/modeling environment, licenses, and release evidence.
+### What happens after installation
 
-Desktop users can instead download the native package for their operating system:
+The native application or local terminal bootstrap registers one per-user service, activates one
+immutable product version, and publishes stable Desktop, CLI, relay, and maintenance entrypoints.
+The first Desktop launch opens the permanent Obsidian Signal shell and its guided setup. Setup keeps
+skipped or unfinished work visible and resumable; accepting a plan does not falsely mark a source,
+model, backup, or client integration complete.
 
-| Platform | Native packages |
-| --- | --- |
-| macOS 12+, Apple Silicon | [DMG](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-aarch64-apple-darwin.dmg) |
-| macOS 12+, Intel | [DMG](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-apple-darwin.dmg) |
-| Windows 10 1809+, x64 | [Guided installer](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-pc-windows-msvc-setup.exe) · [MSI](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-pc-windows-msvc.msi) |
-| Ubuntu 24.04-compatible, x64 | [AppImage](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-unknown-linux-gnu.AppImage) · [DEB](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-unknown-linux-gnu.deb) |
-
-The [GitHub Releases page](https://github.com/Sawmonabo/market-squawk/releases/latest) also
-contains verified complete ZIP bundles for headless and offline installation. Each release records
-whether its native package has Apple or Windows publisher credentials or uses the zero-cost
-GitHub-provenance trust path; package integrity and attestations are always checked by the release
-workflow.
-
-### Open Market Squawk
-
-A native package creates the normal operating-system application entrypoint. The terminal
-installer prints three durable paths when it finishes:
-
-- **Desktop** opens the welcoming guided setup.
-- **CLI** exposes every local product operation.
-- **Updates and repair** manages the verified installation lifecycle.
-
-Open the printed Desktop path. Guided setup explains sources, storage, research, portfolios,
-models, paper execution, risk, fair value, and MCP in plain language and reports a clear readiness
-state. Provider accounts or free API keys are requested only when a selected provider requires
-one.
-
-For terminal use, copy the printed CLI path and choose an absolute directory for local data:
+Use the installed CLI path reported by the installer:
 
 ```bash
-MSQ="/path/printed/by/the/installer/market-squawk"
-DATA_ROOT="/absolute/path/to/market-squawk-data"
+MSQ="/path/reported/by/the/installer/market-squawk"
 
-"$MSQ" --data-dir "$DATA_ROOT" config validate
-"$MSQ" --data-dir "$DATA_ROOT" init
-"$MSQ" --data-dir "$DATA_ROOT" doctor
+"$MSQ" service status
+"$MSQ" service start
+"$MSQ" doctor
+"$MSQ" setup status
 ```
 
-For installation locations, lifecycle commands, offline use, trust verification, rollback,
-uninstall, and recovery, use the
-[installation runbook](docs/operations/installation-and-bootstrap.md).
+The service owns the selected workspace and survives individual Desktop, CLI, Claude Code, and
+Codex sessions. For target-specific verification, repair, data-preserving removal, and recovery,
+use the [installation runbook](docs/operations/installation-and-bootstrap.md).
 
 ## Use Market Squawk
 
@@ -169,21 +160,40 @@ The desktop guides this flow. From the CLI, Treasury Fiscal Data is a practical 
 because it requires no provider account or API key:
 
 ```bash
-"$MSQ" --data-dir "$DATA_ROOT" \
-  source setup treasury.fiscal-data --confirm
+"$MSQ" source setup treasury.fiscal-data --confirm
 ```
 
 Keep the launching terminal open while the protected temporary setup page is active. Then verify
 the local source state:
 
 ```bash
-"$MSQ" --data-dir "$DATA_ROOT" source status treasury.fiscal-data
-"$MSQ" --data-dir "$DATA_ROOT" source coverage treasury.fiscal-data
-"$MSQ" --data-dir "$DATA_ROOT" source health treasury.fiscal-data
+"$MSQ" source status treasury.fiscal-data
+"$MSQ" source coverage treasury.fiscal-data
+"$MSQ" source health treasury.fiscal-data
 ```
 
 Continue with [Source operations](docs/operations/source-operations.md) and
 [Research ingestion](docs/operations/research-ingestion.md).
+
+### Use the dashboard
+
+The permanent Obsidian Signal shell turns the service's typed operations into user-facing
+workspaces rather than exposing every raw command:
+
+- **Overview and Markets** show market state, source quality, freshness, provenance, watchlists,
+  and bounded lookup.
+- **Research, Models, Decisions, and Backtests** connect point-in-time data, forecasts, future price
+  ranges, buy/sell targets, model evidence, candidate dossiers, and historical strategy results.
+- **Portfolios, Paper Execution, and Risk** connect imported holdings and transactions to exposure,
+  performance, scenarios, orders, fills, limits, and kill-switch state.
+- **Fair Value** keeps measurement evidence, hierarchy, approvals, overrides, and audit history
+  separate from execution-quality data.
+- **Sources, MCP, Updates, Backup & Recovery, Logs, and Settings** provide guided setup and bounded
+  lifecycle controls with explicit confirmation and durable progress.
+
+Every workspace reads the one installed service. Freshness, data quality, point-in-time identity,
+limits, authority, and recovery state come from domain owners; the browser view does not invent
+completion or financial evidence.
 
 ### Explore the CLI
 
@@ -205,8 +215,7 @@ rules.
 This command captures a bounded, single-venue Coinbase Exchange diagnostic stream:
 
 ```bash
-"$MSQ" --data-dir "$DATA_ROOT" \
-  capture --products BTC-USD,ETH-USD --seconds 30
+"$MSQ" capture --products BTC-USD,ETH-USD --seconds 30
 ```
 
 Public diagnostic capture does not establish execution-quality data. Use
@@ -229,36 +238,26 @@ task-oriented guides:
 - [Model training and inference](docs/operations/model-inference.md)
 - [Portfolio and paper execution](docs/operations/portfolio-and-paper-execution.md)
 
-### Start the local MCP server
+### Connect Claude Code and Codex
+
+Guided setup is the normal integration path. It discovers each supported client and registers one
+owned user-level entry named `market-squawk`. Claude Code and Codex receive distinct credentials and
+stateless relay processes, but both use the same installed service, selected workspace, models,
+datasets, portfolios, jobs, and artifacts. Repeated setup verifies or repairs the owned entry rather
+than creating duplicate product servers.
+
+The installed compatibility diagnostics are:
 
 ```bash
-"$MSQ" --data-dir "$DATA_ROOT" mcp serve
+"$MSQ" mcp serve --client claude-code
+"$MSQ" mcp serve --client codex
 ```
 
-Generic MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "market-squawk": {
-      "command": "/absolute/path/to/market-squawk",
-      "args": [
-        "--data-dir",
-        "/absolute/path/to/market-squawk-data",
-        "mcp",
-        "serve"
-      ]
-    }
-  }
-}
-```
-
-The server communicates over local stdio. Protocol responses use stdout and operational logs use
-stderr. The desktop's guided setup generates the corresponding client JSON from installed,
-required workspace identity state; it does not start the server or configure a client. Advanced
-policy supplied only through environment variables must also be supplied to the MCP client. See the
-[MCP reference](docs/reference/mcp.md) for tool domains, schemas, limits, audit behavior, controlled
-artifacts, and client integration.
+Each command starts a named stdio relay, not another Market Squawk backend. The shared service must
+already be ready; the relay resolves its authenticated loopback `/mcp` endpoint and credential from
+installed local authorities. Do not copy tokens, ports, or generic server JSON into client settings.
+See the [MCP reference](docs/reference/mcp.md) for registration, schemas, limits, audit behavior,
+controlled artifacts, and repair.
 
 ## Documentation
 
@@ -298,20 +297,45 @@ lockfile. Crates are grouped by product responsibility:
 
 ### Build from source
 
-Source development requires Git, the repository-pinned Rust `1.97.1` toolchain, Node.js `24.18.0`,
-pnpm `10.31.0`, and the official
-[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the host platform.
+Source development requires Git, exact `just` `1.57.0`, the repository-pinned Rust `1.97.1`
+toolchain, Node.js `24.18.0`, pnpm `10.31.0`, uv `0.12.3`, and the official
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the host platform. Install
+`just` once through the already-required Rust toolchain, then use the repository-owned commands:
 
 ```bash
 git clone https://github.com/Sawmonabo/market-squawk.git
 cd market-squawk
-rustup show active-toolchain
-pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk"
+cargo install just --version 1.57.0 --locked
+just setup
+just dev
 ```
 
-Build the headless Rust application and its required helpers with:
+The repository `.nvmrc` pins Node.js `24.18.0`. Every `just` frontend command selects that version
+with `nvm` or `nvm-windows` when available and validates it in the same process that runs pnpm. When
+`nvm` is unavailable, the command proceeds only if the active Node.js version is already exact;
+`just setup` also prepares pinned pnpm `10.31.0`.
+
+`just setup` creates the verified, reusable model and training cache at
+`.market-squawk/development-model-runtime`. `just dev` validates that cache and refreshes it when
+shipping inputs have changed before starting the Tauri desktop with Vite hot reload. Its ignored
+`.market-squawk/development` workspace-data root and `.market-squawk/development-installation`
+service-authority root are separate from the installed product. The one shared development service
+may remain available after the desktop exits so the development CLI and MCP clients can reuse it.
+`just dev-web` is frontend-only diagnostic mode, not the complete product.
+
+`just setup` is safe to rerun. It preserves the managed Python environment, synchronizes the
+hash-locked dependencies, and rebuilds and installs Market Squawk's Rust-backed Python package.
+Tests that verify the signed training environment run only against the sealed installed product;
+the ordinary development suite keeps that authority boundary fail-closed.
+
+Use `just refresh-model-runtime` to rebuild the cache explicitly, `just verify-model-runtime` to
+check it without rebuilding, and `just reset-model-runtime` to remove only that reproducible cache
+after stopping the desktop and service. `just reset-dev` separately removes only the development
+workspace-data and service-authority roots.
+
+Use `just --list` to see the supported developer commands and `just doctor` to inspect the active
+tool and Tauri host-prerequisite state. For a focused headless release build, the underlying locked
+commands remain:
 
 ```bash
 CARGO_INCREMENTAL=0 cargo build --locked --release \
@@ -332,7 +356,8 @@ Before contributing:
 2. Keep provider-specific schemas in adapters and keep analytical or control-plane work outside the
    live event-to-action path.
 3. Run focused checks while developing.
-4. Run the repository gate before submitting an integration change:
+4. Use `just check`, `just test-package <crate>`, or `just test` during development.
+5. Run the repository gate before submitting an integration change:
 
 ```bash
 CARGO_INCREMENTAL=0 ./scripts/verify.sh

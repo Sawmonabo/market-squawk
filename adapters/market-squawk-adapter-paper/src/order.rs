@@ -6,8 +6,8 @@ use market_squawk_domain::{
     Timestamp,
 };
 use market_squawk_execution::{
-    DispatchOrder, ExecutionPriceBound, OrderIntentDigest, ReconciledOrder, ReconciledOrderStatus,
-    RecoveredDispatchOrder, RiskPolicyIdentity,
+    DispatchOrder, ExecutionPriceBound, OrderIntentDigest, OrderTargetReference, ReconciledOrder,
+    ReconciledOrderStatus, RecoveredDispatchOrder, RiskPolicyIdentity,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ pub(crate) struct PaperOrder {
     pub(crate) time_in_force: TimeInForce,
     pub(crate) maximum_slippage: BasisPoints,
     pub(crate) intent_digest: OrderIntentDigest,
+    pub(crate) target_reference: Option<OrderTargetReference>,
     pub(crate) reference_price: PriceTicks,
     pub(crate) execution_price_bound: ExecutionPriceBound,
     pub(crate) accepted_at: Timestamp,
@@ -70,6 +71,8 @@ pub(crate) struct PaperOrderRecoveryWire {
     time_in_force: TimeInForce,
     maximum_slippage: BasisPoints,
     intent_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_reference: Option<OrderTargetReference>,
     reference_price: PriceTicks,
     maximum_execution_price: PriceTicks,
     accepted_at: Timestamp,
@@ -95,6 +98,12 @@ pub(crate) struct PaperOrderRecoveryWire {
     risk_policy_version: RuleVersion,
     market_observed_at: Timestamp,
     valid_until: Timestamp,
+}
+
+impl PaperOrderRecoveryWire {
+    pub(crate) const fn has_target_reference(&self) -> bool {
+        self.target_reference.is_some()
+    }
 }
 
 impl PaperOrder {
@@ -129,6 +138,7 @@ impl PaperOrder {
             time_in_force: dispatch.time_in_force(),
             maximum_slippage: dispatch.maximum_slippage(),
             intent_digest,
+            target_reference: dispatch.target_reference().cloned(),
             reference_price,
             execution_price_bound,
             accepted_at: dispatch.submitted_at(),
@@ -237,6 +247,7 @@ impl PaperOrder {
             time_in_force: self.time_in_force,
             maximum_slippage: self.maximum_slippage,
             intent_digest: self.intent_digest.as_bytes(),
+            target_reference: self.target_reference.clone(),
             reference_price: self.reference_price,
             maximum_execution_price: self.execution_price_bound.maximum_price(),
             accepted_at: self.accepted_at,
@@ -321,6 +332,10 @@ impl PaperOrder {
             || wire.assessment_digest == [0; 32]
             || wire.evidence_binding_digest == [0; 32]
             || wire.portfolio_content_digest == [0; 32]
+            || wire
+                .target_reference
+                .as_ref()
+                .is_some_and(|reference| reference.validate().is_err())
             || wire.valid_until < wire.market_observed_at
             || wire.state == PaperOrderState::New
             || (matches!(wire.order_type, OrderType::Market | OrderType::Limit) && !wire.triggered)
@@ -349,6 +364,7 @@ impl PaperOrder {
             time_in_force: wire.time_in_force,
             maximum_slippage: wire.maximum_slippage,
             intent_digest: OrderIntentDigest::from_bytes(wire.intent_digest),
+            target_reference: wire.target_reference,
             reference_price: wire.reference_price,
             execution_price_bound,
             accepted_at: wire.accepted_at,
@@ -391,6 +407,9 @@ impl PaperOrder {
             self.account_id,
             self.terms.instrument_id(),
             self.intent_digest,
+            self.target_reference
+                .as_ref()
+                .map(OrderTargetReference::audit_digest),
             self.account_revision,
             self.quantity,
             self.execution_price_bound,

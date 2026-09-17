@@ -72,8 +72,8 @@ pub struct TreasuryFiscalQuery {
     filter: String,
     sort: &'static str,
     page_size: NonZeroU16,
-    first_record_date: CalendarDate,
-    last_record_date: CalendarDate,
+    first_record_date: Option<CalendarDate>,
+    last_record_date: Option<CalendarDate>,
     query_digest: [u8; 32],
 }
 
@@ -103,10 +103,40 @@ impl TreasuryFiscalQuery {
             filter,
             sort,
             page_size,
-            first_record_date,
-            last_record_date,
+            first_record_date: Some(first_record_date),
+            last_record_date: Some(last_record_date),
             query_digest,
         })
+    }
+
+    /// Requests every provider-available record without an inferred historical start or end.
+    ///
+    /// The exact page size remains bounded application policy. Only the provider's complete
+    /// one-based page chain, including its data-bearing final page, proves coverage.
+    pub fn average_interest_rates_v2_all_history(
+        page_size: NonZeroU16,
+    ) -> Result<Self, TreasuryProtocolError> {
+        if page_size.get() > 10_000 {
+            return Err(TreasuryProtocolError::InvalidQuery);
+        }
+        let profile = TreasuryDatasetProfile::AverageInterestRatesV2;
+        let fields = profile.fields();
+        let sort = AVERAGE_RATES_SORT;
+        Ok(Self {
+            profile,
+            fields,
+            filter: String::new(),
+            sort,
+            page_size,
+            first_record_date: None,
+            last_record_date: None,
+            query_digest: query_digest(profile, fields, "", sort, page_size),
+        })
+    }
+
+    /// Returns whether this query covers the complete unfiltered provider dataset.
+    pub const fn is_all_history(&self) -> bool {
+        self.first_record_date.is_none() && self.last_record_date.is_none()
     }
 
     /// Binds a one-based page number into the exact outbound request identity.
@@ -123,12 +153,17 @@ impl TreasuryFiscalQuery {
         }
         let endpoint = format!("{FISCAL_DATA_BASE}{}", self.profile.endpoint());
         let mut url = Url::parse(&endpoint).map_err(|_| TreasuryProtocolError::InvalidQuery)?;
-        url.query_pairs_mut()
-            .append_pair("fields", &self.fields.join(","))
-            .append_pair("filter", &self.filter)
-            .append_pair("sort", self.sort)
-            .append_pair("page[number]", &page_number.to_string())
-            .append_pair("page[size]", &self.page_size.get().to_string());
+        {
+            let mut parameters = url.query_pairs_mut();
+            parameters.append_pair("fields", &self.fields.join(","));
+            if !self.filter.is_empty() {
+                parameters.append_pair("filter", &self.filter);
+            }
+            parameters
+                .append_pair("sort", self.sort)
+                .append_pair("page[number]", &page_number.to_string())
+                .append_pair("page[size]", &self.page_size.get().to_string());
+        }
         let request_digest = page_request_digest(self.query_digest, page_number);
         Ok(TreasuryPageRequest {
             profile: self.profile,
@@ -177,13 +212,13 @@ impl TreasuryFiscalQuery {
         crate::source::fiscal_analytical_dataset(self)
     }
 
-    /// Returns the inclusive first record date.
-    pub const fn first_record_date(&self) -> CalendarDate {
+    /// Returns the inclusive first requested date, absent for unfiltered all history.
+    pub const fn first_record_date(&self) -> Option<CalendarDate> {
         self.first_record_date
     }
 
-    /// Returns the inclusive final record date.
-    pub const fn last_record_date(&self) -> CalendarDate {
+    /// Returns the inclusive final requested date, absent for unfiltered all history.
+    pub const fn last_record_date(&self) -> Option<CalendarDate> {
         self.last_record_date
     }
 
@@ -200,8 +235,8 @@ pub struct TreasuryPageRequest {
     url: String,
     page_number: usize,
     page_size: NonZeroU16,
-    first_record_date: CalendarDate,
-    last_record_date: CalendarDate,
+    first_record_date: Option<CalendarDate>,
+    last_record_date: Option<CalendarDate>,
     query_digest: [u8; 32],
     request_digest: [u8; 32],
 }
@@ -237,6 +272,11 @@ impl TreasuryPageRequest {
         self.request_digest
     }
 
+    /// Returns the exact canonical provider page-token fragment sent by this request.
+    pub fn page_token(&self) -> String {
+        canonical_page_token(self.page_number, self.page_size)
+    }
+
     /// Returns the response-source identity bound into the profile.
     pub const fn source_identity(&self) -> &'static str {
         self.profile.source_identity()
@@ -251,8 +291,16 @@ impl TreasuryPageRequest {
     }
 
     pub(crate) fn contains_record_date(&self, date: CalendarDate) -> bool {
-        date >= self.first_record_date && date <= self.last_record_date
+        self.first_record_date.is_none_or(|first| date >= first)
+            && self.last_record_date.is_none_or(|last| date <= last)
     }
+}
+
+pub(crate) fn canonical_page_token(page_number: usize, page_size: NonZeroU16) -> String {
+    format!(
+        "&page%5Bnumber%5D={page_number}&page%5Bsize%5D={}",
+        page_size.get()
+    )
 }
 
 fn query_digest(

@@ -61,6 +61,7 @@ fn map_local_store_error(
 
     match error {
         LocalAuthorityStateStoreError::UnsafeRoot
+        | LocalAuthorityStateStoreError::InvalidNamespace
         | LocalAuthorityStateStoreError::UnsafeFileType
         | LocalAuthorityStateStoreError::PayloadTooLarge { .. }
         | LocalAuthorityStateStoreError::EnvelopeTooLarge { .. }
@@ -115,186 +116,10 @@ enum DurableRunState {
     InUse,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderBudgetPolicyV1 {
-    scope: BudgetScope,
-    requests_per_window: NonZeroU32,
-    window_nanos: NonZeroU64,
-    max_concurrent: NonZeroU16,
-    backoff: BackoffPolicy,
-}
-
-impl ProviderBudgetPolicyV1 {
-    fn into_current(self) -> Result<ProviderBudgetPolicy, AuthorityPersistenceError> {
-        ProviderBudgetPolicy::try_new(
-            self.scope,
-            self.requests_per_window,
-            self.window_nanos,
-            self.max_concurrent,
-            self.backoff,
-        )
-        .map_err(|_| AuthorityPersistenceError::InvalidState)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedProviderBudgetPolicyV1 {
-    policy: ProviderBudgetPolicyV1,
-    endpoint_policy: EndpointPolicy,
-    authorization: crate::AuthorizationGrant,
-    resolved_subject_record: Option<SourceIdentifier>,
-}
-
-impl PersistedProviderBudgetPolicyV1 {
-    fn into_current(self) -> Result<PersistedProviderBudgetPolicy, AuthorityPersistenceError> {
-        PersistedProviderBudgetPolicy::try_new(
-            self.policy.into_current()?,
-            self.endpoint_policy,
-            self.authorization,
-            self.resolved_subject_record,
-        )
-        .map_err(|_| AuthorityPersistenceError::InvalidState)
-    }
-
-    #[cfg(test)]
-    fn try_from_current(
-        current: PersistedProviderBudgetPolicy,
-    ) -> Result<Self, AuthorityPersistenceError> {
-        serde_json::from_slice(&canonical_json_bytes(&current)?)
-            .map_err(|_| AuthorityPersistenceError::InvalidState)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BudgetCheckpointStateV1 {
-    window_started_wall: Timestamp,
-    window_ends_wall: Timestamp,
-    requests_used: u32,
-    in_flight: u16,
-    unavailable_until_wall: Option<Timestamp>,
-    disabled: bool,
-    consecutive_refusals: u32,
-    availability_generation: u64,
-    terminal: bool,
-    poisoned: bool,
-}
-
-impl BudgetCheckpointStateV1 {
-    fn into_current(self) -> BudgetCheckpointState {
-        BudgetCheckpointState {
-            windows: BoundedVec::singleton(BudgetWindowCheckpointState::Tumbling {
-                window_started_wall: self.window_started_wall,
-                window_ends_wall: self.window_ends_wall,
-                requests_used: self.requests_used,
-            }),
-            in_flight: self.in_flight,
-            unavailable_until_wall: self.unavailable_until_wall,
-            disabled: self.disabled,
-            consecutive_refusals: self.consecutive_refusals,
-            availability_generation: self.availability_generation,
-            terminal: self.terminal,
-            poisoned: self.poisoned,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct DurableBudgetGroupV1 {
-    declarations: BoundedVec<PersistedProviderBudgetPolicyV1, MAX_PROCESS_BUDGET_SCOPES>,
-    checkpoint: BudgetCheckpointStateV1,
-}
-
-impl DurableBudgetGroupV1 {
-    fn canonicalize(&mut self) -> Result<(), AuthorityPersistenceError> {
-        let mut keyed = self
-            .declarations
-            .as_slice()
-            .iter()
-            .map(|declaration| canonical_json_bytes(declaration).map(|key| (key, declaration)))
-            .collect::<Result<Vec<_>, _>>()?;
-        keyed.sort_by(|left, right| left.0.cmp(&right.0));
-        if keyed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(AuthorityPersistenceError::InvalidState);
-        }
-        self.declarations = BoundedVec::try_new(
-            keyed
-                .into_iter()
-                .map(|(_key, declaration)| declaration.clone())
-                .collect(),
-        )
-        .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
-        Ok(())
-    }
-
-    fn into_current(self) -> Result<DurableBudgetGroup, AuthorityPersistenceError> {
-        let declarations = self
-            .declarations
-            .into_vec()
-            .into_iter()
-            .map(PersistedProviderBudgetPolicyV1::into_current)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(DurableBudgetGroup {
-            declarations: BoundedVec::try_new(declarations)
-                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?,
-            checkpoint: self.checkpoint.into_current(),
-        })
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct DurableAuthorityEnvelopeV1 {
-    format_version: u16,
-    run_generation: u64,
-    run_state: DurableRunState,
-    saved_at_wall: Timestamp,
-    wall_high_water: Timestamp,
-    registry: crate::RegistryAuthorityState,
-    budgets: BoundedVec<DurableBudgetGroupV1, MAX_PROCESS_BUDGET_SCOPES>,
-}
-
-impl DurableAuthorityEnvelopeV1 {
-    fn canonicalize(&mut self) -> Result<(), AuthorityPersistenceError> {
-        if self.format_version != 1 {
-            return Err(AuthorityPersistenceError::InvalidState);
-        }
-        self.registry.canonicalize()?;
-        let mut groups = self.budgets.as_slice().to_vec();
-        for group in &mut groups {
-            group.canonicalize()?;
-        }
-        let mut keyed = groups
-            .into_iter()
-            .map(|group| canonical_json_bytes(&group).map(|key| (key, group)))
-            .collect::<Result<Vec<_>, _>>()?;
-        keyed.sort_by(|left, right| left.0.cmp(&right.0));
-        self.budgets = BoundedVec::try_new(keyed.into_iter().map(|(_key, group)| group).collect())
-            .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
-        Ok(())
-    }
-
-    fn into_current(self) -> Result<DurableAuthorityEnvelope, AuthorityPersistenceError> {
-        let budgets = self
-            .budgets
-            .into_vec()
-            .into_iter()
-            .map(DurableBudgetGroupV1::into_current)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(DurableAuthorityEnvelope {
-            format_version: DURABLE_AUTHORITY_FORMAT_VERSION,
-            run_generation: self.run_generation,
-            run_state: self.run_state,
-            saved_at_wall: self.saved_at_wall,
-            wall_high_water: self.wall_high_water,
-            registry: self.registry,
-            budgets: BoundedVec::try_new(budgets)
-                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?,
-        })
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UncleanPredecessorPolicy {
+    Reject,
+    RecoverStructurallyValidExclusiveInstalledReplacement,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -313,16 +138,6 @@ pub(crate) enum BudgetWindowCheckpointState {
 }
 
 impl BudgetWindowCheckpointState {
-    #[cfg(test)]
-    fn request_count(&self) -> Option<u32> {
-        match self {
-            Self::Tumbling { requests_used, .. } => Some(*requests_used),
-            Self::Sliding {
-                release_deadlines_wall,
-            } => u32::try_from(release_deadlines_wall.len()).ok(),
-        }
-    }
-
     fn shift_wall_anchor(&mut self, delta: i64) -> Result<(), AuthorityPersistenceError> {
         match self {
             Self::Tumbling {
@@ -389,16 +204,33 @@ impl BudgetCheckpointState {
         self.availability_generation = self.availability_generation.saturating_add(1);
     }
 
-    pub(crate) const fn in_flight(&self) -> u16 {
-        self.in_flight
+    fn recover_exclusive_installed_replacement(&mut self) -> Result<(), AuthorityPersistenceError> {
+        let terminalized_predecessor = self.terminal && self.poisoned && self.disabled;
+        if self.terminal != self.poisoned || (self.terminal && !self.disabled) {
+            return Err(AuthorityPersistenceError::InvalidState);
+        }
+        if self.in_flight == 0 && !terminalized_predecessor {
+            return Ok(());
+        }
+        self.in_flight = 0;
+        if terminalized_predecessor {
+            // A normal constructor terminalizes an unclean predecessor before rejecting it. The
+            // installation-global workspace guard proves that an exclusive replacement cannot
+            // overlap that predecessor, so the replacement may retire this exact fail-closed
+            // marker while preserving windows, request counts, deadlines, and authority history.
+            self.terminal = false;
+            self.poisoned = false;
+            self.disabled = false;
+        }
+        self.availability_generation = self
+            .availability_generation
+            .checked_add(1)
+            .ok_or(AuthorityPersistenceError::GenerationExhausted)?;
+        Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn request_count(&self, index: usize) -> Option<u32> {
-        self.windows
-            .as_slice()
-            .get(index)
-            .and_then(BudgetWindowCheckpointState::request_count)
+    pub(crate) const fn in_flight(&self) -> u16 {
+        self.in_flight
     }
 
     fn shift_wall_anchor(&mut self, delta: i64) -> Result<(), AuthorityPersistenceError> {
@@ -422,6 +254,16 @@ impl BudgetCheckpointState {
 pub(crate) struct DurableBudgetGroup {
     declarations: BoundedVec<PersistedProviderBudgetPolicy, MAX_PROCESS_BUDGET_SCOPES>,
     checkpoint: BudgetCheckpointState,
+}
+
+pub(in crate::policy) enum DurableBudgetRegistrationTarget {
+    Existing { slot: usize },
+    New { checkpoint: BudgetCheckpointState },
+}
+
+pub(in crate::policy) struct DurableBudgetRegistrationGroup {
+    pub(in crate::policy) target: DurableBudgetRegistrationTarget,
+    pub(in crate::policy) declarations: Vec<PersistedProviderBudgetPolicy>,
 }
 
 impl DurableBudgetGroup {
@@ -490,7 +332,7 @@ impl DurableBudgetGroup {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DurableAuthorityEnvelope {
+pub(crate) struct DurableAuthorityEnvelope {
     format_version: u16,
     run_generation: u64,
     run_state: DurableRunState,
@@ -498,6 +340,39 @@ struct DurableAuthorityEnvelope {
     wall_high_water: Timestamp,
     registry: crate::RegistryAuthorityState,
     budgets: BoundedVec<DurableBudgetGroup, MAX_PROCESS_BUDGET_SCOPES>,
+}
+
+pub(crate) fn deserialize_clean_restart_backup(
+    payload: &[u8],
+    now: Timestamp,
+) -> Result<DurableAuthorityEnvelope, AuthorityPersistenceError> {
+    let envelope = deserialize_canonical_envelope(payload)?;
+    envelope.validate(now)?;
+    if envelope.run_state != DurableRunState::Clean
+        || envelope
+            .budgets
+            .as_slice()
+            .iter()
+            .any(|group| group.checkpoint.in_flight() != 0)
+    {
+        return Err(AuthorityPersistenceError::InvalidState);
+    }
+    Ok(envelope)
+}
+
+pub(crate) fn serialize_clean_restart_backup(
+    envelope: &DurableAuthorityEnvelope,
+) -> Result<Vec<u8>, AuthorityPersistenceError> {
+    if envelope.run_state != DurableRunState::Clean
+        || envelope
+            .budgets
+            .as_slice()
+            .iter()
+            .any(|group| group.checkpoint.in_flight() != 0)
+    {
+        return Err(AuthorityPersistenceError::InvalidState);
+    }
+    serialize_canonical_envelope(envelope)
 }
 
 impl DurableAuthorityEnvelope {
@@ -623,10 +498,18 @@ impl AuthorityDurabilitySession {
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
-        Self::open_session(store, now).map(|session| UnpublishedAuthoritySession {
-            session,
-            finalized: false,
-        })
+        Self::open_unpublished_with_policy(store, now, UncleanPredecessorPolicy::Reject)
+    }
+
+    pub(crate) fn open_unpublished_for_exclusive_installed_replacement(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+    ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
+        Self::open_unpublished_with_policy(
+            store,
+            now,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
+        )
     }
 
     #[cfg(test)]
@@ -634,12 +517,24 @@ impl AuthorityDurabilitySession {
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<Arc<Self>, AuthorityPersistenceError> {
-        Self::open_session(store, now)
+        Self::open_session(store, now, UncleanPredecessorPolicy::Reject)
+    }
+
+    fn open_unpublished_with_policy(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+        policy: UncleanPredecessorPolicy,
+    ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
+        Self::open_session(store, now, policy).map(|session| UnpublishedAuthoritySession {
+            session,
+            finalized: false,
+        })
     }
 
     fn open_session(
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
+        policy: UncleanPredecessorPolicy,
     ) -> Result<Arc<Self>, AuthorityPersistenceError> {
         let mut envelope = match store.load().map_err(|_| AuthorityPersistenceError::Store)? {
             Some(bytes) => {
@@ -649,11 +544,22 @@ impl AuthorityDurabilitySession {
             }
             None => DurableAuthorityEnvelope::empty(now),
         };
-        let recovered_unclean = envelope.run_state == DurableRunState::InUse;
+        let predecessor_was_unclean = envelope.run_state == DurableRunState::InUse;
+        let recover_exclusive_installed_replacement = predecessor_was_unclean
+            && policy
+                == UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement;
+        let recovered_unclean = predecessor_was_unclean && !recover_exclusive_installed_replacement;
         if recovered_unclean {
             let mut groups = envelope.budgets.as_slice().to_vec();
             for group in &mut groups {
                 group.checkpoint.terminalize_unclean();
+            }
+            envelope.budgets = BoundedVec::try_new(groups)
+                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        } else if recover_exclusive_installed_replacement {
+            let mut groups = envelope.budgets.as_slice().to_vec();
+            for group in &mut groups {
+                group.checkpoint.recover_exclusive_installed_replacement()?;
             }
             envelope.budgets = BoundedVec::try_new(groups)
                 .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
@@ -773,6 +679,65 @@ impl AuthorityDurabilitySession {
         })
     }
 
+    pub(in crate::policy) fn register_budget_batch(
+        self: &Arc<Self>,
+        registry: crate::RegistryAuthorityState,
+        groups: &[DurableBudgetRegistrationGroup],
+        wall: Timestamp,
+    ) -> Result<Box<[usize]>, AuthorityPersistenceError> {
+        if groups.is_empty() || groups.len() > MAX_PROCESS_BUDGET_SCOPES {
+            return Err(AuthorityPersistenceError::InvalidState);
+        }
+        let mut assigned = Vec::new();
+        assigned
+            .try_reserve_exact(groups.len())
+            .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        self.transact(wall, |envelope, wall_adjustment| {
+            let mut budgets = envelope.budgets.as_slice().to_vec();
+            for group in groups {
+                let (first, remaining) = group
+                    .declarations
+                    .split_first()
+                    .ok_or(AuthorityPersistenceError::InvalidState)?;
+                let slot = match &group.target {
+                    DurableBudgetRegistrationTarget::Existing { slot } => {
+                        if assigned.contains(slot) {
+                            return Err(AuthorityPersistenceError::InvalidState);
+                        }
+                        let retained = budgets
+                            .get_mut(*slot)
+                            .ok_or(AuthorityPersistenceError::InvalidState)?;
+                        retained.add_declaration(first.clone())?;
+                        for declaration in remaining {
+                            retained.add_declaration(declaration.clone())?;
+                        }
+                        *slot
+                    }
+                    DurableBudgetRegistrationTarget::New { checkpoint } => {
+                        if budgets.len() == MAX_PROCESS_BUDGET_SCOPES {
+                            return Err(AuthorityPersistenceError::StateTooLarge);
+                        }
+                        let slot = budgets.len();
+                        let mut anchored = checkpoint.clone();
+                        anchored.shift_wall_anchor(wall_adjustment)?;
+                        let mut retained = DurableBudgetGroup::try_new(first.clone(), anchored)?;
+                        for declaration in remaining {
+                            retained.add_declaration(declaration.clone())?;
+                        }
+                        budgets.push(retained);
+                        slot
+                    }
+                };
+                assigned.push(slot);
+            }
+            envelope.budgets = BoundedVec::try_new(budgets)
+                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+            envelope.registry = registry;
+            Ok(())
+        })?;
+        Ok(assigned.into_boxed_slice())
+    }
+
     #[cfg(test)]
     pub(crate) fn update_budget(
         self: &Arc<Self>,
@@ -824,6 +789,33 @@ impl AuthorityDurabilitySession {
             envelope.registry = registry;
             Ok(())
         })
+    }
+
+    pub(crate) fn export_clean_restart_backup(
+        self: &Arc<Self>,
+        proof: CleanShutdownProof,
+        registry: crate::RegistryAuthorityState,
+        wall: Timestamp,
+    ) -> Result<Vec<u8>, AuthorityPersistenceError> {
+        if !proof.belongs_to(self) || !self.is_available() {
+            proof.invalidate_bound_session();
+            self.invalidate();
+            return Err(AuthorityPersistenceError::SessionUnavailable);
+        }
+        let mut envelope = self
+            .envelope
+            .lock()
+            .map_err(|_| self.fail(AuthorityPersistenceError::SessionUnavailable))?
+            .clone();
+        if wall < envelope.wall_high_water {
+            return Err(AuthorityPersistenceError::WallRollback);
+        }
+        envelope.run_state = DurableRunState::Clean;
+        envelope.saved_at_wall = wall;
+        envelope.wall_high_water = wall;
+        envelope.registry = registry;
+        envelope.validate(wall)?;
+        serialize_clean_restart_backup(&envelope)
     }
 
     pub(crate) fn close_clean(
@@ -1018,50 +1010,20 @@ fn serialize_canonical_envelope(
     Ok(payload)
 }
 
-fn serialize_canonical_envelope_v1(
-    envelope: &DurableAuthorityEnvelopeV1,
-) -> Result<Vec<u8>, AuthorityPersistenceError> {
-    let mut canonical = envelope.clone();
-    canonical.canonicalize()?;
-    let payload = canonical_json_bytes(&canonical)?;
-    if payload.len() > MAX_DURABLE_AUTHORITY_STATE_BYTES {
-        return Err(AuthorityPersistenceError::StateTooLarge);
-    }
-    Ok(payload)
-}
-
-#[derive(Deserialize)]
-struct AuthorityFormatHeader {
-    format_version: u16,
-}
-
 fn deserialize_canonical_envelope(
     payload: &[u8],
 ) -> Result<DurableAuthorityEnvelope, AuthorityPersistenceError> {
     if payload.len() > MAX_DURABLE_AUTHORITY_STATE_BYTES {
         return Err(AuthorityPersistenceError::StateTooLarge);
     }
-    let header: AuthorityFormatHeader =
+    let envelope: DurableAuthorityEnvelope =
         serde_json::from_slice(payload).map_err(|_| AuthorityPersistenceError::InvalidState)?;
-    match header.format_version {
-        DURABLE_AUTHORITY_FORMAT_VERSION => {
-            let envelope: DurableAuthorityEnvelope = serde_json::from_slice(payload)
-                .map_err(|_| AuthorityPersistenceError::InvalidState)?;
-            if serialize_canonical_envelope(&envelope)? != payload {
-                return Err(AuthorityPersistenceError::InvalidState);
-            }
-            Ok(envelope)
-        }
-        1 => {
-            let envelope: DurableAuthorityEnvelopeV1 = serde_json::from_slice(payload)
-                .map_err(|_| AuthorityPersistenceError::InvalidState)?;
-            if serialize_canonical_envelope_v1(&envelope)? != payload {
-                return Err(AuthorityPersistenceError::InvalidState);
-            }
-            envelope.into_current()
-        }
-        _ => Err(AuthorityPersistenceError::InvalidState),
+    if envelope.format_version != DURABLE_AUTHORITY_FORMAT_VERSION
+        || serialize_canonical_envelope(&envelope)? != payload
+    {
+        return Err(AuthorityPersistenceError::InvalidState);
     }
+    Ok(envelope)
 }
 
 include!("persistence/tests.rs");

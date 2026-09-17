@@ -5,74 +5,93 @@ mod ephemeral;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
-use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata};
-use market_squawk_adapter_fred::{
-    CURRENT_FRED_RIGHTS_ARTIFACT_SHA256, CURRENT_UNRATE_RIGHTS_ARTIFACT_SHA256, FredOperation,
-    FredRightsArtifact, FredRightsPolicy, FredSeriesRightsEvidence, FredSeriesRightsGrant,
-    FredServicePermissionChannel, FredServicePermissionEvidence, FredServicePermissionReview,
-    FredTermsDocumentBytes, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
-    MAX_FRED_TERMS_DOCUMENT_BYTES, Sha256Digest, fred_series_endpoint_rule,
+use market_squawk_adapter_bls::{
+    BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata, bls_application_provider_budget,
 };
+use market_squawk_adapter_eia::{EiaParseLimits, EiaTransportLimits, eia_api_endpoint_rules};
+use market_squawk_adapter_federal_reserve::{
+    BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
+    BoardDatasetProfile,
+};
+use market_squawk_adapter_files::{ExtractionLimits, ExtractionLimitsInput};
+use market_squawk_adapter_fred::{
+    FredSource, fred_observations_endpoint_rule, fred_release_observations_v2_endpoint_rule,
+    fred_series_endpoint_rule, fred_vintage_dates_endpoint_rule,
+};
+use market_squawk_adapter_schwab::OAuthLoopbackError;
 use market_squawk_adapter_sec::{
     RawEvidenceStore, SecParserLimits, SecRepresentationLimits, SecRepresentationRegistry,
 };
-use market_squawk_adapter_treasury::{TreasuryFiscalQuery, TreasurySourceConfig};
+use market_squawk_adapter_tiingo::tiingo_provider_rate_declaration;
+use market_squawk_adapter_treasury::{
+    TreasuryDailyRateFamily, TreasuryFiscalQuery, TreasurySourceConfig, TreasurySurface,
+};
+use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
+use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{
-    AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
+    AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     InstrumentId, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityLocator,
     ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
     ProviderInstrumentId, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability,
     SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_platform::{
-    BoundedInput, LocalPaths, LocalSecretStoreError, UserAuthorizedInputRoot,
-};
+use market_squawk_platform::{LocalPaths, LocalSecretStoreError};
+use market_squawk_services::{JsonStructureLimits, RequestContext, RequestId, ServiceLimits};
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    BudgetWindowSemantics, CoverageDomain, EndpointPolicy, FRED_ALFRED_API_SURFACE_ID,
-    FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy, PathScope,
-    ProviderBudgetPolicy, ProviderBudgetWindow, ProviderRateDeclaration, QueryParameterRule,
-    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile,
+    BudgetWindowSemantics, CoverageDomain, CoverageTopology, EndpointPolicy,
+    FRED_ALFRED_API_SURFACE_ID, FreshnessPolicy, HistoricalCapability, HttpRequestBounds,
+    InstrumentCoverage, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderCapabilityRevision, ProviderRateDeclaration, QueryParameterRule, QuerySensitivity,
+    SEC_EDGAR_AUTHORITY, SEC_EDGAR_PROFILE_ID, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile, built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::application::ResearchProviderRuntimeGeneration;
-use crate::provider_activation::{
-    CommittedProviderAdapterReplacement, PreparedProviderAdapterReplacement,
+use crate::application::{
+    ResearchApplicationServices, ResearchProviderRuntimeGeneration, TreasuryApplicationClosure,
 };
+use crate::provider_activation::eia_configuration::{
+    electricity_price_profile, electricity_price_query,
+};
+use crate::provider_activation::{
+    BoardAdapterActivation, CommittedProviderAdapterReplacement,
+    ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
+    TiingoAdapterActivation, YahooAdapterActivation,
+};
+use crate::provider_onboarding::SecCikInput;
 use crate::provider_onboarding::{
-    AcquiredFredTermsDocument, FredPortalEvidenceInput, FredPortalGrantInput,
-    FredPortalServiceEvidenceInput, FredPortalServicePermissionChannelInput,
-    FredPortalServicePermissionInput, FredPortalServiceReviewInput, SecCikInput,
+    SchwabMarketDoctorRunPreparation, SchwabMarketDoctorRuntimeCoordinator,
+    SchwabMarketDoctorRuntimeTerminal, SchwabOAuthBrowserError, SchwabOAuthLifecycleAction,
+    SchwabOAuthLifecycleView, SchwabOAuthMarketAuthority, SchwabOAuthRuntime,
+    SchwabOAuthRuntimeError,
 };
 use crate::{
-    BlsAdapterActivation, FredAdapterActivation, ProviderActivationLease,
+    BlsAdapterActivation, EiaAdapterActivation, FredAdapterActivation, ProviderActivationLease,
     ProviderActivationOutcome, ProviderAdapterActivation, ProviderAdapterActivationError,
     ProviderAdapterActivationRequest, ProviderOnboardingError, ProviderOnboardingService,
     ProviderPortalActivationAuthority, ProviderPortalActivationError,
     ProviderPortalActivationRequest, ProviderPortalActivationView, SecAdapterActivation,
-    TreasuryAdapterActivation,
+    StartOnboardingRequest, TreasuryAdapterActivation,
 };
 
 use super::LocalProduct;
@@ -81,20 +100,15 @@ use super::provider_activation_state::{
     DurableProviderActivationState, RESTORABLE_RESEARCH_SURFACES, SERIALIZED_RESEARCH_SURFACES,
 };
 
-const LEGACY_REQUEST_SCHEMA_VERSION: u16 = 2;
-const PREVIOUS_REQUEST_SCHEMA_VERSION: u16 = 3;
-const REQUEST_SCHEMA_VERSION: u16 = 4;
+const REQUEST_SCHEMA_VERSION: u16 = 6;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
+const SCHWAB_MARKET_DOCTOR_DURATION: Duration = Duration::from_secs(5 * 60);
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
-const FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES: u64 = 256 * 1024;
-const FRED_AUTHORIZATION_MAXIMUM_BYTES: u64 = 256 * 1024;
 const MAXIMUM_SEC_IDENTITIES: usize = 16;
 const MAXIMUM_BLS_SERIES: usize = 1_000;
-const FRED_CAPABILITY_REVISION: u64 = 4;
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
-const SEC_SURFACE: &str = "sec.edgar-public";
 const SEC_IDENTITY_NAMESPACE_V1: &str =
     "https://market-squawk.local/identity/sec-cik-instrument/v1";
 const BLS_PUBLIC_SURFACE: &str = "bls.v1-unregistered";
@@ -105,26 +119,13 @@ const KRAKEN_PUBLIC_SURFACE: &str = "kraken.spot-public-market-data";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = FRED_ALFRED_API_SURFACE_ID;
-const FRED_RIGHTS_MANIFEST_BYTES: &[u8] =
-    include_bytes!("../../../../docs/verification/fred-rights-decision.json");
-const FRED_UNRATE_RIGHTS_BYTES: &[u8] =
-    include_bytes!("../../../../docs/verification/fred-unrate-public-domain-rights.json");
-const FRED_SERIES_OPERATIONS: [FredOperation; 5] = [
-    FredOperation::Display,
-    FredOperation::Persist,
-    FredOperation::Cache,
-    FredOperation::Archive,
-    FredOperation::Train,
-];
-const FRED_SERVICE_OPERATIONS: [FredOperation; 4] = [
-    FredOperation::Persist,
-    FredOperation::Cache,
-    FredOperation::Archive,
-    FredOperation::Train,
-];
-const FRED_SERVICE_PERMISSION_ISSUER: &str = "federal-reserve-bank-of-st-louis";
-const FRED_SERVICE_PERMISSION_APPLICATION: &str = "market-squawk";
-const FRED_SERVICE_PERMISSION_SERVICE: &str = "fred-api";
+const FEDERAL_RESERVE_BOARD_SURFACE: &str = "federal-reserve-board.data-download-program";
+const YAHOO_SURFACE: &str = "yahoo-finance.experimental-enrichment";
+const TIINGO_SURFACE: &str = "tiingo.starter-eod-nav";
+const TIINGO_SOURCE_ID: &str = "tiingo-starter";
+const LOCAL_FILES_SURFACE: &str = "local.files";
+const FRED_UNRATE_DASHBOARD_PROVIDER_DATASET: &str =
+    "fred:series-observations:UNRATE:1776-07-04:9999-12-31";
 const PORTAL_SOURCE_SURFACES: [&str; 3] = [
     COINBASE_PUBLIC_SURFACE,
     COINBASE_DIRECT_SURFACE,
@@ -133,12 +134,44 @@ const PORTAL_SOURCE_SURFACES: [&str; 3] = [
 
 /// Shared application authority behind local portal adapter activation and durable restart.
 #[derive(Clone)]
-pub(super) struct ProviderResearchActivationService {
+pub(crate) struct ProviderResearchActivationService {
     paths: LocalPaths,
     onboarding: Arc<ProviderOnboardingService>,
     activation: Arc<ProviderAdapterActivation>,
     state: DurableProviderActivationState,
     tasks: Arc<ProviderActivationTaskAuthority>,
+    treasury_publication: Arc<OnceLock<TreasuryPublicationRuntime>>,
+    schwab_doctor_tasks: Arc<SchwabMarketDoctorTaskAuthority>,
+    schwab_oauth_lifecycle: Arc<SchwabOAuthServiceLifecycle>,
+    schwab_oauth: Arc<OnceCell<Arc<SchwabOAuthRuntime>>>,
+    schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
+    schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
+}
+
+enum ResearchSetupInput {
+    Selected(ProviderPortalActivationRequest),
+    Saved { surface: String },
+}
+
+struct TreasuryPublicationRuntime {
+    closure: Arc<TreasuryApplicationClosure>,
+    domains: Weak<ResearchApplicationServices>,
+}
+
+pub(crate) type SchwabOAuthRuntimeFactory = Arc<
+    dyn Fn() -> Result<Arc<SchwabOAuthRuntime>, SchwabOAuthRuntimeInitializationError>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SchwabOAuthRuntimeInitializationError {
+    #[error("the installation callback identity is unavailable")]
+    Installation,
+    #[error("the Schwab OAuth runtime configuration is unavailable")]
+    Configuration,
+    #[error("the Schwab OAuth runtime could not be constructed")]
+    Runtime,
 }
 
 impl ProviderResearchActivationService {
@@ -147,6 +180,8 @@ impl ProviderResearchActivationService {
         onboarding: Arc<ProviderOnboardingService>,
         activation: Arc<ProviderAdapterActivation>,
         state: DurableProviderActivationState,
+        schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
+        schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
     ) -> Self {
         Self {
             paths,
@@ -154,7 +189,237 @@ impl ProviderResearchActivationService {
             activation,
             state,
             tasks: Arc::new(ProviderActivationTaskAuthority::new()),
+            treasury_publication: Arc::new(OnceLock::new()),
+            schwab_doctor_tasks: Arc::new(SchwabMarketDoctorTaskAuthority::new()),
+            schwab_oauth_lifecycle: Arc::new(SchwabOAuthServiceLifecycle::new()),
+            schwab_oauth: Arc::new(OnceCell::new()),
+            schwab_oauth_factory,
+            schwab_doctor,
         }
+    }
+
+    pub(super) fn bind_treasury_publication(
+        &self,
+        closure: Arc<TreasuryApplicationClosure>,
+        domains: &Arc<ResearchApplicationServices>,
+    ) -> Result<(), CliProviderActivationError> {
+        self.treasury_publication
+            .set(TreasuryPublicationRuntime {
+                closure,
+                domains: Arc::downgrade(domains),
+            })
+            .map_err(|_| CliProviderActivationError::StateUnavailable)
+    }
+
+    fn prepare_treasury_publication(
+        &self,
+        surface_id: &str,
+    ) -> Result<bool, CliProviderActivationError> {
+        let surface = match surface_id {
+            TREASURY_FISCAL_SURFACE => TreasurySurface::FiscalData,
+            TREASURY_XML_SURFACE => TreasurySurface::DailyRatesXml,
+            _ => return Ok(false),
+        };
+        self.tasks.require_admission()?;
+        let domains = self
+            .treasury_publication
+            .get()
+            .and_then(|runtime| runtime.domains.upgrade())
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        match surface {
+            TreasurySurface::FiscalData => domains.configure_treasury_fiscal_unavailable(),
+            TreasurySurface::DailyRatesXml => domains.configure_treasury_daily_unavailable(),
+        }
+        .map_err(|error| CliProviderActivationError::TreasuryPublication(Box::new(error)))?;
+        Ok(true)
+    }
+
+    pub(super) async fn publish_treasury_for_startup(
+        &self,
+        surface: TreasurySurface,
+        cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        self.tasks.require_admission()?;
+        let deadline = treasury_publication_deadline()?;
+        let guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            _ = self.tasks.cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            result = tokio::time::timeout_at(
+                TokioInstant::from_std(deadline),
+                self.state.acquire_activation(surface.profile_id()),
+            ) => result
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+        };
+        // Read the desired recipe and runtime only after acquiring the fence: a replacement
+        // may have completed while this startup task waited.
+        self.publish_treasury_under_activation_guard(
+            surface.profile_id(),
+            &guard,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn publish_treasury_under_activation_guard(
+        &self,
+        surface_id: &str,
+        _guard: &tokio::sync::OwnedMutexGuard<()>,
+        deadline: Instant,
+        request_cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        let surface = match surface_id {
+            TREASURY_FISCAL_SURFACE => TreasurySurface::FiscalData,
+            TREASURY_XML_SURFACE => TreasurySurface::DailyRatesXml,
+            _ => return Ok(()),
+        };
+        self.tasks.require_admission()?;
+        let runtime = self
+            .treasury_publication
+            .get()
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        let domains = runtime
+            .domains
+            .upgrade()
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        let (provider_datasets, expected_generation) = match surface {
+            TreasurySurface::FiscalData => {
+                let (query, generation) = treasury_fiscal_release_query(&self.state)?;
+                (
+                    vec![
+                        query
+                            .dataset()
+                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+                    ],
+                    generation,
+                )
+            }
+            TreasurySurface::DailyRatesXml => {
+                treasury_daily_rate_all_history_datasets(&self.state)?
+            }
+        };
+        let configuration = super::TreasuryStartupConfiguration {
+            provider_datasets,
+            generation: super::treasury_runtime_generation(
+                &self.activation,
+                surface,
+                expected_generation,
+            )?,
+        };
+        let cancellation = self.tasks.cancellation.child_token();
+        let publication = super::publish_treasury_surface(
+            Arc::clone(&runtime.closure),
+            domains,
+            surface,
+            configuration,
+            deadline,
+            cancellation.clone(),
+        );
+        tokio::pin!(publication);
+        tokio::select! {
+            biased;
+            _ = request_cancellation.cancelled() => {
+                cancellation.cancel();
+                // Keep polling the actual publication through its blocking replay join.
+                publication.await
+            }
+            result = &mut publication => result,
+        }
+    }
+
+    /// Returns only the protected market authority from the portal-owned OAuth runtime.
+    /// Tokens and secret material never cross this installed composition boundary.
+    pub(crate) async fn schwab_market_authority(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthMarketAuthority, ProviderPortalActivationError> {
+        if cancellation.is_cancelled() || session_id.is_nil() {
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
+        let runtime = self
+            .schwab_oauth_lifecycle
+            .runtime(
+                &self.schwab_oauth,
+                self.schwab_oauth_factory.as_ref(),
+                &cancellation,
+            )
+            .await?;
+        runtime
+            .market_authority(session_id, cancellation)
+            .await
+            .map_err(map_schwab_oauth_error)
+    }
+
+    /// Publishes one exact workspace-controlled local-file bundle through the same durable
+    /// activation and replacement authority used by provider onboarding.
+    pub(crate) async fn activate_controlled_local_files(
+        &self,
+        configuration: ControlledLocalFileRequest,
+        cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        self.tasks.require_admission()?;
+        if cancellation.is_cancelled() {
+            return Err(CliProviderActivationError::Cancelled);
+        }
+        let session = self
+            .onboarding
+            .start(
+                StartOnboardingRequest::try_new(LOCAL_FILES_SURFACE, None, None)
+                    .map_err(CliProviderActivationError::Onboarding)?,
+                cancellation.child_token(),
+            )
+            .await
+            .map_err(CliProviderActivationError::Onboarding)?;
+        let session_id = session.session_id();
+        let completion = CancellationToken::new();
+        let lease = self
+            .onboarding
+            .prepare_runtime_activation_target(session_id, completion.clone())
+            .await
+            .map_err(CliProviderActivationError::Onboarding)?;
+        require_surface(&lease, ProviderSurface::Exact(LOCAL_FILES_SURFACE))?;
+        let request = ActivationRequest {
+            schema_version: REQUEST_SCHEMA_VERSION,
+            session_id,
+            provider: ProviderRequest::ControlledLocalFiles { configuration },
+        };
+        let request_bytes =
+            serde_json::to_vec(&request).map_err(|_| CliProviderActivationError::InvalidRequest)?;
+        if request_bytes.is_empty()
+            || u64::try_from(request_bytes.len())
+                .map_or(true, |length| length > REQUEST_MAXIMUM_BYTES)
+        {
+            return Err(CliProviderActivationError::InvalidRequest);
+        }
+        let evidence = LoadedActivationEvidence {
+            objects: BTreeMap::new(),
+        };
+        let activation =
+            build_research_activation(&self.paths, &lease, &request_bytes, request, &evidence)?;
+        let _activation_guard = self
+            .state
+            .acquire_activation(LOCAL_FILES_SURFACE)
+            .await
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        publish_research_activation(
+            &self.state,
+            &self.activation,
+            &self.onboarding,
+            &lease,
+            &request_bytes,
+            &evidence,
+            activation,
+            completion.clone(),
+        )
+        .await?;
+        self.onboarding
+            .reconcile_cleanup(session_id, completion)
+            .await
+            .map_err(CliProviderActivationError::Onboarding)?;
+        Ok(())
     }
 
     async fn activate_from_portal(
@@ -169,8 +434,12 @@ impl ProviderResearchActivationService {
                     .await
             }
             request => {
-                self.activate_research_from_portal(session_id, request, cancellation)
-                    .await
+                self.activate_research_from_portal(
+                    session_id,
+                    ResearchSetupInput::Selected(request),
+                    cancellation,
+                )
+                .await
             }
         }
     }
@@ -228,62 +497,83 @@ impl ProviderResearchActivationService {
     async fn activate_research_from_portal(
         &self,
         session_id: Uuid,
-        request: ProviderPortalActivationRequest,
+        request: ResearchSetupInput,
         cancellation: CancellationToken,
     ) -> Result<ProviderPortalActivationView, CliProviderActivationError> {
         self.tasks.require_admission()?;
         if cancellation.is_cancelled() {
             return Err(CliProviderActivationError::Cancelled);
         }
+        let publication_cancellation = self.tasks.cancellation.child_token();
+        let treasury_import = match &request {
+            ResearchSetupInput::Selected(ProviderPortalActivationRequest::TreasuryFiscal {
+                ..
+            }) => Some(TreasurySurface::FiscalData),
+            ResearchSetupInput::Selected(ProviderPortalActivationRequest::TreasuryDailyRates) => {
+                Some(TreasurySurface::DailyRatesXml)
+            }
+            ResearchSetupInput::Saved { surface } if surface == TREASURY_FISCAL_SURFACE => {
+                Some(TreasurySurface::FiscalData)
+            }
+            ResearchSetupInput::Saved { surface } if surface == TREASURY_XML_SURFACE => {
+                Some(TreasurySurface::DailyRatesXml)
+            }
+            _ => None,
+        }
+        .map(|surface| TreasuryImportControl {
+            key: TreasuryImportKey {
+                session_id,
+                surface,
+            },
+            cancellation: publication_cancellation.clone(),
+            admitted: Arc::new(OnceLock::new()),
+        });
+        let treasury_admitted = treasury_import
+            .as_ref()
+            .map(|control| Arc::clone(&control.admitted));
         let paths = self.paths.clone();
         let state = self.state.clone();
         let activation_authority = Arc::clone(&self.activation);
         let onboarding = Arc::clone(&self.onboarding);
-        let response = self
+        let publication_service = self.clone();
+        let (registered, registration) = oneshot::channel();
+        let mut response = self
             .tasks
-            .spawn(Box::pin(async move {
+            .spawn_with_import(Box::pin(async move {
                 let completion = CancellationToken::new();
                 let lease = onboarding
                     .prepare_runtime_activation_target(session_id, completion.clone())
                     .await
                     .map_err(CliProviderActivationError::Onboarding)?;
-                let (fred_terms, fred_https_permission) = match &request {
-                    ProviderPortalActivationRequest::FredAlfred {
-                        service_permission, ..
-                    } => {
-                        let FredPortalServicePermissionChannelInput::OfficialHttps {
-                            evidence_url,
-                            ..
-                        } = &service_permission.evidence.channel;
-                        let terms =
-                            onboarding.acquire_current_fred_terms(cancellation.child_token());
-                        let permission = onboarding.acquire_official_fred_permission_document(
-                            evidence_url,
-                            cancellation.child_token(),
-                        );
-                        let (terms, permission) = tokio::try_join!(terms, permission)
-                            .map_err(CliProviderActivationError::Onboarding)?;
-                        (Some(terms), Some(permission))
-                    }
-                    _ => (None, None),
-                };
-                let (provider, evidence) = portal_provider_request(
-                    &lease,
-                    request,
-                    fred_terms.as_ref(),
-                    fred_https_permission.as_deref(),
-                )?;
-                require_surface(&lease, provider.surface())?;
                 let surface_id = lease.surface_id().as_str().to_owned();
-                let _activation_guard = state
-                    .acquire_activation(&surface_id)
-                    .await
-                    .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-                let request = ActivationRequest {
-                    schema_version: REQUEST_SCHEMA_VERSION,
-                    session_id,
-                    provider,
+                let _activation_guard = tokio::select! {
+                    biased;
+                    _ = publication_cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                    _ = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                    _ = publication_service.tasks.cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                    result = state.acquire_activation(&surface_id) =>
+                        result.map_err(|_| CliProviderActivationError::StateUnavailable)?,
                 };
+                let (request, evidence) = match request {
+                    ResearchSetupInput::Selected(selected) => {
+                        let (provider, evidence) = portal_provider_request(&lease, selected)?;
+                        (ActivationRequest { schema_version: REQUEST_SCHEMA_VERSION, session_id, provider }, evidence)
+                    }
+                    ResearchSetupInput::Saved { surface } => {
+                        if surface != surface_id { return Err(CliProviderActivationError::SurfaceMismatch); }
+                        let DurableActivationRecipeState::Desired(recipe) = state.load_recipe_for_lifecycle(&surface_id)
+                            .map_err(|_| CliProviderActivationError::StateUnavailable)? else {
+                                return Err(CliProviderActivationError::StateUnavailable);
+                            };
+                        if recipe.session_id != session_id { return Err(CliProviderActivationError::SurfaceMismatch); }
+                        let request = decode_request(&recipe.request_bytes)?;
+                        if request.session_id != session_id { return Err(CliProviderActivationError::InvalidRequest); }
+                        let evidence = LoadedActivationEvidence::from_durable(&state, &request)?;
+                        if evidence.digests() != recipe.evidence_digests { return Err(CliProviderActivationError::InvalidRequest); }
+                        (request, evidence)
+                    }
+                };
+                require_surface(&lease, request.provider.surface())?;
                 let request_bytes = serde_json::to_vec(&request)
                     .map_err(|_error| CliProviderActivationError::InvalidRequest)?;
                 if request_bytes.is_empty()
@@ -313,16 +603,130 @@ impl ProviderResearchActivationService {
                 let active = onboarding
                     .activation_lease(session_id)
                     .map_err(CliProviderActivationError::Onboarding)?;
-                Ok(ProviderPortalActivationView::from_research_lease(
+                let view = ProviderPortalActivationView::from_research_lease(
                     active.surface_id().clone(),
                     &active,
                     provider_dataset_identifier,
-                ))
-            }))
+                );
+                if publication_service.prepare_treasury_publication(&surface_id)? {
+                    let admitted = TreasuryPublicationBinding::try_current(&publication_service, active)?;
+                    treasury_admitted.as_ref().ok_or(CliProviderActivationError::StateUnavailable)?
+                        .set(admitted).map_err(|_| CliProviderActivationError::StateUnavailable)?;
+                    // The durable user intent is committed and the actual task already has
+                    // retained custody. A short portal request owns only this acknowledgement;
+                    // application shutdown and source revocation still cancel the publication.
+                    let _registered = registered.send(view.clone().with_pending_publication());
+                    publication_service
+                        .publish_treasury_under_activation_guard(
+                            &surface_id,
+                            &_activation_guard,
+                            treasury_publication_deadline()?,
+                            publication_cancellation,
+                        )
+                        .await?;
+                }
+                Ok(view)
+            }), treasury_import)
             .await?;
-        response
-            .await
-            .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+        tokio::select! {
+            biased;
+            outcome = &mut response => outcome
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            acknowledgement = registration => match acknowledgement {
+                Ok(view) => Ok(view),
+                Err(_) => response.await
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            },
+        }
+    }
+
+    async fn resume_treasury_publication(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, CliProviderActivationError> {
+        self.tasks.require_admission()?;
+        if cancellation.is_cancelled() {
+            return Err(CliProviderActivationError::Cancelled);
+        }
+        let lease = self
+            .onboarding
+            .activation_lease(session_id)
+            .map_err(CliProviderActivationError::Onboarding)?;
+        let key = TreasuryImportKey::from_surface(session_id, lease.surface_id().as_str())
+            .ok_or(CliProviderActivationError::SurfaceMismatch)?;
+        let current = TreasuryPublicationBinding::try_current(self, lease.clone())?;
+        if self.tasks.has_pending_import(key, &current).await {
+            return Ok(ProviderPortalActivationView::from_lease(
+                lease.surface_id().clone(),
+                &lease,
+            )
+            .with_pending_publication());
+        }
+        let publication_cancellation = self.tasks.cancellation.child_token();
+        let treasury_import = TreasuryImportControl {
+            key,
+            cancellation: publication_cancellation.clone(),
+            admitted: Arc::new(OnceLock::new()),
+        };
+        let admitted = Arc::clone(&treasury_import.admitted);
+        let service = self.clone();
+        let (registered, registration) = oneshot::channel();
+        let mut response = self.tasks.spawn_with_import(Box::pin(async move {
+            let lease = service.onboarding.activation_lease(session_id)
+                .map_err(CliProviderActivationError::Onboarding)?;
+            let surface_id = lease.surface_id().as_str();
+            if !matches!(surface_id, TREASURY_FISCAL_SURFACE | TREASURY_XML_SURFACE) {
+                return Err(CliProviderActivationError::SurfaceMismatch);
+            }
+            let deadline = treasury_publication_deadline()?;
+            let guard = tokio::select! {
+                biased;
+                _ = publication_cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                _ = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                _ = service.tasks.cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+                result = tokio::time::timeout_at(TokioInstant::from_std(deadline),
+                    service.state.acquire_activation(surface_id)) => result
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            };
+            let DurableActivationRecipeState::Desired(recipe) = service.state.load_recipe(surface_id)
+                .map_err(|_| CliProviderActivationError::StateUnavailable)? else {
+                return Err(CliProviderActivationError::StateUnavailable);
+            };
+            if recipe.session_id != session_id {
+                return Err(CliProviderActivationError::StateUnavailable);
+            }
+            let runtime = service.activation.research_runtime_generation(lease.surface_id())
+                .map_err(CliProviderActivationError::Activation)?
+                .ok_or(CliProviderActivationError::StateUnavailable)?;
+            if runtime.session_id() != session_id
+                || runtime.generation_digest()
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                    != recipe.runtime_generation_digest
+            {
+                return Err(CliProviderActivationError::StateUnavailable);
+            }
+            service.prepare_treasury_publication(surface_id)?;
+            let view = ProviderPortalActivationView::from_lease(lease.surface_id().clone(), &lease);
+            admitted.set(TreasuryPublicationBinding::try_current(&service, lease.clone())?)
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+            let _registered = registered.send(view.clone().with_pending_publication());
+            service.publish_treasury_under_activation_guard(
+                surface_id, &guard, deadline, publication_cancellation,
+            ).await?;
+            Ok(view)
+        }), Some(treasury_import)).await?;
+        tokio::select! {
+            biased;
+            outcome = &mut response => outcome
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            acknowledgement = registration => match acknowledgement {
+                Ok(view) => Ok(view),
+                Err(_) => response.await
+                    .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+            },
+        }
     }
 
     async fn cancel_from_portal(
@@ -339,7 +743,10 @@ impl ProviderResearchActivationService {
             .resume(session_id)
             .map_err(CliProviderActivationError::Onboarding)?;
         let surface_id = session.surface_id().to_owned();
-        let _activation_guard = if SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
+        let cancel_import = TreasuryImportKey::from_surface(session_id, &surface_id);
+        let _activation_guard = if cancel_import.is_none()
+            && SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str())
+        {
             Some(
                 self.state
                     .acquire_activation(&surface_id)
@@ -355,57 +762,86 @@ impl ProviderResearchActivationService {
         let completion = CancellationToken::new();
         let response = self
             .tasks
-            .spawn(Box::pin(async move {
-                let _activation_guard = _activation_guard;
-                if SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
-                    let profile = SourceIdentifier::try_from(surface_id.as_str())
-                        .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?;
-                    if let Some(runtime) = activation
-                        .research_runtime_generation(&profile)
-                        .map_err(CliProviderActivationError::Activation)?
-                        .filter(|runtime| runtime.session_id() == session_id)
-                    {
-                        activation
-                            .revoke_research_runtime(&runtime)
-                            .await
-                            .map_err(CliProviderActivationError::Activation)?;
-                    }
-                    if RESTORABLE_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
-                        match state
-                            .load_recipe(&surface_id)
-                            .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+            .spawn_cancellation(
+                Box::pin(async move {
+                    // Startup publication belongs to the existing startup owner, outside this
+                    // portal slot. Exact-generation revocation cancels its source authority
+                    // before waiting for the activation fence, as Source.Stop already does.
+                    if cancel_import.is_some() {
+                        let profile = SourceIdentifier::try_from(surface_id.as_str())
+                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+                        if let Some(runtime) = activation
+                            .research_runtime_generation(&profile)
+                            .map_err(CliProviderActivationError::Activation)?
+                            .filter(|runtime| runtime.session_id() == session_id)
                         {
-                            DurableActivationRecipeState::Desired(recipe)
-                            | DurableActivationRecipeState::Staged(recipe)
-                            | DurableActivationRecipeState::Cutover(recipe)
-                                if recipe.session_id == session_id =>
-                            {
-                                if !state
-                                    .quarantine_recipe_if_current(
-                                        &surface_id,
-                                        recipe.state_digest,
-                                        DurableActivationQuarantineReason::Cancelled,
-                                    )
-                                    .map_err(|_error| {
-                                        CliProviderActivationError::StateUnavailable
-                                    })?
-                                {
-                                    return Err(CliProviderActivationError::StateUnavailable);
-                                }
-                            }
-                            DurableActivationRecipeState::Missing
-                            | DurableActivationRecipeState::Desired(_)
-                            | DurableActivationRecipeState::Staged(_)
-                            | DurableActivationRecipeState::Cutover(_)
-                            | DurableActivationRecipeState::Quarantined(_) => {}
+                            activation
+                                .revoke_research_runtime(&runtime)
+                                .await
+                                .map_err(CliProviderActivationError::Activation)?;
                         }
                     }
-                }
-                onboarding
-                    .cancel(session_id, completion)
-                    .await
-                    .map_err(CliProviderActivationError::Onboarding)
-            }))
+                    let _activation_guard = if cancel_import.is_some() {
+                        Some(
+                            state
+                                .acquire_activation(&surface_id)
+                                .await
+                                .map_err(|_| CliProviderActivationError::StateUnavailable)?,
+                        )
+                    } else {
+                        _activation_guard
+                    };
+                    if SERIALIZED_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
+                        let profile = SourceIdentifier::try_from(surface_id.as_str())
+                            .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?;
+                        if let Some(runtime) = activation
+                            .research_runtime_generation(&profile)
+                            .map_err(CliProviderActivationError::Activation)?
+                            .filter(|runtime| runtime.session_id() == session_id)
+                        {
+                            activation
+                                .revoke_research_runtime(&runtime)
+                                .await
+                                .map_err(CliProviderActivationError::Activation)?;
+                        }
+                        if RESTORABLE_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
+                            match state
+                                .load_recipe_for_lifecycle(&surface_id)
+                                .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+                            {
+                                DurableActivationRecipeState::Desired(recipe)
+                                | DurableActivationRecipeState::Staged(recipe)
+                                | DurableActivationRecipeState::Cutover(recipe)
+                                    if recipe.session_id == session_id =>
+                                {
+                                    if !state
+                                        .quarantine_recipe_if_current(
+                                            &surface_id,
+                                            recipe.state_digest,
+                                            DurableActivationQuarantineReason::Cancelled,
+                                        )
+                                        .map_err(|_error| {
+                                            CliProviderActivationError::StateUnavailable
+                                        })?
+                                    {
+                                        return Err(CliProviderActivationError::StateUnavailable);
+                                    }
+                                }
+                                DurableActivationRecipeState::Missing
+                                | DurableActivationRecipeState::Desired(_)
+                                | DurableActivationRecipeState::Staged(_)
+                                | DurableActivationRecipeState::Cutover(_)
+                                | DurableActivationRecipeState::Quarantined(_) => {}
+                            }
+                        }
+                    }
+                    onboarding
+                        .cancel(session_id, completion)
+                        .await
+                        .map_err(CliProviderActivationError::Onboarding)
+                }),
+                cancel_import,
+            )
             .await?;
         response
             .await
@@ -413,15 +849,217 @@ impl ProviderResearchActivationService {
     }
 }
 
+#[derive(Default)]
+struct SchwabOAuthServiceLifecycleState {
+    drained: bool,
+}
+
+/// Sole installed authority serializing lazy OAuth construction against application shutdown.
+///
+/// The state lock spans construction and final drain. `begin_shutdown` closes admission without
+/// waiting for that lock; an initializer that already owns it observes the closed atomic after
+/// construction, closes the new runtime immediately, and rejects the request. Final shutdown then
+/// waits for that exact initializer before discovering and draining the sole `OnceCell` runtime.
+struct SchwabOAuthServiceLifecycle {
+    accepting: AtomicBool,
+    state: AsyncMutex<SchwabOAuthServiceLifecycleState>,
+}
+
+impl SchwabOAuthServiceLifecycle {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            state: AsyncMutex::new(SchwabOAuthServiceLifecycleState::default()),
+        }
+    }
+
+    async fn runtime(
+        &self,
+        cell: &OnceCell<Arc<SchwabOAuthRuntime>>,
+        factory: Option<&SchwabOAuthRuntimeFactory>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<SchwabOAuthRuntime>, ProviderPortalActivationError> {
+        self.require_admission(cancellation)?;
+        let state = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(ProviderPortalActivationError::Cancelled);
+            }
+            state = self.state.lock() => state,
+        };
+        if state.drained {
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
+        self.require_admission(cancellation)?;
+        let factory = factory.ok_or(ProviderPortalActivationError::Unavailable)?;
+        let runtime = cell
+            .get_or_try_init(|| async { factory() })
+            .await
+            .map_err(|_error| ProviderPortalActivationError::Unavailable)?
+            .clone();
+        if !self.accepting.load(Ordering::Acquire) {
+            runtime.begin_shutdown();
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
+        drop(state);
+        Ok(runtime)
+    }
+
+    fn require_admission(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProviderPortalActivationError> {
+        if cancellation.is_cancelled() {
+            Err(ProviderPortalActivationError::Cancelled)
+        } else if self.accepting.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(ProviderPortalActivationError::Unavailable)
+        }
+    }
+
+    fn begin_shutdown(&self, runtime: Option<&Arc<SchwabOAuthRuntime>>) {
+        self.accepting.store(false, Ordering::Release);
+        if let Some(runtime) = runtime {
+            runtime.begin_shutdown();
+        }
+    }
+
+    async fn finish_shutdown(
+        &self,
+        cell: &OnceCell<Arc<SchwabOAuthRuntime>>,
+        deadline: Instant,
+    ) -> Result<(), ProviderPortalActivationError> {
+        self.begin_shutdown(cell.get());
+        let deadline_at = TokioInstant::from_std(deadline);
+        let mut state = tokio::time::timeout_at(deadline_at, self.state.lock())
+            .await
+            .map_err(|_elapsed| ProviderPortalActivationError::StateUnavailable)?;
+        if state.drained {
+            return Ok(());
+        }
+        if let Some(runtime) = cell.get() {
+            runtime.begin_shutdown();
+            runtime
+                .finish_shutdown(deadline)
+                .await
+                .map_err(map_schwab_oauth_error)?;
+        }
+        state.drained = true;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TreasuryImportKey {
+    session_id: Uuid,
+    surface: TreasurySurface,
+}
+
+impl TreasuryImportKey {
+    fn from_surface(session_id: Uuid, surface_id: &str) -> Option<Self> {
+        let surface = match surface_id {
+            TREASURY_FISCAL_SURFACE => TreasurySurface::FiscalData,
+            TREASURY_XML_SURFACE => TreasurySurface::DailyRatesXml,
+            _ => return None,
+        };
+        Some(Self {
+            session_id,
+            surface,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct TreasuryImportControl {
+    key: TreasuryImportKey,
+    cancellation: CancellationToken,
+    admitted: Arc<OnceLock<TreasuryPublicationBinding>>,
+}
+
+/// Exact authority populated only after the source and durable recipe are registered.
+struct TreasuryPublicationBinding {
+    lease: ProviderActivationLease,
+    runtime_generation_digest: EvidenceDigest,
+    recipe_state_digest: EvidenceDigest,
+}
+
+impl TreasuryPublicationBinding {
+    fn try_current(
+        service: &ProviderResearchActivationService,
+        lease: ProviderActivationLease,
+    ) -> Result<Self, CliProviderActivationError> {
+        let surface = lease.surface_id();
+        if TreasuryImportKey::from_surface(lease.session_id(), surface.as_str()).is_none() {
+            return Err(CliProviderActivationError::SurfaceMismatch);
+        }
+        let DurableActivationRecipeState::Desired(recipe) = service
+            .state
+            .load_recipe(surface.as_str())
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?
+        else {
+            return Err(CliProviderActivationError::StateUnavailable);
+        };
+        let runtime = service
+            .activation
+            .research_runtime_generation(surface)
+            .map_err(CliProviderActivationError::Activation)?
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        let runtime_generation_digest = runtime_generation_digest(&runtime)?;
+        if recipe.session_id != lease.session_id()
+            || runtime.session_id() != lease.session_id()
+            || runtime.profile() != surface
+            || runtime.capability_revision() != lease.capability_revision()
+            || runtime.capability_digest() != lease.capability_digest()
+            || runtime.credential_generation() != lease.generation()
+            || runtime.secret_reference() != lease.secret_reference()
+            || runtime.authority_effective_at() != lease.authority_effective_at()
+            || runtime.parent_rights_authorization_evidence() != lease.rights_decision_digest()
+            || runtime_generation_digest != recipe.runtime_generation_digest
+            || service
+                .state
+                .current_state_digest(surface.as_str())
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                != Some(recipe.state_digest)
+        {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        Ok(Self {
+            lease,
+            runtime_generation_digest,
+            recipe_state_digest: recipe.state_digest,
+        })
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        self.lease.same_authority_as(&current.lease)
+            && self.runtime_generation_digest == current.runtime_generation_digest
+            && self.recipe_state_digest == current.recipe_state_digest
+    }
+}
+
+struct RetainedProviderActivationTask {
+    task: JoinHandle<Result<(), CliProviderActivationError>>,
+    treasury_import: Option<TreasuryImportControl>,
+}
+
+impl RetainedProviderActivationTask {
+    fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
 struct ProviderActivationTaskAuthority {
     accepting: AtomicBool,
-    task: AsyncMutex<Option<JoinHandle<()>>>,
+    cancellation: CancellationToken,
+    task: AsyncMutex<Option<RetainedProviderActivationTask>>,
 }
 
 impl ProviderActivationTaskAuthority {
     fn new() -> Self {
         Self {
             accepting: AtomicBool::new(true),
+            cancellation: CancellationToken::new(),
             task: AsyncMutex::new(None),
         }
     }
@@ -435,34 +1073,132 @@ impl ProviderActivationTaskAuthority {
     }
 
     async fn spawn<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
+    where
+        T: Send + 'static,
+    {
+        self.spawn_owned(work, None, None).await
+    }
+
+    async fn has_pending_import(
         &self,
-        work: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
-    ) -> Result<oneshot::Receiver<T>, CliProviderActivationError>
+        key: TreasuryImportKey,
+        current: &TreasuryPublicationBinding,
+    ) -> bool {
+        self.task.lock().await.as_ref().is_some_and(|task| {
+            !task.is_finished()
+                && task.treasury_import.as_ref().is_some_and(|import| {
+                    import.key == key
+                        && import
+                            .admitted
+                            .get()
+                            .is_some_and(|admitted| admitted.matches(current))
+                })
+        })
+    }
+
+    async fn spawn_with_import<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+        treasury_import: Option<TreasuryImportControl>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
+    where
+        T: Send + 'static,
+    {
+        self.spawn_owned(work, treasury_import, None).await
+    }
+
+    async fn spawn_cancellation<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+        cancel_import: Option<TreasuryImportKey>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
+    where
+        T: Send + 'static,
+    {
+        self.spawn_owned(work, None, cancel_import).await
+    }
+
+    async fn spawn_owned<T>(
+        self: &Arc<Self>,
+        work: Pin<Box<dyn Future<Output = Result<T, CliProviderActivationError>> + Send + 'static>>,
+        treasury_import: Option<TreasuryImportControl>,
+        cancel_import: Option<TreasuryImportKey>,
+    ) -> Result<oneshot::Receiver<Result<T, CliProviderActivationError>>, CliProviderActivationError>
     where
         T: Send + 'static,
     {
         self.require_admission()?;
         let mut task = self.task.lock().await;
-        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+        let matching_import = task
+            .as_ref()
+            .and_then(|task| task.treasury_import.as_ref())
+            .is_some_and(|import| Some(import.key) == cancel_import);
+        if matching_import {
+            // Signal only this exact Treasury session/surface before its activation fence.
+            if let Some(import) = task.as_ref().and_then(|task| task.treasury_import.as_ref()) {
+                import.cancellation.cancel();
+            }
+        } else if task.as_ref().is_some_and(|task| !task.is_finished()) {
             return Err(CliProviderActivationError::StateUnavailable);
         }
-        if let Some(previous) = task.take() {
-            previous
-                .await
-                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        }
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(CliProviderActivationError::StateUnavailable);
-        }
+        self.require_admission()?;
         let (sender, receiver) = oneshot::channel();
-        *task = Some(tokio::spawn(async move {
-            let _response_waiter = sender.send(work.await);
-        }));
+        let retained_owner = Arc::clone(self);
+        // Transfer the original handle directly into the retained successor before any
+        // further await. Dropping the HTTP waiter cannot lose the admitted cancellation
+        // cleanup, the predecessor's actual join, or its original failure.
+        let predecessor = task.take();
+        *task = Some(RetainedProviderActivationTask {
+            treasury_import,
+            task: tokio::spawn(async move {
+                let mut publication_failure = None;
+                if let Some(mut previous) = predecessor {
+                    let outcome = (&mut previous.task)
+                        .await
+                        .map_err(|_| CliProviderActivationError::StateUnavailable);
+                    let failure = match outcome {
+                        Ok(Err(error)) | Err(error) => Some(error),
+                        Ok(Ok(())) => None,
+                    };
+                    if let Some(error) = failure {
+                        if matching_import && !error.is_cancellation() {
+                            publication_failure = Some(error);
+                        } else if !error.is_cancellation() {
+                            tracing::warn!(error = ?error, "previous provider activation/publication failed");
+                        }
+                    }
+                }
+                let cleanup = work.await;
+                let outcome = match (publication_failure, cleanup) {
+                    (None, outcome) => outcome,
+                    (Some(publication), Ok(_)) => Err(publication),
+                    (Some(publication), Err(cleanup)) => {
+                        Err(CliProviderActivationError::CancellationCleanup {
+                            publication: Box::new(publication),
+                            cleanup: Box::new(cleanup),
+                        })
+                    }
+                };
+                if let Err(error) = &outcome {
+                    tracing::warn!(error = ?error, "provider activation/publication failed");
+                }
+                let retained_outcome = match sender.send(outcome) {
+                    Ok(()) | Err(Ok(_)) => Ok(()),
+                    Err(Err(error)) => Err(error),
+                };
+                drop(retained_owner);
+                retained_outcome
+            }),
+        });
         Ok(receiver)
     }
 
     fn begin_shutdown(&self) {
         self.accepting.store(false, Ordering::Release);
+        self.cancellation.cancel();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), CliProviderActivationError> {
@@ -471,19 +1207,140 @@ impl ProviderActivationTaskAuthority {
         let mut slot = tokio::time::timeout_at(deadline, self.task.lock())
             .await
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        let Some(mut task) = slot.take() else {
+        let Some(task) = slot.as_mut() else {
             return Ok(());
         };
-        drop(slot);
-        match tokio::time::timeout_at(deadline, &mut task).await {
+        // Poll in the authority's slot. Cancelling this shutdown waiter cannot detach the
+        // activation or the blocking replay it is still draining.
+        let outcome = tokio::time::timeout_at(deadline, &mut task.task)
+            .await
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        *slot = None;
+        match outcome.map_err(|_| CliProviderActivationError::StateUnavailable)? {
+            Err(error) if error.is_cancellation() => Ok(()),
+            outcome => outcome,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SchwabMarketDoctorTaskKey {
+    session_id: Uuid,
+    access_token_generation: u64,
+}
+
+struct RetainedSchwabMarketDoctorTask {
+    key: SchwabMarketDoctorTaskKey,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+/// One application-owned supervisor for immediate and delayed Schwab doctor work.
+///
+/// The retained key coalesces repeated Connections requests for the same exact OAuth generation.
+/// A replacement generation cancels and joins its predecessor before it can start, while unlink
+/// and shutdown retain the same drain authority.
+struct SchwabMarketDoctorTaskAuthority {
+    accepting: AtomicBool,
+    shutdown: CancellationToken,
+    task: AsyncMutex<Option<RetainedSchwabMarketDoctorTask>>,
+}
+
+impl SchwabMarketDoctorTaskAuthority {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            shutdown: CancellationToken::new(),
+            task: AsyncMutex::new(None),
+        }
+    }
+
+    async fn schedule<F, Fut>(
+        &self,
+        key: SchwabMarketDoctorTaskKey,
+        work: F,
+    ) -> Result<(), CliProviderActivationError>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if !self.accepting.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        let mut slot = self.task.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|retained| retained.key == key && !retained.task.is_finished())
+        {
+            return Ok(());
+        }
+        if let Some(predecessor) = slot.take() {
+            if !predecessor.task.is_finished() {
+                predecessor.cancellation.cancel();
+            }
+            predecessor
+                .task
+                .await
+                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+        }
+        if !self.accepting.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        let cancellation = self.shutdown.child_token();
+        let task_cancellation = cancellation.clone();
+        *slot = Some(RetainedSchwabMarketDoctorTask {
+            key,
+            cancellation,
+            task: tokio::spawn(work(task_cancellation)),
+        });
+        Ok(())
+    }
+
+    async fn cancel_session(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        let mut slot = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            slot = self.task.lock() => slot,
+        };
+        let Some(retained) = slot.as_mut() else {
+            return Ok(());
+        };
+        if retained.key.session_id != session_id {
+            return Ok(());
+        }
+        retained.cancellation.cancel();
+        let joined = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            joined = &mut retained.task => joined,
+        };
+        drop(slot.take());
+        joined.map_err(|_error| CliProviderActivationError::StateUnavailable)
+    }
+
+    fn begin_shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.shutdown.cancel();
+    }
+
+    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), CliProviderActivationError> {
+        self.begin_shutdown();
+        let deadline = TokioInstant::from_std(deadline);
+        let mut slot = tokio::time::timeout_at(deadline, self.task.lock())
+            .await
+            .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+        let Some(mut retained) = slot.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout_at(deadline, &mut retained.task).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_error)) => Err(CliProviderActivationError::StateUnavailable),
             Err(_elapsed) => {
-                let mut slot = self.task.lock().await;
-                if slot.is_some() {
-                    return Err(CliProviderActivationError::StateUnavailable);
-                }
-                *slot = Some(task);
+                *slot = Some(retained);
                 Err(CliProviderActivationError::StateUnavailable)
             }
         }
@@ -504,6 +1361,9 @@ async fn publish_research_activation(
     request: ProviderAdapterActivationRequest,
     cancellation: CancellationToken,
 ) -> Result<(), CliProviderActivationError> {
+    let publication_deadline = Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .ok_or(CliProviderActivationError::ProviderConfiguration)?;
     let surface_id = lease.surface_id().as_str();
     let evidence_digests = evidence.digests();
     let candidate = activation_authority
@@ -528,7 +1388,13 @@ async fn publish_research_activation(
                         != Some(candidate_runtime_digest)
                     && current_state_digest == Some(recipe.state_digest) =>
             {
-                Ok(())
+                publish_eia_activated_data(
+                    activation_authority,
+                    lease,
+                    cancellation,
+                    publication_deadline,
+                )
+                .await
             }
             Ok(DurableActivationRecipeState::Missing)
             | Ok(DurableActivationRecipeState::Quarantined(_))
@@ -575,7 +1441,12 @@ async fn publish_research_activation(
         };
         let predecessor_state_digest = Some(predecessor_recipe.state_digest);
         let prepared = activation_authority
-            .prepare_research_replacement(lease.clone(), request, expected.clone(), cancellation)
+            .prepare_research_replacement(
+                lease.clone(),
+                request,
+                expected.clone(),
+                cancellation.clone(),
+            )
             .await
             .map_err(CliProviderActivationError::Activation)?;
         if prepared.candidate() != &candidate {
@@ -612,7 +1483,10 @@ async fn publish_research_activation(
                 reason,
                 caller_error,
             } = failure;
-            reconcile_failed_replacement(
+            // Keep the large compensation future off this publisher's inline state,
+            // matching the forward replacement boundary above. The same caller still
+            // owns and polls compensation through its original terminal result.
+            Box::pin(reconcile_failed_replacement(
                 state,
                 activation_authority,
                 onboarding,
@@ -621,14 +1495,20 @@ async fn publish_research_activation(
                 published_state_digest,
                 candidate_state_digest,
                 reason,
-            )
+            ))
             .await?;
             return Err(caller_error);
         }
         state
             .reconcile_evidence_objects()
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        return Ok(());
+        return publish_eia_activated_data(
+            activation_authority,
+            lease,
+            cancellation,
+            publication_deadline,
+        )
+        .await;
     }
 
     let published = state
@@ -679,7 +1559,7 @@ async fn publish_research_activation(
         return Err(error);
     }
     let outcome = match activation_authority
-        .activate_exact_research_profile(&candidate, request, cancellation)
+        .activate_exact_research_profile(&candidate, request, cancellation.clone())
         .await
     {
         Ok(outcome) => outcome,
@@ -695,7 +1575,7 @@ async fn publish_research_activation(
             return Err(CliProviderActivationError::Activation(error));
         }
     };
-    let ProviderActivationOutcome::Research(activated) = outcome else {
+    let Some(activated_generation) = provider_activation_generation(&outcome) else {
         quarantine_failed_candidate(
             state,
             onboarding,
@@ -706,7 +1586,7 @@ async fn publish_research_activation(
         )?;
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
-    if activated.generation() != &candidate {
+    if activated_generation != &candidate {
         activation_authority
             .revoke_research_runtime(&candidate)
             .await
@@ -757,6 +1637,38 @@ async fn publish_research_activation(
     state
         .reconcile_evidence_objects()
         .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+    publish_eia_activated_data(
+        activation_authority,
+        lease,
+        cancellation,
+        publication_deadline,
+    )
+    .await
+}
+
+pub(super) async fn publish_eia_activated_data(
+    activation: &ProviderAdapterActivation,
+    lease: &ProviderActivationLease,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<(), CliProviderActivationError> {
+    if lease.surface_id().as_str() != "eia.api-v2" {
+        return Ok(());
+    }
+    let structure = JsonStructureLimits::try_new(16, 4096, 64, 64)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let limits = ServiceLimits::try_new(4096, 8, 4096, 8, structure)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let context = RequestContext::new(
+        RequestId::String(Arc::from("source.energy-data.publication")),
+        cancellation,
+        deadline,
+        limits,
+    );
+    activation
+        .publish_eia_macro(&context)
+        .await
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     Ok(())
 }
 
@@ -952,9 +1864,20 @@ fn runtime_generation_digest(
     generation: &ResearchProviderRuntimeGeneration,
 ) -> Result<EvidenceDigest, CliProviderActivationError> {
     generation
-        .identity_digest()
+        .generation_digest()
         .map_err(ProviderAdapterActivationError::from)
         .map_err(CliProviderActivationError::Activation)
+}
+
+fn provider_activation_generation(
+    outcome: &ProviderActivationOutcome,
+) -> Option<&ResearchProviderRuntimeGeneration> {
+    match outcome {
+        ProviderActivationOutcome::Research(activated) => Some(activated.generation()),
+        ProviderActivationOutcome::Yahoo(activated) => Some(activated.generation()),
+        ProviderActivationOutcome::Tiingo(activated) => Some(activated.generation()),
+        ProviderActivationOutcome::Live(_) | ProviderActivationOutcome::CoinbaseDirect(_) => None,
+    }
 }
 
 enum ReplacementRuntimeTransaction {
@@ -1022,7 +1945,7 @@ async fn reconcile_failed_replacement(
         Desired,
     }
 
-    let durable_phase = match state.load_recipe(expected.profile().as_str()) {
+    let durable_phase = match state.load_recipe_for_lifecycle(expected.profile().as_str()) {
         Ok(DurableActivationRecipeState::Staged(recipe))
             if replacement_recipe_is_exact(
                 &recipe,
@@ -1254,7 +2177,7 @@ fn quarantine_failed_candidate(
         .map_err(|_error| CliProviderActivationError::StateUnavailable)?
     {
         let quarantine = state
-            .load_recipe(surface_id)
+            .load_recipe_for_lifecycle(surface_id)
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
         let DurableActivationRecipeState::Quarantined(quarantine) = quarantine else {
             return Err(CliProviderActivationError::StateUnavailable);
@@ -1274,13 +2197,7 @@ fn require_same_activation_lease(
     current: &ProviderActivationLease,
     expected: &ProviderActivationLease,
 ) -> Result<(), CliProviderActivationError> {
-    if current.session_id() == expected.session_id()
-        && current.surface_id() == expected.surface_id()
-        && current.capability_digest() == expected.capability_digest()
-        && current.rights_decision_digest() == expected.rights_decision_digest()
-        && current.generation() == expected.generation()
-        && current.secret_reference() == expected.secret_reference()
-    {
+    if current.same_authority_as(expected) {
         Ok(())
     } else {
         Err(CliProviderActivationError::ProviderConfiguration)
@@ -1289,6 +2206,16 @@ fn require_same_activation_lease(
 
 #[async_trait]
 impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
+    async fn setup_publication_pending(&self, session_id: Uuid) -> bool {
+        let task = self.tasks.task.lock().await;
+        task.as_ref().is_some_and(|task| {
+            !task.is_finished()
+                && task.treasury_import.as_ref().is_some_and(|import| {
+                    import.key.session_id == session_id && import.admitted.get().is_some()
+                })
+        })
+    }
+
     async fn activate(
         &self,
         session_id: Uuid,
@@ -1298,6 +2225,64 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         self.activate_from_portal(session_id, request, cancellation)
             .await
             .map_err(map_portal_activation_error)
+    }
+
+    async fn resume_research_publication(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError> {
+        self.resume_treasury_publication(session_id, cancellation)
+            .await
+            .map_err(map_portal_activation_error)
+    }
+
+    async fn verify_saved_setup(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError> {
+        let session = self
+            .onboarding
+            .resume(session_id)
+            .map_err(|_| ProviderPortalActivationError::Unavailable)?;
+        let surface = SourceIdentifier::try_from(session.surface_id())
+            .map_err(|_| ProviderPortalActivationError::InvalidRequest)?;
+        if self.retained_setup_session(&surface)? != Some(session_id) {
+            return Err(ProviderPortalActivationError::InvalidRequest);
+        }
+        self.activate_research_from_portal(
+            session_id,
+            ResearchSetupInput::Saved {
+                surface: surface.as_str().to_owned(),
+            },
+            cancellation,
+        )
+        .await
+        .map_err(map_portal_activation_error)
+    }
+
+    fn retained_setup_session(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<Option<Uuid>, ProviderPortalActivationError> {
+        // Only research selections have an activation recipe. Account connections retain their
+        // session and credential generation in onboarding and use the account lifecycle owner.
+        // Returning no recipe lets setup and credential import reuse that current session.
+        if !RESTORABLE_RESEARCH_SURFACES.contains(&profile.as_str()) {
+            return Ok(None);
+        }
+        match self
+            .state
+            .load_recipe_for_lifecycle(profile.as_str())
+            .map_err(|_| ProviderPortalActivationError::StateUnavailable)?
+        {
+            DurableActivationRecipeState::Desired(recipe) => Ok(Some(recipe.session_id)),
+            DurableActivationRecipeState::Missing
+            | DurableActivationRecipeState::Staged(_)
+            | DurableActivationRecipeState::Cutover(_)
+            | DurableActivationRecipeState::Quarantined(_) => Ok(None),
+        }
     }
 
     fn provider_dataset_identifier(
@@ -1320,97 +2305,196 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .map_err(map_portal_activation_error)
     }
 
+    async fn schwab_oauth(
+        &self,
+        session_id: Uuid,
+        action: SchwabOAuthLifecycleAction,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthLifecycleView, ProviderPortalActivationError> {
+        if action == SchwabOAuthLifecycleAction::Unlink {
+            self.schwab_doctor_tasks
+                .cancel_session(session_id, cancellation.child_token())
+                .await
+                .map_err(map_portal_activation_error)?;
+        }
+        let runtime = self
+            .schwab_oauth_lifecycle
+            .runtime(
+                &self.schwab_oauth,
+                self.schwab_oauth_factory.as_ref(),
+                &cancellation,
+            )
+            .await?;
+        let view = runtime
+            .apply(session_id, action, cancellation)
+            .await
+            .map_err(map_schwab_oauth_error)?;
+        if !matches!(
+            action,
+            SchwabOAuthLifecycleAction::Begin | SchwabOAuthLifecycleAction::Continue
+        ) {
+            return Ok(view);
+        }
+        let authority = match runtime
+            .market_authority(session_id, CancellationToken::new())
+            .await
+        {
+            Ok(authority) => authority,
+            Err(
+                SchwabOAuthRuntimeError::ReauthorizationRequired
+                | SchwabOAuthRuntimeError::AuthorizationExchangeInFlight,
+            ) => return Ok(view),
+            Err(error) => return Err(map_schwab_oauth_error(error)),
+        };
+        let current = authority
+            .current_receipt()
+            .await
+            .map_err(|_error| ProviderPortalActivationError::Unavailable)?;
+        let preparation = self
+            .onboarding
+            .prepare_schwab_market_doctor_run(
+                session_id,
+                current.generation().get(),
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(map_schwab_doctor_onboarding_error)?;
+        if matches!(&preparation, SchwabMarketDoctorRunPreparation::Current) {
+            return Ok(view);
+        }
+        let doctor = self
+            .schwab_doctor
+            .as_ref()
+            .cloned()
+            .ok_or(ProviderPortalActivationError::Unavailable)?;
+        let onboarding = Arc::clone(&self.onboarding);
+        let key = SchwabMarketDoctorTaskKey {
+            session_id,
+            access_token_generation: current.generation().get(),
+        };
+        self.schwab_doctor_tasks
+            .schedule(key, move |completion| async move {
+                run_schwab_market_doctor_task(
+                    onboarding,
+                    doctor,
+                    authority,
+                    key,
+                    preparation,
+                    completion,
+                )
+                .await;
+            })
+            .await
+            .map_err(map_portal_activation_error)?;
+        Ok(view)
+    }
+
     fn begin_shutdown(&self) {
         self.tasks.begin_shutdown();
+        self.schwab_doctor_tasks.begin_shutdown();
+        self.schwab_oauth_lifecycle
+            .begin_shutdown(self.schwab_oauth.get());
     }
 
     async fn finish_shutdown(
         &self,
         deadline: Instant,
     ) -> Result<(), ProviderPortalActivationError> {
-        self.tasks
-            .finish_shutdown(deadline)
-            .await
-            .map_err(map_portal_activation_error)
+        let tasks = self.tasks.finish_shutdown(deadline);
+        let schwab_doctor_tasks = self.schwab_doctor_tasks.finish_shutdown(deadline);
+        let oauth = self
+            .schwab_oauth_lifecycle
+            .finish_shutdown(&self.schwab_oauth, deadline);
+        let (tasks, schwab_doctor_tasks, oauth) = tokio::join!(tasks, schwab_doctor_tasks, oauth);
+        tasks.map_err(map_portal_activation_error)?;
+        schwab_doctor_tasks.map_err(map_portal_activation_error)?;
+        oauth
     }
 }
 
-/// Activates one already-onboarded research provider from a closed, no-follow request.
-///
-/// The request never carries credential bytes or caller-made rights evidence. Provider-specific
-/// series metadata and any FRED grant files are read beneath the request's retained input-root
-/// capability. Persistence rights come only from the active code-owned onboarding lease.
-pub(super) async fn activate_research_provider(
-    product: &LocalProduct,
-    request_path: &Path,
-    confirm: bool,
+async fn run_schwab_market_doctor_task(
+    onboarding: Arc<ProviderOnboardingService>,
+    doctor: Arc<SchwabMarketDoctorRuntimeCoordinator>,
+    authority: SchwabOAuthMarketAuthority,
+    key: SchwabMarketDoctorTaskKey,
+    mut preparation: SchwabMarketDoctorRunPreparation,
     cancellation: CancellationToken,
-) -> Result<Value, CliProviderActivationError> {
-    if !confirm {
-        return Err(CliProviderActivationError::ConfirmationRequired);
+) {
+    let deferred_wait = match &preparation {
+        SchwabMarketDoctorRunPreparation::Deferred { wait } => Some(*wait),
+        SchwabMarketDoctorRunPreparation::Current | SchwabMarketDoctorRunPreparation::Ready(_) => {
+            None
+        }
+    };
+    if let Some(wait) = deferred_wait {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return,
+            () = tokio::time::sleep(wait) => {}
+        }
     }
-    if cancellation.is_cancelled() {
-        return Err(CliProviderActivationError::Cancelled);
+    let current = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return,
+        current = authority.current_receipt() => match current {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(%error, "Schwab market-data verification authority is unavailable");
+                return;
+            }
+        }
+    };
+    if current.generation().get() != key.access_token_generation {
+        tracing::warn!(
+            "Schwab market-data verification was superseded by a newer authorization generation"
+        );
+        return;
     }
-    let (root, input, request) = read_request(request_path)?;
-    let onboarding = product.provider_onboarding();
-    let lease = onboarding
-        .prepare_runtime_activation_target(request.session_id, cancellation.clone())
+    if deferred_wait.is_some() {
+        preparation = match onboarding
+            .prepare_schwab_market_doctor_run(
+                key.session_id,
+                key.access_token_generation,
+                cancellation.child_token(),
+            )
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                tracing::warn!(%error, "Schwab market-data verification renewal was not admitted");
+                return;
+            }
+        };
+    }
+    let lease = match preparation {
+        SchwabMarketDoctorRunPreparation::Ready(lease) => lease,
+        SchwabMarketDoctorRunPreparation::Current => return,
+        SchwabMarketDoctorRunPreparation::Deferred { .. } => {
+            tracing::warn!(
+                "Schwab market-data verification renewal did not reach its retained boundary"
+            );
+            return;
+        }
+    };
+    match doctor
+        .run(
+            lease,
+            authority,
+            cancellation,
+            Instant::now() + SCHWAB_MARKET_DOCTOR_DURATION,
+        )
         .await
-        .map_err(CliProviderActivationError::Onboarding)?;
-    require_surface(&lease, request.provider.surface())?;
-    validate_file_fred_request_scope(&lease, &request)?;
-    let evidence = LoadedActivationEvidence::from_user(&root, &request)?;
-    validate_file_fred_authority(
-        &onboarding,
-        &lease,
-        &request,
-        &evidence,
-        cancellation.child_token(),
-    )
-    .await?;
-    if cancellation.is_cancelled() {
-        return Err(CliProviderActivationError::Cancelled);
+    {
+        Ok(SchwabMarketDoctorRuntimeTerminal::Observed(_)) => {
+            tracing::info!("Schwab market-data verification completed");
+        }
+        Ok(SchwabMarketDoctorRuntimeTerminal::SetupRequired(_)) => {
+            tracing::warn!("Schwab market-data verification requires owner setup");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Schwab market-data verification failed");
+        }
     }
-    let surface_id = lease.surface_id().as_str().to_owned();
-    let _activation_guard = product
-        .provider_activation_state()
-        .acquire_activation(&surface_id)
-        .await
-        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-    let session_id = request.session_id;
-    let activation = build_research_activation(
-        product.paths(),
-        &lease,
-        input.as_bytes(),
-        request,
-        &evidence,
-    )?;
-    let provider_dataset_identifier = activation.provider_dataset_identifier().cloned();
-    if cancellation.is_cancelled() {
-        return Err(CliProviderActivationError::Cancelled);
-    }
-    publish_research_activation(
-        product.provider_activation_state(),
-        product.provider_activation().as_ref(),
-        product.provider_onboarding().as_ref(),
-        &lease,
-        input.as_bytes(),
-        &evidence,
-        activation,
-        cancellation.clone(),
-    )
-    .await?;
-    product
-        .provider_onboarding()
-        .reconcile_cleanup(session_id, cancellation)
-        .await
-        .map_err(CliProviderActivationError::Onboarding)?;
-    Ok(activation_result(
-        lease.surface_id(),
-        &lease,
-        provider_dataset_identifier.as_ref(),
-    ))
 }
 
 pub(super) fn restore_research_providers(
@@ -1425,7 +2509,7 @@ pub(super) fn restore_research_providers(
         );
     }
     for surface_id in RESTORABLE_RESEARCH_SURFACES {
-        let recipe = match state.load_recipe(surface_id) {
+        let recipe = match state.load_recipe_for_startup_recovery(surface_id) {
             Ok(DurableActivationRecipeState::Missing) => continue,
             Ok(DurableActivationRecipeState::Quarantined(quarantine)) => {
                 enforce_recovery_quarantine(
@@ -1496,6 +2580,74 @@ pub(super) fn restore_research_providers(
             }
         }
     }
+}
+
+/// Reconstructs one exact retained research recipe for explicit source-lifecycle resume.
+///
+/// Unlike startup recovery, this path may unlock the already admitted credential generation. It
+/// never accepts provider configuration from the lifecycle caller: the existing durable recipe,
+/// digest-addressed evidence, active onboarding lease, and provider-specific builder remain the
+/// sole construction authority.
+pub(super) async fn resume_exact_research_provider(
+    paths: &LocalPaths,
+    onboarding: &crate::ProviderOnboardingService,
+    activation_authority: &crate::ProviderAdapterActivation,
+    state: &DurableProviderActivationState,
+    surface_id: &str,
+    expected_session_id: Uuid,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<ResearchProviderRuntimeGeneration, CliProviderActivationError> {
+    if cancellation.is_cancelled() {
+        return Err(CliProviderActivationError::Cancelled);
+    }
+    let recipe = match state
+        .load_recipe_for_lifecycle(surface_id)
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?
+    {
+        DurableActivationRecipeState::Desired(recipe)
+            if recipe.session_id == expected_session_id =>
+        {
+            recipe
+        }
+        DurableActivationRecipeState::Missing
+        | DurableActivationRecipeState::Desired(_)
+        | DurableActivationRecipeState::Staged(_)
+        | DurableActivationRecipeState::Cutover(_)
+        | DurableActivationRecipeState::Quarantined(_) => {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+    };
+    let prepared = prepare_research_provider_recovery(
+        paths,
+        onboarding,
+        activation_authority,
+        state,
+        surface_id,
+        &recipe,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(CliProviderActivationError::Cancelled);
+    }
+    let expected = prepared.generation.clone();
+    let outcome = activation_authority
+        .activate_exact_research_profile(&expected, prepared.request, cancellation.clone())
+        .await
+        .map_err(CliProviderActivationError::Activation)?;
+    let Some(activated_generation) = provider_activation_generation(&outcome) else {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    if activated_generation != &expected {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
+    publish_eia_activated_data(
+        activation_authority,
+        &prepared.lease,
+        cancellation,
+        deadline,
+    )
+    .await?;
+    Ok(expected)
 }
 
 #[derive(Clone, Copy)]
@@ -1871,10 +3023,10 @@ fn restore_prepared_research_provider(
             }
             Err(error) => return Err(CliProviderActivationError::Activation(error)),
         };
-    let ProviderActivationOutcome::Research(activated) = outcome else {
+    let Some(activated_generation) = provider_activation_generation(&outcome) else {
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
-    if activated.generation() != &prepared.generation {
+    if activated_generation != &prepared.generation {
         return Err(CliProviderActivationError::ProviderConfiguration);
     }
     Ok(ResearchProviderRecovery::Restored)
@@ -2006,7 +3158,9 @@ fn recovery_quarantine_reason(
             DurableActivationQuarantineReason::AdapterRejected
         }
         CliProviderActivationError::StateUnavailable
-        | CliProviderActivationError::InputUnavailable => {
+        | CliProviderActivationError::InputUnavailable
+        | CliProviderActivationError::TreasuryPublication(_)
+        | CliProviderActivationError::CancellationCleanup { .. } => {
             DurableActivationQuarantineReason::StateInvalid
         }
         CliProviderActivationError::ConfirmationRequired
@@ -2036,18 +3190,27 @@ fn build_research_activation(
     .map_err(|_| CliProviderActivationError::InvalidRights)?;
     let activation = match request.provider {
         ProviderRequest::Sec { identities } => {
-            let metadata = metadata(
+            let metadata = metadata_with_source_id(
                 lease,
                 activation_evidence,
-                "sec",
-                "us-sec-edgar",
+                SEC_EDGAR_AUTHORITY
+                    .activation_revision_evidence(activation_evidence)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SEC_EDGAR_AUTHORITY
+                    .canonical_source_id()
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SEC_EDGAR_AUTHORITY.rate_scope(),
                 SourceClass::RegulatoryFiling,
                 CoverageDomain::RegulatoryFilings,
                 AuthorizationMode::PublicInterface,
                 HistoricalCapability::RevisionPreserving,
                 metadata_effective,
-                sec_network_policy()?,
-                simple_budget("us-sec-edgar", 8, SECOND_NANOS, 4, None)?,
+                SEC_EDGAR_AUTHORITY
+                    .endpoint_policy()
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SEC_EDGAR_AUTHORITY
+                    .budget_policy()
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
             )?;
             let identities = sec_identity_registry(
                 &metadata,
@@ -2076,7 +3239,7 @@ fn build_research_activation(
                 .iter()
                 .map(|metadata| metadata.series_id().to_owned())
                 .collect();
-            let plan = BlsRequestPlan::try_new(tier, series_ids, start_year, end_year)
+            BlsRequestPlan::try_new(tier, series_ids, start_year, end_year)
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let endpoint = match tier {
                 BlsAccessTier::PublicV1 => "https://api.bls.gov/publicAPI/v1/timeseries/data/",
@@ -2097,26 +3260,19 @@ fn build_research_activation(
                 HistoricalCapability::Historical,
                 metadata_effective,
                 exact_endpoint_policy(endpoint, 16 * 1024 * 1024)?,
-                bls_budget(lease, authorization_mode, plan.limits().daily_queries())?,
+                bls_application_provider_budget(tier)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
             )?;
             ProviderAdapterActivationRequest::Bls(
                 BlsAdapterActivation::try_new(metadata, tier, series, start_year, end_year)
                     .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?,
             )
         }
-        ProviderRequest::TreasuryFiscal {
-            first_record_date,
-            last_record_date,
-            page_size,
-        } => {
+        ProviderRequest::TreasuryFiscal { page_size } => {
             let page_size = NonZeroU16::new(page_size)
                 .ok_or(CliProviderActivationError::ProviderConfiguration)?;
-            let query = TreasuryFiscalQuery::average_interest_rates_v2(
-                first_record_date,
-                last_record_date,
-                page_size,
-            )
-            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let query = TreasuryFiscalQuery::average_interest_rates_v2_all_history(page_size)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let config = TreasurySourceConfig::average_interest_rates(query);
             let metadata =
                 treasury_metadata(lease, activation_evidence, metadata_effective, &config)?;
@@ -2124,12 +3280,9 @@ fn build_research_activation(
                 metadata, config,
             ))
         }
-        ProviderRequest::TreasuryDailyRates {
-            year,
-            start_year,
-            end_year,
-        } => {
-            let config = treasury_daily_rates_config(year, start_year, end_year)?;
+        ProviderRequest::TreasuryDailyRates => {
+            let config = TreasurySourceConfig::daily_rates_all_history()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             let metadata =
                 treasury_metadata(lease, activation_evidence, metadata_effective, &config)?;
             ProviderAdapterActivationRequest::Treasury(TreasuryAdapterActivation::new(
@@ -2137,22 +3290,8 @@ fn build_research_activation(
             ))
         }
         ProviderRequest::FredAlfred { configuration } => {
-            if lease.capability_revision().get() != FRED_CAPABILITY_REVISION {
-                return Err(CliProviderActivationError::InvalidRights);
-            }
-            let FredProviderRequest {
-                rights_artifact,
-                terms,
-                service_permission,
-                grants,
-            } = *configuration;
-            let policy = fred_policy(
-                evidence,
-                &rights_artifact,
-                terms,
-                service_permission,
-                grants,
-            )?;
+            require_current_fred_revision(lease)?;
+            let FredProviderRequest { provider_dataset } = *configuration;
             let metadata = metadata(
                 lease,
                 activation_evidence,
@@ -2166,34 +3305,150 @@ fn build_research_activation(
                 fred_network_policy()?,
                 fred_budget(lease)?,
             )?;
-            ProviderAdapterActivationRequest::Fred(FredAdapterActivation::new(metadata, policy))
+            ProviderAdapterActivationRequest::Fred(
+                FredAdapterActivation::try_new(metadata, provider_dataset)
+                    .map_err(CliProviderActivationError::Activation)?,
+            )
+        }
+        ProviderRequest::EiaElectricityPrice {
+            start_period,
+            end_period,
+        } => {
+            require_surface(lease, ProviderSurface::Exact("eia.api-v2"))?;
+            let query = electricity_price_query(start_period, end_period)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let network = EndpointPolicy::try_from_api_rules(
+                eia_api_endpoint_rules(&query)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                request_bounds(1024 * 1024)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+            let policy = lease
+                .provider_budget_policy()
+                .cloned()
+                .ok_or(CliProviderActivationError::InvalidMetadata)?;
+            let declaration = ProviderRateDeclaration::try_for_authorization_subject(
+                policy,
+                &authorization_subject(lease)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+            let metadata = metadata(
+                lease,
+                activation_evidence,
+                "eia",
+                "us-eia",
+                SourceClass::OfficialAgency,
+                CoverageDomain::Macroeconomic,
+                AuthorizationMode::UserAuthorized,
+                HistoricalCapability::RevisionPreserving,
+                metadata_effective,
+                network,
+                declaration.policy().clone(),
+            )?;
+            let profile = electricity_price_profile(query)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let limits = EiaTransportLimits::try_new(
+                EiaParseLimits::production_defaults(),
+                1024 * 1024,
+                1,
+                1024 * 1024,
+            )
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            ProviderAdapterActivationRequest::Eia(
+                EiaAdapterActivation::try_new(
+                    metadata,
+                    profile,
+                    limits,
+                    NonZeroU16::new(1).ok_or(CliProviderActivationError::ProviderConfiguration)?,
+                    NonZeroU32::new(24).ok_or(CliProviderActivationError::ProviderConfiguration)?,
+                    nonzero_u64(1024 * 1024)?,
+                )
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+            )
+        }
+        ProviderRequest::FederalReserveBoardH15 => {
+            let profile = BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let metadata = federal_reserve_board_metadata(
+                lease,
+                activation_evidence,
+                metadata_effective,
+                &profile,
+            )?;
+            ProviderAdapterActivationRequest::Board(BoardAdapterActivation::new(metadata, profile))
+        }
+        ProviderRequest::YahooEnrichment => {
+            let metadata = yahoo_metadata(lease, activation_evidence, metadata_effective)?;
+            ProviderAdapterActivationRequest::Yahoo(
+                YahooAdapterActivation::try_new(metadata)
+                    .map_err(CliProviderActivationError::Activation)?,
+            )
+        }
+        ProviderRequest::TiingoStarterEodNav => {
+            let metadata = tiingo_metadata(lease, activation_evidence, metadata_effective)?;
+            ProviderAdapterActivationRequest::Tiingo(
+                TiingoAdapterActivation::try_new(metadata)
+                    .map_err(CliProviderActivationError::Activation)?,
+            )
+        }
+        ProviderRequest::ControlledLocalFiles { configuration } => {
+            let manifest_digest = sha256_evidence(&configuration.manifest_sha256)?;
+            let admitted_input_set = sha256_evidence(&configuration.admitted_input_set_sha256)?;
+            let local_admission = sha256_evidence(&configuration.local_admission_evidence_sha256)?;
+            let workspace_receipt =
+                sha256_evidence(&configuration.workspace_receipt_evidence_sha256)?;
+            let import_receipt = sha256_evidence(&configuration.import_receipt_evidence_sha256)?;
+            let evidence = ImportedUserInputEvidence::try_new(
+                admitted_input_set,
+                manifest_digest,
+                local_admission,
+                workspace_receipt,
+                import_receipt,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidRights)?;
+            let limits = ExtractionLimits::try_new(ExtractionLimitsInput::standard())
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let root = paths
+                .artifacts()
+                .map_err(|_| CliProviderActivationError::InputUnavailable)?
+                .open_controlled_import_root(&configuration.root_reference)
+                .map_err(|_| CliProviderActivationError::InputUnavailable)?;
+            let manifest = root
+                .resolve(&configuration.manifest_reference)
+                .and_then(|input| {
+                    input.open_bounded(ExtractionLimitsInput::standard().max_manifest_bytes)
+                })
+                .and_then(|input| input.read_bounded())
+                .map_err(|_| CliProviderActivationError::InputUnavailable)?;
+            if manifest.digest() != manifest_digest {
+                return Err(CliProviderActivationError::InvalidRequest);
+            }
+            let metadata = controlled_local_file_metadata(
+                lease,
+                activation_evidence,
+                manifest_digest,
+                Timestamp::from_unix_nanos(configuration.admitted_at_unix_nanos),
+            )?;
+            let digest_hex = lower_hex(&manifest_digest.bytes());
+            let representation_state_root = paths
+                .control_root()
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                .root()
+                .join("sources/controlled-file-representations")
+                .join(digest_hex);
+            ProviderAdapterActivationRequest::ControlledLocalFiles(
+                ControlledLocalFileAdapterActivation::new(
+                    metadata,
+                    root,
+                    representation_state_root,
+                    manifest,
+                    limits,
+                    evidence,
+                ),
+            )
         }
     };
     Ok(activation)
-}
-
-fn activation_result(
-    profile: &SourceIdentifier,
-    lease: &ProviderActivationLease,
-    provider_dataset_identifier: Option<&SourceIdentifier>,
-) -> Value {
-    json!({
-        "profile": profile.as_str(),
-        "providerDatasetIdentifier": provider_dataset_identifier
-            .map(SourceIdentifier::as_str),
-        "sessionId": lease.session_id().to_string(),
-        "capabilityRevision": lease.capability_revision().get(),
-        "capabilityEvidence": lease.capability_digest(),
-        "rightsDecisionEvidence": lease.rights_decision_digest(),
-        "persistenceRightsEvidence": lease.persistence_evidence(),
-        "publicConfigurationEvidence": lease.public_configuration_digest(),
-        "credentialGeneration": lease.generation().map(|generation| generation.get()),
-        "verificationExpiresAtUnixNanos": lease
-            .verification_expires_at()
-            .map(Timestamp::unix_nanos),
-        "authorityEffectiveAtUnixNanos": lease.authority_effective_at().unix_nanos(),
-        "issuedAtUnixNanos": lease.issued_at().unix_nanos(),
-    })
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2208,7 +3463,6 @@ struct ActivationRequest {
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum ProviderRequest {
     Sec {
-        #[serde(default)]
         identities: Vec<SecIdentityMappingRequest>,
     },
     Bls {
@@ -2217,21 +3471,35 @@ enum ProviderRequest {
         end_year: u16,
     },
     TreasuryFiscal {
-        first_record_date: CalendarDate,
-        last_record_date: CalendarDate,
         page_size: u16,
     },
-    TreasuryDailyRates {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        year: Option<u16>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        start_year: Option<u16>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        end_year: Option<u16>,
-    },
+    TreasuryDailyRates,
     FredAlfred {
         configuration: Box<FredProviderRequest>,
     },
+    EiaElectricityPrice {
+        start_period: String,
+        end_period: String,
+    },
+    FederalReserveBoardH15,
+    YahooEnrichment,
+    TiingoStarterEodNav,
+    ControlledLocalFiles {
+        configuration: ControlledLocalFileRequest,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControlledLocalFileRequest {
+    pub(crate) root_reference: PathBuf,
+    pub(crate) manifest_reference: PathBuf,
+    pub(crate) manifest_sha256: String,
+    pub(crate) admitted_input_set_sha256: String,
+    pub(crate) local_admission_evidence_sha256: String,
+    pub(crate) workspace_receipt_evidence_sha256: String,
+    pub(crate) import_receipt_evidence_sha256: String,
+    pub(crate) admitted_at_unix_nanos: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2244,86 +3512,16 @@ struct SecIdentityMappingRequest {
 impl ProviderRequest {
     const fn surface(&self) -> ProviderSurface {
         match self {
-            Self::Sec { .. } => ProviderSurface::Exact(SEC_SURFACE),
+            Self::Sec { .. } => ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID),
             Self::Bls { .. } => ProviderSurface::Either(BLS_PUBLIC_SURFACE, BLS_REGISTERED_SURFACE),
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
-            Self::TreasuryDailyRates { .. } => ProviderSurface::Exact(TREASURY_XML_SURFACE),
+            Self::TreasuryDailyRates => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyActivationRequest {
-    schema_version: u16,
-    session_id: Uuid,
-    provider: LegacyProviderRequest,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-enum LegacyProviderRequest {
-    Sec,
-    Bls {
-        series_metadata: Vec<ExactInputReference>,
-        start_year: u16,
-        end_year: u16,
-    },
-    TreasuryFiscal {
-        first_record_date: CalendarDate,
-        last_record_date: CalendarDate,
-        page_size: u16,
-    },
-    TreasuryDailyRates {
-        #[serde(default)]
-        year: Option<u16>,
-        #[serde(default)]
-        start_year: Option<u16>,
-        #[serde(default)]
-        end_year: Option<u16>,
-    },
-    FredAlfred {
-        configuration: Box<LegacyFredProviderRequest>,
-    },
-}
-
-impl From<LegacyProviderRequest> for ProviderRequest {
-    fn from(request: LegacyProviderRequest) -> Self {
-        match request {
-            LegacyProviderRequest::Sec => Self::Sec {
-                identities: Vec::new(),
-            },
-            LegacyProviderRequest::Bls {
-                series_metadata,
-                start_year,
-                end_year,
-            } => Self::Bls {
-                series_metadata,
-                start_year,
-                end_year,
-            },
-            LegacyProviderRequest::TreasuryFiscal {
-                first_record_date,
-                last_record_date,
-                page_size,
-            } => Self::TreasuryFiscal {
-                first_record_date,
-                last_record_date,
-                page_size,
-            },
-            LegacyProviderRequest::TreasuryDailyRates {
-                year,
-                start_year,
-                end_year,
-            } => Self::TreasuryDailyRates {
-                year,
-                start_year,
-                end_year,
-            },
-            LegacyProviderRequest::FredAlfred { configuration } => Self::FredAlfred {
-                configuration: Box::new((*configuration).into()),
-            },
+            Self::EiaElectricityPrice { .. } => ProviderSurface::Exact("eia.api-v2"),
+            Self::FederalReserveBoardH15 => ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE),
+            Self::YahooEnrichment => ProviderSurface::Exact(YAHOO_SURFACE),
+            Self::TiingoStarterEodNav => ProviderSurface::Exact(TIINGO_SURFACE),
+            Self::ControlledLocalFiles { .. } => ProviderSurface::Exact(LOCAL_FILES_SURFACE),
         }
     }
 }
@@ -2331,13 +3529,55 @@ impl From<LegacyProviderRequest> for ProviderRequest {
 fn portal_provider_request(
     lease: &ProviderActivationLease,
     request: ProviderPortalActivationRequest,
-    fred_terms: Option<&[AcquiredFredTermsDocument; 3]>,
-    fred_https_permission: Option<&[u8]>,
 ) -> Result<(ProviderRequest, LoadedActivationEvidence), CliProviderActivationError> {
     match request {
         ProviderPortalActivationRequest::Source => Err(CliProviderActivationError::SurfaceMismatch),
+        ProviderPortalActivationRequest::EiaElectricityPrice {
+            start_period,
+            end_period,
+        } => {
+            require_surface(lease, ProviderSurface::Exact("eia.api-v2"))?;
+            electricity_price_query(start_period.clone(), end_period.clone())
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            Ok((
+                ProviderRequest::EiaElectricityPrice {
+                    start_period,
+                    end_period,
+                },
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
+        ProviderPortalActivationRequest::FederalReserveBoardH15 => {
+            require_surface(lease, ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE))?;
+            Ok((
+                ProviderRequest::FederalReserveBoardH15,
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
+        ProviderPortalActivationRequest::YahooEnrichment => {
+            require_surface(lease, ProviderSurface::Exact(YAHOO_SURFACE))?;
+            Ok((
+                ProviderRequest::YahooEnrichment,
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
+        ProviderPortalActivationRequest::TiingoStarterEodNav => {
+            require_surface(lease, ProviderSurface::Exact(TIINGO_SURFACE))?;
+            Ok((
+                ProviderRequest::TiingoStarterEodNav,
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
         ProviderPortalActivationRequest::Sec { cik } => {
-            require_surface(lease, ProviderSurface::Exact(SEC_SURFACE))?;
+            require_surface(lease, ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID))?;
             Ok((
                 ProviderRequest::Sec {
                     identities: vec![SecIdentityMappingRequest {
@@ -2350,34 +3590,19 @@ fn portal_provider_request(
                 },
             ))
         }
-        ProviderPortalActivationRequest::TreasuryFiscal {
-            first_record_date,
-            last_record_date,
-            page_size,
-        } => {
+        ProviderPortalActivationRequest::TreasuryFiscal { page_size } => {
             require_surface(lease, ProviderSurface::Exact(TREASURY_FISCAL_SURFACE))?;
             Ok((
-                ProviderRequest::TreasuryFiscal {
-                    first_record_date,
-                    last_record_date,
-                    page_size,
-                },
+                ProviderRequest::TreasuryFiscal { page_size },
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
                 },
             ))
         }
-        ProviderPortalActivationRequest::TreasuryDailyRates {
-            start_year,
-            end_year,
-        } => {
+        ProviderPortalActivationRequest::TreasuryDailyRates => {
             require_surface(lease, ProviderSurface::Exact(TREASURY_XML_SURFACE))?;
             Ok((
-                ProviderRequest::TreasuryDailyRates {
-                    year: None,
-                    start_year: Some(start_year),
-                    end_year: Some(end_year),
-                },
+                ProviderRequest::TreasuryDailyRates,
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
                 },
@@ -2428,16 +3653,9 @@ fn portal_provider_request(
                 LoadedActivationEvidence { objects },
             ))
         }
-        ProviderPortalActivationRequest::FredAlfred {
-            service_permission,
-            grants,
-        } => fred_portal_request(
-            lease,
-            service_permission,
-            grants,
-            fred_terms.ok_or(CliProviderActivationError::InvalidRights)?,
-            fred_https_permission,
-        ),
+        ProviderPortalActivationRequest::FredAlfred { provider_dataset } => {
+            fred_portal_request(lease, provider_dataset)
+        }
     }
 }
 
@@ -2511,207 +3729,28 @@ fn sec_identity_registry(
 
 fn fred_portal_request(
     lease: &ProviderActivationLease,
-    service_permission: Box<FredPortalServicePermissionInput>,
-    grants: Vec<FredPortalGrantInput>,
-    terms_documents: &[AcquiredFredTermsDocument; 3],
-    https_permission_document: Option<&[u8]>,
+    provider_dataset: SourceIdentifier,
 ) -> Result<(ProviderRequest, LoadedActivationEvidence), CliProviderActivationError> {
     require_surface(lease, ProviderSurface::Exact(FRED_SURFACE))?;
-    if lease.capability_revision().get() != FRED_CAPABILITY_REVISION
-        || grants.len() != 1
-        || grants[0].series.as_str() != "UNRATE"
-        || grants[0].owner.as_str() != "us-bureau-of-labor-statistics"
-        || !matches!(grants[0].evidence, FredPortalEvidenceInput::ReviewedUnrate)
-    {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    let reviewed_documents = terms_documents
-        .iter()
-        .map(|document| FredTermsDocumentBytes::try_new(document.role(), document.as_bytes()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    FredRightsArtifact::parse_current_reviewed(FRED_RIGHTS_MANIFEST_BYTES, &reviewed_documents)
-        .map_err(|_| CliProviderActivationError::InvalidRights)?;
-
-    let mut objects = BTreeMap::new();
-    let rights_artifact = insert_embedded_evidence(
-        &mut objects,
-        "reviewed-fred-rights.json",
-        FRED_RIGHTS_MANIFEST_BYTES,
-        CURRENT_FRED_RIGHTS_ARTIFACT_SHA256,
-    )?;
-    let terms = insert_acquired_fred_terms(&mut objects, terms_documents)?;
-    let selected_series = grants
-        .iter()
-        .map(|grant| grant.series.clone())
-        .collect::<BTreeSet<_>>();
-    if selected_series.len() != grants.len() {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    let FredPortalServicePermissionInput { evidence, review } = *service_permission;
-    let FredPortalServiceEvidenceInput {
-        channel,
-        sha256,
-        byte_length,
-        content_base64,
-    } = evidence;
-    let FredPortalServicePermissionChannelInput::OfficialHttps {
-        evidence_url,
-        authority_url,
-    } = channel;
-    let channel = FredServicePermissionChannelRequest::OfficialHttps {
-        evidence_url,
-        authority_url,
-    };
-    let FredPortalServiceReviewInput {
-        reviewer,
-        reviewed_at_unix_nanos,
-        issuer,
-        application,
-        service,
-        series,
-        operations,
-        conditions,
-        effective_at_unix_nanos,
-        expires_at_unix_nanos,
-        revalidate_by_unix_nanos,
-    } = review;
-    if issuer.as_str() != FRED_SERVICE_PERMISSION_ISSUER
-        || application.as_str() != FRED_SERVICE_PERMISSION_APPLICATION
-        || service.as_str() != FRED_SERVICE_PERMISSION_SERVICE
-        || operations.iter().copied().collect::<BTreeSet<_>>()
-            != FRED_SERVICE_OPERATIONS.into_iter().collect()
-        || operations.len() != FRED_SERVICE_OPERATIONS.len()
-        || series.iter().cloned().collect::<BTreeSet<_>>() != selected_series
-        || series.len() != selected_series.len()
-    {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    let service_document = decode_portal_evidence(
-        &mut objects,
-        "fred-service-permission.bin",
-        sha256,
-        byte_length,
-        content_base64,
-        MAX_FRED_SERVICE_PERMISSION_BYTES,
-    )?;
-    let exact_service_document = objects
-        .get(&service_document.sha256)
-        .ok_or(CliProviderActivationError::InvalidRights)?;
-    validate_fred_permission_delivery(
-        exact_service_document.as_bytes(),
-        https_permission_document.ok_or(CliProviderActivationError::InvalidRights)?,
-    )?;
-    let service_permission = FredServicePermissionRequest::ExactWrittenPermission {
-        channel,
-        document: service_document,
-        review: Box::new(FredServicePermissionReviewRequest {
-            reviewer,
-            reviewed_at_unix_nanos: parse_decimal_timestamp(&reviewed_at_unix_nanos)?,
-            issuer,
-            application,
-            service,
-            series,
-            operations,
-            conditions,
-            effective_at_unix_nanos: parse_decimal_timestamp(&effective_at_unix_nanos)?,
-            expires_at_unix_nanos: expires_at_unix_nanos
-                .as_deref()
-                .map(parse_decimal_timestamp)
-                .transpose()?,
-            revalidate_by_unix_nanos: parse_decimal_timestamp(&revalidate_by_unix_nanos)?,
-        }),
-    };
-
-    let mut requests = Vec::with_capacity(grants.len());
-    for grant in grants {
-        let FredPortalGrantInput {
-            series,
-            owner,
-            evidence,
-            effective_at_unix_nanos,
-            expires_at_unix_nanos,
-        } = grant;
-        let evidence = match evidence {
-            FredPortalEvidenceInput::ReviewedUnrate => {
-                if series.as_str() != "UNRATE" || owner.as_str() != "us-bureau-of-labor-statistics"
-                {
-                    return Err(CliProviderActivationError::InvalidRights);
-                }
-                FredSeriesRightsEvidence::parse_reviewed_unrate_public_domain(
-                    FRED_UNRATE_RIGHTS_BYTES,
-                )
-                .map_err(|_| CliProviderActivationError::InvalidRights)?;
-                FredGrantEvidenceRequest::ReviewedPublicDomain {
-                    decision: insert_embedded_evidence(
-                        &mut objects,
-                        "reviewed-unrate-public-domain.json",
-                        FRED_UNRATE_RIGHTS_BYTES,
-                        CURRENT_UNRATE_RIGHTS_ARTIFACT_SHA256,
-                    )?,
-                }
-            }
-            FredPortalEvidenceInput::PublicDomain { .. }
-            | FredPortalEvidenceInput::OwnerPermission { .. } => {
-                return Err(CliProviderActivationError::InvalidRights);
-            }
-        };
-        requests.push(FredGrantRequest {
-            series,
-            owner,
-            evidence,
-            operations: FredGrantOperations::Fixed,
-            effective_at_unix_nanos: parse_decimal_timestamp(&effective_at_unix_nanos)?,
-            expires_at_unix_nanos: parse_decimal_timestamp(&expires_at_unix_nanos)?,
-        });
-    }
-
+    require_current_fred_revision(lease)?;
+    FredSource::series_identifier(&provider_dataset)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     Ok((
         ProviderRequest::FredAlfred {
-            configuration: Box::new(FredProviderRequest {
-                rights_artifact,
-                terms,
-                service_permission,
-                grants: requests,
-            }),
+            configuration: Box::new(FredProviderRequest { provider_dataset }),
         },
-        LoadedActivationEvidence { objects },
+        LoadedActivationEvidence {
+            objects: BTreeMap::new(),
+        },
     ))
 }
 
-async fn validate_file_fred_authority(
-    onboarding: &ProviderOnboardingService,
-    lease: &ProviderActivationLease,
-    request: &ActivationRequest,
-    evidence: &LoadedActivationEvidence,
-    cancellation: CancellationToken,
-) -> Result<(), CliProviderActivationError> {
-    let ProviderRequest::FredAlfred { configuration } = &request.provider else {
-        return Ok(());
-    };
-    validate_file_fred_request_scope(lease, request)?;
-    validate_imported_fred_terms(configuration, evidence)?;
-
-    let FredServicePermissionRequest::ExactWrittenPermission {
-        channel, document, ..
-    } = &configuration.service_permission
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
-    let permission = evidence.read(
-        document,
-        u64::try_from(MAX_FRED_SERVICE_PERMISSION_BYTES)
-            .map_err(|_| CliProviderActivationError::InvalidRights)?,
-    )?;
-
-    let FredServicePermissionChannelRequest::OfficialHttps { evidence_url, .. } = channel;
-    let terms = onboarding.acquire_current_fred_terms(cancellation.child_token());
-    let acquired_permission = onboarding
-        .acquire_official_fred_permission_document(evidence_url, cancellation.child_token());
-    let (terms, acquired_permission) = tokio::try_join!(terms, acquired_permission)
-        .map_err(CliProviderActivationError::Onboarding)?;
-    validate_acquired_fred_terms(&terms)?;
-    validate_fred_permission_delivery(permission.as_bytes(), &acquired_permission)
+fn default_unrate_dashboard_dataset() -> Result<SourceIdentifier, CliProviderActivationError> {
+    let provider_dataset = SourceIdentifier::try_from(FRED_UNRATE_DASHBOARD_PROVIDER_DATASET)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    FredSource::series_identifier(&provider_dataset)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    Ok(provider_dataset)
 }
 
 fn validate_file_fred_request_scope(
@@ -2721,251 +3760,36 @@ fn validate_file_fred_request_scope(
     let ProviderRequest::FredAlfred { configuration } = &request.provider else {
         return Ok(());
     };
-    if request.schema_version != REQUEST_SCHEMA_VERSION
-        || lease.capability_revision().get() != FRED_CAPABILITY_REVISION
-    {
+    if request.schema_version != REQUEST_SCHEMA_VERSION {
         return Err(CliProviderActivationError::InvalidRights);
     }
-    validate_reviewed_fred_scope(&configuration.service_permission, &configuration.grants)
+    require_current_fred_revision(lease)?;
+    FredSource::series_identifier(&configuration.provider_dataset)
+        .map(|_series| ())
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)
 }
 
-fn validate_reviewed_fred_scope(
-    service_permission: &FredServicePermissionRequest,
-    grants: &[FredGrantRequest],
+fn current_fred_revision() -> Result<ProviderCapabilityRevision, CliProviderActivationError> {
+    let profiles =
+        built_in_provider_profiles().map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    profiles
+        .get(FRED_SURFACE)
+        .map(|profile| profile.capability().revision())
+        .ok_or(CliProviderActivationError::InvalidMetadata)
+}
+
+fn require_current_fred_revision(
+    lease: &ProviderActivationLease,
 ) -> Result<(), CliProviderActivationError> {
-    let [grant] = grants else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
-    if grant.series.as_str() != "UNRATE"
-        || grant.owner.as_str() != "us-bureau-of-labor-statistics"
-        || !matches!(
-            &grant.evidence,
-            FredGrantEvidenceRequest::ReviewedPublicDomain { .. }
-        )
-        || !matches!(&grant.operations, FredGrantOperations::Fixed)
-    {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    let FredServicePermissionRequest::ExactWrittenPermission { review, .. } = service_permission
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
-    if review.issuer.as_str() != FRED_SERVICE_PERMISSION_ISSUER
-        || review.application.as_str() != FRED_SERVICE_PERMISSION_APPLICATION
-        || review.service.as_str() != FRED_SERVICE_PERMISSION_SERVICE
-        || review.series.len() != 1
-        || review.series[0].as_str() != "UNRATE"
-        || review.operations.len() != FRED_SERVICE_OPERATIONS.len()
-        || review.operations.iter().copied().collect::<BTreeSet<_>>()
-            != FRED_SERVICE_OPERATIONS.into_iter().collect()
-    {
+    if lease.capability_revision() != current_fred_revision()? {
         return Err(CliProviderActivationError::InvalidRights);
     }
     Ok(())
 }
 
-fn validate_imported_fred_terms(
-    configuration: &FredProviderRequest,
-    evidence: &LoadedActivationEvidence,
-) -> Result<(), CliProviderActivationError> {
-    let FredTermsRequest::ExactDocuments {
-        api_terms,
-        services_legal_terms,
-        privacy_policy,
-    } = &configuration.terms
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
-    let maximum = u64::try_from(MAX_FRED_TERMS_DOCUMENT_BYTES)
-        .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let api_terms = evidence.read(api_terms, maximum)?;
-    let services = evidence.read(services_legal_terms, maximum)?;
-    let privacy = evidence.read(privacy_policy, maximum)?;
-    let documents = [
-        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::ApiTerms, api_terms.as_bytes()),
-        FredTermsDocumentBytes::try_new(
-            FredTermsDocumentRole::FredServicesLegalTerms,
-            services.as_bytes(),
-        ),
-        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::PrivacyPolicy, privacy.as_bytes()),
-    ]
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let artifact = evidence.read(
-        &configuration.rights_artifact,
-        FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES,
-    )?;
-    FredRightsArtifact::parse_current_reviewed(artifact.as_bytes(), &documents)
-        .map(|_artifact| ())
-        .map_err(|_| CliProviderActivationError::InvalidRights)
-}
-
-fn validate_acquired_fred_terms(
-    documents: &[AcquiredFredTermsDocument; 3],
-) -> Result<(), CliProviderActivationError> {
-    let documents = documents
-        .iter()
-        .map(|document| FredTermsDocumentBytes::try_new(document.role(), document.as_bytes()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    FredRightsArtifact::parse_current_reviewed(FRED_RIGHTS_MANIFEST_BYTES, &documents)
-        .map(|_artifact| ())
-        .map_err(|_| CliProviderActivationError::InvalidRights)
-}
-
-fn insert_acquired_fred_terms(
-    objects: &mut BTreeMap<String, ExactActivationInput>,
-    documents: &[AcquiredFredTermsDocument; 3],
-) -> Result<FredTermsRequest, CliProviderActivationError> {
-    let mut api_terms = None;
-    let mut services_legal_terms = None;
-    let mut privacy_policy = None;
-    for document in documents {
-        let (path, target) = match document.role() {
-            FredTermsDocumentRole::ApiTerms => ("fred-api-terms.html", &mut api_terms),
-            FredTermsDocumentRole::FredServicesLegalTerms => {
-                ("fred-services-legal-terms.html", &mut services_legal_terms)
-            }
-            FredTermsDocumentRole::PrivacyPolicy => (
-                "st-louis-fed-online-privacy-notice.html",
-                &mut privacy_policy,
-            ),
-        };
-        if target.is_some() {
-            return Err(CliProviderActivationError::InvalidRights);
-        }
-        let digest = Sha256Digest::from_bytes(Sha256::digest(document.as_bytes()).into());
-        let reference = ExactInputReference {
-            path: PathBuf::from(path),
-            sha256: lower_hex(&digest.bytes()),
-        };
-        insert_evidence(
-            objects,
-            &reference,
-            ExactActivationInput {
-                bytes: Arc::from(document.as_bytes()),
-                digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.bytes()),
-            },
-        )?;
-        *target = Some(reference);
-    }
-    Ok(FredTermsRequest::ExactDocuments {
-        api_terms: api_terms.ok_or(CliProviderActivationError::InvalidRights)?,
-        services_legal_terms: services_legal_terms
-            .ok_or(CliProviderActivationError::InvalidRights)?,
-        privacy_policy: privacy_policy.ok_or(CliProviderActivationError::InvalidRights)?,
-    })
-}
-
-fn validate_fred_permission_delivery(
-    imported: &[u8],
-    acquired_https: &[u8],
-) -> Result<(), CliProviderActivationError> {
-    if acquired_https != imported {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    Ok(())
-}
-
-fn insert_embedded_evidence(
-    objects: &mut BTreeMap<String, ExactActivationInput>,
-    path: &str,
-    bytes: &'static [u8],
-    digest: Sha256Digest,
-) -> Result<ExactInputReference, CliProviderActivationError> {
-    let reference = ExactInputReference {
-        path: PathBuf::from(path),
-        sha256: lower_hex(&digest.bytes()),
-    };
-    insert_evidence(
-        objects,
-        &reference,
-        ExactActivationInput {
-            bytes: Arc::from(bytes),
-            digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.bytes()),
-        },
-    )?;
-    Ok(reference)
-}
-
-fn decode_portal_evidence(
-    objects: &mut BTreeMap<String, ExactActivationInput>,
-    path: &str,
-    sha256: String,
-    byte_length: u64,
-    content_base64: String,
-    maximum_bytes: usize,
-) -> Result<ExactInputReference, CliProviderActivationError> {
-    let declared = Sha256Digest::from_lower_hex(&sha256)
-        .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let bytes = BASE64_STANDARD
-        .decode(content_base64)
-        .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let expected_length =
-        usize::try_from(byte_length).map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let actual_digest: [u8; 32] = Sha256::digest(&bytes).into();
-    if bytes.is_empty()
-        || bytes.len() > maximum_bytes
-        || bytes.len() != expected_length
-        || actual_digest != declared.bytes()
-    {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    let reference = ExactInputReference {
-        path: PathBuf::from(path),
-        sha256,
-    };
-    insert_evidence(
-        objects,
-        &reference,
-        ExactActivationInput {
-            bytes: Arc::from(bytes),
-            digest: EvidenceDigest::new(DigestAlgorithm::Sha256, declared.bytes()),
-        },
-    )?;
-    Ok(reference)
-}
-
-fn parse_decimal_timestamp(value: &str) -> Result<i64, CliProviderActivationError> {
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| !byte.is_ascii_digit() && byte != b'-')
-        || value
-            .as_bytes()
-            .iter()
-            .filter(|byte| **byte == b'-')
-            .count()
-            > 1
-        || value.contains('-') && !value.starts_with('-')
-    {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    value
-        .parse::<i64>()
-        .map_err(|_| CliProviderActivationError::InvalidRights)
-}
-
-fn treasury_daily_rates_config(
-    legacy_year: Option<u16>,
-    start_year: Option<u16>,
-    end_year: Option<u16>,
-) -> Result<TreasurySourceConfig, CliProviderActivationError> {
-    match (legacy_year, start_year, end_year) {
-        (Some(year), None, None) => TreasurySourceConfig::daily_par_yield_curve(year)
-            .map_err(|_| CliProviderActivationError::ProviderConfiguration),
-        (None, Some(start), Some(end)) if start <= end => {
-            TreasurySourceConfig::daily_rates_all_families(start, end)
-                .map_err(|_| CliProviderActivationError::ProviderConfiguration)
-        }
-        _ => Err(CliProviderActivationError::ProviderConfiguration),
-    }
-}
-
-pub(super) fn treasury_daily_rate_release_year(
+pub(super) fn treasury_daily_rate_all_history_datasets(
     state: &DurableProviderActivationState,
-) -> Result<u16, CliProviderActivationError> {
+) -> Result<(Vec<SourceIdentifier>, EvidenceDigest), CliProviderActivationError> {
     let recipe = state
         .load_recipe(TREASURY_XML_SURFACE)
         .map_err(|_| CliProviderActivationError::StateUnavailable)?;
@@ -2976,17 +3800,28 @@ pub(super) fn treasury_daily_rate_release_year(
     if request.session_id != recipe.session_id {
         return Err(CliProviderActivationError::StateUnavailable);
     }
-    let ProviderRequest::TreasuryDailyRates {
-        year: None,
-        start_year: Some(start_year),
-        end_year: Some(end_year),
-    } = request.provider
-    else {
+    let ProviderRequest::TreasuryDailyRates = request.provider else {
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
-    TreasurySourceConfig::daily_rates_all_families(start_year, end_year)
+    let config = TreasurySourceConfig::daily_rates_all_history()
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-    Ok(end_year)
+    let catalog = config
+        .dataset_catalog()
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let datasets = catalog
+        .datasets()
+        .iter()
+        .map(|descriptor| descriptor.provider_dataset().clone())
+        .collect::<Vec<_>>();
+    if datasets.len() != TreasuryDailyRateFamily::ALL.len()
+        || !catalog.complete_selected_family_coverage()
+        || datasets.iter().enumerate().any(|(index, dataset)| {
+            !dataset.as_str().ends_with(":all") || datasets[..index].contains(dataset)
+        })
+    {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
+    Ok((datasets, recipe.runtime_generation_digest))
 }
 
 pub(super) fn treasury_fiscal_release_query(
@@ -3002,169 +3837,48 @@ pub(super) fn treasury_fiscal_release_query(
     if request.session_id != recipe.session_id {
         return Err(CliProviderActivationError::StateUnavailable);
     }
-    let ProviderRequest::TreasuryFiscal {
-        first_record_date,
-        last_record_date,
-        page_size,
-    } = request.provider
-    else {
+    let ProviderRequest::TreasuryFiscal { page_size } = request.provider else {
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
     let page_size =
         NonZeroU16::new(page_size).ok_or(CliProviderActivationError::ProviderConfiguration)?;
-    let query = TreasuryFiscalQuery::average_interest_rates_v2(
-        first_record_date,
-        last_record_date,
-        page_size,
-    )
-    .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    let query = TreasuryFiscalQuery::average_interest_rates_v2_all_history(page_size)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     Ok((query, recipe.runtime_generation_digest))
+}
+
+/// Returns the exact application-owned FRED dashboard dataset from callable durable state.
+///
+/// The durable-state owner verifies the recipe envelope before this boundary. Desktop input never
+/// selects or overrides the exact configured series and vintage interval at query time.
+pub(super) fn fred_dashboard_provider_dataset(
+    state: &DurableProviderActivationState,
+) -> Result<SourceIdentifier, CliProviderActivationError> {
+    let recipe = state
+        .load_recipe(FRED_SURFACE)
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+    let DurableActivationRecipeState::Desired(recipe) = recipe else {
+        return Err(CliProviderActivationError::StateUnavailable);
+    };
+    let request = decode_request(&recipe.request_bytes)?;
+    if request.schema_version != REQUEST_SCHEMA_VERSION
+        || request.session_id != recipe.session_id
+        || !recipe.evidence_digests.is_empty()
+    {
+        return Err(CliProviderActivationError::StateUnavailable);
+    }
+    let ProviderRequest::FredAlfred { configuration } = request.provider else {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    FredSource::series_identifier(&configuration.provider_dataset)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    Ok(configuration.provider_dataset)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FredProviderRequest {
-    rights_artifact: ExactInputReference,
-    terms: FredTermsRequest,
-    service_permission: FredServicePermissionRequest,
-    grants: Vec<FredGrantRequest>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FredGrantRequest {
-    series: SourceIdentifier,
-    owner: SourceIdentifier,
-    evidence: FredGrantEvidenceRequest,
-    #[serde(skip)]
-    operations: FredGrantOperations,
-    effective_at_unix_nanos: i64,
-    expires_at_unix_nanos: i64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-enum FredTermsRequest {
-    ReviewedCurrent,
-    ExactDocuments {
-        api_terms: ExactInputReference,
-        services_legal_terms: ExactInputReference,
-        privacy_policy: ExactInputReference,
-    },
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-enum FredGrantEvidenceRequest {
-    ReviewedPublicDomain {
-        decision: ExactInputReference,
-    },
-    PublicDomain {
-        evidence_reference_url: String,
-        authority_url: String,
-        document: ExactInputReference,
-    },
-    OwnerPermission {
-        evidence_reference_url: String,
-        authority_url: String,
-        document: ExactInputReference,
-    },
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-enum FredServicePermissionRequest {
-    ExactWrittenPermission {
-        channel: FredServicePermissionChannelRequest,
-        document: ExactInputReference,
-        review: Box<FredServicePermissionReviewRequest>,
-    },
-    #[serde(skip)]
-    LegacyUnavailable,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-enum FredServicePermissionChannelRequest {
-    OfficialHttps {
-        evidence_url: String,
-        authority_url: String,
-    },
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FredServicePermissionReviewRequest {
-    reviewer: SourceIdentifier,
-    reviewed_at_unix_nanos: i64,
-    issuer: SourceIdentifier,
-    application: SourceIdentifier,
-    service: SourceIdentifier,
-    series: Vec<SourceIdentifier>,
-    operations: Vec<FredOperation>,
-    conditions: Vec<String>,
-    effective_at_unix_nanos: i64,
-    expires_at_unix_nanos: Option<i64>,
-    revalidate_by_unix_nanos: i64,
-}
-
-#[derive(Debug, Default)]
-enum FredGrantOperations {
-    #[default]
-    Fixed,
-    Legacy(Vec<FredOperation>),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyFredProviderRequest {
-    rights_artifact: ExactInputReference,
-    api_terms: ExactInputReference,
-    services_legal_terms: ExactInputReference,
-    privacy_policy: ExactInputReference,
-    grants: Vec<LegacyFredGrantRequest>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyFredGrantRequest {
-    series: SourceIdentifier,
-    owner: SourceIdentifier,
-    authorization_url: String,
-    authorization_document: ExactInputReference,
-    operations: Vec<FredOperation>,
-    effective_at_unix_nanos: i64,
-    expires_at_unix_nanos: i64,
-}
-
-impl From<LegacyFredProviderRequest> for FredProviderRequest {
-    fn from(request: LegacyFredProviderRequest) -> Self {
-        Self {
-            rights_artifact: request.rights_artifact,
-            terms: FredTermsRequest::ExactDocuments {
-                api_terms: request.api_terms,
-                services_legal_terms: request.services_legal_terms,
-                privacy_policy: request.privacy_policy,
-            },
-            service_permission: FredServicePermissionRequest::LegacyUnavailable,
-            grants: request
-                .grants
-                .into_iter()
-                .map(|grant| FredGrantRequest {
-                    series: grant.series,
-                    owner: grant.owner,
-                    evidence: FredGrantEvidenceRequest::OwnerPermission {
-                        authority_url: grant.authorization_url.clone(),
-                        evidence_reference_url: grant.authorization_url,
-                        document: grant.authorization_document,
-                    },
-                    operations: FredGrantOperations::Legacy(grant.operations),
-                    effective_at_unix_nanos: grant.effective_at_unix_nanos,
-                    expires_at_unix_nanos: grant.expires_at_unix_nanos,
-                })
-                .collect(),
-        }
-    }
+    provider_dataset: SourceIdentifier,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3195,22 +3909,6 @@ struct LoadedActivationEvidence {
 }
 
 impl LoadedActivationEvidence {
-    fn from_user(
-        root: &UserAuthorizedInputRoot,
-        request: &ActivationRequest,
-    ) -> Result<Self, CliProviderActivationError> {
-        let mut objects = BTreeMap::new();
-        for bounded in evidence_references(request)? {
-            let input = read_exact_input(root, bounded.reference, bounded.maximum_bytes)?;
-            let exact = ExactActivationInput {
-                bytes: Arc::from(input.as_bytes()),
-                digest: input.digest(),
-            };
-            insert_evidence(&mut objects, bounded.reference, exact)?;
-        }
-        Ok(Self { objects })
-    }
-
     fn from_durable(
         state: &DurableProviderActivationState,
         request: &ActivationRequest,
@@ -3243,7 +3941,7 @@ impl LoadedActivationEvidence {
             .map_err(|_| CliProviderActivationError::InputUnavailable)?;
         if length > maximum_bytes
             || input.digest().algorithm() != DigestAlgorithm::Sha256
-            || input.digest().bytes() != expected.bytes()
+            || input.digest().bytes() != expected
         {
             return Err(CliProviderActivationError::InputUnavailable);
         }
@@ -3293,7 +3991,19 @@ fn evidence_references(
                 return Err(CliProviderActivationError::ProviderConfiguration);
             }
         }
-        ProviderRequest::TreasuryFiscal { .. } | ProviderRequest::TreasuryDailyRates { .. } => {}
+        ProviderRequest::TreasuryFiscal { .. }
+        | ProviderRequest::TreasuryDailyRates
+        | ProviderRequest::FederalReserveBoardH15
+        | ProviderRequest::YahooEnrichment
+        | ProviderRequest::TiingoStarterEodNav
+        | ProviderRequest::ControlledLocalFiles { .. } => {}
+        ProviderRequest::EiaElectricityPrice {
+            start_period,
+            end_period,
+        } => {
+            electricity_price_query(start_period.clone(), end_period.clone())
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+        }
         ProviderRequest::Bls {
             series_metadata, ..
         } => {
@@ -3310,59 +4020,8 @@ fn evidence_references(
             );
         }
         ProviderRequest::FredAlfred { configuration } => {
-            validate_reviewed_fred_scope(&configuration.service_permission, &configuration.grants)?;
-            let terms_maximum = u64::try_from(MAX_FRED_TERMS_DOCUMENT_BYTES)
-                .map_err(|_| CliProviderActivationError::InvalidRights)?;
-            references.push(BoundedExactReference {
-                reference: &configuration.rights_artifact,
-                maximum_bytes: FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES,
-            });
-            let FredTermsRequest::ExactDocuments {
-                api_terms,
-                services_legal_terms,
-                privacy_policy,
-            } = &configuration.terms
-            else {
-                return Err(CliProviderActivationError::InvalidRights);
-            };
-            references.extend([
-                BoundedExactReference {
-                    reference: api_terms,
-                    maximum_bytes: terms_maximum,
-                },
-                BoundedExactReference {
-                    reference: services_legal_terms,
-                    maximum_bytes: terms_maximum,
-                },
-                BoundedExactReference {
-                    reference: privacy_policy,
-                    maximum_bytes: terms_maximum,
-                },
-            ]);
-            if let FredServicePermissionRequest::ExactWrittenPermission { document, .. } =
-                &configuration.service_permission
-            {
-                references.push(BoundedExactReference {
-                    reference: document,
-                    maximum_bytes: u64::try_from(MAX_FRED_SERVICE_PERMISSION_BYTES)
-                        .map_err(|_| CliProviderActivationError::InvalidRights)?,
-                });
-            }
-            references.extend(
-                configuration
-                    .grants
-                    .iter()
-                    .map(|grant| BoundedExactReference {
-                        reference: match &grant.evidence {
-                            FredGrantEvidenceRequest::ReviewedPublicDomain { decision } => decision,
-                            FredGrantEvidenceRequest::PublicDomain { document, .. }
-                            | FredGrantEvidenceRequest::OwnerPermission { document, .. } => {
-                                document
-                            }
-                        },
-                        maximum_bytes: FRED_AUTHORIZATION_MAXIMUM_BYTES,
-                    }),
-            );
+            FredSource::series_identifier(&configuration.provider_dataset)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
         }
     }
     Ok(references)
@@ -3374,9 +4033,7 @@ fn insert_evidence(
     input: ExactActivationInput,
 ) -> Result<(), CliProviderActivationError> {
     let expected = validate_reference_digest(reference)?;
-    if input.digest().algorithm() != DigestAlgorithm::Sha256
-        || input.digest().bytes() != expected.bytes()
-    {
+    if input.digest().algorithm() != DigestAlgorithm::Sha256 || input.digest().bytes() != expected {
         return Err(CliProviderActivationError::InvalidRequest);
     }
     if let Some(existing) = objects.get(&reference.sha256) {
@@ -3391,104 +4048,22 @@ fn insert_evidence(
 
 fn validate_reference_digest(
     reference: &ExactInputReference,
-) -> Result<Sha256Digest, CliProviderActivationError> {
-    Sha256Digest::from_lower_hex(&reference.sha256)
-        .map_err(|_| CliProviderActivationError::InvalidRequest)
-}
-
-fn read_request(
-    path: &Path,
-) -> Result<(UserAuthorizedInputRoot, BoundedInput, ActivationRequest), CliProviderActivationError>
-{
-    let absolute =
-        std::path::absolute(path).map_err(|_| CliProviderActivationError::InputUnavailable)?;
-    if absolute
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(CliProviderActivationError::InputUnavailable);
-    }
-    let parent = absolute
-        .parent()
-        .ok_or(CliProviderActivationError::InputUnavailable)?;
-    let name = absolute
-        .file_name()
-        .ok_or(CliProviderActivationError::InputUnavailable)?;
-    let root = UserAuthorizedInputRoot::open(parent)
-        .map_err(|_| CliProviderActivationError::InputUnavailable)?;
-    let input = read_input(&root, Path::new(name), REQUEST_MAXIMUM_BYTES)?;
-    let request = decode_request(input.as_bytes())?;
-    Ok((root, input, request))
+) -> Result<[u8; 32], CliProviderActivationError> {
+    decode_lower_hex_sha256(&reference.sha256)
 }
 
 fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivationError> {
-    #[derive(Deserialize)]
-    struct SchemaProbe {
-        schema_version: u16,
-    }
-
-    let schema: SchemaProbe =
-        serde_json::from_slice(bytes).map_err(|_| CliProviderActivationError::InvalidRequest)?;
-    match schema.schema_version {
-        REQUEST_SCHEMA_VERSION => {
-            let request: ActivationRequest = serde_json::from_slice(bytes)
-                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
-            if request.schema_version != REQUEST_SCHEMA_VERSION {
-                return Err(CliProviderActivationError::InvalidRequest);
-            }
-            Ok(request)
-        }
-        PREVIOUS_REQUEST_SCHEMA_VERSION => {
-            let mut request: ActivationRequest = serde_json::from_slice(bytes)
-                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
-            if request.schema_version != PREVIOUS_REQUEST_SCHEMA_VERSION
-                || matches!(&request.provider, ProviderRequest::FredAlfred { .. })
-            {
-                return Err(CliProviderActivationError::InvalidRequest);
-            }
-            request.schema_version = REQUEST_SCHEMA_VERSION;
-            Ok(request)
-        }
-        LEGACY_REQUEST_SCHEMA_VERSION => {
-            let request: LegacyActivationRequest = serde_json::from_slice(bytes)
-                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
-            if request.schema_version != LEGACY_REQUEST_SCHEMA_VERSION {
-                return Err(CliProviderActivationError::InvalidRequest);
-            }
-            Ok(ActivationRequest {
-                schema_version: REQUEST_SCHEMA_VERSION,
-                session_id: request.session_id,
-                provider: request.provider.into(),
-            })
-        }
-        _ => Err(CliProviderActivationError::InvalidRequest),
-    }
-}
-
-fn read_input(
-    root: &UserAuthorizedInputRoot,
-    reference: &Path,
-    maximum_bytes: u64,
-) -> Result<BoundedInput, CliProviderActivationError> {
-    root.resolve(reference)
-        .and_then(|input| input.open_bounded(maximum_bytes))
-        .and_then(|input| input.read_bounded())
-        .map_err(|_| CliProviderActivationError::InputUnavailable)
-}
-
-fn read_exact_input(
-    root: &UserAuthorizedInputRoot,
-    reference: &ExactInputReference,
-    maximum_bytes: u64,
-) -> Result<BoundedInput, CliProviderActivationError> {
-    let input = read_input(root, &reference.path, maximum_bytes)?;
-    let expected = validate_reference_digest(reference)?;
-    if input.digest().algorithm() != DigestAlgorithm::Sha256
-        || input.digest().bytes() != expected.bytes()
+    if bytes.is_empty()
+        || u64::try_from(bytes.len()).map_or(true, |length| length > REQUEST_MAXIMUM_BYTES)
     {
         return Err(CliProviderActivationError::InvalidRequest);
     }
-    Ok(input)
+    let request: ActivationRequest =
+        serde_json::from_slice(bytes).map_err(|_| CliProviderActivationError::InvalidRequest)?;
+    if request.schema_version != REQUEST_SCHEMA_VERSION {
+        return Err(CliProviderActivationError::InvalidRequest);
+    }
+    Ok(request)
 }
 
 fn require_surface(
@@ -3553,6 +4128,74 @@ fn source_id(
         .map_err(|_| CliProviderActivationError::InvalidRequest)
 }
 
+fn sha256_evidence(value: &str) -> Result<EvidenceDigest, CliProviderActivationError> {
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        decode_lower_hex_sha256(value)?,
+    ))
+}
+
+fn controlled_local_file_metadata(
+    lease: &ProviderActivationLease,
+    activation_evidence: EvidenceDigest,
+    manifest_digest: EvidenceDigest,
+    admitted_at: Timestamp,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let source_id = source_id("controlled-files", lease.surface_id())?;
+    let digest = lower_hex(&manifest_digest.bytes());
+    let short = digest
+        .get(..24)
+        .ok_or(CliProviderActivationError::InvalidMetadata)?;
+    let revision = MetadataRevision::new(
+        SourceIdentifier::try_from(format!("manifest-{short}"))
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+    );
+    let provider = SourceIdentifier::try_from("user-imported-local-files")
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let basis = SourceIdentifier::try_from("controlled-user-import")
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let manifest_evidence = ExactPayloadEvidence::from_content_digest(manifest_digest);
+    let authorization_evidence = ExactPayloadEvidence::from_content_digest(activation_evidence);
+    let effective = EffectiveInterval::new(admitted_at, None)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        source_id,
+        RevisionBoundPayloadEvidence::new(revision, manifest_evidence.clone()),
+        SourceClass::LocalFile,
+        provider,
+        AuthorizationGrant::new(
+            AuthorizationMode::UserOwnedLocal,
+            AuthorizationBasis::new(basis),
+            authorization_evidence,
+            effective,
+        ),
+        SourceCoverage::try_non_instrument(
+            manifest_evidence,
+            effective,
+            CoverageDomain::AlternativeData,
+            CoverageDelay::Delayed(1),
+            DeliveryEvidence::Unknown,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        DataQuality::DirectUnverified,
+        NetworkAccessPolicy::Denied,
+        FreshnessPolicy::try_new(1, 1, 1, 1, 0)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        None,
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::RevisionPreserving,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "every parameter is an independent source-metadata authority dimension"
@@ -3571,6 +4214,26 @@ fn metadata(
     budget: ProviderBudgetPolicy,
 ) -> Result<SourceMetadata, CliProviderActivationError> {
     let source_id = source_id(source_tag, lease.surface_id())?;
+    let revision_evidence = activation_revision_evidence(evidence)?;
+    metadata_with_source_id(
+        lease,
+        evidence,
+        revision_evidence,
+        source_id,
+        provider,
+        source_class,
+        coverage_domain,
+        authorization_mode,
+        historical,
+        effective,
+        network,
+        budget,
+    )
+}
+
+fn activation_revision_evidence(
+    evidence: EvidenceDigest,
+) -> Result<RevisionBoundPayloadEvidence, CliProviderActivationError> {
     let digest = lower_hex(&evidence.bytes());
     let short = digest
         .get(..24)
@@ -3579,6 +4242,30 @@ fn metadata(
         SourceIdentifier::try_from(format!("activation-{short}"))
             .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
     );
+    Ok(RevisionBoundPayloadEvidence::new(
+        revision,
+        ExactPayloadEvidence::from_content_digest(evidence),
+    ))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every parameter is an independent source-metadata authority dimension"
+)]
+fn metadata_with_source_id(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    revision_evidence: RevisionBoundPayloadEvidence,
+    source_id: SourceId,
+    provider: &str,
+    source_class: SourceClass,
+    coverage_domain: CoverageDomain,
+    authorization_mode: AuthorizationMode,
+    historical: HistoricalCapability,
+    effective: EffectiveInterval,
+    network: EndpointPolicy,
+    budget: ProviderBudgetPolicy,
+) -> Result<SourceMetadata, CliProviderActivationError> {
     let provider = SourceIdentifier::try_from(provider)
         .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     let basis = match authorization_mode {
@@ -3595,7 +4282,7 @@ fn metadata(
     SourceMetadata::try_new(SourceMetadataInput::new(
         SchemaVersion::CURRENT,
         source_id,
-        RevisionBoundPayloadEvidence::new(revision, exact.clone()),
+        revision_evidence,
         source_class,
         provider,
         AuthorizationGrant::new(
@@ -3636,12 +4323,219 @@ fn metadata(
     .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
+fn yahoo_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    provider_market_metadata(
+        lease,
+        evidence,
+        SourceId::try_from(YAHOO_SOURCE_ID)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        "yahoo-finance-experimental",
+        AuthorizationMode::PublicInterface,
+        effective,
+        yahoo_network_policy()?,
+        None,
+        HistoricalCapability::Historical,
+        vec![AssetClass::Equity, AssetClass::Fund, AssetClass::Index],
+    )
+}
+
+fn tiingo_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let declaration = tiingo_provider_rate_declaration()
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    provider_market_metadata(
+        lease,
+        evidence,
+        SourceId::try_from(TIINGO_SOURCE_ID)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        TIINGO_SOURCE_ID,
+        AuthorizationMode::UserAuthorized,
+        effective,
+        tiingo_network_policy()?,
+        Some(declaration.policy().clone()),
+        HistoricalCapability::Historical,
+        vec![AssetClass::Equity, AssetClass::Fund],
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "provider market coverage, authorization, network, and budget stay explicit"
+)]
+fn provider_market_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    source_id: SourceId,
+    provider: &str,
+    authorization_mode: AuthorizationMode,
+    effective: EffectiveInterval,
+    network: EndpointPolicy,
+    budget: Option<ProviderBudgetPolicy>,
+    historical: HistoricalCapability,
+    asset_classes: Vec<AssetClass>,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let digest = lower_hex(&evidence.bytes());
+    let short = digest
+        .get(..24)
+        .ok_or(CliProviderActivationError::InvalidMetadata)?;
+    let revision = MetadataRevision::new(
+        SourceIdentifier::try_from(format!("activation-{short}"))
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+    );
+    let provider = SourceIdentifier::try_from(provider)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let basis = match authorization_mode {
+        AuthorizationMode::PublicInterface => {
+            SourceIdentifier::try_from("official-public-interface")
+                .map_err(|_| CliProviderActivationError::InvalidMetadata)?
+        }
+        AuthorizationMode::UserAuthorized => authorization_subject(lease)?,
+        AuthorizationMode::Licensed | AuthorizationMode::UserOwnedLocal => {
+            return Err(CliProviderActivationError::InvalidMetadata);
+        }
+    };
+    let exact = ExactPayloadEvidence::from_content_digest(evidence);
+    SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        source_id,
+        RevisionBoundPayloadEvidence::new(revision, exact.clone()),
+        SourceClass::LicensedDataset,
+        provider,
+        AuthorizationGrant::new(
+            authorization_mode,
+            AuthorizationBasis::new(basis),
+            exact.clone(),
+            effective,
+        ),
+        SourceCoverage::try_instrument(
+            exact,
+            effective,
+            asset_classes,
+            CoverageTopology::not_applicable(),
+            InstrumentCoverage::partial(),
+            None,
+            CoverageDelay::Delayed(1),
+            DeliveryEvidence::Indirect,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        DataQuality::Aggregated,
+        NetworkAccessPolicy::Allowlisted(network),
+        FreshnessPolicy::try_new(
+            MINUTE_NANOS,
+            MINUTE_NANOS,
+            DAY_NANOS,
+            DAY_NANOS,
+            SECOND_NANOS,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        budget,
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            historical,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)
+}
+
+fn yahoo_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
+    let query_keys = [
+        "corsDomain",
+        "count",
+        "date",
+        "enableCb",
+        "enableCulturalAssets",
+        "enableFuzzyQuery",
+        "enableNavLinks",
+        "enableResearchReports",
+        "events",
+        "fetchPricingData",
+        "formatted",
+        "includeAdjustedClose",
+        "interval",
+        "lang",
+        "listsCount",
+        "modules",
+        "newsCount",
+        "period1",
+        "period2",
+        "q",
+        "query",
+        "quotesCount",
+        "range",
+        "recommendedCount",
+        "region",
+        "start",
+        "symbol",
+        "symbols",
+        "type",
+    ];
+    let query_rules = || {
+        query_keys
+            .iter()
+            .copied()
+            .map(|key| {
+                QueryParameterRule::try_new(
+                    SourceIdentifier::try_from(key)
+                        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                    4_096,
+                    false,
+                    QuerySensitivity::Public,
+                )
+                .map_err(|_| CliProviderActivationError::InvalidMetadata)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let rules = [
+        "https://fc.yahoo.com",
+        "https://query1.finance.yahoo.com",
+        "https://query2.finance.yahoo.com",
+        "https://guce.yahoo.com",
+        "https://consent.yahoo.com",
+        "https://finance.yahoo.com",
+    ]
+    .into_iter()
+    .map(|endpoint| {
+        ApiEndpointRule::try_new(endpoint, PathScope::Descendants, query_rules()?, 32, 16_384)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    EndpointPolicy::try_from_api_rules(rules, request_bounds(4 * 1024 * 1024)?)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)
+}
+
+fn tiingo_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
+    let rule = ApiEndpointRule::try_new(
+        "https://api.tiingo.com/tiingo/daily",
+        PathScope::Descendants,
+        query_rules(&[("startDate", 10), ("endDate", 10)])?,
+        2,
+        64,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(2 * 1024 * 1024)?)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)
+}
+
 fn authorization_subject(
     lease: &ProviderActivationLease,
 ) -> Result<SourceIdentifier, CliProviderActivationError> {
     let provider = match lease.surface_id().as_str() {
         BLS_REGISTERED_SURFACE => "us-bls",
         FRED_SURFACE => "fred",
+        TIINGO_SURFACE => TIINGO_SOURCE_ID,
+        "eia.api-v2" => "us-eia",
         _ => return Err(CliProviderActivationError::InvalidMetadata),
     };
     let provider = SourceIdentifier::try_from(provider)
@@ -3706,22 +4600,13 @@ fn nonzero_u64(value: u64) -> Result<NonZeroU64, CliProviderActivationError> {
 fn fred_budget(
     lease: &ProviderActivationLease,
 ) -> Result<ProviderBudgetPolicy, CliProviderActivationError> {
-    // Match the capability-level conservative ceiling for the combined v1/v2 surface. The
-    // retained official two-per-second evidence is v2-specific, not a claimed v1 provider limit.
-    let windows = [
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(SECOND_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(120).ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(MINUTE_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-    ];
+    // One account-scoped lane governs every v1 and v2 endpoint on this source metadata.
+    let windows = [ProviderBudgetWindow::try_new(
+        NonZeroU32::new(1).ok_or(CliProviderActivationError::InvalidMetadata)?,
+        nonzero_u64(SECOND_NANOS)?,
+        BudgetWindowSemantics::Sliding,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?];
     ProviderBudgetPolicy::try_new_conjunctive(
         BudgetScope::with_authorization_account(
             SourceIdentifier::try_from("fred")
@@ -3729,7 +4614,7 @@ fn fred_budget(
             authorization_subject(lease)?,
         ),
         &windows,
-        NonZeroU16::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
+        NonZeroU16::new(1).ok_or(CliProviderActivationError::InvalidMetadata)?,
         backoff()?,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)
@@ -3769,70 +4654,6 @@ fn bls_series(
             .map_err(|_| CliProviderActivationError::ProviderConfiguration)
         })
         .collect()
-}
-
-fn bls_budget(
-    lease: &ProviderActivationLease,
-    mode: AuthorizationMode,
-    daily_queries: u16,
-) -> Result<ProviderBudgetPolicy, CliProviderActivationError> {
-    let provider = SourceIdentifier::try_from("us-bls")
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    let account = match mode {
-        AuthorizationMode::PublicInterface => None,
-        AuthorizationMode::UserAuthorized => Some(authorization_subject(lease)?),
-        AuthorizationMode::Licensed | AuthorizationMode::UserOwnedLocal => {
-            return Err(CliProviderActivationError::InvalidMetadata);
-        }
-    };
-    let scope = match account {
-        Some(account) => BudgetScope::with_authorization_account(provider, account),
-        None => BudgetScope::new(provider),
-    };
-    let windows = [
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(50).ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(10 * SECOND_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(u32::from(daily_queries))
-                .ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(DAY_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-    ];
-    ProviderBudgetPolicy::try_new_conjunctive(
-        scope,
-        &windows,
-        NonZeroU16::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
-        backoff()?,
-    )
-    .map_err(|_| CliProviderActivationError::InvalidMetadata)
-}
-
-fn sec_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
-    let rules = [
-        ("https://data.sec.gov/submissions", PathScope::Descendants),
-        (
-            "https://data.sec.gov/api/xbrl/companyfacts",
-            PathScope::Descendants,
-        ),
-        (
-            "https://www.sec.gov/Archives/edgar/data",
-            PathScope::Descendants,
-        ),
-    ]
-    .into_iter()
-    .map(|(endpoint, scope)| {
-        ApiEndpointRule::try_new(endpoint, scope, Vec::new(), 1, 1)
-            .map_err(|_| CliProviderActivationError::InvalidMetadata)
-    })
-    .collect::<Result<Vec<_>, _>>()?;
-    EndpointPolicy::try_from_api_rules(rules, request_bounds(64 * 1024 * 1024)?)
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
 fn sec_state(
@@ -3947,7 +4768,66 @@ fn treasury_metadata(
         HistoricalCapability::Historical,
         effective,
         network,
-        simple_budget("us-treasury", 100, MINUTE_NANOS, 2, None)?,
+        lease
+            .provider_budget_policy()
+            .cloned()
+            .ok_or(CliProviderActivationError::InvalidMetadata)?,
+    )
+}
+
+fn federal_reserve_board_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+    profile: &BoardDatasetProfile,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let contract = profile.contract();
+    let rolling_date_count =
+        BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT.to_string();
+    let exact_query =
+        |key: &str, value: &str| -> Result<QueryParameterRule, CliProviderActivationError> {
+            QueryParameterRule::try_new_exact_public(
+                SourceIdentifier::try_from(key)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SourceIdentifier::try_from(value)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)
+        };
+    let rule = ApiEndpointRule::try_new(
+        without_query(contract.url())?,
+        PathScope::Exact,
+        vec![
+            exact_query("filetype", "csv")?,
+            exact_query("label", "include")?,
+            exact_query("lastobs", &rolling_date_count)?,
+            exact_query("layout", "seriescolumn")?,
+            exact_query("rel", "H15")?,
+            exact_query("series", "bf17364827e38702b42a58cf8eaa3f78")?,
+            exact_query("type", "package")?,
+        ],
+        7,
+        256,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    // Match the closed one-megabyte parser ceiling owned by the rolling dashboard profile.
+    let network = EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(1024 * 1024)?)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let source_id = SourceId::try_from(BOARD_DDP_SOURCE_ID)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    metadata_with_source_id(
+        lease,
+        evidence,
+        activation_revision_evidence(evidence)?,
+        source_id,
+        "federal-reserve-board",
+        SourceClass::OfficialAgency,
+        CoverageDomain::Macroeconomic,
+        AuthorizationMode::PublicInterface,
+        HistoricalCapability::Historical,
+        effective,
+        network,
+        simple_budget("federal-reserve-board", 1, MINUTE_NANOS, 1, None)?,
     )
 }
 
@@ -3977,199 +4857,19 @@ fn without_query(url: &str) -> Result<&str, CliProviderActivationError> {
 }
 
 fn fred_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
-    let rules = [
-        ("api_key", QuerySensitivity::Secret, 32),
-        ("series_id", QuerySensitivity::Public, 120),
-        ("realtime_start", QuerySensitivity::Public, 10),
-        ("realtime_end", QuerySensitivity::Public, 10),
-        ("limit", QuerySensitivity::Public, 6),
-        ("offset", QuerySensitivity::Public, 20),
-        ("sort_order", QuerySensitivity::Public, 4),
-        ("output_type", QuerySensitivity::Public, 1),
-        ("file_type", QuerySensitivity::Public, 4),
-    ]
-    .into_iter()
-    .map(|(key, sensitivity, maximum)| {
-        QueryParameterRule::try_new(
-            SourceIdentifier::try_from(key)
-                .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-            maximum,
-            false,
-            sensitivity,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)
-    })
-    .collect::<Result<Vec<_>, _>>()?;
-    let observations = ApiEndpointRule::try_new(
-        "https://api.stlouisfed.org/fred/series/observations",
-        PathScope::Exact,
-        rules,
-        10,
-        1_024,
-    )
-    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    let series =
-        fred_series_endpoint_rule().map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     EndpointPolicy::try_from_api_rules(
-        vec![observations, series],
+        vec![
+            fred_observations_endpoint_rule(),
+            fred_series_endpoint_rule(),
+            fred_vintage_dates_endpoint_rule(),
+            fred_release_observations_v2_endpoint_rule(),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
         request_bounds(64 * 1024 * 1024)?,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)
-}
-
-fn fred_policy(
-    inputs: &LoadedActivationEvidence,
-    artifact_reference: &ExactInputReference,
-    terms: FredTermsRequest,
-    service_permission: FredServicePermissionRequest,
-    grants: Vec<FredGrantRequest>,
-) -> Result<FredRightsPolicy, CliProviderActivationError> {
-    validate_reviewed_fred_scope(&service_permission, &grants)?;
-    let artifact = inputs.read(artifact_reference, FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES)?;
-    let artifact = match terms {
-        FredTermsRequest::ReviewedCurrent => {
-            return Err(CliProviderActivationError::InvalidRights);
-        }
-        FredTermsRequest::ExactDocuments {
-            api_terms,
-            services_legal_terms,
-            privacy_policy,
-        } => {
-            let maximum = u64::try_from(MAX_FRED_TERMS_DOCUMENT_BYTES)
-                .map_err(|_| CliProviderActivationError::InvalidRights)?;
-            let api_terms = inputs.read(&api_terms, maximum)?;
-            let services = inputs.read(&services_legal_terms, maximum)?;
-            let privacy = inputs.read(&privacy_policy, maximum)?;
-            let documents = [
-                FredTermsDocumentBytes::try_new(
-                    FredTermsDocumentRole::ApiTerms,
-                    api_terms.as_bytes(),
-                ),
-                FredTermsDocumentBytes::try_new(
-                    FredTermsDocumentRole::FredServicesLegalTerms,
-                    services.as_bytes(),
-                ),
-                FredTermsDocumentBytes::try_new(
-                    FredTermsDocumentRole::PrivacyPolicy,
-                    privacy.as_bytes(),
-                ),
-            ]
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| CliProviderActivationError::InvalidRights)?;
-            FredRightsArtifact::parse_current_reviewed(artifact.as_bytes(), &documents)
-        }
-    }
-    .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let terms_digest = artifact.terms_evidence().bundle_digest();
-    let FredServicePermissionRequest::ExactWrittenPermission {
-        channel,
-        document,
-        review,
-    } = service_permission
-    else {
-        return Err(CliProviderActivationError::InvalidRights);
-    };
-    let FredServicePermissionReviewRequest {
-        reviewer,
-        reviewed_at_unix_nanos,
-        issuer,
-        application,
-        service,
-        series,
-        operations,
-        conditions,
-        effective_at_unix_nanos,
-        expires_at_unix_nanos,
-        revalidate_by_unix_nanos,
-    } = *review;
-    if operations.len() != FRED_SERVICE_OPERATIONS.len()
-        || operations.iter().copied().collect::<BTreeSet<_>>()
-            != FRED_SERVICE_OPERATIONS.into_iter().collect()
-    {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
-    let permission_document = inputs.read(
-        &document,
-        u64::try_from(MAX_FRED_SERVICE_PERMISSION_BYTES)
-            .map_err(|_| CliProviderActivationError::InvalidRights)?,
-    )?;
-    let FredServicePermissionChannelRequest::OfficialHttps {
-        evidence_url,
-        authority_url,
-    } = channel;
-    let channel = FredServicePermissionChannel::try_official_https(evidence_url, authority_url)
-        .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let review = FredServicePermissionReview::try_new(
-        reviewer,
-        Timestamp::from_unix_nanos(reviewed_at_unix_nanos),
-        issuer,
-        application,
-        service,
-        series,
-        operations,
-        conditions,
-        Timestamp::from_unix_nanos(effective_at_unix_nanos),
-        expires_at_unix_nanos.map(Timestamp::from_unix_nanos),
-        Timestamp::from_unix_nanos(revalidate_by_unix_nanos),
-    )
-    .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let service_permission = FredServicePermissionEvidence::try_new(
-        channel,
-        review,
-        terms_digest,
-        Sha256Digest::from_bytes(permission_document.digest().bytes()),
-        permission_document.as_bytes().len(),
-        permission_document.as_bytes(),
-    )
-    .map_err(|_| CliProviderActivationError::InvalidRights)?;
-    let service_end = service_permission
-        .expires_at()
-        .map_or(service_permission.revalidate_by(), |expires_at| {
-            expires_at.min(service_permission.revalidate_by())
-        });
-    let grants = grants
-        .into_iter()
-        .map(|grant| {
-            let effective_at = Timestamp::from_unix_nanos(grant.effective_at_unix_nanos);
-            let expires_at = Timestamp::from_unix_nanos(grant.expires_at_unix_nanos);
-            if effective_at.max(service_permission.effective_at()) >= expires_at.min(service_end) {
-                return Err(CliProviderActivationError::InvalidRights);
-            }
-            let operations = match grant.operations {
-                FredGrantOperations::Fixed => FRED_SERIES_OPERATIONS.to_vec(),
-                FredGrantOperations::Legacy(legacy_operations) => {
-                    drop(legacy_operations);
-                    return Err(CliProviderActivationError::InvalidRights);
-                }
-            };
-            let evidence = match grant.evidence {
-                FredGrantEvidenceRequest::ReviewedPublicDomain { decision } => {
-                    let decision = inputs.read(&decision, FRED_AUTHORIZATION_MAXIMUM_BYTES)?;
-                    FredSeriesRightsEvidence::parse_reviewed_unrate_public_domain(
-                        decision.as_bytes(),
-                    )
-                }
-                FredGrantEvidenceRequest::PublicDomain { .. }
-                | FredGrantEvidenceRequest::OwnerPermission { .. } => {
-                    return Err(CliProviderActivationError::InvalidRights);
-                }
-            }
-            .map_err(|_| CliProviderActivationError::InvalidRights)?;
-            FredSeriesRightsGrant::try_new_with_evidence(
-                grant.series,
-                grant.owner,
-                evidence,
-                terms_digest,
-                operations,
-                effective_at,
-                expires_at,
-            )
-            .map_err(|_| CliProviderActivationError::InvalidRights)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    FredRightsPolicy::try_new(artifact, Some(service_permission), grants)
-        .map_err(|_| CliProviderActivationError::InvalidRights)
 }
 
 fn lower_hex(bytes: &[u8; 32]) -> String {
@@ -4182,11 +4882,41 @@ fn lower_hex(bytes: &[u8; 32]) -> String {
     value
 }
 
+fn decode_lower_hex_sha256(value: &str) -> Result<[u8; 32], CliProviderActivationError> {
+    let encoded = value.as_bytes();
+    if encoded.len() != 64 {
+        return Err(CliProviderActivationError::InvalidRequest);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in encoded.chunks_exact(2).enumerate() {
+        let high = lower_hex_nibble(pair[0]).ok_or(CliProviderActivationError::InvalidRequest)?;
+        let low = lower_hex_nibble(pair[1]).ok_or(CliProviderActivationError::InvalidRequest)?;
+        decoded[index] = high * 16 + low;
+    }
+    Ok(decoded)
+}
+
+const fn lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn treasury_publication_deadline() -> Result<Instant, CliProviderActivationError> {
+    Instant::now()
+        .checked_add(super::TREASURY_ANALYTICAL_STARTUP_TIMEOUT)
+        .ok_or(CliProviderActivationError::StateUnavailable)
+}
+
 fn map_portal_activation_error(error: CliProviderActivationError) -> ProviderPortalActivationError {
     match error {
         CliProviderActivationError::Cancelled => ProviderPortalActivationError::Cancelled,
         CliProviderActivationError::StateUnavailable
-        | CliProviderActivationError::InputUnavailable => {
+        | CliProviderActivationError::InputUnavailable
+        | CliProviderActivationError::TreasuryPublication(_)
+        | CliProviderActivationError::CancellationCleanup { .. } => {
             ProviderPortalActivationError::StateUnavailable
         }
         CliProviderActivationError::InvalidRequest
@@ -4200,6 +4930,53 @@ fn map_portal_activation_error(error: CliProviderActivationError) -> ProviderPor
         CliProviderActivationError::Onboarding(_) | CliProviderActivationError::Activation(_) => {
             ProviderPortalActivationError::Unavailable
         }
+    }
+}
+
+fn map_schwab_oauth_error(error: SchwabOAuthRuntimeError) -> ProviderPortalActivationError {
+    match error {
+        SchwabOAuthRuntimeError::InvalidSession
+        | SchwabOAuthRuntimeError::DifferentSessionOwned => {
+            ProviderPortalActivationError::InvalidRequest
+        }
+        SchwabOAuthRuntimeError::Cancelled
+        | SchwabOAuthRuntimeError::Browser(SchwabOAuthBrowserError::Cancelled)
+        | SchwabOAuthRuntimeError::Callback(OAuthLoopbackError::Cancelled)
+        | SchwabOAuthRuntimeError::Onboarding(ProviderOnboardingError::OperationCancelled) => {
+            ProviderPortalActivationError::Cancelled
+        }
+        SchwabOAuthRuntimeError::InvalidState
+        | SchwabOAuthRuntimeError::RuntimeRootUnavailable
+        | SchwabOAuthRuntimeError::RuntimeRootAlreadyOwned
+        | SchwabOAuthRuntimeError::MarketEpochUnavailable
+        | SchwabOAuthRuntimeError::MarketAuthorityRetained
+        | SchwabOAuthRuntimeError::CallbackTask
+        | SchwabOAuthRuntimeError::ExchangeTask
+        | SchwabOAuthRuntimeError::ShutdownDeadline
+        | SchwabOAuthRuntimeError::ShutdownStillDraining
+        | SchwabOAuthRuntimeError::Clock
+        | SchwabOAuthRuntimeError::Authority(_)
+        | SchwabOAuthRuntimeError::Onboarding(_) => ProviderPortalActivationError::StateUnavailable,
+        SchwabOAuthRuntimeError::InvalidConfiguration
+        | SchwabOAuthRuntimeError::ShuttingDown
+        | SchwabOAuthRuntimeError::OperationCapacity
+        | SchwabOAuthRuntimeError::CallbackAlreadyOwned
+        | SchwabOAuthRuntimeError::ReauthorizationRequired
+        | SchwabOAuthRuntimeError::AuthorizationExchangeInFlight
+        | SchwabOAuthRuntimeError::MarketAuthorityRevoked
+        | SchwabOAuthRuntimeError::RandomUnavailable
+        | SchwabOAuthRuntimeError::Browser(_)
+        | SchwabOAuthRuntimeError::MarketDrain(_)
+        | SchwabOAuthRuntimeError::Callback(_) => ProviderPortalActivationError::Unavailable,
+    }
+}
+
+fn map_schwab_doctor_onboarding_error(
+    error: ProviderOnboardingError,
+) -> ProviderPortalActivationError {
+    match error {
+        ProviderOnboardingError::OperationCancelled => ProviderPortalActivationError::Cancelled,
+        _ => ProviderPortalActivationError::Unavailable,
     }
 }
 
@@ -4224,10 +5001,36 @@ pub enum CliProviderActivationError {
     StateUnavailable,
     #[error("provider activation was cancelled")]
     Cancelled,
+    #[error("Treasury publication failed before cancellation cleanup also failed")]
+    CancellationCleanup {
+        publication: Box<CliProviderActivationError>,
+        #[source]
+        cleanup: Box<CliProviderActivationError>,
+    },
+    #[error("Treasury publication is unavailable")]
+    TreasuryPublication(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Onboarding(crate::ProviderOnboardingError),
     #[error(transparent)]
     Activation(crate::ProviderAdapterActivationError),
+}
+
+impl CliProviderActivationError {
+    fn is_cancellation(&self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            Self::TreasuryPublication(error) => {
+                matches!(
+                    error.downcast_ref::<market_squawk_services::ServiceError>(),
+                    Some(market_squawk_services::ServiceError::Cancelled)
+                ) || error
+                    .downcast_ref::<crate::provider_activation::TreasuryPublicationActivationError>(
+                    )
+                    .is_some_and(|error| error.is_terminal_cancellation())
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4236,123 +5039,105 @@ mod tests {
     use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
-    use market_squawk_data::OnboardingReservationRequest;
     use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
-    use market_squawk_sources::{
-        OnboardingEvent, OnboardingState, ProviderPublicConfiguration, built_in_provider_profiles,
-    };
+    use market_squawk_sources::{OnboardingState, ProviderPublicConfiguration};
 
     use super::*;
+    use crate::local_product::provider_activation_state::DurableSourceLifecyclePhase;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    #[test]
-    fn fred_request_v3_is_rejected_and_v2_retains_legacy_unavailable_authority() -> TestResult {
+    #[tokio::test]
+    async fn schwab_doctor_scheduler_coalesces_replacement_and_unlink_drain() -> TestResult {
+        let tasks = SchwabMarketDoctorTaskAuthority::new();
         let session_id = Uuid::new_v4();
-        let digest = "11".repeat(32);
-        let v3 = json!({
-            "schema_version": 3,
-            "session_id": session_id,
-            "provider": {
-                "kind": "fred_alfred",
-                "configuration": {
-                    "rights_artifact": {"path": "rights.json", "sha256": digest},
-                    "terms": {"kind": "reviewed_current"},
-                    "service_permission": {
-                        "kind": "exact_written_permission",
-                        "channel": {
-                            "kind": "official_https",
-                            "evidence_url": "https://fred.stlouisfed.org/contactus/permission",
-                            "authority_url": "https://fred.stlouisfed.org/contactus/"
-                        },
-                        "document": {"path": "bank-permission.bin", "sha256": digest},
-                        "review": {
-                            "reviewer": "local-rights-reviewer",
-                            "reviewed_at_unix_nanos": 1,
-                            "issuer": "federal-reserve-bank-of-st-louis",
-                            "application": "market-squawk",
-                            "service": "fred-api",
-                            "series": ["UNRATE"],
-                            "operations": ["persist", "cache", "archive", "train"],
-                            "conditions": [],
-                            "effective_at_unix_nanos": 1,
-                            "revalidate_by_unix_nanos": 2
-                        }
-                    },
-                    "grants": [{
-                        "series": "UNRATE",
-                        "owner": "us-bureau-of-labor-statistics",
-                        "evidence": {
-                            "kind": "reviewed_public_domain",
-                            "decision": {"path": "unrate.json", "sha256": digest}
-                        },
-                        "effective_at_unix_nanos": 1,
-                        "expires_at_unix_nanos": 2
-                    }]
-                }
-            }
-        });
-        assert!(matches!(
-            decode_request(&serde_json::to_vec(&v3)?),
-            Err(CliProviderActivationError::InvalidRequest)
-        ));
-        assert!(
-            serde_json::from_value::<FredServicePermissionChannelRequest>(json!({
-                "kind": "official_email",
-                "sender": "fred@stlouisfed.org",
-                "message_id": "<permission@example.stlouisfed.org>"
-            }))
-            .is_err()
-        );
-
-        let v2 = json!({
-            "schema_version": 2,
-            "session_id": session_id,
-            "provider": {
-                "kind": "fred_alfred",
-                "configuration": {
-                    "rights_artifact": {"path": "rights.json", "sha256": digest},
-                    "api_terms": {"path": "api.html", "sha256": digest},
-                    "services_legal_terms": {"path": "legal.html", "sha256": digest},
-                    "privacy_policy": {"path": "privacy.html", "sha256": digest},
-                    "grants": [{
-                        "series": "CPIAUCSL",
-                        "owner": "us-bureau-of-labor-statistics",
-                        "authorization_url": "https://www.bls.gov/",
-                        "authorization_document": {"path": "permission.txt", "sha256": digest},
-                        "operations": ["persist"],
-                        "effective_at_unix_nanos": 1,
-                        "expires_at_unix_nanos": 2
-                    }]
-                }
-            }
-        });
-        let legacy = decode_request(&serde_json::to_vec(&v2)?)?;
-        let ProviderRequest::FredAlfred { configuration } = legacy.provider else {
-            return Err("v2 FRED request decoded to the wrong provider".into());
+        let first_key = SchwabMarketDoctorTaskKey {
+            session_id,
+            access_token_generation: 1,
         };
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_starts = Arc::clone(&starts);
+        let (first_started_tx, first_started_rx) = oneshot::channel();
+        tasks
+            .schedule(first_key, move |cancellation| async move {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                let _sent = first_started_tx.send(());
+                cancellation.cancelled().await;
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), first_started_rx).await??;
+
+        let duplicate_starts = Arc::clone(&starts);
+        tasks
+            .schedule(first_key, move |_cancellation| async move {
+                duplicate_starts.fetch_add(1, Ordering::SeqCst);
+            })
+            .await?;
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        let replacement_key = SchwabMarketDoctorTaskKey {
+            session_id,
+            access_token_generation: 2,
+        };
+        let replacement_starts = Arc::clone(&starts);
+        let (replacement_started_tx, replacement_started_rx) = oneshot::channel();
+        tasks
+            .schedule(replacement_key, move |cancellation| async move {
+                replacement_starts.fetch_add(1, Ordering::SeqCst);
+                let _sent = replacement_started_tx.send(());
+                cancellation.cancelled().await;
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), replacement_started_rx).await??;
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+
+        tasks
+            .cancel_session(session_id, CancellationToken::new())
+            .await?;
+        assert!(tasks.task.lock().await.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fred_request_requires_current_v1_authority_and_retains_exact_dataset() -> TestResult {
+        assert_eq!(current_fred_revision()?.get(), 1);
+        let session_id = Uuid::new_v4();
+        let mut request = json!({
+            "schema_version": REQUEST_SCHEMA_VERSION,
+            "session_id": session_id,
+            "provider": {
+                "kind": "fred_alfred",
+                "configuration": {
+                    "provider_dataset": "alfred:series-observations:CPIAUCSL:1947-01-01:9999-12-31"
+                }
+            }
+        });
+        let decoded = decode_request(&serde_json::to_vec(&request)?)?;
+        let ProviderRequest::FredAlfred { configuration } = decoded.provider else {
+            return Err("decoded request was not FRED/ALFRED".into());
+        };
+        assert_eq!(
+            configuration.provider_dataset.as_str(),
+            "alfred:series-observations:CPIAUCSL:1947-01-01:9999-12-31"
+        );
+        request["schema_version"] = json!(5);
         assert!(matches!(
-            configuration.terms,
-            FredTermsRequest::ExactDocuments { .. }
-        ));
-        assert!(matches!(
-            configuration.service_permission,
-            FredServicePermissionRequest::LegacyUnavailable
-        ));
-        assert!(matches!(
-            configuration.grants[0].evidence,
-            FredGrantEvidenceRequest::OwnerPermission { .. }
-        ));
-        assert!(matches!(
-            &configuration.grants[0].operations,
-            FredGrantOperations::Legacy(operations)
-                if operations == &[FredOperation::Persist]
+            decode_request(&serde_json::to_vec(&request)?),
+            Err(CliProviderActivationError::InvalidRequest)
         ));
         Ok(())
     }
 
     #[tokio::test]
     async fn post_staging_failure_restores_callable_predecessor_and_quarantines_candidate()
+    -> TestResult {
+        Box::pin(
+            post_staging_failure_restores_callable_predecessor_and_quarantines_candidate_body(),
+        )
+        .await
+    }
+
+    async fn post_staging_failure_restores_callable_predecessor_and_quarantines_candidate_body()
     -> TestResult {
         let temporary = tempfile::tempdir()?;
         let config = AppConfig::load(ConfigSources::new(
@@ -4363,7 +5148,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config.clone())?;
+        let product = crate::LocalProduct::try_new(config.clone()).await?;
         let predecessor_lease = prepared_treasury_lease(&product, "predecessor").await?;
         let (predecessor_bytes, predecessor_evidence, predecessor_request) =
             treasury_activation(&product, &predecessor_lease)?;
@@ -4391,11 +5176,16 @@ mod tests {
             .provider_activation()
             .research_runtime_generation(predecessor_lease.surface_id())?
             .ok_or("predecessor runtime was not published")?;
+        let fiscal_dataset = treasury_fiscal_release_query(state)?.0.dataset()?;
         assert!(
             product
                 .research_ingest()
                 .is_profile_registered(predecessor.profile())?
         );
+        let predecessor_source_identity = product
+            .research_ingest()
+            .treasury_all_history_source_identity_for_test(&predecessor, &fiscal_dataset)
+            .await?;
 
         let same_session_candidate_digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
@@ -4410,7 +5200,7 @@ mod tests {
             same_session_candidate_digest,
         )?;
         assert!(matches!(
-            state.load_recipe(TREASURY_FISCAL_SURFACE)?,
+            state.load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Staged(recipe)
                 if recipe.session_id == predecessor_lease.session_id()
                     && recipe.runtime_generation_digest == same_session_candidate_digest
@@ -4481,6 +5271,13 @@ mod tests {
                 .research_ingest()
                 .is_profile_registered(predecessor.profile())?
         );
+        assert!(
+            product
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(&predecessor, &fiscal_dataset)
+                .await
+                .is_err()
+        );
 
         reconcile_failed_replacement(
             state,
@@ -4516,6 +5313,13 @@ mod tests {
             product
                 .research_ingest()
                 .is_profile_registered(predecessor.profile())?
+        );
+        assert_eq!(
+            product
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(&predecessor, &fiscal_dataset)
+                .await?,
+            predecessor_source_identity
         );
         require_same_activation_lease(
             &product
@@ -4579,7 +5383,7 @@ mod tests {
             .provider_activation()
             .revoke_replacement_predecessor(&mut prepared)
             .await?;
-        let committed = product
+        let mut committed = product
             .provider_activation()
             .commit_research_replacement(&mut prepared)
             .await?;
@@ -4603,7 +5407,7 @@ mod tests {
         let recovery_cutover =
             state.commit_staged_cutover(TREASURY_FISCAL_SURFACE, recovery_staged)?;
         assert!(matches!(
-            state.load_recipe(TREASURY_FISCAL_SURFACE)?,
+            state.load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Cutover(recipe)
                 if recipe.session_id == recovery_lease.session_id()
                     && recipe.state_digest == recovery_cutover
@@ -4613,6 +5417,21 @@ mod tests {
             .provider_activation()
             .retire_replacement_predecessor(&committed, recovery_cutover)
             .await?;
+        let activated = product
+            .provider_activation()
+            .finalize_research_replacement(&mut committed)
+            .await?;
+        assert_eq!(activated.generation(), &recovery_candidate);
+        assert_ne!(
+            product
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(
+                    &recovery_candidate,
+                    &fiscal_dataset,
+                )
+                .await?,
+            predecessor_source_identity
+        );
         assert!(
             product
                 .provider_onboarding()
@@ -4625,7 +5444,7 @@ mod tests {
             &recovery_lease,
         )?;
         assert!(matches!(
-            state.load_recipe(TREASURY_FISCAL_SURFACE)?,
+            state.load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Cutover(recipe)
                 if recipe.session_id == recovery_lease.session_id()
                     && recipe.state_digest == recovery_cutover
@@ -4641,7 +5460,7 @@ mod tests {
         );
         drop(product);
 
-        let recovered = crate::LocalProduct::try_new(config)?;
+        let recovered = crate::LocalProduct::try_new(config.clone()).await?;
         assert!(matches!(
             recovered
                 .provider_activation_state()
@@ -4663,6 +5482,10 @@ mod tests {
                 .research_ingest()
                 .is_profile_registered(recovery_candidate.profile())?
         );
+        let _restarted_source_identity = recovered
+            .research_ingest()
+            .treasury_all_history_source_identity_for_test(&recovery_candidate, &fiscal_dataset)
+            .await?;
         assert_eq!(
             recovered
                 .provider_onboarding()
@@ -4671,11 +5494,106 @@ mod tests {
             OnboardingState::Blocked
         );
 
+        let lifecycle = recovered
+            .provider_activation_state()
+            .source_lifecycle_record(TREASURY_FISCAL_SURFACE)?;
+        let stopped_transition = recovered
+            .provider_activation_state()
+            .begin_source_lifecycle_transition(
+                TREASURY_FISCAL_SURFACE,
+                lifecycle.revision(),
+                SourceIdentifier::try_from("treasury-stopped-restart-proof")?,
+                EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    Sha256::digest(b"treasury-stopped-restart-proof").into(),
+                ),
+                false,
+                Some(recovery_lease.session_id()),
+                Some(recovery_lease.public_configuration_digest()),
+            )?;
+        recovered
+            .provider_activation()
+            .revoke_research_runtime(&recovery_candidate)
+            .await?;
+        assert!(
+            recovered
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(
+                    &recovery_candidate,
+                    &fiscal_dataset,
+                )
+                .await
+                .is_err()
+        );
+        recovered
+            .provider_activation_state()
+            .complete_source_lifecycle_transition(
+                TREASURY_FISCAL_SURFACE,
+                stopped_transition.transition_digest(),
+                DurableSourceLifecyclePhase::Stopped,
+                Some(recovery_lease.session_id()),
+                Some(recovery_lease.public_configuration_digest()),
+                None,
+                None,
+            )?;
+        assert!(
+            recovered
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        drop(recovered);
+
+        let recovered = crate::LocalProduct::try_new(config).await?;
+        assert!(matches!(
+            recovered
+                .provider_activation_state()
+                .load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
+            DurableActivationRecipeState::Desired(recipe)
+                if recipe.session_id == recovery_lease.session_id()
+        ));
+        assert!(matches!(
+            recovered
+                .provider_activation_state()
+                .load_recipe(TREASURY_FISCAL_SURFACE)?,
+            DurableActivationRecipeState::Missing
+        ));
+        assert_eq!(
+            recovered
+                .provider_activation()
+                .research_runtime_generation(recovery_candidate.profile())?,
+            None
+        );
+        assert!(
+            !recovered
+                .research_ingest()
+                .is_profile_registered(recovery_candidate.profile())?
+        );
+        assert!(
+            recovered
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(
+                    &recovery_candidate,
+                    &fiscal_dataset,
+                )
+                .await
+                .is_err()
+        );
+        require_same_activation_lease(
+            &recovered
+                .provider_onboarding()
+                .activation_lease(recovery_lease.session_id())?,
+            &recovery_lease,
+        )?;
+
         let cancellation = ProviderResearchActivationService::new(
             recovered.paths().clone(),
             recovered.provider_onboarding(),
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
+            None,
+            None,
         );
         let _cancelled = cancellation
             .cancel_from_portal(recovery_lease.session_id(), CancellationToken::new())
@@ -4700,7 +5618,7 @@ mod tests {
         assert!(matches!(
             recovered
                 .provider_activation_state()
-                .load_recipe(TREASURY_FISCAL_SURFACE)?,
+                .load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Quarantined(quarantine)
                 if quarantine.session_id == Some(recovery_lease.session_id())
                     && quarantine.reason == DurableActivationQuarantineReason::Cancelled
@@ -4713,7 +5631,7 @@ mod tests {
                 .is_complete()
         );
 
-        let tasks = ProviderActivationTaskAuthority::new();
+        let tasks = Arc::new(ProviderActivationTaskAuthority::new());
         let held_activation = recovered
             .provider_activation_state()
             .acquire_activation(TREASURY_FISCAL_SURFACE)
@@ -4729,16 +5647,31 @@ mod tests {
                     .await
                     .is_ok();
                 let _completed = completed.send(acquired);
+                Ok(())
             }))
             .await?;
         retained_started.await?;
         assert!(matches!(
-            tasks.spawn(Box::pin(async {})).await,
+            tasks.spawn(Box::pin(async { Ok(()) })).await,
             Err(CliProviderActivationError::StateUnavailable)
         ));
         drop(response_waiter);
-        drop(held_activation);
         tasks.begin_shutdown();
+        assert!(tasks.cancellation.is_cancelled());
+        assert!(matches!(
+            tasks.finish_shutdown(Instant::now()).await,
+            Err(CliProviderActivationError::StateUnavailable)
+        ));
+        assert!(
+            tasks
+                .task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|task| !task.is_finished()),
+            "timed-out shutdown lost custody of the retained activation"
+        );
+        drop(held_activation);
         tasks
             .finish_shutdown(Instant::now() + Duration::from_secs(5))
             .await?;
@@ -4747,7 +5680,7 @@ mod tests {
             "retained activation did not survive waiter drop and gate contention"
         );
         assert!(matches!(
-            tasks.spawn(Box::pin(async {})).await,
+            tasks.spawn(Box::pin(async { Ok(()) })).await,
             Err(CliProviderActivationError::StateUnavailable)
         ));
         Ok(())
@@ -4764,16 +5697,12 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config)?;
+        let product = crate::LocalProduct::try_new(config).await?;
         let lease = prepared_sec_lease(&product, "sec-identity-recipe").await?;
         let cik = SecCikInput::try_new("0000320193".to_owned())?;
         let expected_instrument = sec_instrument_id(&cik)?;
-        let (provider, evidence) = portal_provider_request(
-            &lease,
-            ProviderPortalActivationRequest::Sec { cik },
-            None,
-            None,
-        )?;
+        let (provider, evidence) =
+            portal_provider_request(&lease, ProviderPortalActivationRequest::Sec { cik })?;
         let request = ActivationRequest {
             schema_version: REQUEST_SCHEMA_VERSION,
             session_id: lease.session_id(),
@@ -4801,19 +5730,22 @@ mod tests {
         ));
 
         let legacy = serde_json::to_vec(&json!({
-            "schema_version": LEGACY_REQUEST_SCHEMA_VERSION,
+            "schema_version": 2,
             "session_id": lease.session_id(),
             "provider": {"kind": "sec"}
         }))?;
-        let legacy = decode_request(&legacy)?;
         assert!(matches!(
-            &legacy.provider,
-            ProviderRequest::Sec { identities } if identities.is_empty()
+            decode_request(&legacy),
+            Err(CliProviderActivationError::InvalidRequest)
         ));
-        assert!(matches!(
-            evidence_references(&legacy),
-            Err(CliProviderActivationError::ProviderConfiguration)
-        ));
+        for schema_version in [2, 3, 5] {
+            let mut unsupported: Value = serde_json::from_slice(&request_bytes)?;
+            unsupported["schema_version"] = json!(schema_version);
+            assert!(matches!(
+                decode_request(&serde_json::to_vec(&unsupported)?),
+                Err(CliProviderActivationError::InvalidRequest)
+            ));
+        }
         assert!(
             product
                 .application()
@@ -4835,7 +5767,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config)?;
+        let product = crate::LocalProduct::try_new(config).await?;
         let source_lease = prepared_anonymous_lease(
             &product,
             "kraken.spot-public-market-data",
@@ -4847,6 +5779,8 @@ mod tests {
             product.provider_onboarding(),
             product.provider_activation(),
             product.provider_activation_state().clone(),
+            None,
+            None,
         );
 
         activation
@@ -4887,7 +5821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_bls_activation_returns_its_exact_discovery_dataset() -> TestResult {
+    async fn public_research_activations_return_exact_datasets_and_restore() -> TestResult {
         let temporary = tempfile::tempdir()?;
         let config = AppConfig::load(ConfigSources::new(
             None,
@@ -4897,7 +5831,7 @@ mod tests {
                 ..ConfigOverrides::default()
             },
         ))?;
-        let product = crate::LocalProduct::try_new(config.clone())?;
+        let product = crate::LocalProduct::try_new(config.clone()).await?;
         let lease = prepared_lease(
             &product,
             BLS_PUBLIC_SURFACE,
@@ -4926,11 +5860,23 @@ mod tests {
             product.provider_onboarding(),
             product.provider_activation(),
             product.provider_activation_state().clone(),
+            None,
+            None,
         );
 
+        // Bootstrap and credential import enumerate the full profile catalogue, including
+        // account and reference connections that do not belong to the research recipe owner.
+        for profile in product.provider_onboarding().profiles() {
+            let surface = SourceIdentifier::try_from(profile.id())?;
+            assert_eq!(
+                activation.retained_setup_session(&surface).map_err(|error| format!("fresh setup lookup for {surface}: {error:?}"))?,
+                None,
+                "fresh setup unexpectedly retained a research selection for {surface}"
+            );
+        }
         let activated = activation
             .activate_from_portal(lease.session_id(), request, CancellationToken::new())
-            .await?;
+            .await.map_err(|error| format!("BLS activation: {error:?}"))?;
         let value = serde_json::to_value(activated)?;
         let dataset = value
             .get("provider_dataset_identifier")
@@ -4946,6 +5892,55 @@ mod tests {
                 .research_ingest()
                 .is_profile_registered(lease.surface_id())?
         );
+        let board_lease = prepared_anonymous_lease(
+            &product,
+            FEDERAL_RESERVE_BOARD_SURFACE,
+            "federal-reserve-board-h15-dataset",
+        )
+        .await?;
+        assert!(board_lease.generation().is_none());
+        assert!(board_lease.secret_reference().is_none());
+        let board_activated = activation
+            .activate_from_portal(
+                board_lease.session_id(),
+                ProviderPortalActivationRequest::FederalReserveBoardH15,
+                CancellationToken::new(),
+            )
+            .await.map_err(|error| format!("Board activation: {error:?}"))?;
+        let board_value = serde_json::to_value(board_activated)?;
+        let board_dataset = board_value
+            .get("provider_dataset_identifier")
+            .and_then(Value::as_str)
+            .ok_or("Board activation did not return its provider dataset identifier")?;
+        let board_dataset = SourceIdentifier::try_from(board_dataset)?;
+        let board_profile =
+            BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()?;
+        assert_eq!(&board_dataset, board_profile.dataset());
+        assert!(
+            board_profile
+                .contract()
+                .is_h15_treasury_constant_maturities_rolling_dashboard()
+        );
+        assert_eq!(
+            board_profile
+                .analytical_dataset()
+                .as_str()
+                .replace('.', ":"),
+            board_profile.dataset().as_str()
+        );
+        assert!(
+            product
+                .research_ingest()
+                .is_profile_registered(board_lease.surface_id())?
+        );
+        assert_eq!(
+            activation.retained_setup_session(lease.surface_id()).map_err(|error| format!("saved BLS setup lookup: {error:?}"))?,
+            Some(lease.session_id())
+        );
+        assert_eq!(
+            activation.retained_setup_session(board_lease.surface_id()).map_err(|error| format!("saved Board setup lookup: {error:?}"))?,
+            Some(board_lease.session_id())
+        );
         drop(activation);
         assert!(
             product
@@ -4956,22 +5951,36 @@ mod tests {
         );
         drop(product);
 
-        let recovered = crate::LocalProduct::try_new(config)?;
+        let recovered = crate::LocalProduct::try_new(config).await?;
         let recovered_activation = ProviderResearchActivationService::new(
             recovered.paths().clone(),
             recovered.provider_onboarding(),
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
+            None,
+            None,
         );
         assert_eq!(
             recovered_activation.provider_dataset_identifier(lease.surface_id())?,
             Some(dataset.clone())
         );
+        assert_eq!(
+            recovered_activation.provider_dataset_identifier(board_lease.surface_id())?,
+            Some(board_dataset.clone())
+        );
+        assert_eq!(
+            recovered_activation.retained_setup_session(lease.surface_id()).map_err(|error| format!("restored BLS setup lookup: {error:?}"))?,
+            Some(lease.session_id())
+        );
+        assert_eq!(
+            recovered_activation.retained_setup_session(board_lease.surface_id()).map_err(|error| format!("restored Board setup lookup: {error:?}"))?,
+            Some(board_lease.session_id())
+        );
         let status = crate::local_product::execute_cli_command(
             &recovered,
             crate::cli::Command::Source {
                 command: crate::cli::SourceCommand::Status {
-                    provider: Some(BLS_PUBLIC_SURFACE.to_owned()),
+                    provider: None,
                 },
             },
         )
@@ -4982,11 +5991,27 @@ mod tests {
             .and_then(Value::as_array)
             .ok_or("source status did not return rows")?;
         assert_eq!(
-            rows.first()
+            rows.iter()
+                .find(|row| row["profile"]["id"] == BLS_PUBLIC_SURFACE)
                 .and_then(|row| row.get("providerDatasetIdentifier"))
                 .and_then(Value::as_str),
             Some(dataset.as_str())
         );
+        let reference = rows
+            .iter()
+            .find(|row| row["profile"]["id"] == "nasdaq-trader-symbol-directory-reference")
+            .ok_or("source status omitted the registered reference profile")?;
+        assert_eq!(reference["lifecycleSupport"], "not_applicable");
+        assert!(reference["lifecycle"].is_null());
+        assert_eq!(reference["runtime"]["state"], "not_active");
+        for account in ["schwab.trader-api-market-data", "alpaca.basic-market-data"] {
+            let row = rows
+                .iter()
+                .find(|row| row["profile"]["id"] == account)
+                .ok_or("source status omitted an account profile")?;
+            assert_eq!(row["lifecycleSupport"], "managed");
+            assert!(row["lifecycle"].is_object());
+        }
         drop(recovered_activation);
         assert!(
             recovered
@@ -5016,7 +6041,7 @@ mod tests {
             ),
             ("organization".to_owned(), "Market Squawk".to_owned()),
         ]))?;
-        prepared_lease(product, SEC_SURFACE, operation, configuration).await
+        prepared_lease(product, SEC_EDGAR_PROFILE_ID, operation, configuration).await
     }
 
     async fn prepared_anonymous_lease(
@@ -5039,41 +6064,9 @@ mod tests {
         operation: &str,
         public_configuration: ProviderPublicConfiguration,
     ) -> Result<ProviderActivationLease, Box<dyn std::error::Error>> {
-        let profiles = built_in_provider_profiles()?;
-        let profile = profiles
-            .get(surface_id)
-            .ok_or("onboarding profile is missing")?;
-        let catalog = product.research().onboarding_catalog();
-        catalog.register_provider_capability(profile.capability())?;
-        let request = OnboardingReservationRequest::try_new(
-            profile.capability(),
-            public_configuration,
-            profile.capability().maximum_authority().clone(),
-            SourceIdentifier::try_from("provider-replacement-regression")?,
-            SourceIdentifier::try_from(operation)?,
-            Timestamp::from_unix_nanos(i64::MAX),
-            0,
-        )?;
-        let reservation = catalog.reserve_provider_onboarding(&request)?;
-        for (sequence, event) in [1_u64, 2, 3].into_iter().zip([
-            OnboardingEvent::RightsAdmitted {
-                generation: None,
-                decision_digest: profile.rights_decision_digest(),
-            },
-            OnboardingEvent::RatePolicyAdmitted {
-                generation: None,
-                policy_digest: profile.capability().rate_policy().evidence_digest(),
-            },
-            OnboardingEvent::RuntimeVerified {
-                generation: None,
-                evidence_digest: profile.rights_decision_digest(),
-            },
-        ]) {
-            catalog.append_provider_onboarding_event(&reservation, sequence, event)?;
-        }
         Ok(product
             .provider_onboarding()
-            .prepare_runtime_activation_target(reservation.session_id(), CancellationToken::new())
+            .prepare_noncredential_test_activation(surface_id, public_configuration, operation)
             .await?)
     }
 
@@ -5089,13 +6082,7 @@ mod tests {
     ) -> Result<TreasuryActivation, Box<dyn std::error::Error>> {
         let (provider, evidence) = portal_provider_request(
             lease,
-            ProviderPortalActivationRequest::TreasuryFiscal {
-                first_record_date: CalendarDate::new(2025, 1, 1)?,
-                last_record_date: CalendarDate::new(2025, 1, 31)?,
-                page_size: 100,
-            },
-            None,
-            None,
+            ProviderPortalActivationRequest::TreasuryFiscal { page_size: 100 },
         )?;
         let request = ActivationRequest {
             schema_version: REQUEST_SCHEMA_VERSION,

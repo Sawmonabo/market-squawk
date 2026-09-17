@@ -176,24 +176,48 @@ impl TryFrom<&str> for ActorId {
     }
 }
 
-/// Exact currency amount plus the declared accounting decimal scale.
+/// Economic basis represented by an exact valuation amount.
+///
+/// This is independent of fair-value hierarchy, market depth, and data quality. A monetary value
+/// cannot be compared or selected safely unless its economic basis is explicit.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ValuationAmountBasis {
+    /// Amount attributable to one unit of the measured instrument.
+    PerInstrumentUnit,
+    /// Aggregate amount attributable to the reporting entity in its entirety.
+    ReportingEntityTotal,
+    /// Aggregate amount attributable to one retained portfolio position.
+    PositionTotal,
+}
+
+/// Exact currency amount, declared accounting decimal scale, and economic basis.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ValuationAmount {
     money: Money,
     scale: u8,
+    basis: ValuationAmountBasis,
 }
 
 impl ValuationAmount {
-    /// Validates that the declared scale can represent the exact amount without rounding.
+    /// Validates that the declared scale can represent the exact amount without rounding and binds
+    /// the caller-selected economic basis.
     ///
     /// # Errors
     ///
     /// Rejects scales above [`Decimal::MAX_SCALE`] or below the exact amount's scale.
-    pub fn try_new(money: Money, scale: u8) -> Result<Self, FairValueError> {
+    pub fn try_new(
+        money: Money,
+        scale: u8,
+        basis: ValuationAmountBasis,
+    ) -> Result<Self, FairValueError> {
         if u32::from(scale) > Decimal::MAX_SCALE || money.amount().scale() > u32::from(scale) {
             Err(FairValueError::InvalidAmount)
         } else {
-            Ok(Self { money, scale })
+            Ok(Self {
+                money,
+                scale,
+                basis,
+            })
         }
     }
 
@@ -207,11 +231,17 @@ impl ValuationAmount {
         self.scale
     }
 
+    /// Returns the exact economic basis of the amount.
+    pub const fn basis(self) -> ValuationAmountBasis {
+        self.basis
+    }
+
     pub(crate) fn hash_into(self, hash: &mut CanonicalHasher) {
         hash.bytes(self.money.currency().as_str().as_bytes());
         hash.bytes(&self.money.amount().mantissa().to_be_bytes());
         hash.u32(self.money.amount().scale());
         hash.u8(self.scale);
+        hash.u8(amount_basis_tag(self.basis));
     }
 }
 
@@ -422,15 +452,16 @@ impl ValuationMeasurement {
             return Err(FairValueError::DuplicateInput);
         }
 
-        let mut evidence_hash = CanonicalHasher::new(b"market-squawk/valuation-evidence-set/v1");
+        let mut evidence_hash = CanonicalHasher::new(b"market-squawk/valuation-evidence-set/v2");
         evidence_hash
             .u64(u64::try_from(spec.inputs.len()).map_err(|_| FairValueError::Arithmetic)?);
         for input in &spec.inputs {
+            evidence_hash.fixed(input.id().bytes());
             evidence_hash.fixed(input.evidence().hash().bytes());
         }
         let evidence_hash = FairValueEvidenceHash(evidence_hash.finish());
 
-        let mut hash = CanonicalHasher::new(b"market-squawk/valuation-measurement/v1");
+        let mut hash = CanonicalHasher::new(b"market-squawk/valuation-measurement/v2");
         hash.bytes(spec.account_id.as_uuid().as_bytes());
         hash.bytes(spec.instrument_id.as_uuid().as_bytes());
         spec.amount.hash_into(&mut hash);
@@ -492,6 +523,11 @@ impl ValuationMeasurement {
         self.amount
     }
 
+    /// Returns the economic basis of the resulting measurement amount.
+    pub const fn amount_basis(&self) -> ValuationAmountBasis {
+        self.amount.basis()
+    }
+
     /// Returns measurement instant.
     pub const fn measurement_at(&self) -> Timestamp {
         self.measurement_at
@@ -527,6 +563,14 @@ pub(crate) const fn relation_tag(value: InputInstrumentRelation) -> u8 {
         InputInstrumentRelation::Identical => 1,
         InputInstrumentRelation::Similar => 2,
         InputInstrumentRelation::Proxy => 3,
+    }
+}
+
+pub(crate) const fn amount_basis_tag(value: ValuationAmountBasis) -> u8 {
+    match value {
+        ValuationAmountBasis::PerInstrumentUnit => 1,
+        ValuationAmountBasis::ReportingEntityTotal => 2,
+        ValuationAmountBasis::PositionTotal => 3,
     }
 }
 

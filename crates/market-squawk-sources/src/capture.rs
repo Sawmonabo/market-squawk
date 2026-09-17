@@ -8,16 +8,18 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use market_squawk_domain::{
     CaptureAuthorityError, CaptureAuthorityIdentity, CaptureIntegrityState,
     CaptureResidentGenerationLease, CaptureRetainedComponent, CaptureRetainedReceipt,
-    CaptureRetainedSizeError, DigestAlgorithm, EvidenceDigest, Timestamp,
+    CaptureRetainedSizeError, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
     checked_arc_value_allocation_bytes,
 };
+use market_squawk_platform::RawCaptureRecord;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::authority_time::{
     AuthorityTimeContinuity, TrustedReceiptObservation, TrustedRegistryTime,
 };
-use crate::{FrameId, FrameSessionBinding, RawMarketFrame};
+use crate::{FrameId, FrameSessionBinding, ProviderEventMicrobatchMaterial, RawMarketFrame};
 
 const CAPTURE_INITIALIZING: u8 = 0;
 const CAPTURE_HEALTHY: u8 = 1;
@@ -239,6 +241,7 @@ impl CaptureGenerationLease {
 pub struct CaptureAdmissionIssuer {
     binding: FrameSessionBinding,
     lease: CaptureGenerationLease,
+    connection_id: Uuid,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -247,6 +250,7 @@ impl CaptureAdmissionIssuer {
         Self {
             binding,
             lease,
+            connection_id: Uuid::new_v4(),
             not_sync: PhantomData,
         }
     }
@@ -279,6 +283,7 @@ impl CaptureAdmissionIssuer {
         self.validate_active(frame)?;
         let digest: [u8; 32] = Sha256::digest(frame.payload()).into();
         self.validate_active(frame)?;
+        let event_id = Uuid::new_v4();
         Ok(CaptureAdmissionReceipt {
             binding: frame.binding().clone(),
             frame_id: frame.frame_id(),
@@ -287,6 +292,10 @@ impl CaptureAdmissionIssuer {
                 .ok_or(CaptureAdmissionError::TrustedTimeInvalid)?
                 .clone(),
             payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
+            material_identity: Some(CaptureProviderEventIdentity {
+                connection_id: self.connection_id,
+                event_id,
+            }),
             lease: self.lease.clone(),
             resident,
         })
@@ -373,8 +382,14 @@ impl CaptureAdmissionIssuer {
     fn to_domain_error(&self, error: CaptureAdmissionError) -> CaptureAuthorityError {
         match error {
             CaptureAdmissionError::BindingMismatch => CaptureAuthorityError::FrameBindingMismatch,
+            CaptureAdmissionError::FrameIdentityMismatch => {
+                CaptureAuthorityError::FrameBindingMismatch
+            }
             CaptureAdmissionError::Incomplete => CaptureAuthorityError::GenerationIncomplete,
-            CaptureAdmissionError::TrustedTimeInvalid => CaptureAuthorityError::FrameRejected,
+            CaptureAdmissionError::TrustedTimeInvalid
+            | CaptureAdmissionError::PayloadMismatch
+            | CaptureAdmissionError::MaterializationFailed
+            | CaptureAdmissionError::MaterialAlreadyIssued => CaptureAuthorityError::FrameRejected,
             CaptureAdmissionError::NotHealthy => match self.lease.health() {
                 CaptureGenerationHealth::Initializing => CaptureAuthorityError::GenerationNotReady,
                 CaptureGenerationHealth::Healthy => CaptureAuthorityError::FrameRejected,
@@ -425,10 +440,16 @@ impl market_squawk_domain::CaptureInitializer for CaptureInitializationControl {
         CaptureInitializationControl::mark_healthy(self).map_err(|error| match error {
             CaptureAdmissionError::Incomplete
             | CaptureAdmissionError::NotHealthy
-            | CaptureAdmissionError::TrustedTimeInvalid => {
+            | CaptureAdmissionError::TrustedTimeInvalid
+            | CaptureAdmissionError::PayloadMismatch
+            | CaptureAdmissionError::MaterializationFailed
+            | CaptureAdmissionError::MaterialAlreadyIssued => {
                 CaptureAuthorityError::GenerationIncomplete
             }
-            CaptureAdmissionError::BindingMismatch => CaptureAuthorityError::FrameBindingMismatch,
+            CaptureAdmissionError::BindingMismatch
+            | CaptureAdmissionError::FrameIdentityMismatch => {
+                CaptureAuthorityError::FrameBindingMismatch
+            }
         })
     }
 }
@@ -464,6 +485,54 @@ impl market_squawk_domain::CaptureDegradation for CaptureDegradationCapability {
     }
 }
 
+/// Capture-minted raw-envelope identities available to exactly one material issuance.
+#[derive(Debug)]
+struct CaptureProviderEventIdentity {
+    connection_id: Uuid,
+    event_id: Uuid,
+}
+
+/// One-use capture-owned raw-envelope identity for an already admitted exact frame.
+///
+/// This capability carries no payload bytes and cannot admit, decode, or publish data. It exists
+/// only for application composition that must bind an adapter-owned logical handoff back to the
+/// physical connection/event identities minted by the capture generation.
+#[derive(Debug)]
+pub struct CaptureProviderEventIdentityClaim {
+    binding: FrameSessionBinding,
+    frame_id: FrameId,
+    received_at: Timestamp,
+    payload_digest: EvidenceDigest,
+    connection_id: Uuid,
+    event_id: Uuid,
+}
+
+impl CaptureProviderEventIdentityClaim {
+    pub const fn binding(&self) -> &FrameSessionBinding {
+        &self.binding
+    }
+
+    pub const fn frame_id(&self) -> FrameId {
+        self.frame_id
+    }
+
+    pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
+    }
+
+    pub const fn connection_id(&self) -> Uuid {
+        self.connection_id
+    }
+
+    pub const fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+}
+
 /// Owned, non-serializable proof of exact raw-frame capture admission.
 #[derive(Debug)]
 pub struct CaptureAdmissionReceipt {
@@ -471,6 +540,7 @@ pub struct CaptureAdmissionReceipt {
     frame_id: FrameId,
     receipt: TrustedReceiptObservation,
     payload_digest: EvidenceDigest,
+    material_identity: Option<CaptureProviderEventIdentity>,
     lease: CaptureGenerationLease,
     resident: CaptureResidentGenerationLease,
 }
@@ -486,6 +556,7 @@ impl CaptureRetainedReceipt for CaptureAdmissionReceipt {
             frame_id: _,
             receipt: _,
             payload_digest: _,
+            material_identity: _,
             lease: _,
             resident: _,
         } = self;
@@ -517,6 +588,146 @@ impl CaptureAdmissionReceipt {
     pub(crate) const fn lease(&self) -> &CaptureGenerationLease {
         &self.lease
     }
+
+    /// Issues the capture-minted connection/event identity once for an exact admitted frame.
+    ///
+    /// The receipt remains available for mandatory authoritative-registry consumption. Successful
+    /// issuance prevents the same identity from also being issued as provider-event material.
+    pub fn try_issue_provider_event_identity_claim(
+        &mut self,
+        frame: &RawMarketFrame,
+    ) -> Result<CaptureProviderEventIdentityClaim, CaptureAdmissionError> {
+        self.validate_material_frame(frame)?;
+        self.validate_material_identity()?;
+        let identity = self
+            .material_identity
+            .take()
+            .ok_or(CaptureAdmissionError::MaterialAlreadyIssued)?;
+        Ok(CaptureProviderEventIdentityClaim {
+            binding: self.binding.clone(),
+            frame_id: self.frame_id,
+            received_at: self.receipt.received_at(),
+            payload_digest: self.payload_digest,
+            connection_id: identity.connection_id,
+            event_id: identity.event_id,
+        })
+    }
+
+    /// Issues exact durable provider-event material once without consuming registry admission.
+    ///
+    /// Source identity, metadata revision, event identity, connection identity, receive time, and
+    /// payload all come from the exact capture generation and frame. The caller supplies only the
+    /// bounded code-owned logical dataset and stream identifiers. Raw transport does not own a
+    /// provider sequence or exchange timestamp, so both remain absent. Successful issuance clears
+    /// the private material identity; the receipt remains available for its mandatory later
+    /// authoritative-registry consumption.
+    ///
+    /// # Errors
+    ///
+    /// Rejects degraded generations, transplanted frames, mismatched frame/receipt/payload
+    /// evidence, nil capture-owned identities, a second issuance, and any failure to preserve the
+    /// exact raw frame. Any failure before successful construction retains the one-use material
+    /// identity so the exact same admitted frame may be retried.
+    pub fn try_issue_provider_event_microbatch_material(
+        &mut self,
+        frame: &RawMarketFrame,
+        dataset: SourceIdentifier,
+        stream_identity: SourceIdentifier,
+    ) -> Result<ProviderEventMicrobatchMaterial, CaptureAdmissionError> {
+        self.validate_material_frame(frame)?;
+        self.validate_material_identity()?;
+        let identity = self
+            .material_identity
+            .as_ref()
+            .ok_or(CaptureAdmissionError::MaterialAlreadyIssued)?;
+        let record = RawCaptureRecord::try_from_exact_capture_frame(
+            identity.event_id,
+            identity.connection_id,
+            frame,
+        )
+        .map_err(|_error| CaptureAdmissionError::MaterializationFailed)?;
+        if record.event_id() != identity.event_id
+            || record.connection_id() != identity.connection_id
+            || record.source() != self.binding.source_id().as_str()
+            || record.source_sequence().is_some()
+            || record.exchange_at().is_some()
+            || record.received_at().timestamp_nanos_opt()
+                != Some(self.receipt.received_at().unix_nanos())
+            || record.payload() != frame.payload()
+        {
+            return Err(CaptureAdmissionError::MaterializationFailed);
+        }
+        let material = ProviderEventMicrobatchMaterial::try_new(
+            self.binding.source_id().clone(),
+            self.binding.metadata_revision().clone(),
+            dataset,
+            stream_identity,
+            vec![record],
+        )
+        .map_err(|_error| CaptureAdmissionError::MaterializationFailed)?;
+        let [material_frame] = material.receipt().frames() else {
+            return Err(CaptureAdmissionError::MaterializationFailed);
+        };
+        let payload_bytes = u64::try_from(frame.payload().len())
+            .map_err(|_error| CaptureAdmissionError::MaterializationFailed)?;
+        if material.receipt().source_id() != self.binding.source_id()
+            || material.receipt().metadata_revision() != self.binding.metadata_revision()
+            || material_frame.event_id() != *identity.event_id.as_bytes()
+            || material_frame.connection_id() != *identity.connection_id.as_bytes()
+            || material_frame.source_sequence().is_some()
+            || material_frame.exchange_at().is_some()
+            || material_frame.received_at() != self.receipt.received_at()
+            || material_frame.payload_bytes() != payload_bytes
+            || material_frame.payload_digest() != self.payload_digest
+        {
+            return Err(CaptureAdmissionError::MaterializationFailed);
+        }
+        self.material_identity = None;
+        Ok(material)
+    }
+
+    fn validate_material_identity(&self) -> Result<(), CaptureAdmissionError> {
+        let identity = self
+            .material_identity
+            .as_ref()
+            .ok_or(CaptureAdmissionError::MaterialAlreadyIssued)?;
+        if identity.connection_id.is_nil() || identity.event_id.is_nil() {
+            Err(CaptureAdmissionError::MaterializationFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_material_frame(&self, frame: &RawMarketFrame) -> Result<(), CaptureAdmissionError> {
+        if !self.lease.is_healthy() {
+            return Err(CaptureAdmissionError::NotHealthy);
+        }
+        if !self.binding.shares_allocation_with(frame.binding())
+            || self.binding.source_id() != frame.source_id()
+            || self.binding.metadata_revision() != frame.metadata_revision()
+            || self.binding.session_id() != frame.session_id()
+            || self.binding.connection_generation() != frame.connection_generation()
+        {
+            return Err(CaptureAdmissionError::BindingMismatch);
+        }
+        if self.frame_id != frame.frame_id() {
+            return Err(CaptureAdmissionError::FrameIdentityMismatch);
+        }
+        let frame_receipt = frame
+            .trusted_receipt()
+            .ok_or(CaptureAdmissionError::TrustedTimeInvalid)?;
+        if frame_receipt != &self.receipt {
+            return Err(CaptureAdmissionError::TrustedTimeInvalid);
+        }
+        self.lease
+            .validate_receipt(&self.receipt)
+            .map_err(|_error| CaptureAdmissionError::TrustedTimeInvalid)?;
+        let digest: [u8; 32] = Sha256::digest(frame.payload()).into();
+        if self.payload_digest != EvidenceDigest::new(DigestAlgorithm::Sha256, digest) {
+            return Err(CaptureAdmissionError::PayloadMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Capture-generation state or frame-admission failure.
@@ -531,9 +742,21 @@ pub enum CaptureAdmissionError {
     /// Frame belongs to another session/generation allocation.
     #[error("raw frame belongs to another capture generation")]
     BindingMismatch,
+    /// Receipt and frame have different exact generation-local identities.
+    #[error("raw frame identity does not match its capture admission receipt")]
+    FrameIdentityMismatch,
     /// Frame has no source-owned receipt proof or belongs to another continuity lineage.
     #[error("raw frame trusted-time continuity proof is invalid")]
     TrustedTimeInvalid,
+    /// Exact raw payload bytes no longer match the digest issued after enqueue.
+    #[error("raw frame payload does not match its capture admission receipt")]
+    PayloadMismatch,
+    /// Exact admitted raw evidence could not be represented without weakening its invariants.
+    #[error("admitted raw frame could not become provider event material")]
+    MaterializationFailed,
+    /// The receipt already issued its capture-minted raw-envelope identity.
+    #[error("provider event material was already issued for this capture admission receipt")]
+    MaterialAlreadyIssued,
 }
 
 #[cfg(test)]
