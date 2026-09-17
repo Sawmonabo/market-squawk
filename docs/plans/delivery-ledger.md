@@ -1,5 +1,29 @@
 # Market Squawk Delivery Ledger
 
+## 2026-09-16 dependency PR retirement
+
+PRs #47 (clap), #50 (uuid), and #51 (crc32fast) were closed without merging after
+current-use and upstream-change review. Their exact remote heads were respectively
+`a1332cdde7953e2ff0ac28ab03b337682cca7345`,
+`ab843460c23e4744a52249d43780aca896ec6f37`, and
+`9703acbbf10b8a0b04bc8ee5ae5130708ece1d26`. Each remote branch was deleted with an
+explicit expected-head lease, then verified absent. No local branch, worktree, application data,
+old session, or recovery backup was removed by this action.
+
+These optional upgrades were declined, not labeled integrated or superseded: the CLI does not
+use the affected help/new API, UUID's changed diagnostic does not change invalid-input rejection,
+and no current product measurement warrants the CRC optimization. Relevant upstream evidence:
+[clap 4.6.5](https://github.com/clap-rs/clap/releases/tag/v4.6.5),
+[clap 4.6.6](https://github.com/clap-rs/clap/releases/tag/v4.6.6),
+[UUID issue 898](https://github.com/uuid-rs/uuid/issues/898), and
+[CRC comparison](https://github.com/srijs/rust-crc32fast/compare/v1.5.0...v1.5.1).
+PRs #46 and #48 retain their relevant fix-review work; #43 and #26 remain delivery/release PRs.
+Four PRs remain open. Broader branch/worktree reconciliation remains unfinished.
+
+Exact pre-action PR metadata and diffs, retirement reasons, and post-action verification are
+preserved in `.agents/tmp/resume-2026-09-15/support/root-live/branch-cleanup-current/optional-retirement/`.
+This checkpoint records repository housekeeping only, not source integration or product acceptance.
+
 Last updated: 2026-09-08
 
 This is the compact operational handoff required by
