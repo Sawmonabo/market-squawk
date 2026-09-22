@@ -177,20 +177,24 @@ pub struct ExecutionTask<T> {
 impl<T> ExecutionTask<T> {
     /// Awaits both result delivery and task termination, releasing capacity only afterward.
     pub async fn join(&mut self) -> Result<T, ExecutionTaskReaperError> {
-        let output = match self.output.as_mut() {
-            Some(receiver) => receiver.await,
-            None => return Err(ExecutionTaskReaperError::OutcomeLost),
-        };
-        let joined = match self.handle.take() {
+        // Retain the handle while this await can be cancelled. Result delivery occurs before
+        // task termination, so reading it afterward cannot consume a result and then lose it
+        // across a cancelled join.
+        let joined = match self.handle.as_mut() {
             Some(handle) => handle.await,
             None => return Err(ExecutionTaskReaperError::OutcomeLost),
         };
-        self.output = None;
+        self.handle = None;
         self.permit = None;
         if joined.is_err() {
+            self.output = None;
             return Err(ExecutionTaskReaperError::JoinFailed);
         }
-        output.map_err(|_| ExecutionTaskReaperError::OutcomeLost)
+        self.output
+            .take()
+            .ok_or(ExecutionTaskReaperError::OutcomeLost)?
+            .await
+            .map_err(|_| ExecutionTaskReaperError::OutcomeLost)
     }
 
     /// Transfers this handle into its exact pre-reserved reaper slot without allocation.
