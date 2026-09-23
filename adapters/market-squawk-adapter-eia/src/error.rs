@@ -94,9 +94,18 @@ pub enum EiaError {
     /// A required documented response field is absent or has the wrong type.
     #[error("invalid EIA API v2 response shape")]
     InvalidProtocol,
-    /// The response command does not match the exact requested route/surface.
-    #[error("EIA interpreted-request command does not match the request")]
+    /// The response parameter object or request shape differs from the exact request.
+    #[error("EIA interpreted-request parameters do not match the request")]
     RequestEchoMismatch,
+    /// The response command differs from the exact requested route/surface.
+    #[error("EIA interpreted-request command does not match the request")]
+    RequestEchoCommandMismatch,
+    /// The response carries more than one redactable API-key field.
+    #[error("EIA interpreted-request secret-field count differs: {observed}")]
+    RequestEchoSecretCountMismatch {
+        /// Number of secret fields, without any field value or provider payload.
+        observed: usize,
+    },
     /// The response API version is not API v2 or differs from the frozen route contract.
     #[error("EIA API version drift")]
     ApiVersionDrift,

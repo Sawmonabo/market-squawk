@@ -56,7 +56,7 @@ pub(crate) fn parse_envelope(
             || command.to_ascii_lowercase().contains("api_key")
             || normalize_command(command) != normalize_command(expected_command)
         {
-            return Err(EiaError::RequestEchoMismatch);
+            return Err(EiaError::RequestEchoCommandMismatch);
         }
         if !request.contains_key("params") {
             return Err(EiaError::InvalidProtocol);
@@ -69,20 +69,33 @@ pub(crate) fn parse_envelope(
         limits.max_json_depth(),
         &mut redacted_secret_fields,
     )?;
-    if redacted_secret_fields != 1 {
-        return Err(EiaError::RequestEchoMismatch);
+    if redacted_secret_fields > 1 {
+        return Err(EiaError::RequestEchoSecretCountMismatch {
+            observed: redacted_secret_fields,
+        });
     }
     let request = root
         .as_object()
         .and_then(|object| object.get("request"))
         .and_then(Value::as_object)
         .ok_or(EiaError::InvalidProtocol)?;
-    if request.len() != 2
-        || request
-            .get("params")
-            .and_then(Value::as_object)
-            .is_none_or(|params| params != expected_params)
+    // The provider may omit the credential from its echo. Match every non-secret parameter
+    // exactly without inventing a redaction event or changing the retained response evidence.
+    let mut comparison_params = expected_params.clone();
+    if redacted_secret_fields == 0
+        && comparison_params.remove("api_key") != Some(Value::String("[REDACTED]".to_owned()))
     {
+        return Err(EiaError::RequestEchoMismatch);
+    }
+    // With no non-secret metadata parameters, EIA serializes its empty parameter collection
+    // as either {} or []. Keep the actual representation in retained evidence; a data query
+    // with any expected selection parameters can never match an empty array.
+    let params_match = match request.get("params") {
+        Some(Value::Object(params)) => params == &comparison_params,
+        Some(Value::Array(params)) => params.is_empty() && comparison_params.is_empty(),
+        _ => false,
+    };
+    if request.len() != 2 || !params_match {
         return Err(EiaError::RequestEchoMismatch);
     }
     let request_echo_bytes = serde_json::to_vec(request).map_err(|_| EiaError::InvalidJson)?;

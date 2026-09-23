@@ -77,6 +77,42 @@ fn metadata_multi_page_data_and_revisions_preserve_exact_evidence() -> TestResul
     );
     assert_eq!(metadata.receipt().redacted_secret_fields(), 1);
     assert!(!String::from_utf8(metadata.retained_payload().to_vec())?.contains("fixture-secret"));
+    let mut omitted_metadata_key: serde_json::Value = serde_json::from_slice(&metadata_bytes)?;
+    omitted_metadata_key["request"]["params"]
+        .as_object_mut()
+        .ok_or("metadata request params are not an object")?
+        .remove("api_key");
+    let omitted_metadata = parse_route_metadata(
+        &serde_json::to_vec(&omitted_metadata_key)?,
+        &metadata_request,
+        received_at,
+        limits,
+    )?;
+    assert_eq!(omitted_metadata.receipt().redacted_secret_fields(), 0);
+    assert_eq!(omitted_metadata.schema_digest(), metadata.schema_digest());
+    omitted_metadata_key["request"]["params"] = json!([]);
+    let empty_array_metadata = parse_route_metadata(
+        &serde_json::to_vec(&omitted_metadata_key)?,
+        &metadata_request,
+        received_at,
+        limits,
+    )?;
+    assert_eq!(empty_array_metadata.receipt().redacted_secret_fields(), 0);
+    assert_eq!(empty_array_metadata.schema_digest(), metadata.schema_digest());
+    assert_ne!(
+        empty_array_metadata.receipt().retained_payload_digest(),
+        omitted_metadata.receipt().retained_payload_digest()
+    );
+    omitted_metadata_key["request"]["params"] = json!(["unexpected"]);
+    assert_eq!(
+        parse_route_metadata(
+            &serde_json::to_vec(&omitted_metadata_key)?,
+            &metadata_request,
+            received_at,
+            limits,
+        ),
+        Err(EiaError::RequestEchoMismatch)
+    );
     let quarterly_metadata = metadata.clone();
 
     let facet_request = EiaMetadataRequest::facet(route.clone(), field("region")?);
@@ -228,6 +264,69 @@ fn metadata_multi_page_data_and_revisions_preserve_exact_evidence() -> TestResul
         Err(EiaError::Pagination)
     );
     assert_eq!(page_one.description(), Some("fixture route"));
+    let mut omitted_data_key: serde_json::Value = serde_json::from_slice(&page_one_bytes)?;
+    omitted_data_key["request"]["params"]
+        .as_object_mut()
+        .ok_or("data request params are not an object")?
+        .remove("api_key");
+    let omitted_page = EiaDataPage::parse(
+        &serde_json::to_vec(&omitted_data_key)?,
+        query.page(0),
+        &contract,
+        received_at,
+        limits,
+    )?;
+    assert_eq!(omitted_page.receipt().redacted_secret_fields(), 0);
+    assert_eq!(
+        omitted_page
+            .observations()
+            .iter()
+            .map(|row| row.semantic_digest())
+            .collect::<Vec<_>>(),
+        page_one
+            .observations()
+            .iter()
+            .map(|row| row.semantic_digest())
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        omitted_page.receipt().retained_payload_digest(),
+        page_one.receipt().retained_payload_digest()
+    );
+    omitted_data_key["request"]["params"]["frequency"] = json!("quarterly");
+    assert_eq!(
+        EiaDataPage::parse(
+            &serde_json::to_vec(&omitted_data_key)?,
+            query.page(0),
+            &contract,
+            received_at,
+            limits,
+        ),
+        Err(EiaError::RequestEchoMismatch)
+    );
+    let mut duplicate_secret: serde_json::Value = serde_json::from_slice(&page_one_bytes)?;
+    omitted_data_key["request"]["params"] = json!([]);
+    assert_eq!(
+        EiaDataPage::parse(
+            &serde_json::to_vec(&omitted_data_key)?,
+            query.page(0),
+            &contract,
+            received_at,
+            limits,
+        ),
+        Err(EiaError::RequestEchoMismatch)
+    );
+    duplicate_secret["request"]["params"]["API_KEY"] = json!("fixture-secret");
+    assert_eq!(
+        EiaDataPage::parse(
+            &serde_json::to_vec(&duplicate_secret)?,
+            query.page(0),
+            &contract,
+            received_at,
+            limits,
+        ),
+        Err(EiaError::RequestEchoSecretCountMismatch { observed: 2 })
+    );
     let mut mismatched_echo: serde_json::Value = serde_json::from_slice(&page_one_bytes)?;
     mismatched_echo["request"]["params"]["frequency"] = json!("quarterly");
     assert_eq!(
