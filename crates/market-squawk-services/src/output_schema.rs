@@ -23,6 +23,7 @@ const POSITIVE_INTEGER_PATTERN: &str = "^[1-9][0-9]*$";
 const UNSIGNED_INTEGER_PATTERN: &str = "^(?:0|[1-9][0-9]*)$";
 const INTEGER_PATTERN: &str = "^(?:0|-?[1-9][0-9]*)$";
 const MEDIA_TYPE_PATTERN: &str = "^[A-Za-z0-9/.+\\-]+$";
+const ARTIFACT_ID_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9_-]*$";
 const MAXIMUM_POSITIONAL_ITEMS: usize = 256;
 
 pub(crate) fn validate_data_schema(schema: &Value) -> bool {
@@ -295,6 +296,7 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                 | UNSIGNED_INTEGER_PATTERN
                 | INTEGER_PATTERN
                 | MEDIA_TYPE_PATTERN
+                | ARTIFACT_ID_PATTERN
         ),
         Some(_) => false,
     }
@@ -467,6 +469,7 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
         Some(POSITIVE_INTEGER_PATTERN) => positive_integer_matches(value),
         Some(UNSIGNED_INTEGER_PATTERN) => value == "0" || positive_integer_matches(value),
         Some(INTEGER_PATTERN) => integer_matches(value),
+        Some(ARTIFACT_ID_PATTERN) => crate::artifact::artifact_id_matches_pattern(value),
         Some(MEDIA_TYPE_PATTERN) => {
             !value.is_empty()
                 && value.bytes().all(|byte| {
@@ -641,7 +644,7 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 #[cfg(test)]
 mod tests {
     use super::{
-        CALENDAR_DATE_PATTERN, CALENDAR_MONTH_PATTERN, CANONICAL_DECIMAL_PATTERN,
+        ARTIFACT_ID_PATTERN, CALENDAR_DATE_PATTERN, CALENDAR_MONTH_PATTERN, CANONICAL_DECIMAL_PATTERN,
         FORMATTED_PERCENTAGE_PATTERN, INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN,
         NON_WHITESPACE_PATTERN, OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN,
         POSITIVE_DECIMAL_PATTERN, SCALED_DECIMAL_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data,
@@ -731,6 +734,7 @@ mod tests {
         assert!(!validate_data(&decimal_schema, &json!("01.0")));
 
         for (pattern, accepted, rejected) in [
+            (ARTIFACT_ID_PATTERN, "source_recipe-1", "../source_recipe-1"),
             (CALENDAR_MONTH_PATTERN, "2026-09", "2026-13"),
             (SCALED_DECIMAL_PATTERN, "-1.50", "01.0"),
             (NON_WHITESPACE_PATTERN, "Investment", "   "),

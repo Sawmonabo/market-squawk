@@ -531,12 +531,13 @@ pub trait ArtifactAuthority: ArtifactRepository + ArtifactReferenceResolver {}
 impl<T> ArtifactAuthority for T where T: ArtifactRepository + ArtifactReferenceResolver {}
 
 fn valid_artifact_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAXIMUM_ARTIFACT_ID_BYTES
-        && id
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    id.len() <= MAXIMUM_ARTIFACT_ID_BYTES && artifact_id_matches_pattern(id)
+}
+
+pub(crate) fn artifact_id_matches_pattern(id: &str) -> bool {
+    id.bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))

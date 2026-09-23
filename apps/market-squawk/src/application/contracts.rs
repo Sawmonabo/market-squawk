@@ -3372,6 +3372,7 @@ fn nonzero_sha256_argument_schema() -> Value {
         "maxLength": 64,
         "pattern": "^[0-9a-f]{64}$",
         "not": {
+            "type": "string",
             "const": "0000000000000000000000000000000000000000000000000000000000000000",
         },
     })
