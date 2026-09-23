@@ -1,5 +1,25 @@
 # Market Squawk Delivery Ledger
 
+## Current integration and cleanup barrier — 2026-09-23
+
+The active target is `feature/v1-installed-product-experience` at pushed
+`18f11e072fd451b242788f121d86becdeaccbc91`. This checkpoint removes
+arbitrary package-size startup rejection and lets a healthy Desktop remain
+available through optional maintenance failure. Focused installer rollback and
+Desktop compilation passed; installed live restart and the final release gate
+remain open. The target checkout still contains substantial uncommitted V1 work.
+
+At this head, live inventory is 29 local branches, 20 origin heads and 12 linked
+worktrees; all worktrees are dirty. No branch or worktree was removed in this
+audit. Three side commits are already ancestors of the target, but their dirty
+worktrees still need reconciliation. Five Dependabot PRs remain open. The exact
+per-branch and per-worktree disposition is in
+[`2026-09-23-branch-worktree-reconciliation.md`](../reports/2026-09-23-branch-worktree-reconciliation.md).
+Root owns selective target integration and cleanup after behavior, WIP custody,
+focused checks and pushed checkpoints are proven; `main` and `release` stay
+untouched. Current provider-neutral Census read, installed workflows, live
+restart and whole-app resource evidence are next product barriers.
+
 ## 2026-09-16 dependency PR retirement
 
 PRs #47 (clap), #50 (uuid), and #51 (crc32fast) were closed without merging after
@@ -24,7 +44,7 @@ Exact pre-action PR metadata and diffs, retirement reasons, and post-action veri
 preserved in `.agents/tmp/resume-2026-09-15/support/root-live/branch-cleanup-current/optional-retirement/`.
 This checkpoint records repository housekeeping only, not source integration or product acceptance.
 
-Last updated: 2026-09-08
+Last updated: 2026-09-23
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
