@@ -9,8 +9,6 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
-const MAXIMUM_APPLICATION_BYTES: u64 = 768 * 1024 * 1024;
-const MAXIMUM_ONNX_WORKER_BYTES: u64 = 256 * 1024 * 1024;
 const APPLICATION_BASENAME: &str = "market-squawk";
 const DESKTOP_APPLICATION_BASENAME: &str = "market-squawk-desktop";
 const SERVICE_APPLICATION_BASENAME: &str = "market-squawk-service";
@@ -22,7 +20,7 @@ const ONNX_WORKER_BASENAME: &str = "market-squawk-onnx-worker";
 pub(super) fn current_executable_sha256() -> Result<[u8; 32], ExecutableIdentityError> {
     let executable = std::env::current_exe()
         .map_err(|source| ExecutableIdentityError::CurrentExecutable { source })?;
-    hash_stable_regular_file(&executable, MAXIMUM_APPLICATION_BYTES)
+    hash_stable_regular_file(&executable)
 }
 
 /// Returns the signed application identity and its fixed sibling ONNX worker path.
@@ -86,7 +84,7 @@ pub(super) fn development_training_release_programs(
 pub(super) fn installed_application_program() -> Result<PathBuf, ExecutableIdentityError> {
     let (application, _worker) = installed_release_programs()?;
     validate_installed_application_permissions(&application)?;
-    let _digest = hash_stable_regular_file(&application, MAXIMUM_APPLICATION_BYTES)?;
+    let _digest = hash_stable_regular_file(&application)?;
     Ok(application)
 }
 
@@ -102,7 +100,7 @@ pub(super) fn installed_service_program() -> Result<PathBuf, ExecutableIdentityE
         std::env::consts::EXE_SUFFIX
     ));
     validate_installed_application_permissions(&service)?;
-    let _digest = hash_stable_regular_file(&service, MAXIMUM_APPLICATION_BYTES)?;
+    let _digest = hash_stable_regular_file(&service)?;
     Ok(service)
 }
 
@@ -134,7 +132,7 @@ fn development_program(
         return Err(ExecutableIdentityError::InvalidExecutablePath);
     }
     validate_installed_application_permissions(program)?;
-    let _digest = hash_stable_regular_file(program, MAXIMUM_APPLICATION_BYTES)?;
+    let _digest = hash_stable_regular_file(program)?;
     fs::canonicalize(program).map_err(|source| ExecutableIdentityError::Canonicalize { source })
 }
 
@@ -187,17 +185,14 @@ fn admit_onnx_worker(
     candidate: PathBuf,
     expected_digest: [u8; 32],
 ) -> Result<OnnxWorkerProgram, ExecutableIdentityError> {
-    let digest = hash_stable_regular_file(&candidate, MAXIMUM_ONNX_WORKER_BYTES)?;
+    let digest = hash_stable_regular_file(&candidate)?;
     if digest != expected_digest {
         return Err(ExecutableIdentityError::SignedDigestMismatch);
     }
     OnnxWorkerProgram::admit(candidate, expected_digest).map_err(Into::into)
 }
 
-fn hash_stable_regular_file(
-    path: &Path,
-    maximum_bytes: u64,
-) -> Result<[u8; 32], ExecutableIdentityError> {
+fn hash_stable_regular_file(path: &Path) -> Result<[u8; 32], ExecutableIdentityError> {
     let named = fs::symlink_metadata(path)
         .map_err(|source| ExecutableIdentityError::Metadata { source })?;
     if named.file_type().is_symlink() || !named.is_file() {
@@ -213,13 +208,18 @@ fn hash_stable_regular_file(
     let before = file
         .metadata()
         .map_err(|source| ExecutableIdentityError::Metadata { source })?;
-    if !before.is_file() || before.len() == 0 || before.len() > maximum_bytes {
+    if !before.is_file() {
+        return Err(ExecutableIdentityError::UnsafeFileType);
+    }
+    if before.len() == 0 {
         return Err(ExecutableIdentityError::InvalidSize);
     }
-    let first = hash_pass(&mut file, maximum_bytes)?;
+    // Packaging owns executable-size limits. Each startup pass is bounded by the opened file
+    // length, with fixed-size storage and growth rejected before another chunk is read.
+    let first = hash_pass(&mut file, before.len())?;
     file.seek(SeekFrom::Start(0))
         .map_err(|source| ExecutableIdentityError::Read { source })?;
-    let second = hash_pass(&mut file, maximum_bytes)?;
+    let second = hash_pass(&mut file, before.len())?;
     let after = file
         .metadata()
         .map_err(|source| ExecutableIdentityError::Metadata { source })?;
@@ -234,7 +234,7 @@ fn hash_stable_regular_file(
     Ok(first.digest)
 }
 
-fn hash_pass(file: &mut File, maximum_bytes: u64) -> Result<HashPass, ExecutableIdentityError> {
+fn hash_pass(file: &mut File, expected_bytes: u64) -> Result<HashPass, ExecutableIdentityError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; HASH_CHUNK_BYTES];
     let mut bytes = 0_u64;
@@ -248,8 +248,8 @@ fn hash_pass(file: &mut File, maximum_bytes: u64) -> Result<HashPass, Executable
         bytes = bytes
             .checked_add(u64::try_from(read).map_err(|_| ExecutableIdentityError::InvalidSize)?)
             .ok_or(ExecutableIdentityError::InvalidSize)?;
-        if bytes > maximum_bytes {
-            return Err(ExecutableIdentityError::InvalidSize);
+        if bytes > expected_bytes {
+            return Err(ExecutableIdentityError::Changed);
         }
         hasher.update(&buffer[..read]);
     }
@@ -304,8 +304,8 @@ pub enum ExecutableIdentityError {
         #[source]
         source: io::Error,
     },
-    /// The executable is empty or exceeds its fixed startup ceiling.
-    #[error("executable size is outside the admitted bound")]
+    /// The executable is empty or its byte count cannot be represented.
+    #[error("executable is empty or its byte count is invalid")]
     InvalidSize,
     /// A bounded executable read failed.
     #[error("executable identity read failed")]
