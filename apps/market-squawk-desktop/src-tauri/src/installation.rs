@@ -18,8 +18,6 @@ use tauri::Manager as _;
 use thiserror::Error;
 
 const MAXIMUM_CHECKSUM_BYTES: u64 = 64 * 1024;
-const MAXIMUM_BOOTSTRAP_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Installed program state admitted for desktop composition.
 #[derive(Debug)]
@@ -43,9 +41,18 @@ pub(crate) fn prepare(
     app: &tauri::AppHandle,
     root: PathBuf,
 ) -> Result<PreparedInstallation, InstallationStartupError> {
-    let packaged = packaged_release(app)?;
     let current_snapshot = program_install_snapshot(&root, ProgramName::Desktop)?;
     let current = current_snapshot.status();
+    let packaged = match packaged_release(app) {
+        Ok(packaged) => packaged,
+        Err(error) if current.is_installed() && current.is_healthy() => {
+            eprintln!(
+                "market-squawk-desktop: packaged update is unavailable ({error}); continuing the installed release"
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
 
     if current.is_installed() {
         let mut changed = false;
@@ -220,8 +227,8 @@ fn packaged_release(
     if admitted.version() != version.to_string() {
         return Err(InstallationStartupError::InvalidPackagedRelease);
     }
-    let bundle = bounded_regular_file(&directory.join(bundle_name), MAXIMUM_BUNDLE_BYTES)?;
-    bounded_regular_file(&directory.join(bootstrap_name), MAXIMUM_BOOTSTRAP_BYTES)?;
+    let bundle = nonempty_regular_file(&directory.join(bundle_name))?;
+    nonempty_regular_file(&directory.join(bootstrap_name))?;
     bounded_regular_file(&directory.join("SHA256SUMS"), MAXIMUM_CHECKSUM_BYTES)?;
     Ok(Some(PackagedRelease {
         manifest,
@@ -252,16 +259,20 @@ fn read_file_names(root: &Path) -> Result<BTreeSet<String>, InstallationStartupE
     Ok(names)
 }
 
-fn bounded_regular_file(path: &Path, maximum: u64) -> Result<PathBuf, InstallationStartupError> {
+fn nonempty_regular_file(path: &Path) -> Result<PathBuf, InstallationStartupError> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > maximum
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
         return Err(InstallationStartupError::InvalidPackagedRelease);
     }
     Ok(path.to_path_buf())
+}
+
+fn bounded_regular_file(path: &Path, maximum: u64) -> Result<PathBuf, InstallationStartupError> {
+    let path = nonempty_regular_file(path)?;
+    if fs::symlink_metadata(&path)?.len() > maximum {
+        return Err(InstallationStartupError::InvalidPackagedRelease);
+    }
+    Ok(path)
 }
 
 fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, InstallationStartupError> {
