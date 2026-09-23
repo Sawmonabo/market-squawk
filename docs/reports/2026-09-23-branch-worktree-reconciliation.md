@@ -108,3 +108,28 @@ and worktree are absent. No target product file or backup was deleted.
 
 The resulting live inventory is **28 local branches, 19 origin heads and 11
 linked worktrees**. EIA's full live-to-installed product journey remains open.
+
+## Post-audit Coinbase disposition and retirement
+
+The `coinbase-native-identity` worktree was at `b04c2674`, an ancestor of the
+pushed target `fb1fd319`. Its 11 modified tracked files and two untracked files
+implemented adapter-owned copies of provider identity and synthetic reference
+fixtures. Current V1 selects an opaque identity in the instrument catalog,
+retains it with source and capture authority in the registry, and revalidates
+that selection through application publication. Replaying the old constructor
+would break current application callers and duplicate that authority. The
+per-file disposition and exact WIP copy are preserved in
+`/Users/sawmonabo/dev/market-squawk-handoff-backups/2026-09-23-coinbase-wip-reconciliation/`.
+The backup manifest SHA-256 is
+`2096478cdfad086316120797cda67f614011b8812896b877bd7b34aed06369db`;
+all five listed artifact checksums passed before cleanup and again afterward,
+and the 13 recorded source hashes matched the live worktree before cleanup.
+
+No open PR, origin head or runtime handle used this branch or worktree. After
+the source diff and untracked hashes matched the backup, the lead reconciled
+only those 13 obsolete working files, confirmed a clean source worktree,
+removed it without force, pruned metadata and deleted its already-integrated
+local branch with `git branch -d`. The resulting live inventory is **27 local
+branches, 19 origin heads and 10 linked worktrees**. The target, independent
+backup and other worktrees remain intact. Coinbase's complete live-to-installed
+product journey remains a separate acceptance barrier.

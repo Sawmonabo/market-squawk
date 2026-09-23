@@ -9,11 +9,12 @@ available through optional maintenance failure. Focused installer rollback and
 Desktop compilation passed; installed live restart and the final release gate
 remain open. The target checkout still contains substantial uncommitted V1 work.
 
-After the EIA retirement, live inventory is 28 local branches, 19 origin heads
-and 11 linked worktrees; all remaining worktrees are dirty. EIA's obsolete
-source worktree and local/remote side branch were removed only after exact
-WIP-backup verification and current-design disposition. Three other side commits
-are already ancestors of the target, but their dirty worktrees still need
+After the EIA and Coinbase retirements, live inventory is 27 local branches,
+19 origin heads and 10 linked worktrees; all remaining worktrees are dirty.
+The obsolete source worktrees and side branches were removed only after exact
+WIP-backup verification and current-design disposition. The crypto-canonical
+worktree remains because transitive source-run availability needs review;
+Kraken retains unique catalog-selection work. Other dirty worktrees still need
 reconciliation. Five Dependabot PRs remain open. The exact
 per-branch and per-worktree disposition is in
 [`2026-09-23-branch-worktree-reconciliation.md`](../reports/2026-09-23-branch-worktree-reconciliation.md).
