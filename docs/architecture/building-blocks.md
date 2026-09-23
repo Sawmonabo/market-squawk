@@ -9,8 +9,7 @@ event-to-decision path.
 | Document type | Building-block architecture |
 | Audience | Maintainers, reviewers, adapter authors, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-03 |
 
 ## Contents
 
@@ -72,7 +71,9 @@ flowchart TB
     Backtesting["backtesting: PIT simulation and experiment governance"]
     Valuation["valuation: fair-value evidence and workflow"]
     Python["python: stable-ABI research and training bindings"]
-    Mcp["mcp: bounded stdio protocol transport"]
+    Runtime["runtime: rendezvous, generation-bound native clients, /app/v1"]
+    Jobs["jobs: durable lifecycle, recovery, result references"]
+    Mcp["mcp: Streamable HTTP endpoint and named stdio relay"]
 
     Adapters["provider, file, portfolio and paper adapters"]
     App["market-squawk application and CLI composition"]
@@ -109,7 +110,10 @@ flowchart TB
     Analytics --> Python
     Data --> Python
     Modeling --> Python
-    Services --> Mcp
+    Services --> Runtime
+    Services --> Jobs
+    Runtime --> Mcp
+    Jobs --> Mcp
     Domain --> Adapters
     Sources --> Adapters
     Platform --> Adapters
@@ -158,11 +162,13 @@ authority separate from execution.
 
 ### Transport and composition
 
-`market-squawk-mcp` depends only on `market-squawk-services` for business-facing contracts. The
-application supplies concrete domain services and composes the protocol transport. CLI routes
-through the same `Application` and `LocalProduct`. The desktop crate depends on that application
-crate and adds only Tauri lifecycle plus a closed presentation bridge; it does not reimplement the
-product graph.
+`market-squawk-runtime` owns typed service identity, authenticated rendezvous, request envelopes,
+native clients, and private application transport contracts. `market-squawk-jobs` owns durable job
+lifecycle contracts and result references, never the domain result authority. `market-squawk-mcp`
+depends on service/runtime/job contracts for bounded Streamable HTTP handling and a named-client
+stdio relay. The application supplies concrete domain services and composes the per-user service.
+CLI and Desktop route through its native application client; the desktop crate adds only Tauri
+lifecycle plus a closed presentation bridge and does not reimplement the product graph.
 
 The stable-ABI Python crate consumes analytical, data, domain, and modeling contracts. It has no
 edge into live or execution. Concrete adapters depend inward on source/platform/domain or
@@ -190,9 +196,11 @@ production call authority.
 | [`market-squawk-valuation`](../../crates/market-squawk-valuation/src/lib.rs) | ASC 820/IFRS 13 evidence, methods, classification, overrides, approval/revocation, access decisions, recovery, and bounded queries. |
 | [`market-squawk-python`](../../crates/market-squawk-python/src/lib.rs) | Stable-ABI Python access to admitted point-in-time datasets and bounded Rust analytical/training contracts, outside the live path. |
 | [`market-squawk-services`](../../crates/market-squawk-services/src/lib.rs) | Transport-neutral typed operation descriptors, JSON admission, deadlines, cancellation, authorization, artifact policy, bounds, progress, and result metadata. |
-| [`market-squawk-mcp`](../../crates/market-squawk-mcp/src/lib.rs) | Bounded local stdio MCP framing, protocol lifecycle, output backpressure, audit, and opaque artifact references over `ToolServices`. |
-| [`market-squawk`](../../apps/market-squawk/src/lib.rs) | Shared product composition and CLI/MCP binaries: application domains, live source/runtime ownership, research, portfolio, model, fair value, backtest, and paper execution. |
-| [`market-squawk-desktop`](../../apps/market-squawk-desktop/src-tauri/src/lib.rs) | Tauri 2 composition root, window lifecycle, and five-command presentation bridge over `LocalProduct`; the React WebView owns rendering and transient form state only. |
+| [`market-squawk-runtime`](../../crates/market-squawk-runtime/src/lib.rs) | Installation/workspace/service generations, owner-only rendezvous, authenticated `/app/v1` client/server contracts, event and input-staging limits, request replay protection, and runtime route admission. |
+| [`market-squawk-jobs`](../../crates/market-squawk-jobs/src/lib.rs) | Durable job identity/generation/event contracts, typed authority snapshots, bounded observation, cancellation, confirmation, retry, recovery, and terminal result references. |
+| [`market-squawk-mcp`](../../crates/market-squawk-mcp/src/lib.rs) | Bounded authenticated Streamable HTTP MCP handling, named-client stateless stdio relay, resource addressing, output backpressure, audit integration, and opaque artifact references over `ToolServices`. |
+| [`market-squawk`](../../apps/market-squawk/src/lib.rs) | Shared product composition plus the per-user service, CLI client, domain services, live source/runtime, research, portfolio, model, fair value, backtest, paper, jobs, operations, workspace, lifecycle, and MCP-client registration authorities. |
+| [`market-squawk-desktop`](../../apps/market-squawk-desktop/src-tauri/src/lib.rs) | Tauri 2 Desktop client, window lifecycle, and closed presentation bridge over the authenticated service; the React WebView owns rendering and transient form state only. |
 
 ## Adapter responsibilities
 

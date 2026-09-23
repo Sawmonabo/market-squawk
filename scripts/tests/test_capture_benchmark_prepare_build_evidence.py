@@ -25,6 +25,7 @@ from scripts.capture_benchmark_prepare_build_evidence import (
     RESULT_SCHEMA_VERSION,
     RUNNER,
     TARGET,
+    VERIFICATION_BINDING_FIELDS,
     GateError,
     artifact_hash,
     benchmark_backend_binding,
@@ -97,11 +98,11 @@ def binding_value() -> dict:
         "queue_transport": "standard_sync_channel",
         "queue_private_storage_accounting": "not_measured",
         "build_profile": PROFILE,
-        "measured_code_head": "1" * 40,
         "clean_build_enforced": True,
         "build_environment_policy": BUILD_ENVIRONMENT_POLICY,
         "build_command_sha256": "f" * 64,
         "build_environment_sha256": "1" * 64,
+        "measured_source_closure_sha256": "0" * 64,
         "source_inventory_sha256": "2" * 64,
         "cargo_lock_sha256": "3" * 64,
         "workspace_manifest_sha256": "4" * 64,
@@ -111,16 +112,6 @@ def binding_value() -> dict:
         "cargo_executable_sha256": "8" * 64,
         "git_executable_sha256": "9" * 64,
         "rustc_executable_sha256": "7" * 64,
-        "host_gate_shell_sha256": "c" * 64,
-        "host_gate_python_sha256": "d" * 64,
-        "host_gate_process_sha256": "0" * 64,
-        "host_gate_evidence_io_sha256": "1" * 64,
-        "host_gate_cli_sha256": "2" * 64,
-        "host_gate_schema_sha256": "3" * 64,
-        "host_gate_execution_sha256": "6" * 64,
-        "host_gate_observation_sha256": "4" * 64,
-        "host_gate_measured_sha256": "5" * 64,
-        "build_evidence_python_sha256": "e" * 64,
         "platform_source_sha256": "6" * 64,
         "domain_source_sha256": "7" * 64,
         "entrypoint_sha256": "8" * 64,
@@ -277,7 +268,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
 def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
     repository = (root / "repository").resolve()
     repository.mkdir()
-    for name in ("Cargo.toml", "Cargo.lock"):
+    for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
         shutil.copy2(REPOSITORY / name, repository / name)
     platform = repository / "crates/market-squawk-platform"
     platform.mkdir(parents=True)
@@ -295,6 +286,7 @@ def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
     shutil.copytree(REPOSITORY / "crates/market-squawk-platform/benches", platform / "benches")
     domain = repository / "crates/market-squawk-domain"
     domain.mkdir(parents=True)
+    shutil.copy2(REPOSITORY / "crates/market-squawk-domain/Cargo.toml", domain / "Cargo.toml")
     shutil.copytree(REPOSITORY / "crates/market-squawk-domain/src", domain / "src")
     scripts = repository / "scripts"
     scripts.mkdir()
@@ -638,7 +630,7 @@ class BuildEvidenceTest(unittest.TestCase):
         extra_key["unexpected"] = True
         invalid.append(("extra-key", extra_key))
         uppercase_digest = binding_value()
-        uppercase_digest["host_gate_python_sha256"] = "A" * 64
+        uppercase_digest["measured_source_closure_sha256"] = "A" * 64
         invalid.append(("uppercase-digest", uppercase_digest))
         unclean = binding_value()
         unclean["clean_build_enforced"] = False
@@ -673,7 +665,9 @@ class BuildEvidenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             valid = self._runner_script(directory, "valid", binding_value())
-            self.assertEqual(runner_bindings(valid)["runner"], RUNNER)
+            bindings = runner_bindings(valid)
+            self.assertEqual(bindings["runner"], RUNNER)
+            self.assertNotIn("measured_code_head", bindings)
             for name, value in invalid:
                 with self.subTest(name=name):
                     script = self._runner_script(directory, name, value)
@@ -757,6 +751,7 @@ class BuildEvidenceTest(unittest.TestCase):
     def test_current_binding_drift_is_rejected(self) -> None:
         value = binding_value()
         current_fields = {
+            "measured_source_closure_sha256",
             "source_inventory_sha256",
             "cargo_lock_sha256",
             "workspace_manifest_sha256",
@@ -787,14 +782,18 @@ class BuildEvidenceTest(unittest.TestCase):
             "observer_sha256",
             "immutable_module_sha256",
         }
-        current = {field: value[field] for field in current_fields}
+        current = {
+            field: value[field]
+            for field in current_fields - VERIFICATION_BINDING_FIELDS
+        }
+        current.update({field: "a" * 64 for field in VERIFICATION_BINDING_FIELDS})
         validate_current_bindings(value, current)
         missing_execution = dict(current)
         del missing_execution["host_gate_execution_sha256"]
         with self.assertRaises(GateError):
             validate_current_bindings(value, missing_execution)
         mismatched_execution = dict(current)
-        mismatched_execution["host_gate_execution_sha256"] = "0" * 64
+        mismatched_execution["measured_source_closure_sha256"] = "f" * 64
         with self.assertRaises(GateError):
             validate_current_bindings(value, mismatched_execution)
 
@@ -1034,7 +1033,7 @@ class BuildEvidenceTest(unittest.TestCase):
         failure_injection: str | None = None,
     ) -> tuple[list[str], dict[str, str], Path]:
         root.mkdir(parents=True, exist_ok=True)
-        repository, head = initialize_fixture_repository(root)
+        repository, _head = initialize_fixture_repository(root)
         controlled = (root / "controlled").resolve()
         controlled.mkdir(mode=0o700)
         run = controlled / "run"
@@ -1087,12 +1086,16 @@ class BuildEvidenceTest(unittest.TestCase):
             rustc_sha256,
         )
         value = binding_value()
-        value.update(
-            recompute_current_bindings(
-                repository, cargo_sha256, git_sha256, rustc_sha256
-            )
+        current_bindings = recompute_current_bindings(
+            repository, cargo_sha256, git_sha256, rustc_sha256
         )
-        value["measured_code_head"] = head
+        value.update(
+            {
+                field: digest
+                for field, digest in current_bindings.items()
+                if field not in VERIFICATION_BINDING_FIELDS
+            }
+        )
         value["build_command_sha256"] = command_digest
         value["build_environment_sha256"] = environment_digest
         artifact = repository / "target/fixture-runner"

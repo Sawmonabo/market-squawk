@@ -11,18 +11,23 @@ use thiserror::Error;
 
 mod admission;
 mod bundle;
+mod forecast;
 mod input;
 mod metadata;
 mod native;
 #[cfg(feature = "onnx-tract")]
 mod onnx;
 mod registry;
+#[cfg(test)]
+mod test_contracts;
 mod training_environment;
+mod training_protocol;
 
 pub use admission::{
     BundleAuthorityDocument, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
     ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, ValidatedModelCandidate,
-    recover_model_candidate, verify_model_candidate,
+    has_price_return_macro_context_feature_order_v1, recover_model_candidate,
+    verify_model_candidate,
 };
 #[cfg(feature = "release-evidence")]
 pub use bundle::benchmark_support::{
@@ -33,17 +38,28 @@ pub use bundle::benchmark_support::{
 pub use bundle::fuzz_parse_bundle_metadata;
 pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
-    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES,
-    MAX_TRAINING_RUN_BYTES, ModelBundle,
+    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_FORECAST_POLICY_BYTES, MAX_FORECAST_RESIDUAL_BYTES,
+    MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES, MAX_TRAINING_RUN_BYTES, ModelBundle,
+};
+pub use forecast::{
+    CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow,
+    ForecastCentralStatistic, ForecastCoverage, ForecastError, ForecastEstimatorProfile,
+    ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastMeasurement,
+    ForecastObservedPoint, ForecastOutcome, ForecastOutcomeId, ForecastOutputBinding, ForecastPath,
+    ForecastPoint, ForecastRequest, ForecastTargetMeaning, ForecastTrainingObjective,
+    ForecastTransform, ForecastValue, ForecastVintage, ForecastVintageId,
+    MAX_FORECAST_DECIMAL_SCALE, MAX_FORECAST_OBSERVED_POINTS, MAX_FORECAST_POINTS,
+    RealizedCoverage, ResearchForecastBackend, verify_forecast_vintage_identity,
 };
 pub use input::{
     ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,
 };
 pub use metadata::{
-    BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer, MAX_BUNDLE_ID_BYTES,
-    MAX_MODEL_FEATURES, MAX_TRAINING_CODE_REVISION_BYTES, ModelFeatureBinding, ModelFormat,
-    ModelMetadata, ModelMetadataError, ModelOutputSemantics, TrainingDatasetIdentity,
-    TrainingPeriod, ValidationMetric, ValidationMetricName,
+    BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer,
+    ForecastCalibrationArtifacts, MAX_BUNDLE_ID_BYTES, MAX_MODEL_FEATURES,
+    MAX_TRAINING_CODE_REVISION_BYTES, ModelFeatureBinding, ModelFormat, ModelMetadata,
+    ModelMetadataError, ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod,
+    ValidationMetric, ValidationMetricName,
 };
 pub use native::{InferenceBackend, InferenceError, NativeBackendError, NativeLinearBackend};
 #[cfg(feature = "onnx-runtime")]
@@ -64,8 +80,15 @@ pub use registry::{
     ModelRegistry, ModelRegistryError,
 };
 pub use training_environment::{
-    TrainingEnvironmentError, VerifiedTrainingEnvironment, verify_application_training_environment,
-    verify_python_training_environment, verify_validator_training_environment,
+    TrainingEnvironmentError, VerifiedTrainingEnvironment, VerifiedTrainingWorkerProgram,
+    verify_application_training_environment, verify_python_training_environment,
+    verify_validator_training_environment,
+};
+pub use training_protocol::{
+    MAX_TRAINING_WORKER_EVENT_BYTES, MAX_TRAINING_WORKER_EVENTS, MAX_TRAINING_WORKER_STDERR_BYTES,
+    MAX_TRAINING_WORKER_STREAM_BYTES, TRAINING_WORKER_SCHEMA_VERSION, TrainingWorkerCandidate,
+    TrainingWorkerEvent, TrainingWorkerPhase, TrainingWorkerProgress, TrainingWorkerProtocolError,
+    TrainingWorkerProtocolSession, TrainingWorkerStderrEvidence,
 };
 
 /// Exact typed model failure before an execution strategy can create an order intent.
@@ -260,6 +283,7 @@ const fn bundle_error_code(error: BundleError) -> u16 {
         BundleError::MetadataSyntax => 8,
         BundleError::UnsupportedMetadataVersion => 9,
         BundleError::InvalidOutputSemantics => 48,
+        BundleError::InvalidOutputMeasurement => 55,
         BundleError::ModelIdentityMismatch => 10,
         BundleError::BundleIdentityMismatch => 11,
         BundleError::UnsupportedFormat => 12,
@@ -298,6 +322,12 @@ const fn bundle_error_code(error: BundleError) -> u16 {
         BundleError::TrainingRunTrialHashMismatch => 45,
         BundleError::TrainingRunRelationshipMismatch => 46,
         BundleError::UnsupportedArtifactSchemaVersion => 47,
+        BundleError::ForecastCalibrationTooLarge => 49,
+        BundleError::ForecastCalibrationSizeMismatch => 50,
+        BundleError::ForecastCalibrationHashMismatch => 51,
+        BundleError::ForecastCalibrationStructureLimit => 52,
+        BundleError::ForecastCalibrationSyntax => 53,
+        BundleError::InvalidForecastCalibration => 54,
     }
 }
 

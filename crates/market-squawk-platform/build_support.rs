@@ -111,6 +111,8 @@ pub(crate) fn select_benchmark_backend(
 pub(crate) struct BenchmarkBackendSourceBinding {
     backend: BenchmarkBackend,
     dispatcher_sha256: String,
+    standard_source_sha256: String,
+    candidate_source_sha256: String,
     selected_source_relative_path: &'static str,
     selected_source_sha256: String,
     backend_sha256: String,
@@ -123,6 +125,14 @@ impl BenchmarkBackendSourceBinding {
 
     pub(crate) fn dispatcher_sha256(&self) -> &str {
         &self.dispatcher_sha256
+    }
+
+    pub(crate) fn standard_source_sha256(&self) -> &str {
+        &self.standard_source_sha256
+    }
+
+    pub(crate) fn candidate_source_sha256(&self) -> &str {
+        &self.candidate_source_sha256
     }
 
     pub(crate) const fn selected_source_relative_path(&self) -> &'static str {
@@ -163,8 +173,8 @@ pub(crate) fn bind_benchmark_backend_sources(
         return Err("capture benchmark backend sources are byte-identical".into());
     }
     let selected_source_sha256 = match backend {
-        BenchmarkBackend::Standard => standard_sha256,
-        BenchmarkBackend::Candidate => candidate_sha256,
+        BenchmarkBackend::Standard => standard_sha256.clone(),
+        BenchmarkBackend::Candidate => candidate_sha256.clone(),
     };
     let selected_source_relative_path = backend.selected_source_relative_path();
     let mut digest = Sha256::new();
@@ -183,6 +193,8 @@ pub(crate) fn bind_benchmark_backend_sources(
     Ok(BenchmarkBackendSourceBinding {
         backend,
         dispatcher_sha256,
+        standard_source_sha256: standard_sha256,
+        candidate_source_sha256: candidate_sha256,
         selected_source_relative_path,
         selected_source_sha256,
         backend_sha256: format!("{:x}", digest.finalize()),

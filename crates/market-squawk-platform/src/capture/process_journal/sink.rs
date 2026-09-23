@@ -28,6 +28,29 @@ use crate::capture::writer::{
 
 const STARTUP_REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+#[cfg(unix)]
+fn isolate_helper_from_terminal_interrupts(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // The service owns helper shutdown through its bounded protocol and process
+    // supervisor. A separate process group prevents a terminal Ctrl-C from
+    // killing the helper before the service can flush, stop, and reap it.
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn isolate_helper_from_terminal_interrupts(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+
+    // CREATE_NEW_PROCESS_GROUP prevents the helper from receiving the parent
+    // console's Ctrl-C event. Explicit parent kill and reap remain available.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn isolate_helper_from_terminal_interrupts(_command: &mut Command) {}
+
 #[derive(Debug)]
 pub(super) struct StartedProcessJournalSink {
     pub(super) sink: ProcessJournalSink,
@@ -60,6 +83,7 @@ impl ProcessJournalSink {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env_clear();
+        isolate_helper_from_terminal_interrupts(&mut command);
         #[cfg(all(feature = "capture-test", debug_assertions))]
         if let Some(behavior) = config.test_behavior() {
             let mode = match behavior {

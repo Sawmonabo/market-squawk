@@ -8,14 +8,15 @@ admission, native and ONNX inference, evaluation evidence, and restart recovery.
 | Document type | Operations runbook |
 | Audience | Local research operators, model reviewers, release engineers, and incident responders |
 | Status | Current |
-| Last substantive review | 2026-07-30 |
-| Reviewed commit | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
+| Last substantive review | 2026-08-03 |
+| Review basis | Current installed service, durable-job, model, and ONNX contracts; not release approval evidence |
 
 ## Contents
 
 - [Scope](#scope)
 - [Safety and authority boundaries](#safety-and-authority-boundaries)
 - [Preconditions and current product limits](#preconditions-and-current-product-limits)
+- [Use durable model work in the installed product](#use-durable-model-work-in-the-installed-product)
 - [Prepare the verified Python training release](#prepare-the-verified-python-training-release)
 - [Train and export a native candidate](#train-and-export-a-native-candidate)
 - [Prepare an admission request](#prepare-an-admission-request)
@@ -37,7 +38,7 @@ admission, native and ONNX inference, evaluation evidence, and restart recovery.
 This page documents:
 
 - building and selecting the verified Python training release;
-- opening one exact point-in-time Python dataset export;
+- opening one exact receipt-admitted Training-contract dataset export;
 - deterministic native linear or logistic training outside the live path;
 - independent authority review and Rust-validated candidate export;
 - `model admit <REQUEST> --confirm`;
@@ -47,9 +48,10 @@ This page documents:
 - restart validation, immutable replay, no-action failure, and recovery.
 
 It does not place Python in the live event-to-decision path, make a model output an order, or grant
-authority by naming a path. Dataset build output exposes the exact Python export digest, and the
-sealed release builder binds the final application, validator, ONNX worker, and supported
-`market-squawk-train` driver.
+authority by naming a path. Generic `dataset build` and `feature build` results expose only a
+phase-one descriptor digest; that digest is not a training-ready Python export. The sealed release
+builder binds the final application, validator, ONNX worker, and supported `market-squawk-train`
+driver, while the dataset catalog independently requires an exact code-owned Training receipt.
 
 ## Safety and authority boundaries
 
@@ -62,6 +64,10 @@ sealed release builder binds the final application, validator, ONNX worker, and 
   capability path; the CLI does not accept an arbitrary absolute candidate path.
 - Candidate metadata, artifact, training run, authority, dataset export, dataset selection, catalog
   identity, training environment, feature semantics, and runtime policy are digest-bound.
+- A phase-one generation, manifest, or `phaseOneDescriptorSha256` grants no training authority.
+  Training stays unavailable until the code-owned producer has issued the exact closed
+  `market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.training/v1` receipt and
+  its receipt-admitted `exportSha256`.
 - `model admit` is a durable mutation and requires `--confirm`. Prediction is read-only.
   `model evaluate` also requires `--confirm` because it retains bounded process-local evidence.
 - Model results report `executionAuthority: "none"`. A positive or negative model decision is
@@ -93,8 +99,8 @@ Before admission:
 
 - `market-squawk --data-dir "$DATA_ROOT" config validate` and `doctor` must succeed;
 - the selected training release must be installed and unchanged;
-- the exact dataset export receipt, selection cutoff, selection digest, and catalog identity must
-  already exist in accepted evidence;
+- the exact code-owned Training product receipt, its dataset export digest, selection cutoff,
+  selection digest, and catalog identity must already exist in accepted evidence;
 - the candidate must have passed its adjacent Rust validator;
 - the authority file must be an independently reviewed, regular, no-follow file of at most
   256 KiB; and
@@ -109,11 +115,59 @@ only the exact release-bound application and ONNX worker for admission. Model fa
 format are separate authorities: `modelKind` is `linear` or `logistic`, while `artifactFormat` is
 `onnx`.
 
+## Use durable model work in the installed product
+
+The installed Desktop Models workflow starts `Model.StartTraining` and `Model.StartForecast` as
+durable service jobs. The service, not the WebView or a connected MCP/CLI client, owns the exact
+workspace, captured request, worker lifecycle, cancellation, output admission, and terminal
+receipt. A client disconnect therefore does not discard accepted training or forecast work.
+
+### Prerequisites and authority checks
+
+Before starting work, use the Models page or exact typed service status to confirm the active
+workspace, selected signed training release, exact dataset/feature/label identities, model input
+contract, applicable model/admission authority, and available job/storage budget. The request is a
+code-owned closed schema; no raw filesystem path, interpreter path, arbitrary Python command, or
+arbitrary ONNX runtime is supplied by the UI or MCP client. A training proposal still requires
+independent authority review before immutable admission.
+
+If the exact Training-contract receipt is absent, `Model.StartTraining` must remain unavailable.
+Do not substitute a generic phase-one manifest or descriptor, even when that build requested
+`intendedUse: "train"`; rights preflight is not product admission.
+
+### Procedure, evidence, and recovery
+
+1. In **Models**, select the workflow whose displayed identities and source-time evidence match
+   the intended research question. Review validation, expected input/output, cancellation boundary,
+   and the explicit confirmation prompt.
+2. Confirm the start. `Model.StartTraining` or `Model.StartForecast` returns a durable job receipt;
+   record its `jobId`, workspace/service generation, input identity, and initial event sequence.
+3. Watch it from **Operations** or the Models page. `Job.Get`, bounded `Job.Watch`, `Job.Cancel`,
+   `Job.Confirm`, and `Job.Retry` retain the service state. Progress is a named monotonic phase;
+   percentage appears only when objective units exist. An accepted start is not completion.
+4. On `Completed`, open the returned result/controlled artifact and exact model or forecast
+   identity. Forecast review uses `Model.GetForecast`, `Model.ListForecasts`, and
+   `Model.GetForecastOutcomes`. Training still needs the reviewed immutable admission flow below
+   before a new bundle is usable.
+
+Success is a terminal completed job with bounded result identity and a subsequent typed read that
+returns the same evidence after client reconnection. An interrupted, failed, cancelled, or
+`AwaitingConfirmation` job has not produced a usable model merely because temporary worker output
+exists. Cancellation is cooperative: request it through `Job.Cancel`, then wait for terminal
+evidence; do not kill a worker or delete staged output.
+
+After a restore, workspace switch, update, or stale-generation response, reconnect before reading
+or mutating and never reuse earlier requests, previews, job handles, or confirmations. If the
+service reports `Interrupted` or recovery required, preserve its phases, diagnostics, inputs, and
+artifact references. Use `Job.Retry` only when the returned contract declares it recoverable;
+otherwise repair the first failed training-release, dataset, policy, disk, or worker-identity
+authority and start a new governed request. No incomplete output is admitted or shown as a forecast.
+
 ## Prepare the verified Python training release
 
-The v1.0.0 complete installation already contains standard-GIL CPython 3.14.6, uv 0.12.0, and the
-locked Python environment for its target. The desktop automatically selects the active immutable
-complete-release root. A headless process must pass that same active root through
+An installed product release carries its selected managed Python and uv runtime plus the locked
+Python environment for its target. The Desktop automatically selects the active immutable release
+root. A headless process must pass that same active root through
 `--training-release-root`; do not select the retained previous version or an arbitrary virtual
 environment.
 
@@ -223,7 +277,12 @@ hide durable models behind an empty inventory.
 ## Supported ONNX first-use flow
 
 Create a private configuration file containing the exact retained dataset, feature, label, and
-model identities. The schema is closed; placeholders must be replaced with accepted evidence:
+model identities. The schema is closed; every illustrative value below must be replaced with its
+accepted evidence before it is used:
+
+The `dataset.exportSha256` value below must come from the exact code-owned Training receipt. A
+`phaseOneDescriptorSha256` from `dataset build` or `feature build` is a different identity and must
+not be used. If no Training receipt exists, stop: this training flow is unavailable.
 
 ```json
 {
@@ -316,15 +375,15 @@ invocation, compares them with the signed training-environment receipt, and rech
 ```
 
 Retain the proposal, accepted authority, candidate receipt identities, admission request/result,
-dataset receipt, and signed release evidence as one audit set. To train logistic classification,
-change only the reviewed `modelKind` to `logistic` when the exact label is binary; do not relabel a
-linear fit or an ONNX representation after training.
+Training product receipt, and signed release evidence as one audit set. To train logistic
+classification, change only the reviewed `modelKind` to `logistic` when the exact label is binary;
+do not relabel a linear fit or an ONNX representation after training.
 
 ## Train and export a native candidate
 
 This section becomes runnable only when accepted evidence supplies:
 
-- the exact dataset `exportSha256`;
+- the exact receipt-admitted Training product and its `exportSha256`;
 - the selection cutoff in Unix nanoseconds;
 - the feature identities admitted by the dataset and production feature registry; and
 - a candidate output directory below `<data-root>/artifacts` that exists but has no `candidate`
@@ -334,7 +393,7 @@ The Python API enforces at most 100,000 examples, 1,024 features, 2,000,000 reta
 50,000,000 estimated training operations. It supports `linear` and `logistic`, a deterministic
 64-bit seed, and missing policy `reject` or `drop_row`.
 
-### 1. Open one exact dataset receipt and form a proposal
+### 1. Open one exact Training product receipt and form a proposal
 
 Use the sealed interpreter. The following outline uses the shipping API; replace every environment
 value with retained evidence rather than another digest with a similar name:
@@ -389,10 +448,10 @@ def make_proposal():
     )
 ```
 
-`open_dataset` independently verifies the catalog admission, exact export, selected
-content-addressed objects, Arrow/Parquet schema, row lineage, split policy, component contract,
-selection cutoff, result bounds, and current catalog identity. The training run verifies the
-receipt again before fitting and before export.
+`open_dataset` independently verifies the exact Training product contract and production receipt,
+catalog admission, export, selected content-addressed objects, Arrow/Parquet schema, row lineage,
+split policy, component contract, selection cutoff, result bounds, and current catalog identity.
+The training run verifies the receipt again before fitting and before export.
 
 Choose a feature that is both in the Python `feature_contracts` result and in the exact dataset
 component contract. Replace `linear` with `logistic` only when that is the reviewed model kind.
@@ -422,8 +481,8 @@ proposal from corrected inputs.
 
 ### 3. Recreate and export the accepted proposal
 
-Recreate the proposal deterministically with the same installed release, dataset receipt, seed,
-features, label, model kind, and identities. Then use the exact independent authority:
+Recreate the proposal deterministically with the same installed release, Training product receipt,
+seed, features, label, model kind, and identities. Then use the exact independent authority:
 
 ```python
 import os
@@ -559,8 +618,8 @@ A successful new admission reports:
 }
 ```
 
-Retain this result with the candidate receipt, admission request, independent authority, dataset
-receipt, training release evidence, and exact application identity.
+Retain this result with the candidate receipt, admission request, independent authority, Training
+product receipt, training release evidence, and exact application identity.
 
 ## Admit an ONNX bundle
 
@@ -865,6 +924,7 @@ There is no CLI de-admit, delete, or “set current” operation:
 | Invalid SHA-256 or schema version | Request fields are not canonical lowercase SHA-256 or schema 1 | Recreate from exact receipts; never substitute or normalize an unknown digest |
 | Authority path/file rejected | Path is not absolute, file is not bounded/no-follow, root overlaps data root, or bytes changed | Restore the exact independently reviewed authority under a disjoint controlled root |
 | Candidate root unavailable | `candidateDirectory` escaped its grammar or does not exist below `artifacts` | Correct the relative coordinate; do not widen filesystem authority |
+| Training dataset unavailable | Only a generic phase-one generation or descriptor exists; no exact code-owned Training receipt is admitted | Keep training unavailable until the Training product producer issues the receipt; do not relabel a phase-one digest as `exportSha256` |
 | Dataset admission mismatch | Export, as-of cutoff, selection, catalog identity, manifest, or rows differ | Restore the exact dataset/catalog evidence or train a new candidate |
 | Training environment mismatch | Installed release, application, validator, ONNX worker, wheel, `RECORD`, signature, or foundation differs | Restore the exact signed release set; rebuild through the supported release path |
 | Backend policy mismatch | Native/ONNX request does not match the bundle format or ONNX artifact digest | Correct the request from the accepted bundle receipt |

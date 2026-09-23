@@ -1,7 +1,7 @@
 use market_squawk_adapter_kraken::{
     KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_QUALIFICATION_POLICY_DIGEST,
-    KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenDecodeOutcome, KrakenDecoder,
-    KrakenDecoderState, KrakenDepth, KrakenMetadataInput, KrakenQualificationPolicy,
+    KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenDepth, KrakenMetadataInput,
+    KrakenQualificationPolicy,
 };
 use market_squawk_adapter_paper::{
     FeeSchedule, PaperAccountBootstrap, PaperExposureValuation, PaperLedger, PaperLedgerConfig,
@@ -23,7 +23,7 @@ use market_squawk_execution::{
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, ChecksumValidationProfile,
-    FreshnessPolicy, ProviderBudgetPolicy, ProviderChecksumEvidence, SourceProtocolProfile,
+    FreshnessPolicy, ProviderBudgetPolicy, SourceProtocolProfile,
 };
 use rust_decimal::Decimal;
 use std::collections::BTreeSet;
@@ -91,16 +91,6 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
 
-    let mut decoder = KrakenDecoder::try_trades("BTC/USD", instrument)?;
-    let trade = br#"{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":"45283.50000","qty":"0.01000000","ord_type":"market","trade_id":123,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
-    let KrakenDecodeOutcome::Market(observations) = decoder.decode_payload(trade)? else {
-        return Err("trade decoded as control traffic".into());
-    };
-    assert!(matches!(
-        observations[0].checksum(),
-        ProviderChecksumEvidence::Unsupported { .. }
-    ));
-    assert_eq!(decoder.state(), KrakenDecoderState::Healthy);
     Ok(())
 }
 

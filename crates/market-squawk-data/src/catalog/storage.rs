@@ -134,6 +134,9 @@ pub(super) fn apply_migrations(
             super::migration_preflight::preflight_research_use_migration(&transaction)?;
         }
         transaction.execute_batch(migration.sql)?;
+        if migration.version == 22 {
+            super::onboarding::backfill_provider_onboarding_stream_heads(&transaction)?;
+        }
         if migration.version == 5 && legacy_root_migration_required {
             let legacy_schema_version = u64::try_from(applied.len())
                 .map_err(|_| CatalogError::MigrationRegistryMismatch)?;
@@ -716,7 +719,7 @@ pub(super) fn now_timestamp() -> Result<Timestamp, CatalogError> {
 }
 
 /// Advances the durable authority clock only after ruling out local wall-clock rollback.
-pub(super) fn trusted_catalog_now(
+pub(crate) fn trusted_catalog_now(
     transaction: &Transaction<'_>,
 ) -> Result<Timestamp, CatalogError> {
     let wall_now = now_timestamp()?;

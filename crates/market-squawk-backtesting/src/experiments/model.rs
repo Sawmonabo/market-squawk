@@ -183,8 +183,8 @@ pub struct TrialSpec {
     pub(super) dataset_identity: Sha256Digest,
     pub(super) object_graph_digest: Sha256Digest,
     pub(super) execution_assumption_digest: Sha256Digest,
-    pub(super) run_input_digest: Option<Sha256Digest>,
-    pub(super) cohort_authority_digest: Option<Sha256Digest>,
+    pub(super) run_input_digest: Sha256Digest,
+    pub(super) cohort_authority_digest: Sha256Digest,
     pub(super) cohort_universe_digest: Option<Sha256Digest>,
     pub(super) model: Option<TrialComponentBinding>,
     pub(super) strategy: TrialComponentBinding,
@@ -195,75 +195,17 @@ pub struct TrialSpec {
     pub(super) search_space: Box<[TrialSearchDimension]>,
     pub(super) selection_criterion: SourceIdentifier,
     pub(super) identity: TrialId,
-    identity_version: TrialIdentityVersion,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TrialIdentityVersion {
-    V1,
-    V2,
-    V3,
-}
-
-impl TrialIdentityVersion {
-    pub(super) const fn terminal_schema_version(self) -> u16 {
-        match self {
-            Self::V1 => 1,
-            Self::V2 => 2,
-            Self::V3 => 3,
-        }
-    }
-}
-
-pub(super) struct VersionedTrialSpecInput {
-    pub dataset_identity: Sha256Digest,
-    pub object_graph_digest: Sha256Digest,
-    pub execution_assumption_digest: Sha256Digest,
-    pub run_input_digest: Option<Sha256Digest>,
-    pub cohort_authority_digest: Option<Sha256Digest>,
-    pub cohort_universe_digest: Option<Sha256Digest>,
-    pub model: Option<TrialComponentBinding>,
-    pub strategy: TrialComponentBinding,
-    pub code: TrialComponentBinding,
-    pub configuration_digest: Sha256Digest,
-    pub seed: u64,
-    pub parameters: Vec<TrialParameter>,
-    pub search_space: Vec<TrialSearchDimension>,
-    pub selection_criterion: SourceIdentifier,
 }
 
 impl TrialSpec {
     /// Validates every immutable input and computes the collision-resistant trial identity.
-    pub fn try_new(input: TrialSpecInput) -> Result<Self, ExperimentError> {
-        Self::try_new_versioned(
-            VersionedTrialSpecInput {
-                dataset_identity: input.dataset_identity,
-                object_graph_digest: input.object_graph_digest,
-                execution_assumption_digest: input.execution_assumption_digest,
-                run_input_digest: Some(input.run_input_digest),
-                cohort_authority_digest: Some(input.cohort_authority_digest),
-                cohort_universe_digest: input.cohort_universe_digest,
-                model: input.model,
-                strategy: input.strategy,
-                code: input.code,
-                configuration_digest: input.configuration_digest,
-                seed: input.seed,
-                parameters: input.parameters,
-                search_space: input.search_space,
-                selection_criterion: input.selection_criterion,
-            },
-            TrialIdentityVersion::V3,
-        )
-    }
-
-    pub(super) fn try_new_versioned(
-        mut input: VersionedTrialSpecInput,
-        identity_version: TrialIdentityVersion,
-    ) -> Result<Self, ExperimentError> {
+    pub fn try_new(mut input: TrialSpecInput) -> Result<Self, ExperimentError> {
         for digest in [
             input.dataset_identity,
             input.object_graph_digest,
             input.execution_assumption_digest,
+            input.run_input_digest,
+            input.cohort_authority_digest,
             input.strategy.digest,
             input.code.digest,
             input.configuration_digest,
@@ -273,38 +215,12 @@ impl TrialSpec {
         if let Some(model) = &input.model {
             require_digest(model.digest)?;
         }
-        for digest in [
-            input.run_input_digest,
-            input.cohort_authority_digest,
-            input.cohort_universe_digest,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for digest in input.cohort_universe_digest {
             require_digest(digest)?;
-        }
-        let version_fields_valid = match identity_version {
-            TrialIdentityVersion::V1 => {
-                input.run_input_digest.is_none()
-                    && input.cohort_authority_digest.is_none()
-                    && input.cohort_universe_digest.is_none()
-            }
-            TrialIdentityVersion::V2 => {
-                input.run_input_digest.is_some()
-                    && input.cohort_authority_digest.is_none()
-                    && input.cohort_universe_digest.is_none()
-            }
-            TrialIdentityVersion::V3 => {
-                input.run_input_digest.is_some() && input.cohort_authority_digest.is_some()
-            }
-        };
-        if !version_fields_valid {
-            return Err(ExperimentError::InvalidSpec);
         }
         if input.parameters.len() > HARD_MAX_PARAMETERS
             || input.search_space.len() > HARD_MAX_SEARCH_DIMENSIONS
-            || (identity_version != TrialIdentityVersion::V1
-                && input.parameters.len() != input.search_space.len())
+            || input.parameters.len() != input.search_space.len()
         {
             return Err(ExperimentError::InvalidSpec);
         }
@@ -326,19 +242,16 @@ impl TrialSpec {
         {
             return Err(ExperimentError::InvalidSpec);
         }
-        if identity_version != TrialIdentityVersion::V1 {
-            let candidate_count =
-                input
-                    .search_space
-                    .iter()
-                    .try_fold(1_usize, |count, dimension| {
-                        count
-                            .checked_mul(dimension.candidates.len())
-                            .ok_or(ExperimentError::InvalidSpec)
-                    })?;
-            if candidate_count > HARD_MAX_TRIALS {
-                return Err(ExperimentError::InvalidSpec);
-            }
+        let candidate_count = input
+            .search_space
+            .iter()
+            .try_fold(1_usize, |count, dimension| {
+                count
+                    .checked_mul(dimension.candidates.len())
+                    .ok_or(ExperimentError::InvalidSpec)
+            })?;
+        if candidate_count > HARD_MAX_TRIALS {
+            return Err(ExperimentError::InvalidSpec);
         }
         for parameter in &input.parameters {
             let dimension = input
@@ -371,7 +284,6 @@ impl TrialSpec {
             search_space: input.search_space.into_boxed_slice(),
             selection_criterion: input.selection_criterion,
             identity: TrialId(Sha256Digest::new([0; 32])),
-            identity_version,
         };
         spec.identity = TrialId(spec_identity(&spec)?);
         Ok(spec)
@@ -381,10 +293,6 @@ impl TrialSpec {
     #[must_use]
     pub const fn id(&self) -> TrialId {
         self.identity
-    }
-
-    pub(super) const fn identity_version(&self) -> TrialIdentityVersion {
-        self.identity_version
     }
 
     /// Returns the exact PIT dataset identity.
@@ -405,9 +313,9 @@ impl TrialSpec {
         self.execution_assumption_digest
     }
 
-    /// Returns the dataset-independent execution authority for current reservations.
+    /// Returns the dataset-independent execution authority bound into every reservation.
     #[must_use]
-    pub const fn cohort_authority_digest(&self) -> Option<Sha256Digest> {
+    pub const fn cohort_authority_digest(&self) -> Sha256Digest {
         self.cohort_authority_digest
     }
 
@@ -432,20 +340,9 @@ impl TrialSpec {
     /// Hashes the declared search space and criterion independently of one selected parameter set.
     pub fn experiment_design_digest(&self) -> Result<Sha256Digest, ExperimentError> {
         let mut hash = Sha256::new();
-        match self.identity_version {
-            TrialIdentityVersion::V1 | TrialIdentityVersion::V2 => {
-                hash.update(b"market-squawk/backtest-cohort-family/v1");
-            }
-            TrialIdentityVersion::V3 => {
-                hash.update(b"market-squawk/backtest-cohort-family/v2");
-                hash.update(
-                    self.cohort_authority_digest
-                        .ok_or(ExperimentError::CorruptRecord)?
-                        .bytes(),
-                );
-                update_optional_digest(&mut hash, self.cohort_universe_digest);
-            }
-        }
+        hash.update(b"market-squawk/backtest-cohort-family/v2");
+        hash.update(self.cohort_authority_digest.bytes());
+        update_optional_digest(&mut hash, self.cohort_universe_digest);
         hash.update(self.execution_assumption_digest.bytes());
         update_optional_binding(&mut hash, self.model.as_ref())?;
         update_binding(&mut hash, &self.strategy)?;
@@ -646,7 +543,7 @@ pub struct TrialCompletion {
     pub(super) result_digest: Sha256Digest,
     pub(super) artifact: BacktestArtifact,
     pub(super) metrics: Box<[TrialMetric]>,
-    pub(super) dataset_partition: Option<TrialDatasetPartition>,
+    pub(super) dataset_partition: TrialDatasetPartition,
 }
 
 /// Untrusted successful terminal trial input.
@@ -655,7 +552,7 @@ pub(crate) struct TrialCompletionInput {
     pub(crate) result_digest: Sha256Digest,
     pub(crate) artifact: BacktestArtifact,
     pub(crate) metrics: Vec<TrialMetric>,
-    pub(crate) dataset_partition: Option<TrialDatasetPartition>,
+    pub(crate) dataset_partition: TrialDatasetPartition,
 }
 
 impl TrialCompletion {
@@ -710,9 +607,9 @@ impl TrialCompletion {
         &self.metrics
     }
 
-    /// Returns the exact dataset interval, or `None` only for migrated schema-v1 terminals.
+    /// Returns the exact dataset interval represented by this completed trial.
     #[must_use]
-    pub const fn dataset_partition(&self) -> Option<TrialDatasetPartition> {
+    pub const fn dataset_partition(&self) -> TrialDatasetPartition {
         self.dataset_partition
     }
 }
@@ -777,29 +674,13 @@ pub(super) fn require_digest(digest: Sha256Digest) -> Result<(), ExperimentError
 
 fn spec_identity(spec: &TrialSpec) -> Result<Sha256Digest, ExperimentError> {
     let mut hash = Sha256::new();
-    match spec.identity_version {
-        TrialIdentityVersion::V1 => hash.update(b"market-squawk/experiment-trial/v1"),
-        TrialIdentityVersion::V2 => hash.update(b"market-squawk/experiment-trial/v2"),
-        TrialIdentityVersion::V3 => hash.update(b"market-squawk/experiment-trial/v3"),
-    }
+    hash.update(b"market-squawk/experiment-trial/v3");
     hash.update(spec.dataset_identity.bytes());
     hash.update(spec.object_graph_digest.bytes());
     hash.update(spec.execution_assumption_digest.bytes());
-    if spec.identity_version != TrialIdentityVersion::V1 {
-        hash.update(
-            spec.run_input_digest
-                .ok_or(ExperimentError::CorruptRecord)?
-                .bytes(),
-        );
-    }
-    if spec.identity_version == TrialIdentityVersion::V3 {
-        hash.update(
-            spec.cohort_authority_digest
-                .ok_or(ExperimentError::CorruptRecord)?
-                .bytes(),
-        );
-        update_optional_digest(&mut hash, spec.cohort_universe_digest);
-    }
+    hash.update(spec.run_input_digest.bytes());
+    hash.update(spec.cohort_authority_digest.bytes());
+    update_optional_digest(&mut hash, spec.cohort_universe_digest);
     update_optional_binding(&mut hash, spec.model.as_ref())?;
     update_binding(&mut hash, &spec.strategy)?;
     update_binding(&mut hash, &spec.code)?;

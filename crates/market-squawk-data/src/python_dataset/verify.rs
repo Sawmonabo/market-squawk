@@ -1,4 +1,6 @@
 use std::io::{Read as _, Seek as _, SeekFrom};
+use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -31,7 +33,12 @@ use crate::schema::{
     FEATURE_LABEL_SCHEMA_VERSION, POLICY_DIGEST_KEY, SCHEMA_FINGERPRINT_KEY, SCHEMA_NAME_KEY,
     SCHEMA_VERSION_KEY, UNIVERSE_DIGEST_KEY,
 };
-use crate::{CatalogEndpointIdentity, DatasetArrowBatch, Sha256Digest};
+use crate::{
+    CatalogEndpointIdentity, ComponentKind, DatasetArrowBatch, FeatureDatasetProductContract,
+    FeatureDatasetProductionReceiptV1, FeatureLabelComponentSpec, FeatureLabelMeasurement,
+    FeatureLabelMeasurementBinding, ResearchUse, ResearchUseDecisionDigest, ResearchUseGraphDigest,
+    Sha256Digest,
+};
 
 const CONTROL_EXPANSION: usize = 16;
 const CONTROL_OVERHEAD: usize = 64 * 1024;
@@ -57,6 +64,7 @@ type CatalogGenerationRow = (
 pub(super) fn verify(
     local_root: &Path,
     export_sha256: Sha256Digest,
+    expected_contract: FeatureDatasetProductContract,
     as_of: Timestamp,
     limits: PythonDatasetVerificationLimits,
     deadline: Instant,
@@ -78,7 +86,11 @@ pub(super) fn verify(
     let mut connection = Connection::open_with_flags(location.path(), flags)?;
     location.validate_for_open()?;
     catalog_file.validate_identity()?;
-    let length_limit = i32::try_from(limits.max_bytes().min(1024 * 1024))
+    let admission_row_limit = crate::MAX_FEATURE_LABEL_EXPORT_BYTES
+        .checked_add(crate::MAX_FEATURE_DATASET_PRODUCTION_RECEIPT_BYTES)
+        .and_then(|value| value.checked_add(CONTROL_OVERHEAD))
+        .ok_or(PythonDatasetCatalogError::LimitExceeded)?;
+    let length_limit = i32::try_from(limits.max_bytes().min(admission_row_limit))
         .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, length_limit)?;
     connection.busy_timeout(
@@ -103,29 +115,57 @@ pub(super) fn verify(
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     check_control(deadline, cancellation)?;
-    let descriptor_bytes = admitted_descriptor(
+    let admission = admitted_descriptor(
         &transaction,
         export_sha256,
+        expected_contract,
         catalog_identity,
         limits.max_bytes(),
     )?;
-    let control_bytes = descriptor_bytes
+    let retained_admission_bytes = admission
+        .descriptor
         .len()
+        .checked_add(admission.receipt_json.len())
+        .ok_or(PythonDatasetCatalogError::LimitExceeded)?;
+    let control_bytes = retained_admission_bytes
         .checked_mul(CONTROL_EXPANSION)
         .and_then(|value| value.checked_add(CONTROL_OVERHEAD))
         .ok_or(PythonDatasetCatalogError::LimitExceeded)?;
     if control_bytes >= limits.max_bytes() {
         return Err(PythonDatasetCatalogError::LimitExceeded);
     }
+    let descriptor_bytes = admission.descriptor;
     let descriptor = Descriptor::parse(&descriptor_bytes)?;
     let identity = descriptor.identity()?;
+    let production_receipt = FeatureDatasetProductionReceiptV1::decode_and_validate(
+        &admission.receipt_json,
+        &crate::dataset_builder::FeatureDatasetProductionReceiptExpectation {
+            production_identity: admission.production_identity,
+            receipt_sha256: admission.receipt_sha256,
+            catalog_identity,
+            product_contract: admission.product_contract,
+            manifest: identity.manifest(),
+            build_spec_digest: identity.build_spec_digest(),
+            policy_digest: identity.policy_digest(),
+            universe_digest: identity.universe_digest(),
+            universe_id: identity.universe_id().as_str(),
+            output_group_id: admission.output_group_id,
+            final_output_rights_id: admission.final_output_rights_id,
+            export_sha256,
+            research_decision: admission.research_decision,
+            research_graph: admission.research_graph,
+            research_use: admission.research_use,
+            research_use_expires_at: admission.research_use_expires_at,
+            admitted_at: admission.admitted_at,
+        },
+    )?;
     verify_catalog_generation(&transaction, &descriptor)?;
     check_control(deadline, cancellation)?;
     catalog_file.validate_identity()?;
     location.validate_for_open()?;
     let mut hasher = new_selection_hasher(catalog_identity, export_sha256, as_of);
     let mut selected_rows = 0_usize;
-    let mut validator = RowSequenceValidator::new(&descriptor)?;
+    let mut validator = RowSequenceValidator::new(&descriptor, control_bytes)?;
     let artifacts = paths.artifacts()?.clone();
     for object in &descriptor.objects {
         check_control(deadline, cancellation)?;
@@ -143,7 +183,7 @@ pub(super) fn verify(
             &mut validator,
         )?;
     }
-    validator.finish()?;
+    let label_measurements = validator.finish()?;
     check_control(deadline, cancellation)?;
     catalog_file.validate_identity()?;
     location.validate_for_open()?;
@@ -156,38 +196,155 @@ pub(super) fn verify(
         catalog_identity,
         export_sha256,
         descriptor: descriptor_bytes.into_boxed_slice(),
+        production_receipt,
+        product_contract: admission.product_contract,
         selection_sha256: finish_selection_hash(hasher, selected_rows)?,
         selected_rows,
         as_of,
+        label_measurements,
     })
 }
 
 fn admitted_descriptor(
     transaction: &Transaction<'_>,
     export_sha256: Sha256Digest,
+    expected_contract: FeatureDatasetProductContract,
     catalog_identity: CatalogEndpointIdentity,
     max_bytes: usize,
-) -> Result<Vec<u8>, PythonDatasetCatalogError> {
-    let retained: Option<(Vec<u8>, Vec<u8>, i64)> = transaction
+) -> Result<RetainedProductAdmission, PythonDatasetCatalogError> {
+    let retained: Option<RawRetainedProductAdmission> = transaction
         .query_row(
-            "SELECT catalog_identity, descriptor_json, selection_digest_version
-             FROM python_dataset_admissions WHERE export_sha256=?1",
-            params![export_sha256.bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT catalog_identity, descriptor_json, selection_digest_version,
+                    production_identity_sha256, receipt_schema, receipt_sha256, receipt_json,
+                    product_contract, output_group_id, final_output_rights_id, research_decision_id,
+                    research_graph_digest, research_use, research_use_expires_at_ns,
+                    admitted_at_ns
+             FROM feature_dataset_production_admissions
+             WHERE export_sha256=?1 AND product_contract=?2 AND research_use=?3",
+            params![
+                export_sha256.bytes(),
+                expected_contract.identity(),
+                expected_contract.required_use().database_name()
+            ],
+            |row| {
+                Ok(RawRetainedProductAdmission {
+                    catalog_identity: row.get(0)?,
+                    descriptor: row.get(1)?,
+                    selection_digest_version: row.get(2)?,
+                    production_identity: row.get(3)?,
+                    receipt_schema: row.get(4)?,
+                    receipt_sha256: row.get(5)?,
+                    receipt_json: row.get(6)?,
+                    product_contract: row.get(7)?,
+                    output_group_id: row.get(8)?,
+                    final_output_rights_id: row.get(9)?,
+                    research_decision: row.get(10)?,
+                    research_graph: row.get(11)?,
+                    research_use: row.get(12)?,
+                    research_use_expires_at: Timestamp::from_unix_nanos(row.get(13)?),
+                    admitted_at: Timestamp::from_unix_nanos(row.get(14)?),
+                })
+            },
         )
         .optional()?;
-    let Some((catalog, descriptor, digest_version)) = retained else {
+    let Some(retained) = retained else {
         return Err(PythonDatasetCatalogError::UnknownAdmission);
     };
-    if catalog.as_slice() != catalog_identity.bytes()
-        || digest_version != 1
-        || descriptor.is_empty()
-        || descriptor.len() > max_bytes.min(1024 * 1024)
-        || Sha256Digest::new(Sha256::digest(&descriptor).into()) != export_sha256
+    let research_use = parse_research_use(&retained.research_use)?;
+    let product_contract = FeatureDatasetProductContract::from_identity(&retained.product_contract)
+        .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+    if product_contract != expected_contract || research_use != expected_contract.required_use() {
+        return Err(PythonDatasetCatalogError::UnknownAdmission);
+    }
+    let retained = RetainedProductAdmission {
+        catalog_identity: retained.catalog_identity,
+        descriptor: retained.descriptor,
+        selection_digest_version: retained.selection_digest_version,
+        production_identity: Sha256Digest::new(array_32(&retained.production_identity)?),
+        receipt_schema: retained.receipt_schema,
+        receipt_sha256: Sha256Digest::new(array_32(&retained.receipt_sha256)?),
+        receipt_json: retained.receipt_json,
+        product_contract,
+        output_group_id: array_32(&retained.output_group_id)?,
+        final_output_rights_id: array_32(&retained.final_output_rights_id)?,
+        research_decision: ResearchUseDecisionDigest::try_from_bytes(array_32(
+            &retained.research_decision,
+        )?)
+        .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?,
+        research_graph: ResearchUseGraphDigest::try_from_bytes(array_32(&retained.research_graph)?)
+            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?,
+        research_use,
+        research_use_expires_at: retained.research_use_expires_at,
+        admitted_at: retained.admitted_at,
+    };
+    if retained.catalog_identity.as_slice() != catalog_identity.bytes()
+        || retained.selection_digest_version != 2
+        || retained.receipt_schema != crate::FEATURE_DATASET_PRODUCTION_RECEIPT_SCHEMA
+        || retained.descriptor.is_empty()
+        || retained.descriptor.len() > max_bytes.min(1024 * 1024)
+        || retained.receipt_json.is_empty()
+        || retained.receipt_json.len()
+            > max_bytes.min(crate::MAX_FEATURE_DATASET_PRODUCTION_RECEIPT_BYTES)
+        || Sha256Digest::new(Sha256::digest(&retained.descriptor).into()) != export_sha256
+        || retained.admitted_at >= retained.research_use_expires_at
     {
         return Err(PythonDatasetCatalogError::CorruptAdmission);
     }
-    Ok(descriptor)
+    Ok(retained)
+}
+
+fn parse_research_use(value: &str) -> Result<ResearchUse, PythonDatasetCatalogError> {
+    match value {
+        "local_analysis" => Ok(ResearchUse::LocalAnalysis),
+        "train" => Ok(ResearchUse::Train),
+        _ => Err(PythonDatasetCatalogError::CorruptAdmission),
+    }
+}
+
+struct RawRetainedProductAdmission {
+    catalog_identity: Vec<u8>,
+    descriptor: Vec<u8>,
+    selection_digest_version: i64,
+    production_identity: Vec<u8>,
+    receipt_schema: String,
+    receipt_sha256: Vec<u8>,
+    receipt_json: Vec<u8>,
+    product_contract: String,
+    output_group_id: Vec<u8>,
+    final_output_rights_id: Vec<u8>,
+    research_decision: Vec<u8>,
+    research_graph: Vec<u8>,
+    research_use: String,
+    research_use_expires_at: Timestamp,
+    admitted_at: Timestamp,
+}
+
+struct RetainedProductAdmission {
+    catalog_identity: Vec<u8>,
+    descriptor: Vec<u8>,
+    selection_digest_version: i64,
+    production_identity: Sha256Digest,
+    receipt_schema: String,
+    receipt_sha256: Sha256Digest,
+    receipt_json: Vec<u8>,
+    product_contract: FeatureDatasetProductContract,
+    output_group_id: [u8; 32],
+    final_output_rights_id: [u8; 32],
+    research_decision: ResearchUseDecisionDigest,
+    research_graph: ResearchUseGraphDigest,
+    research_use: ResearchUse,
+    research_use_expires_at: Timestamp,
+    admitted_at: Timestamp,
+}
+
+fn array_32(value: &[u8]) -> Result<[u8; 32], PythonDatasetCatalogError> {
+    let bytes: [u8; 32] = value
+        .try_into()
+        .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+    if bytes == [0; 32] {
+        return Err(PythonDatasetCatalogError::CorruptAdmission);
+    }
+    Ok(bytes)
 }
 
 fn verify_catalog_generation(
@@ -579,6 +736,9 @@ fn row(batch: &RecordBatch, index: usize) -> Result<PythonDatasetRow, PythonData
         .and_then(|array| array.as_any().downcast_ref::<TimestampNanosecondArray>())
         .ok_or(PythonDatasetCatalogError::CorruptAdmission)?
         .value(index);
+    let observed_effective = optional_timestamp(batch, "observed_effective_at", index)?;
+    let label_effective = optional_timestamp(batch, "label_effective_at", index)?;
+    let target_coordinate_kind = uint8(batch, "target_coordinate_kind")?.value(index);
     let split = uint8(batch, "split")?.value(index);
     let kind = uint8(batch, "component_kind")?.value(index);
     let name = padded_text(fixed("component_name")?, index)?;
@@ -622,6 +782,9 @@ fn row(batch: &RecordBatch, index: usize) -> Result<PythonDatasetRow, PythonData
         example,
         instrument,
         Timestamp::from_unix_nanos(cutoff),
+        observed_effective,
+        label_effective,
+        target_coordinate_kind,
         split,
         kind,
         name,
@@ -631,6 +794,18 @@ fn row(batch: &RecordBatch, index: usize) -> Result<PythonDatasetRow, PythonData
         currency,
         lineage,
     )
+}
+
+fn optional_timestamp(
+    batch: &RecordBatch,
+    name: &str,
+    index: usize,
+) -> Result<Option<Timestamp>, PythonDatasetCatalogError> {
+    let values = batch
+        .column_by_name(name)
+        .and_then(|array| array.as_any().downcast_ref::<TimestampNanosecondArray>())
+        .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+    Ok((!values.is_null(index)).then(|| Timestamp::from_unix_nanos(values.value(index))))
 }
 
 fn uint8<'a>(
@@ -671,33 +846,106 @@ fn padded_text(
 
 struct RowSequenceValidator {
     components: Vec<(u8, String, u32)>,
+    component_specs: Vec<FeatureLabelComponentSpec>,
+    expected_measurements: Vec<Option<FeatureLabelMeasurement>>,
+    observed_measurements: Vec<Option<FeatureLabelMeasurement>>,
+    expected_horizons: Vec<Option<NonZeroU64>>,
+    observed_horizons: Vec<FixedHorizonState>,
     boundaries: [i64; 3],
     expected_counts: [usize; 3],
     observed_counts: [usize; 3],
-    current_key: Option<(i64, [u8; 16], String, u8)>,
+    current_key: Option<(i64, [u8; 16], String, u8, u8, Option<i64>, Option<i64>)>,
     previous_key: Option<(i64, [u8; 16], String)>,
     component_index: usize,
 }
 
 impl RowSequenceValidator {
-    fn new(descriptor: &Descriptor) -> Result<Self, PythonDatasetCatalogError> {
-        let components = descriptor
-            .components
-            .iter()
-            .map(|component| {
-                Ok((
-                    match component.kind.as_str() {
-                        "feature" => 1,
-                        "label" => 2,
-                        _ => return Err(PythonDatasetCatalogError::CorruptAdmission),
-                    },
-                    component.name.clone(),
-                    component.version,
-                ))
+    fn new(
+        descriptor: &Descriptor,
+        control_bytes: usize,
+    ) -> Result<Self, PythonDatasetCatalogError> {
+        let component_count = descriptor.components.len();
+        let component_name_bytes =
+            descriptor
+                .components
+                .iter()
+                .try_fold(0_usize, |total, component| {
+                    total
+                        .checked_add(component.name.len())
+                        .ok_or(PythonDatasetCatalogError::LimitExceeded)
+                })?;
+        let retained = size_of::<Self>()
+            .checked_add(
+                size_of::<(u8, String, u32)>()
+                    .checked_mul(component_count)
+                    .ok_or(PythonDatasetCatalogError::LimitExceeded)?,
+            )
+            .and_then(|value| value.checked_add(component_name_bytes))
+            .and_then(|value| {
+                value.checked_add(size_of::<FeatureLabelComponentSpec>() * component_count)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .and_then(|value| value.checked_add(component_name_bytes))
+            .and_then(|value| {
+                size_of::<Option<FeatureLabelMeasurement>>()
+                    .checked_mul(component_count)
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .and_then(|value| {
+                size_of::<Option<NonZeroU64>>()
+                    .checked_add(size_of::<FixedHorizonState>())
+                    .and_then(|bytes| bytes.checked_mul(component_count))
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .ok_or(PythonDatasetCatalogError::LimitExceeded)?;
+        if retained > control_bytes {
+            return Err(PythonDatasetCatalogError::LimitExceeded);
+        }
+
+        let mut components = Vec::new();
+        components
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        let mut component_specs = Vec::new();
+        component_specs
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        let mut expected_measurements = Vec::new();
+        expected_measurements
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        let mut expected_horizons = Vec::new();
+        expected_horizons
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        for component in &descriptor.components {
+            let kind = match component.kind.as_str() {
+                "feature" => 1,
+                "label" => 2,
+                _ => return Err(PythonDatasetCatalogError::CorruptAdmission),
+            };
+            components.push((kind, component.name.clone(), component.version));
+            component_specs.push(component.spec()?);
+            expected_measurements.push(component.measurement()?);
+            expected_horizons.push(component.fixed_horizon_nanos()?);
+        }
+        let mut observed_measurements = Vec::new();
+        observed_measurements
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        observed_measurements.resize(component_count, None);
+        let mut observed_horizons = Vec::new();
+        observed_horizons
+            .try_reserve_exact(component_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        observed_horizons.resize(component_count, FixedHorizonState::Unseen);
         Ok(Self {
             components,
+            observed_measurements,
+            observed_horizons,
+            component_specs,
+            expected_measurements,
+            expected_horizons,
             boundaries: [
                 descriptor.split_policy.train_end_unix_nanos,
                 descriptor.split_policy.validation_end_unix_nanos,
@@ -737,11 +985,27 @@ impl RowSequenceValidator {
         {
             return Err(PythonDatasetCatalogError::CorruptAdmission);
         }
+        if row.component_kind == 2 && !matches!(&row.value, PythonDatasetValue::Missing(_)) {
+            let measurement = FeatureLabelMeasurement::try_from_parts(
+                row.unit.as_deref(),
+                row.currency.as_deref(),
+            )
+            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+            let retained = &mut self.observed_measurements[self.component_index];
+            if retained.is_some_and(|value| value != measurement) {
+                return Err(PythonDatasetCatalogError::CorruptAdmission);
+            }
+            *retained = Some(measurement);
+            self.observed_horizons[self.component_index].observe(row.fixed_horizon_nanos());
+        }
         let group = (
             row.cutoff_at.unix_nanos(),
             row.instrument_id,
             row.example_id.to_string(),
             row.split,
+            row.target_coordinate_kind,
+            row.observed_effective_at.map(Timestamp::unix_nanos),
+            row.label_effective_at.map(Timestamp::unix_nanos),
         );
         if self.component_index == 0 {
             let ordering = (group.0, group.1, group.2.clone());
@@ -769,10 +1033,69 @@ impl RowSequenceValidator {
         Ok(())
     }
 
-    fn finish(self) -> Result<(), PythonDatasetCatalogError> {
-        if self.component_index != 0 || self.observed_counts != self.expected_counts {
+    fn finish(self) -> Result<Box<[FeatureLabelMeasurementBinding]>, PythonDatasetCatalogError> {
+        if self.component_index != 0
+            || self.observed_counts != self.expected_counts
+            || self.observed_measurements != self.expected_measurements
+            || self
+                .observed_horizons
+                .iter()
+                .map(|state| state.fixed())
+                .ne(self.expected_horizons.iter().copied())
+        {
             return Err(PythonDatasetCatalogError::CorruptAdmission);
         }
-        Ok(())
+        let binding_count = self
+            .component_specs
+            .iter()
+            .zip(&self.expected_measurements)
+            .filter(|(spec, measurement)| {
+                spec.kind() == ComponentKind::Label && measurement.is_some()
+            })
+            .count();
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(binding_count)
+            .map_err(|_| PythonDatasetCatalogError::LimitExceeded)?;
+        for ((spec, measurement), horizon) in self
+            .component_specs
+            .into_iter()
+            .zip(self.expected_measurements)
+            .zip(self.expected_horizons)
+        {
+            if spec.kind() == ComponentKind::Label {
+                if let Some(measurement) = measurement {
+                    bindings.push(
+                        FeatureLabelMeasurementBinding::try_new(spec, measurement, horizon)
+                            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?,
+                    );
+                }
+            }
+        }
+        Ok(bindings.into_boxed_slice())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FixedHorizonState {
+    Unseen,
+    Fixed(NonZeroU64),
+    Unsupported,
+}
+
+impl FixedHorizonState {
+    fn observe(&mut self, candidate: Option<NonZeroU64>) {
+        *self = match (*self, candidate) {
+            (Self::Unseen, Some(value)) => Self::Fixed(value),
+            (Self::Fixed(expected), Some(value)) if value == expected => Self::Fixed(expected),
+            (Self::Unsupported, _) | (_, None) | (Self::Fixed(_), Some(_)) => Self::Unsupported,
+        };
+    }
+
+    const fn fixed(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Fixed(value) => Some(value),
+            Self::Unseen | Self::Unsupported => None,
+        }
     }
 }

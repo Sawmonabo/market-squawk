@@ -1,7 +1,9 @@
 //! Product-wide durable provider request and connection admission.
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
+#[cfg(debug_assertions)]
+use std::time::Duration;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use serde::Serialize;
@@ -9,10 +11,15 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{AuthorizationMode, AuthorizationSubjectResolutionError, AuthorizationSubjectResolver};
+use crate::{
+    ProviderRateDispatchClaim, ProviderRateResponseSettlement,
+    ProviderRateResponseSettlementReceipt,
+};
 
 use super::{
-    BudgetCollisionKey, BudgetPoolError, BudgetUnavailableReason, EndpointPolicy, MonotonicInstant,
-    ProviderBudgetPolicy, ResolvedProviderBudgetPolicy, RetryAfter, SharedProviderBudget,
+    BudgetClock, BudgetCollisionKey, BudgetPoolError, BudgetUnavailableReason, ClockObservation,
+    EndpointPolicy, MonotonicInstant, ProviderBudgetPolicy, ResolvedProviderBudgetPolicy,
+    RetryAfter, SharedProviderBudget, SystemBudgetClock,
 };
 
 const MAX_RATE_COLLISION_IDENTITIES: usize = 64;
@@ -187,7 +194,7 @@ impl ProviderRateDeclaration {
         }
         let policy_digest = Self::policy_digest_for(&policy)?;
         let declaration_digest = digest_serialized(
-            b"market-squawk/provider-rate-declaration/v1\0",
+            b"market-squawk/provider-rate-declaration/v2\0",
             &ProviderRateDeclarationWire {
                 policy_digest,
                 collision_identities: &collision_identities,
@@ -223,8 +230,9 @@ impl ProviderRateDeclaration {
 
     /// Computes the canonical aggregate-limit digest for one validated provider policy.
     ///
-    /// Diagnostic provider/account labels are intentionally excluded; request windows,
-    /// concurrency, and refusal backoff are the complete enforcement identity.
+    /// Diagnostic provider/account labels are intentionally excluded. Request windows, weighted
+    /// response windows, concurrency, refusal backoff, and the dispatch/terminalization semantic
+    /// versions form the complete enforcement identity.
     ///
     /// # Errors
     ///
@@ -234,7 +242,7 @@ impl ProviderRateDeclaration {
         policy: &ProviderBudgetPolicy,
     ) -> Result<EvidenceDigest, BudgetPoolError> {
         digest_serialized(
-            b"market-squawk/provider-rate-limits/v1\0",
+            b"market-squawk/provider-rate-limits/v2\0",
             &ProviderRateLimitsWire::from_policy(policy),
         )
     }
@@ -262,16 +270,22 @@ impl ProviderRateDeclaration {
 #[serde(deny_unknown_fields)]
 struct ProviderRateLimitsWire {
     windows: Vec<super::ProviderBudgetWindow>,
+    weighted_windows: Vec<crate::ProviderRateWeightedWindow>,
     max_concurrent: u16,
     backoff: super::BackoffPolicy,
+    dispatch_claim_semantics_version: u16,
+    response_terminalization_semantics_version: u16,
 }
 
 impl ProviderRateLimitsWire {
     fn from_policy(policy: &ProviderBudgetPolicy) -> Self {
         Self {
             windows: policy.windows().collect(),
+            weighted_windows: policy.weighted_windows().collect(),
             max_concurrent: policy.max_concurrent(),
             backoff: policy.backoff(),
+            dispatch_claim_semantics_version: 1,
+            response_terminalization_semantics_version: 1,
         }
     }
 }
@@ -305,6 +319,7 @@ macro_rules! opaque_rate_id {
 
 opaque_rate_id!(ProviderRateRunId);
 opaque_rate_id!(ProviderRateGroupId);
+opaque_rate_id!(ProviderRateReservationId);
 opaque_rate_id!(ProviderRatePermitId);
 
 /// Exact registration returned by the durable aggregate authority.
@@ -313,6 +328,154 @@ pub struct ProviderRateRegistration {
     group_id: ProviderRateGroupId,
     policy_digest: EvidenceDigest,
     declaration_digest: EvidenceDigest,
+}
+
+/// Stable key for opaque provider-specific control state retained by the shared rate authority.
+///
+/// The key is derived from one exact generic provider-rate declaration. Account-qualified
+/// declarations use their trusted stable authorization subject; public declarations use the
+/// code-owned governed-provider subject. The extension and schema identities are code-owned and
+/// keep unrelated provider state from sharing one durable row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRateExtensionKey {
+    provider_subject: SourceIdentifier,
+    extension_id: SourceIdentifier,
+    schema_id: SourceIdentifier,
+    policy_digest: EvidenceDigest,
+    declaration_digest: EvidenceDigest,
+}
+
+impl ProviderRateExtensionKey {
+    /// Binds one provider-specific state schema to an exact validated generic declaration.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid declaration or an unrepresentable governed public-provider subject.
+    pub fn try_from_declaration(
+        declaration: &ProviderRateDeclaration,
+        extension_id: SourceIdentifier,
+        schema_id: SourceIdentifier,
+    ) -> Result<Self, BudgetPoolError> {
+        declaration.validate()?;
+        let provider_subject = declaration
+            .policy()
+            .scope()
+            .authorization_account()
+            .cloned()
+            .map_or_else(
+                || {
+                    ProviderRateDeclaration::governed_provider_subject(
+                        declaration.policy().scope().as_source_identifier(),
+                    )
+                },
+                Ok,
+            )?;
+        Ok(Self {
+            provider_subject,
+            extension_id,
+            schema_id,
+            policy_digest: declaration.policy_digest(),
+            declaration_digest: declaration.declaration_digest(),
+        })
+    }
+
+    /// Returns the stable provider/account subject retained in the durable key.
+    pub const fn provider_subject(&self) -> &SourceIdentifier {
+        &self.provider_subject
+    }
+
+    /// Returns the code-owned provider extension identity.
+    pub const fn extension_id(&self) -> &SourceIdentifier {
+        &self.extension_id
+    }
+
+    /// Returns the exact extension-state schema identity.
+    pub const fn schema_id(&self) -> &SourceIdentifier {
+        &self.schema_id
+    }
+
+    /// Returns the exact generic limit policy bound to this extension.
+    pub const fn policy_digest(&self) -> EvidenceDigest {
+        self.policy_digest
+    }
+
+    /// Returns the exact registered generic declaration bound to this extension.
+    pub const fn declaration_digest(&self) -> EvidenceDigest {
+        self.declaration_digest
+    }
+}
+
+/// Exact predecessor identity used for a provider-extension compare-and-exchange transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderRateExtensionRevision {
+    version: NonZeroU64,
+    digest: EvidenceDigest,
+}
+
+impl ProviderRateExtensionRevision {
+    /// Constructs one store-verified opaque-state revision.
+    pub const fn new(version: NonZeroU64, digest: EvidenceDigest) -> Self {
+        Self { version, digest }
+    }
+
+    /// Returns the strictly increasing row version.
+    pub const fn version(self) -> NonZeroU64 {
+        self.version
+    }
+
+    /// Returns the domain-separated digest of the exact opaque state bytes and durable key.
+    pub const fn digest(self) -> EvidenceDigest {
+        self.digest
+    }
+}
+
+/// Bounded opaque provider-extension state returned by the shared durable authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRateExtensionState {
+    key: ProviderRateExtensionKey,
+    revision: ProviderRateExtensionRevision,
+    bytes: Box<[u8]>,
+    updated_at: Timestamp,
+}
+
+impl ProviderRateExtensionState {
+    /// Maximum opaque payload retained in one provider-extension row.
+    pub const MAXIMUM_BYTES: usize = 1024 * 1024;
+
+    /// Constructs state after a store has verified its exact row and digest.
+    pub fn from_verified_store(
+        key: ProviderRateExtensionKey,
+        revision: ProviderRateExtensionRevision,
+        bytes: Box<[u8]>,
+        updated_at: Timestamp,
+    ) -> Self {
+        Self {
+            key,
+            revision,
+            bytes,
+            updated_at,
+        }
+    }
+
+    /// Returns the exact durable extension key.
+    pub const fn key(&self) -> &ProviderRateExtensionKey {
+        &self.key
+    }
+
+    /// Returns the compare-and-exchange predecessor identity.
+    pub const fn revision(&self) -> ProviderRateExtensionRevision {
+        self.revision
+    }
+
+    /// Returns the exact bounded opaque state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns when this state transition committed in the shared authority clock.
+    pub const fn updated_at(&self) -> Timestamp {
+        self.updated_at
+    }
 }
 
 impl ProviderRateRegistration {
@@ -347,8 +510,30 @@ impl ProviderRateRegistration {
 
 /// Durable aggregate request-admission result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderRateDecision {
-    /// One concurrency slot and all request windows were atomically charged.
+pub enum ProviderRateReservationDecision {
+    /// One concurrency slot was reserved; request windows remain uncharged until dispatch.
+    Ready(ProviderRateReservationId),
+    /// No request was charged; retry at or after this wall-clock instant.
+    WaitUntil(Timestamp),
+    /// No request was charged and progress requires an external state change.
+    Unavailable(BudgetUnavailableReason),
+}
+
+/// Sanitized read-only availability of one exact registered provider-rate declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderRateAvailability {
+    /// The persisted provider/account state would not block a new reservation now.
+    Available,
+    /// The persisted provider/account state blocks admission until this inclusive wall clock.
+    WaitUntil(Timestamp),
+    /// Admission requires an external state change and has no truthful retry coordinate.
+    Unavailable(BudgetUnavailableReason),
+}
+
+/// Durable aggregate dispatch result for one previously reserved request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderRateDispatchDecision {
+    /// Every request window was atomically charged at the dispatch boundary.
     Ready(ProviderRatePermitId),
     /// No request was charged; retry at or after this wall-clock instant.
     WaitUntil(Timestamp),
@@ -379,10 +564,37 @@ pub enum ProviderRateStoreError {
     Clock,
 }
 
+/// Retained writer transaction for one fully validated provider-rate registration batch.
+///
+/// Implementations must keep every staged group and declaration invisible until [`Self::commit`]
+/// succeeds. Dropping the capability must roll the entire batch back. The registrations are
+/// exposed before commit only so the control plane can construct non-escaping local allocations;
+/// they do not authorize request admission until this capability has committed.
+pub trait PreparedProviderRateRegistrationBatch: std::fmt::Debug {
+    /// Returns one exact registration for each declaration supplied to the prepare call, in the
+    /// same order.
+    fn registrations(&self) -> &[ProviderRateRegistration];
+
+    /// Atomically publishes every staged group and declaration.
+    fn commit(self: Box<Self>) -> Result<(), ProviderRateStoreError>;
+}
+
 /// Synchronous SQLite-capable persistence boundary used outside the live event-to-action path.
 pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
     /// Starts one process run and reconciles crash-retained permit ownership.
     fn start_run(&self, now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError>;
+
+    /// Stages a bounded declaration batch under one retained writer transaction.
+    ///
+    /// The implementation must validate the complete batch, including declarations staged
+    /// earlier in the same batch, before returning. No staged row may be visible unless the
+    /// returned capability is committed; dropping it must roll the transaction back.
+    fn prepare_registration_batch(
+        &self,
+        run_id: ProviderRateRunId,
+        declarations: &[ProviderRateDeclaration],
+        now: Timestamp,
+    ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>;
 
     /// Idempotently registers one declaration and returns its aggregate collision group.
     fn register(
@@ -390,23 +602,110 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         run_id: ProviderRateRunId,
         declaration: &ProviderRateDeclaration,
         now: Timestamp,
-    ) -> Result<ProviderRateRegistration, ProviderRateStoreError>;
+    ) -> Result<ProviderRateRegistration, ProviderRateStoreError> {
+        let prepared =
+            self.prepare_registration_batch(run_id, std::slice::from_ref(declaration), now)?;
+        let registration = prepared
+            .registrations()
+            .first()
+            .copied()
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        if prepared.registrations().len() != 1
+            || registration.policy_digest() != declaration.policy_digest()
+            || registration.declaration_digest() != declaration.declaration_digest()
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        prepared.commit()?;
+        Ok(registration)
+    }
 
-    /// Atomically charges every request window and reserves one concurrency slot.
-    fn try_acquire(
+    /// Reserves one concurrency slot without charging any request window.
+    fn try_reserve(
         &self,
         run_id: ProviderRateRunId,
         registration: ProviderRateRegistration,
         now: Timestamp,
-    ) -> Result<ProviderRateDecision, ProviderRateStoreError>;
+    ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError>;
 
-    /// Releases only the concurrency slot; request-window consumption remains durable.
+    /// Reads current admission state without reserving concurrency, charging a request window, or
+    /// changing retained provider-rate state.
+    fn inspect_availability(
+        &self,
+        _run_id: ProviderRateRunId,
+        _registration: ProviderRateRegistration,
+        _now: Timestamp,
+    ) -> Result<ProviderRateAvailability, ProviderRateStoreError> {
+        Ok(ProviderRateAvailability::Unavailable(
+            BudgetUnavailableReason::PersistenceUnavailable,
+        ))
+    }
+
+    /// Atomically charges every request window for one exact reserved request at dispatch.
+    fn commit_dispatch(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        reservation_id: ProviderRateReservationId,
+        now: Timestamp,
+    ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError>;
+
+    /// Atomically charges request windows and reserves the exact worst-case weighted response
+    /// claim for one reserved request at dispatch.
+    ///
+    /// The default preserves request-only stores without claiming weighted support. A nonempty
+    /// claim fails closed until the durable store implements weighted dispatch.
+    fn commit_dispatch_with_claim(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        reservation_id: ProviderRateReservationId,
+        now: Timestamp,
+        claim: ProviderRateDispatchClaim,
+    ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+        if claim.is_request_only() {
+            self.commit_dispatch(run_id, registration, reservation_id, now)
+        } else {
+            Err(ProviderRateStoreError::Conflict)
+        }
+    }
+
+    /// Cancels only an undispatched concurrency reservation without charging a request window.
+    fn cancel_reservation(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        reservation_id: ProviderRateReservationId,
+    ) -> Result<(), ProviderRateStoreError>;
+
+    /// Releases an in-flight permit whose response was not explicitly terminalized.
+    ///
+    /// Request-window consumption remains durable. A weighted implementation must conservatively
+    /// replace every pending response claim with its maximum byte/error charge before releasing
+    /// concurrency; a request-only implementation releases only concurrency.
     fn release(
         &self,
         run_id: ProviderRateRunId,
         registration: ProviderRateRegistration,
         permit_id: ProviderRatePermitId,
     ) -> Result<(), ProviderRateStoreError>;
+
+    /// Atomically terminalizes one exact dispatched response, replaces its pending maximum claim
+    /// with the derived exact or conservative units, applies refusal state, removes permit
+    /// ownership, and releases concurrency.
+    ///
+    /// Request-only stores fail closed by default and therefore cannot return a false weighted
+    /// settlement receipt.
+    fn settle_response(
+        &self,
+        _run_id: ProviderRateRunId,
+        _registration: ProviderRateRegistration,
+        _permit_id: ProviderRatePermitId,
+        _now: Timestamp,
+        _settlement: ProviderRateResponseSettlement,
+    ) -> Result<ProviderRateResponseSettlementReceipt, ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
 
     /// Applies one standards-parsed provider retry instruction.
     fn apply_retry_after(
@@ -415,7 +714,7 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         registration: ProviderRateRegistration,
         now: Timestamp,
         retry_after: RetryAfter,
-    ) -> Result<ProviderRateDecision, ProviderRateStoreError>;
+    ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError>;
 
     /// Applies the registered bounded exponential fallback after a provider refusal.
     fn apply_refusal(
@@ -424,7 +723,7 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         registration: ProviderRateRegistration,
         now: Timestamp,
         jitter_sample_basis_points: u16,
-    ) -> Result<ProviderRateDecision, ProviderRateStoreError>;
+    ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError>;
 
     /// Clears shared refusal escalation after a confirmed successful response.
     fn record_success(
@@ -450,6 +749,31 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         mode: AuthorizationMode,
         evidence: EvidenceDigest,
     ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError>;
+
+    /// Loads one exact provider-specific extension state after validating its generic declaration.
+    fn load_extension(
+        &self,
+        _run_id: ProviderRateRunId,
+        _key: &ProviderRateExtensionKey,
+        _now: Timestamp,
+    ) -> Result<Option<ProviderRateExtensionState>, ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
+
+    /// Atomically creates or replaces one bounded opaque extension state.
+    ///
+    /// `None` is the only valid predecessor for initial creation. A replacement requires the
+    /// exact current version and digest. Stale, missing, or unexpected predecessors fail closed.
+    fn compare_exchange_extension(
+        &self,
+        _run_id: ProviderRateRunId,
+        _key: &ProviderRateExtensionKey,
+        _expected: Option<ProviderRateExtensionRevision>,
+        _replacement: &[u8],
+        _now: Timestamp,
+    ) -> Result<ProviderRateExtensionState, ProviderRateStoreError> {
+        Err(ProviderRateStoreError::Conflict)
+    }
 }
 
 /// Cloneable capability over one process run in the product-owned provider-rate store.
@@ -461,6 +785,65 @@ pub struct ProviderRateAuthority {
 struct ProviderRateAuthorityInner {
     store: Arc<dyn ProviderRateStore>,
     run_id: ProviderRateRunId,
+    clock: Arc<dyn BudgetClock>,
+    operation_gate: Mutex<()>,
+    #[cfg(debug_assertions)]
+    manual_clock: Option<Arc<ManualProviderRateClock>>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct ManualProviderRateClock {
+    observation: Mutex<ClockObservation>,
+}
+
+#[cfg(debug_assertions)]
+impl ManualProviderRateClock {
+    fn new(wall_clock: Timestamp) -> Self {
+        Self {
+            observation: Mutex::new(ClockObservation::new(
+                wall_clock,
+                MonotonicInstant::from_nanos(0),
+            )),
+        }
+    }
+
+    fn advance(&self, duration: Duration) -> Result<(), ProviderRateStoreError> {
+        let wall_delta =
+            i64::try_from(duration.as_nanos()).map_err(|_| ProviderRateStoreError::Clock)?;
+        let monotonic_delta =
+            u64::try_from(duration.as_nanos()).map_err(|_| ProviderRateStoreError::Clock)?;
+        let mut observation = self
+            .observation
+            .lock()
+            .map_err(|_| ProviderRateStoreError::Clock)?;
+        let wall_clock = observation
+            .wall_clock
+            .unix_nanos()
+            .checked_add(wall_delta)
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(ProviderRateStoreError::Clock)?;
+        let monotonic = observation
+            .monotonic
+            .checked_add(monotonic_delta)
+            .ok_or(ProviderRateStoreError::Clock)?;
+        *observation = ClockObservation::new(wall_clock, monotonic);
+        Ok(())
+    }
+}
+
+#[cfg(debug_assertions)]
+impl BudgetClock for ManualProviderRateClock {
+    fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason> {
+        self.observation
+            .lock()
+            .map(|observation| *observation)
+            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)
+    }
+
+    fn shared_allocation_charge(&self) -> usize {
+        std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
+    }
 }
 
 impl std::fmt::Debug for ProviderRateAuthority {
@@ -479,10 +862,82 @@ impl ProviderRateAuthority {
     ///
     /// Fails closed when durable state cannot be opened or reconciled.
     pub fn try_new(store: Arc<dyn ProviderRateStore>) -> Result<Self, ProviderRateStoreError> {
-        let now = system_timestamp()?;
+        let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
+        #[cfg(debug_assertions)]
+        {
+            Self::try_new_with_clock(store, clock, None)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Self::try_new_with_clock(store, clock)
+        }
+    }
+
+    /// Opens the real durable authority over a manually advanced paired clock for debug fixtures.
+    ///
+    /// The returned authority still performs normal store ownership, declaration registration,
+    /// request-window charging, and local shared-budget admission. Only its wall and monotonic
+    /// observation source is controlled. This API is absent from release builds.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the initial clock observation or durable run admission fails.
+    #[cfg(debug_assertions)]
+    pub fn try_new_with_debug_manual_clock(
+        store: Arc<dyn ProviderRateStore>,
+        wall_clock: Timestamp,
+    ) -> Result<Self, ProviderRateStoreError> {
+        let manual_clock = Arc::new(ManualProviderRateClock::new(wall_clock));
+        let clock: Arc<dyn BudgetClock> = manual_clock.clone();
+        Self::try_new_with_clock(store, clock, Some(manual_clock))
+    }
+
+    /// Advances both paired clock coordinates by exactly the supplied duration.
+    ///
+    /// No budget or durable state is cleared or rewritten. The next ordinary authority operation
+    /// observes the advanced time and must still pass its real admission policy. This API is absent
+    /// from release builds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an authority not created by [`Self::try_new_with_debug_manual_clock`], a poisoned
+    /// clock, or checked wall/monotonic overflow.
+    #[cfg(debug_assertions)]
+    pub fn advance_debug_manual_clock(
+        &self,
+        duration: Duration,
+    ) -> Result<(), ProviderRateStoreError> {
+        let _operation = self
+            .inner
+            .operation_gate
+            .lock()
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        self.inner
+            .manual_clock
+            .as_ref()
+            .ok_or(ProviderRateStoreError::Clock)?
+            .advance(duration)
+    }
+
+    fn try_new_with_clock(
+        store: Arc<dyn ProviderRateStore>,
+        clock: Arc<dyn BudgetClock>,
+        #[cfg(debug_assertions)] manual_clock: Option<Arc<ManualProviderRateClock>>,
+    ) -> Result<Self, ProviderRateStoreError> {
+        let now = clock
+            .observation()
+            .map_err(|_| ProviderRateStoreError::Clock)?
+            .wall_clock;
         let run_id = store.start_run(now)?;
         Ok(Self {
-            inner: Arc::new(ProviderRateAuthorityInner { store, run_id }),
+            inner: Arc::new(ProviderRateAuthorityInner {
+                store,
+                run_id,
+                clock,
+                operation_gate: Mutex::new(()),
+                #[cfg(debug_assertions)]
+                manual_clock,
+            }),
         })
     }
 
@@ -517,21 +972,67 @@ impl ProviderRateAuthority {
         ) {
             return Err(ProviderRateStoreError::Conflict);
         }
-        let now = system_timestamp()?;
-        self.inner
-            .store
-            .bind_authorization_subject(self.inner.run_id, mode, evidence, subject, now)
+        self.serialized_timed_store_operation(|store, run_id, now| {
+            store.bind_authorization_subject(run_id, mode, evidence, subject, now)
+        })
+        .map(|(_observation, ())| ())
+    }
+
+    /// Loads one provider-specific state row through the same serialized SQLite authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for an unregistered or mismatched declaration, corrupt state, capacity, or
+    /// unavailable authority clock/storage.
+    pub fn load_extension(
+        &self,
+        key: &ProviderRateExtensionKey,
+    ) -> Result<Option<ProviderRateExtensionState>, ProviderRateStoreError> {
+        self.serialized_timed_store_operation(|store, run_id, now| {
+            store.load_extension(run_id, key, now)
+        })
+        .map(|(_observation, state)| state)
+    }
+
+    /// Returns the wall-clock coordinate used by serialized provider-extension transitions.
+    ///
+    /// This preserves the paired manual clock used by debug authority fixtures and avoids a
+    /// provider-specific second clock. The value is an observation, not a state mutation.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the shared operation gate or authority clock is unavailable.
+    pub fn extension_clock_timestamp(&self) -> Result<Timestamp, ProviderRateStoreError> {
+        self.clock_observation()
+            .map(|observation| observation.wall_clock)
+    }
+
+    /// Performs one serialized durable compare-and-exchange of bounded opaque provider state.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the exact predecessor no longer matches or any declaration, schema,
+    /// digest, size, clock, persistence, or integrity invariant fails.
+    pub fn compare_exchange_extension(
+        &self,
+        key: &ProviderRateExtensionKey,
+        expected: Option<ProviderRateExtensionRevision>,
+        replacement: &[u8],
+    ) -> Result<ProviderRateExtensionState, ProviderRateStoreError> {
+        self.serialized_timed_store_operation(|store, run_id, now| {
+            store.compare_exchange_extension(run_id, key, expected, replacement, now)
+        })
+        .map(|(_observation, state)| state)
     }
 
     pub(in crate::policy) fn register_binding(
         &self,
         declaration: &ProviderRateDeclaration,
     ) -> Result<ProviderRateBinding, BudgetPoolError> {
-        let now = system_timestamp().map_err(map_store_registration_error)?;
-        let registration = self
-            .inner
-            .store
-            .register(self.inner.run_id, declaration, now)
+        let (_observation, registration) = self
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.register(run_id, declaration, now)
+            })
             .map_err(map_store_registration_error)?;
         if registration.policy_digest() != declaration.policy_digest()
             || registration.declaration_digest() != declaration.declaration_digest()
@@ -542,6 +1043,109 @@ impl ProviderRateAuthority {
             authority: self.clone(),
             registration,
         })
+    }
+
+    pub(in crate::policy) fn with_prepared_registration_bindings<T>(
+        &self,
+        declarations: &[ProviderRateDeclaration],
+        operation: impl FnOnce(&[ProviderRateBinding], ClockObservation) -> Result<T, BudgetPoolError>,
+    ) -> Result<T, BudgetPoolError> {
+        if declarations.is_empty() {
+            return operation(
+                &[],
+                self.clock_observation()
+                    .map_err(map_store_registration_error)?,
+            );
+        }
+        let _operation = self
+            .inner
+            .operation_gate
+            .lock()
+            .map_err(|_| BudgetPoolError::Persistence)?;
+        let observation = self
+            .inner
+            .clock
+            .observation()
+            .map_err(|_| BudgetPoolError::ClockUnavailable)?;
+        let prepared = self
+            .inner
+            .store
+            .prepare_registration_batch(self.inner.run_id, declarations, observation.wall_clock)
+            .map_err(map_store_registration_error)?;
+        if prepared.registrations().len() != declarations.len() {
+            return Err(BudgetPoolError::Persistence);
+        }
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(declarations.len())
+            .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+        for (registration, declaration) in prepared.registrations().iter().zip(declarations) {
+            if registration.policy_digest() != declaration.policy_digest()
+                || registration.declaration_digest() != declaration.declaration_digest()
+            {
+                return Err(BudgetPoolError::Persistence);
+            }
+            bindings.push(ProviderRateBinding {
+                authority: self.clone(),
+                registration: *registration,
+            });
+        }
+        let result = operation(&bindings, observation)?;
+        prepared.commit().map_err(map_store_registration_error)?;
+        Ok(result)
+    }
+
+    fn clock_observation(&self) -> Result<ClockObservation, ProviderRateStoreError> {
+        let _operation = self
+            .inner
+            .operation_gate
+            .lock()
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        self.inner
+            .clock
+            .observation()
+            .map_err(|_| ProviderRateStoreError::Clock)
+    }
+
+    fn serialized_timed_store_operation<T>(
+        &self,
+        operation: impl FnOnce(
+            &dyn ProviderRateStore,
+            ProviderRateRunId,
+            Timestamp,
+        ) -> Result<T, ProviderRateStoreError>,
+    ) -> Result<(ClockObservation, T), ProviderRateStoreError> {
+        let _operation = self
+            .inner
+            .operation_gate
+            .lock()
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        let observation = self
+            .inner
+            .clock
+            .observation()
+            .map_err(|_| ProviderRateStoreError::Clock)?;
+        let result = operation(
+            self.inner.store.as_ref(),
+            self.inner.run_id,
+            observation.wall_clock,
+        )?;
+        Ok((observation, result))
+    }
+
+    fn serialized_store_operation<T>(
+        &self,
+        operation: impl FnOnce(
+            &dyn ProviderRateStore,
+            ProviderRateRunId,
+        ) -> Result<T, ProviderRateStoreError>,
+    ) -> Result<T, ProviderRateStoreError> {
+        let _operation = self
+            .inner
+            .operation_gate
+            .lock()
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        operation(self.inner.store.as_ref(), self.inner.run_id)
     }
 }
 
@@ -557,12 +1161,12 @@ impl AuthorizationSubjectResolver for ProviderRateAuthority {
         ) {
             return Err(AuthorizationSubjectResolutionError::UnsupportedMode);
         }
-        self.inner
-            .store
-            .resolve_authorization_subject(mode, evidence)
-            .ok()
-            .flatten()
-            .ok_or(AuthorizationSubjectResolutionError::EvidenceUnresolved)
+        self.serialized_store_operation(|store, _run_id| {
+            store.resolve_authorization_subject(mode, evidence)
+        })
+        .ok()
+        .flatten()
+        .ok_or(AuthorizationSubjectResolutionError::EvidenceUnresolved)
     }
 }
 
@@ -585,90 +1189,139 @@ impl ProviderRateBinding {
     pub(in crate::policy) fn same_group(&self, other: &Self) -> bool {
         self.registration.group_id() == other.registration.group_id()
             && self.registration.policy_digest() == other.registration.policy_digest()
+            && Arc::ptr_eq(&self.authority.inner.clock, &other.authority.inner.clock)
     }
 
-    pub(in crate::policy) fn try_acquire_decision(
+    pub(in crate::policy) fn clock(&self) -> Arc<dyn BudgetClock> {
+        Arc::clone(&self.authority.inner.clock)
+    }
+
+    pub(in crate::policy) fn try_reserve_decision(
         &self,
-        now: Timestamp,
-    ) -> Result<ProviderRateDecision, BudgetUnavailableReason> {
+    ) -> Result<(ClockObservation, ProviderRateReservationDecision), BudgetUnavailableReason> {
         self.authority
-            .inner
-            .store
-            .try_acquire(self.authority.inner.run_id, self.registration, now)
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.try_reserve(run_id, self.registration, now)
+            })
+            .map_err(map_store_runtime_error)
+    }
+
+    pub(in crate::policy) fn inspect_availability(
+        &self,
+    ) -> Result<ProviderRateAvailability, BudgetUnavailableReason> {
+        self.authority
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.inspect_availability(run_id, self.registration, now)
+            })
+            .map(|(_observation, availability)| availability)
+            .map_err(map_store_runtime_error)
+    }
+
+    pub(in crate::policy) fn commit_dispatch(
+        &self,
+        reservation_id: ProviderRateReservationId,
+        claim: ProviderRateDispatchClaim,
+    ) -> Result<(ClockObservation, ProviderRateDispatchDecision), BudgetUnavailableReason> {
+        self.authority
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.commit_dispatch_with_claim(
+                    run_id,
+                    self.registration,
+                    reservation_id,
+                    now,
+                    claim,
+                )
+            })
             .map_err(map_store_runtime_error)
     }
 
     pub(in crate::policy) fn apply_retry_after(
         &self,
-        now: Timestamp,
         retry_after: RetryAfter,
-    ) -> Result<ProviderRateDecision, BudgetUnavailableReason> {
+    ) -> Result<(ClockObservation, ProviderRateReservationDecision), BudgetUnavailableReason> {
         self.authority
-            .inner
-            .store
-            .apply_retry_after(
-                self.authority.inner.run_id,
-                self.registration,
-                now,
-                retry_after,
-            )
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.apply_retry_after(run_id, self.registration, now, retry_after)
+            })
             .map_err(map_store_runtime_error)
     }
 
     pub(in crate::policy) fn apply_refusal(
         &self,
-        now: Timestamp,
         jitter_sample_basis_points: u16,
-    ) -> Result<ProviderRateDecision, BudgetUnavailableReason> {
+    ) -> Result<(ClockObservation, ProviderRateReservationDecision), BudgetUnavailableReason> {
         self.authority
-            .inner
-            .store
-            .apply_refusal(
-                self.authority.inner.run_id,
-                self.registration,
-                now,
-                jitter_sample_basis_points,
-            )
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.apply_refusal(run_id, self.registration, now, jitter_sample_basis_points)
+            })
             .map_err(map_store_runtime_error)
     }
 
-    pub(in crate::policy) fn record_success(
-        &self,
-        now: Timestamp,
-    ) -> Result<(), BudgetUnavailableReason> {
+    pub(in crate::policy) fn record_success(&self) -> Result<(), BudgetUnavailableReason> {
         self.authority
-            .inner
-            .store
-            .record_success(self.authority.inner.run_id, self.registration, now)
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.record_success(run_id, self.registration, now)
+            })
+            .map(|(_observation, ())| ())
             .map_err(map_store_runtime_error)
     }
 }
 
-pub(in crate::policy) struct ProviderRatePermit {
+pub(in crate::policy) struct ProviderRateReservation {
     binding: ProviderRateBinding,
-    permit_id: ProviderRatePermitId,
+    reservation_id: ProviderRateReservationId,
     released: bool,
 }
 
-impl std::fmt::Debug for ProviderRatePermit {
+impl std::fmt::Debug for ProviderRateReservation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ProviderRatePermit")
-            .field("permit_id", &self.permit_id)
+            .debug_struct("ProviderRateReservation")
+            .field("reservation_id", &self.reservation_id)
             .field("released", &self.released)
             .finish_non_exhaustive()
     }
 }
 
-impl ProviderRatePermit {
+impl ProviderRateReservation {
     pub(in crate::policy) fn new(
         binding: ProviderRateBinding,
-        permit_id: ProviderRatePermitId,
+        reservation_id: ProviderRateReservationId,
     ) -> Self {
         Self {
             binding,
-            permit_id,
+            reservation_id,
             released: false,
+        }
+    }
+
+    pub(in crate::policy) fn commit_dispatch(
+        mut self,
+        claim: ProviderRateDispatchClaim,
+    ) -> Result<ProviderRateReservationDispatch, BudgetUnavailableReason> {
+        let (observation, decision) = self.binding.commit_dispatch(self.reservation_id, claim)?;
+        self.released = true;
+        match decision {
+            ProviderRateDispatchDecision::Ready(permit_id) => {
+                Ok(ProviderRateReservationDispatch::Ready {
+                    observation,
+                    permit: ProviderRatePermit {
+                        binding: self.binding.clone(),
+                        permit_id,
+                        claim,
+                        released: false,
+                    },
+                })
+            }
+            ProviderRateDispatchDecision::WaitUntil(deadline) => {
+                Ok(ProviderRateReservationDispatch::WaitUntil {
+                    observation,
+                    deadline,
+                })
+            }
+            ProviderRateDispatchDecision::Unavailable(reason) => {
+                Ok(ProviderRateReservationDispatch::Unavailable { reason })
+            }
         }
     }
 
@@ -678,14 +1331,131 @@ impl ProviderRatePermit {
         }
         self.binding
             .authority
-            .inner
-            .store
-            .release(
-                self.binding.authority.inner.run_id,
-                self.binding.registration,
-                self.permit_id,
-            )
+            .serialized_store_operation(|store, run_id| {
+                store.cancel_reservation(run_id, self.binding.registration, self.reservation_id)
+            })
             .map_err(map_store_runtime_error)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+pub(in crate::policy) enum ProviderRateReservationDispatch {
+    Ready {
+        observation: ClockObservation,
+        permit: ProviderRatePermit,
+    },
+    WaitUntil {
+        observation: ClockObservation,
+        deadline: Timestamp,
+    },
+    Unavailable {
+        reason: BudgetUnavailableReason,
+    },
+}
+
+impl Drop for ProviderRateReservation {
+    fn drop(&mut self) {
+        let _released = self.release();
+    }
+}
+
+pub(in crate::policy) struct ProviderRatePermit {
+    binding: ProviderRateBinding,
+    permit_id: ProviderRatePermitId,
+    claim: ProviderRateDispatchClaim,
+    released: bool,
+}
+
+impl std::fmt::Debug for ProviderRatePermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderRatePermit")
+            .field("permit_id", &self.permit_id)
+            .field("claim", &self.claim)
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderRatePermit {
+    pub(in crate::policy) fn settle_response(
+        &mut self,
+        settlement: ProviderRateResponseSettlement,
+    ) -> Result<ProviderRateResponseSettlementReceipt, BudgetUnavailableReason> {
+        if self.released {
+            return Err(BudgetUnavailableReason::StateCorrupt);
+        }
+        let receipt = self
+            .binding
+            .authority
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.settle_response(
+                    run_id,
+                    self.binding.registration,
+                    self.permit_id,
+                    now,
+                    settlement,
+                )
+            })
+            .map(|(_observation, receipt)| receipt)
+            .map_err(map_store_runtime_error)?;
+        // The store has consumed the exact permit even if its returned receipt is malformed.
+        self.released = true;
+        if receipt.group_id() != self.binding.registration.group_id()
+            || receipt.permit_id() != self.permit_id
+            || receipt.settlement() != settlement
+            || self
+                .claim
+                .maximum_response_bytes()
+                .is_some_and(|maximum| receipt.charged_response_bytes() > maximum)
+            || (settlement.response_class() == crate::ProviderRateResponseClass::AbandonedUnknown
+                && receipt.charged_response_bytes()
+                    != self.claim.maximum_response_bytes().unwrap_or(0))
+        {
+            return Err(BudgetUnavailableReason::StateCorrupt);
+        }
+        Ok(receipt)
+    }
+
+    pub(in crate::policy) fn release(&mut self) -> Result<(), BudgetUnavailableReason> {
+        if self.released {
+            return Ok(());
+        }
+        if self.claim.is_request_only() {
+            self.binding
+                .authority
+                .serialized_store_operation(|store, run_id| {
+                    store.release(run_id, self.binding.registration, self.permit_id)
+                })
+                .map_err(map_store_runtime_error)?;
+        } else {
+            let settlement = ProviderRateResponseSettlement::abandoned_unknown();
+            let receipt = self
+                .binding
+                .authority
+                .serialized_timed_store_operation(|store, run_id, now| {
+                    store.settle_response(
+                        run_id,
+                        self.binding.registration,
+                        self.permit_id,
+                        now,
+                        settlement,
+                    )
+                })
+                .map(|(_observation, receipt)| receipt)
+                .map_err(map_store_runtime_error)?;
+            // The store has consumed the exact permit even if its returned receipt is malformed.
+            self.released = true;
+            if receipt.group_id() != self.binding.registration.group_id()
+                || receipt.permit_id() != self.permit_id
+                || receipt.settlement() != settlement
+                || receipt.charged_response_bytes()
+                    != self.claim.maximum_response_bytes().unwrap_or(0)
+            {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            }
+        }
         self.released = true;
         Ok(())
     }
@@ -733,14 +1503,6 @@ fn digest_serialized<T: Serialize>(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
     ))
-}
-
-fn system_timestamp() -> Result<Timestamp, ProviderRateStoreError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ProviderRateStoreError::Clock)?;
-    let nanos = i64::try_from(duration.as_nanos()).map_err(|_| ProviderRateStoreError::Clock)?;
-    Ok(Timestamp::from_unix_nanos(nanos))
 }
 
 fn map_store_registration_error(error: ProviderRateStoreError) -> BudgetPoolError {

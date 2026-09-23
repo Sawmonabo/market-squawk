@@ -21,6 +21,13 @@ pub(super) struct FredHttpResponse {
 pub(super) struct FredHttpRequest {
     pub(super) public_url: url::Url,
     pub(super) api_key: FredApiKey,
+    pub(super) authorization: FredHttpAuthorization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FredHttpAuthorization {
+    QueryParameter,
+    BearerHeader,
 }
 
 impl std::fmt::Debug for FredHttpRequest {
@@ -84,10 +91,16 @@ impl FredTransport for ReqwestFredTransport {
     ) -> BoxFuture<'_, Result<FredHttpResponse, FredSourceError>> {
         Box::pin(async move {
             let operation = async {
-                let response = self
-                    .client
-                    .get(request.public_url)
-                    .query(&[("api_key", request.api_key.expose())])
+                let operation = self.client.get(request.public_url);
+                let operation = match request.authorization {
+                    FredHttpAuthorization::QueryParameter => {
+                        operation.query(&[("api_key", request.api_key.expose())])
+                    }
+                    FredHttpAuthorization::BearerHeader => {
+                        operation.bearer_auth(request.api_key.expose())
+                    }
+                };
+                let response = operation
                     .send()
                     .await
                     .map_err(|_| FredSourceError::Network)?;
@@ -95,7 +108,7 @@ impl FredTransport for ReqwestFredTransport {
                     .content_length()
                     .is_some_and(|length| usize::try_from(length).map_or(true, |n| n > max_bytes))
                 {
-                    return Err(FredSourceError::BodyTooLarge);
+                    return Err(FredSourceError::BodyTooLarge { max: max_bytes });
                 }
                 let status = response.status().as_u16();
                 let retry_after = response
@@ -139,9 +152,9 @@ where
         let next = body
             .len()
             .checked_add(chunk.len())
-            .ok_or(FredSourceError::BodyTooLarge)?;
+            .ok_or(FredSourceError::BodyTooLarge { max: max_bytes })?;
         if next > max_bytes {
-            return Err(FredSourceError::BodyTooLarge);
+            return Err(FredSourceError::BodyTooLarge { max: max_bytes });
         }
         body.extend_from_slice(&chunk);
     }

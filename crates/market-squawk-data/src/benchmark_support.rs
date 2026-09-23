@@ -1,7 +1,7 @@
-//! Closed Arrow, Parquet, DataFusion, and typed Python-handoff release runner.
+//! Closed Arrow, Parquet, DataFusion, and phase-one descriptor-storage release runner.
 
 #[path = "benchmark_support/python_admission.rs"]
-mod python_admission;
+mod phase_one_storage;
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -68,12 +68,12 @@ pub struct ReleaseEvidenceStorageResult {
     point_in_time_content_sha256: [u8; 32],
     point_in_time_audit_sha256: [u8; 32],
     point_in_time_retained_bytes: usize,
-    python_verified_rows: u64,
-    python_selected_rows_per_verification: u64,
-    python_export_sha256: [u8; 32],
-    python_catalog_identity: [u8; 32],
-    python_selection_sha256: [u8; 32],
-    python_dataset_admission_revalidation: StorageLatency,
+    phase_one_verified_rows: u64,
+    phase_one_component_rows_per_verification: u64,
+    phase_one_descriptor_sha256: [u8; 32],
+    phase_one_manifest_sha256: [u8; 32],
+    phase_one_object_sha256: [u8; 32],
+    phase_one_descriptor_object_verification: StorageLatency,
 }
 
 /// Release storage fixture or operation failure.
@@ -97,13 +97,13 @@ pub enum ReleaseEvidenceStorageError {
     /// Bounded point-in-time selection failed.
     #[error("release-evidence point-in-time selection failed")]
     PointInTime,
-    /// Typed Python dataset handoff admission failed.
-    #[error("release-evidence Python handoff failed")]
-    PythonHandoff,
+    /// Non-product phase-one descriptor or immutable-object verification failed.
+    #[error("release-evidence phase-one storage verification failed")]
+    PhaseOneStorage,
 }
 
 /// Runs real canonical Arrow conversion, confined Parquet publication/read, pinned DataFusion SQL,
-/// and the native typed Python handoff boundary.
+/// and the non-product phase-one descriptor/object boundary.
 ///
 /// Repeated Parquet publication uses identical canonical bytes, so content addressing keeps one
 /// durable object while still performing every encode, stage, fsync, hash, and finalization.
@@ -246,7 +246,7 @@ pub async fn run_release_evidence_storage(
     .map_err(|_| ReleaseEvidenceStorageError::Parquet)?;
     let dataset_id = DatasetId::try_from("release-evidence-observations")
         .map_err(|_| ReleaseEvidenceStorageError::Parquet)?;
-    let plan = ManifestPlan::append(dataset_id.clone(), None, object.clone(), 1)
+    let plan = ManifestPlan::append(dataset_id.clone(), None, vec![object.clone()], 1)
         .map_err(|_| ReleaseEvidenceStorageError::Parquet)?;
     let manifest = DatasetManifestRef::try_new_with_schema(
         dataset_id,
@@ -395,11 +395,11 @@ pub async fn run_release_evidence_storage(
     drop(pinned);
     drop(store);
     drop(service);
-    let python = python_admission::measure(&root.join("python-admission"), requested_rows)
+    let phase_one = phase_one_storage::measure(&root.join("phase-one-storage"), requested_rows)
         .await
-        .map_err(|_| ReleaseEvidenceStorageError::PythonHandoff)?;
-    if python.requested_rows != requested_rows {
-        return Err(ReleaseEvidenceStorageError::PythonHandoff);
+        .map_err(|_| ReleaseEvidenceStorageError::PhaseOneStorage)?;
+    if phase_one.requested_rows != requested_rows {
+        return Err(ReleaseEvidenceStorageError::PhaseOneStorage);
     }
 
     Ok(ReleaseEvidenceStorageResult {
@@ -427,15 +427,15 @@ pub async fn run_release_evidence_storage(
         point_in_time_content_sha256,
         point_in_time_audit_sha256,
         point_in_time_retained_bytes,
-        python_verified_rows: python.measured_rows,
-        python_selected_rows_per_verification: python.selected_rows_per_verification,
-        python_export_sha256: python.export_sha256,
-        python_catalog_identity: python.catalog_identity,
-        python_selection_sha256: python.selection_sha256,
-        python_dataset_admission_revalidation: distribution(
-            python.samples,
-            python.measured_rows,
-            python.elapsed_nanos,
+        phase_one_verified_rows: phase_one.measured_rows,
+        phase_one_component_rows_per_verification: phase_one.component_rows_per_verification,
+        phase_one_descriptor_sha256: phase_one.descriptor_sha256,
+        phase_one_manifest_sha256: phase_one.manifest_sha256,
+        phase_one_object_sha256: phase_one.object_sha256,
+        phase_one_descriptor_object_verification: distribution(
+            phase_one.samples,
+            phase_one.measured_rows,
+            phase_one.elapsed_nanos,
         )?,
     })
 }

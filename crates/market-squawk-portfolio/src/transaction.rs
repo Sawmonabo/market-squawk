@@ -97,8 +97,6 @@ impl Trade {
             || price.amount().is_sign_negative()
             || fee.amount().is_sign_negative()
             || price.currency() != fee.currency()
-            || matches!(side, TradeSide::Buy | TradeSide::SellShort)
-                && !matches!(lot_selection, LotSelection::Fifo)
         {
             return Err(PortfolioError::InvalidTransaction);
         }

@@ -20,10 +20,12 @@ use self::io::{
     is_controlled_relative_path, read_exact_bounded, sha256_digest, validate_json_structure,
 };
 use self::validation::{
-    LEGACY_METADATA_SCHEMA_VERSION, METADATA_SCHEMA_VERSION, MetadataWire, NATIVE_FORMAT_VERSION,
-    NativeArtifactWire, TrainingRunWire, parse_digest, parse_format, validate_artifact,
-    validate_dataset, validate_features, validate_label, validate_metrics,
-    validate_output_semantics, validate_prose, validate_thresholds, validate_training_run,
+    FORECAST_POLICY_PATH, FORECAST_RESIDUALS_PATH, ForecastPolicyWire, METADATA_SCHEMA_VERSION,
+    MetadataWire, NATIVE_FORMAT_VERSION, NativeArtifactWire, TrainingRunWire, parse_digest,
+    parse_format, validate_artifact, validate_dataset, validate_features,
+    validate_forecast_calibration, validate_label, validate_metrics, validate_output_measurement,
+    validate_output_semantics, validate_output_statistic, validate_prose, validate_thresholds,
+    validate_training_run,
 };
 use crate::metadata::valid_revision;
 use crate::native::NativeArtifact;
@@ -42,6 +44,10 @@ pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 pub const MAX_ONNX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum exact training-run provenance bytes admitted before parsing.
 pub const MAX_TRAINING_RUN_BYTES: usize = 256 * 1024;
+/// Maximum retained little-endian finite calibration residual bytes.
+pub const MAX_FORECAST_RESIDUAL_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum exact forecast interval-policy JSON bytes.
+pub const MAX_FORECAST_POLICY_BYTES: usize = 64 * 1024;
 
 /// Exercises the production bundle-metadata structural and wire decoders.
 ///
@@ -125,9 +131,14 @@ impl ControlledModelRoot {
 pub struct ModelBundle {
     metadata: ModelMetadata,
     artifact: BundleArtifact,
+    metadata_path: Box<str>,
+    artifact_path: Box<str>,
+    training_run_path: Box<str>,
     metadata_bytes: Box<[u8]>,
     artifact_bytes: Box<[u8]>,
     training_run_bytes: Box<[u8]>,
+    forecast_residuals_bytes: Option<Box<[u8]>>,
+    forecast_policy_bytes: Option<Box<[u8]>>,
     retained_bytes: usize,
 }
 
@@ -169,10 +180,7 @@ impl ModelBundle {
             .map_err(|_| BundleError::MetadataStructureLimit)?;
         let wire: MetadataWire =
             serde_json::from_slice(&metadata_bytes).map_err(|_| BundleError::MetadataSyntax)?;
-        if !matches!(
-            wire.schema_version,
-            LEGACY_METADATA_SCHEMA_VERSION | METADATA_SCHEMA_VERSION
-        ) {
+        if wire.schema_version != METADATA_SCHEMA_VERSION {
             return Err(BundleError::UnsupportedMetadataVersion);
         }
 
@@ -190,12 +198,13 @@ impl ModelBundle {
         }
 
         let format = parse_format(&wire.artifact.format)?;
-        let (output_semantics, output_semantics_bound) = validate_output_semantics(
-            wire.schema_version,
-            wire.output_semantics.as_deref(),
+        let output_semantics = validate_output_semantics(
+            &wire.output_semantics,
             format,
             expectations.output_semantics(),
         )?;
+        validate_output_measurement(&wire.output_measurement, expectations)?;
+        validate_output_statistic(&wire.output_statistic, expectations)?;
         if wire.artifact.format_version != NATIVE_FORMAT_VERSION {
             return Err(BundleError::UnsupportedFormatVersion);
         }
@@ -272,14 +281,74 @@ impl ModelBundle {
             .map_err(|_| BundleError::TrainingRunStructureLimit)?;
         let run: TrainingRunWire = serde_json::from_slice(&training_run_bytes)
             .map_err(|_| BundleError::TrainingRunSyntax)?;
-        validate_training_run(
-            &run,
-            &wire,
-            expectations,
-            format,
-            output_semantics,
-            output_semantics_bound,
-        )?;
+        validate_training_run(&run, &wire, expectations, format, output_semantics)?;
+
+        let (forecast_calibration, forecast_residuals_bytes, forecast_policy_bytes) =
+            match wire.forecast_calibration.as_ref() {
+                Some(reference) => {
+                    if format != crate::ModelFormat::Onnx
+                        || output_semantics != crate::ModelOutputSemantics::Regression
+                        || reference.residuals.path != FORECAST_RESIDUALS_PATH
+                        || reference.policy.path != FORECAST_POLICY_PATH
+                        || reference.residuals.path == wire.artifact.path
+                        || reference.residuals.path == wire.training_run.path
+                        || reference.policy.path == wire.artifact.path
+                        || reference.policy.path == wire.training_run.path
+                        || reference.policy.path == reference.residuals.path
+                    {
+                        return Err(BundleError::InvalidForecastCalibration);
+                    }
+                    let residuals_hash = parse_digest(&reference.residuals.sha256)?;
+                    let policy_hash = parse_digest(&reference.policy.sha256)?;
+                    let residuals_reference =
+                        BundleMetadataRef::try_new(&reference.residuals.path, residuals_hash)?;
+                    let policy_reference =
+                        BundleMetadataRef::try_new(&reference.policy.path, policy_hash)?;
+                    let residuals_size = usize::try_from(reference.residuals.size_bytes)
+                        .map_err(|_| BundleError::ForecastCalibrationTooLarge)?;
+                    let policy_size = usize::try_from(reference.policy.size_bytes)
+                        .map_err(|_| BundleError::ForecastCalibrationTooLarge)?;
+                    if residuals_size == 0
+                        || residuals_size > MAX_FORECAST_RESIDUAL_BYTES
+                        || policy_size == 0
+                        || policy_size > MAX_FORECAST_POLICY_BYTES
+                    {
+                        return Err(BundleError::ForecastCalibrationTooLarge);
+                    }
+                    let residuals = read_exact_bounded(
+                        &root.directory,
+                        residuals_reference.relative_path(),
+                        MAX_FORECAST_RESIDUAL_BYTES,
+                        BundleError::ForecastCalibrationTooLarge,
+                    )?;
+                    let policy = read_exact_bounded(
+                        &root.directory,
+                        policy_reference.relative_path(),
+                        MAX_FORECAST_POLICY_BYTES,
+                        BundleError::ForecastCalibrationTooLarge,
+                    )?;
+                    if residuals.len() != residuals_size || policy.len() != policy_size {
+                        return Err(BundleError::ForecastCalibrationSizeMismatch);
+                    }
+                    if sha256_digest(&residuals) != residuals_hash
+                        || sha256_digest(&policy) != policy_hash
+                    {
+                        return Err(BundleError::ForecastCalibrationHashMismatch);
+                    }
+                    validate_json_structure(&policy)
+                        .map_err(|_| BundleError::ForecastCalibrationStructureLimit)?;
+                    let policy_wire: ForecastPolicyWire = serde_json::from_slice(&policy)
+                        .map_err(|_| BundleError::ForecastCalibrationSyntax)?;
+                    let calibration =
+                        validate_forecast_calibration(reference, policy_wire, &residuals)?;
+                    (
+                        Some(calibration),
+                        Some(residuals.into_boxed_slice()),
+                        Some(policy.into_boxed_slice()),
+                    )
+                }
+                None => (None, None, None),
+            };
 
         let artifact_bytes = read_exact_bounded(
             &root.directory,
@@ -309,15 +378,14 @@ impl ModelBundle {
             artifact_hash,
             format,
             wire.artifact.format_version,
-            output_semantics,
-            output_semantics_bound,
             features,
             validation_metrics,
             thresholds,
             wire.intended_use,
             wire.limitations,
             wire.fallback.reason,
-        );
+        )
+        .with_forecast_calibration(forecast_calibration);
         let retained_bytes = size_of::<Self>()
             .checked_add(
                 metadata
@@ -331,13 +399,35 @@ impl ModelBundle {
             .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
             .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
             .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
+            .and_then(|bytes| bytes.checked_add(reference.relative_path().len()))
+            .and_then(|bytes| bytes.checked_add(artifact_reference.relative_path().len()))
+            .and_then(|bytes| bytes.checked_add(training_run_reference.relative_path().len()))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    forecast_residuals_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    forecast_policy_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
+            })
             .ok_or(BundleError::RetainedSizeOverflow)?;
         Ok(Self {
             metadata,
             artifact,
+            metadata_path: reference.relative_path().into(),
+            artifact_path: artifact_reference.relative_path().into(),
+            training_run_path: training_run_reference.relative_path().into(),
             metadata_bytes: metadata_bytes.into_boxed_slice(),
             artifact_bytes: artifact_bytes.into_boxed_slice(),
             training_run_bytes: training_run_bytes.into_boxed_slice(),
+            forecast_residuals_bytes,
+            forecast_policy_bytes,
             retained_bytes,
         })
     }
@@ -372,6 +462,67 @@ impl ModelBundle {
         &self.training_run_bytes
     }
 
+    /// Returns the first-class admitted residual member for a forecast bundle.
+    #[must_use]
+    pub fn forecast_residuals_bytes(&self) -> Option<&[u8]> {
+        self.forecast_residuals_bytes.as_deref()
+    }
+
+    /// Returns the first-class admitted interval-policy member for a forecast bundle.
+    #[must_use]
+    pub fn forecast_policy_bytes(&self) -> Option<&[u8]> {
+        self.forecast_policy_bytes.as_deref()
+    }
+
+    /// Iterates every exact admitted member in stable semantic order.
+    ///
+    /// Paths were validated by the same controlled-path grammar used during admission. Digests
+    /// name the exact retained bytes and optional forecast members are present as an inseparable
+    /// pair.
+    pub fn retained_members(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, &str, &[u8], Sha256Digest)> {
+        let metadata = self.metadata();
+        [
+            Some((
+                "metadata",
+                self.metadata_path.as_ref(),
+                self.metadata_bytes.as_ref(),
+                metadata.metadata_hash(),
+            )),
+            Some((
+                "artifact",
+                self.artifact_path.as_ref(),
+                self.artifact_bytes.as_ref(),
+                metadata.artifact_hash(),
+            )),
+            Some((
+                "training_run",
+                self.training_run_path.as_ref(),
+                self.training_run_bytes.as_ref(),
+                metadata.training_run_hash(),
+            )),
+            self.forecast_residuals_bytes.as_deref().map(|bytes| {
+                (
+                    "forecast_residuals",
+                    FORECAST_RESIDUALS_PATH,
+                    bytes,
+                    sha256_digest(bytes),
+                )
+            }),
+            self.forecast_policy_bytes.as_deref().map(|bytes| {
+                (
+                    "forecast_policy",
+                    FORECAST_POLICY_PATH,
+                    bytes,
+                    sha256_digest(bytes),
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     pub(crate) const fn native_artifact(&self) -> Option<&NativeArtifact> {
         match &self.artifact {
             BundleArtifact::Native(artifact) => Some(artifact),
@@ -403,6 +554,8 @@ pub enum BundleError {
     ArtifactTooLarge,
     #[error("model training-run provenance exceeds its byte bound")]
     TrainingRunTooLarge,
+    #[error("forecast calibration member exceeds its byte bound")]
+    ForecastCalibrationTooLarge,
     #[error("model bundle metadata hash mismatch")]
     MetadataHashMismatch,
     #[error("model metadata exceeds JSON structural bounds")]
@@ -413,6 +566,8 @@ pub enum BundleError {
     UnsupportedMetadataVersion,
     #[error("model output semantics are invalid or differ from independent authority")]
     InvalidOutputSemantics,
+    #[error("model output measurement is invalid or differs from admitted label rows")]
+    InvalidOutputMeasurement,
     #[error("model artifact schema version is unsupported")]
     UnsupportedArtifactSchemaVersion,
     #[error("model identity differs from independent expectations")]
@@ -475,6 +630,16 @@ pub enum BundleError {
     TrainingRunTrialHashMismatch,
     #[error("model training-run provenance contradicts bundle authority")]
     TrainingRunRelationshipMismatch,
+    #[error("forecast calibration member size mismatch")]
+    ForecastCalibrationSizeMismatch,
+    #[error("forecast calibration member hash mismatch")]
+    ForecastCalibrationHashMismatch,
+    #[error("forecast calibration policy exceeds JSON structural bounds")]
+    ForecastCalibrationStructureLimit,
+    #[error("forecast calibration policy syntax is invalid")]
+    ForecastCalibrationSyntax,
+    #[error("forecast calibration members or decoded policy are invalid")]
+    InvalidForecastCalibration,
     #[error("model artifact exceeds JSON structural bounds")]
     ArtifactStructureLimit,
     #[error("model artifact syntax is invalid")]

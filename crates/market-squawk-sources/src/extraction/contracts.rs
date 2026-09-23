@@ -14,6 +14,8 @@ use thiserror::Error;
 
 use crate::bounded::{BoundedBytes, BoundedVec};
 
+use super::capture::SourceObjectCaptureIdentity;
+
 /// Global ceiling for one discovery request and response.
 pub const MAX_DISCOVERY_OBJECTS: usize = 4_096;
 /// Global record count ceiling for one extraction batch.
@@ -141,6 +143,7 @@ pub struct SourceObject {
     object_id: SourceIdentifier,
     media_type: SourceIdentifier,
     evidence: ExactPayloadEvidence,
+    capture_identity: SourceObjectCaptureIdentity,
     effective: EffectiveInterval,
     published_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "availability_is_unknown")]
@@ -199,6 +202,41 @@ impl SourceObject {
         availability: AvailabilityEvidence,
         expected_bytes: Option<u64>,
     ) -> Result<Self, ExtractionError> {
+        Self::try_new_with_capture_identity(
+            source_id,
+            metadata_revision,
+            request,
+            object_id,
+            media_type,
+            evidence,
+            SourceObjectCaptureIdentity::Standalone,
+            effective,
+            published_at,
+            availability,
+            expected_bytes,
+        )
+    }
+
+    /// Constructs an exact object with required standalone or completed-paged capture lineage.
+    ///
+    /// # Errors
+    ///
+    /// Rejects oversized objects, invalid identifiers/evidence/capture identity, or availability
+    /// before a known source publication time.
+    #[allow(clippy::too_many_arguments, reason = "lineage fields remain explicit")]
+    pub fn try_new_with_capture_identity(
+        source_id: SourceId,
+        metadata_revision: MetadataRevision,
+        request: &DiscoveryRequest,
+        object_id: SourceIdentifier,
+        media_type: SourceIdentifier,
+        evidence: ExactPayloadEvidence,
+        capture_identity: SourceObjectCaptureIdentity,
+        effective: EffectiveInterval,
+        published_at: Option<Timestamp>,
+        availability: AvailabilityEvidence,
+        expected_bytes: Option<u64>,
+    ) -> Result<Self, ExtractionError> {
         if expected_bytes.is_some_and(|size| size > MAX_EXTRACTION_BATCH_BYTES) {
             return Err(ExtractionError::LimitTooLarge {
                 field: "expected_bytes",
@@ -210,6 +248,9 @@ impl SourceObject {
         let object_id = normalize_identifier(&object_id)?;
         let media_type = normalize_identifier(&media_type)?;
         let evidence = normalize_evidence(&evidence)?;
+        let capture_identity = capture_identity
+            .validate()
+            .map_err(|_| ExtractionError::SourceBindingMismatch)?;
         let availability = normalize_availability(&availability)?;
         validate_source_object_availability(published_at, &availability)?;
         Ok(Self {
@@ -220,6 +261,7 @@ impl SourceObject {
             object_id,
             media_type,
             evidence,
+            capture_identity,
             effective,
             published_at,
             availability,
@@ -262,6 +304,11 @@ impl SourceObject {
         &self.evidence
     }
 
+    /// Returns whether the object is standalone or bound to a complete response capture set.
+    pub const fn capture_identity(&self) -> SourceObjectCaptureIdentity {
+        self.capture_identity
+    }
+
     /// Returns source-object effective interval.
     pub const fn effective_interval(&self) -> EffectiveInterval {
         self.effective
@@ -280,6 +327,16 @@ impl SourceObject {
     /// Returns declared source-object bytes.
     pub const fn expected_bytes(&self) -> Option<u64> {
         self.expected_bytes
+    }
+
+    fn try_with_capture_identity(
+        mut self,
+        capture_identity: SourceObjectCaptureIdentity,
+    ) -> Result<Self, ExtractionError> {
+        self.capture_identity = capture_identity
+            .validate()
+            .map_err(|_| ExtractionError::SourceBindingMismatch)?;
+        Ok(self)
     }
 
     fn matches_discovery(&self, request: &DiscoveryRequest) -> bool {
@@ -309,6 +366,7 @@ struct SourceObjectWire {
     object_id: SourceIdentifier,
     media_type: SourceIdentifier,
     evidence: ExactPayloadEvidence,
+    capture_identity: SourceObjectCaptureIdentity,
     effective: EffectiveInterval,
     published_at: Option<Timestamp>,
     #[serde(default)]
@@ -340,6 +398,10 @@ impl<'de> Deserialize<'de> for SourceObject {
             object_id: normalize_identifier(&wire.object_id).map_err(serde::de::Error::custom)?,
             media_type: normalize_identifier(&wire.media_type).map_err(serde::de::Error::custom)?,
             evidence: normalize_evidence(&wire.evidence).map_err(serde::de::Error::custom)?,
+            capture_identity: wire
+                .capture_identity
+                .validate()
+                .map_err(serde::de::Error::custom)?,
             effective: wire.effective,
             published_at: wire.published_at,
             availability: normalize_availability(&wire.availability)
@@ -503,6 +565,22 @@ impl ExtractionRequest {
     /// Returns deterministic request identity.
     pub const fn request_id(&self) -> ExtractionRequestId {
         self.request_id
+    }
+
+    pub(super) fn try_bind_provider_capture(
+        self,
+        capture: &super::capture::ProviderCaptureSetReceipt,
+    ) -> Result<Self, ExtractionError> {
+        if self.object.source_id() != capture.source_id()
+            || self.object.metadata_revision() != capture.metadata_revision()
+            || self.object.dataset() != capture.dataset()
+        {
+            return Err(ExtractionError::SourceBindingMismatch);
+        }
+        let capture_identity = SourceObjectCaptureIdentity::try_from_capture(capture)
+            .map_err(|_| ExtractionError::SourceBindingMismatch)?;
+        let object = self.object.try_with_capture_identity(capture_identity)?;
+        Self::try_new(object, self.max_records, self.max_bytes, self.deadline)
     }
 
     pub(crate) fn dynamic_retained_bytes(&self) -> Result<u64, ExtractionError> {

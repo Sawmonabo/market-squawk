@@ -79,6 +79,13 @@ fn macro_and_local_sources_need_no_fake_asset_or_network_endpoint() -> TestResul
         restored.network_policy(),
         NetworkAccessPolicy::Denied
     ));
+    assert_eq!(
+        serde_json::from_str::<SourceClass>("\"standards_publisher\"")?,
+        SourceClass::StandardsPublisher
+    );
+    let mut standards_without_network_authority = serde_json::to_value(&metadata)?;
+    standards_without_network_authority["source_class"] = serde_json::json!("standards_publisher");
+    assert!(serde_json::from_value::<SourceMetadata>(standards_without_network_authority).is_err());
     Ok(())
 }
 

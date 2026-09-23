@@ -401,8 +401,10 @@ fn revision_id(
                 hash_money(&mut digest, trade.fee);
                 match &trade.lot_selection {
                     LotSelection::Fifo => digest.update([0]),
+                    LotSelection::Lifo => digest.update([1]),
+                    LotSelection::AverageCost => digest.update([2]),
                     LotSelection::SpecificIdentification(ids) => {
-                        digest.update([1]);
+                        digest.update([3]);
                         for id in ids {
                             hash_bytes(&mut digest, id.as_str().as_bytes());
                         }

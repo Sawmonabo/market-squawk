@@ -2,18 +2,22 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
-    FundamentalObservation, InstrumentId, PayloadReference, ResearchContext, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
-    XbrlAccuracy, XbrlAccuracyValue, XbrlContextGraph, XbrlDimensionEvidence,
-    XbrlDimensionLocation, XbrlDimensionMember, XbrlDuplicateClass, XbrlDuplicateEvidence,
-    XbrlEntity, XbrlFactEvidence, XbrlFactEvidenceInput, XbrlOccurrenceRelationships, XbrlPeriod,
-    XbrlQualifiedName, XbrlRelationshipEvidence, XbrlTaxonomySet, XbrlTypedMemberValidation,
-    XbrlUnitExpression, XbrlXmlEvent,
+    AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
+    ExactPayloadEvidence, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
+    FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
+    FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
+    FundamentalRevisionOrder, InstrumentId, PayloadReference, ResearchContext, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp, XbrlAccuracy, XbrlAccuracyValue,
+    XbrlContextGraph, XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember,
+    XbrlDuplicateClass, XbrlDuplicateEvidence, XbrlEntity, XbrlFactEvidence, XbrlFactEvidenceInput,
+    XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName, XbrlRelationshipEvidence,
+    XbrlTaxonomySet, XbrlTypedMemberValidation, XbrlUnitExpression, XbrlXmlEvent,
 };
 use rust_decimal::Decimal;
 
 fn research_context() -> Result<ResearchContext, Box<dyn Error>> {
+    let effective = CalendarDate::new(2025, 6, 28)?;
     Ok(ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: SourceId::try_from("sec-edgar")?,
@@ -34,9 +38,9 @@ fn research_context() -> Result<ResearchContext, Box<dyn Error>> {
                 SourceIdentifier::try_from("sec-retrieval-evidence")?,
             ),
         })?,
-        ResearchTime::new(
-            Timestamp::from_unix_nanos(5),
-            Some(Timestamp::from_unix_nanos(10)),
+        ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::calendar_date(effective),
+            None,
             RevisionNumber::new(1)?,
             None,
         )?,
@@ -144,11 +148,35 @@ fn xbrl_evidence_round_trips_and_binds_the_exact_normalized_value() -> Result<()
         rounding_ruleset: SourceIdentifier::try_from("sec-xbrl-rounding-v1")?,
         evaluated_at: Timestamp::from_unix_nanos(42),
     })?;
+    let fact_context = FundamentalFactContext::try_new(FundamentalFactContextInput {
+        schema_version: SchemaVersion::CURRENT,
+        period: FundamentalPeriod::duration(
+            CalendarDate::new(2025, 3, 30)?,
+            CalendarDate::new(2025, 6, 28)?,
+        )?,
+        unit: SourceIdentifier::try_from("iso4217:USD")?,
+        accession: SourceIdentifier::try_from("0000320193-25-000079")?,
+        filing_form: None,
+        amendment_status: FundamentalAmendmentStatus::Unavailable,
+        filed_on: None,
+        frame: None,
+        fiscal_year: None,
+        fiscal_period: None,
+        cadence: FundamentalCadence::Unavailable,
+        xbrl_context_id: Some(evidence.context_id().clone()),
+        dimensions: FundamentalDimensionContext::try_source_reported(evidence.dimensions())?,
+        consolidation: FundamentalConsolidation::Unavailable,
+        revision_order: FundamentalRevisionOrder::new(
+            RevisionNumber::new(1)?,
+            SourceIdentifier::try_from("sec-inline-xbrl-order-v1")?,
+        ),
+        restatement_status: FundamentalRestatementStatus::Unavailable,
+    })?;
     let observation = FundamentalObservation::new_with_xbrl_evidence(
         context,
         SourceIdentifier::try_from("us-gaap:NetIncomeLoss")?,
         Decimal::from(-23_434_000_000_i64),
-        SourceIdentifier::try_from("iso4217:USD")?,
+        fact_context,
         evidence,
     )?;
 

@@ -6,6 +6,7 @@ use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::mem::size_of;
 
+use super::capture::ProviderCaptureSetReceipt;
 use super::contracts::{
     AvailabilityEvidence, ExtractionError, ExtractionRecord, ExtractionRequest,
     MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
@@ -40,11 +41,11 @@ pub struct ExtractionBatchAccumulator {
 
 /// Typed, request-attempt-independent identity of one normalized extraction's semantic content.
 ///
-/// The identity binds source, metadata revision, exact source-object evidence and size, media and
-/// dataset identity, durable availability, and every ordered record's schema, exact semantic
-/// payload evidence, point-in-time fields, and revision. Discovery/extraction request IDs,
-/// deadlines, and requested ceilings are deliberately excluded because they are operation-attempt
-/// controls rather than persisted research content.
+/// The identity binds source, metadata revision, exact source-object evidence and size, explicit
+/// standalone/paged capture identity, media and dataset identity, durable availability, and every
+/// ordered record's schema, exact semantic payload evidence, point-in-time fields, and revision.
+/// Discovery/extraction request IDs, deadlines, and requested ceilings are deliberately excluded
+/// because they are operation-attempt controls rather than persisted research content.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractionContentIdentity {
     digest: EvidenceDigest,
@@ -62,7 +63,7 @@ impl ExtractionContentIdentity {
         let object = batch.request.object();
         let records = batch.records();
         let mut identity = Sha256::new();
-        identity.update(b"market-squawk/extraction-content/v2");
+        identity.update(b"market-squawk/extraction-content/v3");
         hash_text(&mut identity, object.source_id().as_str())?;
         hash_text(
             &mut identity,
@@ -72,6 +73,7 @@ impl ExtractionContentIdentity {
         hash_text(&mut identity, object.object_id().as_str())?;
         hash_text(&mut identity, object.media_type().as_str())?;
         hash_evidence(&mut identity, object.evidence());
+        object.capture_identity().hash_into(&mut identity);
         hash_timestamp(&mut identity, object.effective_interval().starts_at());
         hash_optional_timestamp(&mut identity, object.effective_interval().ends_at());
         hash_optional_timestamp(&mut identity, object.published_at());
@@ -244,6 +246,35 @@ impl ExtractionBatch {
         self.logical_retained_bytes
             .checked_add(self.records.allocator_slack_bytes()?)
             .ok_or(ExtractionError::ByteCountOverflow)
+    }
+
+    /// Atomically rebinds this normalized batch to one exact completed provider capture.
+    ///
+    /// Only capture lineage and the deterministic extraction request identity are replaced. The
+    /// source object's primary payload evidence, expected bytes, optional version-pinned locator,
+    /// all request ceilings/deadline, and every record's semantic evidence, times, availability,
+    /// revision, and payload remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a capture from another source, metadata revision, or dataset, or a capture whose
+    /// completed lineage cannot be represented under the bounded source-object contract.
+    pub fn try_bind_provider_capture(
+        self,
+        capture: &ProviderCaptureSetReceipt,
+    ) -> Result<Self, ExtractionError> {
+        let Self {
+            request,
+            logical_retained_bytes: _,
+            records,
+        } = self;
+        let request = request.try_bind_provider_capture(capture)?;
+        let records = records
+            .into_vec()
+            .into_iter()
+            .map(|record| record.try_rebind_request(&request))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new(&request, records)
     }
 }
 

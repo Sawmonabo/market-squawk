@@ -78,6 +78,7 @@ pub(crate) struct ExecutionAuditContext {
     approval_id: ApprovalId,
     order_id: OrderId,
     intent_digest: OrderIntentDigest,
+    target_reference_digest: Option<[u8; 32]>,
     strategy_id: StrategyId,
     model_id: Option<ModelId>,
     account_id: AccountId,
@@ -149,6 +150,9 @@ impl ExecutionAuditContext {
             approval_id,
             order_id: intent.order_id(),
             intent_digest: intent.digest(),
+            target_reference_digest: intent
+                .target_reference()
+                .map(crate::OrderTargetReference::audit_digest),
             strategy_id: intent.strategy_id(),
             model_id: intent.model_id(),
             account_id: intent.account_id(),
@@ -177,6 +181,7 @@ impl ExecutionAuditContext {
         approval_id: ApprovalId,
         order_id: OrderId,
         intent_digest: OrderIntentDigest,
+        target_reference_digest: Option<[u8; 32]>,
         strategy_id: StrategyId,
         model_id: Option<ModelId>,
         account_id: AccountId,
@@ -193,6 +198,7 @@ impl ExecutionAuditContext {
             approval_id,
             order_id,
             intent_digest,
+            target_reference_digest,
             strategy_id,
             model_id,
             account_id,
@@ -312,6 +318,10 @@ impl ExecutionAuditEvent {
     }
     pub const fn intent_digest(&self) -> OrderIntentDigest {
         self.context.intent_digest
+    }
+    /// Returns the fixed canonical target-reference digest when the intent was target-derived.
+    pub const fn target_reference_digest(&self) -> Option<[u8; 32]> {
+        self.context.target_reference_digest
     }
     pub const fn strategy_id(&self) -> StrategyId {
         self.context.strategy_id

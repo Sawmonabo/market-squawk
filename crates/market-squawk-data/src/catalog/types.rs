@@ -540,6 +540,10 @@ pub struct IngestReservation {
 }
 
 impl IngestReservation {
+    pub(crate) const fn catalog_id(&self) -> Uuid {
+        self.catalog_id
+    }
+
     /// Returns the opaque run identity used by downstream publication.
     pub const fn run_id(&self) -> Uuid {
         self.run_id
@@ -880,6 +884,9 @@ pub enum CatalogError {
     /// The supplied reservation was not sealed by this open catalog session.
     #[error("catalog ingest reservation is not valid for this session")]
     InvalidReservationCapability,
+    /// Shared composition authority is occupied by another operation.
+    #[error("catalog composition authority is busy")]
+    AuthorityBusy,
     /// Shared composition authority could not be locked.
     #[error("catalog composition authority lock is unavailable")]
     AuthorityLockPoisoned,
@@ -931,6 +938,18 @@ pub enum CatalogError {
     /// The caller's monotonic deadline elapsed while instrument definitions were being pinned.
     #[error("catalog instrument-definition read deadline elapsed")]
     InstrumentDefinitionReadDeadlineExceeded,
+    /// Cancellation was observed while bounded company identities were being read.
+    #[error("catalog company-identity read was cancelled")]
+    CompanyIdentityReadCancelled,
+    /// The caller's monotonic deadline elapsed while company identities were being read.
+    #[error("catalog company-identity read deadline elapsed")]
+    CompanyIdentityReadDeadlineExceeded,
+    /// Cancellation was observed while retained market routes or source revisions were read.
+    #[error("catalog market recovery read was cancelled")]
+    MarketRecoveryReadCancelled,
+    /// The caller's monotonic deadline elapsed during retained market recovery reads.
+    #[error("catalog market recovery read deadline elapsed")]
+    MarketRecoveryReadDeadlineExceeded,
     /// An append identity already names different immutable evidence.
     #[error("catalog append identity conflicts with retained evidence")]
     EvidenceConflict,
@@ -946,6 +965,34 @@ pub enum CatalogError {
     /// A publication did not name an active reserved run.
     #[error("catalog run is unknown or is not reserved")]
     RunStateConflict,
+    /// A sealed provider capture does not match its exact source object and ingest run.
+    #[error("provider capture does not match the source object or ingest run")]
+    ProviderCaptureMismatch,
+    /// A repeated provider-capture admission differs from retained immutable evidence.
+    #[error("provider capture conflicts with retained immutable evidence")]
+    ProviderCaptureConflict,
+    /// A sealed typed provider event does not match its raw frame evidence or ingest run.
+    #[error("provider event publication does not match its raw evidence or ingest run")]
+    ProviderEventMismatch,
+    /// A repeated typed event/composite admission differs from retained immutable evidence.
+    #[error("provider event publication conflicts with retained immutable evidence")]
+    ProviderEventConflict,
+    /// A sealed streamed logical publication does not match its source, run, or exact evidence.
+    #[error("provider logical publication does not match its source, run, or exact evidence")]
+    ProviderLogicalMismatch,
+    /// A repeated streamed logical publication differs from retained immutable evidence.
+    #[error("provider logical publication conflicts with retained immutable evidence")]
+    ProviderLogicalConflict,
+    /// Retained physical provider evidence exhausted the fixed recovery-safe catalog ceiling.
+    #[error(
+        "provider capture exceeds the recovery-safe maximum of {max_claims} physical objects or {max_bytes} retained bytes"
+    )]
+    ProviderCaptureCapacityExceeded {
+        /// Maximum physical raw objects retained by one installed catalog.
+        max_claims: usize,
+        /// Maximum aggregate physical raw-object bytes retained by one installed catalog.
+        max_bytes: u64,
+    },
     /// Backups are never overwritten.
     #[error("catalog backup destination already exists")]
     BackupAlreadyExists,

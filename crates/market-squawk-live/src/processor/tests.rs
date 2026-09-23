@@ -250,22 +250,49 @@ fn ready_trade_with_clock(
 }
 
 #[test]
-fn generation_registry_rebinds_refresh_and_replaces_rollover_atomically() -> TestResult {
+fn health_refresh_rebinds_processor_and_isolates_stale_admission() -> TestResult {
     let mut source = SourceHarness::try_new("source-a", 1)?;
-    let first_lease = source.current_lease(HEALTH_AT)?;
+    let (first_lease, first_batch) = source.batch("trade-1", 1, trade()?, non_book_snapshot()?)?;
+    let evaluated_at = source.timestamp(EVALUATED_AT)?;
     let mut registry = GenerationAuthorityRegistry::try_new(2)?;
-    let first = registry.bind_current(&first_lease, source.timestamp(HEALTH_AT)?)?;
+    let first = registry.bind_current(&first_lease, evaluated_at)?;
+    let (mut processor, _shard, _runtime) = processor(fixed_clock(evaluated_at)?, 4)?;
+    let first_applied = apply_one(&mut processor, &first, first_batch)?;
+    let first_authority = first_applied
+        .authority
+        .ok_or("first health epoch did not produce authority")?;
 
     source.refresh_health(HEALTH_AT + 1)?;
-    let refreshed_lease = source.current_lease(HEALTH_AT + 1)?;
-    let refreshed = registry.bind_current(&refreshed_lease, source.timestamp(HEALTH_AT + 1)?)?;
+    let (refreshed_lease, refreshed_batch) =
+        source.batch("trade-2", 2, trade()?, non_book_snapshot()?)?;
+    let refreshed = registry.bind_current(&refreshed_lease, evaluated_at)?;
     assert!(
-        first
+        !first
             .generation()
             .shares_allocation_with(&refreshed.generation())
     );
-    assert!(first.validate_at(source.timestamp(HEALTH_AT + 1)?).is_err());
-    refreshed.validate_at(source.timestamp(HEALTH_AT + 1)?)?;
+    first.validate_at(evaluated_at)?;
+    refreshed.validate_at(evaluated_at)?;
+
+    processor.clock = fixed_clock(evaluated_at)?;
+    let refreshed_applied = apply_one(&mut processor, &refreshed, refreshed_batch)?;
+    assert!(refreshed_applied.authority.is_some());
+    first.validate_at(evaluated_at)?;
+    assert!(
+        processor
+            .validate_applied_current(&first_authority)
+            .is_err()
+    );
+    first.invalidate_on_admission_failure();
+    refreshed.validate_at(evaluated_at)?;
+    let stream = processor
+        .snapshot_seed(ProcessorSnapshotLimits::try_new(8, 8, 8, 64 * 1024)?)?
+        .streams
+        .into_iter()
+        .next()
+        .ok_or("missing refreshed stream")?;
+    assert_eq!(stream.health_epoch, 2);
+    assert_eq!(stream.state_revision, 2);
 
     let source = source.rollover(2, HEALTH_AT + 2)?;
     let successor_lease = source.current_lease(HEALTH_AT + 3)?;

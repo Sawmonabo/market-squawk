@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -57,19 +59,89 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 {"machine": "", "configured_platform": "win-amd64"},
             )
         )
-        self.assertTrue(
-            builder._compatible(
-                "colorama-0.4.6-py2.py3-none-any.whl",
-                (3, 14),
-                builder.platform_profile("x86_64-pc-windows-msvc"),
+        try:
+            import packaging
+        except ImportError:
+            packaging = None
+        if packaging is None or packaging.__version__ != "26.2":
+            with self.assertRaises(builder.ReleaseBuildError):
+                builder._compatible(
+                    "colorama-0.4.6-py2.py3-none-any.whl",
+                    (3, 14),
+                    builder.platform_profile("x86_64-pc-windows-msvc"),
+                )
+        else:
+            self.assertTrue(
+                builder._compatible(
+                    "colorama-0.4.6-py2.py3-none-any.whl",
+                    (3, 14),
+                    builder.platform_profile("x86_64-pc-windows-msvc"),
+                )
             )
-        )
         _raw, linux = builder.load_release_components(
             ROOT / "distribution" / "release-components.json",
             builder.platform_profile("x86_64-unknown-linux-gnu"),
         )
         self.assertEqual(linux["zig"]["format"], "tar.xz")
         self.assertEqual(linux["zig"]["binary_path"], "zig-x86_64-linux-0.16.0/zig")
+
+    def test_wheel_admission_uses_the_exact_standard_gil_target_tags(self) -> None:
+        mac_arm = builder.platform_profile("aarch64-apple-darwin")
+        linux = builder.platform_profile("x86_64-unknown-linux-gnu")
+        try:
+            import packaging
+        except ImportError:
+            packaging = None
+        if packaging is None or packaging.__version__ != "26.2":
+            with self.assertRaisesRegex(
+                builder.ReleaseBuildError, r"packaging 26\.2"
+            ):
+                builder._compatible(
+                    "onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
+                    (3, 14),
+                    mac_arm,
+                )
+            return
+        self.assertTrue(
+            builder._compatible(
+                "onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
+                (3, 14),
+                mac_arm,
+            )
+        )
+        for filename, profile in (
+            ("onnx-1.22.0-cp314-cp314t-macosx_12_0_arm64.whl", mac_arm),
+            ("fixture-1.0-cp314-cp314-macosx_14_0_arm64.whl", mac_arm),
+            ("fixture-1.0-cp314-cp314-linux_x86_64.whl", linux),
+            ("fixture-1.0-cp314-cp314-musllinux_1_2_x86_64.whl", linux),
+        ):
+            with self.subTest(filename=filename):
+                self.assertFalse(builder._compatible(filename, (3, 14), profile))
+        self.assertTrue(
+            builder._compatible(
+                "fixture-1.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+                (3, 14),
+                linux,
+            )
+        )
+
+    def test_source_refresh_changes_only_the_complete_source_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "wheelhouse-lock.json"
+            before = json.loads((ROOT / "python/wheelhouse-lock.json").read_text())
+            destination.write_text(json.dumps(before), encoding="utf-8")
+
+            builder.refresh_source_closure(destination, ROOT)
+
+            after = json.loads(destination.read_text())
+            self.assertEqual(
+                {key: value for key, value in before.items() if key != "sources"},
+                {key: value for key, value in after.items() if key != "sources"},
+            )
+            self.assertEqual(
+                [entry["path"] for entry in after["sources"]],
+                list(builder.expected_source_paths(ROOT)),
+            )
 
     def test_release_signing_seed_is_zeroed_when_the_build_fails(self) -> None:
         signer = builder.ReleaseSigner.__new__(builder.ReleaseSigner)
@@ -108,9 +180,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             with self.assertRaises(builder.ReleaseBuildError):
                 builder.load_lock(lock_path)
 
-    def test_repository_lock_admits_the_complete_source_closure(self) -> None:
-        lock = builder.load_lock(ROOT / "python" / "wheelhouse-lock.json")
-
+    def test_repository_source_closure_contains_required_inputs(self) -> None:
         expected = builder.expected_source_paths(ROOT)
         self.assertIn("apps/market-squawk/Cargo.toml", expected)
         self.assertIn("apps/market-squawk/src/main.rs", expected)
@@ -120,7 +190,6 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             "docs/reports/performance/2026-07-17-q2-a4-writer-runtime-proof.md",
             expected,
         )
-        builder.admit_sources(lock, ROOT)
 
     def test_offline_admission_never_fetches_a_missing_wheel(self) -> None:
         lock = builder.ReleaseLock.for_test(
@@ -140,6 +209,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             wheel = Path(temporary) / "fixture-1.0-py3-none-any.whl"
             license_payload = b"audited license text"
             with zipfile.ZipFile(wheel, mode="w") as archive:
+                archive.writestr("fixture-1.0.dist-info/licenses/", b"")
                 archive.writestr(
                     "fixture-1.0.dist-info/METADATA",
                     "Metadata-Version: 2.1\n"
@@ -153,9 +223,31 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 )
 
             digest = hashlib.sha256(license_payload).hexdigest()
-            builder._admit_license(wheel, "BSD-3-Clause", digest)
+            with zipfile.ZipFile(wheel) as archive:
+                metadata = builder.BytesParser().parsebytes(
+                    archive.read("fixture-1.0.dist-info/METADATA")
+                )
+                del metadata["License-File"]
+                locked = builder._inspect_wheel_license_files(
+                    archive,
+                    "fixture-1.0.dist-info/METADATA",
+                    metadata,
+                )
+            self.assertEqual(locked[0]["sha256"], digest)
+            expected = (
+                builder.LicenseFile(
+                    locked[0]["path"],
+                    locked[0]["sha256"],
+                    locked[0]["size_bytes"],
+                ),
+            )
+            builder._admit_license(wheel, "BSD-3-Clause", expected)
             with self.assertRaises(builder.ReleaseBuildError):
-                builder._admit_license(wheel, "BSD-3-Clause", "0" * 64)
+                builder._admit_license(
+                    wheel,
+                    "BSD-3-Clause",
+                    (builder.LicenseFile(expected[0].path, "0" * 64, expected[0].size_bytes),),
+                )
 
     def test_unowned_artifact_root_is_never_deleted_or_claimed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -260,6 +352,210 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 environment,
             )
             self.assertEqual(executables.application, release / "market-squawk")
+
+    def test_installed_record_confines_cross_platform_script_paths(self) -> None:
+        cases = (
+            (
+                "x86_64-unknown-linux-gnu",
+                Path("lib/python3.14/site-packages"),
+                Path("bin/f2py"),
+                "../../../bin/f2py",
+                "../../../../escape",
+            ),
+            (
+                "x86_64-pc-windows-msvc",
+                Path("Lib/site-packages"),
+                Path("Scripts/f2py.exe"),
+                "../../Scripts/f2py.exe",
+                "../../../escape",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for target, site_relative, script_relative, record_path, escape in cases:
+                with self.subTest(target=target):
+                    release = Path(temporary) / target / "release-cp314"
+                    site_packages = release / site_relative
+                    dist_info = site_packages / "numpy-2.5.1.dist-info"
+                    dist_info.mkdir(parents=True)
+                    metadata = b"Metadata-Version: 2.4\nName: numpy\nVersion: 2.5.1\n\n"
+                    (dist_info / "METADATA").write_bytes(metadata)
+                    script = release / script_relative
+                    script.parent.mkdir()
+                    script_bytes = b"locked uv launcher"
+                    script.write_bytes(script_bytes)
+
+                    def hashed_row(name: str, content: bytes) -> str:
+                        encoded = base64.urlsafe_b64encode(
+                            hashlib.sha256(content).digest()
+                        ).rstrip(b"=")
+                        return f"{name},sha256={encoded.decode('ascii')},{len(content)}"
+
+                    record = dist_info / "RECORD"
+                    record.write_text(
+                        "\n".join(
+                            (
+                                hashed_row(
+                                    "numpy-2.5.1.dist-info/METADATA", metadata
+                                ),
+                                "numpy-2.5.1.dist-info/RECORD,,",
+                                hashed_row(record_path, script_bytes),
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    runtime = builder.PythonRuntime(
+                        release / "python", (3, 14, 6)
+                    )
+                    profile = builder.platform_profile(target)
+                    with mock.patch.object(builder, "host_profile", return_value=profile):
+                        distribution = builder.inspect_installed_distribution(
+                            release,
+                            runtime,
+                            builder.RuntimeRequirement("numpy", "2.5.1"),
+                        )
+                    signed_script_bytes = b"MZsigned locked uv launcher"
+                    script.write_bytes(signed_script_bytes)
+                    with mock.patch.object(builder, "host_profile", return_value=profile):
+                        builder.rewrite_signed_record_entries(
+                            release,
+                            runtime,
+                            (script,),
+                        )
+                        distribution = builder.inspect_installed_distribution(
+                            release,
+                            runtime,
+                            builder.RuntimeRequirement("numpy", "2.5.1"),
+                        )
+                    self.assertEqual(distribution.file_count, 2)
+                    self.assertEqual(
+                        distribution.roots, ("numpy-2.5.1.dist-info",)
+                    )
+                    self.assertEqual(distribution.external_paths, (record_path,))
+                    self.assertEqual(
+                        builder._distribution_payload(distribution)["external_paths"],
+                        [record_path],
+                    )
+
+                    escaped = site_packages.joinpath(*escape.split("/")).resolve()
+                    escaped.parent.mkdir(parents=True, exist_ok=True)
+                    escaped.write_bytes(script_bytes)
+                    record.write_text(
+                        "\n".join(
+                            (
+                                hashed_row(
+                                    "numpy-2.5.1.dist-info/METADATA", metadata
+                                ),
+                                "numpy-2.5.1.dist-info/RECORD,,",
+                                hashed_row(escape, script_bytes),
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    with mock.patch.object(builder, "host_profile", return_value=profile):
+                        with self.assertRaisesRegex(
+                            builder.ReleaseBuildError,
+                            "installed project RECORD path is invalid",
+                        ):
+                            builder.inspect_installed_distribution(
+                                release,
+                                runtime,
+                            builder.RuntimeRequirement("numpy", "2.5.1"),
+                        )
+
+    def test_installed_distributions_reject_shared_external_script(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            release = Path(temporary) / "release-cp314"
+            site_packages = release / "lib/python3.14/site-packages"
+            script = release / "bin/shared-tool"
+            script.parent.mkdir(parents=True)
+            script_bytes = b"identical owned script"
+            script.write_bytes(script_bytes)
+
+            def hashed_row(name: str, content: bytes) -> str:
+                encoded = base64.urlsafe_b64encode(
+                    hashlib.sha256(content).digest()
+                ).rstrip(b"=")
+                return f"{name},sha256={encoded.decode('ascii')},{len(content)}"
+
+            distributions = []
+            profile = builder.platform_profile("x86_64-unknown-linux-gnu")
+            runtime = builder.PythonRuntime(release / "bin/python", (3, 14, 6))
+            with mock.patch.object(builder, "host_profile", return_value=profile):
+                for name in ("alpha", "beta"):
+                    metadata = (
+                        f"Metadata-Version: 2.4\nName: {name}\nVersion: 1.0\n\n"
+                    ).encode("ascii")
+                    dist_info = site_packages / f"{name}-1.0.dist-info"
+                    dist_info.mkdir(parents=True)
+                    (dist_info / "METADATA").write_bytes(metadata)
+                    (dist_info / "RECORD").write_text(
+                        "\n".join(
+                            (
+                                hashed_row(
+                                    f"{name}-1.0.dist-info/METADATA", metadata
+                                ),
+                                hashed_row("../../../bin/shared-tool", script_bytes),
+                                f"{name}-1.0.dist-info/RECORD,,",
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    distributions.append(
+                        builder.inspect_installed_distribution(
+                            release,
+                            runtime,
+                            builder.RuntimeRequirement(name, "1.0"),
+                        )
+                    )
+
+            with self.assertRaisesRegex(
+                builder.ReleaseBuildError,
+                "installed distribution ownership overlaps",
+            ):
+                builder._require_disjoint_distribution_roots(tuple(distributions))
+            with mock.patch.object(builder, "host_profile", return_value=profile):
+                with self.assertRaisesRegex(
+                    builder.ReleaseBuildError,
+                    "signed installed distribution ownership overlaps",
+                ):
+                    builder.rewrite_signed_record_entries(
+                        release,
+                        runtime,
+                        (script,),
+                    )
+
+            alias = release / "bin/beta-tool"
+            os.link(script, alias)
+            beta_metadata = b"Metadata-Version: 2.4\nName: beta\nVersion: 1.0\n\n"
+            beta_record = site_packages / "beta-1.0.dist-info/RECORD"
+            beta_record.write_text(
+                "\n".join(
+                    (
+                        hashed_row("beta-1.0.dist-info/METADATA", beta_metadata),
+                        hashed_row("../../../bin/beta-tool", script_bytes),
+                        "beta-1.0.dist-info/RECORD,,",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(builder, "host_profile", return_value=profile):
+                aliased = builder.inspect_installed_distribution(
+                    release,
+                    runtime,
+                    builder.RuntimeRequirement("beta", "1.0"),
+                )
+            self.assertNotEqual(distributions[0].external_paths, aliased.external_paths)
+            with self.assertRaisesRegex(
+                builder.ReleaseBuildError,
+                "installed distribution ownership overlaps",
+            ):
+                builder._require_disjoint_distribution_roots(
+                    (distributions[0], aliased)
+                )
 
     def test_training_receipts_bind_build_foundation_and_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

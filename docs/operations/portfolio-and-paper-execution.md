@@ -8,8 +8,8 @@ revision-bound portfolio analytics, and operating the risk-enforced paper runtim
 | Document type | Operations runbook |
 | Audience | Local operators, portfolio analysts, and execution reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-08-03 |
+| Review basis | Current installed shared-service and typed application operations; not release approval evidence |
 
 ## Contents
 
@@ -27,8 +27,9 @@ revision-bound portfolio analytics, and operating the risk-enforced paper runtim
 
 ## Scope
 
-This page documents behavior available through the current CLI and the same typed application
-services exposed by local stdio MCP. It covers:
+This page documents behavior available through the installed shared service: the Desktop, CLI, and
+registered Claude Code/Codex clients call the same typed application operations for the one active
+workspace. It covers:
 
 - versioned local portfolio-manifest admission and raw-evidence preservation;
 - immutable, point-in-time portfolio revisions and reconciliation evidence;
@@ -79,14 +80,16 @@ explicit confirmation, and execution mutations remain dispatcher- and risk-owned
 
 ## Preconditions
 
-Use one explicit data root for the entire procedure. The examples use a shell variable only to
-avoid repeating the path:
+Use one installed service/workspace for the entire procedure. The Desktop shows the active workspace
+and typed paper/portfolio readiness. CLI examples use one explicit data root only where the launcher
+requires it; do not point separate clients at copied or hand-edited roots:
 
 ```bash
 export MARKET_SQUAWK_DATA_DIR="$PWD/.market-squawk"
 market-squawk init
 market-squawk config validate
 market-squawk doctor
+market-squawk --output json setup status
 ```
 
 Before a portfolio import:
@@ -113,6 +116,11 @@ Before a paper run:
 - ensure the artifact and control roots have sufficient free space; and
 - treat `DirectUnverified`, quarantine, incomplete reconciliation, unhealthy export drains, or an
   incomplete prior shutdown as a no-action condition.
+
+Before a mutation, ensure the client is connected to the current service/workspace generation. A
+Desktop/CLI/MCP client that reports a stale generation after a service restart, restore, update, or
+workspace switch must reconnect and reread `Bot.GetStatus`/portfolio state. It must not replay an
+old confirmation, paper request, order ID, or job handle.
 
 ## Import a portfolio revision
 
@@ -194,9 +202,10 @@ and revision evidence.
 
 ## Operate the paper runtime
 
-### Foreground CLI session
+### Start and observe the shared paper operation
 
-Start a bounded foreground run for operational source, lifecycle, audit, and recovery validation:
+Start an explicitly confirmed paper run only after the readiness checks above. This example requests
+an intentionally bounded interval for an operational validation:
 
 ```bash
 market-squawk --output json bot start \
@@ -208,8 +217,9 @@ market-squawk --output json bot start \
 ```
 
 Use `--provider kraken` for the configured Kraken profile. Omitting `--seconds` runs until Ctrl-C.
-The CLI starts the local runtime, waits for the duration or interrupt, requests a confirmed stop,
-and returns both start and stop results only after bounded shutdown.
+The service starts the runtime only after provider, lifecycle, audit, checkpoint, source quality,
+and central-risk checks pass. The returned lifecycle/job/receipt evidence is the source of truth;
+`--seconds` requests a bounded interval and Ctrl-C requests the owned client's bounded stop path.
 
 To run the authenticated Direct path, first complete
 `source setup coinbase.exchange-direct-market-data --confirm` and retain the resulting active
@@ -230,10 +240,9 @@ The setup portal accepts one versioned secret envelope containing the View-only 
 status output. The Direct run does not persist or export market observations under the current
 scoped rights.
 
-The one-shot CLI creates one `LocalProduct` per process. Consequently, a separate `bot status` or
-`execution` CLI process does not attach to an already-running foreground CLI process. Use the local
-stdio MCP session when lifecycle status, order/fill reads, cancellation, or reconciliation must be
-performed against the same live runtime owner. The corresponding typed operations are:
+The installed service retains the active workspace authority while its clients reconnect. Use the
+Desktop Paper Execution page, CLI, or a registered local MCP client to read the same typed status,
+orders, fills, cancellation, and reconciliation state. The corresponding operations are:
 
 | Operation | Purpose |
 | --- | --- |
@@ -247,24 +256,24 @@ performed against the same live runtime owner. The corresponding typed operation
 
 The exact MCP tool names and schemas are in the [MCP reference](../reference/mcp.md). The CLI
 equivalents `execution orders`, `execution fills`, `execution cancel`, and
-`execution reconcile` are valid only when their process owns a running paper controller; otherwise
-they return an unavailable service result.
+`execution reconcile` call the same service authority. If the service reports the paper operation
+stopped, unavailable, recovering, quarantined, or requiring reconciliation, preserve that state and
+repair it before any new start; do not create a parallel controller.
 
 ### Stop and emergency authority
 
-A persistent MCP owner stops the active runtime through `Bot.Stop`, supplying an audit reason and
-local confirmation. The CLI exposes the equivalent syntax:
+Stop the active runtime through `Bot.Stop`, supplying an audit reason and local confirmation. The
+Desktop confirmation follows the same authority; the CLI exposes the equivalent syntax:
 
 ```bash
 market-squawk bot stop --reason "operator requested shutdown" --confirm
 ```
 
-Because each public CLI invocation owns a new process, that standalone command cannot stop a paper
-runtime owned by another CLI or MCP process. A foreground `bot start` handles its own duration or
-Ctrl-C stop. Within a persistent MCP session, `Risk.TriggerKillSwitch` and `Bot.Stop` both stop only
-that session's current paper run and retain the supplied reason. Neither command deletes audits or
-checkpoints. Process shutdown also invalidates new execution authority before draining and
-checkpointing the runtime.
+`Risk.TriggerKillSwitch` and `Bot.Stop` both stop only the current local paper operation and retain
+the supplied reason. Neither command deletes audits or checkpoints. A service shutdown first
+invalidates new execution authority, then drains/reconciles and checkpoints the runtime. A client
+disconnect does not itself prove a stop: reconnect, inspect status, and wait for the terminal
+receipt before treating paper state as settled.
 
 ## Success evidence
 
@@ -292,8 +301,8 @@ A successful lifecycle validation has:
 - `shutdownComplete: true` at stop; and
 - a durable terminal checkpoint whose configuration and recovery digest validate on the next run.
 
-Zero orders and fills are the expected current result because the shipping strategy emits no
-intents and current provider quality is not execution eligible.
+Zero orders/fills can be a valid no-intent outcome. It does not by itself prove either a successful
+strategy or a failed matching engine; read the source-quality, risk, and lifecycle reason codes.
 
 ## Failure and recovery
 
@@ -307,7 +316,7 @@ intents and current provider quality is not execution eligible.
 | `insufficient_history` | Fewer than two comparable point-in-time revisions exist | Import genuine subsequent revisions before calculating performance |
 | Paper start unavailable | Configuration, source admission, checkpoint ownership, audit startup, or lifecycle admission failed | Run `config validate`, `doctor`, and source health checks; inspect local logs and retained checkpoint evidence |
 | Paper checkpoint reports an unclean prior run | Prior terminal state was not durably proved | Keep execution stopped; reconcile exact audit/checkpoint evidence and restart only after recovery succeeds |
-| Execution operation unavailable | The caller does not own a running controller, or the runtime/export drain is unhealthy | Use the same persistent MCP session; otherwise repair source/runtime health and start a new run |
+| Execution operation unavailable | The service is stopped, recovering, quarantined, stale for this client, or its runtime/export drain is unhealthy | Reconnect the client, read current status, then repair the first reported source/runtime condition; never create another controller |
 | Reconciliation required or incomplete shutdown | Paper state cannot be treated as current | Stop new action, invoke same-owner reconciliation, then perform a bounded stop and verify its terminal checkpoint |
 | Disk full or root identity changed | Durable publication authority is unavailable | Stop mutation, restore space/ownership without replacing the root, then rerun validation and exact recovery |
 

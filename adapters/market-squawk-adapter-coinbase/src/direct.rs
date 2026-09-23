@@ -7,19 +7,20 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::DateTime;
 use hmac::{Hmac, Mac as _};
 use market_squawk_domain::{
-    AssetClass, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    EffectiveInterval, ExactPayloadEvidence, InstrumentExecutionTerms, IntegrityRule,
-    LiveEventClass, MarketDepth, PriceTicks, ProviderChannel, ProviderProduct, QuantityLots,
-    RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion, SequenceCapability, SequenceNumber,
-    SequenceValidationRule, SnapshotApplicability, SourceId, SourceIdentifier, Timestamp,
-    TradingStatus, VenueId,
+    AssetClass, CapturePayload, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentExecutionTerms,
+    IntegrityRule, LiveEventClass, MarketDepth, PriceTicks, ProviderChannel, ProviderProduct,
+    QuantityLots, RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion, SequenceCapability,
+    SequenceNumber, SequenceValidationRule, SnapshotApplicability, SourceId, SourceIdentifier,
+    Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
-    ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
-    CoverageTopology, DecoderEvidence, DirectBookLimits, DirectOrderBook, DirectOrderBookError,
-    EndpointPolicy, FreshnessPolicy, HistoricalCapability, HttpCaptureMethod, HttpRequestBounds,
-    InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile,
-    MAX_DECODED_BOOK_ITEMS, NetworkAccessPolicy, PathScope, ProviderBookSide, ProviderBudgetPolicy,
+    ApiEndpointRule, AuthorizationGrant, AuthorizationMode, CaptureAdmissionReceipt,
+    ChecksumValidationProfile, CoverageTopology, DecoderEvidence, DirectBookLimits,
+    DirectOrderBook, DirectOrderBookError, EndpointPolicy, FrameId, FreshnessPolicy,
+    HistoricalCapability, HttpCaptureMethod, HttpRequestBounds, InstrumentCoverage,
+    LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, MAX_DECODED_BOOK_ITEMS,
+    NetworkAccessPolicy, PathScope, ProviderBookSide, ProviderBudgetPolicy,
     ProviderCursorOnlyReason, ProviderDecimalLexeme, ProviderNumericPolicy,
     ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord,
     ProviderPrice, ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
@@ -35,7 +36,10 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::{CoinbaseConfigError, CoinbaseProductMapping, CoinbaseTransportLimits};
+use crate::{
+    CoinbaseConfigError, CoinbaseDirectTradeEvidence, CoinbaseProductMapping,
+    CoinbaseTransportLimits,
+};
 
 /// Authenticated Direct Market Data WebSocket endpoint.
 pub const COINBASE_DIRECT_WEBSOCKET_ENDPOINT: &str = "wss://ws-direct.exchange.coinbase.com";
@@ -63,9 +67,15 @@ const DIRECT_WEBSOCKET_FRAME_COPIES: u64 = 4;
 const DIRECT_BOOK_STATE_COPIES: u64 = 2;
 const DIRECT_ORDER_ENTRY_UPPER_BYTES: u64 = 768;
 const DIRECT_PRICE_LEVEL_ENTRY_UPPER_BYTES: u64 = 128;
-const DIRECT_QUEUE_EVENT_OVERHEAD_BYTES: u64 = 256;
 const DIRECT_SNAPSHOT_SEGMENT_OVERHEAD_BYTES: u64 = 512;
 const DIRECT_PUBLICATION_LEVEL_OVERHEAD_BYTES: u64 = 64;
+// Source/destination replay arrays and capture-receipt arrays coexist during the one-shot handoff.
+const DIRECT_REPLAY_EVENT_CONTAINER_COPIES: u64 = 2;
+const DIRECT_REPLAY_CAPTURE_CONTAINER_COPIES: u64 = 2;
+const DIRECT_REPLAY_SLOT_PADDING_BYTES: u64 = 64;
+// Two event views each retain product/order/rule identities; native matches retain maker+taker.
+const DIRECT_REPLAY_EVENT_IDENTITY_COPIES: u64 = 8;
+const DIRECT_ORDER_LEVEL_EVENT_IDENTITY_COPIES: u64 = 3;
 
 /// Complete transport, snapshot, queue, and level-3 ownership limits for one product generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,13 +150,23 @@ impl CoinbaseDirectLimits {
         self.book
     }
 
+    pub(crate) fn checked_replay_container_slots(self) -> Result<usize, CoinbaseConfigError> {
+        self.book
+            .max_queue_events()
+            .checked_mul(2)
+            .ok_or(CoinbaseConfigError::InvalidDirectLimits)
+    }
+
     /// Returns a checked conservative upper bound for one pre-network Direct session.
     ///
     /// The estimate includes the complete snapshot response while it is captured and decoded,
-    /// WebSocket frame working copies, the queued replay payload and event containers, both
-    /// possible order-book state slots, price-level arenas, and both bid/ask publication buffers.
-    /// It deliberately overestimates allocator and hash-table overhead so application composition
-    /// can reject an unsafe aggregate before opening a socket.
+    /// WebSocket frame working copies, the shared queued raw allocation, both simultaneous
+    /// replay-event arrays, both capture-receipt arrays, replay digests and bounded identities,
+    /// both possible order-book state slots, price-level arenas, bid/ask publication buffers, and
+    /// the worst-case order-level snapshot/replay projection. The limits-level value is
+    /// deliberately complete for the deepest selectable profile because account admission owns
+    /// only these immutable limits. It therefore cannot under-admit an order-level configuration
+    /// before opening a socket.
     ///
     /// # Errors
     ///
@@ -168,8 +188,35 @@ impl CoinbaseDirectLimits {
         )?;
         let queue_payload_bytes = u64::try_from(book.max_queue_bytes())
             .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?;
-        let queue_event_bytes =
-            direct_memory_product(book.max_queue_events(), DIRECT_QUEUE_EVENT_OVERHEAD_BYTES)?;
+        let replay_slots = self.checked_replay_container_slots()?;
+        let replay_event_slot_bytes = direct_type_bytes::<ProviderOrderEvent>()?
+            .checked_add(direct_type_bytes::<CapturePayload>()?)
+            .and_then(|value| {
+                value.checked_add(direct_type_bytes::<Option<CoinbaseDirectTradeEvidence>>().ok()?)
+            })
+            .and_then(|value| value.checked_add(DIRECT_REPLAY_SLOT_PADDING_BYTES))
+            .and_then(|value| value.checked_mul(DIRECT_REPLAY_EVENT_CONTAINER_COPIES))
+            .ok_or(CoinbaseConfigError::InvalidDirectLimits)?;
+        let replay_event_container_bytes =
+            direct_memory_product(replay_slots, replay_event_slot_bytes)?;
+        let identity_bytes = u64::try_from(SourceIdentifier::MAX_LENGTH)
+            .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?;
+        let replay_identity_bytes = direct_memory_product(
+            book.max_queue_events(),
+            identity_bytes
+                .checked_mul(DIRECT_REPLAY_EVENT_IDENTITY_COPIES)
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
+        let replay_capture_slot_bytes = direct_type_bytes::<CaptureAdmissionReceipt>()?
+            .checked_add(direct_type_bytes::<FrameId>()?)
+            .and_then(|value| value.checked_add(direct_type_bytes::<usize>().ok()?))
+            .and_then(|value| value.checked_add(DIRECT_REPLAY_SLOT_PADDING_BYTES))
+            .and_then(|value| value.checked_mul(DIRECT_REPLAY_CAPTURE_CONTAINER_COPIES))
+            .ok_or(CoinbaseConfigError::InvalidDirectLimits)?;
+        let replay_capture_container_bytes =
+            direct_memory_product(replay_slots, replay_capture_slot_bytes)?;
+        let replay_digest_bytes =
+            direct_memory_product(replay_slots, direct_type_bytes::<EvidenceDigest>()?)?;
         let order_bytes = direct_memory_product(
             book.max_orders(),
             DIRECT_ORDER_ENTRY_UPPER_BYTES
@@ -195,16 +242,36 @@ impl CoinbaseDirectLimits {
                 .and_then(|value| value.checked_mul(4))
                 .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
         )?;
+        let order_level_snapshot_bytes =
+            direct_memory_product(book.max_orders(), DIRECT_ORDER_ENTRY_UPPER_BYTES)?;
+        let order_level_replay_bytes = direct_memory_product(
+            replay_slots,
+            direct_type_bytes::<ProviderOrderEvent>()?
+                .checked_add(
+                    u64::try_from(SourceIdentifier::MAX_LENGTH)
+                        .ok()
+                        .and_then(|value| {
+                            value.checked_mul(DIRECT_ORDER_LEVEL_EVENT_IDENTITY_COPIES)
+                        })
+                        .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+                )
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
         [
             DIRECT_SESSION_FIXED_MEMORY_BYTES,
             snapshot_bytes,
             frame_bytes,
             snapshot_segment_bytes,
             queue_payload_bytes,
-            queue_event_bytes,
+            replay_event_container_bytes,
+            replay_identity_bytes,
+            replay_capture_container_bytes,
+            replay_digest_bytes,
             order_bytes,
             price_level_bytes,
             publication_bytes,
+            order_level_snapshot_bytes,
+            order_level_replay_bytes,
         ]
         .into_iter()
         .try_fold(0_u64, |total, value| {
@@ -213,6 +280,10 @@ impl CoinbaseDirectLimits {
                 .ok_or(CoinbaseConfigError::InvalidDirectLimits)
         })
     }
+}
+
+fn direct_type_bytes<T>() -> Result<u64, CoinbaseConfigError> {
+    u64::try_from(std::mem::size_of::<T>()).map_err(|_| CoinbaseConfigError::InvalidDirectLimits)
 }
 
 fn direct_memory_product(count: usize, bytes: u64) -> Result<u64, CoinbaseConfigError> {
@@ -230,6 +301,7 @@ pub struct CoinbaseDirectConfig {
     venue: VenueId,
     terms: InstrumentExecutionTerms,
     limits: CoinbaseDirectLimits,
+    publication_depth: MarketDepth,
     snapshot_url: Box<str>,
     product_url: Box<str>,
 }
@@ -256,8 +328,87 @@ impl CoinbaseDirectConfig {
         budget: ProviderBudgetPolicy,
         limits: CoinbaseDirectLimits,
     ) -> Result<Self, CoinbaseConfigError> {
+        Self::try_new_with_publication_depth(
+            source_id,
+            revision_evidence,
+            authorization,
+            coverage_evidence,
+            effective,
+            mapping,
+            terms,
+            freshness,
+            budget,
+            limits,
+            MarketDepth::PriceLevel,
+            DataQuality::DirectVerified,
+        )
+    }
+
+    /// Builds the authenticated `full` plus REST level-3 order-level profile.
+    ///
+    /// This profile retains provider order identities through the adapter output boundary and
+    /// deliberately declares a `DirectUnverified` quality ceiling. Authentication and order-level
+    /// depth do not establish execution quality; only the central live qualification authority can
+    /// do so after it admits the complete generation, sequence, freshness, status, precision, and
+    /// coverage evidence.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "authorization, coverage, budget, and every runtime bound remain explicit"
+    )]
+    pub fn try_new_order_level(
+        source_id: SourceId,
+        revision_evidence: RevisionBoundPayloadEvidence,
+        authorization: AuthorizationGrant,
+        coverage_evidence: ExactPayloadEvidence,
+        effective: EffectiveInterval,
+        mapping: CoinbaseProductMapping,
+        terms: InstrumentExecutionTerms,
+        freshness: FreshnessPolicy,
+        budget: ProviderBudgetPolicy,
+        limits: CoinbaseDirectLimits,
+    ) -> Result<Self, CoinbaseConfigError> {
+        Self::try_new_with_publication_depth(
+            source_id,
+            revision_evidence,
+            authorization,
+            coverage_evidence,
+            effective,
+            mapping,
+            terms,
+            freshness,
+            budget,
+            limits,
+            MarketDepth::OrderLevel,
+            DataQuality::DirectUnverified,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "authorization, coverage, budget, and every runtime bound remain explicit"
+    )]
+    fn try_new_with_publication_depth(
+        source_id: SourceId,
+        revision_evidence: RevisionBoundPayloadEvidence,
+        authorization: AuthorizationGrant,
+        coverage_evidence: ExactPayloadEvidence,
+        effective: EffectiveInterval,
+        mapping: CoinbaseProductMapping,
+        terms: InstrumentExecutionTerms,
+        freshness: FreshnessPolicy,
+        budget: ProviderBudgetPolicy,
+        limits: CoinbaseDirectLimits,
+        publication_depth: MarketDepth,
+        quality_ceiling: DataQuality,
+    ) -> Result<Self, CoinbaseConfigError> {
         if authorization.mode() != AuthorizationMode::UserAuthorized {
             return Err(CoinbaseConfigError::InvalidDirectAuthorization);
+        }
+        if !matches!(
+            publication_depth,
+            MarketDepth::PriceLevel | MarketDepth::OrderLevel
+        ) {
+            return Err(CoinbaseConfigError::InvalidDirectLimits);
         }
         if terms.instrument_id() != mapping.instrument() {
             return Err(CoinbaseConfigError::InvalidDirectInstrumentTerms);
@@ -289,28 +440,43 @@ impl CoinbaseDirectConfig {
         let sequence_rule = direct_rule("coinbase-exchange-direct-product-sequence")?;
         let checksum_rule = direct_rule("coinbase-exchange-direct-checksum-unsupported")?;
         let quote_snapshot_rule = direct_rule("coinbase-exchange-direct-quote-snapshot-na-v1")?;
-        let live = LiveCoverageDeclaration::try_new(
-            mapping.product().clone(),
-            ProviderChannel::new(SourceIdentifier::try_from(DIRECT_CHANNEL)?),
-            vec![
-                LiveCoverageRule::try_new(
-                    LiveEventClass::Quote,
-                    None,
-                    SnapshotApplicability::NotApplicable {
-                        metadata_rule: quote_snapshot_rule,
-                    },
-                )?,
+        let mut live_rules = vec![
+            LiveCoverageRule::try_new(
+                LiveEventClass::Quote,
+                None,
+                SnapshotApplicability::NotApplicable {
+                    metadata_rule: quote_snapshot_rule,
+                },
+            )?,
+            LiveCoverageRule::try_new(
+                LiveEventClass::BookSnapshot,
+                Some(MarketDepth::PriceLevel),
+                SnapshotApplicability::Required,
+            )?,
+            LiveCoverageRule::try_new(
+                LiveEventClass::BookDelta,
+                Some(MarketDepth::PriceLevel),
+                SnapshotApplicability::Required,
+            )?,
+        ];
+        if publication_depth == MarketDepth::OrderLevel {
+            live_rules.extend([
                 LiveCoverageRule::try_new(
                     LiveEventClass::BookSnapshot,
-                    Some(MarketDepth::PriceLevel),
+                    Some(MarketDepth::OrderLevel),
                     SnapshotApplicability::Required,
                 )?,
                 LiveCoverageRule::try_new(
                     LiveEventClass::BookDelta,
-                    Some(MarketDepth::PriceLevel),
+                    Some(MarketDepth::OrderLevel),
                     SnapshotApplicability::Required,
                 )?,
-            ],
+            ]);
+        }
+        let live = LiveCoverageDeclaration::try_new(
+            mapping.product().clone(),
+            ProviderChannel::new(SourceIdentifier::try_from(DIRECT_CHANNEL)?),
+            live_rules,
         )?;
         let venue = VenueId::try_from(COINBASE_VENUE)?;
         let coverage = SourceCoverage::try_instrument(
@@ -331,7 +497,7 @@ impl CoinbaseDirectConfig {
             SourceIdentifier::try_from(COINBASE_PROVIDER)?,
             authorization,
             coverage,
-            DataQuality::DirectVerified,
+            quality_ceiling,
             NetworkAccessPolicy::Allowlisted(endpoints),
             freshness,
             Some(budget),
@@ -369,6 +535,7 @@ impl CoinbaseDirectConfig {
             venue,
             terms,
             limits,
+            publication_depth,
             snapshot_url: snapshot_url.into_boxed_str(),
             product_url: product_url.into_boxed_str(),
         })
@@ -417,6 +584,27 @@ impl CoinbaseDirectConfig {
     /// Returns all direct transport and ownership limits.
     pub const fn limits(&self) -> CoinbaseDirectLimits {
         self.limits
+    }
+
+    /// Returns the deepest adapter publication contract selected for this source profile.
+    ///
+    /// The order-level profile continues to emit the existing price-level projection so current
+    /// consumers remain compatible while an order-aware consumer retains provider identities.
+    pub const fn publication_depth(&self) -> MarketDepth {
+        self.publication_depth
+    }
+
+    /// Returns the conservative pre-network memory ceiling for this exact profile.
+    ///
+    /// The limits-level admission is conservative for the deepest selectable order-level profile
+    /// so account composition and the product output consume the same complete value before a
+    /// provider connection opens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoinbaseConfigError::InvalidDirectLimits`] if the complete bound overflows.
+    pub fn checked_maximum_retained_bytes(&self) -> Result<u64, CoinbaseConfigError> {
+        self.limits.checked_maximum_retained_bytes()
     }
 
     /// Constructs one redacted authenticated `full` subscription.
@@ -871,12 +1059,65 @@ pub enum CoinbaseDirectSigningError {
 }
 
 /// One decoded Coinbase Direct frame classified by its actual cursor semantics.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum CoinbaseDirectDecodeOutcome {
     /// A proven public product-sequence event eligible for contiguous book processing.
-    Sequenced(ProviderOrderEvent),
+    Sequenced(CoinbaseDirectSequencedEvent),
     /// A validated lifecycle control that carries no public cursor or book authority.
     NonBook(CoinbaseDirectNonBookEvent),
+}
+
+/// One Direct public-cursor event plus native match identity decoded from the same raw frame.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CoinbaseDirectSequencedEvent {
+    event: ProviderOrderEvent,
+    native_trade: Option<CoinbaseDirectTradeEvidence>,
+}
+
+impl CoinbaseDirectSequencedEvent {
+    /// Returns the provider-neutral order mutation used by the synchronized Direct book.
+    pub const fn provider_event(&self) -> &ProviderOrderEvent {
+        &self.event
+    }
+
+    /// Returns native match identity when this cursor is a Coinbase `match` frame.
+    pub const fn native_trade(&self) -> Option<&CoinbaseDirectTradeEvidence> {
+        self.native_trade.as_ref()
+    }
+
+    pub const fn sequence(&self) -> SequenceNumber {
+        self.event.sequence()
+    }
+
+    pub const fn timestamp(&self) -> Timestamp {
+        self.event.timestamp()
+    }
+
+    pub const fn kind(&self) -> &ProviderOrderEventKind {
+        self.event.kind()
+    }
+
+    pub const fn evidence(&self) -> &DecoderEvidence {
+        self.event.evidence()
+    }
+
+    pub const fn wire_bytes(&self) -> usize {
+        self.event.wire_bytes()
+    }
+
+    pub fn into_parts(self) -> (ProviderOrderEvent, Option<CoinbaseDirectTradeEvidence>) {
+        (self.event, self.native_trade)
+    }
+}
+
+#[derive(Debug)]
+struct CoinbaseDirectTradeFields {
+    trade_id: u64,
+    maker_order_id: SourceIdentifier,
+    taker_order_id: SourceIdentifier,
+    maker_side: ProviderBookSide,
+    price: PriceTicks,
+    quantity: QuantityLots,
 }
 
 /// A validated Coinbase lifecycle control that cannot advance public state.
@@ -1097,6 +1338,7 @@ impl CoinbaseDirectDecoder {
         if kind == "activate" {
             return Err(CoinbaseDirectDecodeError::UnknownSequencedMessage);
         }
+        let mut native_trade = None;
         let event_kind = match kind {
             "received" => {
                 validate_fields(
@@ -1209,10 +1451,13 @@ impl CoinbaseDirectDecoder {
                         "side",
                     ],
                 )?;
-                required_u64(object, "trade_id")?;
-                let _taker_order_id = parse_order_id(object, "taker_order_id")?;
-                normalize_direct_price(required_text(object, "price")?, self.terms)?;
-                parse_direct_side(required_text(object, "side")?)?;
+                let trade_id = required_u64(object, "trade_id")?;
+                let taker_order_id = parse_order_id(object, "taker_order_id")?;
+                let maker_order_id = parse_order_id(object, "maker_order_id")?;
+                let price = normalize_direct_price(required_text(object, "price")?, self.terms)?;
+                let maker_side = parse_direct_side(required_text(object, "side")?)?;
+                let quantity =
+                    normalize_direct_quantity(required_text(object, "size")?, self.terms)?;
                 for field in [
                     "taker_user_id",
                     "user_id",
@@ -1225,17 +1470,19 @@ impl CoinbaseDirectDecoder {
                 }
                 validate_optional_nonnegative_decimal(object, "taker_fee_rate")?;
                 validate_optional_nonnegative_decimal(object, "maker_fee_rate")?;
+                native_trade = Some(CoinbaseDirectTradeFields {
+                    trade_id,
+                    maker_order_id: maker_order_id.clone(),
+                    taker_order_id,
+                    maker_side,
+                    price,
+                    quantity,
+                });
                 ProviderOrderEventKind::Match {
-                    maker_order_id: parse_order_id(object, "maker_order_id")?,
-                    maker_side: parse_direct_side(required_text(object, "side")?)?,
-                    maker_price: normalize_direct_price(
-                        required_text(object, "price")?,
-                        self.terms,
-                    )?,
-                    quantity: normalize_direct_quantity(
-                        required_text(object, "size")?,
-                        self.terms,
-                    )?,
+                    maker_order_id,
+                    maker_side,
+                    maker_price: price,
+                    quantity,
                 }
             }
             "done" => {
@@ -1467,7 +1714,7 @@ impl CoinbaseDirectDecoder {
             .map(SequenceNumber::new)
             .ok_or(CoinbaseDirectDecodeError::Schema)?;
         let timestamp = parse_direct_timestamp(required_text(object, "time")?)?;
-        ProviderOrderEvent::try_new(
+        let event = ProviderOrderEvent::try_new(
             self.product.clone(),
             sequence,
             timestamp,
@@ -1475,8 +1722,25 @@ impl CoinbaseDirectDecoder {
             self.terms,
             DecoderEvidence::from_validated_frame(validated, self.decoder_rule.clone()),
         )
-        .map(CoinbaseDirectDecodeOutcome::Sequenced)
-        .map_err(|_| CoinbaseDirectDecodeError::FrameTooLarge)
+        .map_err(|_| CoinbaseDirectDecodeError::FrameTooLarge)?;
+        let native_trade = native_trade.map(|trade| {
+            CoinbaseDirectTradeEvidence::new(
+                trade.trade_id,
+                trade.maker_order_id,
+                trade.taker_order_id,
+                trade.maker_side,
+                trade.price,
+                trade.quantity,
+                sequence,
+                timestamp,
+            )
+        });
+        Ok(CoinbaseDirectDecodeOutcome::Sequenced(
+            CoinbaseDirectSequencedEvent {
+                event,
+                native_trade,
+            },
+        ))
     }
 
     fn decode_unsequenced(
@@ -1951,6 +2215,42 @@ impl CoinbaseDirectSnapshotDecoder {
         capture: &SegmentedHttpResponseCapture,
         owner: &mut DirectOrderBook,
     ) -> Result<(), CoinbaseDirectSnapshotError> {
+        self.decode_into_inner(capture, owner, None)
+            .map(|_coordinates| ())
+    }
+
+    pub(crate) fn decode_into_coordinates(
+        &self,
+        capture: &SegmentedHttpResponseCapture,
+        owner: &mut DirectOrderBook,
+    ) -> Result<CoinbaseDirectSnapshotCoordinates, CoinbaseDirectSnapshotError> {
+        self.decode_into_inner(capture, owner, None)
+    }
+
+    pub(crate) fn decode_into_order_level(
+        &self,
+        capture: &SegmentedHttpResponseCapture,
+        owner: &mut DirectOrderBook,
+        orders: &mut Vec<ProviderOrderRecord>,
+    ) -> Result<CoinbaseDirectSnapshotCoordinates, CoinbaseDirectSnapshotError> {
+        if !orders.is_empty() || orders.capacity() < self.limits.book().max_orders() {
+            owner.invalidate_generation();
+            orders.clear();
+            return Err(CoinbaseDirectSnapshotError::OrderLevelBuffer);
+        }
+        let outcome = self.decode_into_inner(capture, owner, Some(orders));
+        if outcome.is_err() {
+            orders.clear();
+        }
+        outcome
+    }
+
+    fn decode_into_inner(
+        &self,
+        capture: &SegmentedHttpResponseCapture,
+        owner: &mut DirectOrderBook,
+        orders: Option<&mut Vec<ProviderOrderRecord>>,
+    ) -> Result<CoinbaseDirectSnapshotCoordinates, CoinbaseDirectSnapshotError> {
         if owner.product() != &self.product {
             owner.invalidate_generation();
             return Err(CoinbaseDirectSnapshotError::WrongProduct);
@@ -1996,6 +2296,8 @@ impl CoinbaseDirectSnapshotDecoder {
             let decoded = SnapshotRowsSeed {
                 owner,
                 terms: self.terms,
+                orders,
+                max_orders: self.limits.book().max_orders(),
             }
             .deserialize(&mut deserializer);
             decoded.and_then(|count| {
@@ -2012,8 +2314,17 @@ impl CoinbaseDirectSnapshotDecoder {
         }
         owner.bind_snapshot_receipt(capture.receipt().clone())?;
         owner.finish_snapshot(timestamp)?;
-        Ok(())
+        Ok(CoinbaseDirectSnapshotCoordinates {
+            sequence: SequenceNumber::new(metadata.sequence),
+            timestamp,
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoinbaseDirectSnapshotCoordinates {
+    pub(crate) sequence: SequenceNumber,
+    pub(crate) timestamp: Timestamp,
 }
 
 #[derive(Deserialize)]
@@ -2073,6 +2384,8 @@ fn validate_snapshot_auction(
 struct SnapshotRowsSeed<'a> {
     owner: &'a mut DirectOrderBook,
     terms: InstrumentExecutionTerms,
+    orders: Option<&'a mut Vec<ProviderOrderRecord>>,
+    max_orders: usize,
 }
 
 impl<'de> DeserializeSeed<'de> for SnapshotRowsSeed<'_> {
@@ -2085,6 +2398,8 @@ impl<'de> DeserializeSeed<'de> for SnapshotRowsSeed<'_> {
         deserializer.deserialize_map(SnapshotRowsVisitor {
             owner: self.owner,
             terms: self.terms,
+            orders: self.orders,
+            max_orders: self.max_orders,
         })
     }
 }
@@ -2092,6 +2407,8 @@ impl<'de> DeserializeSeed<'de> for SnapshotRowsSeed<'_> {
 struct SnapshotRowsVisitor<'a> {
     owner: &'a mut DirectOrderBook,
     terms: InstrumentExecutionTerms,
+    orders: Option<&'a mut Vec<ProviderOrderRecord>>,
+    max_orders: usize,
 }
 
 impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
@@ -2101,7 +2418,7 @@ impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
         formatter.write_str("a Coinbase level-3 snapshot object")
     }
 
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    fn visit_map<A>(mut self, mut map: A) -> Result<Self::Value, A::Error>
     where
         A: MapAccess<'de>,
     {
@@ -2128,6 +2445,8 @@ impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
                             owner: &mut *self.owner,
                             side: ProviderBookSide::Bid,
                             terms: self.terms,
+                            orders: self.orders.as_deref_mut(),
+                            max_orders: self.max_orders,
                         })?)
                         .ok_or_else(|| A::Error::custom("snapshot order count overflow"))?;
                     seen_bids = true;
@@ -2138,6 +2457,8 @@ impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
                             owner: &mut *self.owner,
                             side: ProviderBookSide::Ask,
                             terms: self.terms,
+                            orders: self.orders.as_deref_mut(),
+                            max_orders: self.max_orders,
                         })?)
                         .ok_or_else(|| A::Error::custom("snapshot order count overflow"))?;
                     seen_asks = true;
@@ -2164,6 +2485,8 @@ struct SnapshotSideSeed<'a> {
     owner: &'a mut DirectOrderBook,
     side: ProviderBookSide,
     terms: InstrumentExecutionTerms,
+    orders: Option<&'a mut Vec<ProviderOrderRecord>>,
+    max_orders: usize,
 }
 
 impl<'de> DeserializeSeed<'de> for SnapshotSideSeed<'_> {
@@ -2177,6 +2500,8 @@ impl<'de> DeserializeSeed<'de> for SnapshotSideSeed<'_> {
             owner: self.owner,
             side: self.side,
             terms: self.terms,
+            orders: self.orders,
+            max_orders: self.max_orders,
         })
     }
 }
@@ -2185,6 +2510,8 @@ struct SnapshotSideVisitor<'a> {
     owner: &'a mut DirectOrderBook,
     side: ProviderBookSide,
     terms: InstrumentExecutionTerms,
+    orders: Option<&'a mut Vec<ProviderOrderRecord>>,
+    max_orders: usize,
 }
 
 impl<'de> Visitor<'de> for SnapshotSideVisitor<'_> {
@@ -2194,7 +2521,7 @@ impl<'de> Visitor<'de> for SnapshotSideVisitor<'_> {
         formatter.write_str("a sequence of Coinbase [price,size,order_id] rows")
     }
 
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    fn visit_seq<A>(mut self, mut sequence: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
     {
@@ -2206,11 +2533,16 @@ impl<'de> Visitor<'de> for SnapshotSideVisitor<'_> {
                 .map_err(|_| A::Error::custom("invalid snapshot price"))?;
             let quantity = normalize_direct_quantity(&quantity, self.terms)
                 .map_err(|_| A::Error::custom("invalid snapshot quantity"))?;
+            let order = ProviderOrderRecord::new(order_id, self.side, price, quantity, self.terms);
             self.owner
-                .try_push_snapshot_order(ProviderOrderRecord::new(
-                    order_id, self.side, price, quantity, self.terms,
-                ))
+                .try_push_snapshot_order(order.clone())
                 .map_err(A::Error::custom)?;
+            if let Some(orders) = self.orders.as_mut() {
+                if orders.len() == self.max_orders {
+                    return Err(A::Error::custom("snapshot order-level buffer exceeded"));
+                }
+                orders.push(order);
+            }
             count = count
                 .checked_add(1)
                 .ok_or_else(|| A::Error::custom("snapshot order count overflow"))?;
@@ -2265,6 +2597,9 @@ pub enum CoinbaseDirectSnapshotError {
     /// Auction indicative books are retained provider evidence, not execution authority.
     #[error("Coinbase Direct snapshot is in auction mode")]
     AuctionMode,
+    /// The pre-admitted order-level publication buffer was missing or inconsistent.
+    #[error("Coinbase Direct order-level snapshot buffer is invalid")]
+    OrderLevelBuffer,
     /// Instrument-owned lifecycle, sequence, map, count, byte, or invariant failure.
     #[error("Coinbase Direct snapshot owner rejected state: {0}")]
     Owner(#[from] DirectOrderBookError),
@@ -2643,7 +2978,7 @@ mod tests {
     ) -> TestResult<market_squawk_sources::ProviderOrderEvent> {
         let frame = frames.try_frame(TransportFrameKind::Text, Bytes::from_static(payload))?;
         match decoder.decode(&session.validate_live_frame(&frame)?)? {
-            CoinbaseDirectDecodeOutcome::Sequenced(event) => Ok(event),
+            CoinbaseDirectDecodeOutcome::Sequenced(event) => Ok(event.into_parts().0),
             CoinbaseDirectDecodeOutcome::NonBook(_) => {
                 Err("expected a sequenced direct event".into())
             }
@@ -2788,7 +3123,7 @@ mod tests {
             DirectBookLimits::try_new(4, 4, 2, received.wire_bytes() - 1, 2)?,
         )?;
         assert_eq!(
-            byte_bounded_owner.try_queue(received),
+            byte_bounded_owner.try_queue(received.into_parts().0),
             Err(market_squawk_sources::DirectOrderBookError::QueueBytesExceeded)
         );
         assert_eq!(byte_bounded_owner.phase(), DirectSyncPhase::Quarantined);

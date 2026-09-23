@@ -11,9 +11,6 @@ use url::Url;
 
 use crate::platform::{NativeTrustMode, PlatformError, SupportedTarget};
 
-pub(crate) const MAXIMUM_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-pub(crate) const MAXIMUM_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
-pub(crate) const MAXIMUM_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Maximum encoded byte length of one per-platform release manifest.
 pub const MAXIMUM_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAXIMUM_ARCHIVE_ENTRIES: usize = 32_768;
@@ -188,9 +185,6 @@ impl TargetRelease {
             expanded_bytes = expanded_bytes
                 .checked_add(component.size)
                 .ok_or(ManifestError::ExpandedSize)?;
-            if expanded_bytes > MAXIMUM_EXPANDED_BYTES {
-                return Err(ManifestError::ExpandedSize);
-            }
             previous_path = Some(&component.path);
         }
 
@@ -219,6 +213,25 @@ impl TargetRelease {
                 }
             }
         }
+        let update_roots = self
+            .components
+            .iter()
+            .filter(|component| component.role == ComponentRole::UpdateRoot)
+            .collect::<Vec<_>>();
+        if update_roots.len() > 1 {
+            return Err(ManifestError::ComponentSet);
+        }
+        if let Some(component) = update_roots.first()
+            && component.path.as_ref()
+                != ComponentRole::UpdateRoot
+                    .fixed_path(self.target)
+                    .ok_or(ManifestError::ComponentSet)?
+        {
+            return Err(ManifestError::RequiredRolePath {
+                role: ComponentRole::UpdateRoot,
+                expected: "share/market-squawk/update/1.root.json".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -233,7 +246,7 @@ pub(crate) struct ArtifactIdentity {
 
 impl ArtifactIdentity {
     fn validate(&self, tag: &str) -> Result<(), ManifestError> {
-        if self.size == 0 || self.size > MAXIMUM_ARCHIVE_BYTES || !is_lower_sha256(&self.sha256) {
+        if self.size == 0 || !is_lower_sha256(&self.sha256) {
             return Err(ManifestError::ArchiveIdentity);
         }
         let url = Url::parse(&self.url).map_err(|_| ManifestError::ArchiveUrl)?;
@@ -267,8 +280,7 @@ pub(crate) struct ComponentIdentity {
 impl ComponentIdentity {
     fn validate(&self) -> Result<(), ManifestError> {
         validate_portable_path(&self.path)?;
-        if self.size > MAXIMUM_ENTRY_BYTES
-            || (self.size == 0 && self.role.requires_executable())
+        if (self.size == 0 && self.role.requires_executable())
             || !is_lower_sha256(&self.sha256)
             || (self.role.requires_executable() && !self.executable)
         {
@@ -285,6 +297,8 @@ impl ComponentIdentity {
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentRole {
     Desktop,
+    Service,
+    McpRelay,
     Cli,
     CaptureHelper,
     OnnxWorker,
@@ -294,14 +308,18 @@ pub enum ComponentRole {
     Uv,
     PythonRuntime,
     PythonEnvironment,
+    UpdateChannel,
+    UpdateRoot,
     DesktopResource,
     License,
     Notice,
 }
 
 impl ComponentRole {
-    pub(crate) const REQUIRED: [Self; 10] = [
+    pub(crate) const REQUIRED: [Self; 13] = [
         Self::Desktop,
+        Self::Service,
+        Self::McpRelay,
         Self::Cli,
         Self::CaptureHelper,
         Self::OnnxWorker,
@@ -311,12 +329,15 @@ impl ComponentRole {
         Self::Uv,
         Self::PythonRuntime,
         Self::PythonEnvironment,
+        Self::UpdateChannel,
     ];
 
     pub(crate) const fn requires_executable(self) -> bool {
         matches!(
             self,
             Self::Desktop
+                | Self::Service
+                | Self::McpRelay
                 | Self::Cli
                 | Self::CaptureHelper
                 | Self::OnnxWorker
@@ -332,6 +353,8 @@ impl ComponentRole {
         let suffix = target.executable_suffix();
         match self {
             Self::Desktop => Some(format!("bin/market-squawk-desktop{suffix}")),
+            Self::Service => Some(format!("bin/market-squawk-service{suffix}")),
+            Self::McpRelay => Some(format!("bin/market-squawk-mcp-relay{suffix}")),
             Self::Cli => Some(format!("bin/market-squawk{suffix}")),
             Self::CaptureHelper => Some(format!("bin/market-squawk-capture-helper{suffix}")),
             Self::OnnxWorker => Some(format!("bin/market-squawk-onnx-worker{suffix}")),
@@ -356,6 +379,8 @@ impl ComponentRole {
                 }
                 .to_owned(),
             ),
+            Self::UpdateChannel => Some("share/market-squawk/update/channel.json".to_owned()),
+            Self::UpdateRoot => Some("share/market-squawk/update/1.root.json".to_owned()),
             Self::PythonEnvironment | Self::DesktopResource | Self::License | Self::Notice => None,
         }
     }
@@ -409,7 +434,7 @@ pub enum ManifestError {
         target: SupportedTarget,
     },
     /// Archive size or digest is invalid.
-    #[error("release archive identity is malformed or outside its fixed size bound")]
+    #[error("release archive identity is malformed")]
     ArchiveIdentity,
     /// Archive URL is not an uncredentialed HTTPS URL.
     #[error("release archive URL must be an uncredentialed HTTPS URL without a fragment")]
@@ -417,8 +442,8 @@ pub enum ManifestError {
     /// Components are empty, excessive, duplicated, or unsorted.
     #[error("release components must be nonempty, bounded, sorted, and portable-unique")]
     ComponentSet,
-    /// Expanded component sizes overflow or exceed the fixed bound.
-    #[error("release components exceed the fixed expanded-size bound")]
+    /// Expanded component sizes overflow.
+    #[error("release component sizes overflow")]
     ExpandedSize,
     /// A component path, size, digest, role, or executable contract is invalid.
     #[error("release component identity is invalid: {path}")]

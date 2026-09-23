@@ -41,6 +41,19 @@ pub enum AggressorSide {
     Unknown,
 }
 
+/// Provider-authored order type of the taker that caused an executed trade.
+///
+/// This is market-data evidence, not an execution instruction or proof that Market Squawk can
+/// submit the same order type to the venue.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeTakerOrderType {
+    /// The taker used a limit order.
+    Limit,
+    /// The taker used a market order.
+    Market,
+}
+
 /// Venue auction phase.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

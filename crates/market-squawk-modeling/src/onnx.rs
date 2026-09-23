@@ -38,6 +38,8 @@ pub use worker::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OnnxRuntimeEvidence {
     model_digest: [u8; 32],
+    forecast_policy_digest: Option<[u8; 32]>,
+    forecast_residuals_digest: Option<[u8; 32]>,
     policy_digest: [u8; 32],
     worker_runtime_semantics_digest: [u8; 32],
     warm_up_digest: [u8; 32],
@@ -49,6 +51,18 @@ impl OnnxRuntimeEvidence {
     #[must_use]
     pub const fn model_digest(self) -> [u8; 32] {
         self.model_digest
+    }
+
+    /// Returns the exact first-class interval-policy member digest for forecast bundles.
+    #[must_use]
+    pub const fn forecast_policy_digest(self) -> Option<[u8; 32]> {
+        self.forecast_policy_digest
+    }
+
+    /// Returns the exact first-class calibration-residual member digest for forecast bundles.
+    #[must_use]
+    pub const fn forecast_residuals_digest(self) -> Option<[u8; 32]> {
+        self.forecast_residuals_digest
     }
 
     /// Returns the exact graph-policy digest.
@@ -143,6 +157,14 @@ impl TractOnnxBackend {
         warm_up_digest.update(warm_up.to_bits().to_be_bytes());
         let evidence = OnnxRuntimeEvidence {
             model_digest: bundle.metadata().artifact_hash().bytes(),
+            forecast_policy_digest: bundle
+                .metadata()
+                .forecast_calibration()
+                .map(|value| value.policy_hash().bytes()),
+            forecast_residuals_digest: bundle
+                .metadata()
+                .forecast_calibration()
+                .map(|value| value.residuals_hash().bytes()),
             policy_digest: policy.policy_digest(),
             worker_runtime_semantics_digest,
             warm_up_digest: warm_up_digest.finalize().into(),

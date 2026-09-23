@@ -39,7 +39,10 @@ fn production_contract_is_exactly_allowlisted_typed_and_non_executable() -> Test
 
     let production = ProductionLiveSourceComposition::try_new(config, vec![route])?;
 
-    assert_eq!(production.endpoint(), "wss://ws-feed.exchange.coinbase.com");
+    assert_eq!(
+        production.endpoint(),
+        "wss://advanced-trade-ws.coinbase.com"
+    );
     assert_eq!(
         production.metadata().quality_ceiling(),
         DataQuality::DirectUnverified
@@ -79,11 +82,11 @@ fn controlled_local_paper_service_composes_without_network_access() -> TestResul
 
 fn app_config_with_overrides(overrides: ConfigOverrides) -> TestResult<AppConfig> {
     let json = r#"{
-      "endpoint":"wss://ws-feed.exchange.coinbase.com",
+      "endpoint":"wss://advanced-trade-ws.coinbase.com",
       "event_classes":["book_snapshot","book_delta","trade"],
       "depth":"price_level",
       "freshness_ms":5000,
-      "max_frame_bytes":1048576,
+      "max_frame_bytes":16777216,
       "subscription_ack_timeout_ms":5000,
       "control_message_capacity":64,
       "control_byte_capacity":65536,
@@ -92,8 +95,8 @@ fn app_config_with_overrides(overrides: ConfigOverrides) -> TestResult<AppConfig
         "provider":"coinbase-exchange",
         "basis":"user-reviewed-coinbase-public-interface",
         "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "evidence_reference":"https://docs.cdp.coinbase.com/exchange/websocket-feed/overview",
-        "evidence_version":"reviewed-2026-07-20",
+        "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+        "evidence_version":"reviewed-2026-08-08",
         "effective_from_unix_nanos":1700000000000000000,
         "effective_until_unix_nanos":1900000000000000000
       },

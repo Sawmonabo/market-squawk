@@ -1,351 +1,275 @@
 # Backup and recovery
 
-This runbook defines the current safe operator procedure for backing up and restoring a complete
-local Market Squawk data root without separating catalogs from their authority and artifact state.
+This runbook operates the installed service's complete product-backup, verification, retention,
+restore, workspace-switch, and program-rollback workflows. Use the Desktop's **Backup & Recovery**
+and **Settings** pages for the same service-owned procedures, or use the CLI commands below. Do
+not copy SQLite files, artifacts, journals, or control files by hand while the service is active.
 
 | Field | Value |
 | --- | --- |
 | Document type | Operations runbook |
-| Audience | Local operators, release engineers, and incident responders |
-| Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Audience | Local operators and incident responders |
+| Status | Current working-product procedure; not release approval evidence |
+| Last substantive review | 2026-08-03 |
 
-## Contents
+## Scope and safety boundary
 
-- [Scope](#scope)
-- [Consistency model](#consistency-model)
-- [Backup inventory](#backup-inventory)
-- [Create a cold whole-root backup](#create-a-cold-whole-root-backup)
-- [Restore to a fresh data root](#restore-to-a-fresh-data-root)
-- [Validate the restored system](#validate-the-restored-system)
-- [Failure-specific recovery](#failure-specific-recovery)
-- [Security and retention](#security-and-retention)
-- [Related documentation and code](#related-documentation-and-code)
-- [External sources](#external-sources)
+A product backup is a service-created, immutable recovery unit for the active workspace. It binds
+the catalog, datasets, controlled artifacts, journals, audit/recovery state, model/portfolio
+state, provider metadata, and workspace configuration that the service can safely restore together.
+The service records the backup's identity as a lowercase SHA-256 value and runs creation,
+verification, retention, restore, workspace switching, update activation, and rollback as durable
+jobs. A disconnected Desktop or CLI does not cancel an admitted job.
 
-## Scope
+The following boundaries are deliberate:
 
-The supported operator procedure at the reviewed commit is a **cold, whole-data-root backup**:
-gracefully stop every process that owns the root, copy the complete root as one archive, verify the
-archive digest, and restore into an empty destination. This preserves the SQLite catalog and
-sidecars, immutable artifacts, current-authority records, paper checkpoints, audits, and journals
-as one recovery unit.
+- A **restore** creates and validates a fresh fenced workspace from one verified backup. It never
+  overlays the active workspace or merges two backup generations.
+- A **program rollback** changes only the verified installed program generation. It is not a data
+  restore and cannot substitute for one.
+- Retention deletes only backups selected by an exact service preview. It never deletes raw
+  workspace files directly.
+- A preview is scoped to the requesting workspace/client, has a returned digest, and is one-use.
+  Re-query rather than reusing a stale preview after any change in jobs, disk, workspace, or
+  program state.
 
-This page does not describe a hot backup, a partial dataset export, a merge into a nonempty root, or
-manual catalog/artifact repair. The data crate implements a receipt-bound analytical backup and
-no-replace restore service, but that service is not exposed through the current CLI or MCP. It must
-not be represented as a runnable operator command.
+The examples assume the installed service is available. Installed-only Operations and Setup
+commands fail truthfully from an uninstalled/source-only execution rather than constructing a
+second recovery authority.
 
-Configuration files, OS-keyring entries, installed Python training releases, optional ONNX Runtime
-libraries, and original user-authorized input files can live outside the data root. Back them up or
-re-provision them under their own authority; copying the data root alone does not include them.
-
-## Consistency model
-
-The catalog is not an independent index that can be recreated safely from a directory scan. It
-contains current-generation, lineage, rights, run, and authority transitions bound to exact
-artifact identities. Conversely, copying only `catalog.sqlite3` omits immutable objects and
-control-plane authority needed to interpret it.
-
-```mermaid
-flowchart LR
-    Stop["Graceful stop and terminal reconciliation"]
-    Root["One closed data-root state"]
-    Archive["Private no-overwrite archive"]
-    Digest["Recorded SHA-256 digest"]
-    Fresh["Fresh restore destination"]
-    Doctor["Application-owned recovery and doctor"]
-
-    Stop --> Root --> Archive --> Digest --> Fresh --> Doctor
+```bash
+MSQ="/path/to/installed/market-squawk"
+"$MSQ" --output json doctor
+"$MSQ" --output json operations backup list --limit 64
 ```
 
-A valid recovery unit contains every existing entry under the configured root, including:
+Success for the preflight is an exit status of `0`, a healthy or explicitly actionable `doctor`
+result, and a bounded backup inventory. Preserve stderr separately from JSON output. A `doctor`
+result is diagnostic evidence, not a proof that a new backup has completed.
 
-```text
-<data-root>/
-├── catalog.sqlite3
-├── catalog.sqlite3-wal            when present
-├── catalog.sqlite3-shm            when present
-├── journal/
-├── artifacts/
-├── control/
-└── authority/                     when a production live source has created it
+## Create and verify a product backup
+
+### Prerequisites and authority checks
+
+Before creating a backup, confirm that the active workspace is the intended one, free storage is
+available, no restore/workspace-switch/update boundary is in progress, and any paper operation is
+stopped or has an explicitly healthy recoverable status. If an active job is incompatible, leave
+it to complete, cancel it through `Job.Cancel` where allowed, or follow its owning recovery path.
+Do not kill the service or remove a lock to make a backup start.
+
+The Desktop displays these readiness facts and the returned job. For CLI operation, inspect jobs
+after submission:
+
+```bash
+"$MSQ" --output json operations backup create --confirm
+# Record the returned jobId and the resulting backupId when the job completes.
+"$MSQ" --output json job get <JOB_ID>
+"$MSQ" --output json job watch <JOB_ID> --after-sequence 0
 ```
 
-Optional directories may be absent on a new installation. Lock files and recovery manifests are
-service-owned state and remain part of the archive; file existence alone does not prove a lock is
-currently held.
+`operations backup create --confirm` admits one durable job; it is not completion evidence.
+Success requires its terminal `Completed` state and a returned backup manifest/`backupId`. If the
+job is `AwaitingConfirmation`, use the explicit job-confirmation receipt supplied by the service;
+if it is `Interrupted`, use `job get` and the documented retry/recovery state rather than starting
+an uncoordinated duplicate.
 
-## Backup inventory
+Verify the exact retained backup before treating it as a recovery point:
 
-Before creating the archive, record these recovery dependencies without recording secret values:
+```bash
+"$MSQ" --output json operations backup verify <BACKUP_ID> --confirm
+"$MSQ" --output json job watch <VERIFY_JOB_ID> --after-sequence 0
+"$MSQ" --output json operations backup get <BACKUP_ID>
+```
 
-| Item | Include or record |
+The verification job must complete and the final manifest must still identify the same
+`backupId`, workspace/generation, content evidence, and verification state. Failure, cancellation,
+or a changed/missing manifest means the backup is not an accepted recovery point. Preserve the
+job/manifest evidence, free capacity or resolve the named authority failure, and create a new
+backup; never edit a manifest or attempt to repair its files manually.
+
+## Inspect and retain recovery points
+
+Use inventory and exact reads rather than directory scans:
+
+```bash
+"$MSQ" --output json operations backup list --limit 64
+"$MSQ" --output json operations backup get <BACKUP_ID>
+```
+
+Record the backup ID, creating/completing job IDs, source workspace identity/generation, manifest
+digest, verification outcome, host/program version, and any separately required secret or
+provider re-provisioning evidence. Backup contents do not expose secret bytes; moving to another
+OS account may still require provider setup through its write-only credential lifecycle.
+
+To change retention, preview the exact consequence first:
+
+```bash
+"$MSQ" --output json operations backup retention preview --keep-latest 3
+```
+
+Review the returned `previewId`, `previewDigest`, retained IDs, removal IDs, and blockers. Use a
+count from `1` through `128`; do not apply retention if the preview removes the only tested
+recovery point or a point required by an incident investigation. If the preview is correct, start
+the preview-bound job exactly once:
+
+```bash
+"$MSQ" --output json operations backup retention apply \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+"$MSQ" --output json job watch <RETENTION_JOB_ID> --after-sequence 0
+```
+
+Successful retention has a completed job and a new inventory matching the approved kept/removed
+sets. A stale preview, missing backup, capacity failure, or an interrupted job is a fail-closed
+result: refresh inventory, preserve the original evidence, and obtain a new preview after the
+underlying condition is resolved.
+
+## Restore one backup safely
+
+### Prerequisites
+
+Restore is destructive only to the **new target workspace it creates**; it does not overwrite the
+current workspace. It is nevertheless authority-sensitive because it changes the active workspace
+after a service-owned fence and forces clients to resynchronize. Before proceeding, stop or
+reconcile paper work, allow incompatible durable jobs to finish/cancel, retain the incident
+evidence that selected the backup, and ensure the service reports sufficient destination disk.
+
+### Procedure
+
+1. List and inspect the exact verified backup.
+
+   ```bash
+   "$MSQ" --output json operations backup get <BACKUP_ID>
+   ```
+
+2. Ask the service for a restore preview. It checks the backup, schema compatibility, available
+   disk, current workspace fence, and blockers; it does not begin extraction.
+
+   ```bash
+   "$MSQ" --output json operations backup restore preview <BACKUP_ID>
+   ```
+
+3. Review the returned `previewId`, `previewDigest`, selected backup, active generation, disk
+   evidence, schema result, and every blocker. Resolve a blocker through its owner; do not bypass
+   it by stopping files or changing a destination path outside the service.
+
+4. Start only the returned preview after explicit confirmation.
+
+   ```bash
+   "$MSQ" --output json operations backup restore start \
+     --preview-id <PREVIEW_UUID> \
+     --preview-digest <LOWERCASE_SHA256> \
+     --confirm
+   "$MSQ" --output json job watch <RESTORE_JOB_ID> --after-sequence 0
+   ```
+
+5. Reconnect every Desktop, CLI, Claude Code, and Codex client after the service reports the new
+   workspace generation. Re-run `doctor`, `operations workspace list --limit 64`, and bounded
+   domain reads appropriate to the restored evidence (for example, portfolio holdings or model
+   metadata). Do not reuse pre-restore client handles, job IDs, or mutation previews.
+
+Restore success requires a terminal completed job, the service-reported post-restore generation and
+health evidence, and successful bounded reads from the newly restored workspace. A plausible
+directory tree is not success evidence.
+
+If preview or execution fails, the operation remains fail-closed: preserve the original active
+workspace, retain the failed job/preflight evidence, and use the returned recovery state. The
+service either keeps the active state or reports recovery required; never combine catalog and
+artifact trees from separate backups to manufacture a result.
+
+## Switch workspaces and reconnect clients
+
+One signed-in user has one active workspace service authority. To select an already known
+workspace, list then preview the switch:
+
+```bash
+"$MSQ" --output json operations workspace list --limit 64
+"$MSQ" --output json operations workspace switch preview <WORKSPACE_UUID>
+```
+
+The preview reports the current/target identity, draining and reconciliation blockers, audit
+evidence, and required client resynchronization. Start it only with the returned one-use preview:
+
+```bash
+"$MSQ" --output json operations workspace switch start \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+"$MSQ" --output json job watch <SWITCH_JOB_ID> --after-sequence 0
+```
+
+Success is a completed job plus the new workspace/generation reported by the service; reconnect
+all clients and repeat their safe bootstrap/health handshake. A desktop window or MCP relay that
+still carries the old generation must refresh rather than retry a mutation. Workspace conflicts,
+active paper operations, active jobs, or a stale preview must be resolved and freshly previewed.
+
+## Program updates and program rollback
+
+This is a program lifecycle procedure, not data recovery. It is available only when the installed
+release has trusted update material; source/development execution or a package built without
+production signing material reports that truthfully and must not be presented as an update failure.
+
+```bash
+"$MSQ" --output json operations update status
+"$MSQ" --output json operations update check --confirm
+"$MSQ" --output json operations update preview
+```
+
+`check` explicitly authorizes metadata contact and stages only an admitted immutable candidate.
+Review availability, current/known-good generation, recovery state, selected candidate, component
+identity, disk/schema compatibility, and active-work blockers in the preview. Then start the exact
+preview and watch its durable job:
+
+```bash
+"$MSQ" --output json operations update start \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+"$MSQ" --output json job watch <UPDATE_JOB_ID> --after-sequence 0
+```
+
+After a completed update, restart/reconnect clients, run `doctor`, and retain the reported program
+generation and health receipt. If activation fails, use the service's recorded recovery outcome;
+do not replace individual sidecars, Python components, or manifests.
+
+To return to a known-good **program** generation, first preview, then start the returned
+preview-bound rollback:
+
+```bash
+"$MSQ" --output json operations update program-rollback preview
+"$MSQ" --output json operations update program-rollback start \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+```
+
+The preview must show a verified known-good target and no active-work blocker. A completed rollback
+and fresh `doctor` result are success evidence. If the data itself is wrong, stop here and use the
+restore procedure; program rollback does not revert data generations.
+
+## Failure modes and evidence preservation
+
+| Failure | Safe action and recovery boundary |
 | --- | --- |
-| Data root | Canonical absolute path and complete directory contents |
-| Application | Market Squawk version, Git commit when locally built, and `Cargo.lock` identity |
-| Configuration | Exact operator-selected TOML file and non-secret environment/CLI overrides |
-| Secret locators | Backend and opaque reference only; the resolved secret remains in its secret store |
-| OS keyring | Ensure the operating-system account/keyring backup policy covers required entries |
-| Python training release | Exact separately installed release root and manifest/signature evidence |
-| Optional ONNX Runtime | Exact admitted library, policy, notice, and admission evidence if used |
-| User source records | Original filings, exports, manifests, and licensed/user-owned data outside the root |
-| Backup archive | Creation time, source root, byte size, and SHA-256 digest |
+| Backup/verification job is failed, cancelled, or interrupted | Preserve its job ID, phase, error, and returned artifact/manifest identity; resolve the named storage/authority condition and create or retry only through the job authority. |
+| Restore preview reports disk, schema, or active-work blocker | Do not start it. Free capacity outside the workspace, drain/reconcile the named work, or select a compatible backup, then request a new preview. |
+| Preview digest is rejected | It expired, was consumed, or no longer matches current facts. Start again at the relevant preview command. |
+| Client reports stale generation after restore/switch/update | Reconnect and re-bootstrap the client; never replay a mutation or handle created under the former generation. |
+| Recovery reports required | Stop new mutation, preserve logs/jobs/manifests, and follow the owning service's exact recovery state. Do not manipulate internal paths. |
+| Update source/trust is unavailable | Treat it as unavailable package evidence, not permission to use an unverified download or component-level replacement. |
 
-Use a destination on storage independent from the active data root. The destination must have
-enough free space for the complete root plus archive metadata.
+## Local locations and related references
 
-## Create a cold whole-root backup
+All internal backup, restore, workspace, update, and job paths are service-owned under the selected
+workspace/control and artifact roots. The product intentionally returns opaque IDs, manifests,
+receipts, and controlled artifacts instead of writable filesystem coordinates. Use the interface
+above to inspect or recover them.
 
-### 1. Quiesce all owners
-
-1. Stop foreground capture and `bot start` sessions through their normal Ctrl-C or duration path.
-2. Stop local MCP clients and allow `market-squawk mcp serve` to complete bounded shutdown.
-3. Confirm any paper run reports a complete terminal shutdown and reconciliation.
-4. Stop any other Market Squawk process using the same data root.
-5. Do not begin the archive while a source, ingestion, query-publication, model-admission, backtest,
-   portfolio-import, fair-value, or paper mutation is active.
-
-If a process did not shut down cleanly, preserve the root unchanged and resolve its typed recovery
-state before designating the copy as a known-clean backup.
-
-### 2. Create a private no-overwrite archive
-
-Set canonical absolute paths. `BACKUP_PARENT` must already exist on independent private storage;
-`BACKUP_DIR` must be new and must not be inside `DATA_ROOT`. The fresh directory makes the archive,
-digest, and retained metadata a single no-overwrite recovery point:
-
-```bash
-(
-  set -eu
-  umask 077
-
-  DATA_ROOT="/absolute/path/to/.market-squawk"
-  BACKUP_PARENT="/independent/private/storage"
-  BACKUP_DIR="$BACKUP_PARENT/market-squawk-2026-07-23"
-  BACKUP_ARCHIVE="$BACKUP_DIR/data-root.tar"
-
-  test -d "$DATA_ROOT"
-  test -d "$BACKUP_PARENT"
-  test ! -e "$BACKUP_DIR"
-  case "$BACKUP_DIR" in "$DATA_ROOT"|"$DATA_ROOT"/*) exit 1 ;; esac
-
-  mkdir -m 0700 "$BACKUP_DIR"
-  tar -C "$(dirname "$DATA_ROOT")" \
-    -cpf "$BACKUP_ARCHIVE" \
-    "$(basename "$DATA_ROOT")"
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$BACKUP_ARCHIVE" > "$BACKUP_DIR/data-root.tar.sha256"
-    shasum -a 256 -c "$BACKUP_DIR/data-root.tar.sha256"
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$BACKUP_ARCHIVE" > "$BACKUP_DIR/data-root.tar.sha256"
-    sha256sum -c "$BACKUP_DIR/data-root.tar.sha256"
-  else
-    exit 1
-  fi
-)
-```
-
-The subshell must exit successfully. A failed `test`, `mkdir`, `tar`, digest write, or digest check
-stops the procedure. Never reuse the failed `BACKUP_DIR`; inspect it, remove it only after confirming
-that it contains no accepted recovery point, and repeat with another new directory after a clean
-shutdown. An archive created while the source root changed is not a supported recovery point.
-
-### 3. Record and verify the archive digest
-
-The macOS commands above create and verify the digest inside the fresh recovery-point directory.
-To verify it again later:
-
-```bash
-BACKUP_DIR="/independent/private/storage/market-squawk-2026-07-23"
-shasum -a 256 -c "$BACKUP_DIR/data-root.tar.sha256"
-```
-
-On systems that provide GNU Coreutils, use `sha256sum` for both creation and verification inside the
-same fresh directory. Protect the entire recovery-point directory from replacement. A digest
-detects changed bytes; it does not prove that the source was quiescent or that an untrusted archive
-is safe to extract.
-
-### 4. Retain success evidence
-
-Record:
-
-- successful terminal shutdown evidence;
-- canonical source-root identity;
-- archive and digest paths;
-- archive byte size and SHA-256;
-- creation timestamp and host/platform; and
-- identities of the separately backed-up configuration, keyring policy, training release, and
-  optional native runtime.
-
-## Restore to a fresh data root
-
-Never overlay or merge a backup into an active or previously initialized data root. Restore into a
-new empty parent, validate it, then explicitly point configuration at that restored root.
-
-### 1. Verify before extraction
-
-```bash
-(
-  set -eu
-
-  BACKUP_DIR="/independent/private/storage/market-squawk-2026-07-23"
-  BACKUP_ARCHIVE="$BACKUP_DIR/data-root.tar"
-  BACKUP_DIGEST="$BACKUP_DIR/data-root.tar.sha256"
-
-  test -f "$BACKUP_ARCHIVE"
-  test -f "$BACKUP_DIGEST"
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 -c "$BACKUP_DIGEST"
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -c "$BACKUP_DIGEST"
-  else
-    exit 1
-  fi
-
-  # First prove the complete archive table is readable, then display a bounded preview.
-  tar -tf "$BACKUP_ARCHIVE" >/dev/null
-  tar -tf "$BACKUP_ARCHIVE" | sed -n '1,200p'
-)
-```
-
-The subshell must exit successfully. Confirm the preview begins with the one expected top-level
-data-root directory. For an archive received from another trust boundary, the 200-entry preview is
-not a complete path audit: inspect every archive entry and link target with trusted platform archive
-tooling, and reject any absolute path, parent (`..`) component, extra top-level root, or escaping
-link before extraction. Proceed only after both digest verification and the applicable name audit
-succeed.
-
-### 2. Extract into an empty private parent
-
-```bash
-(
-  set -eu
-  umask 077
-
-  BACKUP_ARCHIVE="/independent/private/storage/market-squawk-2026-07-23/data-root.tar"
-  RESTORE_PARENT="/absolute/path/to/fresh-restore-parent"
-
-  test -f "$BACKUP_ARCHIVE"
-  test ! -e "$RESTORE_PARENT"
-  mkdir -m 0700 "$RESTORE_PARENT"
-  tar -C "$RESTORE_PARENT" -xpf "$BACKUP_ARCHIVE"
-)
-```
-
-The parent of `RESTORE_PARENT` must already exist. Plain `mkdir` and fail-fast execution make an
-occupied restore path a hard failure; extraction never overlays an existing directory. Set
-`RESTORED_DATA_ROOT` to the extracted top-level directory. Preserve ownership and permissions; do
-not resolve a startup failure by making the root broadly writable.
-
-### 3. Re-establish external dependencies
-
-- restore the exact non-secret configuration or reconstruct it explicitly;
-- ensure opaque secret locators resolve in the current operating-system account's keyring;
-- restore the exact verified training release before durable model admissions are opened;
-- restore and re-admit an optional ONNX Runtime only when its library and evidence tuple match; and
-- make any operator-owned source inputs required for future ingestion available under new explicit
-  input capabilities.
-
-When moving to another machine, a keyring locator may survive in configuration while its secret
-does not. Re-provision through the supported source setup/activation path; do not copy resolved
-credential bytes into configuration.
-
-## Validate the restored system
-
-Point only the validation process at the restored root:
-
-```bash
-RESTORED_DATA_ROOT="/absolute/path/to/fresh-restore-parent/.market-squawk"
-RESTORED_CONFIG="/absolute/path/to/restored-market-squawk.toml"
-RESTORED_TRAINING_RELEASE_ROOT="/absolute/path/to/restored-python-release"
-
-"$RESTORED_TRAINING_RELEASE_ROOT/bin/market-squawk" \
-  --config "$RESTORED_CONFIG" \
-  --data-dir "$RESTORED_DATA_ROOT" \
-  --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
-  config validate
-"$RESTORED_TRAINING_RELEASE_ROOT/bin/market-squawk" \
-  --config "$RESTORED_CONFIG" \
-  --data-dir "$RESTORED_DATA_ROOT" \
-  --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
-  doctor
-"$RESTORED_TRAINING_RELEASE_ROOT/bin/market-squawk" \
-  --config "$RESTORED_CONFIG" \
-  --data-dir "$RESTORED_DATA_ROOT" \
-  --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
-  dataset list
-```
-
-If the restored root has no durable model admission, omit `--training-release-root` and use the
-normal installed application. Otherwise the option must name the exact separately restored release,
-and every validation command must run that release's signed `bin/market-squawk`. Use the same
-explicit `--config`, `--data-dir`, and applicable release coordinates for every domain command
-below.
-
-Then validate the domains actually present in the backup:
-
-- `source status`, `source coverage`, and `source health` for restored providers;
-- `dataset manifest <DATASET>` and bounded dataset queries for current generations;
-- `model list` and `model metadata <MODEL>` for admitted bundles;
-- `portfolio holdings --account <ACCOUNT>` for imported accounts;
-- `backtest show <RUN>` for governed experiments;
-- `fair-value list` and evidence reads for measurements; and
-- a paper start only after checkpoint recovery, provider state, disk capacity, and operator intent
-  are independently acceptable.
-
-Validation is successful only when the application opens the exact authorities and returns bounded
-typed results. A directory that merely contains plausible files is not a validated restore.
-
-## Failure-specific recovery
-
-| Failure | Immediate action | Supported recovery boundary |
-| --- | --- | --- |
-| Source disconnect, gap, stale data, or checksum failure | Keep the affected generation non-executable | Reconnect with a newer generation, obtain required snapshot/checksum evidence, and requalify |
-| Interrupted immutable publication | Keep the prior manifest generation current | Let the owning service reconcile exact staged/object/catalog evidence; do not promote files manually |
-| Authority-state peer mismatch | Stop mutation of that authority | Reopen through the owning service, which selects the highest verified peer or reports recovery required |
-| Paper unclean-run or checkpoint mismatch | Keep paper execution stopped | Reconcile exact audit, configuration, and checkpoint evidence; publish a clean terminal checkpoint |
-| Portfolio publication mismatch | Keep the affected account revision unavailable | Restore the exact artifact/publication pair or re-import the original immutable manifest |
-| Model admission mismatch | Produce no inference output | Restore the exact bundle, training release, runtime admission, and signatures; re-admit explicitly if identity changed |
-| Catalog or artifact corruption | Preserve the root and stop all mutation | Restore the complete known-good root into a fresh location; never splice a catalog and artifact tree from different recovery points |
-| Missing keyring entry | Keep provider activation unavailable | Re-provision the secret through supported setup and bind a new validated locator/evidence revision |
-| Disk full | Stop new publication and capture | Free capacity outside the root, preserve existing identities, then retry the owning service's exact recovery |
-
-The lower-level analytical backup service creates receipt-bound catalog and artifact bundles and
-supports fresh or exact-subset no-replace restore. Until a public product operation composes that
-service, whole-root cold backup is the operator-facing recovery procedure.
-
-## Security and retention
-
-- Store archives with owner-only permissions and storage encryption appropriate for the underlying
-  filings, portfolios, audit records, and licensed/user-owned data.
-- Keep backups outside the active artifact root so ingest, compaction, and artifact inventories
-  never discover them as product objects.
-- Retain at least two verified recovery points on independent storage before deleting the oldest
-  known-good archive.
-- Test restores into fresh roots; do not test by overlaying production state.
-- Apply the source data's retention and licensing terms to backups as well as active storage.
-- Deleting an active artifact or audit is not backup rotation. Rotate only complete external
-  archives after a successful newer restore test.
-
-## Related documentation and code
-
-- [Local deployment](../architecture/deployment.md)
-- [Research data plane](../architecture/research-data-plane.md)
-- [Configuration and secrets](configuration-and-secrets.md)
-- [Datasets and query](datasets-and-query.md)
-- [Portfolio and paper execution](portfolio-and-paper-execution.md)
-- [Troubleshooting](troubleshooting.md)
-- [Local path capabilities](../../crates/market-squawk-platform/src/paths.rs)
-- [Analytical backup service](../../crates/market-squawk-data/src/analytical_backup.rs)
-- [Catalog backup implementation](../../crates/market-squawk-data/src/catalog/backup.rs)
-- [Paper checkpoint repository](../../adapters/market-squawk-adapter-paper/src/checkpoint_repository.rs)
-
-## External sources
-
-| Source | Operational relevance | Reviewed |
-| --- | --- | --- |
-| [SQLite Online Backup API](https://sqlite.org/backup.html) | Defines SQLite's consistent live-snapshot mechanism used by Market Squawk's lower-level analytical backup service | 2026-07-23 |
-| [SQLite write-ahead logging](https://sqlite.org/wal.html) | Explains why the live catalog and its WAL/SHM state cannot be treated as unrelated files | 2026-07-23 |
-| [SQLite How To Corrupt](https://sqlite.org/howtocorrupt.html) | Documents copy/overwrite and locking patterns that can damage a database | 2026-07-23 |
+Related pages: [configuration and secrets](configuration-and-secrets.md),
+[troubleshooting](troubleshooting.md), [CLI reference](../reference/cli.md),
+[MCP reference](../reference/mcp.md), [deployment architecture](../architecture/deployment.md),
+and [the delivery ledger](../plans/delivery-ledger.md). The code authorities are
+[`operations.rs`](../../apps/market-squawk/src/application/operations.rs),
+[`backup.rs`](../../apps/market-squawk/src/application/backup.rs), and the installed
+[`operations`](../../apps/market-squawk/src/local_product/operations/) composition.

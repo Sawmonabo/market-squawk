@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use atomicwrites::{AllowOverwrite, AtomicFile, DisallowOverwrite, OverwriteBehavior};
+#[cfg(windows)]
+use directories::BaseDirs;
 use fs2::FileExt as _;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -205,6 +207,14 @@ pub(crate) struct InstallStore {
 }
 
 impl InstallStore {
+    pub(crate) fn program_root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn installation_data_root(&self) -> Result<&Path, StoreError> {
+        self.root.parent().ok_or(StoreError::UnsafeRoot)
+    }
+
     pub(crate) fn open_or_create(root: &Path) -> Result<Self, StoreError> {
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         fs::create_dir_all(parent)
@@ -991,6 +1001,39 @@ pub(crate) fn validate_store_parent(path: &Path) -> Result<(), StoreError> {
         validate_unix_ancestor_chain(&resolved, false)?;
     }
     #[cfg(windows)]
+    validate_windows_ancestor_chain(path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_ancestor_chain(path: &Path) -> Result<(), StoreError> {
+    let resolved_path = fs::canonicalize(path)
+        .map_err(|source| StoreError::io("resolve installation ancestors", source))?;
+    let local_app_data =
+        BaseDirs::new().and_then(|directories| fs::canonicalize(directories.data_local_dir()).ok());
+
+    if let Some(local_app_data) = local_app_data
+        && resolved_path.starts_with(&local_app_data)
+    {
+        // Reject redirects in the caller's spelling of the path before relying on the resolved
+        // known-folder boundary. FOLDERID_LocalAppData itself is the per-user Windows boundary;
+        // its ordinary inherited ACL is not an application-owned exclusive ACL.
+        for ancestor in path.ancestors() {
+            open_windows_parent(ancestor)?;
+        }
+
+        for (depth, ancestor) in resolved_path.ancestors().enumerate() {
+            if ancestor == local_app_data {
+                open_windows_parent(ancestor)?;
+                return Ok(());
+            }
+            verify_exclusive_windows_parent(ancestor, depth == 0)?;
+        }
+        return Err(StoreError::UnsafeRoot);
+    }
+
+    // Custom roots outside the operating-system known-folder boundary retain the original strict
+    // validation through the volume root.
     for (depth, ancestor) in path.ancestors().enumerate() {
         verify_exclusive_windows_parent(ancestor, depth == 0)?;
     }
@@ -1156,8 +1199,6 @@ fn verify_exclusive_windows_parent(
     path: &Path,
     require_creation_control: bool,
 ) -> Result<(), StoreError> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-
     use win_security_identifier::{
         GetCurrentSid as _, SecurityIdentifier,
         well_known::{BUILTIN_ADMINISTRATORS, LOCAL_SYSTEM},
@@ -1167,27 +1208,10 @@ fn verify_exclusive_windows_parent(
         wrappers::GetSecurityInfo,
     };
 
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
     const TRUSTED_INSTALLER_SID: &str =
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .access_mode(AccessRights::ReadControl.bits())
-        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let parent = options
-        .open(path)
-        .map_err(|source| StoreError::io("open installation parent authority", source))?;
-    let metadata = parent
-        .metadata()
-        .map_err(|source| StoreError::io("inspect installation parent handle", source))?;
-    if !metadata.is_dir() || is_directory_redirect(&metadata) {
-        return Err(StoreError::UnsafeRoot);
-    }
+    let parent = open_windows_parent(path)?;
 
     let current_user = SecurityIdentifier::get_current_user_sid()
         .map_err(|_| StoreError::UnsafeRoot)?
@@ -1241,6 +1265,34 @@ fn verify_exclusive_windows_parent(
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_parent(path: &Path) -> Result<File, StoreError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_permissions::constants::AccessRights;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(AccessRights::ReadControl.bits())
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let parent = options
+        .open(path)
+        .map_err(|source| StoreError::io("open installation parent authority", source))?;
+    let metadata = parent
+        .metadata()
+        .map_err(|source| StoreError::io("inspect installation parent handle", source))?;
+    if !metadata.is_dir() || is_directory_redirect(&metadata) {
+        return Err(StoreError::UnsafeRoot);
+    }
+    Ok(parent)
 }
 
 #[cfg(windows)]

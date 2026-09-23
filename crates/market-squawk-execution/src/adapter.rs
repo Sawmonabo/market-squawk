@@ -25,7 +25,7 @@ use thiserror::Error;
 use crate::dispatcher::PersistenceFinalization;
 use crate::{
     ExecutionMarketReference, ExecutionPriceBound, OrderIntent, OrderIntentDigest,
-    RiskPolicyIdentity,
+    OrderTargetReference, RiskPolicyIdentity,
 };
 
 /// Object-safe boxed future returned by execution adapters.
@@ -78,6 +78,11 @@ impl DispatchOrder {
     /// Returns the contributing model, when present.
     pub const fn model_id(&self) -> Option<ModelId> {
         self.intent.model_id()
+    }
+
+    /// Returns exact target/decision provenance when the order was target-derived.
+    pub const fn target_reference(&self) -> Option<&OrderTargetReference> {
+        self.intent.target_reference()
     }
 
     /// Returns the risk-coordinated account.
@@ -289,6 +294,7 @@ impl RecoveredDispatchOrder {
         account_id: AccountId,
         instrument_id: market_squawk_domain::InstrumentId,
         intent_digest: OrderIntentDigest,
+        target_reference_digest: Option<[u8; 32]>,
         account_revision: u64,
         requested_quantity: QuantityLots,
         execution_price_bound: ExecutionPriceBound,
@@ -316,6 +322,7 @@ impl RecoveredDispatchOrder {
             || assessment_digest == [0; 32]
             || evidence_binding_digest == [0; 32]
             || portfolio_content_digest == [0; 32]
+            || target_reference_digest.is_some_and(|digest| digest == [0; 32])
             || valid_until < market_observed_at
             || recovered_at < market_observed_at
         {
@@ -335,6 +342,7 @@ impl RecoveredDispatchOrder {
                 approval_id,
                 order_id,
                 intent_digest,
+                target_reference_digest,
                 strategy_id,
                 model_id,
                 account_id,

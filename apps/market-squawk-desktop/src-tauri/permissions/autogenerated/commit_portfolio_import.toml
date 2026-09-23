@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-commit-portfolio-import"
+description = "Enables the commit_portfolio_import command without any pre-configured scope."
+commands.allow = ["commit_portfolio_import"]
+
+[[permission]]
+identifier = "deny-commit-portfolio-import"
+description = "Denies the commit_portfolio_import command without any pre-configured scope."
+commands.deny = ["commit_portfolio_import"]

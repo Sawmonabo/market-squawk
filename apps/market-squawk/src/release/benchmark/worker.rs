@@ -260,12 +260,6 @@ fn effective_config_hash(config: &AppConfig) -> String {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/release-benchmark-effective-config/v1");
     hash.update(format!("{config:?}").as_bytes());
-    if let Some(reference) = config.source_secret() {
-        hash.update([1]);
-        hash.update(reference.expose_reference().as_bytes());
-    } else {
-        hash.update([0]);
-    }
     hex_digest(hash.finalize().into())
 }
 

@@ -133,6 +133,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                 Some(source_identifier("BUY")?),
                 rule("coinbase-aggressor")?,
             ),
+            taker_order_type: None,
         },
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;
@@ -194,6 +195,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                         Some(source_identifier("BUY")?),
                         rule("coinbase-aggressor")?,
                     ),
+                    taker_order_type: None,
                 },
             )?)
         };
@@ -259,27 +261,23 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         coverage.metadata_revision().as_source_identifier().as_str(),
         "revision-a"
     );
+    let current_evidence = current_observation
+        .evidence()
+        .transport_frame()
+        .ok_or("current fixture lost transport-frame evidence")?;
+    assert_eq!(current_evidence.frame_id(), current_frame.frame_id());
     assert_eq!(
-        current_observation.frame_evidence().frame_id(),
-        current_frame.frame_id()
-    );
-    assert_eq!(
-        current_observation.frame_evidence().received_at(),
+        current_evidence.received_at(),
         current_frame.received_at()
     );
-    assert_eq!(
-        current_observation.frame_evidence().payload_digest(),
-        current_payload_digest
-    );
+    assert_eq!(current_evidence.payload_digest(), current_payload_digest);
     assert!(
-        current_observation
-            .frame_evidence()
+        current_evidence
             .binding()
             .shares_allocation_with(current_frame.binding())
     );
     assert_eq!(
-        current_observation
-            .frame_evidence()
+        current_evidence
             .decoder_rule()
             .provider_rule()
             .as_str(),

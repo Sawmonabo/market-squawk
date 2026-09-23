@@ -63,7 +63,7 @@ pub enum ObservedRevisionError {
     /// Checked byte or allocation arithmetic overflowed.
     #[error("observed revision byte accounting overflowed")]
     ByteCountOverflow,
-    /// A canonical PIT-v1 family or payload cannot be encoded exactly.
+    /// A canonical PIT-v2 family or payload cannot be encoded exactly.
     #[error("observed revision canonical encoding failed")]
     CanonicalEncoding,
     /// A fallible bounded allocation could not be reserved.
@@ -184,7 +184,7 @@ mod tests {
         )?;
 
         let mut exact_family = b"MSQPIT".to_vec();
-        exact_family.extend_from_slice(&1_u16.to_le_bytes());
+        exact_family.extend_from_slice(&2_u16.to_le_bytes());
         exact_family.extend_from_slice(&24_u64.to_le_bytes());
         exact_family.extend_from_slice(b"market-squawk/pit/family");
         exact_family.push(3);
@@ -204,9 +204,9 @@ mod tests {
         assert_eq!(
             family.identity().bytes(),
             [
-                0x3f, 0x05, 0x1c, 0x37, 0x3d, 0x3f, 0x62, 0x50, 0x07, 0x4e, 0xab, 0x6c, 0xa0, 0x7f,
-                0x36, 0xa9, 0x66, 0x91, 0x30, 0x7f, 0x45, 0xc6, 0x82, 0xed, 0x0a, 0x99, 0xa8, 0x60,
-                0xf5, 0x1d, 0x38, 0x1a,
+                0xdb, 0x77, 0xf6, 0xda, 0x1a, 0xe1, 0xd5, 0x3b, 0xc9, 0x08, 0x15, 0xe3, 0x74, 0xac,
+                0x42, 0xb9, 0x3d, 0x1b, 0x3e, 0xec, 0xc9, 0x0b, 0x89, 0x05, 0x36, 0x2d, 0x65, 0xbd,
+                0x39, 0x49, 0xaf, 0x08,
             ]
         );
 

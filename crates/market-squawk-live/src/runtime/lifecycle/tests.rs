@@ -4,6 +4,8 @@ mod fixture;
 use std::collections::HashMap;
 use std::future::pending;
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -17,9 +19,94 @@ use super::{
 use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
 use crate::runtime::actor::{ActorCompletion, ActorError, ActorStartFailure, ShardActorInput, run};
 use crate::snapshot::create_snapshot_plane;
-use crate::{ShardId, ShardLifecycleSnapshot, ShardRoutingVersion, SnapshotReadError};
+use crate::{
+    ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
+    LiveActionHook, LiveActionHookActivationError, LiveActionHookError, RouteActionHook, ShardId,
+    ShardLifecycleSnapshot, ShardRoutingVersion, SnapshotReadError,
+};
 
-use fixture::{DropSignal, TestResult, config, route, runtime_shell};
+use fixture::{DropSignal, TestResult, config, route, route_for, runtime_shell};
+
+#[derive(Debug)]
+struct DropCountedHook {
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for DropCountedHook {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl LiveActionHook for DropCountedHook {
+    fn on_committed(
+        &mut self,
+        _context: CommittedActionContext<'_>,
+        _authority: &mut CurrentAuthorityGate<'_>,
+    ) -> ActionHookDisposition {
+        ActionHookDisposition::NoAction
+    }
+
+    fn retained_bytes(&self) -> Result<usize, LiveActionHookError> {
+        Ok(std::mem::size_of::<Self>() + 128)
+    }
+
+    fn maximum_authority_issues(&self) -> ActionAuthorityIssueLimit {
+        ActionAuthorityIssueLimit::MIN
+    }
+}
+
+#[tokio::test]
+async fn dynamic_two_route_group_enables_once_then_disables_and_reaps_exactly() -> TestResult {
+    let config = config(2, 4, Duration::from_secs(1))?;
+    let first = route()?;
+    let second = route_for("018f0000-0000-7000-8000-000000000002", "kraken", "XBT/USD")?;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hooks = vec![
+        RouteActionHook::try_new(
+            first.route().clone(),
+            Box::new(DropCountedHook {
+                drops: Arc::clone(&drops),
+            }),
+            Vec::new(),
+        )?,
+        RouteActionHook::try_new(
+            second.route().clone(),
+            Box::new(DropCountedHook {
+                drops: Arc::clone(&drops),
+            }),
+            Vec::new(),
+        )?,
+    ];
+    let mut runtime = LiveRuntime::start(config, vec![first, second]).await?;
+    let prepared = runtime
+        .prepare_action_hooks(hooks, CancellationToken::new())
+        .await?;
+    let activation = prepared.activation_for_test();
+    let generation = prepared.generation();
+    let incarnation = prepared.runtime_incarnation();
+
+    assert!(!activation.is_active());
+    let active = prepared.activate()?;
+    assert_eq!(active.generation(), generation);
+    assert!(activation.is_active());
+    let disabled = active.disable();
+    assert_eq!(disabled.runtime_incarnation(), incarnation);
+    assert!(!activation.is_active());
+
+    let receipt = runtime.reap_action_hooks(CancellationToken::new()).await?;
+    assert_eq!(receipt.runtime_incarnation(), incarnation);
+    assert_eq!(receipt.generation(), generation);
+    assert_eq!(receipt.removed_hooks(), 2);
+    assert_eq!(drops.load(Ordering::Acquire), 2);
+    assert!(matches!(
+        activation.validate_prepared(incarnation, generation),
+        Err(LiveActionHookActivationError::Retired)
+    ));
+    drop(disabled);
+    assert!(runtime.shutdown().await.is_complete());
+    Ok(())
+}
 
 #[tokio::test]
 async fn complete_startup_publishes_every_ready_shard_before_runtime_escape() -> TestResult {
@@ -131,7 +218,9 @@ async fn partial_startup_cleanup_invalidates_closes_aborts_and_awaits_every_task
         NonZeroU64::new(70).ok_or("zero incarnation")?,
         &[Vec::new()],
     )?;
-    let snapshots = create_snapshot_plane(initial, 1)?.reader;
+    let snapshot_bundle = create_snapshot_plane(initial, 1)?;
+    let snapshots = snapshot_bundle.reader.clone();
+    assert!(snapshots.try_load(shard).is_ok());
 
     cleanup_failed_startup(&mut owner, &cancellation, &mut actors, &snapshots).await;
 
@@ -143,6 +232,7 @@ async fn partial_startup_cleanup_invalidates_closes_aborts_and_awaits_every_task
         snapshots.try_load(ShardId::new(0, 1)?).err(),
         Some(SnapshotReadError::Closed)
     );
+    drop(snapshot_bundle.publishers);
     Ok(())
 }
 
@@ -173,6 +263,7 @@ async fn graceful_shutdown_invalidates_before_controlled_drain_then_joins_withou
     let harness = runtime_shell(config, 80, owner, cancellation, actors, task_shards)?;
     let runtime_lease = harness.runtime_lease.clone();
     let reader = harness.reader.clone();
+    assert!(reader.try_load(shard).is_ok());
     let shutdown = harness.runtime.shutdown();
     tokio::pin!(shutdown);
 
@@ -303,7 +394,7 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
         routes: Vec::new(),
         action_hooks: Vec::new(),
         qualified_market_exports: Vec::new(),
-        maximum_action_hook_bytes_per_route: config.maximum_action_hook_bytes_per_route().get(),
+        maximum_action_hook_bytes_per_route: config.maximum_action_hook_bytes_per_route(),
         maximum_sources_per_route: 1,
         maximum_streams_per_route: 1,
         feature_capacity: config.feature_capacity(),
@@ -312,7 +403,7 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
             config.maximum_message_bytes().get(),
         ),
         mailbox: mpsc::channel(1).1,
-        registrations: mpsc::channel(1).1,
+        controls: mpsc::channel(1).1,
         snapshot_limits: config.snapshot_limits(),
         snapshot_interval: config.snapshot_interval(),
         snapshot_event_trigger: config.snapshot_event_trigger().get(),
@@ -335,12 +426,8 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
     assert!(runtime_lease.validate().is_err());
     runtime_owner.invalidate();
     assert_eq!(
-        plane
-            .reader
-            .try_load(ShardId::new(0, 1)?)?
-            .snapshot()
-            .lifecycle(),
-        ShardLifecycleSnapshot::Ready
+        plane.reader.try_load(ShardId::new(0, 1)?).err(),
+        Some(SnapshotReadError::Closed)
     );
     Ok(())
 }

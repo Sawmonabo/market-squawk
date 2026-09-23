@@ -4,6 +4,8 @@
 
 #[path = "../backtest_vertical.rs"]
 mod backtest_vertical;
+#[path = "../decision_persistence.rs"]
+mod decision_persistence;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../journal_path_integration.rs"]
@@ -20,7 +22,7 @@ mod research_vertical;
 
 #[cfg(test)]
 mod product_doctor {
-    use std::{collections::BTreeMap, ffi::OsString};
+    use std::collections::BTreeMap;
 
     use market_squawk::doctor;
     use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
@@ -28,14 +30,9 @@ mod product_doctor {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[tokio::test]
-    async fn reports_provenance_without_mutating_or_exposing_secret_locators() -> TestResult {
-        const SECRET_REFERENCE: &str = "keyring:doctor-secret-locator";
-
+    async fn reports_provenance_without_mutating_storage() -> TestResult {
         let temporary = tempfile::tempdir()?;
-        let environment = BTreeMap::from([(
-            OsString::from("MARKET_SQUAWK_SOURCE_SECRET"),
-            OsString::from(SECRET_REFERENCE),
-        )]);
+        let environment = BTreeMap::new();
         let config = AppConfig::load(ConfigSources::new(
             None,
             &environment,
@@ -52,14 +49,6 @@ mod product_doctor {
         assert_eq!(report["status"], "blocked");
         assert_eq!(report["configuration"]["sourceShutdownMs"]["value"], 60_000);
         assert_eq!(report["configuration"]["sourceShutdownMs"]["origin"], "cli");
-        assert_eq!(
-            report["configuration"]["sourceSecretConfigured"]["value"],
-            true
-        );
-        assert_eq!(
-            report["configuration"]["sourceSecretConfigured"]["origin"],
-            "environment"
-        );
         assert_eq!(entries_before, entries_after);
         assert_eq!(report["localStorage"]["modifiedByInspection"], false);
         assert_eq!(report["localStorage"]["layout"]["state"], "unavailable");
@@ -79,7 +68,6 @@ mod product_doctor {
                 .as_array()
                 .is_some_and(|blockers| !blockers.is_empty())
         );
-        assert!(!serde_json::to_string(&report)?.contains(SECRET_REFERENCE));
         Ok(())
     }
 }

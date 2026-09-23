@@ -285,7 +285,7 @@ pub(super) fn build_comparison_result(
     )
 }
 
-fn bounded_result(
+pub(super) fn bounded_result(
     values: &[Value],
     available: usize,
     source_coverage: Value,

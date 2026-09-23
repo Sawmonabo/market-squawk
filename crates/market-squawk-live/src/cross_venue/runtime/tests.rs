@@ -148,7 +148,7 @@ fn capacity(command_count: usize) -> TestResult<LiveFeatureCapacity> {
         maximum_cross_venue_instruments: nonzero(4)?,
         maximum_venues_per_cross_venue_instrument: nonzero(2)?,
         maximum_feature_snapshot_bytes: NonZeroU32::new(65_536).ok_or("zero bytes")?,
-        maximum_action_hook_bytes_per_route: nonzero(65_536)?,
+        maximum_action_hook_bytes_per_route: 65_536,
     })
 }
 

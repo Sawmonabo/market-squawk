@@ -9,8 +9,7 @@ cross-cutting semantics, trust, deployment, quality, and accepted decisions.
 | Document type | Architecture index |
 | Audience | Operators, maintainers, integrators, reviewers, and contributors |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-11 |
 
 ## Reading path
 
@@ -41,10 +40,11 @@ implementation, not release-status journals or operator runbooks.
 | [Building blocks](building-blocks.md) | Which crate or adapter owns each responsibility, dependency, and authority boundary? |
 | [Live execution plane](live-execution-plane.md) | How do current provider frames become qualified instrument state and risk-evaluated paper actions? |
 | [Research data plane](research-data-plane.md) | How do source objects become immutable, queryable, point-in-time analytical generations? |
-| [Local control plane](control-plane.md) | How do desktop, CLI, and stdio MCP share typed application services, lifecycle, audit, and local capabilities? |
+| [Market-data provider architecture](market-data-provider-architecture.md) | Which selected providers supply each capability; how are raw/canonical/derived data published; when may a workflow become available; and which gaps remain? |
+| [Local control plane](control-plane.md) | How do Desktop, CLI, and named-client MCP relays use one authenticated per-user service, durable jobs, lifecycle, audit, and local capabilities? |
 | [Data, time, and provenance](data-time-and-provenance.md) | How are identity, knowledge time, source precision, revisions, and lineage preserved? |
 | [Security and trust boundaries](security-and-trust-boundaries.md) | Where do requests, bytes, credentials, evidence, and financial authority change trust level? |
-| [Local deployment](deployment.md) | Which processes, endpoints, directories, startup stages, and recovery surfaces exist on one host? |
+| [Local deployment](deployment.md) | Which per-user service, clients, loopback endpoints, directories, startup stages, and recovery surfaces exist on one host? |
 | [Quality attributes](quality-attributes.md) | Which measurable integrity, resource, recovery, privacy, and performance scenarios define acceptance? |
 | [Architecture decisions](decisions/README.md) | Which significant structural choices are accepted, and what trade-offs do they carry? |
 
@@ -59,16 +59,23 @@ implementation, not release-status journals or operator runbooks.
   point-in-time aware.
 - Strategies and models emit intents; central risk owns approval; the dispatcher owns the sole
   adapter submission boundary.
+- One per-user installed service owns the active workspace, product authorities, durable jobs, and
+  authenticated loopback application/MCP transports. Desktop, CLI, Claude Code, and Codex are
+  clients, not competing product owners.
 - Desktop, CLI, and MCP invoke the same typed application operations, while dedicated presentation
   and producer workflows retain their narrower local capabilities.
 - Current authority is process-local, generation-bound, deadline-bound, revocable, and not
   recreated by archived evidence.
+- Package construction, native signing, artifact publication, and clean-machine installation are
+  separate evidence obligations; implementation architecture alone does not prove them.
 
 ## Other documentation domains
 
 - [Operations](../operations/README.md) provides current runnable procedures and recovery steps.
 - [Reference](../reference/README.md) specifies commands, configuration, MCP, source coverage,
   quality, and temporal contracts.
+- [Canonical market-data schemas](../reference/market-data-canonical-schemas.md) define the shared
+  provider-independent evidence, storage, PIT, analytical-binding, and typed-read contract.
 - [Delivery ledger](../plans/delivery-ledger.md) owns mutable implementation and release-blocker
   state.
 - [Historical architecture audits](../audits/architecture/) preserve superseded evidence and are

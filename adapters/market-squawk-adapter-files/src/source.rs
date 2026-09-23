@@ -10,11 +10,12 @@ use market_squawk_domain::{
     AlternativeDataObservation, AvailabilityEvidence as DomainAvailabilityEvidence, DataQuality,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, PayloadReference,
     ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
-    ResearchTime, RevisionNumber, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
+    ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceIdentifier, Timestamp,
+    UniverseMembershipObservation, VersionPinnedSourceLocator,
 };
 use market_squawk_platform::{
-    BoundedInput, ControlledInputFileError, InputReadCheckpoint, InputReadControl,
-    InputReadControlError, UserAuthorizedInputRoot,
+    BoundedInput, ControlledImportInputRoot, ControlledInputFileError, InputReadCheckpoint,
+    InputReadControl, InputReadControlError, UserAuthorizedInputRoot,
 };
 use market_squawk_sources::{
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
@@ -22,7 +23,6 @@ use market_squawk_sources::{
     ExtractionRequest, ExtractionSource, ExtractionSourceError, NetworkAccessPolicy, SourceClass,
     SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
 };
-use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -31,9 +31,9 @@ use crate::clock::{ExtractionClock, RequestDeadline, SystemExtractionClock};
 use crate::contracts::{
     ExtractionLimits, FileAdapterError, ParseBudget, ParsedRow, ParserLimit, SourceRowLimit,
 };
-use crate::manifest::{FileFormat, FileObjectSpec, FileSourceManifest, MANIFEST_SCHEMA_VERSION};
+use crate::manifest::{FileObjectSpec, FileSourceManifest};
+use crate::parse::{parse_decimal_lexeme, parse_rows};
 use crate::representation::FileRepresentationAuthority;
-use crate::{csv, database, excel, json, ofx, parquet, xml};
 
 const MAX_CONCURRENT_BLOCKING_OPERATIONS: usize = 4;
 const MAX_CONCURRENT_DEADLINE_SAMPLES: usize = 4;
@@ -62,15 +62,42 @@ impl InputReadControl for FileInputReadControl<'_> {
     }
 }
 
-/// A manifest-bound extraction source over one user-authorized local root.
+/// A manifest-bound extraction source over one retained local input root.
 #[derive(Clone)]
 pub struct FileExtractionSource {
     metadata: Arc<SourceMetadata>,
-    root: UserAuthorizedInputRoot,
+    root: FileInputRoot,
     manifest: Arc<FileSourceManifest>,
     limits: ExtractionLimits,
     representation: Arc<FileRepresentationAuthority>,
     clock: Arc<dyn ExtractionClock>,
+}
+
+#[derive(Clone)]
+enum FileInputRoot {
+    UserAuthorized(UserAuthorizedInputRoot),
+    ControlledImport(ControlledImportInputRoot),
+}
+
+impl FileInputRoot {
+    fn resolve(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<market_squawk_platform::InputFileCapability, market_squawk_platform::InputFileError>
+    {
+        match self {
+            Self::UserAuthorized(root) => root.resolve(relative),
+            Self::ControlledImport(root) => root.resolve(relative),
+        }
+    }
+
+    fn ensure_disjoint_root(&self, candidate: &Path) -> Result<(), FileAdapterError> {
+        match self {
+            Self::UserAuthorized(root) => root.ensure_disjoint_root(candidate),
+            Self::ControlledImport(root) => root.ensure_disjoint_root(candidate),
+        }
+        .map_err(|_| FileAdapterError::RepresentationAuthorityScope)
+    }
 }
 
 impl fmt::Debug for FileExtractionSource {
@@ -78,7 +105,7 @@ impl fmt::Debug for FileExtractionSource {
         formatter
             .debug_struct("FileExtractionSource")
             .field("metadata", &self.metadata)
-            .field("root", &"[USER-AUTHORIZED INPUT ROOT]")
+            .field("root", &"[RETAINED LOCAL INPUT ROOT]")
             .field("objects", &self.manifest.objects.len())
             .field("limits", &self.limits)
             .field("representation", &"[DURABLE EXACT-OBJECT AUTHORITY]")
@@ -136,6 +163,75 @@ impl FileExtractionSource {
         limits: ExtractionLimits,
         clock: Arc<dyn ExtractionClock>,
     ) -> Result<Self, FileAdapterError> {
+        Self::try_new_with_input_root(
+            metadata,
+            FileInputRoot::UserAuthorized(root),
+            representation_state_root.as_ref(),
+            manifest_input,
+            limits,
+            clock,
+        )
+    }
+
+    /// Constructs an immutable source over a committed controlled-import directory.
+    ///
+    /// The input root must originate beneath the retained artifact repository through
+    /// [`market_squawk_platform::ArtifactRoot::open_controlled_import_root`]. This constructor does
+    /// not claim original user-root ownership; imported ownership/admission evidence remains a
+    /// separate durable data-layer decision.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same metadata, manifest, row-policy, exact-object, disjoint-state, and durable
+    /// representation validation as [`Self::try_new`].
+    pub fn try_new_controlled_import(
+        metadata: SourceMetadata,
+        root: ControlledImportInputRoot,
+        representation_state_root: impl AsRef<Path>,
+        manifest_input: BoundedInput,
+        limits: ExtractionLimits,
+    ) -> Result<Self, FileAdapterError> {
+        Self::try_new_controlled_import_with_clock(
+            metadata,
+            root,
+            representation_state_root,
+            manifest_input,
+            limits,
+            Arc::new(SystemExtractionClock),
+        )
+    }
+
+    /// Constructs a controlled-import source with an explicitly injected paired clock.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same validation as [`Self::try_new_controlled_import`].
+    pub fn try_new_controlled_import_with_clock(
+        metadata: SourceMetadata,
+        root: ControlledImportInputRoot,
+        representation_state_root: impl AsRef<Path>,
+        manifest_input: BoundedInput,
+        limits: ExtractionLimits,
+        clock: Arc<dyn ExtractionClock>,
+    ) -> Result<Self, FileAdapterError> {
+        Self::try_new_with_input_root(
+            metadata,
+            FileInputRoot::ControlledImport(root),
+            representation_state_root.as_ref(),
+            manifest_input,
+            limits,
+            clock,
+        )
+    }
+
+    fn try_new_with_input_root(
+        metadata: SourceMetadata,
+        root: FileInputRoot,
+        representation_state_root: &Path,
+        manifest_input: BoundedInput,
+        limits: ExtractionLimits,
+        clock: Arc<dyn ExtractionClock>,
+    ) -> Result<Self, FileAdapterError> {
         if metadata.source_class() != SourceClass::LocalFile
             || !matches!(metadata.network_policy(), NetworkAccessPolicy::Denied)
             || !metadata.capabilities().extraction()
@@ -153,8 +249,8 @@ impl FileExtractionSource {
         let manifest_digest = manifest_input.digest();
         let manifest = FileSourceManifest::parse(manifest_input.as_bytes(), limits)?;
         manifest.validate()?;
+        root.ensure_disjoint_root(representation_state_root)?;
         let representation = FileRepresentationAuthority::try_open(
-            &root,
             representation_state_root,
             metadata.source_id(),
             metadata.revision(),
@@ -530,45 +626,8 @@ impl FileExtractionSource {
             deadline,
             row_limit,
         );
-        let rows = match &specification.format {
-            FileFormat::Csv { delimiter, .. } => csv::parse(bytes, *delimiter, &mut budget),
-            FileFormat::Tsv { .. } => csv::parse(bytes, b'\t', &mut budget),
-            FileFormat::Json { .. } => json::parse_json(bytes, &mut budget),
-            FileFormat::Ndjson { .. } => json::parse_ndjson(bytes, &mut budget),
-            FileFormat::Xml { record_element, .. } => {
-                xml::parse(bytes, record_element, &mut budget)
-            }
-            FileFormat::Excel { formula_policy } => {
-                excel::parse(bytes, *formula_policy, &mut budget)
-            }
-            FileFormat::Parquet { .. } => parquet::parse(bytes, &mut budget),
-            FileFormat::Sqlite {
-                table,
-                columns,
-                order_by,
-            } => database::parse(bytes, table, columns, order_by, &mut budget),
-            FileFormat::Ofx {
-                account_id,
-                currency,
-            }
-            | FileFormat::Qfx {
-                account_id,
-                currency,
-            } => ofx::parse(bytes, account_id, currency, &mut budget),
-        }?;
-        let mut identities = BTreeSet::new();
-        for row in &rows {
-            let identity = row
-                .fields
-                .get(&specification.row_policy.identity_field)
-                .ok_or(FileAdapterError::InvalidRecord)?
-                .as_text()?;
-            if identities.contains(identity) {
-                return Err(FileAdapterError::DuplicateField);
-            }
-            budget.set_entry::<&str>()?;
-            let _ = identities.insert(identity);
-        }
+        let rows = parse_rows(&specification.format, bytes, &mut budget)?;
+        validate_mapped_rows(specification, &rows, &mut budget)?;
         Ok(rows)
     }
 
@@ -583,13 +642,16 @@ impl FileExtractionSource {
     ) -> Result<ExtractionBatch, FileAdapterError> {
         let (received_at, ingested_at) = operation_times;
         let record_availability = request.object().availability().clone();
-        let domain_availability = domain_availability(&record_availability);
+        let object_domain_availability = domain_availability(&record_availability);
         let maximum_records = usize::try_from(request.max_records())
             .map_err(|_| FileAdapterError::LimitExceeded(ParserLimit::Records))?
             .min(self.limits.input.max_records);
         let expected = rows
             .len()
             .checked_mul(specification.row_policy.fields.len())
+            .and_then(|records| {
+                records.checked_add(usize::from(specification.universe_membership.is_some()))
+            })
             .ok_or(FileAdapterError::LimitExceeded(ParserLimit::Records))?;
         if expected > maximum_records {
             return Err(FileAdapterError::ExtractionContract(
@@ -600,6 +662,74 @@ impl FileExtractionSource {
         }
         let mut batch = ExtractionBatchAccumulator::try_new(request)
             .map_err(FileAdapterError::ExtractionContract)?;
+        if let Some(membership) = &specification.universe_membership {
+            let instrument_id = specification
+                .instrument_binding
+                .instrument_id()
+                .ok_or(FileAdapterError::InvalidManifest)?;
+            let interval = EffectiveInterval::new(membership.starts_at, membership.ends_at)
+                .map_err(|_| FileAdapterError::InvalidManifest)?;
+            let source_record = membership_reference(specification)?;
+            let context = ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: self.metadata.source_id().clone(),
+                    instrument_id: Some(instrument_id),
+                    venue_id: None,
+                    source_identifier: source_record,
+                    source_timestamp: None,
+                    received_at,
+                    ingested_at,
+                    quality: self.metadata.quality_ceiling(),
+                    payload_reference: PayloadReference::SourceReference(
+                        specification.object_id.clone(),
+                    ),
+                    availability: object_domain_availability.clone(),
+                })
+                .map_err(|_| FileAdapterError::Contract)?,
+                ResearchTime::try_new_with_coordinates(
+                    ResearchTemporalCoordinate::exact(membership.starts_at),
+                    specification
+                        .published_at
+                        .map(ResearchTemporalCoordinate::exact),
+                    RevisionNumber::new(specification.revision_number)
+                        .map_err(|_| FileAdapterError::InvalidManifest)?,
+                    specification
+                        .superseded_at
+                        .map(ResearchTemporalCoordinate::exact),
+                )
+                .map_err(|_| FileAdapterError::Contract)?,
+            )
+            .map_err(|_| FileAdapterError::Contract)?;
+            let observation = ResearchObservation::UniverseMembership(
+                UniverseMembershipObservation::new(context, membership.universe.clone(), interval)
+                    .map_err(|_| FileAdapterError::Contract)?,
+            );
+            let payload =
+                serde_json::to_vec(&observation).map_err(|_| FileAdapterError::Contract)?;
+            let evidence =
+                EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
+            batch
+                .push(
+                    ExtractionRecord::try_new_with_time(
+                        request,
+                        SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
+                            .map_err(|_| FileAdapterError::Contract)?,
+                        ExactPayloadEvidence::from_content_digest(evidence),
+                        ResearchTemporalCoordinate::exact(membership.starts_at),
+                        specification
+                            .published_at
+                            .map(ResearchTemporalCoordinate::exact),
+                        record_availability.clone(),
+                        specification.revision.clone(),
+                        specification
+                            .superseded_at
+                            .map(ResearchTemporalCoordinate::exact),
+                        Bytes::from(payload),
+                    )
+                    .map_err(FileAdapterError::ExtractionContract)?,
+                )
+                .map_err(FileAdapterError::ExtractionContract)?;
+        }
         for row in rows {
             self.check_control(cancellation, deadline)?;
             let row_id = row
@@ -610,10 +740,16 @@ impl FileExtractionSource {
             let source_row =
                 SourceIdentifier::try_from(row_id).map_err(|_| FileAdapterError::InvalidRecord)?;
             let payload_reference = row_reference(specification, &row)?;
+            let row_time = resolve_row_time(
+                specification,
+                &row,
+                &record_availability,
+                &payload_reference,
+            )?;
+            if received_at > ingested_at {
+                return Err(FileAdapterError::ClockFailure);
+            }
             for mapping in &specification.row_policy.fields {
-                if received_at > ingested_at {
-                    return Err(FileAdapterError::ClockFailure);
-                }
                 let text = row
                     .fields
                     .get(&mapping.source)
@@ -636,17 +772,10 @@ impl FileExtractionSource {
                         payload_reference: PayloadReference::SourceReference(
                             payload_reference.clone(),
                         ),
-                        availability: domain_availability.clone(),
+                        availability: row_time.domain_availability.clone(),
                     })
                     .map_err(|_| FileAdapterError::Contract)?,
-                    ResearchTime::try_new_with_coordinates(
-                        specification.record_time.effective.clone(),
-                        specification.record_time.published.clone(),
-                        RevisionNumber::new(specification.revision_number)
-                            .map_err(|_| FileAdapterError::InvalidManifest)?,
-                        specification.record_time.superseded.clone(),
-                    )
-                    .map_err(|_| FileAdapterError::Contract)?,
+                    row_time.research_time.clone(),
                 )
                 .map_err(|_| FileAdapterError::Contract)?;
                 let observation =
@@ -668,11 +797,11 @@ impl FileExtractionSource {
                             SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
                                 .map_err(|_| FileAdapterError::Contract)?,
                             ExactPayloadEvidence::from_content_digest(evidence),
-                            specification.record_time.effective.clone(),
-                            specification.record_time.published.clone(),
-                            record_availability.clone(),
-                            specification.revision.clone(),
-                            specification.record_time.superseded.clone(),
+                            row_time.research_time.effective().clone(),
+                            row_time.research_time.published().cloned(),
+                            row_time.availability.clone(),
+                            row_time.revision.clone(),
+                            row_time.research_time.superseded().cloned(),
                             Bytes::from(payload),
                         )
                         .map_err(FileAdapterError::ExtractionContract)?,
@@ -716,6 +845,159 @@ impl FileExtractionSource {
         }
         deadline.trusted_timestamp(self.clock.as_ref())
     }
+}
+
+struct ResolvedRowTime {
+    research_time: ResearchTime,
+    availability: AvailabilityEvidence,
+    domain_availability: DomainAvailabilityEvidence,
+    revision: SourceIdentifier,
+}
+
+pub(crate) fn validate_mapped_rows(
+    specification: &FileObjectSpec,
+    rows: &[ParsedRow],
+    budget: &mut ParseBudget<'_>,
+) -> Result<(), FileAdapterError> {
+    let mut identities = BTreeSet::new();
+    let fallback_availability = AvailabilityEvidence::Unknown;
+    for row in rows {
+        let identity = row
+            .fields
+            .get(&specification.row_policy.identity_field)
+            .ok_or(FileAdapterError::InvalidRecord)?
+            .as_text()?;
+        SourceIdentifier::try_from(identity).map_err(|_| FileAdapterError::InvalidRecord)?;
+        if identities.contains(identity) {
+            return Err(FileAdapterError::DuplicateField);
+        }
+        budget.set_entry::<&str>()?;
+        let _ = identities.insert(identity);
+        let row_evidence = row_reference(specification, row)?;
+        let _ = resolve_row_time(specification, row, &fallback_availability, &row_evidence)?;
+        for mapping in &specification.row_policy.fields {
+            let text = row
+                .fields
+                .get(&mapping.source)
+                .ok_or(FileAdapterError::InvalidRecord)?
+                .as_text()?;
+            let value = parse_decimal_lexeme(text)?;
+            if value.scale() != mapping.decimal_scale {
+                return Err(FileAdapterError::DecimalScaleMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_row_time(
+    specification: &FileObjectSpec,
+    row: &ParsedRow,
+    object_availability: &AvailabilityEvidence,
+    row_evidence: &SourceIdentifier,
+) -> Result<ResolvedRowTime, FileAdapterError> {
+    let Some(fields) = specification.row_time.as_ref() else {
+        let availability = object_availability.clone();
+        return Ok(ResolvedRowTime {
+            research_time: ResearchTime::try_new_with_coordinates(
+                specification.record_time.effective.clone(),
+                specification.record_time.published.clone(),
+                RevisionNumber::new(specification.revision_number)
+                    .map_err(|_| FileAdapterError::InvalidManifest)?,
+                specification.record_time.superseded.clone(),
+            )
+            .map_err(|_| FileAdapterError::InvalidManifest)?,
+            domain_availability: domain_availability(&availability),
+            availability,
+            revision: specification.revision.clone(),
+        });
+    };
+    let effective = fields.effective_field.as_deref().map_or_else(
+        || Ok(specification.record_time.effective.clone()),
+        |field| mapped_timestamp(row, field).map(ResearchTemporalCoordinate::exact),
+    )?;
+    let published = fields.published_field.as_deref().map_or_else(
+        || Ok(specification.record_time.published.clone()),
+        |field| {
+            mapped_timestamp(row, field)
+                .map(ResearchTemporalCoordinate::exact)
+                .map(Some)
+        },
+    )?;
+    let superseded = fields.superseded_field.as_deref().map_or_else(
+        || Ok(specification.record_time.superseded.clone()),
+        |field| {
+            mapped_timestamp(row, field)
+                .map(ResearchTemporalCoordinate::exact)
+                .map(Some)
+        },
+    )?;
+    let revision_number = fields.revision_number_field.as_deref().map_or_else(
+        || {
+            RevisionNumber::new(specification.revision_number)
+                .map_err(|_| FileAdapterError::InvalidManifest)
+        },
+        |field| parse_revision_number(mapped_text(row, field)?),
+    )?;
+    let revision = fields.revision_field.as_deref().map_or_else(
+        || Ok(specification.revision.clone()),
+        |field| {
+            SourceIdentifier::try_from(mapped_text(row, field)?)
+                .map_err(|_| FileAdapterError::InvalidRecord)
+        },
+    )?;
+    let availability = if let Some(field) = fields.available_field.as_deref() {
+        AvailabilityEvidence::Observed {
+            available_at: mapped_timestamp(row, field)?,
+            evidence: row_evidence.clone(),
+        }
+    } else {
+        object_availability.clone()
+    };
+    let research_time =
+        ResearchTime::try_new_with_coordinates(effective, published, revision_number, superseded)
+            .map_err(|_| FileAdapterError::InvalidRecord)?;
+    Ok(ResolvedRowTime {
+        research_time,
+        domain_availability: domain_availability(&availability),
+        availability,
+        revision,
+    })
+}
+
+fn mapped_text<'a>(row: &'a ParsedRow, field: &str) -> Result<&'a str, FileAdapterError> {
+    row.fields
+        .get(field)
+        .ok_or(FileAdapterError::InvalidRecord)?
+        .as_text()
+}
+
+fn mapped_timestamp(row: &ParsedRow, field: &str) -> Result<Timestamp, FileAdapterError> {
+    parse_unix_nanos(mapped_text(row, field)?)
+}
+
+fn parse_unix_nanos(value: &str) -> Result<Timestamp, FileAdapterError> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty()
+        || value.starts_with('+')
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(FileAdapterError::InvalidRecord);
+    }
+    value
+        .parse::<i64>()
+        .map(Timestamp::from_unix_nanos)
+        .map_err(|_| FileAdapterError::InvalidRecord)
+}
+
+fn parse_revision_number(value: &str) -> Result<RevisionNumber, FileAdapterError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(FileAdapterError::InvalidRecord);
+    }
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| FileAdapterError::InvalidRecord)?;
+    RevisionNumber::new(value).map_err(|_| FileAdapterError::InvalidRecord)
 }
 
 fn domain_availability(availability: &AvailabilityEvidence) -> DomainAvailabilityEvidence {
@@ -764,7 +1046,7 @@ fn row_reference(
 ) -> Result<SourceIdentifier, FileAdapterError> {
     let mut hasher = Sha256::new();
     hasher.update(b"market-squawk/local-file-row/v2");
-    hasher.update(MANIFEST_SCHEMA_VERSION.to_be_bytes());
+    hasher.update(specification.manifest_schema_version.to_be_bytes());
     hash_identifier(&mut hasher, &specification.dataset)?;
     hash_identifier(&mut hasher, &specification.object_id)?;
     specification.instrument_binding.bind_identity(&mut hasher);
@@ -777,13 +1059,42 @@ fn row_reference(
     SourceIdentifier::try_from(reference).map_err(|_| FileAdapterError::Contract)
 }
 
+fn membership_reference(
+    specification: &FileObjectSpec,
+) -> Result<SourceIdentifier, FileAdapterError> {
+    let membership = specification
+        .universe_membership
+        .as_ref()
+        .ok_or(FileAdapterError::InvalidManifest)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/local-file-universe-membership/v1");
+    hasher.update(specification.manifest_schema_version.to_be_bytes());
+    hash_identifier(&mut hasher, &specification.dataset)?;
+    hash_identifier(&mut hasher, &specification.object_id)?;
+    specification.instrument_binding.bind_identity(&mut hasher);
+    hash_identifier(&mut hasher, &membership.universe)?;
+    hasher.update(membership.starts_at.unix_nanos().to_be_bytes());
+    match membership.ends_at {
+        Some(ends_at) => {
+            hasher.update([1]);
+            hasher.update(ends_at.unix_nanos().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    let mut reference = String::from("local-object-membership:sha256:");
+    for byte in hasher.finalize() {
+        write!(&mut reference, "{byte:02x}").map_err(|_| FileAdapterError::Contract)?;
+    }
+    SourceIdentifier::try_from(reference).map_err(|_| FileAdapterError::Contract)
+}
+
 fn object_evidence(
     specification: &FileObjectSpec,
     content_digest: EvidenceDigest,
 ) -> Result<ExactPayloadEvidence, FileAdapterError> {
     let mut hasher = Sha256::new();
     hasher.update(b"market-squawk/local-file-object-binding/v1");
-    hasher.update(MANIFEST_SCHEMA_VERSION.to_be_bytes());
+    hasher.update(specification.manifest_schema_version.to_be_bytes());
     hash_identifier(&mut hasher, &specification.dataset)?;
     hash_identifier(&mut hasher, &specification.object_id)?;
     specification.instrument_binding.bind_identity(&mut hasher);
@@ -814,85 +1125,6 @@ fn hash_identifier(
     );
     hasher.update(bytes);
     Ok(())
-}
-
-fn parse_decimal_lexeme(value: &str) -> Result<Decimal, FileAdapterError> {
-    let Some(exponent_index) = value.find(['e', 'E']) else {
-        return Decimal::from_str_exact(value).map_err(|_| FileAdapterError::InvalidDecimal);
-    };
-    let (base, exponent) = value.split_at(exponent_index);
-    let exponent = exponent
-        .get(1..)
-        .ok_or(FileAdapterError::InvalidDecimal)?
-        .parse::<i32>()
-        .map_err(|_| FileAdapterError::InvalidDecimal)?;
-    let (negative, unsigned) = match base.as_bytes().first() {
-        Some(b'-') => (true, base.get(1..).ok_or(FileAdapterError::InvalidDecimal)?),
-        Some(b'+') => (
-            false,
-            base.get(1..).ok_or(FileAdapterError::InvalidDecimal)?,
-        ),
-        _ => (false, base),
-    };
-    let (whole, fractional) = match unsigned.split_once('.') {
-        Some((whole, fractional))
-            if !whole.is_empty() && !fractional.is_empty() && !fractional.contains('.') =>
-        {
-            (whole, fractional)
-        }
-        Some(_) => return Err(FileAdapterError::InvalidDecimal),
-        None if !unsigned.is_empty() => (unsigned, ""),
-        None => return Err(FileAdapterError::InvalidDecimal),
-    };
-    if !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(FileAdapterError::InvalidDecimal);
-    }
-    let scale = i32::try_from(fractional.len())
-        .map_err(|_| FileAdapterError::InvalidDecimal)?
-        .checked_sub(exponent)
-        .ok_or(FileAdapterError::InvalidDecimal)?;
-    if scale > i32::try_from(Decimal::MAX_SCALE).map_err(|_| FileAdapterError::InvalidDecimal)? {
-        return Err(FileAdapterError::InvalidDecimal);
-    }
-    let extra_zeroes = if scale < 0 {
-        scale
-            .checked_neg()
-            .ok_or(FileAdapterError::InvalidDecimal)?
-    } else {
-        0
-    };
-    if extra_zeroes
-        > i32::try_from(Decimal::MAX_SCALE).map_err(|_| FileAdapterError::InvalidDecimal)?
-    {
-        return Err(FileAdapterError::InvalidDecimal);
-    }
-    let mut canonical = String::new();
-    let zeroes = usize::try_from(extra_zeroes).map_err(|_| FileAdapterError::InvalidDecimal)?;
-    let capacity = usize::from(negative)
-        .checked_add(whole.len())
-        .and_then(|bytes| bytes.checked_add(fractional.len()))
-        .and_then(|bytes| bytes.checked_add(zeroes))
-        .and_then(|bytes| bytes.checked_add(1))
-        .ok_or(FileAdapterError::InvalidDecimal)?;
-    canonical
-        .try_reserve_exact(capacity)
-        .map_err(|_| FileAdapterError::InvalidDecimal)?;
-    if negative {
-        canonical.push('-');
-    }
-    canonical.push_str(whole);
-    canonical.push_str(fractional);
-    canonical.extend(std::iter::repeat_n('0', zeroes));
-    let mut decimal =
-        Decimal::from_str_exact(&canonical).map_err(|_| FileAdapterError::InvalidDecimal)?;
-    if scale > 0 {
-        decimal
-            .set_scale(u32::try_from(scale).map_err(|_| FileAdapterError::InvalidDecimal)?)
-            .map_err(|_| FileAdapterError::InvalidDecimal)?;
-    }
-    Ok(decimal)
 }
 
 impl SourceMetadataProvider for FileExtractionSource {

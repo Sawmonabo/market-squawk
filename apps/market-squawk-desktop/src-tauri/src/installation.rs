@@ -10,16 +10,14 @@ use std::{
 use market_squawk_installer::{
     InstallError, InstallRequest, InstallStatus, MAXIMUM_MANIFEST_BYTES, ManifestError,
     PlatformError, ProgramInstallSnapshot, ProgramName, ReleaseManifest, RepairRequest,
-    RollbackRequest, SupportedTarget, UpdateRequest, default_install_root, install,
-    program_install_snapshot, repair, rollback, update,
+    RollbackRequest, SupportedTarget, UpdateRequest, install, program_install_snapshot, repair,
+    rollback, update,
 };
 use semver::Version;
 use tauri::Manager as _;
 use thiserror::Error;
 
 const MAXIMUM_CHECKSUM_BYTES: u64 = 64 * 1024;
-const MAXIMUM_BOOTSTRAP_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Installed program state admitted for desktop composition.
 #[derive(Debug)]
@@ -41,11 +39,20 @@ struct PackagedRelease {
 /// Installs, updates, or repairs the complete packaged release and returns its active root.
 pub(crate) fn prepare(
     app: &tauri::AppHandle,
+    root: PathBuf,
 ) -> Result<PreparedInstallation, InstallationStartupError> {
-    let root = default_install_root()?;
-    let packaged = packaged_release(app)?;
     let current_snapshot = program_install_snapshot(&root, ProgramName::Desktop)?;
     let current = current_snapshot.status();
+    let packaged = match packaged_release(app) {
+        Ok(packaged) => packaged,
+        Err(error) if current.is_installed() && current.is_healthy() => {
+            eprintln!(
+                "market-squawk-desktop: packaged update is unavailable ({error}); continuing the installed release"
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
 
     if current.is_installed() {
         let mut changed = false;
@@ -63,10 +70,20 @@ pub(crate) fn prepare(
                 &active,
                 current.previous_version(),
             ) {
-                update(
-                    UpdateRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
-                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
-                )?;
+                // A native package is a local release, not a threshold-signed network update.
+                let result = UpdateRequest::from_local(
+                    root.clone(),
+                    &packaged.manifest,
+                    &packaged.bundle,
+                )
+                .and_then(update);
+                if let Err(error) = result {
+                    return continue_healthy_installed_after_optional_failure(
+                        root,
+                        &current_snapshot,
+                        error,
+                    );
+                }
                 changed = true;
             } else if packaged.version == active
                 && (!current.is_healthy()
@@ -74,10 +91,20 @@ pub(crate) fn prepare(
                     || current.channel_manifest_url()
                         != Some(packaged.channel_manifest_url.as_ref()))
             {
-                repair(
-                    RepairRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
-                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
-                )?;
+                let result = RepairRequest::from_local(
+                    root.clone(),
+                    &packaged.manifest,
+                    &packaged.bundle,
+                )
+                .and_then(|request| request.with_channel_manifest_url(&packaged.channel_manifest_url))
+                .and_then(repair);
+                if let Err(error) = result {
+                    return continue_healthy_installed_after_optional_failure(
+                        root,
+                        &current_snapshot,
+                        error,
+                    );
+                }
                 changed = true;
             } else if !current.is_healthy() {
                 match recover_active_or_previous(&root) {
@@ -97,10 +124,16 @@ pub(crate) fn prepare(
                 }
             } else if current.channel_manifest_url() != Some(packaged.channel_manifest_url.as_ref())
             {
-                repair(
-                    RepairRequest::new(root.clone())
-                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
-                )?;
+                let result = RepairRequest::new(root.clone())
+                    .with_channel_manifest_url(&packaged.channel_manifest_url)
+                    .and_then(repair);
+                if let Err(error) = result {
+                    return continue_healthy_installed_after_optional_failure(
+                        root,
+                        &current_snapshot,
+                        error,
+                    );
+                }
                 changed = true;
             }
         } else if !current.is_healthy() {
@@ -131,6 +164,29 @@ pub(crate) fn prepare(
         });
     }
     Err(InstallationStartupError::PackagedReleaseUnavailable)
+}
+
+fn continue_healthy_installed_after_optional_failure(
+    root: PathBuf,
+    before: &ProgramInstallSnapshot,
+    error: InstallError,
+) -> Result<PreparedInstallation, InstallationStartupError> {
+    if before.status().is_healthy() {
+        if let Ok(after) = program_install_snapshot(&root, ProgramName::Desktop) {
+            if after.status().is_healthy()
+                && after.status().active_version() == before.status().active_version()
+                && after.status().manifest_sha256() == before.status().manifest_sha256()
+                && after.active_release_root() == before.active_release_root()
+                && after.program_path() == before.program_path()
+            {
+                eprintln!(
+                    "market-squawk-desktop: packaged maintenance failed ({error}); continuing the verified installed release"
+                );
+                return prepared_snapshot(root, after);
+            }
+        }
+    }
+    Err(error.into())
 }
 
 fn prepared_installed(root: PathBuf) -> Result<PreparedInstallation, InstallationStartupError> {
@@ -220,8 +276,8 @@ fn packaged_release(
     if admitted.version() != version.to_string() {
         return Err(InstallationStartupError::InvalidPackagedRelease);
     }
-    let bundle = bounded_regular_file(&directory.join(bundle_name), MAXIMUM_BUNDLE_BYTES)?;
-    bounded_regular_file(&directory.join(bootstrap_name), MAXIMUM_BOOTSTRAP_BYTES)?;
+    let bundle = nonempty_regular_file(&directory.join(bundle_name))?;
+    nonempty_regular_file(&directory.join(bootstrap_name))?;
     bounded_regular_file(&directory.join("SHA256SUMS"), MAXIMUM_CHECKSUM_BYTES)?;
     Ok(Some(PackagedRelease {
         manifest,
@@ -252,16 +308,20 @@ fn read_file_names(root: &Path) -> Result<BTreeSet<String>, InstallationStartupE
     Ok(names)
 }
 
-fn bounded_regular_file(path: &Path, maximum: u64) -> Result<PathBuf, InstallationStartupError> {
+fn nonempty_regular_file(path: &Path) -> Result<PathBuf, InstallationStartupError> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > maximum
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
         return Err(InstallationStartupError::InvalidPackagedRelease);
     }
     Ok(path.to_path_buf())
+}
+
+fn bounded_regular_file(path: &Path, maximum: u64) -> Result<PathBuf, InstallationStartupError> {
+    let path = nonempty_regular_file(path)?;
+    if fs::symlink_metadata(&path)?.len() > maximum {
+        return Err(InstallationStartupError::InvalidPackagedRelease);
+    }
+    Ok(path)
 }
 
 fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, InstallationStartupError> {

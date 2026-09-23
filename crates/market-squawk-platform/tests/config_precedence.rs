@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use market_squawk_domain::{AssetClass, Denomination, LiveEventClass, MarketDepth, TradingStatus};
 use market_squawk_platform::{
-    AppConfig, COINBASE_EXCHANGE_ENDPOINT, ConfigError, ConfigOrigin, ConfigOverrides,
-    ConfigSetting, ConfigSources, KRAKEN_WEBSOCKET_V2_ENDPOINT, SecretReference,
+    AppConfig, COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, ConfigError, ConfigOrigin,
+    ConfigOverrides, ConfigSetting, ConfigSources, KRAKEN_WEBSOCKET_V2_ENDPOINT,
 };
 use tempfile::tempdir;
 
@@ -18,7 +18,7 @@ fn coinbase_config_toml(max_frame_bytes: usize) -> String {
     format!(
         r#"
 [coinbase]
-endpoint = "{COINBASE_EXCHANGE_ENDPOINT}"
+endpoint = "{COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT}"
 event_classes = ["book_snapshot", "book_delta", "trade"]
 depth = "price_level"
 freshness_ms = 5000
@@ -32,8 +32,8 @@ mode = "public_interface"
 provider = "coinbase-exchange"
 basis = "user-reviewed-coinbase-public-interface"
 evidence_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-evidence_reference = "https://docs.cdp.coinbase.com/exchange/websocket-feed/overview"
-evidence_version = "reviewed-2026-07-20"
+evidence_reference = "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview"
+evidence_version = "reviewed-2026-08-08"
 effective_from_unix_nanos = 1700000000000000000
 effective_until_unix_nanos = 1900000000000000000
 
@@ -56,7 +56,7 @@ trading_status = "active"
 fn coinbase_config_json(max_frame_bytes: usize) -> String {
     format!(
         r#"{{
-  "endpoint":"{COINBASE_EXCHANGE_ENDPOINT}",
+  "endpoint":"{COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT}",
   "event_classes":["book_snapshot","book_delta","trade"],
   "depth":"price_level",
   "freshness_ms":5000,
@@ -69,8 +69,8 @@ fn coinbase_config_json(max_frame_bytes: usize) -> String {
     "provider":"coinbase-exchange",
     "basis":"user-reviewed-coinbase-public-interface",
     "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "evidence_reference":"https://docs.cdp.coinbase.com/exchange/websocket-feed/overview",
-    "evidence_version":"reviewed-2026-07-20",
+    "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "evidence_version":"reviewed-2026-08-08",
     "effective_from_unix_nanos":1700000000000000000,
     "effective_until_unix_nanos":1900000000000000000
   }},
@@ -95,7 +95,7 @@ fn kraken_config_json(endpoint: &str) -> String {
     format!(
         r#"{{
   "endpoint":"{endpoint}",
-  "channel":"book",
+  "channels":["book","trade"],
   "depth":10,
   "freshness_ms":5000,
   "max_frame_bytes":1048576,
@@ -107,8 +107,8 @@ fn kraken_config_json(endpoint: &str) -> String {
     "provider":"kraken",
     "basis":"user-reviewed-kraken-public-interface",
     "evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "evidence_reference":"https://docs.kraken.com/api/docs/websocket-v2/book/",
-    "evidence_version":"reviewed-2026-07-21",
+    "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
+    "evidence_version":"reviewed-2026-08-14",
     "effective_from_unix_nanos":1700000000000000000,
     "effective_until_unix_nanos":1900000000000000000
   }},
@@ -144,6 +144,14 @@ fn production_kraken_config_is_explicit_typed_and_endpoint_sealed()
     assert_eq!(kraken.symbol(), "BTC/USD");
     assert_eq!(kraken.depth(), 10);
     assert_eq!(
+        kraken.event_classes(),
+        [
+            LiveEventClass::BookSnapshot,
+            LiveEventClass::BookDelta,
+            LiveEventClass::Trade,
+        ]
+    );
+    assert_eq!(
         kraken.definition().venue_mappings()[0].venue_id().as_str(),
         "kraken"
     );
@@ -158,6 +166,19 @@ fn production_kraken_config_is_explicit_typed_and_endpoint_sealed()
         ))
         .is_err()
     );
+
+    for invalid_channels in ["[\"book\"]", "[\"trade\",\"book\"]"] {
+        let invalid = json.replace("[\"book\",\"trade\"]", invalid_channels);
+        let invalid_environment = environment(&[("MARKET_SQUAWK_KRAKEN_JSON", &invalid)]);
+        assert!(
+            AppConfig::load(ConfigSources::new(
+                None,
+                &invalid_environment,
+                ConfigOverrides::default(),
+            ))
+            .is_err()
+        );
+    }
     Ok(())
 }
 
@@ -190,7 +211,10 @@ fn production_coinbase_config_is_explicit_typed_and_obeys_precedence()
     ))?;
     let coinbase = config.coinbase().ok_or("Coinbase configuration missing")?;
 
-    assert_eq!(coinbase.endpoint(), COINBASE_EXCHANGE_ENDPOINT);
+    assert_eq!(
+        coinbase.endpoint(),
+        COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT
+    );
     assert_eq!(coinbase.max_frame_bytes().get(), 3_145_728);
     assert_eq!(coinbase.depth(), MarketDepth::PriceLevel);
     assert_eq!(
@@ -263,8 +287,10 @@ fn production_coinbase_config_fails_closed_on_ambiguous_or_unsafe_mappings()
 #[test]
 fn production_coinbase_config_rejects_custom_endpoints_and_subscription_overflow()
 -> Result<(), Box<dyn std::error::Error>> {
-    let custom_endpoint =
-        coinbase_config_json(1_048_576).replace(COINBASE_EXCHANGE_ENDPOINT, "ws://127.0.0.1:9000");
+    let custom_endpoint = coinbase_config_json(1_048_576).replace(
+        COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT,
+        "ws://127.0.0.1:9000",
+    );
     let custom_environment = environment(&[("MARKET_SQUAWK_COINBASE_JSON", &custom_endpoint)]);
     assert!(
         AppConfig::load(ConfigSources::new(
@@ -339,7 +365,6 @@ paper_bot_enabled = false
 capture_flush_interval_ms = 500
 capture_shutdown_ms = 2000
 source_shutdown_ms = 3000
-source_secret = "keyring:coinbase"
 "#,
     )?;
     let environment = environment(&[
@@ -379,10 +404,6 @@ source_secret = "keyring:coinbase"
     assert_eq!(config.stale_after().as_millis(), 4_000);
     assert!(config.paper_bot_enabled());
     assert_eq!(config.source_shutdown().as_millis(), 6_000);
-    assert_eq!(
-        config.source_secret(),
-        Some(&SecretReference::try_from("keyring:coinbase")?)
-    );
     assert_eq!(
         config.provenance().origin(ConfigSetting::DataDirectory),
         ConfigOrigin::Cli
@@ -454,24 +475,6 @@ fn source_shutdown_accepts_safe_boundaries_and_rejects_incomplete_cleanup_budget
             Err(market_squawk_platform::ConfigError::InvalidSourceShutdownTiming)
         ));
     }
-}
-
-#[test]
-fn debug_output_redacts_secret_references() -> Result<(), Box<dyn std::error::Error>> {
-    let environment = environment(&[(
-        "MARKET_SQUAWK_SOURCE_SECRET",
-        "keyring:highly-sensitive-account",
-    )]);
-    let config = AppConfig::load(ConfigSources::new(
-        None,
-        &environment,
-        ConfigOverrides::default(),
-    ))?;
-
-    let debug = format!("{config:?}");
-    assert!(debug.contains("[REDACTED]"));
-    assert!(!debug.contains("highly-sensitive-account"));
-    Ok(())
 }
 
 #[test]
@@ -588,11 +591,11 @@ fn oversized_config_is_rejected_before_toml_parsing() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn malformed_secret_bearing_toml_is_redacted_from_errors() -> Result<(), Box<dyn std::error::Error>>
+fn unknown_sensitive_toml_field_is_redacted_from_errors() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempdir()?;
     let path = directory.path().join("invalid.toml");
-    std::fs::write(&path, "source_secret = [\"sensitive-locator\"")?;
+    std::fs::write(&path, "unsupported_setting = \"sensitive-value\"")?;
 
     let error = AppConfig::load(ConfigSources::new(
         Some(&path),
@@ -602,7 +605,7 @@ fn malformed_secret_bearing_toml_is_redacted_from_errors() -> Result<(), Box<dyn
     .err()
     .ok_or("invalid TOML was accepted")?;
     let rendered = format!("{error:?} {error}");
-    assert!(!rendered.contains("sensitive-locator"));
+    assert!(!rendered.contains("sensitive-value"));
     Ok(())
 }
 

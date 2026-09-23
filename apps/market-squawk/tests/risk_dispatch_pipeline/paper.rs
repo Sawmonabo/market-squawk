@@ -893,16 +893,16 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         )
         .is_err()
     );
-    let mut previous_schema = checkpoint_value.clone();
-    previous_schema["schema_version"] = serde_json::json!(
+    let mut unsupported_schema = checkpoint_value.clone();
+    unsupported_schema["schema_version"] = serde_json::json!(
         PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
-            .checked_sub(1)
-            .ok_or("paper checkpoint schema has no predecessor")?
+            .checked_sub(2)
+            .ok_or("paper checkpoint schema has no unsupported predecessor")?
     );
     assert!(
         market_squawk_adapter_paper::PaperExecutionCheckpoint::decode(
             paper_config.clone(),
-            &serde_json::to_vec(&previous_schema)?,
+            &serde_json::to_vec(&unsupported_schema)?,
             1024 * 1024,
         )
         .is_err()

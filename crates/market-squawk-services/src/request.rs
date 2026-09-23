@@ -89,6 +89,53 @@ pub enum RequestIdError {
     },
 }
 
+/// Validated workspace and client identity admitted by an installed transport.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RequestOrigin {
+    workspace_id: uuid::Uuid,
+    client_id: uuid::Uuid,
+}
+
+impl RequestOrigin {
+    /// Creates an origin from non-nil transport identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestOriginError::NilIdentity`] when either identity is nil.
+    pub fn try_new(
+        workspace_id: uuid::Uuid,
+        client_id: uuid::Uuid,
+    ) -> Result<Self, RequestOriginError> {
+        if workspace_id.is_nil() || client_id.is_nil() {
+            return Err(RequestOriginError::NilIdentity);
+        }
+        Ok(Self {
+            workspace_id,
+            client_id,
+        })
+    }
+
+    /// Workspace that owns the installed request.
+    #[must_use]
+    pub const fn workspace_id(self) -> uuid::Uuid {
+        self.workspace_id
+    }
+
+    /// Registered installed client that submitted the request.
+    #[must_use]
+    pub const fn client_id(self) -> uuid::Uuid {
+        self.client_id
+    }
+}
+
+/// Invalid installed-request origin.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RequestOriginError {
+    /// Workspace and client identities must both be non-nil.
+    #[error("request origin identities must be non-nil")]
+    NilIdentity,
+}
+
 /// Maximum nested structure admitted for one JSON value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsonStructureLimits {
@@ -358,6 +405,7 @@ pub struct RequestContext {
     deadline: Instant,
     limits: ServiceLimits,
     progress: ProgressReporter,
+    origin: Option<RequestOrigin>,
 }
 
 impl RequestContext {
@@ -377,6 +425,7 @@ impl RequestContext {
             deadline,
             limits,
             progress,
+            origin: None,
         }
     }
 
@@ -402,7 +451,15 @@ impl RequestContext {
             deadline,
             limits,
             progress,
+            origin: None,
         }
+    }
+
+    /// Binds a validated installed-transport origin to this request.
+    #[must_use]
+    pub fn with_origin(mut self, origin: RequestOrigin) -> Self {
+        self.origin = Some(origin);
+        self
     }
 
     /// Correlation identity for this request.
@@ -434,6 +491,12 @@ impl RequestContext {
     pub const fn progress(&self) -> &ProgressReporter {
         &self.progress
     }
+
+    /// Returns the installed-transport origin when the caller supplied one.
+    #[must_use]
+    pub const fn origin(&self) -> Option<RequestOrigin> {
+        self.origin
+    }
 }
 
 impl fmt::Debug for RequestContext {
@@ -445,6 +508,29 @@ impl fmt::Debug for RequestContext {
             .field("deadline", &self.deadline)
             .field("limits", &self.limits)
             .field("progress", &self.progress)
+            .field("origin", &self.origin)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RequestOrigin, RequestOriginError};
+    use uuid::Uuid;
+
+    #[test]
+    fn request_origin_preserves_admitted_non_nil_transport_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace_id = Uuid::from_u128(1);
+        let client_id = Uuid::from_u128(2);
+        let origin = RequestOrigin::try_new(workspace_id, client_id)?;
+
+        assert_eq!(origin.workspace_id(), workspace_id);
+        assert_eq!(origin.client_id(), client_id);
+        assert_eq!(
+            RequestOrigin::try_new(Uuid::nil(), client_id),
+            Err(RequestOriginError::NilIdentity)
+        );
+        Ok(())
     }
 }

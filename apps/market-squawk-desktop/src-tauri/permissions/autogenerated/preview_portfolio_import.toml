@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-portfolio-import"
+description = "Enables the preview_portfolio_import command without any pre-configured scope."
+commands.allow = ["preview_portfolio_import"]
+
+[[permission]]
+identifier = "deny-preview-portfolio-import"
+description = "Denies the preview_portfolio_import command without any pre-configured scope."
+commands.deny = ["preview_portfolio_import"]

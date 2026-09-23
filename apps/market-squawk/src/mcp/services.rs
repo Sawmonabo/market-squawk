@@ -123,7 +123,7 @@ impl LocalToolServices {
     fn market_snapshot(&self, request: &TypedToolRequest) -> Result<(Value, usize), ServiceError> {
         let snapshot = self.diagnostic_engine.read().snapshot();
         let Some(product) = request.arguments().get("product") else {
-            let item_count = snapshot.products.len().max(1);
+            let item_count = snapshot.products.len();
             let content =
                 serde_json::to_value(snapshot).map_err(|_error| ServiceError::Internal)?;
             return Ok((content, item_count));
@@ -141,7 +141,7 @@ impl LocalToolServices {
 
     fn market_quality(&self) -> Result<(Value, usize), ServiceError> {
         let snapshot = self.diagnostic_engine.read().snapshot();
-        let item_count = snapshot.products.len().max(1);
+        let item_count = snapshot.products.len();
         let mut quality = Map::new();
         for (product, state) in snapshot.products {
             quality.insert(

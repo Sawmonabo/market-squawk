@@ -21,21 +21,21 @@ use super::cohort::{
 };
 use super::model::{
     BacktestArtifact, ExperimentLimits, TrialCompletion, TrialCompletionInput, TrialFailure,
-    TrialId, TrialIdentityVersion, TrialRecord, TrialSpec, TrialStatus,
+    TrialId, TrialRecord, TrialSpec, TrialStatus,
 };
 use super::wire::{
     decode_reservation, decode_terminal, digest_bytes, encode_hex, encode_reservation,
     encode_terminal,
 };
 
-const NAMESPACE: &str = "backtesting/v1";
-const RESERVATIONS: &str = "backtesting/v1/reservations";
-const TERMINALS: &str = "backtesting/v1/terminals";
-const ATTEMPTS: &str = "backtesting/v1/attempts";
-const PENDING: &str = "backtesting/v1/pending";
-const COHORTS: &str = "backtesting/v1/cohorts";
-const ARTIFACTS: &str = "backtesting/v1/artifacts/sha256";
-const AUTHORITY_LOCK: &str = "backtesting/v1/inventory.lock";
+const NAMESPACE: &str = "backtesting/v3";
+const RESERVATIONS: &str = "backtesting/v3/reservations";
+const TERMINALS: &str = "backtesting/v3/terminals";
+const ATTEMPTS: &str = "backtesting/v3/attempts";
+const PENDING: &str = "backtesting/v3/pending";
+const COHORTS: &str = "backtesting/v3/cohorts";
+const ARTIFACTS: &str = "backtesting/v3/artifacts/sha256";
+const AUTHORITY_LOCK: &str = "backtesting/v3/inventory.lock";
 const DEFAULT_LEASE_NANOS: i64 = 60 * 60 * 1_000_000_000;
 const MAX_ATTEMPTS_PER_TRIAL: usize = 1_024;
 const MAX_STAGE_NAME_ATTEMPTS: usize = 32;
@@ -92,7 +92,7 @@ impl ExperimentInventory {
             ATTEMPTS,
             PENDING,
             COHORTS,
-            "backtesting/v1/artifacts",
+            "backtesting/v3/artifacts",
             ARTIFACTS,
         ] {
             ensure_directory(&root, Path::new(path))?;
@@ -122,9 +122,6 @@ impl ExperimentInventory {
         acquired_at: Timestamp,
         lease_nanos: i64,
     ) -> Result<TrialReservation, ExperimentError> {
-        if spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::InvalidSpec);
-        }
         if lease_nanos <= 0 {
             return Err(ExperimentError::InvalidLease);
         }
@@ -144,20 +141,6 @@ impl ExperimentInventory {
             return Err(ExperimentError::LimitExceeded);
         }
         publish_immutable(&self.root, &path, &bytes, ExistingPolicy::AcceptExact)?;
-        if read_optional_bounded(
-            &self.root,
-            &legacy_terminal_path(spec.id()),
-            self.limits.max_record_bytes,
-        )?
-        .is_some()
-        {
-            return Err(match spec.identity_version() {
-                TrialIdentityVersion::V1 | TrialIdentityVersion::V2 => {
-                    ExperimentError::TrialAlreadyExists
-                }
-                TrialIdentityVersion::V3 => ExperimentError::CorruptRecord,
-            });
-        }
         self.acquire_attempt(spec, digest_bytes(&bytes), acquired_at, lease_nanos)
     }
 
@@ -176,6 +159,27 @@ impl ExperimentInventory {
             digest,
             byte_count: u64::try_from(bytes.len()).map_err(|_| ExperimentError::LimitExceeded)?,
         })
+    }
+
+    /// Reads one content-addressed backtest report through the inventory's confined artifact root.
+    ///
+    /// The caller supplies only the immutable digest and exact retained byte count. The inventory
+    /// derives the capability-relative location, refuses oversized or mismatched content, and
+    /// never returns a filesystem path.
+    pub fn read_artifact(
+        &self,
+        digest: Sha256Digest,
+        byte_count: u64,
+    ) -> Result<Vec<u8>, ExperimentError> {
+        let artifact = BacktestArtifact {
+            reference: artifact_reference(digest)?.into_boxed_str(),
+            digest,
+            byte_count,
+        };
+        let (path, maximum) = self.validate_artifact_authority(&artifact)?;
+        let bytes = read_bounded(&self.root, &path, maximum)?;
+        validate_artifact_bytes(&bytes, &artifact)?;
+        Ok(bytes)
     }
 
     pub(crate) fn publish_cohort_evaluation(
@@ -218,9 +222,6 @@ impl ExperimentInventory {
         completion: TrialCompletion,
         artifact_bytes: &[u8],
     ) -> Result<TrialRecord, ExperimentError> {
-        if reservation.spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::CorruptRecord);
-        }
         let expected_artifact = self.prepare_artifact(artifact_bytes)?;
         if completion.artifact() != &expected_artifact {
             return Err(ExperimentError::InvalidCompletion);
@@ -280,9 +281,6 @@ impl ExperimentInventory {
         reservation: &TrialReservation,
         input: TrialCompletionInput,
     ) -> Result<TrialCompletion, ExperimentError> {
-        if reservation.spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::CorruptRecord);
-        }
         let completion = TrialCompletion::try_new(input, self.limits)?;
         let terminal = encode_terminal(
             reservation.spec.id(),
@@ -319,7 +317,6 @@ impl ExperimentInventory {
             return Err(ExperimentError::CorruptRecord);
         }
         let reservation_digest = digest_bytes(&reservation);
-        let identity_version = spec.identity_version();
         let latest = latest_attempt(
             &self.root,
             id,
@@ -329,63 +326,18 @@ impl ExperimentInventory {
         let attempt_terminal = authoritative_attempt_terminal(
             &self.root,
             id,
-            identity_version,
             latest.as_ref(),
             self.limits.max_record_bytes,
         )?;
-        let legacy = read_optional_bounded(
-            &self.root,
-            &legacy_terminal_path(id),
-            self.limits.max_record_bytes,
-        )?;
-        let status = match identity_version {
-            TrialIdentityVersion::V1 | TrialIdentityVersion::V2 => {
-                if let Some(bytes) = legacy {
-                    let decoded = decode_terminal(
-                        &bytes,
-                        id,
-                        identity_version.terminal_schema_version(),
-                        self.limits,
-                    )?;
-                    self.validate_published_terminal(decoded)?
-                } else {
-                    TrialStatus::Reserved
-                }
+        let status = match (latest, attempt_terminal) {
+            (Some(attempt), Some(bytes)) => {
+                let decoded = decode_terminal(&bytes, id, self.limits)?;
+                self.reconcile_terminal_artifact(id, attempt.attempt, decoded)?
             }
-            TrialIdentityVersion::V3 => {
-                if legacy.is_some() {
-                    return Err(ExperimentError::CorruptRecord);
-                }
-                match (latest, attempt_terminal) {
-                    (Some(attempt), Some(bytes)) => {
-                        let decoded = decode_terminal(
-                            &bytes,
-                            id,
-                            identity_version.terminal_schema_version(),
-                            self.limits,
-                        )?;
-                        self.reconcile_terminal_artifact(id, attempt.attempt, decoded)?
-                    }
-                    (Some(_), None) | (None, None) => TrialStatus::Reserved,
-                    (None, Some(_)) => return Err(ExperimentError::CorruptRecord),
-                }
-            }
+            (Some(_), None) | (None, None) => TrialStatus::Reserved,
+            (None, Some(_)) => return Err(ExperimentError::CorruptRecord),
         };
         Ok(TrialRecord { spec, status })
-    }
-
-    fn validate_published_terminal(
-        &self,
-        decoded: super::wire::DecodedTerminal,
-    ) -> Result<TrialStatus, ExperimentError> {
-        let TrialStatus::Completed(completion) = &decoded.status else {
-            return Ok(decoded.status);
-        };
-        let (final_path, maximum) = self.validate_artifact_authority(completion.artifact())?;
-        let final_bytes = read_optional_bounded(&self.root, &final_path, maximum)?
-            .ok_or(ExperimentError::CorruptRecord)?;
-        validate_artifact_bytes(&final_bytes, completion.artifact())?;
-        Ok(decoded.status)
     }
 
     fn reconcile_terminal_artifact(
@@ -447,9 +399,6 @@ impl ExperimentInventory {
         reservation: TrialReservation,
         status: TrialStatus,
     ) -> Result<TrialRecord, ExperimentError> {
-        if reservation.spec.identity_version() != TrialIdentityVersion::V3 {
-            return Err(ExperimentError::CorruptRecord);
-        }
         let _guard = self
             .writer
             .lock()
@@ -906,10 +855,6 @@ fn reservation_path(id: TrialId) -> std::path::PathBuf {
     Path::new(RESERVATIONS).join(format!("{}.json", encode_hex(id.digest().bytes())))
 }
 
-fn legacy_terminal_path(id: TrialId) -> std::path::PathBuf {
-    Path::new(TERMINALS).join(format!("{}.json", encode_hex(id.digest().bytes())))
-}
-
 fn terminal_attempt_parent(id: TrialId) -> PathBuf {
     Path::new(TERMINALS).join(encode_hex(id.digest().bytes()))
 }
@@ -939,7 +884,6 @@ fn attempt_path(id: TrialId, attempt: u64) -> PathBuf {
 fn authoritative_attempt_terminal(
     root: &Dir,
     id: TrialId,
-    identity_version: TrialIdentityVersion,
     latest_attempt: Option<&AttemptRecord>,
     maximum: usize,
 ) -> Result<Option<Vec<u8>>, ExperimentError> {
@@ -971,7 +915,7 @@ fn authoritative_attempt_terminal(
     if count == 0 {
         return Ok(None);
     }
-    if identity_version != TrialIdentityVersion::V3 || invalid {
+    if invalid {
         return Err(ExperimentError::CorruptRecord);
     }
     let number = candidate.ok_or(ExperimentError::CorruptRecord)?;

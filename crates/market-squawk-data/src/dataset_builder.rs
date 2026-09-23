@@ -3,11 +3,15 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use market_squawk_domain::Timestamp;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::analytical_backup::AnalyticalOperationGate;
-use crate::{AnalyticalDataService, CatalogAuthority};
+use crate::{
+    AnalyticalDataService, CatalogAuthority, ResearchUse, ResearchUseDecisionDigest,
+    ResearchUseGraphDigest, ResearchUseRequest,
+};
 
 #[path = "dataset_builder/admission.rs"]
 mod admission;
@@ -19,17 +23,83 @@ mod canonical;
 mod export;
 #[path = "dataset_builder/model.rs"]
 mod model;
+#[path = "dataset_builder/production.rs"]
+mod production;
 
-pub use admission::PythonDatasetAdmission;
+pub(crate) use admission::FeatureDatasetProductionReceiptExpectation;
+pub use admission::{
+    FEATURE_DATASET_PRODUCTION_RECEIPT_SCHEMA, FeatureDatasetProductionReceiptV1,
+    MAX_FEATURE_DATASET_PRODUCTION_RECEIPT_BYTES,
+};
 pub use export::{FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES};
 
 pub use model::{
     ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionSensitivity, DatasetBuildInputs,
     DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetExample,
-    DatasetOutputAuthorization, DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput,
-    FeatureLabelComponentSpec, FeatureLabelDataset, MissingValuePolicy,
+    DatasetOutputAuthorization, DatasetSplit, DatasetSplitCounts, FEATURE_LABEL_PROBABILITY_UNIT,
+    FEATURE_LABEL_RETURN_UNIT, FeatureLabelComponentInput, FeatureLabelComponentSpec,
+    FeatureLabelDataset, FeatureLabelMeasurement, FeatureLabelMeasurementBinding,
+    MissingValuePolicy,
 };
+pub use production::{
+    FeatureDatasetMacroComponentDescriptor, FeatureDatasetProductContract,
+    FeatureDatasetProductionComposition, FeatureDatasetProductionError,
+    FeatureDatasetProductionProofV1, FeatureDatasetProductionPublication,
+    FeatureDatasetProductionPublicationDisposition, FeatureDatasetProductionPublisher,
+};
+
+/// Process-local authority that must remain live through derived-generation publication.
+pub trait DatasetBuildPrecommitAuthority: fmt::Debug + Send + Sync {
+    /// Revalidates the exact caller authority immediately before the derived-generation commit.
+    fn validate_precommit(&self) -> Result<(), DatasetBuildError>;
+
+    /// Records that the derived-generation commit succeeded before any later fallible work.
+    fn commit_succeeded(&self);
+}
+
+/// Immutable identities proven by one successful pre-read research-use evaluation.
+///
+/// This receipt is evidence for orchestration only. It contains no catalog session, permit,
+/// publication authority, or reusable capability; the opaque permit minted by the evaluation is
+/// dropped before this value is returned. Every build still performs its own authorization before
+/// reading inputs and again at its durable publication boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatasetResearchUsePreflightReceipt {
+    request: ResearchUseRequest,
+    decision_digest: ResearchUseDecisionDigest,
+    graph_digest: ResearchUseGraphDigest,
+    expires_at: Timestamp,
+}
+
+impl DatasetResearchUsePreflightReceipt {
+    /// Returns exact roots, downstream use, and bounds evaluated by the authority.
+    pub const fn request(&self) -> &ResearchUseRequest {
+        &self.request
+    }
+
+    /// Returns the canonical durable decision identity produced by this evaluation.
+    pub const fn decision_digest(&self) -> ResearchUseDecisionDigest {
+        self.decision_digest
+    }
+
+    /// Returns the canonical exact transitive parent graph evaluated by the authority.
+    pub const fn graph_digest(&self) -> ResearchUseGraphDigest {
+        self.graph_digest
+    }
+
+    /// Returns the independently authorized downstream research use.
+    pub const fn research_use(&self) -> ResearchUse {
+        self.request.requested_use()
+    }
+
+    /// Returns the exclusive expiry of the ephemeral decision evaluated by this preflight.
+    ///
+    /// The receipt remains identity evidence after this time but never carries usable authority.
+    pub const fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+}
 
 /// Rights-bound builder scoped to one active analytical catalog and artifact root.
 pub struct DatasetBuilderService<'service> {
@@ -61,12 +131,47 @@ impl<'service> DatasetBuilderService<'service> {
         }
     }
 
-    /// Re-resolves and returns the immutable catalog admission for one producer-owned result.
-    pub fn python_admission(
+    /// Re-resolves the exact parent graph and validates its current research-use authority.
+    ///
+    /// This is an admission-only preflight for guided preparation. Publication performs the same
+    /// validation again before reading inputs and at its durable commit boundary.
+    pub fn validate_request_authority(
         &self,
-        dataset: &FeatureLabelDataset,
-    ) -> Result<PythonDatasetAdmission, DatasetBuildError> {
-        admission::register(self, dataset)
+        request: &DatasetBuildRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(), DatasetBuildError> {
+        build::validate_request_authority(self, request, cancellation)
+    }
+
+    /// Evaluates current ResearchUse rights before an orchestrator reads any parent generation.
+    ///
+    /// Only immutable request and graph identities cross this boundary. The authorization's
+    /// single-use permit is deliberately destroyed here and cannot be supplied to `build`; build
+    /// therefore re-traverses and reauthorizes the graph under its existing commit protocol. A
+    /// later [`DatasetBuildRequest`] must retain these exact roots, requested use, and limits;
+    /// equality with [`DatasetResearchUsePreflightReceipt::request`] is the producer's explicit
+    /// composition check, not authority conferred by this receipt.
+    pub fn preflight_research_use(
+        &self,
+        request: ResearchUseRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<DatasetResearchUsePreflightReceipt, DatasetBuildError> {
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| DatasetBuildError::AuthorityLockPoisoned)?;
+        let authorization = authority.authorize_research_use(request.clone(), cancellation)?;
+        if authorization.research_use() != request.requested_use() {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        let receipt = DatasetResearchUsePreflightReceipt {
+            request,
+            decision_digest: authorization.decision_digest(),
+            graph_digest: authorization.graph().digest(),
+            expires_at: authorization.expires_at(),
+        };
+        drop(authorization);
+        Ok(receipt)
     }
 }
 
@@ -82,6 +187,14 @@ pub trait DatasetBuilder {
         request: DatasetBuildRequest,
         cancellation: CancellationToken,
     ) -> Result<FeatureLabelDataset, DatasetBuildError>;
+
+    /// Builds while retaining exact caller authority through derived-generation publication.
+    async fn build_with_precommit_authority(
+        &self,
+        request: DatasetBuildRequest,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn DatasetBuildPrecommitAuthority>,
+    ) -> Result<FeatureLabelDataset, DatasetBuildError>;
 }
 
 impl DatasetBuilder for DatasetBuilderService<'_> {
@@ -90,7 +203,16 @@ impl DatasetBuilder for DatasetBuilderService<'_> {
         request: DatasetBuildRequest,
         cancellation: CancellationToken,
     ) -> Result<FeatureLabelDataset, DatasetBuildError> {
-        build::build(self, request, cancellation).await
+        build::build(self, request, cancellation, None).await
+    }
+
+    async fn build_with_precommit_authority(
+        &self,
+        request: DatasetBuildRequest,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn DatasetBuildPrecommitAuthority>,
+    ) -> Result<FeatureLabelDataset, DatasetBuildError> {
+        build::build(self, request, cancellation, Some(precommit_authority)).await
     }
 }
 
@@ -142,6 +264,9 @@ pub enum DatasetBuildError {
     /// The caller-selected monotonic deadline elapsed before commit.
     #[error("dataset build deadline elapsed")]
     DeadlineExceeded,
+    /// The caller's publication authority was revoked before the durable generation commit.
+    #[error("dataset build publication authority was revoked")]
+    PublicationAuthorityRevoked,
     /// The process-owned catalog writer lock is unavailable.
     #[error("dataset build catalog authority is unavailable")]
     AuthorityLockPoisoned,
@@ -178,8 +303,8 @@ pub enum DatasetBuildError {
     /// Research-use traversal or publication authority rejected the build.
     #[error("dataset build research-use authority failed: {0}")]
     ResearchUse(#[from] crate::ResearchUseCatalogError),
-    /// Immutable Python dataset admission failed.
-    #[error("dataset build Python admission failed: {0}")]
+    /// Receipt-required feature-dataset production admission failed.
+    #[error("feature-dataset production admission failed: {0}")]
     PythonDataset(#[from] crate::PythonDatasetCatalogError),
     /// Dataset schema construction or resolution failed.
     #[error("dataset build schema is invalid: {0}")]

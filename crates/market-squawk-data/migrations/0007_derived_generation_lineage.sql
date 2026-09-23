@@ -113,7 +113,7 @@ ORDER BY dataset_id, manifest_version;
 CREATE TABLE analytical_generation_objects (
     dataset_id TEXT NOT NULL,
     manifest_version INTEGER NOT NULL,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 1023),
     artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
     content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
     row_count INTEGER NOT NULL CHECK (row_count > 0),

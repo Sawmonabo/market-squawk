@@ -1844,12 +1844,14 @@ mod tests {
 
     use fs2::FileExt as _;
     use market_squawk_domain::{
-        AccountId, ClientOrderId, Currency, Money, OrderId, RuleVersion, SourceIdentifier,
-        Timestamp, VenueId,
+        AccountId, ApprovalId, BasisPoints, ClientOrderId, Currency, Denomination,
+        InstrumentDefinitionRevision, InstrumentExecutionTerms, LotSize, Money, OrderId, OrderSide,
+        OrderType, PriceTicks, QuantityLots, RuleVersion, SourceIdentifier, StrategyId, TickSize,
+        TimeInForce, Timestamp, VenueId,
     };
     use market_squawk_execution::{
-        AccountIdempotencyBootstrap, AccountIdempotencyTombstone, OrderIntentDigest,
-        ReconciledAccountState,
+        AccountIdempotencyBootstrap, AccountIdempotencyTombstone, ExecutionPriceBound,
+        OrderIntentDigest, OrderTargetReference, ReconciledAccountState, RiskPolicyIdentity,
     };
     use market_squawk_platform::LocalPaths;
     use rust_decimal::Decimal;
@@ -1859,14 +1861,16 @@ mod tests {
     #[cfg(unix)]
     use super::read_bounded_regular;
     use super::{
-        CHECKPOINT_OBJECT_ROOT, LEGACY_REPOSITORY_LOCK_PATH, PaperAccountReplaySnapshot,
-        PaperCheckpointPublicationPoint, PaperCheckpointReceipt, PaperCheckpointRepository,
-        PaperCheckpointRepositoryError, REPOSITORY_LOCK_PATH, hex_bytes,
+        CHECKPOINT_OBJECT_ROOT, CURRENT_MANIFEST_PATH, CurrentManifestWire,
+        LEGACY_REPOSITORY_LOCK_PATH, PaperAccountReplaySnapshot, PaperCheckpointPublicationPoint,
+        PaperCheckpointReceipt, PaperCheckpointRepository, PaperCheckpointRepositoryError,
+        REPOSITORY_LOCK_PATH, hex_bytes,
     };
+    use crate::order::PaperOrder;
     use crate::{
         FeeSchedule, PaperAccountBootstrap, PaperExecutionCheckpoint, PaperExecutionConfig,
-        PaperExecutionConfigInput, PaperExposureValuation, PaperLedger, PaperVenueSession,
-        PaperVenueSessionCalendar,
+        PaperExecutionConfigInput, PaperExposureValuation, PaperLedger, PaperOrderLifecycle,
+        PaperVenueSession, PaperVenueSessionCalendar,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2179,6 +2183,88 @@ mod tests {
         let alternate_paths = LocalPaths::prepare(directory.path().join("alternate"))?;
         let (config, mut checkpoint) = checkpoint_fixture()?;
         let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+
+        let legacy_paths = LocalPaths::prepare(directory.path().join("legacy"))?;
+        let mut legacy_checkpoint = checkpoint.clone();
+        legacy_checkpoint.schema_version = 10;
+        let legacy_order = archived_order(None)?;
+        let legacy_order_id = legacy_order.order_id;
+        legacy_checkpoint.sequence = 1;
+        legacy_checkpoint.durable_sequence = 1;
+        legacy_checkpoint.reconciled_orders.insert(legacy_order_id);
+        legacy_checkpoint
+            .archived_orders
+            .insert(legacy_order_id, legacy_order);
+        let legacy_bytes = legacy_checkpoint.encode(maximum_bytes.get())?;
+        assert!(
+            !legacy_bytes
+                .windows(b"target_reference".len())
+                .any(|window| window == b"target_reference")
+        );
+        let legacy_digest: [u8; 32] = Sha256::digest(&legacy_bytes).into();
+        assert_eq!(legacy_checkpoint.recovery_input_digest()?, legacy_digest);
+        let legacy_hex = hex_bytes(&legacy_digest)?;
+        let legacy_parent = format!("{CHECKPOINT_OBJECT_ROOT}/{}", &legacy_hex[..2]);
+        let legacy_reference = format!("{legacy_parent}/{legacy_hex}.json");
+        let legacy_repository_id = [17; 32];
+        let legacy_generation = NonZeroU64::MIN;
+        let legacy_replay = exact_empty_replay(&legacy_checkpoint)?;
+        let legacy_manifest = CurrentManifestWire::try_new(
+            legacy_repository_id,
+            legacy_generation,
+            config.digest(),
+            &legacy_checkpoint,
+            legacy_digest,
+            legacy_digest,
+            legacy_reference.clone(),
+            &legacy_replay,
+        )?;
+        let legacy_root = legacy_paths.artifacts()?.root();
+        std::fs::create_dir_all(legacy_root.join(&legacy_parent))?;
+        std::fs::write(legacy_root.join(&legacy_reference), &legacy_bytes)?;
+        std::fs::write(
+            legacy_root.join(CURRENT_MANIFEST_PATH),
+            serde_json::to_vec(&legacy_manifest)?,
+        )?;
+        let mut legacy_repository = PaperCheckpointRepository::try_new(
+            legacy_paths.artifacts()?.clone(),
+            config.clone(),
+            maximum_bytes,
+        )?;
+        let migrated = legacy_repository
+            .take_recovery()
+            .ok_or("missing migrated version-10 recovery")?;
+        assert_eq!(
+            migrated.checkpoint().schema_version(),
+            PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            migrated.checkpoint().configuration_digest(),
+            config.digest()
+        );
+        assert!(
+            migrated
+                .checkpoint()
+                .orders
+                .values()
+                .chain(migrated.checkpoint().archived_orders.values())
+                .all(|order| order.target_reference.is_none())
+        );
+        drop(legacy_repository);
+
+        let target_reference = OrderTargetReference::try_new(
+            "target.recovery-alpha",
+            NonZeroU64::new(3).ok_or("zero target revision")?,
+            [13; 32],
+        )?;
+        let archived_order = archived_order(Some(target_reference.clone()))?;
+        let archived_order_id = archived_order.order_id;
+        checkpoint.sequence = 1;
+        checkpoint.durable_sequence = 1;
+        checkpoint.reconciled_orders.insert(archived_order_id);
+        checkpoint
+            .archived_orders
+            .insert(archived_order_id, archived_order);
         let mut repository = PaperCheckpointRepository::try_new(
             paths.artifacts()?.clone(),
             config.clone(),
@@ -2194,6 +2280,13 @@ mod tests {
             &checkpoint.encode(maximum_bytes.get())?,
             maximum_bytes.get(),
         )?;
+        assert_eq!(
+            recovered
+                .archived_orders
+                .get(&archived_order_id)
+                .and_then(|order| order.target_reference.as_ref()),
+            Some(&target_reference)
+        );
         let paper_state = &recovered.reconciled_accounts_for_recovery()?[0];
         let risk_state = paper_state.clone();
         let replay = [PaperAccountReplaySnapshot::from_reconciled_state(
@@ -2244,6 +2337,61 @@ mod tests {
             &wrong_root,
         ));
         Ok(())
+    }
+
+    fn archived_order(
+        target_reference: Option<OrderTargetReference>,
+    ) -> Result<PaperOrder, Box<dyn std::error::Error>> {
+        let usd = Currency::try_from("USD")?;
+        let quantity = QuantityLots::new(1)?;
+        let mut lifecycle = PaperOrderLifecycle::try_new(quantity)?;
+        lifecycle.reject(1)?;
+        Ok(PaperOrder {
+            approval_id: ApprovalId::from_str("40000000-0000-0000-0000-000000000089")?,
+            order_id: OrderId::from_str("20000000-0000-0000-0000-000000000089")?,
+            client_order_id: ClientOrderId::try_from("recovered-target-order")?,
+            account_id: AccountId::from_str("50000000-0000-0000-0000-000000000088")?,
+            account_revision: 1,
+            terms: InstrumentExecutionTerms::try_new(
+                "10000000-0000-0000-0000-000000000089".parse()?,
+                InstrumentDefinitionRevision::try_from(1)?,
+                TickSize::try_from_decimal(Decimal::new(1, 2))?,
+                LotSize::try_from_decimal(Decimal::ONE)?,
+                usd,
+                Denomination::Currency(usd),
+                Decimal::ONE,
+            )?,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            quantity,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            maximum_slippage: BasisPoints::new(50),
+            intent_digest: OrderIntentDigest::from_bytes([5; 32]),
+            target_reference,
+            reference_price: PriceTicks::new(90),
+            execution_price_bound: ExecutionPriceBound::try_new(PriceTicks::new(100))?,
+            accepted_at: Timestamp::from_unix_nanos(10),
+            eligible_at: Timestamp::from_unix_nanos(10),
+            expires_at: Timestamp::from_unix_nanos(20),
+            accepted_sequence: 1,
+            cancel_effective_at: None,
+            triggered: true,
+            resting: false,
+            lifecycle,
+            cumulative_fee: Money::new(Decimal::ZERO, usd),
+            weighted_fill_ticks: 0,
+            maximum_fill_price: None,
+            strategy_id: StrategyId::from_str("30000000-0000-0000-0000-000000000089")?,
+            model_id: None,
+            assessment_digest: [6; 32],
+            evidence_binding_digest: [7; 32],
+            portfolio_content_digest: [8; 32],
+            risk_policy: RiskPolicyIdentity::try_from_recovery([9; 32], RuleVersion::new(1)?)?,
+            market_observed_at: Timestamp::from_unix_nanos(10),
+            valid_until: Timestamp::from_unix_nanos(20),
+        })
     }
 
     #[cfg(unix)]

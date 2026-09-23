@@ -286,6 +286,18 @@ impl BacktestDataset {
     pub const fn object_graph_digest(&self) -> Sha256Digest {
         self.object_graph_digest
     }
+
+    /// Returns the exact point-in-time content identity minted by the query authority.
+    #[must_use]
+    pub const fn point_in_time_content(&self) -> Sha256Digest {
+        self.point_in_time_content
+    }
+
+    /// Returns the exact point-in-time audit identity minted by the query authority.
+    #[must_use]
+    pub const fn point_in_time_audit(&self) -> Sha256Digest {
+        self.point_in_time_audit
+    }
 }
 
 fn dataset_identity(input: &BacktestDatasetInput) -> Sha256Digest {
