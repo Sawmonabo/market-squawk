@@ -40,9 +40,9 @@ export const backupManifestSchema = z.object({
   }),
   analyticalReceipt: z
     .object({
-      artifactCount: losslessIntegerSchema,
-      artifactBytes: losslessIntegerSchema,
-      cutoff: timestamp,
+      artifact_count: losslessIntegerSchema,
+      artifact_bytes: losslessIntegerSchema,
+      cutoff_ns: timestamp,
     })
     .passthrough(),
   components: z.array(componentSchema).max(9),

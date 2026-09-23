@@ -3,7 +3,7 @@
 use std::{
     fmt,
     fs::{File, OpenOptions},
-    io::Cursor,
+    io::{Cursor, Read as _},
     sync::Arc,
     time::Duration,
 };
@@ -212,10 +212,25 @@ impl DecisionJournal {
         if bytes.is_empty() || bytes.len() > MAX_BACKUP_BYTES {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
+        // SQLite's online-backup image can retain WAL format bytes even though every committed
+        // page is in this complete image. sqlite3_deserialize cannot open WAL-mode memory images:
+        // https://www.sqlite.org/c3ref/deserialize.html prescribes rollback mode at bytes 18/19.
+        // The caller verified the original content digest first. Normalize only a transient header,
+        // retaining the original body, receipt, schema checks, and complete typed journal replay.
+        let mut header: [u8; 20] = bytes.get(..20)
+            .ok_or(DecisionApplicationError::InvalidPersistentState)?
+            .try_into().map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+        if &header[..16] != b"SQLite format 3\0"
+            || !matches!(&header[18..20], [1, 1] | [2, 2])
+        {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        header[18..20].copy_from_slice(&[1, 1]);
+        let image = Cursor::new(header).chain(Cursor::new(&bytes[20..]));
         let mut source =
             Connection::open_in_memory().map_err(|_error| DecisionApplicationError::Persistence)?;
         source
-            .deserialize_read_exact(MAIN_DB, Cursor::new(bytes), bytes.len(), true)
+            .deserialize_read_exact(MAIN_DB, image, bytes.len(), true)
             .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
         disable_trusted_schema(&source)?;
         verify_integrity(&source)?;

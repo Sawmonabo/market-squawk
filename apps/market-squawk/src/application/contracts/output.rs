@@ -5117,7 +5117,7 @@ fn operations_preview() -> Value {
         vec![
             ("previewId", uuid()),
             ("previewDigest", text()),
-            ("expiresAt", timestamp()),
+            ("expiresAt", integer()),
             ("evidence", record()),
         ],
         &["previewId", "previewDigest", "expiresAt", "evidence"],
