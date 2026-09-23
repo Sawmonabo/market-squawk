@@ -77,6 +77,25 @@ fn metadata_multi_page_data_and_revisions_preserve_exact_evidence() -> TestResul
     );
     assert_eq!(metadata.receipt().redacted_secret_fields(), 1);
     assert!(!String::from_utf8(metadata.retained_payload().to_vec())?.contains("fixture-secret"));
+    let mut description_metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes)?;
+    description_metadata["response"]["description"] = json!("First paragraph.\nSecond\r\n\tline.");
+    let description_metadata_bytes = serde_json::to_vec(&description_metadata)?;
+    assert_eq!(
+        parse_route_metadata(
+            &description_metadata_bytes,
+            &metadata_request,
+            received_at,
+            limits
+        )?
+        .description(),
+        Some("First paragraph.\nSecond\r\n\tline.")
+    );
+    description_metadata["response"]["description"] = json!("invalid\u{1b}control");
+    assert!(matches!(
+        parse_route_metadata(&serde_json::to_vec(&description_metadata)?, &metadata_request, received_at, limits),
+        Err(EiaError::StructureLimit { receipt })
+            if receipt.kind() == EiaStructureLimitKind::ControlCharacter
+    ));
     let mut omitted_metadata_key: serde_json::Value = serde_json::from_slice(&metadata_bytes)?;
     omitted_metadata_key["request"]["params"]
         .as_object_mut()
@@ -264,6 +283,95 @@ fn metadata_multi_page_data_and_revisions_preserve_exact_evidence() -> TestResul
         Err(EiaError::Pagination)
     );
     assert_eq!(page_one.description(), Some("fixture route"));
+    let natural_query = EiaDataQuery::try_new(EiaDataQueryInput {
+        route: query.route().clone(),
+        data_fields: query.data_fields().to_vec(),
+        facets: query.facets().to_vec(),
+        frequency: query.frequency().clone(),
+        start: query.start().map(str::to_owned),
+        end: query.end().map(str::to_owned),
+        sorts: query.sorts()[..2].to_vec(),
+        length: query.length(),
+    })?;
+    let natural_contract = EiaDatasetContract::try_new(EiaDatasetContractInput {
+        metadata: contract.metadata().clone(),
+        query: natural_query.clone(),
+        fields: contract.fields().to_vec(),
+        facet_catalogs: contract.facet_catalogs().to_vec(),
+        descriptor_fields: contract.descriptor_fields().to_vec(),
+        clock_fields: contract.clock_fields().to_vec(),
+    })?;
+    let mut natural_page: serde_json::Value = serde_json::from_slice(&page_one_bytes)?;
+    natural_page["request"]["params"]["sort"] = json!([
+        {"column": "period", "direction": "asc"},
+        {"column": "region", "direction": "asc"}
+    ]);
+    natural_page["response"]["description"] = json!("First paragraph.\nSecond paragraph.");
+    let natural_parsed = EiaDataPage::parse(
+        &serde_json::to_vec(&natural_page)?,
+        natural_query.page(0),
+        &natural_contract,
+        received_at,
+        limits,
+    )?;
+    assert_eq!(
+        natural_parsed.description(),
+        Some("First paragraph.\nSecond paragraph.")
+    );
+    assert_eq!(
+        natural_parsed.observations()[0].series().descriptors(),
+        page_one.observations()[0].series().descriptors()
+    );
+    for field in ["region", "price", "price-units"] {
+        let mut invalid = natural_page.clone();
+        invalid["response"]["data"][0][field] = json!("invalid\nvalue");
+        assert!(matches!(
+            EiaDataPage::parse(&serde_json::to_vec(&invalid)?, natural_query.page(0), &natural_contract, received_at, limits),
+            Err(EiaError::StructureLimit { receipt })
+                if receipt.kind() == EiaStructureLimitKind::ControlCharacter
+        ));
+    }
+    natural_page["response"]["data"][1]["period"] = json!("2024-01");
+    natural_page["response"]["data"][1]["region-name"] = json!("zzzz descriptor");
+    assert_eq!(
+        EiaDataPage::parse(
+            &serde_json::to_vec(&natural_page)?,
+            natural_query.page(0),
+            &natural_contract,
+            received_at,
+            limits
+        ),
+        Err(EiaError::NonTotalSort)
+    );
+    natural_page["request"]["params"]["sort"] = json!([
+        {"column": "period", "direction": "asc"},
+        {"column": "region", "direction": "asc"},
+        {"column": "region-name", "direction": "asc"}
+    ]);
+    assert_eq!(
+        EiaDataPage::parse(
+            &serde_json::to_vec(&natural_page)?,
+            query.page(0),
+            &contract,
+            received_at,
+            limits,
+        ),
+        Err(EiaError::NonTotalSort)
+    );
+    let mut duplicate_next_page: serde_json::Value = serde_json::from_slice(&page_two_bytes)?;
+    duplicate_next_page["response"]["data"][0]["period"] = json!("2024-02");
+    duplicate_next_page["response"]["data"][0]["region-name"] = json!("zzzz descriptor");
+    let duplicate_next_page = EiaDataPage::parse(
+        &serde_json::to_vec(&duplicate_next_page)?,
+        query.page(2),
+        &contract,
+        received_at,
+        limits,
+    )?;
+    assert_eq!(
+        EiaAcquisition::try_from_pages(vec![page_one.clone(), duplicate_next_page]),
+        Err(EiaError::NonTotalSort)
+    );
     let mut omitted_data_key: serde_json::Value = serde_json::from_slice(&page_one_bytes)?;
     omitted_data_key["request"]["params"]
         .as_object_mut()

@@ -125,6 +125,22 @@ pub(crate) fn parse_bounded_string(
     value: &Value,
     limits: EiaParseLimits,
 ) -> Result<String, EiaError> {
+    parse_bounded_text(value, limits, false)
+}
+
+/// Descriptions may contain ordinary paragraph/indentation whitespace, never terminal controls.
+pub(crate) fn parse_bounded_description(
+    value: &Value,
+    limits: EiaParseLimits,
+) -> Result<String, EiaError> {
+    parse_bounded_text(value, limits, true)
+}
+
+fn parse_bounded_text(
+    value: &Value,
+    limits: EiaParseLimits,
+    allow_description_whitespace: bool,
+) -> Result<String, EiaError> {
     let value = value.as_str().ok_or(EiaError::InvalidProtocol)?;
     if value.len() > limits.max_string_bytes() {
         return Err(EiaError::structure_limit(
@@ -133,7 +149,10 @@ pub(crate) fn parse_bounded_string(
             limits.max_string_bytes(),
         ));
     }
-    if value.chars().any(char::is_control) {
+    if value.chars().any(|character| {
+        character.is_control()
+            && !(allow_description_whitespace && matches!(character, '\n' | '\r' | '\t'))
+    }) {
         return Err(EiaError::structure_limit(
             EiaStructureLimitKind::ControlCharacter,
             1,

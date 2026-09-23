@@ -26,13 +26,7 @@ pub(crate) fn electricity_price_query(
         frequency: field("monthly")?,
         start: Some(start_period),
         end: Some(end_period),
-        sorts: [
-            "period",
-            "stateid",
-            "sectorid",
-            "stateDescription",
-            "sectorName",
-        ]
+        sorts: ["period", "stateid", "sectorid"]
         .into_iter()
         .map(|name| Ok(EiaSort::new(field(name)?, EiaSortDirection::Ascending)))
         .collect::<Result<Vec<_>, EiaError>>()?,

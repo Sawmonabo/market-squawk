@@ -8,7 +8,10 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::types::digest_parts;
-use crate::wire::{object_schema_digest, parse_bounded_string, parse_count, parse_envelope};
+use crate::wire::{
+    object_schema_digest, parse_bounded_description, parse_bounded_string, parse_count,
+    parse_envelope,
+};
 use crate::{
     EiaApiVersion, EiaDigest, EiaError, EiaFacetValue, EiaFieldId, EiaMetadataRequest,
     EiaMetadataRequestKind, EiaParseLimits, EiaRoute, EiaStructureLimitKind,
@@ -472,7 +475,7 @@ pub fn parse_route_metadata(
 
     let id = take_optional_identifier(&mut response, "id", limits)?;
     let name = take_optional_string(&mut response, "name", limits)?;
-    let description = take_optional_string(&mut response, "description", limits)?;
+    let description = take_optional_description(&mut response, limits)?;
     let child_routes = parse_children(response.remove("routes"), limits)?;
     let frequencies = parse_frequencies(response.remove("frequency"), limits)?;
     let facets = parse_facets(response.remove("facets"), limits)?;
@@ -615,7 +618,7 @@ fn parse_children(
         children.push(EiaChildRoute {
             id: take_required_identifier(&mut object, "id", limits)?,
             name: take_optional_string(&mut object, "name", limits)?,
-            description: take_optional_string(&mut object, "description", limits)?,
+            description: take_optional_description(&mut object, limits)?,
         });
     }
     children.sort_by(|left, right| left.id.cmp(&right.id));
@@ -637,7 +640,7 @@ fn parse_frequencies(
         let mut object = exact_object(value, &["id", "description", "query", "format"])?;
         frequencies.push(EiaFrequencyMetadata {
             id: take_required_identifier(&mut object, "id", limits)?,
-            description: take_optional_string(&mut object, "description", limits)?,
+            description: take_optional_description(&mut object, limits)?,
             query: take_optional_string(&mut object, "query", limits)?,
             format: take_required_string(&mut object, "format", limits)?,
         });
@@ -661,7 +664,7 @@ fn parse_facets(
         let mut object = exact_object(value, &["id", "description"])?;
         facets.push(EiaFacetMetadata {
             id: take_required_identifier(&mut object, "id", limits)?,
-            description: take_optional_string(&mut object, "description", limits)?,
+            description: take_optional_description(&mut object, limits)?,
         });
     }
     facets.sort_by(|left, right| left.id.cmp(&right.id));
@@ -756,6 +759,16 @@ fn take_optional_string(
     object
         .remove(key)
         .map(|value| parse_bounded_string(&value, limits))
+        .transpose()
+}
+
+fn take_optional_description(
+    object: &mut Map<String, Value>,
+    limits: EiaParseLimits,
+) -> Result<Option<String>, EiaError> {
+    object
+        .remove("description")
+        .map(|value| parse_bounded_description(&value, limits))
         .transpose()
 }
 

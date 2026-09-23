@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use crate::metadata::{EiaFacetCatalog, EiaFacetMetadata, EiaRouteMetadata};
 use crate::request::EiaDataPageRequest;
 use crate::types::digest_parts;
-use crate::wire::{parse_bounded_string, parse_count, parse_envelope};
+use crate::wire::{parse_bounded_description, parse_bounded_string, parse_count, parse_envelope};
 use crate::{
     EiaApiVersion, EiaDataQuery, EiaDigest, EiaError, EiaFacetFilter, EiaFacetValue, EiaFieldId,
     EiaParseLimits, EiaRoute, EiaSortDirection, EiaStructureLimitKind,
@@ -657,7 +657,7 @@ struct EiaReturnedSortCoordinate {
     direction: EiaSortDirection,
 }
 
-/// Exact provider-returned row coordinates in the query's ordered sort directions.
+/// Exact period/facet coordinates in the query's ordered directions, excluding display labels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EiaReturnedSortKey {
     coordinates: Arc<[EiaReturnedSortCoordinate]>,
@@ -679,11 +679,13 @@ impl EiaReturnedSortKey {
                 period.raw().to_owned()
             } else if let Some(facet) = facets.iter().find(|facet| facet.facet() == sort.column()) {
                 facet.value().as_str().to_owned()
-            } else if let Some(descriptor) = descriptors
+            } else if descriptors
                 .iter()
-                .find(|descriptor| descriptor.field() == sort.column())
+                .any(|descriptor| descriptor.field() == sort.column())
             {
-                descriptor.value().to_owned()
+                // Optional descriptor suffix sorts must never distinguish duplicate natural
+                // coordinates, either within a page or across its retained endpoint keys.
+                continue;
             } else {
                 return Err(EiaError::NonTotalSort);
             };
@@ -985,7 +987,7 @@ impl EiaDataPage {
         }
         let description = response
             .remove("description")
-            .map(|value| parse_bounded_string(&value, limits))
+            .map(|value| parse_bounded_description(&value, limits))
             .transpose()?;
         let rows = match response.remove("data") {
             Some(Value::Array(rows)) => rows,
@@ -2136,13 +2138,17 @@ fn validate_total_sort(
     let period = EiaFieldId::try_from("period")?;
     let mut required = BTreeSet::new();
     required.insert(period);
-    for coordinate in query
-        .facets()
-        .iter()
-        .map(|facet| facet.facet())
-        .chain(descriptor_fields)
-    {
+    for coordinate in query.facets().iter().map(|facet| facet.facet()) {
         if !required.insert(coordinate.clone()) {
+            return Err(EiaError::NonTotalSort);
+        }
+    }
+    // Facet IDs and period are mandatory ordering coordinates. Display descriptors remain
+    // exact retained evidence but need not be sortable provider columns. Strict returned-key
+    // ordering still rejects duplicate coordinates, including rows with different descriptors.
+    let mut allowed = required.clone();
+    for descriptor in descriptor_fields {
+        if !allowed.insert(descriptor.clone()) {
             return Err(EiaError::NonTotalSort);
         }
     }
@@ -2151,7 +2157,15 @@ fn validate_total_sort(
         .iter()
         .map(|sort| sort.column().clone())
         .collect::<BTreeSet<_>>();
-    if actual != required || query.sorts().len() != required.len() {
+    if !required.is_subset(&actual)
+        || !actual.is_subset(&allowed)
+        || query.sorts().len() != actual.len()
+        || query
+            .sorts()
+            .iter()
+            .take(required.len())
+            .any(|sort| !required.contains(sort.column()))
+    {
         return Err(EiaError::NonTotalSort);
     }
     Ok(())
