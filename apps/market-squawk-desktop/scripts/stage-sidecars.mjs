@@ -1,12 +1,15 @@
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   realpathSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -176,10 +179,7 @@ function stageCompleteRelease() {
   }
   const manifest = JSON.parse(manifestBytes.toString("utf8"))
   const target = manifest?.targets?.[0]
-  const bundleMetadata = controlledReleaseFile(
-    join(releaseOutput, bundleName),
-    2 * 1024 * 1024 * 1024,
-  )
+  const bundleMetadata = controlledReleaseFile(join(releaseOutput, bundleName))
   if (
     manifest?.schema_version !== 2 ||
     manifest?.product !== "market-squawk" ||
@@ -197,7 +197,7 @@ function stageCompleteRelease() {
   ) {
     throw new Error("The complete release manifest does not match this native package.")
   }
-  controlledReleaseFile(join(releaseOutput, bootstrapName), 256 * 1024 * 1024)
+  controlledReleaseFile(join(releaseOutput, bootstrapName))
   controlledReleaseFile(
     join(releaseOutput, manifestName),
     MAXIMUM_RELEASE_MANIFEST_BYTES,
@@ -245,13 +245,13 @@ function parseChecksums(value) {
   return parsed
 }
 
-function controlledReleaseFile(path, maximumBytes) {
+function controlledReleaseFile(path, maximumBytes = null) {
   const metadata = lstatSync(path)
   if (
     metadata.isSymbolicLink() ||
     !metadata.isFile() ||
     metadata.size === 0 ||
-    metadata.size > maximumBytes
+    (maximumBytes !== null && metadata.size > maximumBytes)
   ) {
     throw new Error("A complete release file violates its fixed identity bounds.")
   }
@@ -259,7 +259,31 @@ function controlledReleaseFile(path, maximumBytes) {
 }
 
 function fileSha256(path) {
-  return sha256(readFileSync(path))
+  const before = lstatSync(path)
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error("A complete release file is not regular.")
+  }
+  const descriptor = openSync(path, "r")
+  const digest = createHash("sha256")
+  const buffer = Buffer.allocUnsafe(64 * 1024)
+  try {
+    let count
+    while ((count = readSync(descriptor, buffer, 0, buffer.length, null)) !== 0) {
+      digest.update(buffer.subarray(0, count))
+    }
+  } finally {
+    closeSync(descriptor)
+  }
+  const after = lstatSync(path)
+  if (
+    after.isSymbolicLink() ||
+    !after.isFile() ||
+    after.size !== before.size ||
+    after.mtimeMs !== before.mtimeMs
+  ) {
+    throw new Error("A complete release file changed during hashing.")
+  }
+  return digest.digest("hex")
 }
 
 async function prepareLinuxBundlerTools(targetDirectory) {

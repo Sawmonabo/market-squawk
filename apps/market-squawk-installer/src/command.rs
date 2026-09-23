@@ -30,8 +30,8 @@ use crate::lifecycle::{
     uninstall, update,
 };
 use crate::manifest::{
-    ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_ARCHIVE_ENTRIES,
-    MAXIMUM_ENTRY_BYTES, MAXIMUM_MANIFEST_BYTES, ReleaseManifest,
+    ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_ENTRIES, MAXIMUM_MANIFEST_BYTES,
+    ReleaseManifest,
 };
 use crate::platform::{NativeTrustMode, ProgramName, SupportedTarget, default_install_root};
 use crate::service_registration::{
@@ -194,11 +194,15 @@ pub async fn update_from_channel(root: &Path) -> Result<InstallReceipt, CommandE
     if manifest.len() > MAXIMUM_MANIFEST_BYTES {
         return Err(CommandError::DownloadIdentity);
     }
+    let archive_size = ReleaseManifest::admit_current(&manifest)?
+        .target_release()
+        .archive
+        .size;
     let bundle = download_target_file(
         &client,
         repository_url(&base, &archive_download_path)?,
         root,
-        MAXIMUM_ARCHIVE_BYTES,
+        archive_size,
     )
     .await?;
     let root_refs = root_chain.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -525,7 +529,7 @@ fn build_release_manifest(
         return Err(CommandError::ManifestBuild);
     }
     let root = controlled_staging_root(&arguments.staging_root)?;
-    let bundle = controlled_regular_file(&arguments.bundle, MAXIMUM_ARCHIVE_BYTES)?;
+    let bundle = controlled_regular_file(&arguments.bundle)?;
     let output = new_output_path(&arguments.output, &root)?;
     let components = staged_components(&root, target)?;
     let paths_before = components
@@ -542,7 +546,7 @@ fn build_release_manifest(
     }
 
     let bundle_size = fs::metadata(&bundle).map_err(CommandError::Io)?.len();
-    let bundle_sha256 = stable_sha256_file(&bundle, MAXIMUM_ARCHIVE_BYTES)?;
+    let bundle_sha256 = stable_sha256_file(&bundle)?;
     let value = json!({
         "schema_version": crate::manifest::MANIFEST_SCHEMA_VERSION,
         "product": "market-squawk",
@@ -628,12 +632,11 @@ fn controlled_staging_root(path: &Path) -> Result<PathBuf, CommandError> {
     path.canonicalize().map_err(CommandError::Io)
 }
 
-fn controlled_regular_file(path: &Path, maximum: u64) -> Result<PathBuf, CommandError> {
+fn controlled_regular_file(path: &Path) -> Result<PathBuf, CommandError> {
     let metadata = fs::symlink_metadata(path).map_err(CommandError::Io)?;
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() == 0
-        || metadata.len() > maximum
     {
         return Err(CommandError::ManifestBuild);
     }
@@ -670,7 +673,7 @@ fn staged_components(
             let file = root.join(Path::new(&path));
             let metadata = fs::symlink_metadata(&file).map_err(CommandError::Io)?;
             let size = metadata.len();
-            let sha256 = stable_sha256_file(&file, MAXIMUM_ENTRY_BYTES)?;
+            let sha256 = stable_sha256_file(&file)?;
             Ok(ComponentIdentity {
                 path: path.into(),
                 role,
@@ -767,11 +770,10 @@ fn file_is_executable(_metadata: &fs::Metadata, role: ComponentRole) -> bool {
     role.requires_executable()
 }
 
-fn stable_sha256_file(path: &Path, maximum: u64) -> Result<String, CommandError> {
+fn stable_sha256_file(path: &Path) -> Result<String, CommandError> {
     let named_before = fs::symlink_metadata(path).map_err(CommandError::Io)?;
     if !named_before.file_type().is_file()
         || named_before.file_type().is_symlink()
-        || named_before.len() > maximum
     {
         return Err(CommandError::ManifestBuild);
     }
@@ -790,7 +792,7 @@ fn stable_sha256_file(path: &Path, maximum: u64) -> Result<String, CommandError>
         }
         observed = observed
             .checked_add(u64::try_from(read).map_err(|_| CommandError::ManifestBuild)?)
-            .filter(|bytes| *bytes <= maximum)
+            .filter(|bytes| *bytes <= named_before.len())
             .ok_or(CommandError::ManifestBuild)?;
         digest.update(&buffer[..read]);
     }
@@ -971,14 +973,23 @@ fn consistent_target_path(bytes: &[u8], logical_path: &str) -> Result<String, Co
     Ok(format!("{parent}/{digest}.{name}"))
 }
 
+fn ensure_download_space(parent: &Path, expected_size: u64) -> Result<(), CommandError> {
+    let available = fs2::available_space(parent).map_err(CommandError::Io)?;
+    if expected_size > available {
+        return Err(CommandError::InsufficientSpace);
+    }
+    Ok(())
+}
+
 async fn download_target_file(
     client: &reqwest::Client,
     url: Url,
     install_root: &Path,
-    maximum: u64,
+    expected_size: u64,
 ) -> Result<NamedTempFile, CommandError> {
     let parent = install_root.parent().ok_or(CommandError::DownloadRoot)?;
     fs::create_dir_all(parent).map_err(CommandError::Io)?;
+    ensure_download_space(parent, expected_size)?;
     let mut output = tempfile::Builder::new()
         .prefix(".market-squawk-download-")
         .suffix(".target")
@@ -993,7 +1004,7 @@ async fn download_target_file(
         .map_err(CommandError::Network)?;
     if response
         .content_length()
-        .is_some_and(|length| length > maximum)
+        .is_some_and(|length| length != expected_size)
     {
         return Err(CommandError::DownloadIdentity);
     }
@@ -1003,11 +1014,11 @@ async fn download_target_file(
         let chunk = chunk.map_err(CommandError::Network)?;
         total = total
             .checked_add(u64::try_from(chunk.len()).map_err(|_| CommandError::DownloadIdentity)?)
-            .filter(|value| *value <= maximum)
+            .filter(|value| *value <= expected_size)
             .ok_or(CommandError::DownloadIdentity)?;
         output.write_all(&chunk).map_err(CommandError::Io)?;
     }
-    if total == 0 {
+    if total != expected_size {
         return Err(CommandError::DownloadIdentity);
     }
     output.as_file_mut().sync_all().map_err(CommandError::Io)?;
@@ -1102,6 +1113,7 @@ async fn download_release(
 
     let parent = install_root.parent().ok_or(CommandError::DownloadRoot)?;
     fs::create_dir_all(parent).map_err(CommandError::Io)?;
+    ensure_download_space(parent, release.target_release().archive.size)?;
     let mut bundle = tempfile::Builder::new()
         .prefix(".market-squawk-download-")
         .suffix(".zip")
@@ -1127,7 +1139,7 @@ async fn download_release(
         total = total
             .checked_add(u64::try_from(chunk.len()).map_err(|_| CommandError::DownloadIdentity)?)
             .ok_or(CommandError::DownloadIdentity)?;
-        if total > release.target_release().archive.size || total > MAXIMUM_ARCHIVE_BYTES {
+        if total > release.target_release().archive.size {
             return Err(CommandError::DownloadIdentity);
         }
         bundle.write_all(&chunk).map_err(CommandError::Io)?;
@@ -1287,6 +1299,8 @@ pub enum CommandError {
     DownloadIdentity,
     #[error("the installation root has no usable parent directory")]
     DownloadRoot,
+    #[error("the release download exceeds available disk space")]
+    InsufficientSpace,
     #[error("release manifest build input changed, escaped its boundary, or is inconsistent")]
     ManifestBuild,
     #[error("failed to install the process TLS provider")]

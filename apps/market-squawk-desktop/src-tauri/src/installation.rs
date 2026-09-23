@@ -70,10 +70,20 @@ pub(crate) fn prepare(
                 &active,
                 current.previous_version(),
             ) {
-                update(
-                    UpdateRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
-                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
-                )?;
+                // A native package is a local release, not a threshold-signed network update.
+                let result = UpdateRequest::from_local(
+                    root.clone(),
+                    &packaged.manifest,
+                    &packaged.bundle,
+                )
+                .and_then(update);
+                if let Err(error) = result {
+                    return continue_healthy_installed_after_optional_failure(
+                        root,
+                        &current_snapshot,
+                        error,
+                    );
+                }
                 changed = true;
             } else if packaged.version == active
                 && (!current.is_healthy()
@@ -81,10 +91,20 @@ pub(crate) fn prepare(
                     || current.channel_manifest_url()
                         != Some(packaged.channel_manifest_url.as_ref()))
             {
-                repair(
-                    RepairRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
-                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
-                )?;
+                let result = RepairRequest::from_local(
+                    root.clone(),
+                    &packaged.manifest,
+                    &packaged.bundle,
+                )
+                .and_then(|request| request.with_channel_manifest_url(&packaged.channel_manifest_url))
+                .and_then(repair);
+                if let Err(error) = result {
+                    return continue_healthy_installed_after_optional_failure(
+                        root,
+                        &current_snapshot,
+                        error,
+                    );
+                }
                 changed = true;
             } else if !current.is_healthy() {
                 match recover_active_or_previous(&root) {
@@ -104,10 +124,16 @@ pub(crate) fn prepare(
                 }
             } else if current.channel_manifest_url() != Some(packaged.channel_manifest_url.as_ref())
             {
-                repair(
-                    RepairRequest::new(root.clone())
-                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
-                )?;
+                let result = RepairRequest::new(root.clone())
+                    .with_channel_manifest_url(&packaged.channel_manifest_url)
+                    .and_then(repair);
+                if let Err(error) = result {
+                    return continue_healthy_installed_after_optional_failure(
+                        root,
+                        &current_snapshot,
+                        error,
+                    );
+                }
                 changed = true;
             }
         } else if !current.is_healthy() {
@@ -138,6 +164,29 @@ pub(crate) fn prepare(
         });
     }
     Err(InstallationStartupError::PackagedReleaseUnavailable)
+}
+
+fn continue_healthy_installed_after_optional_failure(
+    root: PathBuf,
+    before: &ProgramInstallSnapshot,
+    error: InstallError,
+) -> Result<PreparedInstallation, InstallationStartupError> {
+    if before.status().is_healthy() {
+        if let Ok(after) = program_install_snapshot(&root, ProgramName::Desktop) {
+            if after.status().is_healthy()
+                && after.status().active_version() == before.status().active_version()
+                && after.status().manifest_sha256() == before.status().manifest_sha256()
+                && after.active_release_root() == before.active_release_root()
+                && after.program_path() == before.program_path()
+            {
+                eprintln!(
+                    "market-squawk-desktop: packaged maintenance failed ({error}); continuing the verified installed release"
+                );
+                return prepared_snapshot(root, after);
+            }
+        }
+    }
+    Err(error.into())
 }
 
 fn prepared_installed(root: PathBuf) -> Result<PreparedInstallation, InstallationStartupError> {

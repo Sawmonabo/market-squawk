@@ -11,9 +11,6 @@ use url::Url;
 
 use crate::platform::{NativeTrustMode, PlatformError, SupportedTarget};
 
-pub(crate) const MAXIMUM_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-pub(crate) const MAXIMUM_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
-pub(crate) const MAXIMUM_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Maximum encoded byte length of one per-platform release manifest.
 pub const MAXIMUM_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAXIMUM_ARCHIVE_ENTRIES: usize = 32_768;
@@ -188,9 +185,6 @@ impl TargetRelease {
             expanded_bytes = expanded_bytes
                 .checked_add(component.size)
                 .ok_or(ManifestError::ExpandedSize)?;
-            if expanded_bytes > MAXIMUM_EXPANDED_BYTES {
-                return Err(ManifestError::ExpandedSize);
-            }
             previous_path = Some(&component.path);
         }
 
@@ -252,7 +246,7 @@ pub(crate) struct ArtifactIdentity {
 
 impl ArtifactIdentity {
     fn validate(&self, tag: &str) -> Result<(), ManifestError> {
-        if self.size == 0 || self.size > MAXIMUM_ARCHIVE_BYTES || !is_lower_sha256(&self.sha256) {
+        if self.size == 0 || !is_lower_sha256(&self.sha256) {
             return Err(ManifestError::ArchiveIdentity);
         }
         let url = Url::parse(&self.url).map_err(|_| ManifestError::ArchiveUrl)?;
@@ -286,8 +280,7 @@ pub(crate) struct ComponentIdentity {
 impl ComponentIdentity {
     fn validate(&self) -> Result<(), ManifestError> {
         validate_portable_path(&self.path)?;
-        if self.size > MAXIMUM_ENTRY_BYTES
-            || (self.size == 0 && self.role.requires_executable())
+        if (self.size == 0 && self.role.requires_executable())
             || !is_lower_sha256(&self.sha256)
             || (self.role.requires_executable() && !self.executable)
         {
@@ -441,7 +434,7 @@ pub enum ManifestError {
         target: SupportedTarget,
     },
     /// Archive size or digest is invalid.
-    #[error("release archive identity is malformed or outside its fixed size bound")]
+    #[error("release archive identity is malformed")]
     ArchiveIdentity,
     /// Archive URL is not an uncredentialed HTTPS URL.
     #[error("release archive URL must be an uncredentialed HTTPS URL without a fragment")]
@@ -449,8 +442,8 @@ pub enum ManifestError {
     /// Components are empty, excessive, duplicated, or unsorted.
     #[error("release components must be nonempty, bounded, sorted, and portable-unique")]
     ComponentSet,
-    /// Expanded component sizes overflow or exceed the fixed bound.
-    #[error("release components exceed the fixed expanded-size bound")]
+    /// Expanded component sizes overflow.
+    #[error("release component sizes overflow")]
     ExpandedSize,
     /// A component path, size, digest, role, or executable contract is invalid.
     #[error("release component identity is invalid: {path}")]

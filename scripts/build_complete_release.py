@@ -20,9 +20,6 @@ import zipfile
 
 
 MAXIMUM_FILES = 32_768
-MAXIMUM_FILE_BYTES = 1024 * 1024 * 1024
-MAXIMUM_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
-MAXIMUM_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAXIMUM_PLATFORM_MANIFEST_BYTES = 8 * 1024 * 1024
 MAXIMUM_UPDATE_METADATA_BYTES = 1024 * 1024
 COPY_BUFFER_BYTES = 1024 * 1024
@@ -978,7 +975,6 @@ def _admit_manifest_target(
     ):
         raise ReleaseBuildError("platform release archive identity is invalid")
     previous = None
-    expanded = 0
     for component in components:
         if not isinstance(component, dict) or set(component) != {
             "executable",
@@ -997,14 +993,10 @@ def _admit_manifest_target(
             and previous >= path
             or not isinstance(component["size"], int)
             or component["size"] < 0
-            or component["size"] > MAXIMUM_FILE_BYTES
             or re.fullmatch(r"[0-9a-f]{64}", str(component["sha256"])) is None
             or not isinstance(component["executable"], bool)
         ):
             raise ReleaseBuildError("platform release component identity is invalid")
-        expanded += component["size"]
-        if expanded > MAXIMUM_EXPANDED_BYTES:
-            raise ReleaseBuildError("platform release component set is oversized")
         previous = path
 
 
@@ -1451,7 +1443,6 @@ def controlled_regular_file(path: Path, label: str, maximum: int) -> Path:
 
 def list_regular_paths(root: Path) -> tuple[str, ...]:
     paths = []
-    total = 0
     pending = [root]
     while pending:
         directory = pending.pop()
@@ -1467,13 +1458,8 @@ def list_regular_paths(root: Path) -> tuple[str, ...]:
             relative = child.relative_to(root).as_posix()
             validate_portable_path(relative)
             paths.append(relative)
-            total += metadata.st_size
-            if (
-                len(paths) > MAXIMUM_FILES
-                or metadata.st_size > MAXIMUM_FILE_BYTES
-                or total > MAXIMUM_EXPANDED_BYTES
-            ):
-                raise ReleaseBuildError("release input exceeds its fixed size bounds")
+            if len(paths) > MAXIMUM_FILES:
+                raise ReleaseBuildError("release input exceeds its file-count bound")
     return tuple(sorted(paths))
 
 
@@ -1496,9 +1482,8 @@ def copy_stable(source: Path, destination: Path, *, executable: bool) -> None:
     if (
         source.is_symlink()
         or not stat.S_ISREG(before.st_mode)
-        or before.st_size > MAXIMUM_FILE_BYTES
     ):
-        raise ReleaseBuildError("release source is not a bounded regular file")
+        raise ReleaseBuildError("release source is not a regular file")
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
     if destination.exists() or destination.is_symlink():
         raise ReleaseBuildError("release staging path is duplicated")
@@ -1585,8 +1570,8 @@ def write_deterministic_zip(staging: Path, output: Path) -> None:
             information.flag_bits |= 0x800
             with source.open("rb") as reader, archive.open(information, "w") as writer:
                 shutil.copyfileobj(reader, writer, COPY_BUFFER_BYTES)
-    if output.stat().st_size == 0 or output.stat().st_size > MAXIMUM_ARCHIVE_BYTES:
-        raise ReleaseBuildError("release archive exceeds its fixed byte bound")
+    if output.stat().st_size == 0:
+        raise ReleaseBuildError("release archive is empty")
     with zipfile.ZipFile(output, "r") as archive:
         if tuple(member.filename for member in archive.infolist()) != list_regular_paths(staging):
             raise ReleaseBuildError("release archive inventory changed after construction")

@@ -20,7 +20,7 @@ use crate::contracts::{
     RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 use crate::manifest::{
-    AdmittedRelease, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
+    AdmittedRelease, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
 };
 use crate::platform::{NativeTrustMode, ProgramName};
 use crate::service_registration::{
@@ -279,7 +279,8 @@ pub fn program_install_snapshot(
     };
     let active_release_root = store.version_path(&state.active);
     let healthy = verify_installed_tree(&active_release_root, &state.active.components).is_ok()
-        && verify_stable_programs(&store, &state).is_ok();
+        && verify_stable_programs(&store, &state).is_ok()
+        && verify_service_registration(&store, &state.active).is_ok();
     let recovery_ready = read_cached_release(&store, &state.active).is_ok();
     let status = installed_status(&state, healthy);
     if !healthy {
@@ -1334,7 +1335,7 @@ fn copy_exact_bundle(
         total = total
             .checked_add(u64::try_from(read).map_err(|_| InstallError::CorruptInstallation)?)
             .ok_or(InstallError::CorruptInstallation)?;
-        if total > expected_size || total > MAXIMUM_ARCHIVE_BYTES {
+        if total > expected_size {
             return Err(InstallError::Archive(ArchiveError::SizeLimit));
         }
         output

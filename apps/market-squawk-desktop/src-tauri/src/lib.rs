@@ -51,8 +51,6 @@ use service_client::{
 };
 
 #[cfg(target_os = "linux")]
-const MAXIMUM_APPIMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-#[cfg(target_os = "linux")]
 const APPIMAGE_HEADER_BYTES: usize = 11;
 #[cfg(target_os = "linux")]
 const DESKTOP_EXECUTABLE_BASENAME: &str = "market-squawk-desktop";
@@ -497,7 +495,6 @@ pub(crate) fn appimage_mcp_launcher(
     if named.file_type().is_symlink()
         || !named.is_file()
         || named.len() == 0
-        || named.len() > MAXIMUM_APPIMAGE_BYTES
         || mode & 0o111 == 0
         || mode & 0o022 != 0
         || (owner != 0 && owner != process_owner)

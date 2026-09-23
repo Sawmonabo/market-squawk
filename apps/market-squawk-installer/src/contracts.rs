@@ -337,6 +337,11 @@ impl InstallStatus {
         self.previous_version.as_deref()
     }
 
+    /// Returns the active release manifest digest when installed.
+    pub fn manifest_sha256(&self) -> Option<&str> {
+        self.manifest_sha256.as_deref()
+    }
+
     /// Returns the retained HTTPS update channel when present.
     pub fn channel_manifest_url(&self) -> Option<&str> {
         self.channel_manifest_url.as_deref()
