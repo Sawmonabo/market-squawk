@@ -111,12 +111,17 @@ linked worktrees**. EIA's full live-to-installed product journey remains open.
 
 ## Post-audit Coinbase disposition and retirement
 
-The `coinbase-native-identity` worktree was at `b04c2674`, an ancestor of the
-pushed target `fb1fd319`. Its 11 modified tracked files and two untracked files
-implemented adapter-owned copies of provider identity and synthetic reference
+The directory named `coinbase-native-identity` belonged to branch
+`feature/coinbase-provider-identity-selection` at `b04c2674`, an ancestor of
+the pushed target `fb1fd319`. This is distinct from the still-live local and
+origin branch `feature/coinbase-native-identity` at `12a6b5d7`, whose unique
+commits remain pending separate semantic reconciliation. The retired worktree's
+11 modified tracked files and two untracked files implemented adapter-owned
+copies of provider identity and synthetic reference
 fixtures. Current V1 selects an opaque identity in the instrument catalog,
 retains it with source and capture authority in the registry, and revalidates
-that selection through application publication. Replaying the old constructor
+that selection through application publication. Coinbase public profile and
+decoder binding to that selection remain open. Replaying the old constructor
 would break current application callers and duplicate that authority. The
 per-file disposition and exact WIP copy are preserved in
 `/Users/sawmonabo/dev/market-squawk-handoff-backups/2026-09-23-coinbase-wip-reconciliation/`.
@@ -133,3 +138,40 @@ local branch with `git branch -d`. The resulting live inventory is **27 local
 branches, 19 origin heads and 10 linked worktrees**. The target, independent
 backup and other worktrees remain intact. Coinbase's complete live-to-installed
 product journey remains a separate acceptance barrier.
+
+## Retained work after the cleanup wave
+
+The `feature/coinbase-native-identity` branch at `12a6b5d7` is a different,
+worktree-free branch from the retired Coinbase worktree above. Its ten unique
+commits use an older native-attestation design; current provider-neutral
+startup and publication wiring is still uncommitted. It has no open PR, but
+retirement awaits accepted replacement or independent commit custody.
+
+The independent backups in this section are under
+`/Users/sawmonabo/dev/market-squawk-handoff-backups/`. The
+`alpaca-native-identity` worktree at `049faf72` has nine tracked and three
+untracked files plus six unique commits. Its current-design successors exist
+only in the dirty target, so it remains linked. All source files, commits and a
+Git bundle are preserved in the independent
+`2026-09-23-alpaca-wip-reconciliation` backup (manifest SHA-256
+`79e199e1b187e8c8358f0dc61213f9e7371ca3ca3797ac95e442f5ab00f501c1`).
+
+The `source-current-integration` head `8c7ee0b0` is an ancestor of the target,
+but its worktree has ten staged and 47 unstaged files. Its static attestation
+code cannot be adopted as written: its public crypto composition uses an empty
+identity registry and old native namespaces. Fourteen files still express
+required Coinbase/Kraken intent: the target selects catalog identity, but
+constructs live profiles and decoder coordinates from static configuration
+before consuming that selection. The corrected 57-file custody backup is
+`2026-09-23-source-current-wip-reconciliation` (manifest SHA-256
+`c1a14e0b5adf8911b3895e15c43de641b1181995755e39df5e2ec0df1a5dd089`);
+its 70 checksums and live staged/unstaged patch hashes verified. This
+worktree remains until the current provider bindings are integrated.
+
+The `kraken-native-identity` worktree at `a0cdc33c` has five unique commits and
+six tracked edits with still-needed catalog-bound profile and worker-draining
+behavior. The `crypto-canonical-data` worktree at `3facc2b2` retains an
+unresolved transitive source-run availability proof for derived data. Neither
+was removed; old code will be selected only where it fits the current V1
+contracts. These retained states are product/integration work, not accepted
+provider completion.
