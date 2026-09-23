@@ -9,16 +9,20 @@ available through optional maintenance failure. Focused installer rollback and
 Desktop compilation passed; installed live restart and the final release gate
 remain open. The target checkout still contains substantial uncommitted V1 work.
 
-At this head, live inventory is 29 local branches, 20 origin heads and 12 linked
-worktrees; all worktrees are dirty. No branch or worktree was removed in this
-audit. Three side commits are already ancestors of the target, but their dirty
-worktrees still need reconciliation. Five Dependabot PRs remain open. The exact
+After the EIA retirement, live inventory is 28 local branches, 19 origin heads
+and 11 linked worktrees; all remaining worktrees are dirty. EIA's obsolete
+source worktree and local/remote side branch were removed only after exact
+WIP-backup verification and current-design disposition. Three other side commits
+are already ancestors of the target, but their dirty worktrees still need
+reconciliation. Five Dependabot PRs remain open. The exact
 per-branch and per-worktree disposition is in
 [`2026-09-23-branch-worktree-reconciliation.md`](../reports/2026-09-23-branch-worktree-reconciliation.md).
 Root owns selective target integration and cleanup after behavior, WIP custody,
 focused checks and pushed checkpoints are proven; `main` and `release` stay
 untouched. Current provider-neutral Census read, installed workflows, live
-restart and whole-app resource evidence are next product barriers.
+restart and whole-app resource evidence are next product barriers. The Census
+checkpoint branch retains unique response-wide semantics until shared restart
+evidence proves or replaces them.
 
 ## 2026-09-16 dependency PR retirement
 

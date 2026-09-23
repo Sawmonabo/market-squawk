@@ -86,3 +86,25 @@ patches, is retained outside both worktrees at
 Its manifest SHA-256 at review was
 `e11286d84eb58512b74cec197cfda7bd6980602ed809460205bfc7d5ee80830b`.
 That preservation is not permission to discard the still-dirty source worktree.
+
+## Post-audit EIA disposition and retirement
+
+The lead independently compared the remote-only `2727b7a3` to local `9cfe443d`:
+their EIA tree differs only by a borrow-scope correction in the old ignored live
+test. Local `9f4219f6` diagnostics and useful production behavior are already
+present in the target; the dirty source edits would regress current bounded
+reopen, coordinates and diagnostics. The ignored test uses obsolete APIs; its
+fresh live journey remains a V1 verification requirement, not code to replay.
+There was no open PR or runtime handle for the EIA worktree.
+
+Before cleanup, the live tracked diff and untracked activation file matched the
+independent backup byte-for-byte. Its seven artifacts and manifest checksum
+verified again after cleanup. The lead restored only the backed-up obsolete EIA
+working files, removed that backed-up untracked source copy, confirmed a clean
+worktree, removed it without force, and pruned worktree metadata. The remote
+branch was deleted with an exact-head lease on `2727b7a3`, then local branch
+`9f4219f6` was deleted. Live origin and filesystem checks confirm both branch
+and worktree are absent. No target product file or backup was deleted.
+
+The resulting live inventory is **28 local branches, 19 origin heads and 11
+linked worktrees**. EIA's full live-to-installed product journey remains open.
