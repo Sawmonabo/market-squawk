@@ -955,3 +955,49 @@ fn authentication_digest(
     body.zeroize();
     Ok(hasher.finalize().into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swapped_prepared_authenticators_cannot_claim_rotation_authority(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let prior = SecretValue::new("prior test unlock".to_owned())?;
+        let candidate = SecretValue::new("candidate test unlock".to_owned())?;
+        {
+            let state = LocalAuthorityStateStore::try_open(directory.path())?;
+            let context = state.prepare_commit()?;
+            let mut vault = Vault::prepared(
+                EncryptedSet::empty(&prior)?,
+                EncryptedSet::empty(&candidate)?,
+                &prior,
+                &candidate,
+                &context,
+            )?;
+            let VaultState::Prepared {
+                active_authentication,
+                candidate_authentication,
+                ..
+            } = &mut vault.state
+            else {
+                return Err("prepared constructor returned another phase".into());
+            };
+            std::mem::swap(active_authentication, candidate_authentication);
+            state.store_contextual(&context, &serde_json::to_vec(&vault)?)?;
+        }
+        for unlock in [prior, candidate] {
+            let store = EncryptedFileSecretStore::try_open(directory.path(), unlock)?;
+            assert!(matches!(
+                store.recover_rotation(),
+                Err(LocalSecretStoreError::AuthenticationFailed)
+            ));
+            assert!(matches!(
+                store.finalize_rotation(),
+                Err(LocalSecretStoreError::AuthenticationFailed)
+            ));
+        }
+        Ok(())
+    }
+}

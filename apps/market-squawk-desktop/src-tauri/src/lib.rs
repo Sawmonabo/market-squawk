@@ -2,7 +2,6 @@
 
 use std::{
     cell::RefCell,
-    ffi::OsString,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -307,14 +306,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         return handoff_to_selected_release(program);
     }
     let desktop_data_directory = app.path().app_local_data_dir()?;
-    let mut environment = ConfigSources::process_environment();
-    environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
-    #[cfg(debug_assertions)]
-    {
-        environment.remove(&OsString::from("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM"));
-        environment.remove(&OsString::from(DEVELOPMENT_MCP_RELAY_PROGRAM));
-    }
+    let environment = ConfigSources::process_product_environment();
     let config_path = args
         .config
         .as_deref()

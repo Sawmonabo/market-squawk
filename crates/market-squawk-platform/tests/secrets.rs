@@ -352,39 +352,10 @@ fn encrypted_store_confines_authenticates_redacts_and_rotates_secrets() -> TestR
         symlink(&outside, &substitution)?;
         assert!(matches!(
             store.rotate_unlock(SecretValue::new("rejected unlock phrase".to_owned())?),
-            Err(LocalSecretStoreError::AuthorityFinalizationPending)
+            Err(LocalSecretStoreError::UnsafeStorage)
         ));
         assert_eq!(fs::read(&outside)?, b"must remain untouched");
         fs::remove_file(substitution)?;
-        drop(store);
-
-        let repaired = EncryptedFileSecretStore::try_open(
-            &root,
-            SecretValue::new("first unlock phrase".to_owned())?,
-        )?;
-        drop(repaired);
-        let prepared_a = fs::read(root.join(SLOT_A_FILE))?;
-        let prepared_b = fs::read(root.join(SLOT_B_FILE))?;
-        swap_prepared_authenticators_and_reseal_outer_envelopes(&root)?;
-        for unlock in ["first unlock phrase", "rejected unlock phrase"] {
-            let swapped =
-                EncryptedFileSecretStore::try_open(&root, SecretValue::new(unlock.to_owned())?)?;
-            assert!(matches!(
-                swapped.recover_rotation(),
-                Err(LocalSecretStoreError::AuthenticationFailed)
-            ));
-            assert!(matches!(
-                swapped.finalize_rotation(),
-                Err(LocalSecretStoreError::AuthenticationFailed)
-            ));
-            drop(swapped);
-        }
-        fs::write(root.join(SLOT_A_FILE), prepared_a)?;
-        fs::write(root.join(SLOT_B_FILE), prepared_b)?;
-        store = EncryptedFileSecretStore::try_open(
-            &root,
-            SecretValue::new("first unlock phrase".to_owned())?,
-        )?;
         store.recover_rotation()?;
         assert_eq!(store.load(&key)?.expose_secret(), "credential-value-1");
     }
@@ -457,24 +428,6 @@ fn remove_active_entry_and_reseal_outer_envelope(root: &Path) -> TestResult {
             .and_then(serde_json::Value::as_object_mut)
             .ok_or("stable vault entries are missing")?
             .clear();
-        Ok(())
-    })
-}
-
-fn swap_prepared_authenticators_and_reseal_outer_envelopes(root: &Path) -> TestResult {
-    rewrite_vault_pair(root, |vault| {
-        let state = vault
-            .pointer_mut("/state")
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or("prepared vault state is missing")?;
-        let active = state
-            .remove("active_authentication")
-            .ok_or("prepared active authentication is missing")?;
-        let candidate = state
-            .remove("candidate_authentication")
-            .ok_or("prepared candidate authentication is missing")?;
-        state.insert("active_authentication".to_owned(), candidate);
-        state.insert("candidate_authentication".to_owned(), active);
         Ok(())
     })
 }

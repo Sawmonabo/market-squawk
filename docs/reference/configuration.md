@@ -15,22 +15,22 @@ only through `market-squawk operations settings` (or the equivalent typed applic
 
 `AppConfig` is composed once before a CLI, relay, service, or diagnostic command acquires product
 authority. Its low-to-high precedence order is built-in default, the one explicit `--config` TOML
-file, `MARKET_SQUAWK_*` environment, and the command's supported CLI override. There is no implicit
-configuration-file discovery or in-process reload. An invalid value at any layer rejects the whole
-merged configuration without echoing secret material.
+file, supported `MARKET_SQUAWK_*` environment settings, and the command's supported CLI
+override. There is no implicit configuration-file discovery or in-process reload. Invalid
+recognized values reject the merged configuration without echoing sensitive input.
 
-`market-squawk-service` and `market-squawk-mcp-relay` remove `MARKET_SQUAWK_LOG` and
-`MARKET_SQUAWK_EXTERNAL_NETWORK` before loading `AppConfig`; `MARKET_SQUAWK_LOG` is instead a
-tracing option. The installed service owns the active
+Installed Desktop, CLI, service, and MCP relay capture only supported application setting names
+from the ambient environment. Unrelated prefixed variables are ignored; recognized values remain
+strictly validated. `MARKET_SQUAWK_LOG` is a separate tracing option. The installed service owns the active
 workspace after startup. Client commands discover it through the authenticated owner-only rendezvous;
 the rendezvous endpoint, credentials, service generation, and workspace identity are not user
 configuration fields.
 
 ## Accepted startup settings
 
-All integer ceilings are bytes, counts, or milliseconds as named. The accepted TOML keys and
-environment variables are closed; an unknown `MARKET_SQUAWK_*` key, non-UTF-8 in-scope key/value,
-or invalid scalar fails closed.
+All integer ceilings are bytes, counts, or milliseconds as named. The accepted TOML keys are
+closed. Installed binaries ignore unrelated inherited `MARKET_SQUAWK_*` names; a recognized
+setting with a non-UTF-8 value or invalid scalar fails closed.
 
 | TOML key | Environment | CLI override | Default | Exact admission |
 | --- | --- | --- | --- | --- |
@@ -45,7 +45,6 @@ or invalid scalar fails closed.
 | `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | internal only | `5000` | Positive, no more than `60000`, and no less than the flush interval. |
 | `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000` and at most `121000`. |
 | `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | unset | Nonempty absolute path when set; admitted models also require the release-bound application and sibling ONNX worker identities to verify. |
-| `source_secret` | `MARKET_SQUAWK_SOURCE_SECRET` | internal only | unset | Redacted `keyring:` or `encrypted-file:` locator, `1..=512` bytes, no control characters. |
 | `coinbase` | `MARKET_SQUAWK_COINBASE_JSON` | internal typed override | unset | Complete closed Coinbase profile; environment JSON is at most 128 KiB. |
 | `kraken` | `MARKET_SQUAWK_KRAKEN_JSON` | internal typed override | unset | Complete closed Kraken profile; environment JSON is at most 128 KiB. |
 
@@ -71,11 +70,10 @@ capture_flush_interval_ms = 1000
 capture_shutdown_ms = 5000
 source_shutdown_ms = 15000
 training_release_root = "/absolute/path/to/installed-training-release"
-source_secret = "keyring:opaque-local-reference"
 ```
 
-Do not place a credential, bearer token, MCP token, or raw provider secret in TOML or environment.
-The `source_secret` value is only a redacted legacy locator.
+Do not place a credential, bearer token, MCP token, raw provider secret, or secret locator in
+startup TOML or environment. Provider credentials are managed through native onboarding.
 
 ## Provider profile contract
 
@@ -84,7 +82,9 @@ profile permits construction only; it does not register a provider, prove rights
 observation, or create execution authority. Those actions use the typed Source, Bot, Execution,
 and Risk operations.
 
-Both profiles carry a closed `authorization` object:
+Both profiles require separate closed `authorization` and `reference_authorization` objects.
+The former covers the live market feed; the latter covers Coinbase's public product REST
+reference or Kraken's v2 instrument reference channel. Each object uses these fields:
 
 | Field | Contract |
 | --- | --- |
@@ -108,8 +108,8 @@ contract; they are not a generic venue or symbol escape hatch.
 
 ## Secret boundary
 
-`AppConfig` retains a redacted reference, not resolved material. The product prefers the current
-user's OS credential facility (Apple Keychain, Windows Credential Manager, or Secret Service).
+`AppConfig` contains neither provider credentials nor secret locators. Provider onboarding prefers
+the current user's OS credential facility (Apple Keychain, Windows Credential Manager, or Secret Service).
 The locked encrypted-file fallback under the product control root is eligible only when the primary
 backend is unavailable, the fallback was explicitly configured and unlocked, and the exact
 operation permits it. Existing references are never silently migrated between backends.
@@ -123,8 +123,8 @@ and the WebView do not expose those credentials.
 
 `market-squawk config show` and `market-squawk config validate` emit the redacted
 `market-squawk-effective-config-v1` view. Each startup setting reports `value` and one origin:
-`safe_default`, `local_file`, `environment`, or `cli`. Secrets and live profiles are represented
-only as configured/not-configured facts.
+`safe_default`, `local_file`, `environment`, or `cli`. Live profiles are represented only as
+configured/not-configured facts; provider credentials are outside this configuration view.
 
 Runtime product settings are a distinct typed, revision-fenced authority. `operations settings get`
 returns settings, origin, and restart impact; changes and rollbacks require a preview and then an

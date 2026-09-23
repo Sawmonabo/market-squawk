@@ -1,7 +1,7 @@
 // Rust #159105: see the service binary for the measured macOS debug-link limitation.
 #![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
 
-use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -115,9 +115,7 @@ fn load_config(
     config_file: Option<&std::path::Path>,
     data_dir: Option<PathBuf>,
 ) -> Result<AppConfig> {
-    let mut environment = ConfigSources::process_environment();
-    environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
+    let environment = ConfigSources::process_product_environment();
     Ok(AppConfig::load(ConfigSources::new(
         config_file,
         &environment,

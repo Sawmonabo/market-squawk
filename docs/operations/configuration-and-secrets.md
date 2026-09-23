@@ -39,8 +39,8 @@ configuration layers, every accepted setting, closed-file validation, redacted i
 OS-keyring-first secret composition, the distinct one-time provider credential import, explicit
 encrypted-fallback unlock, and the stop-correct-validate-restart procedure.
 
-Configuration can select local paths, resource ceilings, timing, optional provider profiles, and
-opaque secret locators. It cannot:
+Configuration can select local paths, resource ceilings, timing, and optional provider profiles.
+It cannot:
 
 - contain or return resolved credential bytes;
 - grant provider rights or activate an adapter;
@@ -71,8 +71,8 @@ status evidence proves the action.
 - For selected provider credentials, prepare the exact owner-only
   [`market-squawk-provider-credentials/v1`](../reference/market-squawk-provider-credentials.env.example)
   file and ensure the installed application service is reachable. Use an available interactive OS
-  credential service or plan an explicit foreground unlock of the encrypted fallback through the
-  loopback portal.
+  credential service or plan an explicit foreground unlock of the encrypted fallback through
+  Settings → Connections.
 
 Examples use:
 
@@ -87,21 +87,19 @@ CONFIG=/absolute/operator-owned/market-squawk/config.toml
    startup TOML, the process environment, a CLI argument, shell history, or an activation request.
    The exact owner-only one-time provider credential bundle is the admitted file exception; never
    source it as a shell file.
-2. The `source_secret` setting is an opaque locator only. Its accepted syntax does not connect that
-   locator to either onboarding backend in the current application composition.
-3. Always pass `--config <PATH>` explicitly. Market Squawk does not search the current directory,
+2. Always pass `--config <PATH>` explicitly. Market Squawk does not search the current directory,
    home directory, XDG directories, or platform configuration folders.
-4. A higher-precedence layer silently replaces the same setting from a lower layer before
+3. A higher-precedence layer silently replaces the same setting from a lower layer before
    validation. Inspect the launch environment and CLI arguments when a corrected file appears to
    have no effect.
-5. `config validate` is a parse and whole-object validation check. It does not open provider
+4. `config validate` is a parse and whole-object validation check. It does not open provider
    connections, resolve a secret, admit a training release, or prove runtime readiness.
-6. `config show` and `config validate` are redacted, but their current output still reveals
+5. `config show` and `config validate` are redacted, but their current output still reveals
    non-secret effective values such as products and resource ceilings. Treat captured output as
    operational metadata.
-7. Stop a long-lived process before changing its configuration. There is no hot reload or
+6. Stop a long-lived process before changing its configuration. There is no hot reload or
    in-process rollback.
-8. A changed `data_dir` selects another state root; it does not move, merge, or restore the old
+7. A changed `data_dir` selects another state root; it does not move, merge, or restore the old
    root.
 
 ## Precedence and loading
@@ -124,10 +122,10 @@ The TOML file is optional at the code boundary and is loaded only when `--config
 file must be no larger than 1 MiB, must be valid UTF-8 TOML, and has a closed root: an unknown key
 rejects the complete configuration.
 
-The environment layer accepts only the fourteen keys in the next table. An unknown
-`MARKET_SQUAWK_*` key, a non-UTF-8 in-scope key or value, an invalid scalar, or oversized provider
-JSON rejects startup. `MARKET_SQUAWK_LOG` is the one separate tracing variable: the CLI consumes it
-before `AppConfig` validation.
+The environment layer accepts the thirteen settings in the next table. Installed Desktop, CLI,
+service, and MCP relay ignore unrelated inherited `MARKET_SQUAWK_*` names. A recognized setting
+with a non-UTF-8 value, invalid scalar, or oversized provider JSON rejects startup.
+`MARKET_SQUAWK_LOG` is a separate tracing option.
 
 The installed desktop changes one value only within the lowest-precedence safe-default layer: its
 data root is the operating system's application-local data directory. The explicit file,
@@ -151,7 +149,6 @@ All durations are integer milliseconds. All memory limits are exact integer byte
 | `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | None | `5000` | Positive, `<=60000`, and no less than the flush interval |
 | `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000`, and no greater than `121000` |
 | `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | Unset | When present, nonempty and absolute; startup verifies that the running application and sibling ONNX worker are the exact signed files installed there |
-| `source_secret` | `MARKET_SQUAWK_SOURCE_SECRET` | None | Unset | Locator only; `1..=512` bytes, no control characters, prefix `keyring:` or `encrypted-file:` |
 | `coinbase` | `MARKET_SQUAWK_COINBASE_JSON` | None | Unset | Complete closed Coinbase profile; environment JSON at most 128 KiB |
 | `kraken` | `MARKET_SQUAWK_KRAKEN_JSON` | None | Unset | Complete closed Kraken profile; environment JSON at most 128 KiB |
 
@@ -188,8 +185,8 @@ paper_bot_enabled = false
 ```
 
 Omit `training_release_root` until a sealed training release has been installed and independently
-verified. Omit `source_secret`, `coinbase`, and `kraken` unless a separate, evidence-reviewed
-procedure supplies their exact non-secret locator or closed profile.
+verified. Omit `coinbase` and `kraken` unless a separate, evidence-reviewed procedure supplies
+their exact closed profiles.
 
 Protect the file from unintended modification and reading according to the host's local account
 model. Even though the file must not contain credentials, it records paths, products, and resource
@@ -278,10 +275,9 @@ The preferred store probes the operating-system credential service first:
 
 Credential bytes are accepted only through an admitted write-only onboarding flow, wrapped in a
 redacting and zeroizing value, written under an opaque backend reference and generation, and
-verified by readback. CLI and portal status surfaces return only secret-free state such as whether
+verified by readback. CLI and Settings status surfaces return only secret-free state such as whether
 a credential is stored and which generation is active. The platform secret value must be
-`1..=65536` bytes; the portal's provider-key field, when a profile is release-enabled, is further
-limited to 8192 characters.
+`1..=65536` bytes. Native forms apply narrower provider-specific input bounds.
 
 The installed credential-bundle path can delegate the selected Schwab, Alpaca Paper, BLS, BEA,
 Census, EIA, FRED/ALFRED, and Tiingo values into those same protected authorities. It can also
@@ -295,23 +291,21 @@ the source operations rather than inferred from secret-store state.
 
 The fallback root is code-owned under the data root and starts locked in every new process. No
 unlock is read from a file, configuration, environment variable, command argument, or background
-restart. To make the fallback eligible for the current portal process:
+restart. To make the fallback eligible for the current installed service:
 
-1. Open the bounded loopback portal with `source setup` as described in
-   [Source operations](source-operations.md).
-2. In **Encrypted credential fallback**, enter the fallback unlock and select **Unlock fallback**.
-   The value is sent only to that loopback process as a bounded binary secret, redacted, and
-   zeroized after admission.
-3. Confirm that the portal reports the fallback as ready. Secret creation still uses the OS
-   credential service when its exact lifecycle is available; only a proved unavailable,
-   session-unavailable, or unsupported primary permits the ready fallback.
-4. Select **Lock fallback** when the foreground workflow is finished. Process shutdown also drops
-   the in-memory unlock authority.
+1. Open **Settings → Connections → Set up connections** and select the saved provider.
+2. In the secure-storage form, enter the existing password and select **Unlock storage**. The
+   bounded value passes through the private native service request and is redacted and zeroized.
+3. Confirm that storage reports ready. New secret creation still uses the OS credential service
+   when its exact lifecycle is available; only a proved unavailable, session-unavailable, or
+   unsupported primary permits the ready fallback.
+4. Select **Lock credential storage** when the foreground work is finished. Service shutdown also
+   drops the in-memory unlock authority. Closing the Desktop does not itself stop the service.
 
 An existing `SecretRef` remains permanently bound to its recorded backend and generation. The
 router never probes another backend for that reference and never migrates secret bytes between the
-OS store and encrypted vault. A syntactically valid `source_secret = "encrypted-file:..."` locator
-does not unlock the vault or bypass the onboarding lifecycle.
+OS store and encrypted vault. Startup configuration contains no secret locator and cannot unlock
+the vault or bypass the onboarding lifecycle.
 
 There is also no public generic `secret set`, `secret get`, `secret list`, or `secret delete`
 command. Do not manipulate catalog secret references or OS-keyring entries independently of their
@@ -345,8 +339,14 @@ The secret-free result has exactly 17 provider rows. Its only dispositions are:
 | --- | --- |
 | `disabled` | Provider was not requested |
 | `credential_stored_unverified` | Protected credential write completed; provider verification remains open |
+| `saved_setup_reused` | Existing saved configuration/session or credential was retained; no replacement was imported |
 | `probe_required` | No-secret onboarding intent is durable; the provider probe remains open |
 | `profile_unavailable` | Exact selected profile mapping/revision/release contract could not be satisfied |
+
+A repeated import reuses an existing saved recipe first, then its exact credential/session. It
+does not ask the owner to sign up again or replace a stored key. Settings can select the prepared
+file through its native picker; its contents do not enter the WebView. The file is never
+automatically sourced from the working directory or process environment.
 
 An imported credential is **Configured**, not **Available**. Availability additionally requires a
 successful current doctor/entitlement probe, actual provider production, durable canonical
@@ -503,10 +503,6 @@ With the baseline above, `config validate` returns this shape:
       "value": 15000,
       "origin": "safe_default"
     },
-    "sourceSecretConfigured": {
-      "value": false,
-      "origin": "safe_default"
-    },
     "coinbaseConfigured": {
       "value": false,
       "origin": "safe_default"
@@ -525,7 +521,7 @@ Success proves:
 - the explicit file was readable, bounded, valid UTF-8 TOML, and closed-schema compliant;
 - all admitted environment and CLI values parsed;
 - the merged values satisfied individual and cross-setting bounds;
-- secret and provider-profile contents were not emitted.
+- provider-profile contents were not emitted.
 
 It does not prove that the data root is writable, a keyring is available, a provider is reachable,
 rights are admitted, or the full product can compose. Use `doctor` and domain-specific status
@@ -550,8 +546,8 @@ commands for those separate checks.
   and error. A proved unavailable, session-unavailable, or unsupported primary may use the already
   configured and explicitly unlocked fallback for a new eligible plan. Existing keyring-bound
   references remain bound to that keyring and follow their lifecycle-owned recovery state.
-- **Encrypted fallback is locked after restart:** reopen the loopback portal and submit the same
-  unlock through its write-only fallback control. Do not place the unlock in startup configuration
+- **Encrypted fallback is locked after restart:** open Settings → Connections and submit the same
+  unlock through its write-only secure-storage control. Do not place the unlock in startup configuration
   or automation.
 - **Fallback unlock is lost or rejected:** the vault cannot be recovered without its authentic
   unlock. Preserve the vault and backup evidence; do not replace it, guess completion, or rewrite
@@ -566,18 +562,17 @@ commands for those separate checks.
 | --- | --- | --- |
 | `--config` file not found | Wrong explicit path or service working-directory assumption | Supply the intended absolute path; there is no discovery fallback |
 | File rejected as too large, invalid UTF-8, malformed TOML, or unknown field | The 1 MiB closed-file contract failed | Correct the file; do not split hidden values across unreviewed sources |
-| Unknown `MARKET_SQUAWK_*` error | Typo, stale variable, or unsupported setting in the inherited environment | Remove or correct the exact variable; unrelated variables are ignored |
+| Unrelated inherited `MARKET_SQUAWK_*` variable | Installed product ignores it during configuration loading | Use only recognized settings to configure the product; correct a typo if a desired setting had no effect |
 | Products reject despite looking valid | Literal comma split retained whitespace, duplicate, empty, oversized, or disallowed character | Supply a unique list with no padding around comma-separated environment values |
 | Capture timing rejects | Flush interval is zero/greater than shutdown, or shutdown exceeds `60000` | Correct both values as one merged configuration |
 | Changed file has no effect | Environment or CLI layer wins, or the existing process has not restarted | Inspect launch inputs, stop the old process, validate, and start anew |
 | A reported origin is unexpected | A higher-precedence environment or CLI layer supplied the effective value | Inspect the inherited environment and exact launch arguments; correct the highest-precedence source |
-| `sourceSecretConfigured.value` is `true` but secret use fails | The value is only a locator and does not grant onboarding or fallback-unlock authority | Use the admitted portal lifecycle; do not put the credential or unlock in configuration |
 | `source import-credentials` rejects the input | The installed service is unavailable, `--confirm` is absent, path/file confinement failed, the file exceeds 64 KiB, or the strict ordered V1 contract failed | Use the installed CLI and an owner-only regular file at an absolute path; compare all 32 fields with the maintained example and correct only the input |
 | Credential receipt says `credential_stored_unverified` or `probe_required` | Import succeeded but provider verification or no-secret probing is still required | Continue through the provider-specific doctor/activation flow; do not report the source or workflow as Available |
 | Native OS credential approval prompt appears | The primary keyring requires one foreground user decision | Complete the operating-system prompt; the Desktop keeps navigation available and reconnects automatically |
 | OS credential service is unavailable | The primary backend or session cannot provide the required exact lifecycle | Use the explicitly unlocked fallback only for a new eligible plan; preserve existing backend-bound references and fail closed when they cannot be recovered |
-| Portal reports `invalid_unlock` | Submitted unlock does not authenticate the retained vault authority | Preserve the vault, correct the operator-owned unlock, and retry through the same bounded portal |
-| Portal reports `fallback_unavailable` | Fallback is locked, unavailable, or cannot complete the requested transition | Preserve portal stderr and vault state; do not delete, recreate, or bypass the authority |
+| Settings rejects the storage unlock | Submitted unlock does not authenticate the retained vault authority | Preserve the vault, correct the operator-owned unlock, and retry through Settings |
+| Settings reports unavailable secure storage | Fallback is locked, unavailable, or cannot complete the requested transition | Preserve the bounded service error and vault state; do not delete, recreate, or bypass the authority |
 | `config validate` succeeds but `doctor` reports unavailable storage | Configuration validity does not prove that `init` created a safe, current layout and catalog | Preserve the doctor result; run the explicit bootstrap/upgrade procedure or repair the stable diagnostic class |
 | `doctor` remains top-level `blocked` | Durable provider onboarding, rights, code-owned release evidence, or local storage remains incomplete or invalid | Use source operations and the delivery ledger; query current runtime health through the application-owned source service |
 

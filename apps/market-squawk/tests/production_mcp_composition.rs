@@ -72,16 +72,30 @@ const INSTALLED_BOARD_HISTORY_MAXIMUM_BYTES: usize = 8 * 1024 * 1024;
 
 #[test]
 fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestResult {
+    run_installed_service_test(None)
+}
+
+#[test]
+#[ignore = "requires an explicit real Alpaca credential bundle and external-network authorization"]
+fn installed_service_real_alpaca_vertical_survives_restart() -> TestResult {
+    let path = protected_real_alpaca_bundle_path()?
+        .context("explicit real Alpaca credential-bundle path is unavailable")?;
+    run_installed_service_test(Some(path))
+}
+
+fn run_installed_service_test(real_alpaca_bundle_path: Option<PathBuf>) -> TestResult {
     let scenario = std::thread::Builder::new()
         .name("market-squawk-installed-service-test".to_owned())
         .stack_size(INSTALLED_SERVICE_MAIN_STACK_BYTES)
-        .spawn(|| -> TestResult {
+        .spawn(move || -> TestResult {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
                 .build()
                 .context("construct installed-service test runtime")?
-                .block_on(Box::pin(run_installed_service_authority_scenario()))
+                .block_on(Box::pin(run_installed_service_authority_scenario(
+                    real_alpaca_bundle_path,
+                )))
         })
         .context("start installed-service test thread")?;
     scenario.join().map_err(|_panic| {
@@ -89,14 +103,15 @@ fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestR
     })?
 }
 
-async fn run_installed_service_authority_scenario() -> TestResult {
+async fn run_installed_service_authority_scenario(
+    real_alpaca_bundle_path: Option<PathBuf>,
+) -> TestResult {
     if let Some(role) = std::env::var_os(INSTALLED_SERVICE_PROCESS_ROLE_ENV) {
         let root = std::env::var_os(INSTALLED_SERVICE_PROCESS_ROOT_ENV)
             .map(PathBuf::from)
             .context("resolve installed-service subprocess root")?;
         return run_installed_service_process_role(&role, root).await;
     }
-    let real_alpaca_bundle_path = protected_real_alpaca_bundle_path()?;
     let temporary = tempfile::tempdir().context("create installed-service scenario root")?;
     let environment = BTreeMap::<OsString, OsString>::new();
     let config = AppConfig::load(ConfigSources::new(

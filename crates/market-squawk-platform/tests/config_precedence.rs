@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 use market_squawk_domain::{AssetClass, Denomination, LiveEventClass, MarketDepth, TradingStatus};
 use market_squawk_platform::{
     AppConfig, COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, ConfigError, ConfigOrigin,
-    ConfigOverrides, ConfigSetting, ConfigSources, KRAKEN_WEBSOCKET_V2_ENDPOINT, SecretReference,
+    ConfigOverrides, ConfigSetting, ConfigSources, KRAKEN_WEBSOCKET_V2_ENDPOINT,
 };
 use tempfile::tempdir;
 
@@ -365,7 +365,6 @@ paper_bot_enabled = false
 capture_flush_interval_ms = 500
 capture_shutdown_ms = 2000
 source_shutdown_ms = 3000
-source_secret = "keyring:coinbase"
 "#,
     )?;
     let environment = environment(&[
@@ -405,10 +404,6 @@ source_secret = "keyring:coinbase"
     assert_eq!(config.stale_after().as_millis(), 4_000);
     assert!(config.paper_bot_enabled());
     assert_eq!(config.source_shutdown().as_millis(), 6_000);
-    assert_eq!(
-        config.source_secret(),
-        Some(&SecretReference::try_from("keyring:coinbase")?)
-    );
     assert_eq!(
         config.provenance().origin(ConfigSetting::DataDirectory),
         ConfigOrigin::Cli
@@ -480,24 +475,6 @@ fn source_shutdown_accepts_safe_boundaries_and_rejects_incomplete_cleanup_budget
             Err(market_squawk_platform::ConfigError::InvalidSourceShutdownTiming)
         ));
     }
-}
-
-#[test]
-fn debug_output_redacts_secret_references() -> Result<(), Box<dyn std::error::Error>> {
-    let environment = environment(&[(
-        "MARKET_SQUAWK_SOURCE_SECRET",
-        "keyring:highly-sensitive-account",
-    )]);
-    let config = AppConfig::load(ConfigSources::new(
-        None,
-        &environment,
-        ConfigOverrides::default(),
-    ))?;
-
-    let debug = format!("{config:?}");
-    assert!(debug.contains("[REDACTED]"));
-    assert!(!debug.contains("highly-sensitive-account"));
-    Ok(())
 }
 
 #[test]
@@ -614,11 +591,11 @@ fn oversized_config_is_rejected_before_toml_parsing() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn malformed_secret_bearing_toml_is_redacted_from_errors() -> Result<(), Box<dyn std::error::Error>>
+fn unknown_sensitive_toml_field_is_redacted_from_errors() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempdir()?;
     let path = directory.path().join("invalid.toml");
-    std::fs::write(&path, "source_secret = [\"sensitive-locator\"")?;
+    std::fs::write(&path, "unsupported_setting = \"sensitive-value\"")?;
 
     let error = AppConfig::load(ConfigSources::new(
         Some(&path),
@@ -628,7 +605,7 @@ fn malformed_secret_bearing_toml_is_redacted_from_errors() -> Result<(), Box<dyn
     .err()
     .ok_or("invalid TOML was accepted")?;
     let rendered = format!("{error:?} {error}");
-    assert!(!rendered.contains("sensitive-locator"));
+    assert!(!rendered.contains("sensitive-value"));
     Ok(())
 }
 

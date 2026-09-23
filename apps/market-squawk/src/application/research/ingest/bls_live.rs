@@ -627,21 +627,14 @@ mod tests {
         "value":"4.2","footnotes":[]
       }]}]}
     }"#;
-    const LIVE_REGISTERED_ACCEPTANCE: &str = "MARKET_SQUAWK_BLS_REGISTERED_LIVE_ACCEPTANCE";
 
     #[tokio::test]
     async fn public_and_protected_sources_seal_publish_and_reopen_exact_macro_plans() -> TestResult
     {
         let temporary = tempfile::tempdir()?;
-        let live_registered = live_registered_acceptance_enabled()?;
-        let registration_key = if live_registered {
-            std::env::var("BLS_REGISTRATION_KEY")
-                .map_err(|_error| "live BLS registration key is unavailable")?
-        } else {
-            "fixture-registration-key".to_owned()
-        };
+        let registration_key = "fixture-registration-key".to_owned();
         let secret_reference =
-            protected_registration_key(temporary.path(), &registration_key, live_registered)?;
+            protected_registration_key(temporary.path(), &registration_key, false)?;
         prove_live_journey(
             &temporary.path().join("public-v1"),
             BlsAccessTier::PublicV1,
@@ -655,7 +648,25 @@ mod tests {
             BlsAccessTier::RegisteredV2,
             Some(secret_reference),
             Some(registration_key),
-            live_registered,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicit live BLS credential and external-network authorization"]
+    async fn live_registered_source_seals_publishes_and_reopens() -> TestResult {
+        let temporary = tempfile::tempdir()?;
+        let registration_key = std::env::var("BLS_REGISTRATION_KEY")
+            .map_err(|_error| "live BLS registration key is unavailable")?;
+        let secret_reference =
+            protected_registration_key(temporary.path(), &registration_key, true)?;
+        prove_live_journey(
+            &temporary.path().join("registered-v2"),
+            BlsAccessTier::RegisteredV2,
+            Some(secret_reference),
+            Some(registration_key),
+            true,
         )
         .await
     }
@@ -906,16 +917,6 @@ mod tests {
             SecretValue::new(registration_key.to_owned())?,
             &control,
         )?)
-    }
-
-    fn live_registered_acceptance_enabled() -> TestResult<bool> {
-        match std::env::var(LIVE_REGISTERED_ACCEPTANCE) {
-            Err(std::env::VarError::NotPresent) => Ok(false),
-            Ok(value) if value == "1" => Ok(true),
-            Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {
-                Err("live BLS acceptance gate must be unset or exactly 1".into())
-            }
-        }
     }
 
     fn series_metadata() -> TestResult<BlsSeriesMetadata> {

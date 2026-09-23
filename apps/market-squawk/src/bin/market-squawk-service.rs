@@ -4,7 +4,6 @@
 #![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
 
 use std::{
-    ffi::OsString,
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
@@ -449,9 +448,7 @@ fn load_config(
     data_dir: Option<PathBuf>,
     training_release_root: Option<PathBuf>,
 ) -> Result<AppConfig> {
-    let mut environment = ConfigSources::process_environment();
-    environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
+    let environment = ConfigSources::process_product_environment();
     Ok(AppConfig::load(ConfigSources::new(
         config_file,
         &environment,

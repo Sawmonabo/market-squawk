@@ -486,7 +486,6 @@ fn isolated_config(
     let mut overrides = ConfigOverrides::from(config);
     overrides.data_dir = Some(data_dir);
     overrides.training_release_root = Some(training_root);
-    overrides.source_secret = None;
     overrides.coinbase = None;
     overrides.kraken = None;
     overrides.paper_bot_enabled = Some(false);

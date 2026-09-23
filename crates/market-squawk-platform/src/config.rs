@@ -90,8 +90,6 @@ pub enum ConfigSetting {
     SourceShutdown,
     /// Optional verified Python training-release root.
     TrainingReleaseDirectory,
-    /// Redacted source-secret reference.
-    SourceSecret,
     /// Coinbase production profile.
     Coinbase,
     /// Kraken production profile.
@@ -99,7 +97,7 @@ pub enum ConfigSetting {
 }
 
 impl ConfigSetting {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 13] = [
         Self::DataDirectory,
         Self::Products,
         Self::StaleAfter,
@@ -111,10 +109,30 @@ impl ConfigSetting {
         Self::CaptureShutdown,
         Self::SourceShutdown,
         Self::TrainingReleaseDirectory,
-        Self::SourceSecret,
         Self::Coinbase,
         Self::Kraken,
     ];
+
+    fn from_environment_key(key: &str) -> Option<Self> {
+        match key {
+            "MARKET_SQUAWK_DATA_DIR" => Some(Self::DataDirectory),
+            "MARKET_SQUAWK_PRODUCTS" => Some(Self::Products),
+            "MARKET_SQUAWK_STALE_AFTER_MS" => Some(Self::StaleAfter),
+            "MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY" => Some(Self::CaptureQueueCapacity),
+            "MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES" => Some(Self::CaptureMemoryCeiling),
+            "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES" => {
+                Some(Self::CaptureDestinationRegistryMemoryCeiling)
+            }
+            "MARKET_SQUAWK_PAPER_BOT_ENABLED" => Some(Self::PaperBotEnabled),
+            "MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS" => Some(Self::CaptureFlushInterval),
+            "MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS" => Some(Self::CaptureShutdown),
+            "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => Some(Self::SourceShutdown),
+            "MARKET_SQUAWK_TRAINING_RELEASE_ROOT" => Some(Self::TrainingReleaseDirectory),
+            "MARKET_SQUAWK_COINBASE_JSON" => Some(Self::Coinbase),
+            "MARKET_SQUAWK_KRAKEN_JSON" => Some(Self::Kraken),
+            _ => None,
+        }
+    }
 
     const fn index(self) -> usize {
         self as usize
@@ -211,11 +229,6 @@ impl ConfigProvenance {
             ConfigOrigin::LocalFile,
         );
         self.mark_if(
-            file.source_secret.is_some(),
-            ConfigSetting::SourceSecret,
-            ConfigOrigin::LocalFile,
-        );
-        self.mark_if(
             file.coinbase.is_some(),
             ConfigSetting::Coinbase,
             ConfigOrigin::LocalFile,
@@ -229,32 +242,7 @@ impl ConfigProvenance {
 
     fn apply_environment(&mut self, environment: &BTreeMap<OsString, OsString>) {
         for key in environment.keys().filter_map(|key| key.to_str()) {
-            let setting = match key {
-                "MARKET_SQUAWK_DATA_DIR" => Some(ConfigSetting::DataDirectory),
-                "MARKET_SQUAWK_PRODUCTS" => Some(ConfigSetting::Products),
-                "MARKET_SQUAWK_STALE_AFTER_MS" => Some(ConfigSetting::StaleAfter),
-                "MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY" => Some(ConfigSetting::CaptureQueueCapacity),
-                "MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES" => {
-                    Some(ConfigSetting::CaptureMemoryCeiling)
-                }
-                "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES" => {
-                    Some(ConfigSetting::CaptureDestinationRegistryMemoryCeiling)
-                }
-                "MARKET_SQUAWK_PAPER_BOT_ENABLED" => Some(ConfigSetting::PaperBotEnabled),
-                "MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS" => {
-                    Some(ConfigSetting::CaptureFlushInterval)
-                }
-                "MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS" => Some(ConfigSetting::CaptureShutdown),
-                "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => Some(ConfigSetting::SourceShutdown),
-                "MARKET_SQUAWK_TRAINING_RELEASE_ROOT" => {
-                    Some(ConfigSetting::TrainingReleaseDirectory)
-                }
-                "MARKET_SQUAWK_SOURCE_SECRET" => Some(ConfigSetting::SourceSecret),
-                "MARKET_SQUAWK_COINBASE_JSON" => Some(ConfigSetting::Coinbase),
-                "MARKET_SQUAWK_KRAKEN_JSON" => Some(ConfigSetting::Kraken),
-                _ => None,
-            };
-            if let Some(setting) = setting {
+            if let Some(setting) = ConfigSetting::from_environment_key(key) {
                 self.mark(setting, ConfigOrigin::Environment);
             }
         }
@@ -315,11 +303,6 @@ impl ConfigProvenance {
         self.mark_if(
             cli.training_release_root.is_some(),
             ConfigSetting::TrainingReleaseDirectory,
-            ConfigOrigin::Cli,
-        );
-        self.mark_if(
-            cli.source_secret.is_some(),
-            ConfigSetting::SourceSecret,
             ConfigOrigin::Cli,
         );
         self.mark_if(
@@ -477,8 +460,6 @@ pub struct ConfigOverrides {
     pub source_shutdown_ms: Option<u64>,
     /// Absolute installed Python training-release root.
     pub training_release_root: Option<PathBuf>,
-    /// Redacted secret locator.
-    pub source_secret: Option<SecretReference>,
     /// Complete validated production Coinbase source profile.
     pub coinbase: Option<CoinbaseSourceConfig>,
     /// Complete validated production Kraken public book-and-trade source profile.
@@ -536,6 +517,19 @@ impl<'a> ConfigSources<'a> {
     pub fn process_environment() -> BTreeMap<OsString, OsString> {
         std::env::vars_os().collect()
     }
+
+    /// Captures only supported application settings for installed Desktop, service, CLI, and MCP.
+    /// Provider credentials and unrelated Market Squawk tool variables are handled by their own
+    /// setup or command boundaries and cannot prevent ordinary product startup.
+    pub fn process_product_environment() -> BTreeMap<OsString, OsString> {
+        std::env::vars_os()
+            .filter(|(key, _)| {
+                key.to_str()
+                    .and_then(ConfigSetting::from_environment_key)
+                    .is_some()
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -552,7 +546,6 @@ struct FileConfig {
     capture_shutdown_ms: Option<u64>,
     source_shutdown_ms: Option<u64>,
     training_release_root: Option<PathBuf>,
-    source_secret: Option<String>,
     coinbase: Option<CoinbaseSourceConfig>,
     kraken: Option<KrakenSourceConfig>,
 }
@@ -571,7 +564,6 @@ pub struct AppConfig {
     capture_shutdown: Duration,
     source_shutdown: Duration,
     training_release_root: Option<PathBuf>,
-    source_secret: Option<SecretReference>,
     coinbase: Option<CoinbaseSourceConfig>,
     kraken: Option<KrakenSourceConfig>,
     provenance: ConfigProvenance,
@@ -601,10 +593,6 @@ impl fmt::Debug for AppConfig {
             .field("capture_shutdown", &self.capture_shutdown)
             .field("source_shutdown", &self.source_shutdown)
             .field("training_release_root", &self.training_release_root)
-            .field(
-                "source_secret",
-                &self.source_secret.as_ref().map(|_| "[REDACTED]"),
-            )
             .field("coinbase", &self.coinbase)
             .field("kraken", &self.kraken)
             .field("provenance", &self.provenance)
@@ -639,7 +627,6 @@ impl Default for AppConfig {
             capture_shutdown: Duration::from_millis(DEFAULT_SHUTDOWN_MS),
             source_shutdown: Duration::from_millis(DEFAULT_SOURCE_SHUTDOWN_MS),
             training_release_root: None,
-            source_secret: None,
             coinbase: None,
             kraken: None,
             provenance: ConfigProvenance::default(),
@@ -765,11 +752,6 @@ impl AppConfig {
         self.training_release_root.as_deref()
     }
 
-    /// Returns the optional redacted source-secret reference.
-    pub const fn source_secret(&self) -> Option<&SecretReference> {
-        self.source_secret.as_ref()
-    }
-
     /// Returns the optional strict production Coinbase source profile.
     pub const fn coinbase(&self) -> Option<&CoinbaseSourceConfig> {
         self.coinbase.as_ref()
@@ -804,7 +786,6 @@ impl From<AppConfig> for ConfigOverrides {
             capture_shutdown_ms: Some(duration_millis(config.capture_shutdown)),
             source_shutdown_ms: Some(duration_millis(config.source_shutdown)),
             training_release_root: config.training_release_root,
-            source_secret: config.source_secret,
             coinbase: config.coinbase,
             kraken: config.kraken,
         }
@@ -858,9 +839,6 @@ impl ConfigOverrides {
         if higher.training_release_root.is_some() {
             self.training_release_root = higher.training_release_root;
         }
-        if higher.source_secret.is_some() {
-            self.source_secret = higher.source_secret;
-        }
         if higher.coinbase.is_some() {
             self.coinbase = higher.coinbase;
         }
@@ -883,11 +861,6 @@ impl ConfigOverrides {
             capture_shutdown_ms: file.capture_shutdown_ms,
             source_shutdown_ms: file.source_shutdown_ms,
             training_release_root: file.training_release_root,
-            source_secret: file
-                .source_secret
-                .as_deref()
-                .map(SecretReference::try_from)
-                .transpose()?,
             coinbase: file.coinbase,
             kraken: file.kraken,
         });
@@ -910,49 +883,47 @@ impl ConfigOverrides {
                 continue;
             }
             let value = value.to_str().ok_or(ConfigError::NonUtf8Environment)?;
-            match key {
-                "MARKET_SQUAWK_DATA_DIR" => layer.data_dir = Some(PathBuf::from(value)),
-                "MARKET_SQUAWK_PRODUCTS" => {
+            let setting = ConfigSetting::from_environment_key(key)
+                .ok_or(ConfigError::UnknownEnvironmentKey)?;
+            match setting {
+                ConfigSetting::DataDirectory => layer.data_dir = Some(PathBuf::from(value)),
+                ConfigSetting::Products => {
                     layer.products = Some(value.split(',').map(str::to_owned).collect());
                 }
-                "MARKET_SQUAWK_STALE_AFTER_MS" => {
+                ConfigSetting::StaleAfter => {
                     layer.stale_after_ms = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY" => {
+                ConfigSetting::CaptureQueueCapacity => {
                     layer.capture_queue_capacity = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES" => {
+                ConfigSetting::CaptureMemoryCeiling => {
                     layer.capture_memory_ceiling_bytes = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES" => {
+                ConfigSetting::CaptureDestinationRegistryMemoryCeiling => {
                     layer.capture_destination_registry_memory_ceiling_bytes =
                         Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_PAPER_BOT_ENABLED" => {
+                ConfigSetting::PaperBotEnabled => {
                     layer.paper_bot_enabled = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS" => {
+                ConfigSetting::CaptureFlushInterval => {
                     layer.capture_flush_interval_ms = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS" => {
+                ConfigSetting::CaptureShutdown => {
                     layer.capture_shutdown_ms = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => {
+                ConfigSetting::SourceShutdown => {
                     layer.source_shutdown_ms = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_TRAINING_RELEASE_ROOT" => {
+                ConfigSetting::TrainingReleaseDirectory => {
                     layer.training_release_root = Some(PathBuf::from(value));
                 }
-                "MARKET_SQUAWK_SOURCE_SECRET" => {
-                    layer.source_secret = Some(SecretReference::try_from(value)?);
-                }
-                "MARKET_SQUAWK_COINBASE_JSON" => {
+                ConfigSetting::Coinbase => {
                     layer.coinbase = Some(instruments::parse_environment_profile(value)?);
                 }
-                "MARKET_SQUAWK_KRAKEN_JSON" => {
+                ConfigSetting::Kraken => {
                     layer.kraken = Some(instruments::parse_kraken_environment_profile(value)?);
                 }
-                _ => return Err(ConfigError::UnknownEnvironmentKey),
             }
         }
         self.apply(layer);
@@ -1060,7 +1031,6 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             capture_shutdown: Duration::from_millis(shutdown_ms.get()),
             source_shutdown: Duration::from_millis(source_shutdown_ms.get()),
             training_release_root: values.training_release_root,
-            source_secret: values.source_secret,
             coinbase: values.coinbase,
             kraken: values.kraken,
             provenance: ConfigProvenance::default(),
@@ -1120,9 +1090,6 @@ pub enum ConfigError {
     /// The optional training release root was empty or not absolute.
     #[error("training release directory is invalid")]
     InvalidTrainingReleaseDirectory,
-    /// A redacted secret reference was invalid.
-    #[error(transparent)]
-    Secret(#[from] SecretError),
     /// A required default was accidentally omitted by internal composition.
     #[error("configuration composition invariant failed")]
     InternalComposition,
