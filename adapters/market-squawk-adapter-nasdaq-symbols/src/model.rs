@@ -158,6 +158,10 @@ pub enum NasdaqOtherExchange {
     /// `M` — NYSE Texas, formerly NYSE Chicago.
     #[serde(rename = "M")]
     NyseTexas,
+    /// `F` — Texas Stock Exchange (SIP participant F, exchange MIC TXSE).
+    /// See https://www.txse.com/regulations/id-codes.
+    #[serde(rename = "F")]
+    TexasStockExchange,
     /// `Z` — Cboe BZX.
     #[serde(rename = "Z")]
     CboeBzx,
@@ -173,6 +177,7 @@ impl NasdaqOtherExchange {
             Self::Nyse => "XNYS",
             Self::NyseArca => "ARCX",
             Self::NyseTexas => "XCHI",
+            Self::TexasStockExchange => "TXSE",
             Self::CboeBzx => "BATS",
             Self::Iex => "IEXG",
         };

@@ -133,7 +133,7 @@ CREATE TABLE listing_reference_values (
         )
         OR (
             file_kind = 'other_listed'
-            AND exchange_code IN ('A', 'N', 'P', 'M', 'Z', 'V')
+            AND exchange_code IN ('A', 'N', 'P', 'M', 'Z', 'V', 'F')
             AND cqs_symbol IS NOT NULL
             AND nasdaq_symbol IS NOT NULL
             AND market_category IS NULL

@@ -43,8 +43,8 @@ pub const NASDAQ_SYMBOL_DIRECTORY_DATASET: &str = "nasdaq.symbol-directory.us-li
 /// Provider identity required by the adapter's immutable source metadata.
 pub const NASDAQ_SYMBOL_DIRECTORY_PROVIDER: &str = "nasdaq-trader-symbol-directory";
 /// Exact listing-venue MICs represented by the admitted equity directory files.
-pub const NASDAQ_SYMBOL_DIRECTORY_VENUES: [&str; 7] =
-    ["XNAS", "XASE", "XNYS", "ARCX", "XCHI", "BATS", "IEXG"];
+pub const NASDAQ_SYMBOL_DIRECTORY_VENUES: [&str; 8] =
+    ["XNAS", "XASE", "XNYS", "ARCX", "XCHI", "TXSE", "BATS", "IEXG"];
 /// Minimum app-owned total acquisition budget for the bounded large-object path.
 pub const NASDAQ_REFERENCE_MIN_TOTAL_TIMEOUT_NANOS: u64 = 300_000_000_000;
 /// Maximum requests admitted by the shared application queue in its minute window.

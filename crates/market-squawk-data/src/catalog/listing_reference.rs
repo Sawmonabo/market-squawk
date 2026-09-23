@@ -160,6 +160,7 @@ pub enum ListingReferenceExchangeCode {
     Nyse,
     NyseArca,
     NyseTexas,
+    TexasStockExchange,
     CboeBzx,
     Iex,
 }
@@ -171,6 +172,7 @@ impl ListingReferenceExchangeCode {
             Self::Nyse => "N",
             Self::NyseArca => "P",
             Self::NyseTexas => "M",
+            Self::TexasStockExchange => "F",
             Self::CboeBzx => "Z",
             Self::Iex => "V",
         }
@@ -182,6 +184,7 @@ impl ListingReferenceExchangeCode {
             Self::Nyse => "XNYS",
             Self::NyseArca => "ARCX",
             Self::NyseTexas => "XCHI",
+            Self::TexasStockExchange => "TXSE",
             Self::CboeBzx => "BATS",
             Self::Iex => "IEXG",
         }
@@ -193,6 +196,7 @@ impl ListingReferenceExchangeCode {
             "N" => Ok(Self::Nyse),
             "P" => Ok(Self::NyseArca),
             "M" => Ok(Self::NyseTexas),
+            "F" => Ok(Self::TexasStockExchange),
             "Z" => Ok(Self::CboeBzx),
             "V" => Ok(Self::Iex),
             _ => Err(ListingReferenceError::CorruptCatalog),

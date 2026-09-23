@@ -2696,6 +2696,7 @@ fn parse_other_exchange(value: &str) -> Result<NasdaqOtherExchange, NasdaqRefere
         "N" => Ok(NasdaqOtherExchange::Nyse),
         "P" => Ok(NasdaqOtherExchange::NyseArca),
         "M" => Ok(NasdaqOtherExchange::NyseTexas),
+        "F" => Ok(NasdaqOtherExchange::TexasStockExchange),
         "Z" => Ok(NasdaqOtherExchange::CboeBzx),
         "V" => Ok(NasdaqOtherExchange::Iex),
         _ => Err(NasdaqReferenceError::InvalidProviderRow),

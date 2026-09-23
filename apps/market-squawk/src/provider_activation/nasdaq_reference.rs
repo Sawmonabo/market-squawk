@@ -1023,6 +1023,7 @@ const fn listing_exchange_code(value: NasdaqOtherExchange) -> ListingReferenceEx
         NasdaqOtherExchange::Nyse => ListingReferenceExchangeCode::Nyse,
         NasdaqOtherExchange::NyseArca => ListingReferenceExchangeCode::NyseArca,
         NasdaqOtherExchange::NyseTexas => ListingReferenceExchangeCode::NyseTexas,
+        NasdaqOtherExchange::TexasStockExchange => ListingReferenceExchangeCode::TexasStockExchange,
         NasdaqOtherExchange::CboeBzx => ListingReferenceExchangeCode::CboeBzx,
         NasdaqOtherExchange::Iex => ListingReferenceExchangeCode::Iex,
     }

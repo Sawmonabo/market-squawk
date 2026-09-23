@@ -244,6 +244,7 @@ fn parse_other_exchange(value: &str, row: u32) -> Result<NasdaqOtherExchange, Na
         "N" => Ok(NasdaqOtherExchange::Nyse),
         "P" => Ok(NasdaqOtherExchange::NyseArca),
         "M" => Ok(NasdaqOtherExchange::NyseTexas),
+        "F" => Ok(NasdaqOtherExchange::TexasStockExchange),
         "Z" => Ok(NasdaqOtherExchange::CboeBzx),
         "V" => Ok(NasdaqOtherExchange::Iex),
         _ => Err(NasdaqParseError::InvalidField {
@@ -412,6 +413,31 @@ mod tests {
         assert_eq!(record.quality(), DataQuality::OfficialDelayed);
         let payload = serde_json::to_vec(&record)?;
         assert_eq!(NasdaqListingRecord::from_json(&payload)?, record);
+
+        // The official current directory includes TXSE listings using native exchange F.
+        let txse = b"ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\r\nCTAG|Calamos Timpani Active SMID Growth ETF|F|CTAG|Y|100|N|CTAG\r\nFile Creation Time: 0922202618:01||||||\r\n";
+        let parsed_txse = parse_directory(NasdaqDirectoryKind::OtherListed, txse, &cancellation)?;
+        assert_eq!(parsed_txse.rows.len(), 1);
+        assert_eq!(
+            parsed_txse.rows[0].fields.other_exchange(),
+            Some(crate::NasdaqOtherExchange::TexasStockExchange)
+        );
+        let txse_record = NasdaqListingRecord::try_new(
+            parsed_txse.rows[0].row_number,
+            parsed_txse.file_creation_time,
+            Timestamp::from_unix_nanos(41),
+            Timestamp::from_unix_nanos(42),
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(txse).into(),
+            )),
+            parsed_txse.rows[0].fields.clone(),
+        )?;
+        assert_eq!(txse_record.listing_venue().as_str(), "TXSE");
+        assert_eq!(
+            NasdaqListingRecord::from_json(&serde_json::to_vec(&txse_record)?)?,
+            txse_record
+        );
 
         let duplicate = b"Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\nAAPL|Apple Inc.|Q|N|N|100|N|N\nAAPL|Apple Duplicate|Q|N|N|100|N|N\nFile Creation Time: 0807202621:31|||||||\n";
         assert!(matches!(
