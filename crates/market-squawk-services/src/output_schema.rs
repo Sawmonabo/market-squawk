@@ -12,6 +12,7 @@ const NANOSECOND_UTC_TIMESTAMP_PATTERN: &str =
     "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z$";
 const CALENDAR_DATE_PATTERN: &str = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
 const CALENDAR_MONTH_PATTERN: &str = "^[0-9]{4}-(?:0[1-9]|1[0-2])$";
+const CALENDAR_QUARTER_PATTERN: &str = "^[0-9]{4}-Q[1-4]$";
 const SCALED_DECIMAL_PATTERN: &str = r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$";
 const CANONICAL_DECIMAL_PATTERN: &str = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
 const NON_WHITESPACE_PATTERN: &str = "\\S";
@@ -285,6 +286,7 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                 | NANOSECOND_UTC_TIMESTAMP_PATTERN
                 | CALENDAR_DATE_PATTERN
                 | CALENDAR_MONTH_PATTERN
+                | CALENDAR_QUARTER_PATTERN
                 | SCALED_DECIMAL_PATTERN
                 | CANONICAL_DECIMAL_PATTERN
                 | NON_WHITESPACE_PATTERN
@@ -456,6 +458,13 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
                 && bytes[..4].iter().all(u8::is_ascii_digit)
                 && bytes[4] == b'-'
                 && matches!(&bytes[5..], [b'0', b'1'..=b'9'] | [b'1', b'0'..=b'2'])
+        }
+        Some(CALENDAR_QUARTER_PATTERN) => {
+            let bytes = value.as_bytes();
+            bytes.len() == 7
+                && bytes[..4].iter().all(u8::is_ascii_digit)
+                && &bytes[4..6] == b"-Q"
+                && matches!(bytes[6], b'1'..=b'4')
         }
         Some(CANONICAL_DECIMAL_PATTERN) => decimal_matches(value, false),
         Some(SCALED_DECIMAL_PATTERN) => decimal_matches(value, true),
@@ -644,7 +653,8 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 #[cfg(test)]
 mod tests {
     use super::{
-        ARTIFACT_ID_PATTERN, CALENDAR_DATE_PATTERN, CALENDAR_MONTH_PATTERN, CANONICAL_DECIMAL_PATTERN,
+        ARTIFACT_ID_PATTERN, CALENDAR_DATE_PATTERN, CALENDAR_MONTH_PATTERN, CALENDAR_QUARTER_PATTERN,
+        CANONICAL_DECIMAL_PATTERN,
         FORMATTED_PERCENTAGE_PATTERN, INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN,
         NON_WHITESPACE_PATTERN, OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN,
         POSITIVE_DECIMAL_PATTERN, SCALED_DECIMAL_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data,
@@ -736,6 +746,7 @@ mod tests {
         for (pattern, accepted, rejected) in [
             (ARTIFACT_ID_PATTERN, "source_recipe-1", "../source_recipe-1"),
             (CALENDAR_MONTH_PATTERN, "2026-09", "2026-13"),
+            (CALENDAR_QUARTER_PATTERN, "2026-Q2", "2026-Q5"),
             (SCALED_DECIMAL_PATTERN, "-1.50", "01.0"),
             (NON_WHITESPACE_PATTERN, "Investment", "   "),
             (POSITIVE_DECIMAL_PATTERN, "0.25", "-0.25"),
