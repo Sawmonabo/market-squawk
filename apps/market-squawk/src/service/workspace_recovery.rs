@@ -151,12 +151,8 @@ impl ManagedWorkspaceRestoreAuthority for WorkspaceRecoveryBridge {
         active_workspace: WorkspaceId,
         cancellation: &CancellationToken,
     ) -> Result<PreparedFreshWorkspace, ProductBackupError> {
-        if cancellation.is_cancelled() || source_workspace == active_workspace {
-            return if cancellation.is_cancelled() {
-                Err(ProductBackupError::Cancelled)
-            } else {
-                Err(ProductBackupError::InvalidRestoreTarget)
-            };
+        if cancellation.is_cancelled() {
+            return Err(ProductBackupError::Cancelled);
         }
         let selector = self
             .selector
@@ -169,6 +165,8 @@ impl ManagedWorkspaceRestoreAuthority for WorkspaceRecoveryBridge {
         let (workspace_id, paths) = selector
             .prepare_fresh_managed_workspace()
             .map_err(map_selector_restore)?;
+        // The backup may belong to the active workspace; only the newly allocated target
+        // must be distinct from both original identities.
         if cancellation.is_cancelled()
             || workspace_id == source_workspace
             || workspace_id == active_workspace
