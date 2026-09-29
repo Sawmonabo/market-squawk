@@ -342,6 +342,9 @@ checkpoint, and no additional branch/worktree was created. PR #43 records the pu
 
 ### Selected-account exposure checkpoint — 2026-09-29
 
+Source checkpoint `5bddacf1bbb2cd035924309586c23b833d8d1cf9` is pushed to origin;
+PR #43 carries its delivery evidence. All implementation ownership for this slice is released.
+
 Acceptance 4/5/6; refreshed clean base `09dac494`. Exposure exists but the selected-account
 Desktop is disconnected. Its read materializes allocations and every instrument row; preserve
 complete coverage by reusing the admitted positions page and adding whole-snapshot totals.
