@@ -224,7 +224,7 @@ These are identified dependencies, not completed behavior or permission for an u
 
 ### Integrated selected-account cash and performance — 2026-09-29
 
-Acceptance 4/5/6; refreshed clean base `3b74186b`. Existing GetPerformance computes cash,
+Source checkpoint `4b5e4f7e`; acceptance 4/5/6, refreshed clean base `3b74186b`. Existing GetPerformance computes cash,
 reported value, exact returns and accounting/reconciliation, but its raw account-ID request and
 unused Desktop shape prevent the selected account from opening it. Update this V1 operation in
 place to the existing opaque account token; retain instrument/time filters and exact output.
