@@ -839,7 +839,7 @@ const RESEARCH_FILE_COMMIT_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const RESEARCH_FILE_DISCARD_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("previewId", ArgumentKind::Sha256)];
-const PORTFOLIO_RISK_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+const PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
     "accountToken",
     ArgumentKind::OpaqueProductToken,
 )];
@@ -2261,9 +2261,13 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Portfolio.GetTransactions",
         "Return bounded normalized portfolio transactions.",
     ),
-    read_portfolio(
+    read(
         "Portfolio.GetPerformance",
-        "Return point-in-time portfolio performance.",
+        "Return point-in-time performance and accounting for the selected portfolio account.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read_portfolio(
         "Portfolio.GetExposure",
@@ -2274,7 +2278,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Return named portfolio risk measures, coverage, stress evidence, and evidence-backed guidance.",
         ServiceDomain::Portfolio,
         PRODUCT_PORTFOLIO_RISK_SCOPE,
-        PORTFOLIO_RISK_ARGUMENTS,
+        PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
     read(

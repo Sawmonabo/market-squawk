@@ -12,6 +12,7 @@ import type { ReactNode } from "react"
 
 import { PortfolioChart } from "@/components/charts/portfolio-chart"
 import { formatMoney } from "@/lib/formatters"
+import { formatUnixNanos } from "../opportunities/format"
 
 import type {
   PortfolioAccount,
@@ -22,6 +23,7 @@ import type {
 } from "./portfolio-contracts"
 import {
   formatProductTime,
+  formatPortfolioRate,
   investmentDisplayName,
   portfolioDisplayName,
 } from "./portfolio-format"
@@ -94,28 +96,40 @@ export function AllocationPanel({ holdings }: { holdings: PortfolioHolding[] }) 
 }
 
 export function PerformancePanel({ performance }: { performance: PortfolioPerformance }) {
+  const coverage = performance.historyStatus === "insufficient_history"
+    ? "At least two portfolio observations are needed to calculate returns."
+    : performance.historyStatus === "insufficient_comparable_history"
+      ? "The recorded observations do not support a comparable return period."
+      : `Returns use ${performance.periods?.toLocaleString()} comparable portfolio update periods. They are not annualized.`
   const values: [string, string][] = [
-    ["Current value", formatMoney(performance.currentValue)],
-    ["Time-weighted return", performance.timeWeightedReturn?.display ?? "Not available"],
-    ["Money-weighted return", performance.moneyWeightedReturn?.display ?? "Not available"],
-    [
-      "Comparable periods",
-      performance.comparablePeriods?.toLocaleString() ?? "Not available",
-    ],
+    ["Portfolio value", formatMoney(performance.currentValue)],
+    ["Time-weighted return", formatPortfolioRate(performance.timeWeightedReturn)],
+    ["Money-weighted return", formatPortfolioRate(performance.moneyWeightedReturn)],
+    ["Comparable periods", performance.periods?.toLocaleString() ?? "Not available"],
   ]
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
-      <PanelHeading
-        eyebrow="How it has changed"
-        title="Performance"
-        detail={performance.coverageExplanation}
-      />
+      <PanelHeading eyebrow="How it has changed" title="Performance" detail={coverage} />
       <dl className="mt-5 grid gap-4 sm:grid-cols-2">
-        {values.map(([label, value]) => (
-          <Fact key={label} label={label} value={value} />
-        ))}
+        {values.map(([label, value]) => <Fact key={label} label={label} value={value} />)}
       </dl>
-      {performance.accounting ? <AccountingPanel accounting={performance.accounting} /> : null}
+      <p className="mt-4 text-xs leading-5 text-muted-foreground">
+        Time-weighted return adjusts for external cash transfers. Money-weighted return uses
+        the recorded cash transfers and portfolio values to estimate the return on invested money.
+      </p>
+      <AccountingPanel accounting={performance.accountingEvidence} />
+      <EvidenceNote icon={Clock3}>
+        Values are reported portfolio observations, not current market prices. Portfolio value
+        includes cash, reported holdings and any unpaid cash entitlements. Returns use the
+        available recorded history; enough comparable periods does not establish complete history.
+      </EvidenceNote>
+      <dl className="mt-4 grid gap-4 sm:grid-cols-2">
+        <Fact label="Portfolio observation" value={formatUnixNanos(performance.effectiveAtUnixNanos)} />
+        <Fact label="Information available" value={performance.availableAtUnixNanos === null
+          ? "Not recorded" : formatUnixNanos(performance.availableAtUnixNanos)} />
+        <Fact label="Data confidence" value={performance.dataConfidence === "limited"
+          ? "Limited" : performance.dataConfidence === "moderate" ? "Moderate" : "Strong"} />
+      </dl>
     </section>
   )
 }
@@ -207,80 +221,86 @@ export function DataQualityPanel({ account }: { account: PortfolioAccount }) {
 }
 
 export function ReconciliationPanel({ performance }: { performance: PortfolioPerformance | null }) {
-  const accounting = performance?.accounting
+  const reconciliation = performance?.accountingEvidence.reconciliation
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
       <PanelHeading
         eyebrow="Import confidence"
         title="Reconciliation"
-        detail={
-          accounting?.reconciliationExplanation ??
-          "A complete supplied-versus-calculated comparison is not available."
-        }
+        detail={reconciliation?.status === "needs_review"
+          ? "Reported and calculated totals have recorded differences that need review."
+          : reconciliation ? "No comparison differences are recorded for this portfolio observation."
+            : "A reported-versus-calculated comparison is not available."}
       />
-      {!accounting ? (
+      {!reconciliation ? (
         <EvidenceNote icon={CircleAlert}>
           Do not treat a missing comparison as confirmation that the totals agree.
         </EvidenceNote>
       ) : (
         <div className="mt-5 space-y-3">
-          <p className="text-sm font-semibold">{accounting.reconciliationLabel}</p>
-          {accounting.reconciliationFindings.map((finding) => (
-            <div
-              key={finding.findingActionToken}
-              className="rounded-lg border border-border bg-background/35 p-3 text-xs"
-            >
-              <p className="font-medium text-foreground">{finding.label}</p>
-              <p className="mt-1 leading-5 text-muted-foreground">{finding.explanation}</p>
+          {reconciliation.discrepancies.map((finding, index) => (
+            <div key={`${finding.field}:${index}`} className="rounded-lg border border-border bg-background/35 p-3 text-xs">
+              <p className="font-medium text-foreground">
+                {finding.field === "cash" ? "Cash" : finding.field === "market_value" ? "Market value" : "Cost basis"}
+                {" · "}{finding.currency}
+              </p>
               <dl className="mt-2 grid gap-2 sm:grid-cols-3">
-                <Fact label="Supplied" value={formatMoney(finding.supplied)} />
+                <Fact label="Reported" value={formatMoney(finding.supplied)} />
                 <Fact label="Calculated" value={formatMoney(finding.calculated)} />
-                <Fact label="Tolerance" value={formatMoney(finding.tolerance)} />
+                <Fact label="Allowed difference" value={formatMoney(finding.tolerance.amount)} />
               </dl>
             </div>
           ))}
+          <p className="text-xs leading-5 text-muted-foreground">
+            This shows recorded comparison findings. The absence of a recorded difference
+            does not establish that every account figure has been independently verified.
+          </p>
         </div>
       )}
     </section>
   )
 }
 
-function AccountingPanel({
-  accounting,
-}: {
-  accounting: NonNullable<PortfolioPerformance["accounting"]>
-}) {
-  const entries: [string, string][] = [
-    ["Reported cash", formatMoney(accounting.cash)],
-    ["Reported market value", formatMoney(accounting.reportedMarketValue)],
-    ["Unrealized gain", measuredAmount(accounting.unrealizedGain)],
-    ["Realized gain", measuredAmount(accounting.realizedGain)],
-    ["Reported income", measuredAmount(accounting.income)],
-    ["Reported fees", measuredAmount(accounting.fees)],
+function AccountingPanel({ accounting }: { accounting: PortfolioPerformance["accountingEvidence"] }) {
+  const measures = [
+    { label: "Unrealized gain", value: accounting.unrealizedGain,
+      detail: "Uses reported holdings values and resolved cost basis. Missing or ambiguous basis makes this unavailable." },
+    { label: "Realized gain", value: accounting.realizedGain,
+      detail: accounting.realizedGain.status === "not_available"
+        ? "The recorded trade history does not yet support a realized gain calculation."
+        : "Calculated from the available recorded trade history." },
+    { label: "Recorded income", value: accounting.income,
+      detail: accounting.income.status === "partial"
+        ? "The recorded income total is partial: dividends, interest and withholding have not been separately identified."
+        : accounting.income.status === "not_available" ? "The recorded history does not support an income total."
+          : "The total of income recorded in this portfolio history." },
+    { label: "Recorded fees", value: accounting.fees,
+      detail: "The signed total of transactions recorded as fees; this does not establish complete fee history." },
   ]
   return (
     <section className="mt-5 rounded-lg border border-border bg-background/35 p-4">
-      <p className="text-sm font-medium">Account summary</p>
-      <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        {entries.map(([label, value]) => (
-          <Fact key={label} label={label} value={value} />
+      <h3 className="text-sm font-medium">Cash and account summary</h3>
+      <dl className="mt-4 grid gap-3 sm:grid-cols-2">
+        <Fact label="Reported cash" value={formatMoney(accounting.cash.amount)} />
+        <Fact label="Reported holdings value" value={formatMoney(accounting.reportedMarketValue)} />
+        {measures.map(({ label, value, detail }) => (
+          <div key={label}>
+            <Fact label={label} value={measuredAmount(value)} />
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{detail}</p>
+          </div>
         ))}
       </dl>
-      <p className="mt-3 text-[11px] text-muted-foreground">
-        Cash updated {formatProductTime(accounting.cashUpdatedAt)}
+      <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
+        Cash observed {formatUnixNanos(accounting.cash.observedAtUnixNanos)}. This reported
+        portfolio cash is not a current bank balance or confirmation of funds available to trade.
       </p>
     </section>
   )
 }
 
-function measuredAmount(value: {
-  state: "available" | "unavailable"
-  amount?: { amount: string; currency: string }
-  explanation?: string
-}) {
-  return value.state === "available" && value.amount
-    ? formatMoney(value.amount)
-    : value.explanation ?? "Not available"
+function measuredAmount(value: PortfolioPerformance["accountingEvidence"]["income"]): string {
+  if (value.status === "not_available" || value.amount === undefined) return "Not available"
+  return `${formatMoney(value.amount)}${value.status === "partial" ? " · Partial" : ""}`
 }
 
 function SummaryFact({

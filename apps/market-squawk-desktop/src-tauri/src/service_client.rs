@@ -229,8 +229,10 @@ pub(crate) async fn dashboard_query(
         DashboardQueryCommand::PortfolioTransactions { account_id } => {
             ("Portfolio.GetTransactions", account_arguments(account_id))
         }
-        DashboardQueryCommand::PortfolioPerformance { account_id } => {
-            ("Portfolio.GetPerformance", account_arguments(account_id))
+        DashboardQueryCommand::PortfolioPerformance { account_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("accountToken".to_owned(), json!(account_token));
+            ("Portfolio.GetPerformance", arguments)
         }
         DashboardQueryCommand::PortfolioExposure { account_id } => {
             ("Portfolio.GetExposure", account_arguments(account_id))

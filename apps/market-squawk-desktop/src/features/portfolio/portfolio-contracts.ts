@@ -168,47 +168,74 @@ export const portfolioAttributionSchema = z
   })
   .strict()
 
-const measuredAmountSchema = z.discriminatedUnion("state", [
-  z.object({ state: z.literal("available"), amount: moneySchema }).strict(),
-  z.object({ state: z.literal("unavailable"), explanation: productTextSchema }).strict(),
-])
+// The performance read uses the canonical Portfolio.GetPerformance projection.
+// Keep its exact monetary values and optional history evidence intact.
+const unixNanosSchema = z.string().regex(/^-?\d+$/)
+const measuredAccountingSchema = z.strictObject({
+  status: z.enum(["available", "partial", "not_available"]),
+  amount: moneySchema.optional(),
+}).superRefine((measure, context) => {
+  if (measure.status !== "not_available" && measure.amount === undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "An available amount is missing." })
+  }
+})
 
-const reconciliationDetailSchema = z
-  .object({
-    findingActionToken: portfolioActionTokenSchema,
-    label: productNameSchema,
-    supplied: moneySchema,
-    calculated: moneySchema,
-    tolerance: moneySchema,
-    explanation: productTextSchema,
-  })
-  .strict()
+const reconciliationDetailSchema = z.strictObject({
+  field: z.enum(["cash", "market_value", "cost_basis"]),
+  supplied: moneySchema,
+  calculated: moneySchema,
+  currency: currencySchema,
+  tolerance: z.strictObject({ kind: z.literal("absolute"), amount: moneySchema }),
+})
 
-const accountingSummarySchema = z
-  .object({
-    cash: moneySchema,
-    cashUpdatedAt: productTimeSchema,
-    reportedMarketValue: moneySchema,
-    unrealizedGain: measuredAmountSchema,
-    realizedGain: measuredAmountSchema,
-    income: measuredAmountSchema,
-    fees: measuredAmountSchema,
-    reconciliationLabel: productNameSchema,
-    reconciliationExplanation: productTextSchema,
-    reconciliationFindings: z.array(reconciliationDetailSchema).max(100),
-  })
-  .strict()
+const accountingEvidenceSchema = z.strictObject({
+  cash: z.strictObject({
+    amount: moneySchema,
+    observedAtUnixNanos: unixNanosSchema,
+    status: z.literal("available"),
+  }),
+  reportedMarketValue: moneySchema,
+  unrealizedGain: measuredAccountingSchema,
+  realizedGain: measuredAccountingSchema,
+  income: measuredAccountingSchema,
+  fees: measuredAccountingSchema,
+  reconciliation: z.strictObject({
+    status: z.enum(["clear", "needs_review"]),
+    discrepancies: z.array(reconciliationDetailSchema),
+  }),
+})
 
-export const performanceSchema = z
-  .object({
-    currentValue: moneySchema,
-    timeWeightedReturn: percentageSchema.nullable(),
-    moneyWeightedReturn: percentageSchema.nullable(),
-    comparablePeriods: z.number().int().nonnegative().nullable(),
-    coverageExplanation: productTextSchema,
-    accounting: accountingSummarySchema.nullable(),
-  })
-  .strict()
+export const performanceSchema = z.strictObject({
+  accountId: z.string().min(1),
+  snapshotToken: z.string().uuid(),
+  effectiveAtUnixNanos: unixNanosSchema,
+  availableAtUnixNanos: unixNanosSchema.nullable(),
+  dataConfidence: z.enum(["limited", "moderate", "strong"]),
+  currentValue: moneySchema,
+  historyStatus: z.enum(["insufficient_history", "insufficient_comparable_history"]).optional(),
+  timeWeightedReturn: exactDecimalSchema.optional(),
+  moneyWeightedReturn: exactDecimalSchema.optional(),
+  periods: z.number().int().positive().optional(),
+  accountingEvidence: accountingEvidenceSchema,
+}).superRefine((performance, context) => {
+  const hasReturns = performance.timeWeightedReturn !== undefined
+    && performance.moneyWeightedReturn !== undefined
+    && performance.periods !== undefined
+  const noReturns = performance.timeWeightedReturn === undefined
+    && performance.moneyWeightedReturn === undefined
+    && performance.periods === undefined
+  if (!(hasReturns && performance.historyStatus === undefined)
+    && !(noReturns && performance.historyStatus !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Performance history evidence is inconsistent." })
+  }
+})
+
+export function parsePortfolioPerformance(result: ApplicationResult): PortfolioPerformance {
+  if (result.metadata.returnedItems !== 1 || result.metadata.availableItems !== 1) {
+    throw new Error("Performance information is incomplete.")
+  }
+  return parsePortfolioResult(result, performanceSchema)
+}
 
 const exposureRowSchema = z
   .object({ label: productNameSchema, amount: moneySchema })

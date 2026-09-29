@@ -9,6 +9,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { AccountRisk } from "../risk/account-risk"
+import { AccountPerformance } from "./account-performance"
 
 import { PortfolioHistory } from "./portfolio-history"
 import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
@@ -159,11 +160,14 @@ function SelectedPortfolio({
       </section>
       <Alert>
         <AlertCircle aria-hidden="true" />
-        <AlertTitle>Holdings, performance, and exposure unavailable</AlertTitle>
+        <AlertTitle>Holdings and exposure unavailable</AlertTitle>
         <AlertDescription>
           These details cannot currently be opened here.
         </AlertDescription>
       </Alert>
+      <DemandPanel title="Cash and performance" className="rounded-xl border border-border bg-card/30 p-4">
+        <AccountPerformance account={account} bootstrap={bootstrap} transport={transport} />
+      </DemandPanel>
       <DemandPanel title="Risk and guidance" className="rounded-xl border border-border bg-card/30 p-4">
         <p className="text-xs leading-5 text-muted-foreground">
           Guidance for {account.displayName} informs a decision and cannot approve or place a trade.

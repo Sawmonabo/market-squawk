@@ -298,13 +298,16 @@ fn admitted_history<'a>(
                 .is_some_and(|available| scope.end.is_none_or(|end| available <= end))
         })
         .collect::<Vec<_>>();
-    if let Some(start) = scope.start
-        && let Some(first_in_range) = admitted
+    if let Some(start) = scope.start {
+        let Some(first_in_range) = admitted
             .iter()
             .position(|revision| revision.effective_at >= start)
-        && first_in_range > 0
-    {
-        admitted.drain(..first_in_range - 1);
+        else {
+            return Ok(Vec::new());
+        };
+        // An in-range closing observation needs its preceding opening value. Without a
+        // closing observation in the requested period, old history cannot establish a return.
+        admitted.drain(..first_in_range.saturating_sub(1));
     }
     Ok(admitted)
 }

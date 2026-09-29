@@ -487,7 +487,7 @@ pub(crate) enum DashboardQueryCommand {
         account_id: String,
     },
     PortfolioPerformance {
-        account_id: String,
+        account_token: String,
     },
     PortfolioExposure {
         account_id: String,

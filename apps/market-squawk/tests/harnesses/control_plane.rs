@@ -101,7 +101,7 @@ mod portfolio_application {
     async fn portfolio_import_atomically_publishes_the_queried_revision() -> TestResult {
         let temporary = tempfile::tempdir()?;
         let paths = AppPaths::prepare(temporary.path())?;
-        let batch = account_and_holding_batch()?;
+        let batch = account_and_holding_batch(1, 100, "50")?;
         let mut artifact = paths
             .artifacts()?
             .resolve("portfolio/import.json")?
@@ -124,7 +124,8 @@ mod portfolio_application {
                 )?,
                 context(1)?,
             )
-            .await?;
+            .await
+            .map_err(|error| format!("first import: {error}"))?;
         let holdings = service
             .call(
                 admitted(
@@ -136,16 +137,188 @@ mod portfolio_application {
                 )?,
                 context(2)?,
             )
-            .await?;
+            .await
+            .map_err(|error| format!("holdings: {error}"))?;
 
+        assert_eq!(imported.structured_content()["state"], "saved");
+        let holding = holdings
+            .structured_content()
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or("published holding is missing")?;
+        let snapshot = holding["snapshotToken"]
+            .as_str()
+            .ok_or("snapshot is missing")?;
+        uuid::Uuid::parse_str(snapshot)?;
+        let accounts = service
+            .call(
+                admitted(
+                    "Portfolio.ListAccounts",
+                    json!({
+                        "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
+                    }),
+                )?,
+                context(3)?,
+            )
+            .await
+            .map_err(|error| format!("accounts: {error}"))?;
+        let token = accounts.structured_content()["accounts"][0]["accountToken"]
+            .as_str()
+            .ok_or("account token is missing")?;
+        let arguments = json!({
+            "accountToken": token,
+            "instrumentIds": ["11111111-1111-4111-8111-111111111111"],
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
+        });
+        let performance = service
+            .call(
+                admitted("Portfolio.GetPerformance", arguments.clone())?,
+                context(4)?,
+            )
+            .await
+            .map_err(|error| format!("initial performance: {error}"))?;
+        let capabilities = application_capabilities()?;
+        performance.validate_for(
+            capabilities
+                .find("Portfolio.GetPerformance")
+                .ok_or("performance descriptor missing")?,
+        )?;
+        let report = performance.structured_content();
+        assert_eq!(report["snapshotToken"], snapshot);
         assert_eq!(
-            imported.structured_content().get("revisionId"),
-            holdings
-                .structured_content()
-                .as_array()
-                .and_then(|rows| rows.first())
-                .and_then(|row| row.get("revisionId"))
+            report["currentValue"],
+            json!({"amount": "1050", "currency": "USD"})
         );
+        assert_eq!(
+            report["accountingEvidence"]["cash"]["amount"],
+            json!({"amount": "1000", "currency": "USD"})
+        );
+        assert_eq!(
+            report["accountingEvidence"]["reportedMarketValue"]["amount"],
+            "50"
+        );
+        assert_eq!(
+            report["accountingEvidence"]["unrealizedGain"]["amount"]["amount"],
+            "10"
+        );
+        assert_eq!(
+            report["accountingEvidence"]["realizedGain"]["status"],
+            "not_available"
+        );
+        assert_eq!(report["historyStatus"], "insufficient_history");
+        assert!(report.get("timeWeightedReturn").is_none());
+        assert!(
+            admitted(
+                "Portfolio.GetPerformance",
+                json!({
+                    "accountId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
+                })
+            )
+            .is_err()
+        );
+        let mut unknown_account = arguments.clone();
+        unknown_account["accountToken"] = json!("portfolio_00000000000000000000000000000000");
+        assert!(
+            service
+                .call(
+                    admitted("Portfolio.GetPerformance", unknown_account)?,
+                    context(5)?
+                )
+                .await
+                .is_err()
+        );
+        let second_batch = account_and_holding_batch(2, 200, "100")?;
+        let mut second_artifact = paths
+            .artifacts()?
+            .resolve("portfolio/update.json")?
+            .create_new()?;
+        serde_json::to_writer(&mut second_artifact, &second_batch)?;
+        second_artifact.flush()?;
+        service
+            .call(
+                admitted(
+                    "Portfolio.Import",
+                    json!({
+                        "accountId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "artifactId": "portfolio/update.json", "confirm": true,
+                        "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
+                    }),
+                )?,
+                context(6)?,
+            )
+            .await
+            .map_err(|error| format!("second import: {error}"))?;
+        let updated = service
+            .call(
+                admitted("Portfolio.GetPerformance", arguments.clone())?,
+                context(7)?,
+            )
+            .await
+            .map_err(|error| format!("updated performance: {error}"))?;
+        updated.validate_for(
+            capabilities
+                .find("Portfolio.GetPerformance")
+                .ok_or("performance descriptor missing")?,
+        )?;
+        let expected = updated.structured_content().clone();
+        assert_eq!(expected["currentValue"]["amount"], "1100");
+        assert_eq!(expected["periods"], 1);
+        assert!(
+            expected["timeWeightedReturn"]
+                .as_str()
+                .is_some_and(|rate| rate != "0")
+        );
+        assert_ne!(expected["snapshotToken"], snapshot);
+        let mut closing_period = arguments.clone();
+        closing_period["timeRange"] = json!({"start": "1970-01-01T00:00:00.000000150Z", "end": "1970-01-01T00:00:00.000000250Z"});
+        let closing = service
+            .call(
+                admitted("Portfolio.GetPerformance", closing_period)?,
+                context(10)?,
+            )
+            .await
+            .map_err(|error| format!("closing period: {error}"))?;
+        assert_eq!(closing.structured_content()["periods"], 1);
+        assert_eq!(
+            closing.structured_content()["timeWeightedReturn"],
+            expected["timeWeightedReturn"]
+        );
+        let mut empty_period = arguments.clone();
+        empty_period["timeRange"] = json!({"start": "1970-01-01T00:00:00.000000300Z", "end": "1970-01-01T00:00:00.000000400Z"});
+        let outside = service
+            .call(
+                admitted("Portfolio.GetPerformance", empty_period)?,
+                context(8)?,
+            )
+            .await
+            .map_err(|error| format!("empty period: {error}"))?;
+        assert_eq!(
+            outside.structured_content()["historyStatus"],
+            "insufficient_history"
+        );
+        assert!(
+            outside
+                .structured_content()
+                .get("timeWeightedReturn")
+                .is_none()
+        );
+        drop(service);
+        let reopened =
+            PortfolioApplicationService::try_new(&paths, PortfolioApplicationLimits::standard())?;
+        let retained = reopened
+            .call(
+                admitted("Portfolio.GetPerformance", arguments)?,
+                context(9)?,
+            )
+            .await
+            .map_err(|error| format!("reopened performance: {error}"))?;
+        retained.validate_for(
+            capabilities
+                .find("Portfolio.GetPerformance")
+                .ok_or("performance descriptor missing")?,
+        )?;
+        assert_eq!(retained.structured_content(), &expected);
         Ok(())
     }
 
@@ -178,7 +351,11 @@ mod portfolio_application {
         ))
     }
 
-    fn account_and_holding_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
+    fn account_and_holding_batch(
+        revision: u64,
+        at: i64,
+        market_value: &str,
+    ) -> Result<ExtractionBatch, Box<dyn Error>> {
         let source_id = SourceId::try_from("portfolio-control-test")?;
         let metadata_revision =
             MetadataRevision::new(SourceIdentifier::try_from("portfolio-control-v1")?);
@@ -189,9 +366,23 @@ mod portfolio_application {
             NonZeroU16::MIN,
             Timestamp::from_unix_nanos(1_000),
         )?;
+        let record = |record_id: &str, value: Value| {
+            serde_json::to_vec(&json!({
+                "record_id": record_id, "revision_number": revision,
+                "supersedes_revision": revision.checked_sub(1).filter(|previous| *previous > 0).map(|previous| format!("statement-{previous}")),
+                "received_at_unix_nanos": (at + 3).to_string(),
+                "ingested_at_unix_nanos": (at + 4).to_string(), "record": value,
+            }))
+        };
         let payloads = [
-            br#"{"record_id":"account","revision_number":1,"received_at_unix_nanos":"103","ingested_at_unix_nanos":"104","record":{"kind":"account","account_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","currency":"USD","cash_balance":"1000","as_of_unix_nanos":"100"}}"#.as_slice(),
-            br#"{"record_id":"holding","revision_number":1,"received_at_unix_nanos":"103","ingested_at_unix_nanos":"104","record":{"kind":"holding","account_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","instrument_id":"11111111-1111-4111-8111-111111111111","currency":"USD","quantity":"2","lot_size":"1","market_value":"50","as_of_unix_nanos":"100","cost_basis":{"status":"resolved","amount":"40","lot_method":"fifo"}}}"#.as_slice(),
+            record(
+                "account",
+                json!({"kind": "account", "account_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "currency": "USD", "cash_balance": "1000", "as_of_unix_nanos": at.to_string()}),
+            )?,
+            record(
+                "holding",
+                json!({"kind": "holding", "account_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instrument_id": "11111111-1111-4111-8111-111111111111", "currency": "USD", "quantity": "2", "lot_size": "1", "market_value": market_value, "as_of_unix_nanos": at.to_string(), "cost_basis": {"status": "resolved", "amount": "40", "lot_method": "fifo"}}),
+            )?,
         ];
         let object_bytes = payloads.concat();
         let object_evidence = exact_evidence(&object_bytes);
@@ -199,13 +390,13 @@ mod portfolio_application {
             source_id,
             metadata_revision,
             &discovery,
-            SourceIdentifier::try_from("portfolio-control-object")?,
+            SourceIdentifier::try_from(format!("portfolio-control-object-{revision}"))?,
             SourceIdentifier::try_from("application-market-squawk-portfolio-records-json")?,
             object_evidence,
-            EffectiveInterval::new(Timestamp::from_unix_nanos(100), None)?,
-            Some(Timestamp::from_unix_nanos(101)),
+            EffectiveInterval::new(Timestamp::from_unix_nanos(at), None)?,
+            Some(Timestamp::from_unix_nanos(at + 1)),
             AvailabilityEvidence::Observed {
-                available_at: Timestamp::from_unix_nanos(102),
+                available_at: Timestamp::from_unix_nanos(at + 2),
                 evidence: SourceIdentifier::try_from("local-file-first-observed")?,
             },
             Some(u64::try_from(object_bytes.len())?),
@@ -219,18 +410,18 @@ mod portfolio_application {
         let records = payloads
             .into_iter()
             .map(|payload| {
-                let payload = Bytes::copy_from_slice(payload);
+                let payload = Bytes::from(payload);
                 ExtractionRecord::try_new(
                     &request,
                     SourceIdentifier::try_from("market-squawk-portfolio-raw-v1")?,
                     exact_evidence(&payload),
-                    Timestamp::from_unix_nanos(100),
-                    Some(Timestamp::from_unix_nanos(101)),
+                    Timestamp::from_unix_nanos(at),
+                    Some(Timestamp::from_unix_nanos(at + 1)),
                     AvailabilityEvidence::Observed {
-                        available_at: Timestamp::from_unix_nanos(102),
+                        available_at: Timestamp::from_unix_nanos(at + 2),
                         evidence: SourceIdentifier::try_from("local-file-first-observed")?,
                     },
-                    SourceIdentifier::try_from("statement-1")?,
+                    SourceIdentifier::try_from(format!("statement-{revision}"))?,
                     None,
                     payload,
                 )

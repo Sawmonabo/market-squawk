@@ -222,6 +222,63 @@ return estimate. Full selected-account completion also requires consistent revis
 history/attribution and explicit scenarios/rebalancing through the existing financial authorities.
 These are identified dependencies, not completed behavior or permission for an unbounded rewrite.
 
+### Integrated selected-account cash and performance — 2026-09-29
+
+Acceptance 4/5/6; refreshed clean base `3b74186b`. Existing GetPerformance computes cash,
+reported value, exact returns and accounting/reconciliation, but its raw account-ID request and
+unused Desktop shape prevent the selected account from opening it. Update this V1 operation in
+place to the existing opaque account token; retain instrument/time filters and exact output.
+
+| Owner | Exclusive files | Dependency and finish condition |
+| --- | --- | --- |
+| Lead | `application/contracts.rs`, Desktop `src/lib/transport.ts`, native `contracts.rs`/`service_client.rs`, existing `tests/harnesses/control_plane.rs` and Desktop `src/test/app.test.tsx`, `docs/reference/cli.md`, ledger/Git/check scheduling | Freeze GetPerformance accountToken input with existing portfolio scope filters and unchanged canonical output; align native and CLI documentation. Extend existing import/publication case to real snapshot identity, token selection, exact accounting, output validation and same-root reopen. |
+| Sol High performance reader | `apps/market-squawk/src/portfolio_application/read.rs` only | Resolve GetPerformance through existing token resolver; preserve its instrument/time filters while keeping GetRisk's current restriction. No output/calculation changes, builds or Git. |
+| Sol High performance Desktop | Desktop `src/features/portfolio/{portfolio-contracts.ts,portfolio-panels.tsx,portfolio-page.tsx,use-portfolio.ts,portfolio-format.ts}`, optional cohesive `account-performance.tsx` | Consume canonical output in `application/contracts/output.rs::portfolio_performance`; replace unused speculative performance/accounting shape and update all its renderers in owned files. Demand-loaded selected account, cancellation/session isolation, retry, exact money/rate formatting and explicit partial/unavailable evidence. Input freezes as `{query: "portfolioPerformance", accountToken}`. No shared transport/backend edits, tests/builds/Git. |
+
+Reader inspection found an adjacent financial correctness defect: a requested period wholly after
+retained observations leaves all old history admitted, potentially showing old returns for an empty
+period. Astra High owns only `portfolio_application/analytics.rs` to correct that existing history
+selection in place; lead owns the corresponding extension of the existing import/publication check.
+No additional review round or new harness. Reader handoff is integrated; its ownership is released.
+
+DAG: shared input contract → independent reader and Desktop implementation → lead integration and
+existing critical checks → coherent commit/push. No new worktree or branch. Native setup remains
+separately pending; fixture/restart checks do not establish live financial completion. Holdings,
+exposure and history stay subsequent required checkpoints, not silently waived capabilities.
+
+Reader, Desktop and financial-period handoffs are inspected and integrated; agent ownership is
+released. GetPerformance uses the same canonical account-token resolver as risk, preserving its
+existing instrument/time filters. Native and TypeScript requests agree; CLI/MCP retain the shared
+operation. Desktop now renders actual cash, exact returns, accounting, reconciliation and original
+cutoffs on expansion, with cancellation/session isolation and retry. Missing realized gain and
+partial income remain explicit. Existing money formatting is reused; percentage display shifts
+exact decimal text without floating-point arithmetic. No new financial computation lives in React.
+The history fix preserves the preceding opening observation only when an in-range observation exists.
+
+The valid two-revision check passed updated accounting and period assertions, then exposed a
+same-root reopening failure: restoration reimported old publications against the latest raw
+adapter head, which correctly rejects reactivating superseded records. Astra High implemented
+`PortfolioExtractionSource::restore_published_batch` in adapter `src/archive.rs`; lead integrated
+both ordinary and governed restoration in `portfolio_application/import.rs`. Ownership is released.
+Exact previously admitted records are normalized and reconciled with their historical account
+bindings without changing the active head. Fresh or partially rebuilt archives use unchanged live
+import transitions. Raw-only failed records are not treated as admitted. Both paths reuse the same
+revision builders and financial calculations; no cursor, new store, migration or compatibility path.
+
+Verification: Desktop TypeScript and the existing selected-account journey passed, including
+large exact cash, fractional return display, partial/unavailable accounting and stale-response
+cancellation. Native Desktop compilation passed before the recovery change. The existing Rust
+publication case now covers actual snapshot identities, two valid superseding imports, token
+lookup, canonical output validation, accounting, empty-period rejection, a retained opening
+observation and same-root reopening. Its recovery rerun passed (one selected case, 5.75 seconds; one-job compilation).
+The existing adapter correction case also checks historical reconstruction without head rollback,
+raw-only rejection and interrupted fresh-archive rebuilding; it passed (one selected case, 0.30 seconds). These extensions cover the discovered
+persistence failure and its live-import authority boundary; no new harness or broad suite.
+`git diff --check` passed. This checkpoint is implemented and critically verified; all agent
+ownership is released. No CI, resource measurement, live or installed completion is claimed.
+Next dependency: selected holdings/exposure/history identity and continuation, alongside pending
+native secure setup and actual stock/model/input admission.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved

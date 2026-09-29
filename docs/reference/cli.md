@@ -112,9 +112,13 @@ path-free Parquet artifact reference with `artifactId`, `sha256`, `byteCount`, `
 | `model list`; `model metadata <model>` | Admitted immutable model bundles or one bundle's validation metadata. |
 | `model admit <request> --confirm` | CLI-owned verified model-admission request. |
 | `model evaluate <request> --confirm`; `model predict <request>` | Confined model-input object. Prediction failure produces no automatic action. |
-| `portfolio import <path> --account <id> --confirm` | CLI-owned confined portfolio import. |
+| `portfolio accounts [--cursor <cursor>] [--limit <count>]` | Named portfolio directory and opaque account tokens; default page size 25. |
+| `portfolio import preview <path> --account <id> --confirm` | Review a selected file and its required interpretation choices. |
+| `portfolio import approve --review-token <token> --interpretations <path> --confirm` | Approve explicit interpretations from that review; returns an approval token. |
+| `portfolio import commit --approval-token <token> --confirm`; `portfolio import discard --review-token <token> --confirm` | Save the approved import, or discard an unsaved review. |
 | `portfolio holdings --account <id>`; `portfolio transactions --account <id>` | Bounded current holdings or normalized transactions. |
-| `portfolio performance <request>`; `portfolio exposure <request>`; `portfolio risk <request>` | Confined typed point-in-time request object. |
+| `portfolio performance <request>`; `portfolio risk <request>` | Confined typed point-in-time request object using `accountToken` returned by `portfolio accounts`. Performance preserves optional instrument/time filters and returns exact cash, reported value, returns and reconciliation from one saved snapshot. |
+| `portfolio exposure <request>` | Confined typed point-in-time request object using `accountId`. |
 | `backtest run <request> --confirm`; `backtest show <run>` | CLI-owned governed-input registration followed by a bounded backtest request, or one result. |
 | `bot status`; `bot preparation` | Current paper state or available market, virtual-cash, trading-cost and practice-mode choices. Choices come from the service; none is silently selected. |
 | `bot prepare --market-choice <token> --cash-choice <token> --cost-choice <token> --mode-choice <token>` | Prepare the exact selected session and return its short-lived confirmation token. |

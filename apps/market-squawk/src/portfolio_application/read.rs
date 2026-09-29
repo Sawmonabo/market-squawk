@@ -54,7 +54,9 @@ impl ReadScope {
             .get("accountToken")
             .and_then(Value::as_str)
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
-        if request.arguments().contains_key("instrumentIds") {
+        if request.name() == "Portfolio.GetRisk"
+            && request.arguments().contains_key("instrumentIds")
+        {
             return Err(PortfolioApplicationServiceError::InvalidRequest);
         }
         let catalog = super::product::account_catalog(image)?;
@@ -140,7 +142,10 @@ pub(super) fn call(
         "Portfolio.ListRevisions" => return list_revisions(image, request, context, limits),
         _ => {}
     }
-    let scope = if request.name() == "Portfolio.GetRisk" {
+    let scope = if matches!(
+        request.name(),
+        "Portfolio.GetPerformance" | "Portfolio.GetRisk"
+    ) {
         ReadScope::from_product_request(image, request, limits)?
     } else {
         ReadScope::from_request(request, limits)?

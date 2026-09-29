@@ -659,8 +659,13 @@ impl ImportAuthority {
             }
             _ => {}
         }
+        let imported = self
+            .source_for_batch(&batch)?
+            .import_batch(&batch)
+            .map_err(|_| PortfolioApplicationServiceError::Import)?;
         let mut candidate_accounts = self.accounts.clone();
         let published = self.build_revision(
+            &imported,
             request.account_id,
             &batch,
             artifact_sha256,
@@ -1250,7 +1255,12 @@ impl ImportAuthority {
             }
             _ => {}
         }
+        let imported = self
+            .source_for_batch(batch)?
+            .import_batch(batch)
+            .map_err(|_| PortfolioApplicationServiceError::Import)?;
         let published = self.build_governed_revision(
+            &imported,
             account_id,
             batch,
             artifact_sha256,
@@ -1327,7 +1337,10 @@ impl ImportAuthority {
             .governance
             .validate()
             .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
-        let imported = self.preview_batch(batch)?;
+        let imported = self
+            .source_for_batch(batch)?
+            .restore_published_batch(batch)
+            .map_err(|_| PortfolioApplicationServiceError::Import)?;
         validate_account_binding(account_id, &imported)?;
         // The source authority may already classify this immutable batch as a replay after a
         // restart. The original preview disposition is therefore not recomputed from mutable
@@ -1373,6 +1386,7 @@ impl ImportAuthority {
         )?;
         let published = self
             .build_governed_revision(
+                &imported,
                 account_id,
                 batch,
                 artifact_sha256,
@@ -1389,19 +1403,14 @@ impl ImportAuthority {
     }
 
     fn build_governed_revision(
-        &mut self,
+        &self,
+        imported: &PortfolioImport,
         account_id: AccountId,
         batch: &ExtractionBatch,
         artifact_sha256: [u8; 32],
         instructions: &[Task10TransactionInstruction],
         corporate_action_plan: Option<&market_squawk_data::CorporateActionPlan>,
     ) -> Result<PublishedRevision, PortfolioApplicationServiceError> {
-        let imported = {
-            let source = self.source_for_batch(batch)?;
-            source
-                .import_batch(batch)
-                .map_err(|_| PortfolioApplicationServiceError::Import)?
-        };
         validate_account_binding(account_id, &imported)?;
         let prior = self
             .accounts
@@ -1485,9 +1494,18 @@ impl ImportAuthority {
         batch: &ExtractionBatch,
         artifact_sha256: [u8; 32],
     ) -> Result<(), PortfolioApplicationServiceError> {
+        let imported = self
+            .source_for_batch(batch)?
+            .restore_published_batch(batch)
+            .map_err(|_| PortfolioApplicationServiceError::Import)?;
         let current_accounts = self.accounts.clone();
-        let published =
-            self.build_revision(account_id, batch, artifact_sha256, &current_accounts)?;
+        let published = self.build_revision(
+            &imported,
+            account_id,
+            batch,
+            artifact_sha256,
+            &current_accounts,
+        )?;
         let history = self.accounts.entry(account_id).or_default();
         if history.revisions.len() >= self.limits.max_history_per_account {
             return Err(PortfolioApplicationServiceError::CorruptPublication);
@@ -1497,51 +1515,14 @@ impl ImportAuthority {
     }
 
     fn build_revision(
-        &mut self,
+        &self,
+        imported: &PortfolioImport,
         account_id: AccountId,
         batch: &ExtractionBatch,
         artifact_sha256: [u8; 32],
         accounts: &BTreeMap<AccountId, AccountHistory>,
     ) -> Result<PublishedRevision, PortfolioApplicationServiceError> {
         let object = batch.request().object();
-        let key = SourceKey {
-            source_id: object.source_id().clone(),
-            metadata_revision: object
-                .metadata_revision()
-                .as_source_identifier()
-                .as_str()
-                .to_owned(),
-        };
-        let source = match self.sources.entry(key.clone()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let namespace = source_namespace(&key);
-                let store = LocalAuthorityStateStore::try_open(
-                    self.control_root
-                        .join(RAW_ARCHIVE_NAMESPACE)
-                        .join(namespace),
-                )
-                .map_err(|_| PortfolioApplicationServiceError::Authority)?;
-                entry.insert(
-                    PortfolioExtractionSource::try_new(
-                        key.source_id.clone(),
-                        MetadataRevision::new(
-                            SourceIdentifier::try_from(key.metadata_revision.clone()).map_err(
-                                |_| PortfolioApplicationServiceError::CorruptPublication,
-                            )?,
-                        ),
-                        DataQuality::DirectUnverified,
-                        store,
-                        None,
-                        PortfolioImportLimits::standard(),
-                    )
-                    .map_err(|_| PortfolioApplicationServiceError::Import)?,
-                )
-            }
-        };
-        let imported = source
-            .import_batch(batch)
-            .map_err(|_| PortfolioApplicationServiceError::Import)?;
         let prior = accounts
             .get(&account_id)
             .and_then(|history| history.revisions.last());
@@ -1568,8 +1549,8 @@ impl ImportAuthority {
             .unwrap_or(effective_at);
         let mut source_coverage =
             prior.map_or_else(Vec::new, |revision| revision.source_coverage.clone());
-        if !source_coverage.contains(&key.source_id) {
-            source_coverage.push(key.source_id.clone());
+        if !source_coverage.contains(object.source_id()) {
+            source_coverage.push(object.source_id().clone());
             source_coverage.sort_unstable();
         }
         let core = build_core_revision(

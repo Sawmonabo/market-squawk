@@ -310,6 +310,10 @@ fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without
         Err(market_squawk_adapter_portfolio::PortfolioImportError::AccountMismatch)
     ));
     assert_eq!(source.raw_records().len(), 1);
+    assert!(matches!(
+        source.restore_published_batch(&unbound),
+        Err(market_squawk_adapter_portfolio::PortfolioImportError::AccountMismatch)
+    ));
 
     let duplicate_archive = tempfile::tempdir()?;
     let mut source = open_source(duplicate_archive.path())?;
@@ -393,6 +397,42 @@ fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without
             })
     );
     drop(corrected);
+
+    drop(source);
+    let mut source = open_source(correction_archive.path())?;
+    let historical = source.restore_published_batch(&original_batch)?;
+    assert_eq!(historical.disposition(), ImportDisposition::Replay);
+    assert_eq!(
+        historical.transactions()[0].amount().amount().to_string(),
+        "10"
+    );
+    assert_eq!(
+        source
+            .active_record(&stable_record_id)
+            .ok_or("active correction absent")?
+            .revision_number(),
+        revision_two
+    );
+    assert!(source.import_batch(&original_batch).is_err());
+
+    let recovered_archive = tempfile::tempdir()?;
+    let mut recovered = open_source(recovered_archive.path())?;
+    recovered.restore_published_batch(&original_batch)?;
+    drop(recovered);
+    let mut recovered = open_source(recovered_archive.path())?;
+    recovered.restore_published_batch(&original_batch)?;
+    let recovered_correction = recovered.restore_published_batch(&correction_batch)?;
+    assert_eq!(
+        recovered_correction.transactions()[0]
+            .amount()
+            .amount()
+            .to_string(),
+        "10.25"
+    );
+    assert_eq!(
+        recovered.active_record(&stable_record_id),
+        source.active_record(&stable_record_id)
+    );
 
     let non_increasing = [FixtureRecord {
         revision: "statement-3".to_owned(),

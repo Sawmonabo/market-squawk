@@ -931,7 +931,7 @@ describe("Market Squawk desktop boundary", () => {
     )
   })
 
-  it("loads selected portfolio risk on demand and discards a cancelled account response", async () => {
+  it("loads selected portfolio reports on demand and discards a cancelled account response", async () => {
     const user = userEvent.setup()
     const first = "portfolio_11111111111111111111111111111111"
     const second = "portfolio_22222222222222222222222222222222"
@@ -956,13 +956,41 @@ describe("Market Squawk desktop boundary", () => {
         uncertainty: { level: "high", explanation: "Historical estimates can change.", outOfSampleEvidence: "unavailable", calibration: "unavailable", tradingCosts: "unavailable", pointInTimeInputs: "supported" },
       },
     })
+    const cashReport = {
+      accountId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", snapshotToken: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      effectiveAtUnixNanos: "1790000000000000000", availableAtUnixNanos: "1790000000000000001", dataConfidence: "limited",
+      currentValue: { amount: "9007199254741043.01", currency: "USD" }, historyStatus: "insufficient_history",
+      accountingEvidence: {
+        cash: { amount: { amount: "9007199254740993.01", currency: "USD" }, observedAtUnixNanos: "1790000000000000000", status: "available" },
+        reportedMarketValue: { amount: "50", currency: "USD" },
+        unrealizedGain: { status: "available", amount: { amount: "10", currency: "USD" } },
+        realizedGain: { status: "not_available" },
+        income: { status: "partial", amount: { amount: "7.50", currency: "USD" } },
+        fees: { status: "available", amount: { amount: "-2", currency: "USD" } },
+        reconciliation: { status: "clear", discrepancies: [] },
+      },
+    }
+    const performanceReads: string[] = []
+    let performanceSignal: AbortSignal | undefined
+    let resolvePerformance: ((value: ApplicationResult) => void) | undefined
     const reads: string[] = []
     let firstSignal: AbortSignal | undefined
     let resolveFirst: ((value: ApplicationResult) => void) | undefined
     render(
       <MemoryRouter initialEntries={["/portfolio"]}>
-        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk"] }, undefined, async (request, options) => {
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance"] }, undefined, async (request, options) => {
           if (request.query === "portfolioAccounts") return result({ accounts, nextCursor: null }, 2)
+          if (request.query === "portfolioPerformance") {
+            performanceReads.push(request.accountToken)
+            if (request.accountToken === first) {
+              performanceSignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolvePerformance = resolve })
+            }
+            return result(performanceReads.length > 2 ? {
+              ...cashReport, historyStatus: undefined, periods: 1,
+              timeWeightedReturn: "-0.01234567890123456789", moneyWeightedReturn: "0.0125",
+            } : cashReport)
+          }
           if (request.query === "portfolioRisk") {
             reads.push(request.accountToken)
             if (request.accountToken === first) {
@@ -975,12 +1003,29 @@ describe("Market Squawk desktop boundary", () => {
         })} />
       </MemoryRouter>,
     )
-    await user.click(await screen.findByRole("button", { name: /Portfolio 1/ }))
+    await user.click(await screen.findByRole("button", { name: /Portfolio 1/ }, { timeout: 5_000 }))
     expect(reads).toEqual([])
+    expect(performanceReads).toEqual([])
+    await user.click(screen.getByText("Cash and performance"))
+    await waitFor(() => expect(performanceReads).toEqual([first]))
     await user.click(screen.getByText("Risk and guidance"))
     await waitFor(() => expect(reads).toEqual([first]))
     await user.click(screen.getByRole("button", { name: /Portfolio 2/ }))
     await waitFor(() => expect(firstSignal?.aborted).toBe(true))
+    expect(performanceSignal?.aborted).toBe(true)
+    await user.click(screen.getByText("Cash and performance"))
+    expect(await screen.findByText("USD 9,007,199,254,740,993.01")).toBeTruthy()
+    expect(screen.getByText("USD 7.50 · Partial")).toBeTruthy()
+    expect(screen.getByText("At least two portfolio observations are needed to calculate returns.")).toBeTruthy()
+    expect(screen.getByText("Realized gain").parentElement?.textContent).toContain("Not available")
+    resolvePerformance?.(result({ ...cashReport, currentValue: { amount: "999", currency: "USD" } }))
+    await waitFor(() => expect(performanceReads).toEqual([first, second]))
+    expect(screen.queryByText("USD 999")).toBeNull()
+    await user.click(screen.getByRole("button", { name: "Refresh cash and performance" }))
+    expect(await screen.findByText("-1.234567890123456789%")).toBeTruthy()
+    expect(screen.getByText("1.25%")).toBeTruthy()
+    await user.click(screen.getByText("Cash and performance"))
+    await waitFor(() => expect(screen.queryByText("USD 9,007,199,254,740,993.01")).toBeNull())
     expect(reads).toEqual([first])
     await user.click(screen.getByText("Risk and guidance"))
     expect(await screen.findByText("Portfolio 2 original risk guidance")).toBeTruthy()

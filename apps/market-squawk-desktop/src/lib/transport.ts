@@ -106,11 +106,10 @@ export type ProductQuery =
       query:
         | "portfolioHoldings"
         | "portfolioTransactions"
-        | "portfolioPerformance"
         | "portfolioExposure"
       accountId: string
     }
-  | { query: "portfolioRisk"; accountToken: string }
+  | { query: "portfolioRisk" | "portfolioPerformance"; accountToken: string }
   | {
       query: "portfolioRevisions"
       accountId: string
