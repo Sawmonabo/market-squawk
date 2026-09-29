@@ -1,5 +1,29 @@
 # Market Squawk Delivery Ledger
 
+## Current execution — documentation aligned, product work paused — 2026-09-29
+
+The [owner-test goal](v1-owner-test-goal.md) is the tracked scope and finite acceptance contract.
+The owner authorized this documentation alignment and its commit/push only. Product implementation,
+agent dispatch, builds, tests, provider calls and measurements remain paused until explicit resume.
+
+The latest **product-code checkpoint** is `9543ed357349a83715079ba0720b0f4789f9da58`, pushed to
+`feature/v1-installed-product-experience` and recorded in draft PR #43. This documentation
+checkpoint changes no application code and does not inherit or claim fresh exact-head release
+approval. Three local branches, three origin heads and one primary worktree remain, with no linked
+worktrees. Main/release are unchanged. The preserved parent-workspace troubleshooting note is
+included in this documentation checkpoint; sessions and recovery backups remain intact.
+
+| Outcome | Current owner/status | Next dependency and evidence |
+| --- | --- | --- |
+| Resource processing remediation | Implemented and pushed at `9543ed35`; implementation assignments closed | Focused evidence below; complete installed workflows and final measurement remain unproven |
+| Owner-test goal and instruction alignment | Lead; documentation only, product execution paused | This checkpoint synchronizes scope, ownership and progress; no product checks required |
+| First complete stock analysis and saved-result restart | Pending explicit resume; no implementation files assigned | Brief refresh of the seven acceptance items against current source, then exact disjoint provider/financial/Desktop assignments |
+
+On resume, update this single table with bounded outcomes, exact file ownership, dependencies,
+critical evidence, blockers and pushed commits. Distinguish missing implementation from implemented
+but unproven behavior. Do not restart completed resource work or an open-ended infrastructure audit.
+All earlier active/current tables and local wave handoffs are historical, not live assignments.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved
@@ -7,7 +31,8 @@ The owner resumed work after the mockup pause and approved
 current `feature/v1-installed-product-experience` worktree, run critical verification, commit and
 push, then pause. The audit base is `913bb0127fed3866b6411de6225c2467421d169c` plus preserved
 financial WIP. This entry supersedes the older active-lane and parser-blocker descriptions below;
-those entries remain historical evidence. PR #43 records the resulting pushed checkpoint.
+those entries remain historical evidence. The resulting checkpoint is
+`9543ed357349a83715079ba0720b0f4789f9da58`, pushed to origin and recorded in PR #43. This resource batch is implemented; full product acceptance remains open.
 
 The integrated batch uses streamed query/storage output, indexed filing and point-in-time
 processing, disk-backed backtest history/results, paged model/forecast inventories, selected-model
@@ -23,8 +48,7 @@ The full installed financial workflow, whole-app measurement and unchanged final
 remain open. The owner deferred RAM measurement until complete application workflows are ready.
 No new branches or worktrees are created; old sessions and recovery backups remain preserved.
 
-
-## Owner screen-mock and resource correction — 2026-09-28
+## Historical screen-mock and resource correction — 2026-09-28
 
 The owner requests a complete Desktop screen mockup set, followed immediately by pausing the
 V1 goal and all agents. Mockups live only in the main worktree at `.agents/tmp/screen-mocks/`.
@@ -47,7 +71,7 @@ original session/recovery backup remain preserved. Resume requires owner directi
 implementation dependency remains genuine SEC filing normalization and complete financial
 workflow/restart proof, alongside completing the resource-restriction audit.
 
-## Current integration and cleanup barrier — 2026-09-29
+## Historical integration and cleanup barrier — 2026-09-29
 
 The active target is `feature/v1-installed-product-experience`. This combined
 source checkpoint is committed and pushed at `ff16c370c90d930979e3b69b4f641f19ede43302`;
@@ -84,7 +108,7 @@ type-checking passed with the pinned Node and pnpm versions.
 Three existing capture/routing cases and seven Census library cases passed. These focused results do not
 prove installed generation, backup/restore, restart or release acceptance.
 
-Current dependency and ownership wave:
+Historical dependency and ownership wave (closed by the later integrated checkpoint):
 
 | Lane | Owner and scope | Next dependency |
 | --- | --- | --- |
@@ -169,7 +193,7 @@ This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
 
-## Current integration barrier — 2026-09-16
+## Historical integration barrier — 2026-09-16
 
 The active checkout is `feature/v1-installed-product-experience` at pushed commit
 `5024a5dcd390401a51f162aa2a71cf360b4bf2d0`, with substantial uncommitted integration work.
@@ -563,7 +587,7 @@ records remain unchanged as locators.
   branch was deleted. Dirty older shared worktrees remain deliberately preserved and must not be
   force-removed. Root was clean after the integration and cleanup.
 
-## Current execution handoff — 2026-08-30
+## Historical execution handoff — 2026-08-30
 
 This section supersedes older active-state statements below. Historical release and audit records
 remain unchanged as locators.
@@ -615,7 +639,7 @@ remain unchanged as locators.
   `source-current-integration` (57). They must not be force-removed; each will be reconciled or
   preserved before cleanup.
 
-## Active installed-product V1 execution
+## Historical installed-product V1 execution
 
 - Active branch: `feature/v1-installed-product-experience`, based on
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
@@ -771,7 +795,7 @@ remain unchanged as locators.
 - Completion stops at the feature-branch packaged V1 handoff. Publishing assets, creating a public
   release, or merging to the release branch or `main` remains explicitly outside this execution.
 
-## Current v1.0.0 release state
+## Historical v1.0.0 release state
 
 - The accepted desktop and installer product candidate is
   `1611c268bb04cf5ed872749bfe44d7e3bfca8c04`, tree
@@ -1387,7 +1411,7 @@ and repository closeout. The integrated product demonstration is a required inte
 it does not claim that the Market Squawk product release is complete while the external provider
 predicates remain open.
 
-## Active Quarter 4 closeout sequence
+## Historical Quarter 4 closeout sequence
 
 The provider, research/model, and execution/paper implementation lanes are integrated. Remaining
 work is no longer represented as those three active implementation lanes:

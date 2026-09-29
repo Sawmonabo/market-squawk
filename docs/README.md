@@ -9,7 +9,7 @@ delivery status, research, and historical evidence so each page has one clear jo
 | Document type | Documentation portal index |
 | Audience | Operators, users, integrators, maintainers, reviewers, and contributors |
 | Status | Current |
-| Last substantive review | 2026-08-11 |
+| Last substantive review | 2026-09-29 |
 
 ## Start by intent
 
@@ -24,7 +24,8 @@ delivery status, research, and historical evidence so each page has one clear jo
 | Look up an exact desktop/CLI command, setting, MCP tool, source capability, quality class, or time field | [Reference](reference/README.md) |
 | See what is runnable and what still blocks the first complete release | [Delivery ledger](plans/delivery-ledger.md) |
 | Review the original dated requirement classification | [Historical gap analysis](plans/gap-analysis.md) |
-| Follow the approved implementation sequence | [Implementation plan](plans/implementation-plan.md) |
+| Follow the current V1 scope and acceptance checklist | [Owner-test goal](plans/v1-owner-test-goal.md) |
+| Inspect the earlier detailed implementation sequence | [Implementation plan](plans/implementation-plan.md) |
 | Reproduce or review the terminal release evidence | [Exact-head release gate](verification/usable-release-gate.md) |
 | Inspect original research and primary-source decisions | [Research](research/) |
 | Inspect historical architecture baselines | [Architecture audits](audits/architecture/) |
@@ -84,7 +85,8 @@ The [delivery ledger](plans/delivery-ledger.md) is the sole mutable summary of a
 evidence, active work, blockers, and release checkpoints. The dated
 [gap analysis](plans/gap-analysis.md) preserves the original requirement-by-requirement
 classification at its stated audit anchor; it is not current capability authority. The
-[implementation plan](plans/implementation-plan.md) retains the approved delivery sequence.
+[owner-test goal](plans/v1-owner-test-goal.md) owns current scope and acceptance; the earlier
+[implementation plan](plans/implementation-plan.md) remains detailed historical planning evidence.
 
 Use only these release-status labels in maintained product summaries:
 

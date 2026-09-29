@@ -8,6 +8,33 @@ This file preserves project-level decisions that must survive context compaction
 and later implementation sessions. It is not a transient progress report. Root
 [`AGENTS.md`](../AGENTS.md) requires future agents to read and follow it.
 
+## Owner correction: workflow completion and execution ownership — 2026-09-29
+
+The current V1 objective is the finite [owner-test goal](plans/v1-owner-test-goal.md): complete
+working Everyday/Advanced investment workflows, all agreed providers and shared Desktop/CLI/MCP
+behavior, followed by installed owner-test evidence. It supersedes conflicting historical
+execution, agent-model, scope-expansion and stopping instructions. Public publication and merging
+into main/release are outside this goal. Current execution status and the single assignment table
+belong only in the [delivery ledger](plans/delivery-ledger.md); document edits do not resume work.
+
+Before additional engineering, name the acceptance item, concrete failure or missing behavior,
+and smallest complete fix. Necessary financial correctness, credential/data protection,
+persistence/recovery and existing substantiated finding remediation remain mandatory. Speculative
+hardening, hypothetical future scale and general cleanup do not create new completion blockers.
+Report functional completion separately from final verification and release readiness.
+
+Use the existing feature branch and primary worktree. No new branch/worktree without explicit
+owner approval. Agents own disjoint files; the lead owns shared contracts, schemas, composition,
+manifests, lockfiles, Git and build/test scheduling. Integrate producer and consumer changes,
+verify the coherent slice, commit/push and release ownership before accumulating replacements.
+Start with provider integration, financial workflow and Desktop lanes when execution resumes;
+expand only where dependencies and ownership permit. No agents are authorized by this note alone.
+
+Keep local builds serialized and single-job. Use existing critical checks, adding a case only for
+an uncovered critical failure. No blanket TDD or per-task CI/review rounds. Existing grouped
+quarter reviews and remediation remain required; ordinary integration checkpoints are not final
+approval and need not repeat that ceremony. Final whole-app measurement follows complete workflows.
+
 ## Owner correction: whole-application memory and complete capability — 2026-09-28
 
 The owner clarified the intended RAM range as **500 MB to 1.5 GB, with a 2 GB maximum**
@@ -34,10 +61,10 @@ that batch requires critical correctness checks, commit and push, then a pause.
 
 ## Product and quality posture
 
-Market Squawk is implemented as hardened local production infrastructure. "Production-ready" is an
-evidence standard: invariant-preserving contracts, fail-closed authority, bounded ownership,
-checked financial arithmetic, deterministic lifecycle control, durable audit/recovery semantics,
-adversarial tests, and verification at the exact reviewed commit.
+The V1 delivery objective is a complete working investment product for owner testing. Correct financial
+arithmetic, credential/data protection, durable recovery and honest evidence are essential to that
+outcome. Production hardening is not an open-ended prerequisite: apply the scope rule above and
+reserve consolidated approval evidence for the final unchanged owner-test candidate.
 
 Market Squawk's product category is **self-hosted**: operators install and run it on infrastructure
 they control, application and analytical data remain local by default, and external provider
@@ -146,17 +173,15 @@ documentation checker scripts, prose tests, or new Rust test targets for documen
 
 ## Maximum-safe parallelism
 
-### Agent effort — owner correction, 2026-09-16
+### Agent model and effort — owner correction, 2026-09-29
 
-Use GPT-6 Astra with **medium** effort for ordinary coding and implementation. Use Astra with
-**high** effort for advanced financial modeling, forecasting, backtesting, harmonics, financial
-algorithms, and complex architectural or design work. This supersedes earlier xhigh agent requests.
-Before dispatching or replacing a worker, record its actual task, effort, reason, dependencies,
-and exclusive file ownership in the current wave. Classify by the task, not an inherited agent name.
-If an ordinary implementation lane encounters advanced financial or architectural work, split that
-specific work into an explicitly classified high-effort task. Do not silently increase all workers.
-Preserve paused predecessors and their unique work during context transfer; verify one transfer
-pilot before replacing the other workers. Completed workers need no replacement without remaining work.
+Use GPT-6 Astra High for advanced forecasting/modeling, harmonics, financial algorithms,
+backtesting, difficult debugging and advanced optimization. Use GPT-6 Sol High for other tasks.
+Use bounded briefs with `fork_turns="none"`, explicit dependencies, exclusive files and a
+finishable outcome. This supersedes older Astra Medium and xhigh instructions. If the task changes
+category, coordinate a bounded ownership handoff rather than silently expanding the lane.
+Inspect actual changes and relevant evidence before acceptance; a worker's completion message
+alone is insufficient. Preserve unique work and do not dispatch replacements for completed work.
 
 Parallelism follows dependencies and ownership, not raw agent count.
 
@@ -220,6 +245,9 @@ active processes and preserving every dirty or unique worktree state.
 
 ### Worktree lifecycle
 
+New worktrees require explicit owner approval under the current single-worktree rule. The
+following cleanup rules apply only to historical or explicitly approved exceptions.
+
 An isolated lane worktree is temporary execution infrastructure, not a permanent archive. Remove it
 promptly after all of its commits and follow-up artifacts are integrated or otherwise handed off,
 its reported evidence is recorded, its agent is no longer using it, and `git status --short` is
@@ -278,7 +306,7 @@ or another historical task label.
 ## Four-quarter review policy
 
 Fresh independent specialist reviews are grouped at four delivery-quarter checkpoints, not repeated
-after every ordinary task. Lane workers still perform TDD, self-review, focused verification, and
+after every ordinary task. Lane workers still perform self-review, existing critical verification, and
 blast-radius inspection before handoff. The canonical plan maps every Stage and Wave into exactly one
 of those four checkpoints; it must never invent Q5 or a higher-numbered quarter.
 
@@ -339,9 +367,15 @@ There are three distinct evidence levels:
 
 | Evidence | Meaning | May claim approval? |
 | --- | --- | --- |
-| Focused lane tests | The bounded lane behavior works in its isolated branch. | No |
+| Focused lane tests | The bounded lane behavior works in the shared candidate. | No |
 | Dirty candidate gate | The reviewed intended diff passes before commit. | No |
 | Clean exact-head gate | The committed, integrated, unchanged head passes every required local gate. | Only with completed review and no unresolved findings |
+
+Ordinary coherent checkpoints may be committed and pushed after relevant critical verification
+and inspection without a new quarter review. They must not retain unresolved substantiated
+findings in the behavior being accepted. Unrelated incomplete acceptance items stay explicit in
+the ledger; they do not require one enormous all-product commit. Existing findings still block
+final approval until corrected or retracted with evidence.
 
 Never call a pre-commit run, cached run from another head, or isolated-lane result "exact-head"
 evidence. After an approval review, any further commit—even documentation or style—invalidates the
@@ -427,31 +461,30 @@ contract that could stop before Python/modeling, complete MCP, and other mandato
 The old halfway criteria are retained in repository history only; they have no authority to pause or
 terminate active delivery. Progress weighting is status information, not a stopping gate.
 
-## Usable complete-release terminal condition
+## Current owner-test terminal condition
 
-Active delivery continues through a usable complete local release. It does not stop at 50 percent,
-at the end of a numbered Stage, or when only contracts, schemas, mocks, synthetic sources,
-diagnostic paths, plans, or focused lane tests exist.
+Complete the finite functional checklist in the [owner-test goal](plans/v1-owner-test-goal.md).
+Contracts, scaffolding, mocks, diagnostic paths and isolated checks do not establish complete
+working workflows. The functional milestone is distinct from final owner-test acceptance.
 
-The terminal condition requires all of the following at one clean, unchanged exact head:
+After functional completion, finish the agreed installed journeys and four-platform package
+proofs, whole-app resource measurements, existing consolidated deterministic/network/fuzz/security
+and dependency checks, and applicable Quarter 4 grouped review/remediation against one clean,
+unchanged final candidate. Preserve every required substantiated finding; do not invent additional
+review quarters or publication-specific work. No per-task full gate is required.
 
-1. Every mandatory live, research, adapter, storage, point-in-time, analytics, Python/modeling,
-   backtesting, portfolio, execution/risk, valuation, CLI, and MCP capability is a working bounded
-   producer-to-consumer vertical slice.
-2. The integrated local demonstration exercises the required CLI and complete typed MCP surfaces
-   without a mandatory paid API, cloud service, external database, container runtime, or telemetry
-   service.
-3. Deterministic tests, separately gated authorized network smokes, parser/model/MCP fuzz targets,
-   measured performance, and security, dependency, vulnerability, license, credential, and
-   generated-artifact checks provide fresh exact-head evidence.
-4. The Quarter 4 of 4 grouped independent review approves the same frozen commit with no unresolved
-   substantiated Critical, Important, or Minor finding.
-5. The exact commit is clean, pushed to `origin`, reported on the active pull request with truthful
-   local and hosted evidence, and every completed lane worktree is safely removed after handoff.
+The final owner-test handoff includes pushed candidate/package identities, instructions and PR #43
+evidence, with no public publication or merge into main/release. Explicit owner pauses control at
+any point. Only mark the goal complete when functional and final owner-test obligations are proven.
 
-Only then may implementation stop for complete-release handoff. A user-approved scope change may
-alter the product contract, but progress percentage or elapsed time cannot waive a mandatory
-capability or release gate.
+## Historical checkpoint records
+
+The dated records below preserve their original evidence and decisions. Their branch counts,
+active assignments, package versions, model choices, permission blockers and release/publication
+instructions apply to their audit anchors, not current execution. Use current corrections, the
+owner-test goal and delivery ledger before acting; do not resurrect superseded work or reopen
+settled personal-use permissions. Still-applicable technical requirements and substantiated
+findings remain in force until satisfied or explicitly superseded with evidence.
 
 ## 2026-07-21 Task 11 research vertical closeout
 

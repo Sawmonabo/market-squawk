@@ -1,6 +1,11 @@
 # Resource processing remediation
 
-Status: **Owner approved implementation in the current V1 worktree; commit and push after verification, then pause.**
+Status: **Implemented and pushed at `9543ed357349a83715079ba0720b0f4789f9da58`; scoped critical
+verification completed. This batch is closed; full product acceptance remains open.**
+
+Current scope is the [owner-test goal](v1-owner-test-goal.md); execution status and assignments are
+in the [delivery ledger](delivery-ledger.md). The design and ownership sequence below document the
+completed batch, not authorization to restart it. Whole-app measurement remains deferred.
 
 Prepared 2026-09-28 against `913bb0127fed3866b6411de6225c2467421d169c` plus the existing
 working changes in `feature/v1-installed-product-experience`. This is an investigation anchor,
@@ -238,7 +243,7 @@ apply stale responses; close/cancel releases read work; chart zoom keeps exact e
 and reopening retains correct saved results. Measure WebView/JS and native memory during long
 browsing sessions as part of the whole-app workload. Add no routine component-test matrix.
 
-## Dependency and ownership sequence after approval
+## Implemented dependency and ownership sequence
 
 | Stage | Work and exclusive owner | Dependency / completion condition |
 | --- | --- | --- |
@@ -381,5 +386,5 @@ Focused checks completed during integration:
 The source closure manifest is refreshed without acquiring or rebuilding the Python runtime;
 only its source identities change. Exact rights, object and custody hashes remain enforced.
 No full CI/release gate, installed complete-V1 acceptance or whole-app RAM measurement is claimed.
-After the resource checkpoint is committed and pushed, pause as directed. Whole-application RAM
-measurement waits for complete product workflows.
+The resource checkpoint was committed and pushed; product execution is paused. Whole-application
+RAM measurement waits for complete product workflows.

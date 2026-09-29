@@ -294,6 +294,11 @@ running. Build-script and procedural-macro support remain enabled. These are the
 [rust-analyzer configuration controls](https://rust-analyzer.github.io/book/configuration),
 verified against the installed extension on 2026-09-29.
 
+These settings must belong to the folder actually opened in VS Code. If a parent folder lists
+this repository in `rust-analyzer.linkedProjects`, its workspace settings control the analyzer;
+the nested repository's `.vscode/settings.json` does not. Apply the same on-demand settings to
+that parent workspace and confirm the effective values in the rust-analyzer extension log.
+
 Monitor generated storage at meaningful integration boundaries:
 
 ```bash
