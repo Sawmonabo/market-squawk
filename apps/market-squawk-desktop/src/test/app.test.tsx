@@ -11,6 +11,7 @@ import type { MarketProductRow } from "@/features/markets/market-product"
 import { parseInvestmentAnalysis, type InvestmentAnalysis } from "@/features/opportunities/contracts"
 import type { PortfolioPositionChoice } from "@/features/portfolio/portfolio-contracts"
 import { PortfolioPlanning } from "@/features/portfolio/portfolio-planning"
+import type { PortfolioRiskReport } from "@/features/risk/contracts"
 import {
   type ApplicationResult,
   type DesktopSystemBootstrap,
@@ -928,6 +929,66 @@ describe("Market Squawk desktop boundary", () => {
     expect(renderedMacro).not.toMatch(
       /Federal Reserve|FRED|ALFRED|H\.?15|Macro\.GetContext|\bprovider\b|\bsource\b|\bmanifest\b|\bdigest\b/i,
     )
+  })
+
+  it("loads selected portfolio risk on demand and discards a cancelled account response", async () => {
+    const user = userEvent.setup()
+    const first = "portfolio_11111111111111111111111111111111"
+    const second = "portfolio_22222222222222222222222222222222"
+    const accounts = [first, second].map((accountToken, index) => ({
+      accountToken, displayName: `Portfolio ${index + 1}`, currency: "USD", holdings: 2, dataIssues: 0,
+    }))
+    const result = (data: unknown, count = 1): ApplicationResult => ({
+      data, metadata: { completeness: "complete", returnedItems: count, availableItems: count },
+    })
+    const report = (name: string): PortfolioRiskReport => ({
+      accountName: name, asOf: "2026-09-01T00:00:00Z", availableAt: "2026-09-02T00:00:00Z", horizon: "One day",
+      coverage: { state: "complete", observations: 65, period: "Saved account history", explanation: "Comparable recorded periods." },
+      measures: ["Value at risk", "Expected shortfall", "Annualized volatility"].map((label) => ({
+        label: label as PortfolioRiskReport["measures"][number]["label"], value: "2.5%", status: "available", explanation: "Measured from retained returns.",
+      })),
+      stress: { label: "Market decline", impact: { amount: "-125", currency: "USD" }, status: "available", explanation: "An assumed decline, not a forecast.", assumptions: ["Holdings remain fixed."] },
+      recommendation: {
+        action: "abstain", horizon: "One day", summary: `${name} original risk guidance`, ranges: [],
+        reasons: ["Risk measures alone do not establish a trade."], risks: ["Losses can exceed historical estimates."],
+        assumptions: ["Recorded holdings remain unchanged."], invalidators: ["A new account revision."],
+        validity: { state: "unavailable", explanation: "No trade approval." },
+        uncertainty: { level: "high", explanation: "Historical estimates can change.", outOfSampleEvidence: "unavailable", calibration: "unavailable", tradingCosts: "unavailable", pointInTimeInputs: "supported" },
+      },
+    })
+    const reads: string[] = []
+    let firstSignal: AbortSignal | undefined
+    let resolveFirst: ((value: ApplicationResult) => void) | undefined
+    render(
+      <MemoryRouter initialEntries={["/portfolio"]}>
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk"] }, undefined, async (request, options) => {
+          if (request.query === "portfolioAccounts") return result({ accounts, nextCursor: null }, 2)
+          if (request.query === "portfolioRisk") {
+            reads.push(request.accountToken)
+            if (request.accountToken === first) {
+              firstSignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolveFirst = resolve })
+            }
+            return result(report("Portfolio 2"))
+          }
+          throw new Error(`Unexpected portfolio query: ${request.query}`)
+        })} />
+      </MemoryRouter>,
+    )
+    await user.click(await screen.findByRole("button", { name: /Portfolio 1/ }))
+    expect(reads).toEqual([])
+    await user.click(screen.getByText("Risk and guidance"))
+    await waitFor(() => expect(reads).toEqual([first]))
+    await user.click(screen.getByRole("button", { name: /Portfolio 2/ }))
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true))
+    expect(reads).toEqual([first])
+    await user.click(screen.getByText("Risk and guidance"))
+    expect(await screen.findByText("Portfolio 2 original risk guidance")).toBeTruthy()
+    resolveFirst?.(result(report("Portfolio 1")))
+    await waitFor(() => expect(reads).toEqual([first, second]))
+    expect(screen.queryByText("Portfolio 1 original risk guidance")).toBeNull()
+    await user.click(screen.getByText("Risk and guidance"))
+    await waitFor(() => expect(screen.queryByText("Portfolio 2 original risk guidance")).toBeNull())
   })
 
   it("keeps portfolio planning explicit and analysis-only", async () => {

@@ -165,6 +165,37 @@ Next native step: after the owner unlocks macOS, restart the expired setup again
 using existing binaries, verify the visible setup screen, and let the owner enter the app password
 locally. Usable rendering, unlocked service and live data admission remain unverified.
 
+### Active Portfolio integration — 2026-09-29
+
+Acceptance 4/5/6, reviewed Wave 2, refreshed at `35caedd4`: Portfolio renders unconditional
+unavailability for selected accounts, while Risk & Guidance already consumes the actual product
+risk report by opaque account token. First coherent dependency checkpoint: reuse that exact
+cancellable report and its presentation in the selected Portfolio view, independently of missing
+holdings/performance/history/planning wiring. Do not call this complete Portfolio acceptance.
+
+| Owner | Exact scope | Completion evidence / dependency |
+| --- | --- | --- |
+| Sol High Portfolio risk UI | Desktop `src/features/risk/risk-page.tsx`, new cohesive `src/features/risk/account-risk.tsx`, `src/features/portfolio/portfolio-page.tsx` | Extract existing account risk read/presentation without copying it; both screens use it. Explicit account choice, session/account isolation, abort on deselection, demand loading for expanded analysis, visible retry. Remove the unconditional risk-unavailable claim while retaining truthful gaps for unwired details. No new schema/transport/financial calculations. |
+| Lead | Existing Desktop `src/test/app.test.tsx`, ledger/Git/check scheduling | Extend the existing essential account-selection journey if needed to prove the newly reachable report cannot leak the previous account's values. Typecheck and one critical selected check; no Rust build. |
+| Sol High contract trace (read-only) | Existing `portfolio_application/{read,product,analytics}.rs`, shared operation contracts, native dashboard transport, canonical instrument lookup and existing tests | Identify the smallest coherent producer-to-consumer change for real holdings/performance/exposure/history from the selected account token. Account picker currently supplies no account ID; existing UI schemas do not match real payloads. Return exact files/dependencies and reusable identity/format owners; no edits or new parallel architecture. |
+
+Lead retains all shared bindings/contracts and application composition. No other file ownership,
+Git operations, builds or worktrees are delegated. Native setup awaits the unlocked local session.
+
+Risk UI handoff integrated and ownership released. Portfolio now opens the actual account risk
+report on expansion; Risk & Guidance reuses the same query and presentation module. Session changes
+clear selection, account changes close the panel, and closing/deselecting releases its observer.
+Request signals and zero inactive-cache retention remain intact. Read errors have a direct retry.
+Backend quantities, money, measures, cutoffs and recommendation evidence are rendered unchanged.
+
+Critical gap/check: the existing app harness gained one account-switch cancellation journey, since
+displaying the prior account's late financial response under the new selection was otherwise
+uncovered. It proves no read before expansion, cancellation on account switch, the actual second
+account report, rejection of a late first-account response and release on close. Passed (1 selected,
+8 skipped, 1.83 seconds), with TypeScript and `git diff --check` passing. No Rust build, broad suite,
+CI, resource measurement or live Portfolio acceptance is claimed. Holdings, cash/performance,
+exposure, history/attribution and planning remain explicit next integrations, not data absence.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved

@@ -8,6 +8,8 @@ import { Skeleton } from "@/components/ui/skeleton"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
+import { AccountRisk } from "../risk/account-risk"
+
 import { PortfolioHistory } from "./portfolio-history"
 import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
 import { PortfolioPlanning } from "./portfolio-planning"
@@ -37,7 +39,13 @@ export function PortfolioPage() {
     )
   }
 
-  return <PortfolioWorkspace bootstrap={product.bootstrap} transport={product.transport} />
+  return (
+    <PortfolioWorkspace
+      key={product.bootstrap.productSessionToken}
+      bootstrap={product.bootstrap}
+      transport={product.transport}
+    />
+  )
 }
 
 function PortfolioWorkspace({
@@ -105,7 +113,16 @@ function PortfolioWorkspace({
             selectedToken={selectedToken}
             select={setSelectedToken}
           />
-          {selected ? <SelectedPortfolio account={selected} /> : <SelectPortfolioPrompt />}
+          {selected ? (
+            <SelectedPortfolio
+              key={`${bootstrap.productSessionToken}:${selected.accountToken}`}
+              account={selected}
+              bootstrap={bootstrap}
+              transport={transport}
+            />
+          ) : (
+            <SelectPortfolioPrompt />
+          )}
         </>
       )}
 
@@ -125,7 +142,15 @@ function PortfolioWorkspace({
   )
 }
 
-function SelectedPortfolio({ account }: { account: PortfolioAccountSummary }) {
+function SelectedPortfolio({
+  account,
+  bootstrap,
+  transport,
+}: {
+  account: PortfolioAccountSummary
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
+}) {
   return (
     <div className="mt-5 space-y-4">
       <section className="rounded-xl border border-border p-5">
@@ -134,12 +159,17 @@ function SelectedPortfolio({ account }: { account: PortfolioAccountSummary }) {
       </section>
       <Alert>
         <AlertCircle aria-hidden="true" />
-        <AlertTitle>Detailed analysis is unavailable</AlertTitle>
+        <AlertTitle>Holdings, performance, and exposure unavailable</AlertTitle>
         <AlertDescription>
-          Holdings, performance, exposure, and risk are hidden until complete named investments,
-          exact values, dates, and safeguards are available together.
+          These details cannot currently be opened here.
         </AlertDescription>
       </Alert>
+      <DemandPanel title="Risk and guidance" className="rounded-xl border border-border bg-card/30 p-4">
+        <p className="text-xs leading-5 text-muted-foreground">
+          Guidance for {account.displayName} informs a decision and cannot approve or place a trade.
+        </p>
+        <AccountRisk account={account} bootstrap={bootstrap} transport={transport} />
+      </DemandPanel>
       <details className="group rounded-xl border border-border bg-card/20 p-4">
         <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">
           <span>History, stress tests, and planning</span>
@@ -172,7 +202,7 @@ function AccountDirectory({
 }: {
   accounts: PortfolioAccountSummary[]
   selectedToken: string | null
-  select: (accountToken: string) => void
+  select: (accountToken: string | null) => void
 }) {
   return (
     <section
@@ -199,7 +229,7 @@ function AccountDirectory({
               key={account.accountToken}
               type="button"
               aria-pressed={selected}
-              onClick={() => select(account.accountToken)}
+              onClick={() => select(selected ? null : account.accountToken)}
               className={`rounded-lg border p-4 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary ${
                 selected
                   ? "border-primary/60 bg-primary/10"
@@ -220,7 +250,7 @@ function AccountDirectory({
                 <AccountFact label="Data issues" value={account.dataIssues.toLocaleString()} />
               </dl>
               <p className="mt-4 text-[11px] font-medium text-primary">
-                {selected ? "Selected" : "View this portfolio"}
+                {selected ? "Deselect this portfolio" : "View this portfolio"}
               </p>
             </button>
           )
