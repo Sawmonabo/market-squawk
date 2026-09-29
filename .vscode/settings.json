@@ -1,5 +1,7 @@
 {
     "rust-analyzer.cargo.allTargets": false,
+    "rust-analyzer.cargo.autoreload": false,
+    "rust-analyzer.cargo.buildScripts.rebuildOnSave": false,
     "rust-analyzer.cargo.extraEnv": {
         "CARGO_BUILD_JOBS": "1",
         "CARGO_INCREMENTAL": "0"

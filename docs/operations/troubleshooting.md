@@ -287,6 +287,12 @@ Full variable-level debugging is opt-in through `cargo build --profile debugging
 The tracked VS Code workspace settings disable rust-analyzer's automatic on-save
 workspace/all-target flycheck and incremental analyzer builds; use focused on-demand diagnostics so
 editor background work does not duplicate release gates or silently expand `target/`.
+Automatic Cargo project reload and build-script rebuild-on-save are also disabled: manifest
+changes previously started background workspace checks despite flycheck being disabled. After a
+dependency change, refresh the analyzer project deliberately when no scheduled Cargo command is
+running. Build-script and procedural-macro support remain enabled. These are the upstream
+[rust-analyzer configuration controls](https://rust-analyzer.github.io/book/configuration),
+verified against the installed extension on 2026-09-29.
 
 Monitor generated storage at meaningful integration boundaries:
 
