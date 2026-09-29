@@ -23,8 +23,15 @@ All commits remain reachable through retained `codex/common-seal-root-integratio
 at `988c8547`; none had a separate worktree, live remote branch or open PR.
 This is label consolidation, not acceptance of the common-seal candidate.
 
-Fresh inventory: **21 local branches, 14 origin heads, six local worktrees
-including the target**. Six local and two remote Codex branches remain.
+The `codex/sealed-binding-catalog` label at `9a0170e2` was retired after
+independent comparison: its first two outside-target commits are patch-equivalent,
+and all 14 blobs in its remaining commit exactly match the retained common-seal
+index. The verified complete-history September 7 bundle also contains that exact
+branch tip. No worktree, remote branch or open PR belonged to this label. The
+common-seal index and backup remain intact; their product acceptance is still open.
+
+Fresh inventory: **20 local branches, 14 origin heads, six local worktrees
+including the target**. Five local and two remote Codex branches remain.
 The five donor worktrees are Alpaca, Census, Kraken, Schwab and common-seal
 integration. Unique commits and dirty layers still require disposition;
 this checkpoint does not claim that all source work is integrated.
