@@ -145,6 +145,8 @@ and existing `saved_benchmark_chart_accepts_retained_series_and_unavailability` 
 125 filtered, 0.08 seconds; compilation 3m50s). `git diff --check` passed. No tests or harnesses were
 added; this verifies compilation and the existing chart publication contract, not live CLI dispatch
 or three-client restart equality. Those require the original saved-stock evidence in I1.
+The coherent implementation/docs checkpoint is `25ec5422`, pushed to origin; CLI implementation
+ownership is released.
 
 Independent native-startup investigation: Astra High has read-only ownership of the existing
 Desktop visibility/bootstrap path (`src-tauri/src/lib.rs`, `service.rs`, related bootstrap state
@@ -153,6 +155,15 @@ was verified, while secure setup timed out. Determine whether source/runtime evi
 an application defect before treating this solely as owner delay. No edits, builds, restarts,
 credential access or user interaction; lead retains application composition. Return a bounded
 diagnosis and exact next action, not a new infrastructure plan.
+
+Investigation complete; read-only ownership released. The native process sample is inside
+`run_return` / `NSApplication run`, not blocked on service connection. macOS unified logs report
+the created window visible but occluded, and the lead independently confirmed
+`CGSSessionScreenIsLocked=Yes` through read-only `ioreg`. This supports a locked desktop obscuring
+the window, not a demonstrated startup defect. No visibility code or dependency change is justified.
+Next native step: after the owner unlocks macOS, restart the expired setup against the same V1 root
+using existing binaries, verify the visible setup screen, and let the owner enter the app password
+locally. Usable rendering, unlocked service and live data admission remain unverified.
 
 ## Resource processing checkpoint — 2026-09-29
 
