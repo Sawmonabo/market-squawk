@@ -53,6 +53,12 @@ still require implementation. Next dependency after this checkpoint is corrected
 then common saved planning evidence/reopening. Native setup and the real saved stock journey remain
 open independently; no full CI, release gate or whole-app memory measurement ran.
 
+Pushed source checkpoint: `c7a5170c17fb8b60930b80f6d76df8b369a3c641`.
+[PR #43 delivery evidence](https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5894065626)
+records the exact check scope and remaining acceptance gaps. One primary worktree remains;
+no auxiliary branch/worktree was created. Local check logs are under
+`.agents/tmp/v1-first-stock/portfolio-stress-{math,service,ui,typecheck,native}.log`.
+
 ## Current execution — first-stock wave resumed — 2026-09-29
 
 The owner resumed the registered goal after reviewed planning. The [owner-test goal](v1-owner-test-goal.md)
