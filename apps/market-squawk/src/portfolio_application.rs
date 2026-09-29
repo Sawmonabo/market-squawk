@@ -743,7 +743,10 @@ impl ApplicationDomainService for PortfolioApplicationService {
             .await
             .map_err(|error| error.as_service_error());
         }
-        if request.name() == "Portfolio.GetHoldings" {
+        if matches!(
+            request.name(),
+            "Portfolio.GetHoldings" | "Portfolio.GetExposure"
+        ) {
             let runtime = Arc::clone(&self.runtime);
             return tokio::task::spawn_blocking(move || {
                 let _guard = guard;

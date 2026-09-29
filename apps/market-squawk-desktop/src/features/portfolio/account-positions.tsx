@@ -10,41 +10,47 @@ import { CursorNavigation } from "../shared/cursor-navigation"
 
 import { HoldingTable } from "./holding-table"
 import type { PortfolioAccountSummary } from "./portfolio-contracts"
-import { usePortfolioHoldings } from "./use-portfolio"
+import { ExposurePanel } from "./portfolio-panels"
+import { usePortfolioPositions } from "./use-portfolio"
 
-export function AccountHoldings({ account, bootstrap, transport }: {
+export function AccountPositions({ account, bootstrap, transport, mode }: {
   account: PortfolioAccountSummary
   bootstrap: DesktopBootstrap
   transport: ProductTransport
+  mode: "holdings" | "exposure"
 }) {
-  const positions = usePortfolioHoldings(transport, bootstrap, account.accountToken)
+  const positions = usePortfolioPositions(transport, bootstrap, account.accountToken, mode)
   const page = positions.query.data
+  const label = mode === "holdings" ? "Positions" : "Exposure"
+  const detail = label.toLowerCase()
 
   if (!positions.available) {
-    return <PositionsUnavailable title="Positions unavailable"
+    return <PositionsUnavailable title={`${label} unavailable`}
       detail="These details cannot currently be opened for this portfolio." />
   }
 
   return (
-    <div className="space-y-4" aria-label={`Positions for ${account.displayName}`}>
+    <div className="space-y-4" aria-label={`${label} for ${account.displayName}`}>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-3xl text-xs leading-5 text-muted-foreground">
-          Positions are shown one page at a time from the same recorded portfolio observation.
-          Refresh positions to start again with the latest available observation.
+          {mode === "exposure"
+            ? "Exposure totals and paged positions use the same recorded portfolio observation."
+            : "Positions are shown one page at a time from the same recorded portfolio observation."}
+          {` Refresh ${detail} to start again with the latest available observation.`}
         </p>
         <Button variant="outline" onClick={positions.refresh} disabled={positions.query.isFetching}>
           <RefreshCw className={positions.query.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh positions
+          Refresh {detail}
         </Button>
       </div>
       {positions.query.isPending ? (
-        <div aria-label={`Loading positions for ${account.displayName}`}>
+        <div aria-label={`Loading ${detail} for ${account.displayName}`}>
           <Skeleton className="h-80 rounded-xl" />
         </div>
       ) : positions.query.isError ? (
         <div>
-          <PositionsUnavailable title="This portfolio’s positions could not be opened"
-            detail="Try again, or refresh positions to start with the latest available portfolio observation." />
+          <PositionsUnavailable title={`This portfolio’s ${detail} could not be opened`}
+            detail={`Try again, or refresh ${detail} to start with the latest available portfolio observation.`} />
           <Button className="mt-4" onClick={() => void positions.query.refetch()} disabled={positions.query.isFetching}>
             Try again
           </Button>
@@ -62,6 +68,18 @@ export function AccountHoldings({ account, bootstrap, transport }: {
                 ? "Not recorded" : formatUnixNanos(page.availableAtUnixNanos)}</dd>
             </div>
           </dl>
+          {mode === "exposure" && "exposure" in page ? (
+            <ExposurePanel exposure={page.exposure} />
+          ) : null}
+          {mode === "exposure" ? (
+            <div>
+              <h3 className="text-sm font-semibold">Positions on this page</h3>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                This page shows part of the position detail. The exposure totals above cover the
+                complete observation and do not change with the page.
+              </p>
+            </div>
+          ) : null}
           <HoldingTable key={page.snapshotToken + ":" + positions.navigation.page} holdings={page.holdings} />
         </>
       ) : null}

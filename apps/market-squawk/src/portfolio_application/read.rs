@@ -166,7 +166,6 @@ pub(super) fn call(
     match request.name() {
         "Portfolio.GetTransactions" => transactions(revision, &scope, context),
         "Portfolio.GetPerformance" => analytics::performance(image, revision, &scope, context),
-        "Portfolio.GetExposure" => analytics::exposure(revision, &scope, context),
         "Portfolio.GetRisk" => analytics::risk(image, revision, &scope, context),
         "Portfolio.GetAttribution"
         | "Portfolio.EvaluateScenario"

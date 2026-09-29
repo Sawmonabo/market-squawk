@@ -6183,14 +6183,18 @@ fn portfolio_account() -> Value {
 }
 
 fn portfolio_holdings_page() -> Value {
-    closed_complete(vec![
+    closed_complete(portfolio_position_page_fields())
+}
+
+fn portfolio_position_page_fields() -> Vec<(&'static str, Value)> {
+    vec![
         ("holdings", array(portfolio_holding())),
         ("pageCursor", bounded_text(512)),
         ("nextCursor", nullable(bounded_text(512))),
         ("snapshotToken", uuid()),
         ("effectiveAtUnixNanos", text()),
         ("availableAtUnixNanos", nullable(text())),
-    ])
+    ]
 }
 
 fn portfolio_holding() -> Value {
@@ -6368,35 +6372,27 @@ fn portfolio_reconciliation_detail() -> Value {
 }
 
 fn portfolio_exposure() -> Value {
-    let mut fields = portfolio_report_fields();
-    fields.extend([
-        ("instrument", array(portfolio_exposure_instrument())),
-        ("currency", array(portfolio_exposure_currency())),
-        ("sector", array(portfolio_exposure_classification())),
-        ("factor", array(portfolio_exposure_classification())),
-        ("net", money()),
-        ("gross", money()),
-        ("calculationStatus", text()),
-        ("classificationStatus", text()),
-    ]);
-    closed(
-        fields,
-        &[
-            "accountId",
-            "snapshotToken",
-            "effectiveAtUnixNanos",
-            "availableAtUnixNanos",
-            "dataConfidence",
-            "instrument",
-            "currency",
-            "sector",
-            "factor",
-        ],
-    )
-}
-
-fn portfolio_exposure_instrument() -> Value {
-    closed_complete(vec![("instrumentId", text()), ("amount", money())])
+    let mut fields = portfolio_position_page_fields();
+    fields.push((
+        "exposure",
+        closed_complete(vec![
+            ("currency", array(portfolio_exposure_currency())),
+            ("sector", array(portfolio_exposure_classification())),
+            ("factor", array(portfolio_exposure_classification())),
+            ("net", nullable(money())),
+            ("gross", nullable(money())),
+            ("positionCount", unsigned()),
+            (
+                "calculationStatus",
+                enumeration(&["available", "no_positions"]),
+            ),
+            (
+                "classificationStatus",
+                constant("not_supplied_by_portfolio_source"),
+            ),
+        ]),
+    ));
+    closed_complete(fields)
 }
 
 fn portfolio_exposure_currency() -> Value {

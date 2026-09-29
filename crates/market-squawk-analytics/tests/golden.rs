@@ -4,10 +4,10 @@ use market_squawk_analytics::{
     AnalyticsError, Annualization, DatedMoney, DatedStatisticalInput, DecimalMeasurement,
     DecimalPolicy, ExactDecimalScale, ExactDecimalUnit, ExactRate, FactorObservation,
     FundamentalPeriod, MeasurementUnit, MissingValuePolicy, MonetaryBasis, MonetaryValue,
-    PortfolioAllocation, Quantile, RatePoint, ReturnSeries, ScenarioShock, ShockComposition,
-    StatisticalDispersion, StatisticalInput, StatisticalLocation, StatisticalScale,
-    StatisticalUnit, VarianceConvention, WeightPolicy, WeightedStatisticalInput, alpha_beta,
-    correlation, cumulative_return, discrete_expected_shortfall, earnings_surprise,
+    PortfolioAllocation, PortfolioExposure, Quantile, RatePoint, ReturnSeries, ScenarioShock,
+    ShockComposition, StatisticalDispersion, StatisticalInput, StatisticalLocation,
+    StatisticalScale, StatisticalUnit, VarianceConvention, WeightPolicy, WeightedStatisticalInput,
+    alpha_beta, correlation, cumulative_return, discrete_expected_shortfall, earnings_surprise,
     factor_regression, free_cash_flow_yield, fundamental_growth, historical_var, information_ratio,
     macro_surprise, margin, maximum_drawdown, parametric_var, portfolio_attribution,
     portfolio_exposure, resolve_optional_inputs, scenario_impact, sharpe_ratio, simple_returns,
@@ -474,6 +474,56 @@ fn portfolio_attribution_and_composed_scenarios_remain_exact() -> TestResult {
     assert_eq!(
         exposure.gross().money(),
         Money::new(Decimal::new(1_000, 0), usd)
+    );
+    let signed = PortfolioExposure::from_value(monetary(
+        Money::new(Decimal::new(-600, 0), usd),
+        MonetaryBasis::Total,
+    ))
+    .checked_add(allocations[1].market_value())?;
+    assert_eq!(signed.net().money(), Money::new(Decimal::new(-200, 0), usd));
+    assert_eq!(
+        signed.gross().money(),
+        Money::new(Decimal::new(1_000, 0), usd)
+    );
+    assert_eq!(
+        signed.checked_add(monetary(
+            Money::new(Decimal::ONE, Currency::try_from("EUR")?),
+            MonetaryBasis::Total,
+        )),
+        Err(AnalyticsError::CurrencyMismatch)
+    );
+    assert_eq!(
+        signed.checked_add(monetary(
+            Money::new(Decimal::ONE, usd),
+            MonetaryBasis::PerShare
+        )),
+        Err(AnalyticsError::MeasurementUnitMismatch)
+    );
+    // Net remains representable, but absolute gross exposure must reject overflow.
+    let maximum = PortfolioExposure::from_value(monetary(
+        Money::new(Decimal::MAX, usd),
+        MonetaryBasis::Total,
+    ));
+    assert_eq!(
+        maximum.checked_add(monetary(
+            Money::new(-Decimal::ONE, usd),
+            MonetaryBasis::Total
+        )),
+        Err(AnalyticsError::DecimalArithmetic)
+    );
+    assert_eq!(
+        maximum.checked_add(monetary(
+            Money::new(Decimal::new(1, 1), usd),
+            MonetaryBasis::Total
+        )),
+        Err(AnalyticsError::DecimalArithmetic)
+    );
+    assert_eq!(
+        portfolio_exposure(&[]),
+        Err(AnalyticsError::InsufficientHistory {
+            required: 1,
+            actual: 0
+        })
     );
 
     let shocks = [

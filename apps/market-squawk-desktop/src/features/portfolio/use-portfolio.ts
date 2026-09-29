@@ -5,7 +5,8 @@ import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 import { useCursorNavigation } from "../shared/cursor-navigation"
-import { parsePortfolioAccountPage, parsePortfolioHoldings, parsePortfolioPerformance } from "./portfolio-contracts"
+import { parsePortfolioAccountPage, parsePortfolioExposure, parsePortfolioHoldings, parsePortfolioPerformance } from "./portfolio-contracts"
+import type { PortfolioExposurePage, PortfolioHoldingsPage } from "./portfolio-contracts"
 
 // Both account consumers share raw native responses and the same summary
 // projection. Navigation retains only cursor identities and the current page.
@@ -21,28 +22,32 @@ export function usePortfolioAccounts(transport: ProductTransport, bootstrap: Des
   return { available, query, navigation }
 }
 
-// Mounted only while the selected account's positions panel is open. Older
+// Holdings and exposure use the same immutable position-page lifecycle. Older
 // pages retain cursor identities only; closing releases the request and data.
-export function usePortfolioHoldings(
+export function usePortfolioPositions(
   transport: ProductTransport,
   bootstrap: DesktopBootstrap,
   accountToken: string,
+  mode: "holdings" | "exposure",
 ) {
-  const available = hasProductCapability(bootstrap, "portfolio_holdings")
+  const kind = mode === "holdings" ? "portfolioHoldings" : "portfolioExposure"
+  const available = hasProductCapability(bootstrap,
+    kind === "portfolioHoldings" ? "portfolio_holdings" : "portfolio_exposure")
   const navigation = useCursorNavigation()
-  const query = useQuery({
+  const query = useQuery<PortfolioHoldingsPage | PortfolioExposurePage>({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
       "portfolio",
-      "Portfolio.GetHoldings",
+      kind === "portfolioHoldings" ? "Portfolio.GetHoldings" : "Portfolio.GetExposure",
       { accountToken, cursor: navigation.after, limit: 25 },
     ),
     enabled: available,
     gcTime: 0,
     retry: false,
-    queryFn: async ({ signal }) => parsePortfolioHoldings(
-      await transport.query({ query: "portfolioHoldings", accountToken, cursor: navigation.after, limit: 25 }, { signal }),
-    ),
+    queryFn: async ({ signal }) => {
+      const result = await transport.query({ query: kind, accountToken, cursor: navigation.after, limit: 25 }, { signal })
+      return mode === "holdings" ? parsePortfolioHoldings(result) : parsePortfolioExposure(result)
+    },
   })
   const refresh = () => {
     navigation.restart()

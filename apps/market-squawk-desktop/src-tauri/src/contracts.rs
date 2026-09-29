@@ -492,7 +492,9 @@ pub(crate) enum DashboardQueryCommand {
         account_token: String,
     },
     PortfolioExposure {
-        account_id: String,
+        account_token: String,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     PortfolioRisk {
         account_token: String,

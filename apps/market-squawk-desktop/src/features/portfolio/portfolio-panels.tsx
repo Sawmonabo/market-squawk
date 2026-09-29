@@ -141,20 +141,40 @@ export function ExposurePanel({ exposure }: { exposure: PortfolioExposure }) {
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
       <PanelHeading
-        eyebrow="Where risk is concentrated"
+        eyebrow="What this portfolio covers"
         title="Exposure"
-        detail={exposure.coverageExplanation}
+        detail="Totals cover the complete recorded portfolio observation, including positions on other pages."
       />
-      <div className="mt-5 grid gap-5 lg:grid-cols-2">
-        <ExposureList title="By currency" rows={exposure.byCurrency} />
-        <ExposureList title="By investment" rows={exposure.byInvestment.slice(0, 8)} />
+      <dl className="mt-5 grid gap-4 sm:grid-cols-3">
+        <Fact label="Net position exposure" value={exposure.net ? formatMoney(exposure.net) : "Not available"} />
+        <Fact label="Gross position exposure" value={exposure.gross ? formatMoney(exposure.gross) : "Not available"} />
+        <Fact label="Positions in this observation" value={exposure.positionCount.toLocaleString()} />
+      </dl>
+      <p className="mt-4 text-xs leading-5 text-muted-foreground">
+        Net exposure combines signed position values; short positions reduce it. Gross exposure
+        counts the size of both long and short positions without offsetting them. Both exclude cash
+        and unpaid cash entitlements.
+      </p>
+      {exposure.calculationStatus === "no_positions" ? (
+        <p className="mt-3 text-xs text-muted-foreground">
+          This portfolio observation has no positions. Position exposure is not available;
+          any recorded cash and unpaid cash entitlements still appear by currency.
+        </p>
+      ) : null}
+      <div className="mt-5">
+        <ExposureList title="By currency" rows={exposure.currency.map((row) => ({
+          label: row.currency, amount: row.amount,
+        }))} />
+        <p className="mt-3 text-xs leading-5 text-muted-foreground">
+          Currency totals include position values, cash and unpaid cash entitlements. They are
+          not converted or combined across currencies. Negative amounts remain negative.
+        </p>
       </div>
-      {(exposure.net || exposure.gross) && (
-        <dl className="mt-5 grid gap-4 sm:grid-cols-2">
-          <Fact label="Net exposure" value={exposure.net ? formatMoney(exposure.net) : "Not available"} />
-          <Fact label="Gross exposure" value={exposure.gross ? formatMoney(exposure.gross) : "Not available"} />
-        </dl>
-      )}
+      <EvidenceNote icon={CircleAlert}>
+        Sector and factor exposure are unavailable because the recorded portfolio information
+        does not include those classifications. Missing classifications do not mean zero exposure
+        or zero risk.
+      </EvidenceNote>
     </section>
   )
 }

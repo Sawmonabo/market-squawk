@@ -277,10 +277,6 @@ async fn run_cli_vertical(product: &LocalProduct, scratch: &Path) -> Result<CliE
     )
     .await
     .context("release portfolio transactions read failed")?;
-    let account_request = write_json(
-        &scratch.join("portfolio-request.json"),
-        &json!({"accountId": ACCOUNT}),
-    )?;
     let selected_account_request = write_json(
         &scratch.join("selected-portfolio-request.json"),
         &json!({"accountToken": account_token}),
@@ -300,7 +296,7 @@ async fn run_cli_vertical(product: &LocalProduct, scratch: &Path) -> Result<CliE
             request: selected_account_request.clone(),
         },
         PortfolioCommand::Exposure {
-            request: account_request.clone(),
+            request: selected_account_request.clone(),
         },
         PortfolioCommand::Risk {
             request: selected_account_request,

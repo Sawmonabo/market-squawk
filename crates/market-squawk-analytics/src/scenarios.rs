@@ -148,6 +148,49 @@ pub struct PortfolioExposure {
 }
 
 impl PortfolioExposure {
+    /// Starts an exact exposure total from one signed position value.
+    #[must_use]
+    pub fn from_value(value: MonetaryValue) -> Self {
+        Self {
+            net: value,
+            gross: MonetaryValue::new(
+                Money::new(value.money().amount().abs(), value.money().currency()),
+                value.basis(),
+            ),
+        }
+    }
+
+    /// Adds one position without retaining individual allocations.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mixed currencies/bases and unrepresentable exact net or gross addition.
+    pub fn checked_add(self, value: MonetaryValue) -> Result<Self, AnalyticsError> {
+        if value.money().currency() != self.net.money().currency() {
+            return Err(AnalyticsError::CurrencyMismatch);
+        }
+        if value.basis() != self.net.basis() {
+            return Err(AnalyticsError::MeasurementUnitMismatch);
+        }
+        let net = self
+            .net
+            .money()
+            .checked_add(value.money())
+            .map_err(|_| AnalyticsError::DecimalArithmetic)?;
+        let gross = self
+            .gross
+            .money()
+            .checked_add(Money::new(
+                value.money().amount().abs(),
+                value.money().currency(),
+            ))
+            .map_err(|_| AnalyticsError::DecimalArithmetic)?;
+        Ok(Self {
+            net: MonetaryValue::new(net, self.net.basis()),
+            gross: MonetaryValue::new(gross, self.net.basis()),
+        })
+    }
+
     /// Returns signed net exposure.
     #[must_use]
     pub const fn net(self) -> MonetaryValue {
@@ -170,28 +213,10 @@ pub fn portfolio_exposure(
     allocations: &[PortfolioAllocation],
 ) -> Result<PortfolioExposure, AnalyticsError> {
     validate_count(allocations.len(), 1)?;
-    let (currency, basis) = common_measurement(allocations)?;
-    let (net, gross) = allocations.iter().try_fold(
-        (
-            Money::new(Decimal::ZERO, currency),
-            Money::new(Decimal::ZERO, currency),
-        ),
-        |(net, gross), allocation| {
-            let market_value = allocation.market_value.money();
-            let absolute = Money::new(market_value.amount().abs(), currency);
-            let net = net
-                .checked_add(market_value)
-                .map_err(|_| AnalyticsError::DecimalArithmetic)?;
-            let gross = gross
-                .checked_add(absolute)
-                .map_err(|_| AnalyticsError::DecimalArithmetic)?;
-            Ok::<_, AnalyticsError>((net, gross))
-        },
-    )?;
-    Ok(PortfolioExposure {
-        net: MonetaryValue::new(net, basis),
-        gross: MonetaryValue::new(gross, basis),
-    })
+    allocations[1..].iter().try_fold(
+        PortfolioExposure::from_value(allocations[0].market_value),
+        |exposure, allocation| exposure.checked_add(allocation.market_value),
+    )
 }
 
 /// Computes exact contribution `market_value * return_rate` for every allocation.

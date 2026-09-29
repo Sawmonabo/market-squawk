@@ -843,7 +843,7 @@ const PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::requi
     "accountToken",
     ArgumentKind::OpaqueProductToken,
 )];
-const PORTFOLIO_HOLDINGS_ARGUMENTS: &[ArgumentSpec] = &[
+const PORTFOLIO_POSITION_PAGE_ARGUMENTS: &[ArgumentSpec] = &[
     PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
     CURSOR_PAGE_ARGUMENTS[0],
     CURSOR_PAGE_ARGUMENTS[1],
@@ -2263,7 +2263,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Return a page of positions from the selected portfolio snapshot.",
         ServiceDomain::Portfolio,
         PORTFOLIO_SCOPE,
-        PORTFOLIO_HOLDINGS_ARGUMENTS,
+        PORTFOLIO_POSITION_PAGE_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
     read_portfolio(
@@ -2278,9 +2278,13 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
-    read_portfolio(
+    read(
         "Portfolio.GetExposure",
-        "Return point-in-time instrument, sector, factor, and currency exposure.",
+        "Return selected portfolio exposure totals and a page of positions from the same saved snapshot.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_POSITION_PAGE_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read(
         "Portfolio.GetRisk",

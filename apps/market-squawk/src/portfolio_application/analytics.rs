@@ -1,17 +1,17 @@
 //! Revision-bound Task 12 performance, exposure, risk, and scenario results.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use market_squawk_adapter_portfolio::{
     ReconciliationField, ReconciliationTolerance, TransactionKind,
 };
 use market_squawk_analytics::{
-    ExactDecimalScale, ExactRate, MonetaryBasis, MonetaryValue, PortfolioAllocation, Quantile,
-    ScenarioShock, ShockComposition, StatisticalInput, StatisticalScale, StatisticalUnit,
-    discrete_expected_shortfall, historical_var, portfolio_exposure, scenario_impact,
+    ExactDecimalScale, ExactRate, MonetaryBasis, MonetaryValue, PortfolioAllocation,
+    PortfolioExposure, Quantile, ScenarioShock, ShockComposition, StatisticalInput,
+    StatisticalScale, StatisticalUnit, discrete_expected_shortfall, historical_var,
+    scenario_impact,
 };
-use market_squawk_domain::{Currency, Money, SourceIdentifier};
+use market_squawk_domain::{Money, SourceIdentifier};
 use market_squawk_portfolio::{
     AnalyticsPolicyBinding, CashFlowTiming, MoneyWeightedMethod, PerformancePeriod,
     PerformancePolicy, PerformanceReport, PortfolioAnalyticsEvidence, PortfolioLimitInput,
@@ -25,7 +25,7 @@ use serde_json::{Map, Number, Value, json};
 use super::PortfolioApplicationServiceError;
 use super::import::hex;
 use super::model::{BasisResolution, PortfolioReadImage, PublishedRevision};
-use super::read::{ReadScope, product_report_result, report_result};
+use super::read::{ReadScope, check_context, product_report_result, report_result};
 
 /// Three 5% tail observations are the minimum retained evidence for the historical tail measures.
 const MINIMUM_HISTORICAL_RISK_RETURNS: usize = 60;
@@ -91,56 +91,53 @@ pub(super) fn performance(
     report_result(Value::Object(output), revision, scope, context)
 }
 
-pub(super) fn exposure(
+/// Whole-snapshot totals; the caller budgets this summary together with its holdings page.
+pub(super) fn exposure_summary(
     revision: &PublishedRevision,
     scope: &ReadScope,
     context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let allocations = allocations(revision, scope)?;
-    let mut output = base_report(revision, "task12_exact_exposure_v1");
-    let instrument = revision
-        .holdings
-        .iter()
-        .filter(|holding| scope.admits_instrument(holding.instrument_id()))
-        .map(|holding| {
-            json!({
-                "instrumentId": holding.instrument_id().to_string(),
-                "amount": money_value(holding.market_value())
-            })
-        })
-        .collect::<Vec<_>>();
-    output.insert("instrument".to_owned(), Value::Array(instrument));
-    output.insert(
-        "currency".to_owned(),
-        Value::Array(currency_exposure(revision, scope)?),
-    );
-    if allocations.is_empty() {
-        output.insert(
-            "calculationStatus".to_owned(),
-            Value::String("no_positions".to_owned()),
-        );
-        output.insert("sector".to_owned(), Value::Array(Vec::new()));
-        output.insert("factor".to_owned(), Value::Array(Vec::new()));
-        return report_result(Value::Object(output), revision, scope, context);
-    }
-    let report = portfolio_exposure(&allocations)
+) -> Result<Value, PortfolioApplicationServiceError> {
+    check_context(context)?;
+    let cash = revision
+        .account
+        .cash_balance()
+        .checked_add(scoped_receivables(revision, scope, Some(context))?)
         .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
-    output.insert("net".to_owned(), money_value(report.net().money()));
-    output.insert("gross".to_owned(), money_value(report.gross().money()));
-    let unclassified = money_value(report.net().money());
-    output.insert(
-        "sector".to_owned(),
-        json!([{"classification": "unclassified", "amount": unclassified.clone()}]),
-    );
-    output.insert(
-        "factor".to_owned(),
-        json!([{"classification": "unclassified", "amount": unclassified}]),
-    );
-    output.insert(
-        "classificationStatus".to_owned(),
-        Value::String("not_supplied_by_portfolio_source".to_owned()),
-    );
-    report_result(Value::Object(output), revision, scope, context)
+    let mut exposure: Option<PortfolioExposure> = None;
+    let mut position_count = 0_usize;
+    for holding in &revision.holdings {
+        check_context(context)?;
+        if !scope.admits_instrument(holding.instrument_id()) {
+            continue;
+        }
+        if holding.account_id() != scope.account_id {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        let value = MonetaryValue::new(holding.market_value(), MonetaryBasis::Total);
+        exposure = Some(match exposure {
+            Some(total) => total
+                .checked_add(value)
+                .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
+            None => PortfolioExposure::from_value(value),
+        });
+        position_count += 1;
+    }
+    let net = exposure.map(|report| report.net().money());
+    let classifications = net.map_or_else(Vec::new, |amount| {
+        vec![json!({"classification": "unclassified", "amount": money_value(amount)})]
+    });
+    let output = json!({
+        "net": net.map(money_value),
+        "gross": exposure.map(|report| money_value(report.gross().money())),
+        "positionCount": position_count,
+        "currency": currency_exposure(cash, net)?,
+        "sector": classifications,
+        "factor": classifications,
+        "calculationStatus": if exposure.is_some() { "available" } else { "no_positions" },
+        "classificationStatus": "not_supplied_by_portfolio_source",
+    });
+    check_context(context)?;
+    Ok(output)
 }
 
 pub(super) fn risk(
@@ -392,7 +389,7 @@ fn total_value(
             revision
                 .account
                 .cash_balance()
-                .checked_add(scoped_receivables(revision, scope)?)
+                .checked_add(scoped_receivables(revision, scope, None)?)
                 .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
             |total, holding| {
                 total
@@ -423,33 +420,27 @@ fn allocations(
 }
 
 fn currency_exposure(
-    revision: &PublishedRevision,
-    scope: &ReadScope,
+    cash: Money,
+    positions: Option<Money>,
 ) -> Result<Vec<Value>, PortfolioApplicationServiceError> {
-    let mut totals = BTreeMap::<Currency, Money>::new();
-    let cash = revision.account.cash_balance();
-    totals.insert(
-        cash.currency(),
-        cash.checked_add(scoped_receivables(revision, scope)?)
-            .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
-    );
-    for holding in revision
-        .holdings
-        .iter()
-        .filter(|holding| scope.admits_instrument(holding.instrument_id()))
-    {
-        let total = totals
-            .entry(holding.currency())
-            .or_insert_with(|| Money::new(Decimal::ZERO, holding.currency()));
-        *total = total
-            .checked_add(holding.market_value())
-            .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+    // Position exposure requires one currency. Cash may carry a different currency; preserve
+    // the separate amount rather than inventing an exchange rate or retaining per-position rows.
+    let mut totals = vec![cash];
+    if let Some(positions) = positions {
+        if positions.currency() == cash.currency() {
+            totals[0] = cash
+                .checked_add(positions)
+                .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+        } else {
+            totals.push(positions);
+            totals.sort_unstable_by_key(|amount| amount.currency());
+        }
     }
     Ok(totals
         .into_iter()
-        .map(|(currency, amount)| {
-            json!({"currency": currency.as_str(), "amount": money_value(amount)})
-        })
+        .map(
+            |amount| json!({"currency": amount.currency().as_str(), "amount": money_value(amount)}),
+        )
         .collect())
 }
 
@@ -679,18 +670,18 @@ fn number(value: f64) -> Result<Value, PortfolioApplicationServiceError> {
 fn scoped_receivables(
     revision: &PublishedRevision,
     scope: &ReadScope,
+    context: Option<&RequestContext>,
 ) -> Result<Money, PortfolioApplicationServiceError> {
-    revision
-        .core
-        .cash_entitlements()
-        .iter()
-        .filter(|claim| !claim.settled() && scope.admits_instrument(claim.instrument()))
-        .try_fold(
-            Money::new(Decimal::ZERO, revision.core.base_currency()),
-            |total, claim| {
-                total
-                    .checked_add(claim.amount())
-                    .map_err(|_| PortfolioApplicationServiceError::Analytics)
-            },
-        )
+    let mut total = Money::new(Decimal::ZERO, revision.core.base_currency());
+    for claim in revision.core.cash_entitlements() {
+        if let Some(context) = context {
+            check_context(context)?;
+        }
+        if !claim.settled() && scope.admits_instrument(claim.instrument()) {
+            total = total
+                .checked_add(claim.amount())
+                .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+        }
+    }
+    Ok(total)
 }

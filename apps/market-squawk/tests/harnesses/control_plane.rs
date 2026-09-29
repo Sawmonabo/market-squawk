@@ -178,6 +178,56 @@ mod portfolio_application {
         )?;
         assert_eq!(holding["quantity"], "2");
         assert_eq!(holding["investment"], json!({"name": null, "symbol": null}));
+        let exposure = service
+            .call(
+                admitted("Portfolio.GetExposure", first_page_arguments.clone())?,
+                context(16)?,
+            )
+            .await?;
+        exposure.validate_for(
+            application_capabilities()?
+                .find("Portfolio.GetExposure")
+                .ok_or("exposure descriptor missing")?,
+        )?;
+        assert_eq!(
+            exposure.structured_content()["holdings"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            exposure.structured_content()["exposure"]["positionCount"],
+            2
+        );
+        assert_eq!(
+            exposure.structured_content()["exposure"]["net"]["amount"],
+            "75"
+        );
+        assert_eq!(
+            exposure.structured_content()["exposure"]["gross"]["amount"],
+            "75"
+        );
+        assert_eq!(
+            exposure.structured_content()["exposure"]["currency"][0]["amount"]["amount"],
+            "1075"
+        );
+        assert_eq!(
+            exposure.structured_content()["exposure"]["sector"][0]["classification"],
+            "unclassified"
+        );
+        let empty_exposure = service.call(admitted("Portfolio.GetExposure", json!({
+            "accountToken": token, "instrumentIds": ["33333333-3333-4333-8333-333333333333"],
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
+        }))?, context(19)?).await?;
+        assert_eq!(
+            empty_exposure.structured_content()["exposure"]["calculationStatus"],
+            "no_positions"
+        );
+        assert!(empty_exposure.structured_content()["exposure"]["net"].is_null());
+        assert_eq!(
+            empty_exposure.structured_content()["exposure"]["currency"][0]["amount"]["amount"],
+            "1000"
+        );
         let arguments = json!({
             "accountToken": token,
             "instrumentIds": ["11111111-1111-4111-8111-111111111111"],
@@ -289,6 +339,24 @@ mod portfolio_application {
             first_page_again.structured_content(),
             holdings.structured_content()
         );
+        let next_exposure = service
+            .call(
+                admitted("Portfolio.GetExposure", continuation_arguments.clone())?,
+                context(17)?,
+            )
+            .await?;
+        assert_eq!(
+            next_exposure.structured_content()["snapshotToken"],
+            snapshot
+        );
+        assert_eq!(
+            next_exposure.structured_content()["exposure"],
+            exposure.structured_content()["exposure"]
+        );
+        assert_eq!(
+            next_exposure.structured_content()["holdings"],
+            next_holdings.structured_content()["holdings"]
+        );
         let mut wrong_scope = continuation_arguments.clone();
         wrong_scope["instrumentIds"] = json!(["11111111-1111-4111-8111-111111111111"]);
         assert!(
@@ -379,6 +447,17 @@ mod portfolio_application {
         assert_eq!(
             retained_holdings.structured_content(),
             next_holdings.structured_content()
+        );
+
+        let retained_exposure = reopened
+            .call(
+                admitted("Portfolio.GetExposure", first_page_arguments.clone())?,
+                context(18)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_exposure.structured_content(),
+            exposure.structured_content()
         );
 
         let retained_first_page = reopened

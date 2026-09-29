@@ -9,7 +9,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { AccountRisk } from "../risk/account-risk"
-import { AccountHoldings } from "./account-holdings"
+import { AccountPositions } from "./account-positions"
 import { AccountPerformance } from "./account-performance"
 
 import { PortfolioHistory } from "./portfolio-history"
@@ -160,15 +160,11 @@ function SelectedPortfolio({
         <p className="mt-2 text-sm text-muted-foreground">{account.currency} · {account.holdings} recorded holdings · {account.dataIssues} recorded data issues</p>
       </section>
       <DemandPanel title="Positions" className="rounded-xl border border-border bg-card/30 p-4">
-        <AccountHoldings account={account} bootstrap={bootstrap} transport={transport} />
+        <AccountPositions mode="holdings" account={account} bootstrap={bootstrap} transport={transport} />
       </DemandPanel>
-      <Alert>
-        <AlertCircle aria-hidden="true" />
-        <AlertTitle>Exposure unavailable</AlertTitle>
-        <AlertDescription>
-          These details cannot currently be opened here.
-        </AlertDescription>
-      </Alert>
+      <DemandPanel title="Exposure" className="rounded-xl border border-border bg-card/30 p-4">
+        <AccountPositions mode="exposure" account={account} bootstrap={bootstrap} transport={transport} />
+      </DemandPanel>
       <DemandPanel title="Cash and performance" className="rounded-xl border border-border bg-card/30 p-4">
         <AccountPerformance account={account} bootstrap={bootstrap} transport={transport} />
       </DemandPanel>

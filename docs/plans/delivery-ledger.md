@@ -340,6 +340,63 @@ remain required; whole-app RAM and final owner-test gates remain deferred until 
 Only the lead owns the next integration assignment; no implementation agents remain active for this
 checkpoint, and no additional branch/worktree was created. PR #43 records the pushed identity.
 
+### Selected-account exposure checkpoint — 2026-09-29
+
+Acceptance 4/5/6; refreshed clean base `09dac494`. Exposure exists but the selected-account
+Desktop is disconnected. Its read materializes allocations and every instrument row; preserve
+complete coverage by reusing the admitted positions page and adding whole-snapshot totals.
+History/attribution remain required subsequent work, not waived by this slice.
+
+| Owner | Exclusive files | Dependency / finish condition |
+| --- | --- | --- |
+| Astra High exposure aggregation | `portfolio_application/analytics.rs`, `crates/market-squawk-analytics/src/scenarios.rs` and its existing scenario tests if a critical arithmetic gap demands extension | Replace exposure with `exposure_summary(revision, scope, context) -> Result<Value, PortfolioApplicationServiceError>`. Reuse exact financial authority with streaming aggregation; no per-position JSON/allocations vector, artificial count cap, lost signs, invented classifications or frontend math. Preserve performance/risk. |
+| Sol High exposure Desktop | `features/portfolio/{portfolio-contracts.ts,use-portfolio.ts,portfolio-panels.tsx,portfolio-page.tsx,account-holdings.tsx}`, consolidated `account-positions.tsx` replacing duplicated position/exposure renderers | Render frozen exposure page below on explicit expansion; share existing position table/paging, exact formatting, cancellation/session/account lifecycle. No builds/tests/Git. |
+| Lead | `portfolio_application/{holdings.rs,read.rs}`, `portfolio_application.rs`, shared application contracts/output, CLI/native/TS transports, release demonstration, existing control-plane/Desktop app test, docs/ledger/Git | Reuse same immutable page selection for exposure and holdings, fit summary and rows together within response budget, update all callers, verify whole-snapshot totals with one-row pages and restart. |
+
+Frozen exposure output is the existing holdings page (`holdings`, `pageCursor`, `nextCursor`,
+`snapshotToken`, original effective/available clocks), plus `exposure`: nullable money `net`/`gross`,
+`positionCount`, `currency` rows `{currency, amount}`, `sector`/`factor` rows
+`{classification, amount}`, `calculationStatus` (`available`/`no_positions`) and
+`classificationStatus` (`not_supplied_by_portfolio_source`). Net/gross describe positions;
+currency totals preserve existing cash/receivable inclusion. Missing classification stays explicit.
+Input is the same accountToken/cursor/limit/instrument/time/result scope as holdings. No new endpoint.
+
+DAG: frozen contract → independent financial/Desktop lanes → lead shared page/transport/checks
+→ coherent commit/push and ownership release. Only lead schedules single-job builds. Existing
+publication/restart and selected-portfolio Desktop checks cover totals independent of page length,
+original snapshot persistence, exact signs/amounts and demand/cancellation; no new harness.
+Native live admission is still waiting on owner secure setup (macOS lock rechecked as Yes).
+
+Financial and Desktop handoffs are inspected and integrated; both owners are released. The
+shared exact exposure accumulator avoids retaining a second allocations vector or whole-account
+instrument JSON. Holdings and exposure share immutable page selection, historical display lookup,
+response budgeting, cancellation and one Desktop component/query lifecycle. Exposure totals cover
+the full selected snapshot regardless of page size; signed position totals stay distinct from
+cash-inclusive currency totals. No migration, compatibility reader, duplicate financial formula,
+new endpoint or imposed position-count admission limit was added.
+
+Critical checks extend existing cases only, covering otherwise unverified exact incremental
+arithmetic and newly reachable exposure paging/account isolation:
+
+- Analytics `feature_contracts::golden::portfolio_attribution_and_composed_scenarios_remain_exact`
+  passed (1 selected): signed net/gross, currency/basis mismatch, overflow and precision loss.
+- Application `control_plane::portfolio_application::portfolio_import_atomically_publishes_the_queried_revision`
+  passed (1 selected, 11.43 seconds after single-job compilation): registered exposure output,
+  full totals on one-row pages, cash-only scope, continuation after a newer import and identical
+  saved output after service reopen. Existing holdings/performance/recovery assertions remain.
+- Desktop TypeScript and the existing selected-portfolio app journey passed (1 selected UI test):
+  demand loading, cancelled account reads, signed exact amounts, stable totals across Next/Previous
+  and close. No new component suite or harness.
+- Native `cargo check --locked --offline -p market-squawk-desktop --lib` and `git diff --check`
+  passed. Both Rust commands used `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0`; existing unrelated
+  compiler warnings remain. This slice is implemented and critically verified.
+
+Local logs are `.agents/tmp/v1-first-stock/portfolio-exposure-{math,check,typecheck,ui,native-check}.log`.
+These are deterministic integration checks, not live/installed Portfolio acceptance or final
+approval. Native secure setup and actual stock/model input admission remain the live dependency;
+transactions/history/attribution, scenarios/planning and paper composition remain required work.
+No additional branch/worktree, ordinary-task CI, release gate or whole-app RAM measurement.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved

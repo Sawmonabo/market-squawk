@@ -105,14 +105,16 @@ export const holdingSchema = z.strictObject({
   investment: z.strictObject({ name: z.string().nullable(), symbol: z.string().nullable() }),
 })
 
-export const portfolioHoldingsPageSchema = z.strictObject({
+const portfolioPositionPageSchema = z.strictObject({
   holdings: z.array(holdingSchema),
   pageCursor: z.string().min(1).max(512),
   nextCursor: z.string().min(1).max(512).nullable(),
   snapshotToken: z.string().uuid(),
   effectiveAtUnixNanos: unixNanosSchema,
   availableAtUnixNanos: unixNanosSchema.nullable(),
-}).superRefine((page, context) => {
+})
+
+function validatePositionPage(page: z.infer<typeof portfolioPositionPageSchema>, context: z.RefinementCtx) {
   const instruments = new Set<string>()
   for (const holding of page.holdings) {
     if (holding.snapshotToken !== page.snapshotToken
@@ -122,10 +124,19 @@ export const portfolioHoldingsPageSchema = z.strictObject({
     }
     instruments.add(holding.instrumentId)
   }
-})
+}
+
+export const portfolioHoldingsPageSchema = portfolioPositionPageSchema.superRefine(validatePositionPage)
 
 export function parsePortfolioHoldings(result: ApplicationResult): PortfolioHoldingsPage {
-  const page = parsePortfolioResult(result, portfolioHoldingsPageSchema)
+  return parsePositionPage(result, portfolioHoldingsPageSchema)
+}
+
+function parsePositionPage<Schema extends z.ZodType<z.infer<typeof portfolioPositionPageSchema>>>(
+  result: ApplicationResult,
+  schema: Schema,
+): z.infer<Schema> {
+  const page = parsePortfolioResult(result, schema)
   if (result.metadata.returnedItems !== page.holdings.length) {
     throw new Error("Position counts are inconsistent.")
   }
@@ -240,21 +251,24 @@ export function parsePortfolioPerformance(result: ApplicationResult): PortfolioP
   return parsePortfolioResult(result, performanceSchema)
 }
 
-const exposureRowSchema = z
-  .object({ label: productNameSchema, amount: moneySchema })
-  .strict()
+export const exposureSchema = z.strictObject({
+  net: moneySchema.nullable(),
+  gross: moneySchema.nullable(),
+  positionCount: z.number().int().nonnegative(),
+  currency: z.array(z.strictObject({ currency: currencySchema, amount: moneySchema })),
+  sector: z.array(z.strictObject({ classification: productNameSchema, amount: moneySchema })),
+  factor: z.array(z.strictObject({ classification: productNameSchema, amount: moneySchema })),
+  calculationStatus: z.enum(["available", "no_positions"]),
+  classificationStatus: z.literal("not_supplied_by_portfolio_source"),
+})
 
-export const exposureSchema = z
-  .object({
-    byInvestment: z.array(exposureRowSchema).max(500),
-    byCurrency: z.array(exposureRowSchema).max(64),
-    bySector: z.array(exposureRowSchema).max(128),
-    byFactor: z.array(exposureRowSchema).max(128),
-    net: moneySchema.nullable(),
-    gross: moneySchema.nullable(),
-    coverageExplanation: productTextSchema,
-  })
-  .strict()
+export const portfolioExposurePageSchema = portfolioPositionPageSchema
+  .extend({ exposure: exposureSchema })
+  .superRefine(validatePositionPage)
+
+export function parsePortfolioExposure(result: ApplicationResult): PortfolioExposurePage {
+  return parsePositionPage(result, portfolioExposurePageSchema)
+}
 
 const riskMetricSchema = z
   .object({
@@ -374,6 +388,7 @@ export type PortfolioTransaction = z.infer<typeof portfolioTransactionSchema>
 export type PortfolioRevisionChoice = z.infer<typeof portfolioRevisionChoiceSchema>
 export type PortfolioPerformance = z.infer<typeof performanceSchema>
 export type PortfolioExposure = z.infer<typeof exposureSchema>
+export type PortfolioExposurePage = z.infer<typeof portfolioExposurePageSchema>
 export type PortfolioRisk = z.infer<typeof riskSchema>
 export type PortfolioAttribution = z.infer<typeof portfolioAttributionSchema>
 export type PortfolioStressChoice = z.infer<typeof stressChoiceSchema>

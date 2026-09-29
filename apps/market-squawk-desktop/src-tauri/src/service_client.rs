@@ -227,11 +227,10 @@ pub(crate) async fn dashboard_query(
             account_token,
             cursor,
             limit,
-        } => {
-            let mut arguments = product_page_arguments(cursor, limit, 512)?;
-            arguments.insert("accountToken".to_owned(), json!(account_token));
-            ("Portfolio.GetHoldings", arguments)
-        }
+        } => (
+            "Portfolio.GetHoldings",
+            portfolio_page_arguments(account_token, cursor, limit)?,
+        ),
         DashboardQueryCommand::PortfolioTransactions { account_id } => {
             ("Portfolio.GetTransactions", account_arguments(account_id))
         }
@@ -240,9 +239,14 @@ pub(crate) async fn dashboard_query(
             arguments.insert("accountToken".to_owned(), json!(account_token));
             ("Portfolio.GetPerformance", arguments)
         }
-        DashboardQueryCommand::PortfolioExposure { account_id } => {
-            ("Portfolio.GetExposure", account_arguments(account_id))
-        }
+        DashboardQueryCommand::PortfolioExposure {
+            account_token,
+            cursor,
+            limit,
+        } => (
+            "Portfolio.GetExposure",
+            portfolio_page_arguments(account_token, cursor, limit)?,
+        ),
         DashboardQueryCommand::PortfolioRisk { account_token } => {
             let mut arguments = Map::new();
             arguments.insert("accountToken".to_owned(), json!(account_token));
@@ -2393,6 +2397,16 @@ fn opaque_page_cursor(value: String, maximum_bytes: usize) -> Result<String, Des
         ));
     }
     Ok(value)
+}
+
+fn portfolio_page_arguments(
+    account_token: String,
+    cursor: Option<String>,
+    limit: Option<u16>,
+) -> Result<Map<String, Value>, DesktopCommandError> {
+    let mut arguments = product_page_arguments(cursor, limit, 512)?;
+    arguments.insert("accountToken".to_owned(), json!(account_token));
+    Ok(arguments)
 }
 
 fn product_page_arguments(

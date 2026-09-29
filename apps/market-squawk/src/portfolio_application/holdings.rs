@@ -1,4 +1,4 @@
-//! Selected-account holdings pages pinned to their original immutable publication.
+//! Selected-account position pages and exposure bound to one immutable publication.
 
 use std::ops::Bound::{Excluded, Unbounded};
 
@@ -156,6 +156,9 @@ pub(super) fn call(
         }),
     )
     .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+    let exposure = (request.name() == "Portfolio.GetExposure")
+        .then(|| super::analytics::exposure_summary(revision, &scope, context))
+        .transpose()?;
     loop {
         check_context(context)?;
         let count = rows.len();
@@ -175,19 +178,18 @@ pub(super) fn call(
         } else {
             None
         };
-        let result = TypedToolResult::try_new(
-            json!({
-                "holdings":rows,
-                "pageCursor":page_cursor,
-                "nextCursor":next_cursor,
-                "snapshotToken":snapshot,
-                "effectiveAtUnixNanos":revision.effective_at.unix_nanos().to_string(),
-                "availableAtUnixNanos":revision.available_at.map(|time| time.unix_nanos().to_string()),
-            }),
-            count,
-            metadata.clone(),
-            limits,
-        );
+        let mut output = json!({
+            "holdings":rows,
+            "pageCursor":page_cursor,
+            "nextCursor":next_cursor,
+            "snapshotToken":snapshot,
+            "effectiveAtUnixNanos":revision.effective_at.unix_nanos().to_string(),
+            "availableAtUnixNanos":revision.available_at.map(|time| time.unix_nanos().to_string()),
+        });
+        if let Some(exposure) = &exposure {
+            output["exposure"] = exposure.clone();
+        }
+        let result = TypedToolResult::try_new(output, count, metadata.clone(), limits);
         match result {
             Ok(result) => {
                 check_context(context)?;
