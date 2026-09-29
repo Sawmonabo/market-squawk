@@ -887,11 +887,17 @@ pub enum PortfolioCommand {
         /// Confined JSON request with accountToken and both saved snapshot tokens.
         request: PathBuf,
     },
-    /// Report normalized transactions.
+    /// Report a page of recorded transactions from one portfolio snapshot.
     Transactions {
-        /// Exact account identity.
+        /// Opaque account token returned by portfolio accounts.
         #[arg(long)]
         account: String,
+        /// Continue the same saved portfolio observation.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Transactions per page.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
     },
     /// Measure point-in-time portfolio performance.
     Performance {

@@ -231,9 +231,14 @@ pub(crate) async fn dashboard_query(
             "Portfolio.GetHoldings",
             portfolio_page_arguments(account_token, cursor, limit)?,
         ),
-        DashboardQueryCommand::PortfolioTransactions { account_id } => {
-            ("Portfolio.GetTransactions", account_arguments(account_id))
-        }
+        DashboardQueryCommand::PortfolioTransactions {
+            account_token,
+            cursor,
+            limit,
+        } => (
+            "Portfolio.GetTransactions",
+            portfolio_page_arguments(account_token, cursor, limit)?,
+        ),
         DashboardQueryCommand::PortfolioPerformance { account_token } => {
             let mut arguments = Map::new();
             arguments.insert("accountToken".to_owned(), json!(account_token));

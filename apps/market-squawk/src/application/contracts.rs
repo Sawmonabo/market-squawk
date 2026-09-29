@@ -2265,9 +2265,13 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         PORTFOLIO_POSITION_PAGE_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
-    read_portfolio(
+    read(
         "Portfolio.GetTransactions",
-        "Return bounded normalized portfolio transactions.",
+        "Return a page of recorded transactions from the selected portfolio snapshot.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_POSITION_PAGE_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read(
         "Portfolio.GetPerformance",
@@ -3787,17 +3791,6 @@ const fn read_observations(
         domain,
         DATA_SCOPE,
         DATASET_ARGUMENT,
-        SourceEvidencePolicy::Required,
-    )
-}
-
-const fn read_portfolio(name: &'static str, description: &'static str) -> OperationSpec {
-    read(
-        name,
-        description,
-        ServiceDomain::Portfolio,
-        PORTFOLIO_SCOPE,
-        ACCOUNT_ARGUMENT,
         SourceEvidencePolicy::Required,
     )
 }

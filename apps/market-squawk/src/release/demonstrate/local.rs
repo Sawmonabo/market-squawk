@@ -271,7 +271,9 @@ async fn run_cli_vertical(product: &LocalProduct, scratch: &Path) -> Result<CliE
         product,
         Command::Portfolio {
             command: PortfolioCommand::Transactions {
-                account: ACCOUNT.to_owned(),
+                account: account_token.to_owned(),
+                cursor: None,
+                limit: 25,
             },
         },
     )
@@ -288,7 +290,7 @@ async fn run_cli_vertical(product: &LocalProduct, scratch: &Path) -> Result<CliE
         .is_some_and(|rows| !rows.is_empty())
         && transactions
             .value()
-            .pointer("/data")
+            .pointer("/data/transactions")
             .and_then(Value::as_array)
             .is_some_and(|rows| !rows.is_empty());
     for command in [

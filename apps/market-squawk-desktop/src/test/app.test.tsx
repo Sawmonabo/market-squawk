@@ -1024,6 +1024,25 @@ describe("Market Squawk desktop boundary", () => {
       }],
     })
     const historyReads: string[] = []
+    const transactionReads: { account: string; cursor?: string }[] = []
+    let transactionSignal: AbortSignal | undefined
+    let resolveTransactions: ((value: ApplicationResult) => void) | undefined
+    const transactionPage = (next: boolean) => ({
+      snapshotToken: cashReport.snapshotToken,
+      effectiveAtUnixNanos: cashReport.effectiveAtUnixNanos,
+      availableAtUnixNanos: cashReport.availableAtUnixNanos,
+      pageCursor: next ? "next-transaction-page" : "first-transaction-page",
+      nextCursor: next ? null : "next-transaction-page",
+      transactions: [{
+        transactionToken: next ? "dddddddd-dddd-4ddd-8ddd-dddddddddddd" : "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        accountId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", snapshotToken: cashReport.snapshotToken,
+        instrumentId: next ? null : "11111111-1111-4111-8111-111111111111",
+        investment: next ? null : { name: "Recorded investment", symbol: "REC" },
+        category: next ? "fee" : "trade", amount: { amount: next ? "-1.25" : "9007199254740993.02", currency: "USD" },
+        quantity: next ? null : "-0.000000000000000001", occurredAtUnixNanos: "1780000000000000000",
+        lotMethod: next ? null : "First in, first out",
+      }],
+    })
     const comparisonReads: { account: string; selected: string; baseline: string; cursor?: string }[] = []
     let historySignal: AbortSignal | undefined
     let resolveHistory: ((value: ApplicationResult) => void) | undefined
@@ -1040,8 +1059,16 @@ describe("Market Squawk desktop boundary", () => {
     let resolveFirst: ((value: ApplicationResult) => void) | undefined
     render(
       <MemoryRouter initialEntries={["/portfolio"]}>
-        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution"] }, undefined, async (request, options) => {
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution", "portfolio_transactions"] }, undefined, async (request, options) => {
           if (request.query === "portfolioAccounts") return result({ accounts, nextCursor: null }, 2)
+          if (request.query === "portfolioTransactions") {
+            transactionReads.push({ account: request.accountToken, cursor: request.cursor })
+            if (request.accountToken === first) {
+              transactionSignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolveTransactions = resolve })
+            }
+            return result(transactionPage(request.cursor === "next-transaction-page"))
+          }
           if (request.query === "portfolioRevisions") {
             historyReads.push(request.accountToken)
             if (request.accountToken === first) {
@@ -1103,6 +1130,9 @@ describe("Market Squawk desktop boundary", () => {
     expect(comparisonReads).toEqual([])
     await user.click(screen.getByText("History, stress tests, and planning"))
     await waitFor(() => expect(historyReads).toEqual([first]))
+    expect(transactionReads).toEqual([])
+    await user.click(screen.getByText("Transaction history", { selector: "summary" }))
+    await waitFor(() => expect(transactionReads).toEqual([{ account: first, cursor: undefined }]))
     await user.click(screen.getByText("Exposure"))
     await waitFor(() => expect(exposureReads).toEqual([{ account: first, cursor: undefined }]))
     await user.click(screen.getByText("Positions"))
@@ -1117,6 +1147,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(holdingsSignal?.aborted).toBe(true)
     expect(exposureSignal?.aborted).toBe(true)
     expect(historySignal?.aborted).toBe(true)
+    expect(transactionSignal?.aborted).toBe(true)
     await user.click(screen.getByText("Cash and performance"))
     expect(await screen.findByText("USD 9,007,199,254,740,993.01")).toBeTruthy()
     expect(screen.getByText("USD 7.50 · Partial")).toBeTruthy()
@@ -1193,6 +1224,20 @@ describe("Market Squawk desktop boundary", () => {
     expect(comparisonReads.at(-1)?.cursor).toBe("first-comparison-page")
     await user.click(screen.getByRole("button", { name: "Clear comparison" }))
     expect(screen.queryByLabelText("Saved position value comparison")).toBeNull()
+    await user.click(screen.getByText("Transaction history", { selector: "summary" }))
+    expect(await screen.findByText("USD 9,007,199,254,740,993.02")).toBeTruthy()
+    const transactionRegion = within(screen.getByLabelText("Transaction history for Portfolio 2"))
+    expect(transactionRegion.getByText("-0.000000000000000001")).toBeTruthy()
+    resolveTransactions?.(result({ ...transactionPage(false), transactions: [{ ...transactionPage(false).transactions[0],
+      investment: { name: "Wrong account activity", symbol: null } }] }))
+    await user.click(transactionRegion.getByRole("button", { name: "Next" }))
+    expect(await screen.findByText("USD -1.25")).toBeTruthy()
+    expect(screen.queryByText("Wrong account activity")).toBeNull()
+    await user.click(transactionRegion.getByRole("button", { name: "Previous" }))
+    expect(await screen.findByText("USD 9,007,199,254,740,993.02")).toBeTruthy()
+    expect(transactionReads.at(-1)?.cursor).toBe("first-transaction-page")
+    await user.click(screen.getByText("Transaction history", { selector: "summary" }))
+    await waitFor(() => expect(screen.queryByLabelText("Transaction history for Portfolio 2")).toBeNull())
     await user.click(screen.getByText("History, stress tests, and planning"))
     await waitFor(() => expect(screen.queryByLabelText("Saved portfolio history for Portfolio 2")).toBeNull())
   })

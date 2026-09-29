@@ -143,17 +143,47 @@ function parsePositionPage<Schema extends z.ZodType<z.infer<typeof portfolioPosi
   return page
 }
 
-export const portfolioTransactionSchema = z
-  .object({
-    transactionActionToken: portfolioActionTokenSchema,
-    categoryLabel: productNameSchema,
-    investment: investmentDisplaySchema.nullable(),
-    amount: moneySchema,
-    quantity: exactDecimalSchema.nullable(),
-    quantityLabel: productNameSchema.nullable(),
-    occurredAt: productTimeSchema,
-  })
-  .strict()
+export const portfolioTransactionSchema = z.strictObject({
+  transactionToken: z.string().uuid(),
+  accountId: z.string().min(1),
+  snapshotToken: z.string().uuid(),
+  instrumentId: z.string().min(1).nullable(),
+  category: z.enum(["trade", "cash_transfer", "income", "fee", "corporate_action"]),
+  amount: moneySchema,
+  quantity: exactDecimalSchema.nullable(),
+  occurredAtUnixNanos: unixNanosSchema,
+  lotMethod: lotMethodSchema.nullable(),
+  investment: z.strictObject({ name: z.string().nullable(), symbol: z.string().nullable() }).nullable(),
+})
+
+export const portfolioTransactionPageSchema = z.strictObject({
+  transactions: z.array(portfolioTransactionSchema),
+  pageCursor: z.string().min(1).max(512),
+  nextCursor: z.string().min(1).max(512).nullable(),
+  snapshotToken: z.string().uuid(),
+  effectiveAtUnixNanos: unixNanosSchema,
+  availableAtUnixNanos: unixNanosSchema.nullable(),
+}).superRefine((page, context) => {
+  const tokens = new Set<string>()
+  const accountId = page.transactions[0]?.accountId
+  for (const transaction of page.transactions) {
+    if (transaction.snapshotToken !== page.snapshotToken
+      || transaction.accountId !== accountId
+      || tokens.has(transaction.transactionToken)
+      || (transaction.instrumentId === null && transaction.investment !== null)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Transaction evidence is inconsistent." })
+    }
+    tokens.add(transaction.transactionToken)
+  }
+})
+
+export function parsePortfolioTransactions(result: ApplicationResult): PortfolioTransactionPage {
+  const page = parsePortfolioResult(result, portfolioTransactionPageSchema)
+  if (result.metadata.returnedItems !== page.transactions.length) {
+    throw new Error("Transaction counts are inconsistent.")
+  }
+  return page
+}
 
 export const portfolioRevisionChoiceSchema = z.strictObject({
   snapshotToken: z.string().uuid(),
@@ -434,6 +464,7 @@ export type PortfolioAccount = z.infer<typeof portfolioAccountSchema>
 export type PortfolioHolding = z.infer<typeof holdingSchema>
 export type PortfolioHoldingsPage = z.infer<typeof portfolioHoldingsPageSchema>
 export type PortfolioTransaction = z.infer<typeof portfolioTransactionSchema>
+export type PortfolioTransactionPage = z.infer<typeof portfolioTransactionPageSchema>
 export type PortfolioRevisionChoice = z.infer<typeof portfolioRevisionChoiceSchema>
 export type PortfolioRevisionPage = z.infer<typeof portfolioRevisionPageSchema>
 export type PortfolioPerformance = z.infer<typeof performanceSchema>

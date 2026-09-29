@@ -14,6 +14,8 @@ mod paper;
 mod product;
 mod read;
 mod recommendation;
+mod snapshot_page;
+mod transactions;
 
 pub(crate) use paper::PaperPortfolioPublishCapability;
 
@@ -748,6 +750,7 @@ impl ApplicationDomainService for PortfolioApplicationService {
             request.name(),
             "Portfolio.GetHoldings"
                 | "Portfolio.GetExposure"
+                | "Portfolio.GetTransactions"
                 | "Portfolio.ListRevisions"
                 | "Portfolio.GetAttribution"
         ) {
@@ -755,13 +758,10 @@ impl ApplicationDomainService for PortfolioApplicationService {
             return tokio::task::spawn_blocking(move || {
                 let _guard = guard;
                 ensure_live(&runtime, &context)?;
-                let read = if matches!(
-                    request.name(),
-                    "Portfolio.ListRevisions" | "Portfolio.GetAttribution"
-                ) {
-                    history::call
-                } else {
-                    holdings::call
+                let read = match request.name() {
+                    "Portfolio.ListRevisions" | "Portfolio.GetAttribution" => history::call,
+                    "Portfolio.GetTransactions" => transactions::call,
+                    _ => holdings::call,
                 };
                 let result = read(
                     &runtime.image.load(),

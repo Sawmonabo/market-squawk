@@ -6,7 +6,7 @@ import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 import { useCursorNavigation } from "../shared/cursor-navigation"
-import { parsePortfolioAccountPage, parsePortfolioAttribution, parsePortfolioExposure, parsePortfolioHoldings, parsePortfolioPerformance, parsePortfolioRevisions } from "./portfolio-contracts"
+import { parsePortfolioAccountPage, parsePortfolioAttribution, parsePortfolioExposure, parsePortfolioHoldings, parsePortfolioPerformance, parsePortfolioRevisions, parsePortfolioTransactions } from "./portfolio-contracts"
 import type { PortfolioExposurePage, PortfolioHoldingsPage } from "./portfolio-contracts"
 
 // Both account consumers share raw native responses and the same summary
@@ -91,8 +91,7 @@ export function usePortfolioRevisions(
 ) {
   const available = hasProductCapability(bootstrap, "portfolio_revision_list")
   const navigation = useCursorNavigation()
-  const selectedSnapshot = useRef<string | null>(null)
-  const firstPageCursor = useRef<string | null>(null)
+  const pinned = usePinnedPortfolioPage()
   const query = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "portfolio", "Portfolio.ListRevisions",
       { accountToken, cursor: navigation.after, limit: 25, readSession }),
@@ -102,14 +101,54 @@ export function usePortfolioRevisions(
     queryFn: async ({ signal }) => {
       const page = parsePortfolioRevisions(await transport.query({
         query: "portfolioRevisions", accountToken,
-        cursor: navigation.after ?? firstPageCursor.current ?? undefined, limit: 25,
+        cursor: pinned.cursor(navigation.after), limit: 25,
       }, { signal }))
+      pinned.retain(page.selectedSnapshotToken, page.pageCursor, navigation.after, signal)
+      return page
+    },
+  })
+  return { available, query, navigation }
+}
+
+// Transactions and saved-version listings retain the initial page cursor for
+// retries/refetches. Only a newly mounted read may select the latest snapshot.
+function usePinnedPortfolioPage() {
+  const snapshot = useRef<string | null>(null)
+  const firstPageCursor = useRef<string | null>(null)
+  return {
+    cursor: (after: string | undefined) => after ?? firstPageCursor.current ?? undefined,
+    retain: (snapshotToken: string, pageCursor: string, after: string | undefined, signal: AbortSignal) => {
       if (signal.aborted) throw new Error("The saved portfolio read was cancelled.")
-      if (selectedSnapshot.current !== null && selectedSnapshot.current !== page.selectedSnapshotToken) {
-        throw new Error("The selected saved portfolio changed. Refresh history to start again.")
+      if (snapshot.current !== null && snapshot.current !== snapshotToken) {
+        throw new Error("The selected saved portfolio changed. Refresh to start again.")
       }
-      selectedSnapshot.current = page.selectedSnapshotToken
-      if (navigation.after === undefined) firstPageCursor.current = page.pageCursor
+      snapshot.current = snapshotToken
+      if (after === undefined) firstPageCursor.current = pageCursor
+    },
+  }
+}
+
+export function usePortfolioTransactions(
+  transport: ProductTransport,
+  bootstrap: DesktopBootstrap,
+  accountToken: string,
+  readSession: string,
+) {
+  const available = hasProductCapability(bootstrap, "portfolio_transactions")
+  const navigation = useCursorNavigation()
+  const pinned = usePinnedPortfolioPage()
+  const query = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "portfolio", "Portfolio.GetTransactions",
+      { accountToken, cursor: navigation.after, limit: 25, readSession }),
+    enabled: available,
+    gcTime: 0,
+    retry: false,
+    queryFn: async ({ signal }) => {
+      const page = parsePortfolioTransactions(await transport.query({
+        query: "portfolioTransactions", accountToken,
+        cursor: pinned.cursor(navigation.after), limit: 25,
+      }, { signal }))
+      pinned.retain(page.snapshotToken, page.pageCursor, navigation.after, signal)
       return page
     },
   })

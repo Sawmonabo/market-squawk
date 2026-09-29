@@ -1385,7 +1385,11 @@ async fn portfolio(
     authority: CliAuthority<'_>,
     command: PortfolioCommand,
 ) -> Result<CliProductResult, CliProductError> {
-    let listing_revisions = matches!(&command, PortfolioCommand::Revisions { .. });
+    let page_operation = match &command {
+        PortfolioCommand::Revisions { .. } => "Portfolio.ListRevisions",
+        PortfolioCommand::Transactions { .. } => "Portfolio.GetTransactions",
+        _ => "Portfolio.GetHoldings",
+    };
     let (operation, mut arguments, summary) = match command {
         PortfolioCommand::Accounts { cursor, limit } => (
             "Portfolio.ListAccounts",
@@ -1421,24 +1425,16 @@ async fn portfolio(
             account,
             cursor,
             limit,
+        }
+        | PortfolioCommand::Transactions {
+            account,
+            cursor,
+            limit,
         } => {
             let mut arguments = product_page_arguments(cursor, limit, 512)?;
             arguments.insert("accountToken".to_owned(), json!(account));
-            (
-                if listing_revisions {
-                    "Portfolio.ListRevisions"
-                } else {
-                    "Portfolio.GetHoldings"
-                },
-                arguments,
-                "portfolio observation page read",
-            )
+            (page_operation, arguments, "portfolio observation page read")
         }
-        PortfolioCommand::Transactions { account } => (
-            "Portfolio.GetTransactions",
-            json_object(json!({"accountId": account}))?,
-            "portfolio transactions read",
-        ),
         PortfolioCommand::Performance { request } => (
             "Portfolio.GetPerformance",
             read_json_object(&request)?,

@@ -162,7 +162,6 @@ pub(super) fn call(
     };
     let revision = select_revision(image, &scope)?;
     match request.name() {
-        "Portfolio.GetTransactions" => transactions(revision, &scope, context),
         "Portfolio.GetPerformance" => analytics::performance(image, revision, &scope, context),
         "Portfolio.GetRisk" => analytics::risk(image, revision, &scope, context),
         "Portfolio.EvaluateScenario"
@@ -389,86 +388,6 @@ pub(super) fn select_revision<'image>(
     Ok(revision)
 }
 
-fn transactions(
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let rows = revision
-        .transactions
-        .iter()
-        .filter(|transaction| {
-            transaction
-                .instrument_id()
-                .is_none_or(|instrument| scope.admits_instrument(instrument))
-                && scope.admits_time(transaction.occurred_at())
-        })
-        .map(|transaction| {
-            Ok(json!({
-                "transactionToken": transaction_token(transaction),
-                "accountId": transaction.account_id().to_string(),
-                "snapshotToken": snapshot_token(revision),
-                "instrumentId": transaction.instrument_id().map(|value| value.to_string()),
-                "category": transaction_kind(transaction.kind()),
-                "amount": money_value(transaction.amount()),
-                "quantity": transaction.quantity().map(|value| value.to_string()),
-                "occurredAtUnixNanos": transaction.occurred_at().unix_nanos().to_string(),
-                "lotMethod": transaction.lot_method().map(lot_method),
-            }))
-        })
-        .collect::<Result<Vec<_>, PortfolioApplicationServiceError>>()?;
-    bounded_rows(rows, revision, scope, context)
-}
-
-pub(super) fn bounded_rows(
-    rows: Vec<Value>,
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let available = rows.len();
-    if available == 0 {
-        return data_result(Value::Array(Vec::new()), 0, 0, revision, scope, context);
-    }
-    let upper = available
-        .min(scope.maximum_items)
-        .min(context.limits().maximum_result_items());
-    if upper == 0 {
-        return Err(PortfolioApplicationServiceError::ResourceExhausted);
-    }
-    let mut low = 0_usize;
-    let mut high = upper;
-    let mut selected = None;
-    while low <= high {
-        let count = low.saturating_add(high.saturating_sub(low) / 2);
-        if count == 0 {
-            low = 1;
-            continue;
-        }
-        match data_result(
-            Value::Array(rows[..count].to_vec()),
-            count,
-            available,
-            revision,
-            scope,
-            context,
-        ) {
-            Ok(result) => {
-                selected = Some(result);
-                low = count.saturating_add(1);
-            }
-            Err(PortfolioApplicationServiceError::ResourceExhausted) => {
-                if count == 0 {
-                    break;
-                }
-                high = count - 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    selected.ok_or(PortfolioApplicationServiceError::ResourceExhausted)
-}
-
 pub(super) fn report_result(
     mut value: Value,
     revision: &PublishedRevision,
@@ -610,7 +529,7 @@ pub(super) fn snapshot_token(revision: &PublishedRevision) -> String {
     .to_string()
 }
 
-fn transaction_token(transaction: &PortfolioTransaction) -> String {
+pub(super) fn transaction_token(transaction: &PortfolioTransaction) -> String {
     Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!(
@@ -642,7 +561,7 @@ pub(super) fn basis_value(basis: &BasisResolution) -> Value {
     }
 }
 
-const fn lot_method(method: LotMethod) -> &'static str {
+pub(super) const fn lot_method(method: LotMethod) -> &'static str {
     match method {
         LotMethod::Fifo => "First in, first out",
         LotMethod::Lifo => "Last in, first out",
@@ -651,7 +570,7 @@ const fn lot_method(method: LotMethod) -> &'static str {
     }
 }
 
-const fn transaction_kind(kind: TransactionKind) -> &'static str {
+pub(super) const fn transaction_kind(kind: TransactionKind) -> &'static str {
     match kind {
         TransactionKind::Trade => "trade",
         TransactionKind::CashTransfer => "cash_transfer",

@@ -1,5 +1,5 @@
 import * as React from "react"
-import { CircleAlert, History, RefreshCw } from "lucide-react"
+import { CircleAlert, RefreshCw } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -9,7 +9,9 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 import { formatUnixNanos } from "../opportunities/format"
 import { CursorNavigation } from "../shared/cursor-navigation"
+import { DemandPanel } from "../shared/demand-panel"
 
+import { AccountTransactions } from "./account-transactions"
 import type { PortfolioAccountSummary, PortfolioAttribution } from "./portfolio-contracts"
 import { usePortfolioAttribution, usePortfolioRevisions } from "./use-portfolio"
 
@@ -33,16 +35,9 @@ export function PortfolioHistory(props: HistoryProps) {
         </p>
       </header>
       <HistoryRead key={generation} {...props} refresh={() => setGeneration((value) => value + 1)} />
-      <div className="mt-5 rounded-lg border border-dashed border-border bg-background/25 p-4">
-        <div className="flex items-center gap-2">
-          <History className="size-4 text-primary" aria-hidden="true" />
-          <h3 className="text-sm font-semibold">Transaction history unavailable</h3>
-        </div>
-        <p className="mt-3 text-xs leading-5 text-muted-foreground">
-          Saved-version comparisons cover reported position values. Transaction details are not
-          connected to this view yet; recorded transaction counts do not provide a transaction history.
-        </p>
-      </div>
+      <DemandPanel title="Transaction history" className="mt-5 rounded-lg border border-border bg-background/25 p-4">
+        <AccountTransactions {...props} />
+      </DemandPanel>
     </section>
   )
 }

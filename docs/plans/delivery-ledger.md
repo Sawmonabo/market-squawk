@@ -447,6 +447,70 @@ Source checkpoint `56415f547ab631f651bbc16804c53193ea60cbcd` is pushed to origin
 [PR #43 delivery evidence](https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5889238461).
 The primary worktree remains the only worktree; no implementation ownership remains active for this slice.
 
+### Integrated transaction history — 2026-09-29
+
+Acceptance 4/5/6, reviewed Wave 2; refreshed clean base `4bfc16ea`. The transaction reader
+materialized all rows and truncated without continuation; Desktop exposed no transaction read.
+This checkpoint delivers recorded transaction history through the existing operation and all clients, using
+opaque account selection, exact values, original dates and snapshot-pinned continuation.
+
+| Owner | Exclusive files | Finish condition |
+| --- | --- | --- |
+| Sol High backend transactions | `portfolio_application/holdings.rs`, new `transactions.rs` and `snapshot_page.rs`; `read.rs` only transaction removal/helper visibility | Reuse snapshot pagination admission/pinning/byte fitting across positions and transactions without copying it; bounded transaction pages and historical investment display. Preserve existing holdings/exposure behavior. No Git/build/test execution. |
+| Sol High Desktop transactions | New `features/portfolio/account-transactions.tsx`; `portfolio-history.tsx`, `portfolio-contracts.ts`, `use-portfolio.ts` | Replace the transaction placeholder with an independently demand-loaded, cancellable selected-account transaction page, exact formatting, pinned refresh/retry and cursor navigation. No automatic comparison or financial calculations. No Git/build/test execution. |
+| Lead | Shared operation/output contracts, `portfolio_application.rs`, CLI/native/TS transport, existing control-plane/app checks, docs | Freeze shared shapes, integrate both handoffs, schedule thin checks then commit/push. |
+
+DAG: frozen shared contract → disjoint backend/Desktop → integrated critical checks → pushed
+checkpoint. `Portfolio.GetTransactions` takes accountToken/cursor/limit and existing scope. It returns
+`{transactions,pageCursor,nextCursor,snapshotToken,effectiveAtUnixNanos,availableAtUnixNanos}`.
+Rows preserve transactionToken, accountId, snapshotToken, nullable instrumentId, category,
+amount, nullable quantity, occurredAtUnixNanos and nullable lotMethod; add nullable investment with
+nullable name/symbol (null for activity without an instrument). Exact values remain strings.
+Page defaults 25/max 100; cursor at most 512 characters; all rows remain reachable. Only returned
+rows need display lookup. Metadata counts transaction rows. Reuse current transaction categories
+and deterministic stored ordering; preserve original observation and availability semantics.
+Extend the existing publication/restart and selected-account UI checks only for this uncovered
+continuation/recovery seam. No extra review, full CI or RAM measurement. Native setup remains
+pending an unlocked macOS session, independently of this slice.
+Lead also owns the affected `release/demonstrate/local.rs` caller: update its transaction command
+and payload access in place without running the final release demonstration during this checkpoint.
+During serialized verification, an Astra High read-only trace inspected existing stress/planning
+authorities and their Desktop callers. It owned no writable files, tests or Git; the next
+implementation remains behind this checkpoint's integration barrier.
+
+Both implementation agents finished and released their files; the lead inspected their actual changes
+and affected consumers. Shared `snapshot_page.rs` now owns account/scope admission, immutable pinning,
+result metadata and byte fitting for holdings/exposure and transactions. Transaction reads seek within
+the saved ordered observation, retain only the requested page plus lookahead, and resolve display only
+for that page. The old materialization/truncation path and unused helper are removed. Desktop uses
+an independent Transaction history expansion and shared pinned-read behavior with saved-version history.
+The CLI and release-demonstration caller consume the same revised contract; MCP uses shared descriptors.
+
+Existing selected-account Desktop check and TypeScript passed. The existing portfolio publication/restart
+check passed with exact fee/income values at equal timestamps, continuation/scope validation, and identical
+transaction pages after restart plus a later import; its holdings/exposure/comparison assertions also
+passed. Native Desktop library compilation and `git diff --check` passed. Local evidence is retained under
+`.agents/tmp/v1-first-stock/portfolio-transactions-*.log`. No extra test target, review round, CI gate,
+live/installed completion or resource measurement is claimed.
+
+The read-only financial trace is complete and owns no files. Next sequence is explicit snapshot-bound
+stress assumptions, corrected rebalance proposals, then position impact, preserving all three required
+workflows. Existing `advanced/scenario.rs` and `advanced/planning.rs` already calculate results; the
+frontend prepared-choice shapes have no producer and must be replaced in place. Candidate impact uses
+the durably configured recommendation account and must explicitly match the selected account before
+being exposed there. These calls do not currently persist saved planning results; recomputation must
+not be called saved-result retrieval. Refresh these findings against the pushed transaction checkpoint
+before assigning implementation:
+
+- `advanced/planning.rs` and `crates/market-squawk-portfolio/src/rebalance.rs` calculate buy capacity
+  using unscaled sales, then scale both buys and sales. With cash 100, holdings 200/100, targets .25/.75,
+  minimum cash 50 and unrestricted turnover, scale .75 fails at cash 25 although .5 is feasible. Correct
+  the shared financial behavior and existing critical arithmetic case when wiring rebalance.
+- `crates/market-squawk-analytics/src/scenarios.rs` validates each shock at least -1 but does not enforce
+  that floor after additive composition. The new stress workflow must resolve the combined price-shock
+  semantics rather than presenting a loss beyond the supported price basis. Reuse its existing exact
+  scenario test; no broad matrix.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved

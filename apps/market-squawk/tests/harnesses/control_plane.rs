@@ -141,6 +141,60 @@ mod portfolio_application {
         let token = accounts.structured_content()["accounts"][0]["accountToken"]
             .as_str()
             .ok_or("account token is missing")?;
+        let transaction_arguments = json!({"accountToken": token, "limit": 1,
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}});
+        let transactions = service
+            .call(
+                admitted("Portfolio.GetTransactions", transaction_arguments.clone())?,
+                context(30)?,
+            )
+            .await?;
+        transactions.validate_for(
+            application_capabilities()?
+                .find("Portfolio.GetTransactions")
+                .ok_or("transaction descriptor missing")?,
+        )?;
+        let activity = &transactions.structured_content()["transactions"][0];
+        assert_eq!(activity["category"], "fee");
+        assert_eq!(activity["amount"]["amount"], "-0.000000000000000001");
+        assert!(activity["investment"].is_null());
+        let mut next_transaction_arguments = transaction_arguments.clone();
+        next_transaction_arguments["cursor"] =
+            transactions.structured_content()["nextCursor"].clone();
+        assert!(next_transaction_arguments["cursor"].is_string());
+        let next_transactions = service
+            .call(
+                admitted(
+                    "Portfolio.GetTransactions",
+                    next_transaction_arguments.clone(),
+                )?,
+                context(31)?,
+            )
+            .await?;
+        assert_eq!(
+            next_transactions.structured_content()["transactions"][0]["category"],
+            "income"
+        );
+        assert_eq!(
+            next_transactions.structured_content()["transactions"][0]["investment"],
+            json!({"name":null,"symbol":null})
+        );
+        assert_eq!(
+            next_transactions.structured_content()["transactions"][0]["amount"]["amount"],
+            "5"
+        );
+        assert!(next_transactions.structured_content()["nextCursor"].is_null());
+        let mut wrong_transaction_scope = next_transaction_arguments.clone();
+        wrong_transaction_scope["instrumentIds"] = json!(["11111111-1111-4111-8111-111111111111"]);
+        assert!(
+            service
+                .call(
+                    admitted("Portfolio.GetTransactions", wrong_transaction_scope)?,
+                    context(32)?
+                )
+                .await
+                .is_err()
+        );
         let holdings = service
             .call(
                 admitted(
@@ -634,6 +688,30 @@ mod portfolio_application {
             next_comparison.structured_content()
         );
 
+        let mut pinned_transaction_arguments = transaction_arguments;
+        pinned_transaction_arguments["cursor"] =
+            transactions.structured_content()["pageCursor"].clone();
+        for (arguments, expected, id) in [
+            (
+                pinned_transaction_arguments,
+                transactions.structured_content(),
+                33,
+            ),
+            (
+                next_transaction_arguments,
+                next_transactions.structured_content(),
+                34,
+            ),
+        ] {
+            let retained = reopened
+                .call(
+                    admitted("Portfolio.GetTransactions", arguments)?,
+                    context(id)?,
+                )
+                .await?;
+            assert_eq!(retained.structured_content(), expected);
+        }
+
         Ok(())
     }
 
@@ -701,6 +779,14 @@ mod portfolio_application {
             record(
                 "second-holding",
                 json!({"kind": "holding", "account_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instrument_id": "22222222-2222-4222-8222-222222222222", "currency": "USD", "quantity": "1.000000000000000001", "lot_size": "0.000000000000000001", "market_value": (25 * revision).to_string(), "as_of_unix_nanos": at.to_string(), "cost_basis": {"status": "resolved", "amount": "0", "lot_method": "fifo"}}),
+            )?,
+            record(
+                "fee",
+                json!({"kind":"transaction", "broker_transaction_id":"fee", "account_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instrument_id":null, "currency":"USD", "transaction_type":"fee", "amount":"-0.000000000000000001", "quantity":null, "occurred_at_unix_nanos":(at - 1).to_string(), "lot_method":null}),
+            )?,
+            record(
+                "income",
+                json!({"kind":"transaction", "broker_transaction_id":"income", "account_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instrument_id":"11111111-1111-4111-8111-111111111111", "currency":"USD", "transaction_type":"income", "amount":"5", "quantity":null, "occurred_at_unix_nanos":(at - 1).to_string(), "lot_method":null}),
             )?,
         ];
         let object_bytes = payloads.concat();

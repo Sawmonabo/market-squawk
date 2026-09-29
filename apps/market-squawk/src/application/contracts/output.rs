@@ -377,7 +377,14 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ("selectedSnapshotToken", uuid()),
         ]),
         "Portfolio.GetHoldings" => portfolio_holdings_page(),
-        "Portfolio.GetTransactions" => array(portfolio_transaction()),
+        "Portfolio.GetTransactions" => closed_complete(vec![
+            ("transactions", array(portfolio_transaction())),
+            ("pageCursor", bounded_text(512)),
+            ("nextCursor", nullable(bounded_text(512))),
+            ("snapshotToken", uuid()),
+            ("effectiveAtUnixNanos", text()),
+            ("availableAtUnixNanos", nullable(text())),
+        ]),
         "Portfolio.GetPerformance" => portfolio_performance(),
         "Portfolio.GetExposure" => portfolio_exposure(),
         "Portfolio.GetRisk" => portfolio_risk(),
@@ -6265,6 +6272,7 @@ fn portfolio_price_state() -> Value {
 fn portfolio_transaction() -> Value {
     closed_complete(vec![
         ("transactionToken", uuid()),
+        ("investment", nullable(portfolio_investment_display())),
         ("accountId", text()),
         ("snapshotToken", uuid()),
         ("instrumentId", nullable(text())),
