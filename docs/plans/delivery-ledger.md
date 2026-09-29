@@ -195,6 +195,32 @@ account report, rejection of a late first-account response and release on close.
 8 skipped, 1.83 seconds), with TypeScript and `git diff --check` passing. No Rust build, broad suite,
 CI, resource measurement or live Portfolio acceptance is claimed. Holdings, cash/performance,
 exposure, history/attribution and planning remain explicit next integrations, not data absence.
+Implementation/checkpoint `957d04d9` is pushed to origin and recorded in PR #43.
+
+Contract trace complete; read-only ownership released. `portfolio_application/analytics.rs` already
+calculates current value, exact returns, cash/accounting and exposure. `read.rs` already resolves
+opaque account tokens for risk, but other reads and `ListRevisions` require raw IDs. Update existing
+operations in place, preserving their supported instrument/time filters: the current product scope
+helper rejects `instrumentIds` specifically for risk and must not accidentally narrow those reads.
+Do not change the shared `ACCOUNT_ARGUMENT` globally without updating its distinct consumers.
+
+Next coherent outcome is selected-account cash and performance through the real `GetPerformance`
+payload, not the unused speculative Desktop shape. Lead freezes its token/input/output bindings
+and composition; backend and Desktop can then own disjoint producer/rendering files. Follow with
+holdings/exposure/history on the same canonical contracts, preserving snapshot identity and
+continuation instead of presenting truncated holdings as complete. The existing
+`portfolio_import_atomically_publishes_the_queried_revision` check currently compares missing
+`revisionId` fields; extend it to use the actual ListAccounts token, emitted `snapshotToken`, exact
+cash/values and registered schema before claiming this boundary verified.
+
+Named historical holdings/transactions need canonical display at their original clocks. Reuse
+`ResearchService::market_data_instruments()` / `MarketDataInstrumentReadCapability` indexed exact-ID
+population pinning in existing supported batches; no universe scan or inferred ticker. The current
+private saved-analysis display helper is current-only/name-only, not a historical resolver.
+Attribution remains reported-value change before cash-flow/corporate-action adjustments, not a
+return estimate. Full selected-account completion also requires consistent revisions across reads,
+history/attribution and explicit scenarios/rebalancing through the existing financial authorities.
+These are identified dependencies, not completed behavior or permission for an unbounded rewrite.
 
 ## Resource processing checkpoint — 2026-09-29
 
