@@ -14,7 +14,7 @@ use market_squawk_sources::{
     TransportFrameKind,
 };
 
-use crate::common::{TestResult, direct_metadata, now_timestamp, source_identifier};
+use crate::common::{TestResult, acquire_budget, direct_metadata, now_timestamp, source_identifier};
 
 const CHILD_PHASE: &str = "MARKET_SQUAWK_AUTHORITY_CHILD_PHASE";
 const CHILD_ROOT: &str = "MARKET_SQUAWK_AUTHORITY_CHILD_ROOT";
@@ -182,7 +182,7 @@ fn clean_shutdown_requires_reconciled_sessions_and_provider_permits() -> TestRes
         now_timestamp()?,
     )?;
     let budget = take_live_budget(&mut permit_registry, &registered, "permit-budget-session")?;
-    let permit = match budget.try_acquire() {
+    let permit = match acquire_budget(&budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected permit decision: {other:?}").into()),
     };
@@ -192,7 +192,7 @@ fn clean_shutdown_requires_reconciled_sessions_and_provider_permits() -> TestRes
     ));
     permit.release();
     assert!(matches!(
-        budget.try_acquire(),
+        acquire_budget(&budget),
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
     ));
     Ok(())
@@ -274,7 +274,7 @@ fn nonclean_registry_drop_revokes_retained_request_capture_and_live_capabilities
     drop(registry);
 
     assert!(matches!(
-        budget.try_acquire(),
+        acquire_budget(&budget),
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
     ));
     assert!(matches!(
@@ -302,7 +302,7 @@ fn durable_authority_child() -> TestResult {
             let budget =
                 take_live_budget(&mut registry, &registered, "durable-request-write-session")?;
             for _ in 0..9 {
-                let BudgetDecision::Ready(permit) = budget.try_acquire() else {
+                let BudgetDecision::Ready(permit) = acquire_budget(&budget) else {
                     return Err("request capacity was exhausted before nine reservations".into());
                 };
                 permit.release();
@@ -314,11 +314,11 @@ fn durable_authority_child() -> TestResult {
             let registered = register_revision(&mut registry, "durable-request", "revision-2")?;
             let budget =
                 take_live_budget(&mut registry, &registered, "durable-request-read-session")?;
-            let BudgetDecision::Ready(permit) = budget.try_acquire() else {
+            let BudgetDecision::Ready(permit) = acquire_budget(&budget) else {
                 return Err("restored request capacity did not preserve the final slot".into());
             };
             permit.release();
-            assert!(matches!(budget.try_acquire(), BudgetDecision::WaitUntil(_)));
+            assert!(matches!(acquire_budget(&budget), BudgetDecision::WaitUntil(_)));
             registry.shutdown()?;
         }
         "cooldown-write" => {
@@ -338,8 +338,11 @@ fn durable_authority_child() -> TestResult {
             let mut registry = open_registry(&root)?;
             let registered = register_revision(&mut registry, "durable-cooldown", "revision-2")?;
             assert!(matches!(
-                take_live_budget(&mut registry, &registered, "durable-cooldown-read-session",)?
-                    .try_acquire(),
+                acquire_budget(&take_live_budget(
+                    &mut registry,
+                    &registered,
+                    "durable-cooldown-read-session",
+                )?),
                 BudgetDecision::WaitUntil(_)
             ));
             registry.shutdown()?;
@@ -358,8 +361,11 @@ fn durable_authority_child() -> TestResult {
             let mut registry = open_registry(&root)?;
             let registered = register_revision(&mut registry, "durable-disabled", "revision-2")?;
             assert!(matches!(
-                take_live_budget(&mut registry, &registered, "durable-disabled-read-session",)?
-                    .try_acquire(),
+                acquire_budget(&take_live_budget(
+                    &mut registry,
+                    &registered,
+                    "durable-disabled-read-session",
+                )?),
                 BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
             ));
             registry.shutdown()?;
@@ -369,7 +375,7 @@ fn durable_authority_child() -> TestResult {
             let registered = register_revision(&mut registry, "durable-unclean", "revision-1")?;
             let budget =
                 take_live_budget(&mut registry, &registered, "durable-unclean-write-session")?;
-            let permit = match budget.try_acquire() {
+            let permit = match acquire_budget(&budget) {
                 BudgetDecision::Ready(permit) => permit,
                 other => return Err(format!("unexpected unclean acquire: {other:?}").into()),
             };

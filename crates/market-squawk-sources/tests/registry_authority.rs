@@ -21,7 +21,7 @@ use market_squawk_sources::{
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 use crate::common::{
-    TestResult, direct_metadata, direct_metadata_with_instruments, exact_evidence,
+    TestResult, acquire_budget, direct_metadata, direct_metadata_with_instruments, exact_evidence,
     next_timestamp_after, now_timestamp, source_identifier,
 };
 
@@ -515,17 +515,17 @@ fn two_sources_with_one_scope_share_concurrency_and_cooldown() -> TestResult {
     )?;
     let first_budget = take_live_budget(&mut registry, &first, "shared-budget-first")?;
     let second_budget = take_live_budget(&mut registry, &second, "shared-budget-second")?;
-    let permit = match first_budget.try_acquire() {
+    let permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected first budget decision: {other:?}").into()),
     };
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Unavailable(_)
     ));
     permit.release();
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Ready(_)
     ));
     Ok(())
@@ -573,19 +573,19 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
     let restored_budget = take_live_budget(&mut restored, &restored_source, "interner-restored")?;
     assert!(first_budget.shares_allocation_with(&restored_budget));
 
-    let permit = match first_budget.try_acquire() {
+    let permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected coordinated acquire: {other:?}").into()),
     };
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Unavailable(
             market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
         )
     ));
     permit.release();
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Ready(_)
     ));
 
@@ -596,11 +596,11 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
         other => return Err(format!("unexpected coordinated cooldown: {other:?}").into()),
     };
     assert!(matches!(
-        first_budget.try_acquire(),
+        acquire_budget(&first_budget),
         BudgetDecision::WaitUntil(deadline) if deadline == cooldown
     ));
     assert!(matches!(
-        restored_budget.try_acquire(),
+        acquire_budget(&restored_budget),
         BudgetDecision::WaitUntil(deadline) if deadline == cooldown
     ));
     Ok(())
@@ -641,12 +641,12 @@ fn account_aliases_and_locator_metadata_cannot_multiply_one_credential_budget() 
     let second_budget = take_live_budget(&mut second, &second_source, "account-alias-second")?;
     assert!(first_budget.shares_allocation_with(&second_budget));
 
-    let permit = match first_budget.try_acquire() {
+    let permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected account acquire: {other:?}").into()),
     };
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Unavailable(
             market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
         )
@@ -738,11 +738,11 @@ fn public_bridge_declaration_fails_without_merging_existing_allocations() -> Tes
         Err(RegistryError::BudgetCoordinator)
     ));
     assert!(!first_budget.shares_allocation_with(&second_budget));
-    let first_permit = match first_budget.try_acquire() {
+    let first_permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("first bridge allocation changed: {other:?}").into()),
     };
-    let second_permit = match second_budget.try_acquire() {
+    let second_permit = match acquire_budget(&second_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("second bridge allocation changed: {other:?}").into()),
     };
@@ -1043,7 +1043,7 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
     let cooling_health_at = next_timestamp_after(qualified_health_at)?;
     let disabled_health_at = next_timestamp_after(cooling_health_at)?;
 
-    let permit = match budget.try_acquire() {
+    let permit = match acquire_budget(budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected budget decision: {other:?}").into()),
     };

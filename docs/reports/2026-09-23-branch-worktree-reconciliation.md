@@ -1,5 +1,36 @@
 # Branch and worktree reconciliation audit — 2026-09-23
 
+## September 28 closure checkpoint
+
+The obsolete `source-current-integration` checkout has been retired. Before
+cleanup, the lead compared all 57 live source files with the independent
+September 23 backup, and the full-index staged/unstaged patches and status with
+the preserved packet. The September 7 complete-history bundle verified; its
+SHA-256 remains `0b8cba3838cb3c0c7bc4aa0fe63212f1a57264f406ef0b780e15ee30ce020ee6`.
+Neither independent backup nor the original session was removed.
+
+The current V1 registry selects native identity through the catalog, checks the
+independent native coordinates, and assigns original row ordinals before route
+grouping. The donor's public-record attestation and precommit publication-context
+variants are superseded. Required external budget callers now use the public
+reservation/dispatch API through one existing test-support module; assertions
+are preserved. Current observation fixtures still need catalog-selected setup;
+syntax inspection is not a passing Rust or installed journey result.
+
+After preserving and dispositioning the dirty layers, the lead restored only
+the 57 archived donor paths, confirmed a clean checkout, removed it without
+force and pruned metadata. Its integrated branch `codex/source-current-integration`
+at `8c7ee0b0` was deleted normally. The separate rejected
+`codex/source-current-publication` branch at `27c57146` duplicates the donor's
+ten staged blobs and was explicitly retired; its full history remains in the
+verified backup bundle. Neither branch exists on origin or has an open PR.
+
+Fresh counts after cleanup: **25 local branches, 19 origin heads, six worktrees
+including the target**. Remaining worktrees are Alpaca, Census, Kraken, Schwab,
+and common-seal integration. Product acceptance and the clean integrated V1
+checkpoint remain open; worktree retirement is not provider completion.
+
+
 Audit target: pushed `feature/v1-installed-product-experience` at
 `18f11e072fd451b242788f121d86becdeaccbc91`. Live origin heads were read with
 `git ls-remote --heads origin`; no branch or worktree was removed in this audit.

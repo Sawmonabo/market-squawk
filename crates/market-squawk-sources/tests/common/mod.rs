@@ -16,15 +16,29 @@ use market_squawk_domain::{
     SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, CoverageTopology,
+    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetDecision, BudgetDispatchDecision,
+    BudgetReservationDecision, BudgetScope, CoverageTopology,
     EndpointPolicy, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
     LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
     ProviderBudgetPolicy, ProviderNumericPolicy, SemanticInterpretationProfile,
-    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SequenceValidationProfile, SharedProviderBudget, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata,
     SourceMetadataInput, SourceProtocolProfile,
 };
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+pub(crate) fn acquire_budget(budget: &SharedProviderBudget) -> BudgetDecision {
+    match budget.try_reserve_request() {
+        BudgetReservationDecision::Ready(reservation) => match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => BudgetDecision::Ready(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => BudgetDecision::WaitUntil(deadline),
+            BudgetDispatchDecision::Unavailable(reason) => BudgetDecision::Unavailable(reason),
+        },
+        BudgetReservationDecision::WaitUntil(deadline) => BudgetDecision::WaitUntil(deadline),
+        BudgetReservationDecision::Unavailable(reason) => BudgetDecision::Unavailable(reason),
+    }
+}
 
 pub(crate) fn now_timestamp() -> TestResult<Timestamp> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
