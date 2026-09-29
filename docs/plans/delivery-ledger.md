@@ -400,6 +400,50 @@ approval. Native secure setup and actual stock/model input admission remain the 
 transactions/history/attribution, scenarios/planning and paper composition remain required work.
 No additional branch/worktree, ordinary-task CI, release gate or whole-app RAM measurement.
 
+### Integrated saved portfolio comparison — 2026-09-29
+
+Acceptance 4/5/6, reviewed Wave 2; clean refreshed base `30964544`. At that base, history was a static
+Desktop placeholder; ListRevisions accepted raw IDs and materialized all rows, and attribution
+omitted newly added holdings and derived change through a rounded division. This checkpoint delivers
+explicit saved-version selection and exact paged value changes through the existing operations. Transactions
+remain a subsequent required integration. Native setup remains externally pending (macOS locked).
+
+| Owner | Exclusive files | Dependency / finish condition |
+| --- | --- | --- |
+| Astra High saved comparison | New `portfolio_application/history.rs`, existing `portfolio_application/advanced.rs` | Implement saved revision pages and snapshot-pinned exact union-of-holdings comparisons; remove superseded attribution implementation. Stream exact closing minus opening, include opened/closed/short/zero positions, share canonical money/display and request checks. No per-account output vector, invented return, builds or Git. |
+| Sol High history Desktop | `features/portfolio/{portfolio-history.tsx,portfolio-contracts.ts,use-portfolio.ts,portfolio-page.tsx}` | Explicit earlier-version choice, demand-loaded snapshot list and paged comparison; exact amounts, original dates, cancellation/session/account isolation and retry. Replace speculative schemas, reuse navigation/formatting. No tests/builds/Git. |
+| Lead | Shared operation/output contracts, `portfolio_application.rs`, `portfolio_application/read.rs`, CLI/native/TS transports, existing control-plane/app checks and docs | Freeze contracts below; remove old list dispatch, integrate both clients and CLI commands, validate same-snapshot restart and financial comparison. Sole Git/build owner. |
+
+DAG: frozen contracts → independent backend/Desktop → integrated critical checks → commit/push.
+ListRevisions uses accountToken/cursor/limit plus existing scope; output is `{revisions:[existing
+snapshot summary],pageCursor,nextCursor,selectedSnapshotToken}`. The selected snapshot anchors the
+listing across newer imports. GetAttribution uses accountToken, selectedSnapshotToken,
+baselineSnapshotToken, cursor/limit and existing scope. Output has contributions (instrumentId,
+nullable name/symbol investment, opening/closing/amount money), whole-comparison total, pageCursor,
+nextCursor, snapshotToken, baselineSnapshotToken, both original effective/available clocks and
+explanation. Change is reported market value before cash-flow/corporate-action adjustments, not
+performance. Page defaults 25/max 100; continuation covers all rows instead of rejecting larger
+portfolios. No new endpoint or compatibility path. Existing publication/restart and selected-account
+journey are the critical checks; no broad gate, new review round or RAM measurement.
+
+Both agents completed their assigned files; the lead inspected the changes and affected consumers.
+Their ownership is released. The old history reader and attribution calculation are removed in
+place. Desktop opens history only on demand, requires an explicit earlier-version choice, retains
+the selected observations through pagination/retry, and cancels reads on close/account change.
+CLI now exposes `portfolio revisions` and `portfolio attribution`; MCP uses the same canonical
+operation contracts. A constant-auxiliary-memory merge includes opened, closed, short and zero-value
+holdings with exact monetary subtraction and full totals independent of the displayed page.
+
+Critical verification passed: the new single financial regression covers the previously uncovered
+union-of-holdings arithmetic and overflow; the existing publication/restart case covers canonical
+output admission, paged comparisons, invalid selection/scope rejection, and identical saved reads
+after restart plus another import. The existing selected-account Desktop case covers demand loading,
+cancelled-account isolation, explicit comparison choice and pagination. TypeScript and the native
+Desktop library check pass; `git diff --check` passes. Logs are under
+`.agents/tmp/v1-first-stock/portfolio-history-*.log`; no live or installed completion is claimed.
+Next dependencies remain transaction history, real stress/planning choices and the native setup
+needed for live stock inputs. This checkpoint does not waive them.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved

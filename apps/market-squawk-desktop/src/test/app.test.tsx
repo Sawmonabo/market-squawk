@@ -998,6 +998,35 @@ describe("Market Squawk desktop boundary", () => {
       } }
     }
     const exposureReads: { account: string; cursor?: string }[] = []
+    const baselineSnapshot = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    const historyPage = {
+      selectedSnapshotToken: cashReport.snapshotToken,
+      pageCursor: "first-history-page", nextCursor: null,
+      revisions: [cashReport.snapshotToken, baselineSnapshot].map((snapshotToken, index) => ({
+        snapshotToken, effectiveAtUnixNanos: index === 0 ? cashReport.effectiveAtUnixNanos : "1780000000000000000",
+        availableAtUnixNanos: index === 0 ? cashReport.availableAtUnixNanos : "1780000000000000001",
+        holdingCount: 2, transactionCount: 0, dataIssueCount: 0, dataState: "ready",
+      })),
+    }
+    const comparisonPage = (next: boolean) => ({
+      snapshotToken: cashReport.snapshotToken, baselineSnapshotToken: baselineSnapshot,
+      effectiveAtUnixNanos: cashReport.effectiveAtUnixNanos, availableAtUnixNanos: cashReport.availableAtUnixNanos,
+      baselineEffectiveAtUnixNanos: "1780000000000000000", baselineAvailableAtUnixNanos: "1780000000000000001",
+      pageCursor: next ? "next-comparison-page" : "first-comparison-page", nextCursor: next ? null : "next-comparison-page",
+      total: { amount: "-24", currency: "USD" },
+      explanation: "Reported market value change before cash-flow and corporate-action adjustments. This is not investment performance.",
+      contributions: [{
+        instrumentId: next ? "22222222-2222-4222-8222-222222222222" : "11111111-1111-4111-8111-111111111111",
+        investment: { name: next ? "New short position" : "Compared investment", symbol: null },
+        opening: { amount: next ? "0" : "3", currency: "USD" },
+        closing: { amount: next ? "-25" : "4", currency: "USD" },
+        amount: { amount: next ? "-25" : "1", currency: "USD" },
+      }],
+    })
+    const historyReads: string[] = []
+    const comparisonReads: { account: string; selected: string; baseline: string; cursor?: string }[] = []
+    let historySignal: AbortSignal | undefined
+    let resolveHistory: ((value: ApplicationResult) => void) | undefined
     let exposureSignal: AbortSignal | undefined
     let resolveExposure: ((value: ApplicationResult) => void) | undefined
     const holdingsReads: { account: string; cursor?: string }[] = []
@@ -1011,8 +1040,21 @@ describe("Market Squawk desktop boundary", () => {
     let resolveFirst: ((value: ApplicationResult) => void) | undefined
     render(
       <MemoryRouter initialEntries={["/portfolio"]}>
-        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure"] }, undefined, async (request, options) => {
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution"] }, undefined, async (request, options) => {
           if (request.query === "portfolioAccounts") return result({ accounts, nextCursor: null }, 2)
+          if (request.query === "portfolioRevisions") {
+            historyReads.push(request.accountToken)
+            if (request.accountToken === first) {
+              historySignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolveHistory = resolve })
+            }
+            return result(historyPage, 2)
+          }
+          if (request.query === "portfolioAttribution") {
+            comparisonReads.push({ account: request.accountToken, selected: request.selectedSnapshotToken,
+              baseline: request.baselineSnapshotToken, cursor: request.cursor })
+            return result(comparisonPage(request.cursor === "next-comparison-page"))
+          }
           if (request.query === "portfolioExposure") {
             exposureReads.push({ account: request.accountToken, cursor: request.cursor })
             if (request.accountToken === first) {
@@ -1057,6 +1099,10 @@ describe("Market Squawk desktop boundary", () => {
     expect(performanceReads).toEqual([])
     expect(holdingsReads).toEqual([])
     expect(exposureReads).toEqual([])
+    expect(historyReads).toEqual([])
+    expect(comparisonReads).toEqual([])
+    await user.click(screen.getByText("History, stress tests, and planning"))
+    await waitFor(() => expect(historyReads).toEqual([first]))
     await user.click(screen.getByText("Exposure"))
     await waitFor(() => expect(exposureReads).toEqual([{ account: first, cursor: undefined }]))
     await user.click(screen.getByText("Positions"))
@@ -1070,6 +1116,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(performanceSignal?.aborted).toBe(true)
     expect(holdingsSignal?.aborted).toBe(true)
     expect(exposureSignal?.aborted).toBe(true)
+    expect(historySignal?.aborted).toBe(true)
     await user.click(screen.getByText("Cash and performance"))
     expect(await screen.findByText("USD 9,007,199,254,740,993.01")).toBeTruthy()
     expect(screen.getByText("USD 7.50 · Partial")).toBeTruthy()
@@ -1126,6 +1173,28 @@ describe("Market Squawk desktop boundary", () => {
     expect(screen.queryByText("Wrong account exposure")).toBeNull()
     await user.click(screen.getByText("Exposure", { selector: "summary" }))
     await waitFor(() => expect(screen.queryByText("Exposure investment")).toBeNull())
+    await user.click(screen.getByText("History, stress tests, and planning"))
+    const chooseEarlier = await screen.findByRole("button", { name: "Compare with this version" })
+    expect(comparisonReads).toEqual([])
+    resolveHistory?.(result({ ...historyPage, selectedSnapshotToken: baselineSnapshot }, 2))
+    await user.click(chooseEarlier)
+    expect(await screen.findByText("Compared investment")).toBeTruthy()
+    expect(comparisonReads.at(-1)).toEqual({ account: second, selected: cashReport.snapshotToken,
+      baseline: baselineSnapshot, cursor: undefined })
+    const comparison = within(screen.getByLabelText("Saved position value comparison"))
+    expect(comparison.getByText("USD -24")).toBeTruthy()
+    expect(comparison.getByText("USD 1")).toBeTruthy()
+    await user.click(comparison.getByRole("button", { name: "Next" }))
+    expect(await screen.findByText("New short position")).toBeTruthy()
+    expect(comparison.getByText("USD -24")).toBeTruthy()
+    expect(comparison.getAllByText("USD -25")).toHaveLength(2)
+    await user.click(comparison.getByRole("button", { name: "Previous" }))
+    expect(await screen.findByText("Compared investment")).toBeTruthy()
+    expect(comparisonReads.at(-1)?.cursor).toBe("first-comparison-page")
+    await user.click(screen.getByRole("button", { name: "Clear comparison" }))
+    expect(screen.queryByLabelText("Saved position value comparison")).toBeNull()
+    await user.click(screen.getByText("History, stress tests, and planning"))
+    await waitFor(() => expect(screen.queryByLabelText("Saved portfolio history for Portfolio 2")).toBeNull())
   })
 
   it("keeps portfolio planning explicit and analysis-only", async () => {

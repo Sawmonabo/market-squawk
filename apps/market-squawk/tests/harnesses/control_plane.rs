@@ -389,6 +389,115 @@ mod portfolio_application {
                 .is_some_and(|rate| rate != "0")
         );
         assert_ne!(expected["snapshotToken"], snapshot);
+        let history_arguments = json!({"accountToken": token, "limit": 1,
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}});
+        let history = service
+            .call(
+                admitted("Portfolio.ListRevisions", history_arguments.clone())?,
+                context(20)?,
+            )
+            .await?;
+        history.validate_for(
+            capabilities
+                .find("Portfolio.ListRevisions")
+                .ok_or("history descriptor missing")?,
+        )?;
+        assert_eq!(
+            history.structured_content()["selectedSnapshotToken"],
+            expected["snapshotToken"]
+        );
+        assert_eq!(
+            history.structured_content()["revisions"][0]["snapshotToken"],
+            expected["snapshotToken"]
+        );
+        let mut earlier_arguments = history_arguments.clone();
+        earlier_arguments["cursor"] = history.structured_content()["nextCursor"].clone();
+        assert!(earlier_arguments["cursor"].is_string());
+        let earlier = service
+            .call(
+                admitted("Portfolio.ListRevisions", earlier_arguments.clone())?,
+                context(21)?,
+            )
+            .await?;
+        assert_eq!(
+            earlier.structured_content()["revisions"][0]["snapshotToken"],
+            snapshot
+        );
+        assert!(earlier.structured_content()["nextCursor"].is_null());
+        let comparison_arguments = json!({"accountToken": token,
+            "selectedSnapshotToken": expected["snapshotToken"], "baselineSnapshotToken": snapshot,
+            "limit": 1, "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}});
+        let comparison = service
+            .call(
+                admitted("Portfolio.GetAttribution", comparison_arguments.clone())?,
+                context(22)?,
+            )
+            .await?;
+        comparison.validate_for(
+            capabilities
+                .find("Portfolio.GetAttribution")
+                .ok_or("comparison descriptor missing")?,
+        )?;
+        assert_eq!(
+            comparison.structured_content()["total"],
+            json!({"amount":"75", "currency":"USD"})
+        );
+        assert_eq!(
+            comparison.structured_content()["contributions"][0]["opening"]["amount"],
+            "50"
+        );
+        assert_eq!(
+            comparison.structured_content()["contributions"][0]["closing"]["amount"],
+            "100"
+        );
+        assert_eq!(
+            comparison.structured_content()["contributions"][0]["amount"]["amount"],
+            "50"
+        );
+        let mut next_comparison_arguments = comparison_arguments.clone();
+        next_comparison_arguments["cursor"] = comparison.structured_content()["nextCursor"].clone();
+        assert!(next_comparison_arguments["cursor"].is_string());
+        let next_comparison = service
+            .call(
+                admitted(
+                    "Portfolio.GetAttribution",
+                    next_comparison_arguments.clone(),
+                )?,
+                context(23)?,
+            )
+            .await?;
+        assert_eq!(
+            next_comparison.structured_content()["total"],
+            comparison.structured_content()["total"]
+        );
+        assert_eq!(
+            next_comparison.structured_content()["contributions"][0]["amount"]["amount"],
+            "25"
+        );
+        assert!(next_comparison.structured_content()["nextCursor"].is_null());
+        let mut reversed_comparison = comparison_arguments.clone();
+        reversed_comparison["selectedSnapshotToken"] = json!(snapshot);
+        reversed_comparison["baselineSnapshotToken"] = expected["snapshotToken"].clone();
+        assert!(
+            service
+                .call(
+                    admitted("Portfolio.GetAttribution", reversed_comparison)?,
+                    context(24)?
+                )
+                .await
+                .is_err()
+        );
+        let mut filtered_comparison = next_comparison_arguments.clone();
+        filtered_comparison["instrumentIds"] = json!(["11111111-1111-4111-8111-111111111111"]);
+        assert!(
+            service
+                .call(
+                    admitted("Portfolio.GetAttribution", filtered_comparison)?,
+                    context(25)?
+                )
+                .await
+                .is_err()
+        );
         let mut closing_period = arguments.clone();
         closing_period["timeRange"] = json!({"start": "1970-01-01T00:00:00.000000150Z", "end": "1970-01-01T00:00:00.000000250Z"});
         let closing = service
@@ -469,6 +578,60 @@ mod portfolio_application {
         assert_eq!(
             retained_first_page.structured_content(),
             holdings.structured_content()
+        );
+
+        // Old choices and comparison pages remain pinned after restart and another publication.
+        let third_batch = account_and_holding_batch(3, 300, "150")?;
+        let mut third_artifact = paths
+            .artifacts()?
+            .resolve("portfolio/third.json")?
+            .create_new()?;
+        serde_json::to_writer(&mut third_artifact, &third_batch)?;
+        third_artifact.flush()?;
+        reopened
+            .call(
+                admitted(
+                    "Portfolio.Import",
+                    json!({
+                        "accountId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "artifactId": "portfolio/third.json", "confirm": true,
+                        "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
+                    }),
+                )?,
+                context(26)?,
+            )
+            .await?;
+        let mut pinned_history_arguments = history_arguments;
+        pinned_history_arguments["cursor"] = history.structured_content()["pageCursor"].clone();
+        let retained_history = reopened
+            .call(
+                admitted("Portfolio.ListRevisions", pinned_history_arguments)?,
+                context(27)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_history.structured_content(),
+            history.structured_content()
+        );
+        let retained_comparison = reopened
+            .call(
+                admitted("Portfolio.GetAttribution", comparison_arguments)?,
+                context(28)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_comparison.structured_content(),
+            comparison.structured_content()
+        );
+        let retained_next_comparison = reopened
+            .call(
+                admitted("Portfolio.GetAttribution", next_comparison_arguments)?,
+                context(29)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_next_comparison.structured_content(),
+            next_comparison.structured_content()
         );
 
         Ok(())

@@ -1,5 +1,5 @@
 import * as React from "react"
-import { AlertCircle, BriefcaseBusiness, ChevronDown, RefreshCw } from "lucide-react"
+import { AlertCircle, BriefcaseBusiness, RefreshCw } from "lucide-react"
 
 import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -174,27 +174,20 @@ function SelectedPortfolio({
         </p>
         <AccountRisk account={account} bootstrap={bootstrap} transport={transport} />
       </DemandPanel>
-      <details className="group rounded-xl border border-border bg-card/20 p-4">
-        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">
-          <span>History, stress tests, and planning</span>
-          <ChevronDown
-            className="size-4 text-muted-foreground transition-transform group-open:rotate-180"
-            aria-hidden="true"
-          />
-        </summary>
+      <DemandPanel title="History, stress tests, and planning" className="group rounded-xl border border-border bg-card/20 p-4">
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
           No comparison, stress scenario, position change, or rebalance plan is selected by
           default. These tools cannot place an order.
         </p>
         <div className="mt-4 space-y-4">
-          <PortfolioHistory />
+          <PortfolioHistory account={account} bootstrap={bootstrap} transport={transport} />
           <div className="grid gap-4 2xl:grid-cols-2">
             <PortfolioScenarios choices={null} />
             <PortfolioPlanning positionChoices={null} rebalanceChoices={null} />
           </div>
 
         </div>
-      </details>
+      </DemandPanel>
     </div>
   )
 }

@@ -155,33 +155,82 @@ export const portfolioTransactionSchema = z
   })
   .strict()
 
-export const portfolioRevisionChoiceSchema = z
-  .object({
-    comparisonActionToken: portfolioActionTokenSchema,
-    label: productNameSchema,
-    effectiveAt: productTimeSchema,
-    positionCount: z.number().int().nonnegative(),
-  })
-  .strict()
+export const portfolioRevisionChoiceSchema = z.strictObject({
+  snapshotToken: z.string().uuid(),
+  effectiveAtUnixNanos: unixNanosSchema,
+  availableAtUnixNanos: unixNanosSchema.nullable(),
+  holdingCount: z.number().int().nonnegative(),
+  transactionCount: z.number().int().nonnegative(),
+  dataIssueCount: z.number().int().nonnegative(),
+  dataState: z.enum(["ready", "needs_review"]),
+})
 
-const contributionSchema = z
-  .object({
-    contributionActionToken: portfolioActionTokenSchema,
-    investment: investmentDisplaySchema,
-    amount: moneySchema,
-  })
-  .strict()
+export const portfolioRevisionPageSchema = z.strictObject({
+  revisions: z.array(portfolioRevisionChoiceSchema),
+  pageCursor: z.string().min(1).max(512),
+  nextCursor: z.string().min(1).max(512).nullable(),
+  selectedSnapshotToken: z.string().uuid(),
+}).superRefine((page, context) => {
+  const tokens = new Set<string>()
+  for (const revision of page.revisions) {
+    if (tokens.has(revision.snapshotToken)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Saved portfolio choices are inconsistent." })
+    }
+    tokens.add(revision.snapshotToken)
+  }
+})
 
-export const portfolioAttributionSchema = z
-  .object({
-    comparisonLabel: productNameSchema,
-    comparisonPeriod: productTextSchema,
-    totalChange: moneySchema,
-    contributions: z.array(contributionSchema).max(500),
-    explanation: productTextSchema,
-    uncertainty: productTextSchema,
-  })
-  .strict()
+export function parsePortfolioRevisions(result: ApplicationResult): PortfolioRevisionPage {
+  const page = parsePortfolioResult(result, portfolioRevisionPageSchema)
+  if (result.metadata.returnedItems !== page.revisions.length) {
+    throw new Error("Saved portfolio counts are inconsistent.")
+  }
+  return page
+}
+
+const contributionSchema = z.strictObject({
+  instrumentId: z.string().min(1),
+  investment: z.strictObject({ name: z.string().nullable(), symbol: z.string().nullable() }),
+  opening: moneySchema,
+  closing: moneySchema,
+  amount: moneySchema,
+})
+
+export const portfolioAttributionSchema = z.strictObject({
+  contributions: z.array(contributionSchema),
+  total: moneySchema,
+  pageCursor: z.string().min(1).max(512),
+  nextCursor: z.string().min(1).max(512).nullable(),
+  snapshotToken: z.string().uuid(),
+  baselineSnapshotToken: z.string().uuid(),
+  effectiveAtUnixNanos: unixNanosSchema,
+  availableAtUnixNanos: unixNanosSchema.nullable(),
+  baselineEffectiveAtUnixNanos: unixNanosSchema,
+  baselineAvailableAtUnixNanos: unixNanosSchema.nullable(),
+  explanation: z.string(),
+}).superRefine((page, context) => {
+  const instruments = new Set<string>()
+  if (page.snapshotToken === page.baselineSnapshotToken) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Choose an earlier saved portfolio." })
+  }
+  for (const contribution of page.contributions) {
+    if (instruments.has(contribution.instrumentId)
+      || contribution.opening.currency !== page.total.currency
+      || contribution.closing.currency !== page.total.currency
+      || contribution.amount.currency !== page.total.currency) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Saved portfolio comparison is inconsistent." })
+    }
+    instruments.add(contribution.instrumentId)
+  }
+})
+
+export function parsePortfolioAttribution(result: ApplicationResult): PortfolioAttribution {
+  const page = parsePortfolioResult(result, portfolioAttributionSchema)
+  if (result.metadata.returnedItems !== page.contributions.length) {
+    throw new Error("Comparison counts are inconsistent.")
+  }
+  return page
+}
 
 // The performance read uses the canonical Portfolio.GetPerformance projection.
 // Keep its exact monetary values and optional history evidence intact.
@@ -386,6 +435,7 @@ export type PortfolioHolding = z.infer<typeof holdingSchema>
 export type PortfolioHoldingsPage = z.infer<typeof portfolioHoldingsPageSchema>
 export type PortfolioTransaction = z.infer<typeof portfolioTransactionSchema>
 export type PortfolioRevisionChoice = z.infer<typeof portfolioRevisionChoiceSchema>
+export type PortfolioRevisionPage = z.infer<typeof portfolioRevisionPageSchema>
 export type PortfolioPerformance = z.infer<typeof performanceSchema>
 export type PortfolioExposure = z.infer<typeof exposureSchema>
 export type PortfolioExposurePage = z.infer<typeof portfolioExposurePageSchema>

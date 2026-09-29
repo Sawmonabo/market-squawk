@@ -500,12 +500,16 @@ pub(crate) enum DashboardQueryCommand {
         account_token: String,
     },
     PortfolioRevisions {
-        account_id: String,
-        after_snapshot_token: Option<String>,
+        account_token: String,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     PortfolioAttribution {
-        account_id: String,
+        account_token: String,
+        selected_snapshot_token: String,
         baseline_snapshot_token: String,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     PortfolioScenario {
         account_id: String,

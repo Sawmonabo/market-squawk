@@ -149,10 +149,8 @@ pub(super) fn call(
     context: &RequestContext,
     limits: PortfolioApplicationLimits,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    match request.name() {
-        "Portfolio.ListAccounts" => return list_accounts(image, request, context, limits),
-        "Portfolio.ListRevisions" => return list_revisions(image, request, context, limits),
-        _ => {}
+    if request.name() == "Portfolio.ListAccounts" {
+        return list_accounts(image, request, context, limits);
     }
     let scope = if matches!(
         request.name(),
@@ -167,12 +165,9 @@ pub(super) fn call(
         "Portfolio.GetTransactions" => transactions(revision, &scope, context),
         "Portfolio.GetPerformance" => analytics::performance(image, revision, &scope, context),
         "Portfolio.GetRisk" => analytics::risk(image, revision, &scope, context),
-        "Portfolio.GetAttribution"
-        | "Portfolio.EvaluateScenario"
+        "Portfolio.EvaluateScenario"
         | "Portfolio.EvaluateScenarioBatch"
-        | "Portfolio.ProposeRebalance" => {
-            super::advanced::call(image, revision, &scope, request, context)
-        }
+        | "Portfolio.ProposeRebalance" => super::advanced::call(revision, &scope, request, context),
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
 }
@@ -302,54 +297,6 @@ fn list_accounts(
     }
 }
 
-fn list_revisions(
-    image: &PortfolioReadImage,
-    request: &TypedToolRequest,
-    context: &RequestContext,
-    application_limits: PortfolioApplicationLimits,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let scope = ReadScope::from_request(request, application_limits)?;
-    let after_snapshot = request
-        .arguments()
-        .get("afterSnapshotToken")
-        .and_then(Value::as_str);
-    let history = image
-        .accounts
-        .get(&scope.account_id)
-        .ok_or(PortfolioApplicationServiceError::NotFound)?;
-    let mut cursor_seen = after_snapshot.is_none();
-    let mut rows = Vec::new();
-    for revision in &history.revisions {
-        let token = snapshot_token(revision);
-        if !cursor_seen {
-            if after_snapshot == Some(token.as_str()) {
-                cursor_seen = true;
-            }
-            continue;
-        }
-        if !scope.admits_time(revision.effective_at)
-            || scope.end.is_some_and(|end| {
-                revision
-                    .available_at
-                    .is_none_or(|available| available > end)
-            })
-        {
-            continue;
-        }
-        rows.push(revision_summary(revision));
-    }
-    if !cursor_seen {
-        return Err(PortfolioApplicationServiceError::InvalidRequest);
-    }
-    portfolio_page(
-        rows,
-        scope.maximum_items,
-        scope.maximum_bytes,
-        context,
-        json!({"scope": "portfolio_history"}),
-    )
-}
-
 fn account_summary(
     binding: &super::product::ProductAccountBinding,
     revision: &PublishedRevision,
@@ -366,7 +313,7 @@ fn account_summary(
     }))
 }
 
-fn revision_summary(revision: &PublishedRevision) -> Value {
+pub(super) fn revision_summary(revision: &PublishedRevision) -> Value {
     json!({
         "snapshotToken": snapshot_token(revision),
         "effectiveAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
@@ -404,40 +351,6 @@ fn read_result_limits(
         .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
         .min(application_limits.max_retained_bytes);
     Ok((maximum_items, maximum_bytes))
-}
-
-fn portfolio_page(
-    rows: Vec<Value>,
-    maximum_items: usize,
-    maximum_bytes: usize,
-    context: &RequestContext,
-    coverage: Value,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let available = rows.len();
-    let upper = available
-        .min(maximum_items)
-        .min(context.limits().maximum_result_items());
-    let quality = json!({"state": "available", "confidence": "limited"});
-    let limits = narrowed_limits(context, maximum_items, maximum_bytes)?;
-    let mut count = upper;
-    loop {
-        let metadata = if count < available {
-            ToolResultMetadata::try_truncated(available, coverage.clone(), quality.clone())
-        } else {
-            ToolResultMetadata::try_complete(coverage.clone(), quality.clone())
-        }
-        .map_err(|_| PortfolioApplicationServiceError::Publication)?;
-        match TypedToolResult::try_new(
-            Value::Array(rows[..count].to_vec()),
-            count,
-            metadata,
-            limits,
-        ) {
-            Ok(result) => return Ok(result),
-            Err(_) if count > 0 => count -= 1,
-            Err(_) => return Err(PortfolioApplicationServiceError::ResourceExhausted),
-        }
-    }
 }
 
 pub(super) fn select_revision<'image>(

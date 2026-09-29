@@ -253,18 +253,25 @@ pub(crate) async fn dashboard_query(
             ("Portfolio.GetRisk", arguments)
         }
         DashboardQueryCommand::PortfolioRevisions {
-            account_id,
-            after_snapshot_token,
-        } => {
-            let mut arguments = account_arguments(account_id);
-            insert_optional(&mut arguments, "afterSnapshotToken", after_snapshot_token);
-            ("Portfolio.ListRevisions", arguments)
-        }
+            account_token,
+            cursor,
+            limit,
+        } => (
+            "Portfolio.ListRevisions",
+            portfolio_page_arguments(account_token, cursor, limit)?,
+        ),
         DashboardQueryCommand::PortfolioAttribution {
-            account_id,
+            account_token,
+            selected_snapshot_token,
             baseline_snapshot_token,
+            cursor,
+            limit,
         } => {
-            let mut arguments = account_arguments(account_id);
+            let mut arguments = portfolio_page_arguments(account_token, cursor, limit)?;
+            arguments.insert(
+                "selectedSnapshotToken".to_owned(),
+                json!(selected_snapshot_token),
+            );
             arguments.insert(
                 "baselineSnapshotToken".to_owned(),
                 json!(baseline_snapshot_token),

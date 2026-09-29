@@ -5,6 +5,7 @@ mod advanced;
 mod analytics;
 mod backup;
 mod candidate;
+mod history;
 mod holdings;
 mod import;
 mod instrument_display;
@@ -745,13 +746,24 @@ impl ApplicationDomainService for PortfolioApplicationService {
         }
         if matches!(
             request.name(),
-            "Portfolio.GetHoldings" | "Portfolio.GetExposure"
+            "Portfolio.GetHoldings"
+                | "Portfolio.GetExposure"
+                | "Portfolio.ListRevisions"
+                | "Portfolio.GetAttribution"
         ) {
             let runtime = Arc::clone(&self.runtime);
             return tokio::task::spawn_blocking(move || {
                 let _guard = guard;
                 ensure_live(&runtime, &context)?;
-                let result = holdings::call(
+                let read = if matches!(
+                    request.name(),
+                    "Portfolio.ListRevisions" | "Portfolio.GetAttribution"
+                ) {
+                    history::call
+                } else {
+                    holdings::call
+                };
+                let result = read(
                     &runtime.image.load(),
                     &request,
                     &context,

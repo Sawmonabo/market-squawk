@@ -370,7 +370,12 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Portfolio.PreviewRecommendationSetup" => recommendation_setup_preview(),
         "Portfolio.CommitRecommendationSetup" => recommendation_setup_receipt(),
         "Portfolio.ListAccounts" => cursor_page("accounts", portfolio_account()),
-        "Portfolio.ListRevisions" => nullable_rows(portfolio_snapshot()),
+        "Portfolio.ListRevisions" => closed_complete(vec![
+            ("revisions", array(portfolio_snapshot())),
+            ("pageCursor", bounded_text(512)),
+            ("nextCursor", nullable(bounded_text(512))),
+            ("selectedSnapshotToken", uuid()),
+        ]),
         "Portfolio.GetHoldings" => portfolio_holdings_page(),
         "Portfolio.GetTransactions" => array(portfolio_transaction()),
         "Portfolio.GetPerformance" => portfolio_performance(),
@@ -6199,13 +6204,7 @@ fn portfolio_position_page_fields() -> Vec<(&'static str, Value)> {
 
 fn portfolio_holding() -> Value {
     closed_complete(vec![
-        (
-            "investment",
-            closed_complete(vec![
-                ("name", nullable(text())),
-                ("symbol", nullable(text())),
-            ]),
-        ),
+        ("investment", portfolio_investment_display()),
         ("accountId", text()),
         ("snapshotToken", uuid()),
         ("instrumentId", text()),
@@ -6216,6 +6215,13 @@ fn portfolio_holding() -> Value {
         ("asOfUnixNanos", text()),
         ("costBasis", portfolio_cost_basis()),
         ("price", portfolio_price_state()),
+    ])
+}
+
+fn portfolio_investment_display() -> Value {
+    closed_complete(vec![
+        ("name", nullable(text())),
+        ("symbol", nullable(text())),
     ])
 }
 
@@ -6535,16 +6541,28 @@ fn portfolio_recommendation_uncertainty() -> Value {
 }
 
 fn portfolio_attribution() -> Value {
-    let mut fields = portfolio_report_fields();
-    fields.extend([
+    closed_complete(vec![
+        ("snapshotToken", uuid()),
+        ("effectiveAtUnixNanos", text()),
+        ("availableAtUnixNanos", nullable(text())),
         ("baselineSnapshotToken", uuid()),
         ("baselineEffectiveAtUnixNanos", text()),
         ("baselineAvailableAtUnixNanos", nullable(text())),
-        ("contributions", array(portfolio_contribution())),
+        (
+            "contributions",
+            array(closed_complete(vec![
+                ("instrumentId", text()),
+                ("investment", portfolio_investment_display()),
+                ("opening", money()),
+                ("closing", money()),
+                ("amount", money()),
+            ])),
+        ),
         ("total", money()),
+        ("pageCursor", bounded_text(512)),
+        ("nextCursor", nullable(bounded_text(512))),
         ("explanation", text()),
-    ]);
-    closed_complete(fields)
+    ])
 }
 
 fn portfolio_contribution() -> Value {

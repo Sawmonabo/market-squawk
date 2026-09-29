@@ -1,13 +1,10 @@
-//! Evidence-bound portfolio attribution, scenario, proposal, and candidate-impact operations.
+//! Evidence-bound portfolio scenario, proposal, and candidate-impact operations.
 
 mod planning;
 mod scenario;
 
-use std::collections::BTreeSet;
-
 use market_squawk_analytics::{
     ExactDecimalScale, ExactRate, MonetaryBasis, MonetaryValue, PortfolioAllocation,
-    portfolio_attribution,
 };
 use market_squawk_domain::{Currency, InstrumentId, Money};
 use market_squawk_services::{RequestContext, TypedToolRequest, TypedToolResult};
@@ -15,18 +12,16 @@ use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 
 use super::PortfolioApplicationServiceError;
-use super::model::{PortfolioReadImage, PublishedRevision};
-use super::read::{ReadScope, report_result, snapshot_token};
+use super::model::PublishedRevision;
+use super::read::ReadScope;
 
 pub(super) fn call(
-    image: &PortfolioReadImage,
     revision: &PublishedRevision,
     scope: &ReadScope,
     request: &TypedToolRequest,
     context: &RequestContext,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     match request.name() {
-        "Portfolio.GetAttribution" => attribution(image, revision, scope, request, context),
         "Portfolio.EvaluateScenario" => scenario::evaluate_one(revision, scope, request, context),
         "Portfolio.EvaluateScenarioBatch" => {
             scenario::evaluate_batch(revision, scope, request, context)
@@ -34,111 +29,6 @@ pub(super) fn call(
         "Portfolio.ProposeRebalance" => planning::rebalance(revision, scope, request, context),
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
-}
-
-fn attribution(
-    image: &PortfolioReadImage,
-    selected: &PublishedRevision,
-    scope: &ReadScope,
-    request: &TypedToolRequest,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let baseline_id = required_string(request.arguments(), "baselineSnapshotToken")?;
-    let history = image
-        .accounts
-        .get(&scope.account_id)
-        .ok_or(PortfolioApplicationServiceError::NotFound)?;
-    let selected_index = history
-        .revisions
-        .iter()
-        .position(|revision| revision.token() == selected.token())
-        .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
-    let baseline = history.revisions[..selected_index]
-        .iter()
-        .find(|revision| snapshot_token(revision) == baseline_id)
-        .ok_or(PortfolioApplicationServiceError::NotFound)?;
-    if baseline.available_at.is_none()
-        || selected.available_at.is_none()
-        || baseline.account.currency() != selected.account.currency()
-    {
-        return Err(PortfolioApplicationServiceError::Analytics);
-    }
-
-    let mut seen = BTreeSet::new();
-    let mut instrument_ids = Vec::new();
-    let mut allocations = Vec::new();
-    for opening in baseline
-        .holdings
-        .iter()
-        .filter(|holding| scope.admits_instrument(holding.instrument_id()))
-    {
-        let opening_value = opening.market_value();
-        if opening_value.currency() != selected.account.currency()
-            || opening_value.amount() <= Decimal::ZERO
-            || !seen.insert(opening.instrument_id())
-        {
-            return Err(PortfolioApplicationServiceError::Analytics);
-        }
-        let closing_value = selected
-            .holdings
-            .iter()
-            .find(|holding| holding.instrument_id() == opening.instrument_id())
-            .map_or(Decimal::ZERO, |holding| holding.market_value().amount());
-        let return_rate = closing_value
-            .checked_div(opening_value.amount())
-            .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
-            .ok_or(PortfolioApplicationServiceError::Analytics)?;
-        let rate = exact_rate(return_rate)?;
-        instrument_ids.push(opening.instrument_id());
-        allocations.push(
-            PortfolioAllocation::try_new(
-                &instrument_dimension(opening.instrument_id()),
-                MonetaryValue::new(opening_value, MonetaryBasis::Total),
-                rate,
-            )
-            .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
-        );
-    }
-    if allocations.is_empty() || allocations.len() > scope.maximum_items {
-        return Err(PortfolioApplicationServiceError::Analytics);
-    }
-    let result = portfolio_attribution(&allocations)
-        .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
-    let contributions = instrument_ids
-        .iter()
-        .zip(result.contributions())
-        .map(|(instrument_id, contribution)| {
-            json!({
-                "instrumentId": instrument_id.to_string(),
-                "amount": money_value(contribution.amount().money()),
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut output = base_report(selected, "portfolio_change");
-    output.insert(
-        "baselineSnapshotToken".to_owned(),
-        Value::String(snapshot_token(baseline)),
-    );
-    output.insert(
-        "baselineEffectiveAtUnixNanos".to_owned(),
-        Value::String(baseline.effective_at.unix_nanos().to_string()),
-    );
-    output.insert(
-        "baselineAvailableAtUnixNanos".to_owned(),
-        baseline.available_at.map_or(Value::Null, |value| {
-            Value::String(value.unix_nanos().to_string())
-        }),
-    );
-    output.insert("contributions".to_owned(), Value::Array(contributions));
-    output.insert("total".to_owned(), money_value(result.total().money()));
-    output.insert(
-        "explanation".to_owned(),
-        Value::String(
-            "Change in reported market value before cash-flow and corporate-action adjustments."
-                .to_owned(),
-        ),
-    );
-    report_result(Value::Object(output), selected, scope, context)
 }
 
 pub(super) fn allocations(

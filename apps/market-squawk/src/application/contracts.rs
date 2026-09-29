@@ -866,13 +866,12 @@ const RECOMMENDATION_SETUP_COMMIT_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("previewId", ArgumentKind::Uuid),
     ArgumentSpec::required("previewDigest", ArgumentKind::Sha256),
 ];
-const LIST_REVISIONS_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
-    ArgumentSpec::optional("afterSnapshotToken", ArgumentKind::Uuid),
-];
 const PORTFOLIO_ATTRIBUTION_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
+    ArgumentSpec::required("selectedSnapshotToken", ArgumentKind::Uuid),
     ArgumentSpec::required("baselineSnapshotToken", ArgumentKind::Uuid),
+    CURSOR_PAGE_ARGUMENTS[0],
+    CURSOR_PAGE_ARGUMENTS[1],
 ];
 const PORTFOLIO_SCENARIO_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("accountId", ArgumentKind::Identifier),
@@ -2252,10 +2251,10 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     read(
         "Portfolio.ListRevisions",
-        "List bounded append-only revisions for one portfolio account.",
+        "List saved portfolio observations with snapshot-pinned continuation.",
         ServiceDomain::Portfolio,
         PORTFOLIO_SCOPE,
-        LIST_REVISIONS_ARGUMENTS,
+        PORTFOLIO_POSITION_PAGE_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
     read(
@@ -2296,7 +2295,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     read(
         "Portfolio.GetAttribution",
-        "Return source-mark change attribution between two immutable revisions.",
+        "Compare exact reported position values between two selected saved observations.",
         ServiceDomain::Portfolio,
         PORTFOLIO_SCOPE,
         PORTFOLIO_ATTRIBUTION_ARGUMENTS,

@@ -870,6 +870,23 @@ pub enum PortfolioCommand {
         #[arg(long, default_value_t = 25)]
         limit: u16,
     },
+    /// List saved observations for a selected portfolio.
+    Revisions {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Continue the same saved history listing.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Saved observations per page.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Compare reported position values between two selected saved observations.
+    Attribution {
+        /// Confined JSON request with accountToken and both saved snapshot tokens.
+        request: PathBuf,
+    },
     /// Report normalized transactions.
     Transactions {
         /// Exact account identity.

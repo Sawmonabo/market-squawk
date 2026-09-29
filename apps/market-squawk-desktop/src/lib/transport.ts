@@ -107,13 +107,17 @@ export type ProductQuery =
   | { query: "portfolioRisk" | "portfolioPerformance"; accountToken: string }
   | {
       query: "portfolioRevisions"
-      accountId: string
-      afterSnapshotToken?: string
+      accountToken: string
+      cursor?: string
+      limit?: number
     }
   | {
       query: "portfolioAttribution"
-      accountId: string
+      accountToken: string
+      selectedSnapshotToken: string
       baselineSnapshotToken: string
+      cursor?: string
+      limit?: number
     }
   | {
       query: "portfolioCandidateImpact"
