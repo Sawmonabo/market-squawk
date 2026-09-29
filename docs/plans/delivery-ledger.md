@@ -1,22 +1,27 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — documentation aligned, product work paused — 2026-09-29
+## Current execution — plans reviewed, implementation paused — 2026-09-29
 
 The [owner-test goal](v1-owner-test-goal.md) is the tracked scope and finite acceptance contract.
-The owner authorized this documentation alignment and its commit/push only. Product implementation,
-agent dispatch, builds, tests, provider calls and measurements remain paused until explicit resume.
+Completion planning and four fresh, disjoint senior GPT-6 Astra High reviews are complete.
+Two Important and two Minor planning findings were corrected and explicitly closed by their
+reviewers; all four approved the final document hashes recorded in the
+[plan review report](../reports/2026-09-29-v1-completion-plan-review.md). Product implementation,
+builds, tests, provider calls and measurements remain paused until explicit resume.
+Author/reviewer assignments are closed; no implementation files are assigned.
 
 The latest **product-code checkpoint** is `9543ed357349a83715079ba0720b0f4789f9da58`, pushed to
 `feature/v1-installed-product-experience` and recorded in draft PR #43. This documentation
 checkpoint changes no application code and does not inherit or claim fresh exact-head release
 approval. Three local branches, three origin heads and one primary worktree remain, with no linked
-worktrees. Main/release are unchanged. The preserved parent-workspace troubleshooting note is
-included in this documentation checkpoint; sessions and recovery backups remain intact.
+worktrees. Main/release are unchanged. The earlier documentation checkpoint preserved the parent-workspace troubleshooting note;
+sessions and recovery backups remain intact.
 
 | Outcome | Current owner/status | Next dependency and evidence |
 | --- | --- | --- |
 | Resource processing remediation | Implemented and pushed at `9543ed35`; implementation assignments closed | Focused evidence below; complete installed workflows and final measurement remain unproven |
-| Owner-test goal and instruction alignment | Lead; documentation only, product execution paused | This checkpoint synchronizes scope, ownership and progress; no product checks required |
+| Owner-test goal and instruction alignment | Completed and pushed at `523da3b9` | Current scope and ownership supersede historical execution instructions |
+| Completion plan and first-stock wave | Written and independently approved; all four valid findings closed | [Completion plan](v1-workflow-completion-plan.md), [first-stock wave](v1-first-stock-wave.md), [exact review evidence](../reports/2026-09-29-v1-completion-plan-review.md); owner review and explicit implementation resume |
 | First complete stock analysis and saved-result restart | Pending explicit resume; no implementation files assigned | Brief refresh of the seven acceptance items against current source, then exact disjoint provider/financial/Desktop assignments |
 
 On resume, update this single table with bounded outcomes, exact file ownership, dependencies,

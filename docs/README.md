@@ -25,6 +25,7 @@ delivery status, research, and historical evidence so each page has one clear jo
 | See what is runnable and what still blocks the first complete release | [Delivery ledger](plans/delivery-ledger.md) |
 | Review the original dated requirement classification | [Historical gap analysis](plans/gap-analysis.md) |
 | Follow the current V1 scope and acceptance checklist | [Owner-test goal](plans/v1-owner-test-goal.md) |
+| Plan the remaining workflows and first implementation wave | [Workflow completion plan](plans/v1-workflow-completion-plan.md) |
 | Inspect the earlier detailed implementation sequence | [Implementation plan](plans/implementation-plan.md) |
 | Reproduce or review the terminal release evidence | [Exact-head release gate](verification/usable-release-gate.md) |
 | Inspect original research and primary-source decisions | [Research](research/) |
