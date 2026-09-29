@@ -6,6 +6,13 @@ This is the approved scope and acceptance contract. Current execution status, co
 and next assignments live in the [delivery ledger](delivery-ledger.md). Updating this document does
 not resume execution; explicit owner pauses and later resume instructions control.
 
+For execution after explicit resume, follow the reviewed
+[workflow completion plan](v1-workflow-completion-plan.md) for remaining outcomes and dependencies,
+then the [first-stock wave](v1-first-stock-wave.md) for initial tasks and file ownership.
+The [independent review record](../reports/2026-09-29-v1-completion-plan-review.md) records approval
+and finding closure. These plans implement this goal; they do not replace or narrow its acceptance
+criteria. The delivery ledger remains the authority for current assignments and evidence.
+
 ## Objective and scope
 
 Complete the existing V1 feature branch as a fully working, installed application for owner testing

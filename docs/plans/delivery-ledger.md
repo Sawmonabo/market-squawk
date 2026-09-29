@@ -10,6 +10,10 @@ reviewers; all four approved the final document hashes recorded in the
 builds, tests, provider calls and measurements remain paused until explicit resume.
 Author/reviewer assignments are closed; no implementation files are assigned.
 
+Reviewed plans were committed and pushed at `d9b87115d9cccee1a81466abeae803ff3dc525a6`.
+The owner subsequently authorized direct plan references in the tracked goal and local goal
+attachment. Those references preserve the existing scope and pause; they do not resume execution.
+
 The latest **product-code checkpoint** is `9543ed357349a83715079ba0720b0f4789f9da58`, pushed to
 `feature/v1-installed-product-experience` and recorded in draft PR #43. This documentation
 checkpoint changes no application code and does not inherit or claim fresh exact-head release
