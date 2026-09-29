@@ -544,6 +544,7 @@ describe("Market Squawk desktop boundary", () => {
           destination: {
             action: productLookupActions.openInvestment,
             instrumentId,
+            selectionToken: marketSelectionToken,
           },
         },
         {
@@ -564,7 +565,7 @@ describe("Market Squawk desktop boundary", () => {
     }
     const parsed = lookupResultSchema.parse(output)
 
-    expect(lookupRoute(parsed.matches[0]!)).toBe(`/markets?instrumentId=${instrumentId}`)
+    expect(lookupRoute(parsed.matches[0]!)).toBe(`/markets?selectionToken=${marketSelectionToken}`)
     expect(lookupRoute(parsed.matches[1]!)).toBe(
       `/opportunities?screenId=${encodeURIComponent(screenId)}`,
     )
@@ -583,7 +584,7 @@ describe("Market Squawk desktop boundary", () => {
     ).toBe(false)
 
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
-    render(
+    const savedScreen = render(
       <MemoryRouter
         initialEntries={[
           `/opportunities?screenId=${encodeURIComponent(screenId)}`,
@@ -632,6 +633,40 @@ describe("Market Squawk desktop boundary", () => {
     expect(document.body.textContent ?? "").not.toMatch(
       /provider-sentinel|source-sentinel|manifest-sentinel/i,
     )
+    savedScreen.unmount()
+
+    const requestedRow: MarketProductRow = {
+      ...marketOverviewRow,
+      identity: { symbol: "MSQ", name: "Requested investment", assetClass: "equity" },
+    }
+    const openInvestment = (route: string) => render(
+      <MemoryRouter initialEntries={[route]}>
+        <App transport={transport(
+          { ...blockedBootstrap, capabilities: ["market_overview", "market_instrument"] },
+          undefined,
+          async (request) => {
+            issuedQueries.push(request)
+            if (request.query === "marketOverview") return marketOverviewResult
+            if (request.query === "marketInstrument" && request.selectionToken === marketSelectionToken) {
+              return marketResult(requestedRow)
+            }
+            throw new Error("This investment selection is no longer available.")
+          },
+        )} />
+      </MemoryRouter>,
+    )
+    const investment = openInvestment(lookupRoute(parsed.matches[0]!))
+    expect(await screen.findByRole("heading", { name: "Requested investment" })).toBeTruthy()
+    expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: marketSelectionToken })
+    investment.unmount()
+
+    const staleToken = "market_ffffffffffffffffffffffffffffffff"
+    openInvestment(`/markets?selectionToken=${staleToken}`)
+    expect((await screen.findByRole("alert")).textContent).toContain("This investment could not be opened")
+    expect(issuedQueries).toContainEqual({ query: "marketInstrument", selectionToken: staleToken })
+    expect(screen.queryByRole("heading", { name: "Requested investment" })).toBeNull()
+    // The overview still contains Bitcoin, but a rejected route must not select it as fallback.
+    expect(screen.getAllByRole("heading", { name: "Bitcoin" })).toHaveLength(1)
   })
 
   it("renders one provider-neutral market journey with current price and explicit selection", async () => {

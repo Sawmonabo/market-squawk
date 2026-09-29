@@ -2582,13 +2582,27 @@ fn publication_arguments(run: &WorkflowRun) -> Result<Value, WorkflowError> {
     let study = work.receipts.get("StudyBacktest").filter(|receipt| receipt.operation == "Analysis.GetRecommendationBacktestJobResult")
         .map(|receipt| json!({"requestDigest": receipt.body.get("requestDigest"), "evidenceDigest": receipt.body.get("evidenceDigest")}));
     let probabilities = probability::publication(work)?;
-    let source_action_reference = work.initial_source_action_reference()?.clone();
-    let current_share_action_reference = work
-        .receipt(Step::FinalPrepare)?
+    let market = work
+        .receipt(Step::FinalEvidence)?
         .body
-        .get("sourceActionReference")
+        .get("reference")
         .cloned()
         .unwrap_or(Value::Null);
+    let source_action_reference = if price.is_null() {
+        Value::Null
+    } else {
+        work.initial_source_action_reference()?.clone()
+    };
+    let current_share_action_reference =
+        if price.is_null() || source_action_reference.is_null() || market.is_null() {
+            Value::Null
+        } else {
+            work.receipt(Step::FinalPrepare)?
+                .body
+                .get("sourceActionReference")
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
     let fundamental_share_sources = work
         .receipt(Step::FinalPrepare)?
         .body
@@ -2607,7 +2621,7 @@ fn publication_arguments(run: &WorkflowRun) -> Result<Value, WorkflowError> {
     Ok(json!({"financialProfile": DriverState::profile(run)?,
         "analyticalProfile": {"profileId": run.profile.active.profile_id, "revision": revision, "contentSha256": run.profile.active.config_digest},
         "workflow": {"workflowId": workflow_id, "revision": 1, "contentSha256": digest},
-        "market": work.receipt(Step::FinalEvidence)?.body.get("reference").cloned().unwrap_or(Value::Null),
+        "market": market,
         "portfolio": work.receipt(Step::FinalPortfolio)?.body.get("reference").ok_or_else(WorkflowError::internal)?,
         "sourceCutoffUnixNanos": work.source_cutoff, "priceForecast": price,
         "sourceActionReference": source_action_reference,
@@ -3342,4 +3356,265 @@ fn price_preparation(receipt: &Receipt) -> Result<PriceForecastPreparation, Work
         }
     }
     Ok(prepared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::decision::investment_request::{
+        GenerateRequest, validate_canonical_request,
+    };
+    use market_squawk_domain::{CalendarDate, DigestAlgorithm, EvidenceDigest, Timestamp};
+
+    fn receipt(operation: &str, arguments: Value, body: Value) -> Receipt {
+        Receipt {
+            operation: operation.to_owned(),
+            arguments: serde_json::from_value(arguments).expect("receipt arguments"),
+            sha256: hex_digest(Sha256::digest(
+                serde_json::to_vec(&body).expect("receipt bytes"),
+            )),
+            body,
+        }
+    }
+
+    #[test]
+    fn publication_action_references_follow_forecast_and_market_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::application::application_capabilities()?;
+        let directory = tempfile::tempdir()?;
+        let paths = market_squawk_platform::LocalPaths::prepare(directory.path())?;
+        let workspace = Uuid::new_v4();
+        let controller = AnalyticalWorkflowController::try_open(&paths, workspace)?;
+        let selection = crate::application::market_selection::product::token(
+            "market_",
+            b"workflow-publication-regression",
+            &[workspace.as_bytes()],
+        )?;
+        controller.begin_workflow(
+            WorkflowKind::AnalyzeInvestment,
+            Some(selection.into_string()),
+            None,
+            super::super::host::WorkflowOrigin::new(
+                market_squawk_services::RequestOrigin::try_new(workspace, Uuid::new_v4())?,
+            ),
+        )?;
+        let mut run = controller.next_run()?.ok_or("missing workflow")?;
+        let profile = serde_json::to_value(
+            crate::application::analytical_profile::resolve(None, None)?.resolution(),
+        )?;
+        let cutoff = 1_800_000_000_000_000_000_i64;
+        let current = cutoff + 1_000_000_000;
+        let now = current.to_string();
+        let instrument = Uuid::new_v4();
+        let digest = "1".repeat(64);
+        let evidence_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]);
+        let date = CalendarDate::new(2026, 1, 2)?;
+        // Inert reference fixtures exercise request admission; they confer no source authority.
+        let original = json!({
+            "version": 1, "source_origin_content": evidence_digest,
+            "source_binding": evidence_digest, "source_snapshot": evidence_digest,
+            "calendar": {"originContentDigest": digest, "captureBindingDigest": digest},
+            "requested_instruments": [instrument], "interval": [date, date],
+            "knowledge_cutoff": Timestamp::from_unix_nanos(cutoff),
+            "valuation_cutoff": Timestamp::from_unix_nanos(cutoff),
+            "evaluated_at": Timestamp::from_unix_nanos(cutoff),
+            "adjustment": 1, "policy_version": 1, "payment_policy": "retain_receivable",
+            "content_hash": evidence_digest, "audit_hash": evidence_digest, "ordinary": [],
+            "current_ordinary": null, "current_ordinary_digest": null,
+            "ordinary_coverage_digest": null, "anchor": null
+        });
+        let mut current_actions = original.clone();
+        for field in ["knowledge_cutoff", "valuation_cutoff", "evaluated_at"] {
+            current_actions[field] = json!(Timestamp::from_unix_nanos(current));
+        }
+        let market = json!({
+            "instrumentId": instrument, "sourceCutoffUnixNanos": now,
+            "maximumMarkAgeNanos": "1000000000", "evidenceDigest": digest,
+            "sourceSelectionDigest": digest, "rightsGraphDigest": digest,
+            "publicationSelectionDigest": digest, "definitionSelectionDigest": digest,
+            "priceAuthorityDigest": digest, "sourceScopeDigests": null
+        });
+        let portfolio = json!({"calendar": null, "prerequisites": {
+            "candidateInstrumentId": instrument, "sourceCutoffUnixNanos": now,
+            "accountId": Uuid::new_v4(), "portfolioRevision": digest,
+            "setupAuthorityDigest": digest, "configurationDigest": digest,
+            "profileDigest": digest, "catalogDigest": digest, "prerequisitePolicyDigest": digest,
+            "minimumHistoricalReturnObservations": 60, "maximumHistoricalReturnObservations": 252,
+            "evidenceDigest": digest, "portfolioSnapshotDigest": digest, "marketSetDigest": digest,
+            "calculatedAtUnixNanos": now, "status": "unavailable"
+        }});
+        apply_receipt(
+            &mut run,
+            receipt("AnalyticalProfile.Resolve", json!({}), profile.clone()),
+            &now,
+        )?;
+        apply_receipt(
+            &mut run,
+            receipt(
+                "Market.PrepareInvestmentEvidence",
+                json!({}),
+                json!({
+                    "status": "prepared", "instrumentId": instrument,
+                    "preparedAtUnixNanos": cutoff.to_string(),
+                    "financialConfigurationDigest": profile["configurationDigest"],
+                    "sourceActionReference": original
+                }),
+            ),
+            &now,
+        )?;
+        run.driver.as_mut().ok_or("missing driver")?.step = Step::PreparePriceForecast;
+        let (operation, arguments, _) = next_invocation(&run)?;
+        let absence = receipt(
+            operation,
+            Value::Object(arguments),
+            json!({
+                "instrumentId": instrument,
+                "availability": {"state": "unavailable", "reason": "compatible_forecast_selection_unavailable"},
+                "forecast": null, "requestSha256": null,
+                "financialProfileDigest": profile["configurationDigest"],
+                "sourceCutoffUnixNanos": cutoff.to_string(), "forecastCohort": null,
+                "expectedObservedThroughUnixNanos": null
+            }),
+        );
+        assert!(absence.valid());
+        apply_receipt(&mut run, absence.clone(), &now)?;
+        assert_eq!(
+            run.driver.as_ref().ok_or("missing driver")?.step,
+            Step::ProbabilityPlan
+        );
+        assert_eq!(next_invocation(&run)?.1["sourceActionReference"], original);
+        run.driver.as_mut().ok_or("missing driver")?.step = Step::HistoricalStudy;
+        assert_eq!(next_invocation(&run)?.1["sourceActionReference"], original);
+
+        let forecast = receipt(
+            "Model.GetForecastJobResult",
+            json!({}),
+            json!({
+                "job": {"jobId": Uuid::new_v4(), "generation": 1, "sequence": 1, "state": "completed"},
+                "forecast": {"forecastToken": Uuid::new_v4()}, "requestSha256": digest,
+                "financialProfileDigest": profile["configurationDigest"]
+            }),
+        );
+        let forecast_reference = exact_forecast_reference(&forecast)?;
+        let study = json!({"requestDigest": digest, "evidenceDigest": "2".repeat(64)});
+        let work = run.driver.as_mut().ok_or("missing driver")?;
+        work.receipts
+            .insert("ProbabilityForecast-0".to_owned(), forecast.clone());
+        work.receipts
+            .insert("FiscalForecast-0".to_owned(), forecast.clone());
+        work.receipts.insert(
+            "StudyBacktest".to_owned(),
+            receipt(
+                "Analysis.GetRecommendationBacktestJobResult",
+                json!({}),
+                study.clone(),
+            ),
+        );
+        work.step = Step::FinalPrepare;
+        apply_receipt(
+            &mut run,
+            receipt(
+                "Market.PrepareInvestmentEvidence",
+                json!({}),
+                json!({
+                    "instrumentId": instrument, "preparedAtUnixNanos": now,
+                    "sourceActionReference": current_actions, "fundamentalShareSources": null
+                }),
+            ),
+            &now,
+        )?;
+        apply_receipt(
+            &mut run,
+            receipt(
+                "Market.SelectInvestmentEvidence",
+                json!({}),
+                json!({
+                    "instrumentId": instrument, "sourceCutoffUnixNanos": now,
+                    "status": "available", "reference": market
+                }),
+            ),
+            &now,
+        )?;
+        apply_receipt(
+            &mut run,
+            receipt(
+                "Portfolio.SelectAnalysisPrerequisites",
+                json!({}),
+                json!({
+                    "instrumentId": instrument, "reference": portfolio
+                }),
+            ),
+            &now,
+        )?;
+
+        for (has_forecast, has_market) in [(false, true), (true, true), (true, false)] {
+            let mut candidate = run.clone();
+            let work = candidate.driver.as_mut().ok_or("missing driver")?;
+            if has_forecast {
+                work.receipts
+                    .insert("PriceForecast".to_owned(), forecast.clone());
+            }
+            if !has_market {
+                work.receipts.insert("FinalEvidence".to_owned(), receipt(
+                    "Market.SelectInvestmentEvidence", json!({}), json!({
+                        "instrumentId": instrument, "sourceCutoffUnixNanos": now,
+                        "status": "unavailable", "reason": "market_evidence_unavailable", "reference": null
+                    }),
+                ));
+            }
+            let retained = work.clone();
+            let (operation, mut arguments, mutation) = next_invocation(&candidate)?;
+            assert_eq!(operation, "Decision.GenerateInvestmentAnalysis");
+            assert!(mutation);
+            assert_eq!(arguments.remove("confirm"), Some(json!(true)));
+            assert_eq!(
+                arguments["priceForecast"],
+                if has_forecast {
+                    forecast_reference.clone()
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(
+                arguments["sourceActionReference"],
+                if has_forecast {
+                    original.clone()
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(
+                arguments["currentShareActionReference"],
+                if has_forecast && has_market {
+                    current_actions.clone()
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(
+                arguments["probabilityForecasts"]["priceHigher"],
+                forecast_reference
+            );
+            assert_eq!(arguments["financialForecasts"], json!([forecast_reference]));
+            assert_eq!(arguments["historicalStudy"], study);
+
+            let mut binding = arguments.clone();
+            for key in ["analyticalProfile", "workflow", "market", "portfolio"] {
+                binding.remove(key);
+            }
+            binding.insert("instrumentId".to_owned(), json!(instrument));
+            assert_eq!(
+                arguments["workflow"]["contentSha256"],
+                json!(hex_digest(Sha256::digest(serde_json::to_vec(&binding)?)))
+            );
+            // Match the service's typed serialization before its actual canonical admission.
+            let input: GenerateRequest = serde_json::from_value(Value::Object(arguments))?;
+            validate_canonical_request(&serde_json::to_vec(&input)?)?;
+            let after = candidate.driver.as_ref().ok_or("missing driver")?;
+            assert_eq!(after, &retained);
+            assert_eq!(after.initial_source_action_reference()?, &original);
+            assert_eq!(after.receipt(Step::PreparePriceForecast)?, &absence);
+        }
+        Ok(())
+    }
 }

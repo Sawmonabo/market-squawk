@@ -87,10 +87,7 @@ pub(in crate::application::contracts) fn command(update: bool) -> Value {
             closed(
                 vec![
                     ("action", constant("analyzeInvestment")),
-                    (
-                        "selectionToken",
-                        json!({"type":"string","pattern":"^market_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$","maxLength":128}),
-                    ),
+                    ("selectionToken", token("market")),
                     ("benchmarkInstrumentId", uuid()),
                 ],
                 &["action", "selectionToken"],

@@ -1,5 +1,6 @@
 import { z } from "zod"
 
+import { marketSelectionTokenSchema } from "@/features/markets/market-product"
 import {
   PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS,
   productLookupActions,
@@ -47,6 +48,7 @@ export const lookupMatchSchema = z.discriminatedUnion("category", [
     destination: z.object({
       action: z.literal(productLookupActions.openInvestment),
       instrumentId: z.string().uuid(),
+      selectionToken: marketSelectionTokenSchema,
     }).strict(),
   }).strict(),
   z.object({

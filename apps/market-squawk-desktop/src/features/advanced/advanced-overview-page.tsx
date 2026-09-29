@@ -150,6 +150,8 @@ function AnalyticalProfileStatus({
   }
 
   const active = query.data
+  const available = active.workflowAvailability === "available"
+  const AvailabilityIcon = available ? ShieldCheck : CircleAlert
   return (
     <section
       className="mt-6 rounded-xl border border-border bg-card/45 p-5"
@@ -182,10 +184,12 @@ function AnalyticalProfileStatus({
         <ProfileFact label="Activated" value={formatUnixNanos(active.activatedAt)} />
       </dl>
 
-      <div className="mt-5 flex gap-3 rounded-lg border border-amber-400/25 bg-amber-400/5 p-4">
-        <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-300" aria-hidden="true" />
+      <div className={`mt-5 flex gap-3 rounded-lg border p-4 ${available
+        ? "border-primary/25 bg-primary/5"
+        : "border-amber-400/25 bg-amber-400/5"}`}>
+        <AvailabilityIcon className={`mt-0.5 size-4 shrink-0 ${available ? "text-primary" : "text-amber-300"}`} aria-hidden="true" />
         <div>
-          <h3 className="text-sm font-semibold">New analysis is unavailable</h3>
+          <h3 className="text-sm font-semibold">{available ? "New analysis is available" : "New analysis is unavailable"}</h3>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
             {active.nextAction}
           </p>

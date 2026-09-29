@@ -2527,7 +2527,7 @@ fn valid_market_selection_token(value: &str) -> bool {
     value
         .strip_prefix("market_")
         .and_then(|value| value.parse::<Uuid>().ok())
-        .is_some_and(|id| !id.is_nil() && value == format!("market_{id}"))
+        .is_some_and(|id| !id.is_nil() && value == format!("market_{}", id.simple()))
 }
 
 fn valid_unsigned_decimal(value: &str) -> bool {

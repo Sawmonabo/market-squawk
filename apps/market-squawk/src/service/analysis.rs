@@ -3,11 +3,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use market_squawk_data::{
-    AnalyticalReadCapability, AnalyticalReadLimit, CatalogError,
-    InstrumentDefinitionReadCapability, InstrumentSearchMatch,
+    AnalyticalReadCapability, AnalyticalReadLimit, MarketDataInstrumentPopulationDisposition,
+    MarketDataInstrumentPopulationQuery, MarketDataInstrumentRecord,
 };
 use market_squawk_decisions::{SavedScreen, ScreenId};
-use market_squawk_domain::{AssetClass, InstrumentDefinition, TradingStatus};
+use market_squawk_domain::{AssetClass, MarketDataInstrumentDefinition};
 use market_squawk_jobs::{JobListPageLimit, SqliteJobRepository};
 use market_squawk_services::{
     RequestContext, ServiceCapabilities, ServiceError, TOOL_RESULT_LIMITS_FIELD,
@@ -17,13 +17,15 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    LocalProduct,
+    LocalProduct, ResearchService, ResearchServiceError,
     application::{
         PRODUCT_LOOKUP_ACTION_OPEN_INVESTMENT, PRODUCT_LOOKUP_ACTION_OPEN_SAVED_SCREEN,
         PRODUCT_LOOKUP_CATEGORIES, PRODUCT_LOOKUP_CATEGORY_INVESTMENT,
         PRODUCT_LOOKUP_CATEGORY_SAVED_SCREEN,
         decision::{DecisionApplication, DecisionApplicationError},
         job::{JobApplication, JobApplicationError},
+        map_market_definition_read_error,
+        market_selection::product::individual_selection_token,
         product_lookup_query_is_canonical,
     },
     jobs::InstalledJobAuthority,
@@ -39,7 +41,7 @@ pub(super) struct InstalledAnalysisOperations {
     capabilities: ServiceCapabilities,
     providers: Arc<ProviderOnboardingService>,
     analytical: AnalyticalReadCapability,
-    instrument_definitions: InstrumentDefinitionReadCapability,
+    research: Arc<ResearchService>,
     decisions: Arc<DecisionApplication>,
     jobs: JobApplication<SqliteJobRepository>,
 }
@@ -50,7 +52,7 @@ impl InstalledAnalysisOperations {
             capabilities: product.application().capabilities(),
             providers: product.provider_onboarding(),
             analytical: product.research().analytical_reader(),
-            instrument_definitions: product.research().instrument_definitions(),
+            research: product.research(),
             decisions: product.decisions(),
             jobs: JobApplication::new(jobs.repository(), jobs.authority()),
         }
@@ -107,15 +109,18 @@ impl InstalledAnalysisOperations {
             ensure_live(context)?;
             match category.as_str() {
                 PRODUCT_LOOKUP_CATEGORY_INVESTMENT => {
-                    let page = self
-                        .instrument_definitions
-                        .search(query, maximum, context.deadline(), context.cancellation())
-                        .map_err(map_instrument_search)?;
-                    category_matches.push(CategoryMatches {
-                        matches: page.matches().iter().map(instrument_lookup_match).collect(),
-                        has_more: page.has_more(),
+                    let (matches, complete) =
+                        self.investment_matches(query, maximum, context).await?;
+                    category_matches.push(matches);
+                    status.push(if complete {
+                        available(PRODUCT_LOOKUP_CATEGORY_INVESTMENT)
+                    } else {
+                        json!({
+                            "category": PRODUCT_LOOKUP_CATEGORY_INVESTMENT,
+                            "state": "unavailable",
+                            "message": "Some matching investments are not available to open right now."
+                        })
                     });
-                    status.push(available(PRODUCT_LOOKUP_CATEGORY_INVESTMENT));
                 }
                 PRODUCT_LOOKUP_CATEGORY_SAVED_SCREEN => {
                     let mut matches = Vec::new();
@@ -180,6 +185,72 @@ impl InstalledAnalysisOperations {
             }),
             count,
         ))
+    }
+
+    async fn investment_matches(
+        &self,
+        query: &str,
+        maximum: usize,
+        context: &RequestContext,
+    ) -> Result<(CategoryMatches, bool), ServiceError> {
+        let query = query.to_owned();
+        let markets = self.research.market_data_instruments();
+        let at = super::runtime::current_timestamp().map_err(|_| ServiceError::Unavailable)?;
+        let deadline = context.deadline();
+        self.research
+            .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
+                let page = markets
+                    .search_as_of(&query, at, at, maximum, deadline, &cancellation)
+                    .map_err(map_market_definition_read_error)?;
+                let mut matches = Vec::with_capacity(page.matches().len());
+                if page.matches().is_empty() {
+                    return Ok((
+                        CategoryMatches {
+                            matches,
+                            has_more: page.has_more(),
+                        },
+                        true,
+                    ));
+                }
+                let population = MarketDataInstrumentPopulationQuery::try_new(
+                    page.matches()
+                        .iter()
+                        .map(|item| item.record().definition().instrument_id())
+                        .collect(),
+                    at,
+                    at,
+                )
+                .map_err(map_market_definition_read_error)?;
+                let selected = markets
+                    .pin_population_as_of(population, deadline, &cancellation)
+                    .map_err(map_market_definition_read_error)?;
+                // Preserve search relevance, but only navigate using the selected canonical revision.
+                for item in page.matches() {
+                    if let Ok(index) = selected.records().binary_search_by_key(
+                        &item.record().definition().instrument_id(),
+                        |record| record.definition().instrument_id(),
+                    ) {
+                        matches.push(instrument_lookup_match(&selected.records()[index])?);
+                    }
+                }
+                Ok((
+                    CategoryMatches {
+                        matches,
+                        has_more: page.has_more(),
+                    },
+                    selected.disposition() == MarketDataInstrumentPopulationDisposition::Complete,
+                ))
+            })
+            .await
+            .map_err(|error| match error {
+                ResearchServiceError::Ingest(market_squawk_data::IngestError::Cancelled) => {
+                    ServiceError::Cancelled
+                }
+                ResearchServiceError::Ingest(market_squawk_data::IngestError::DeadlineExceeded) => {
+                    ServiceError::DeadlineExceeded
+                }
+                _ => ServiceError::Internal,
+            })?
     }
 
     async fn overview(&self, context: &RequestContext) -> Result<(Value, usize), ServiceError> {
@@ -255,7 +326,7 @@ impl std::fmt::Debug for InstalledAnalysisOperations {
             .field("capabilities", &self.capabilities)
             .field("providers", &"[PROVIDER AUTHORITY]")
             .field("analytical", &self.analytical)
-            .field("instrument_definitions", &self.instrument_definitions)
+            .field("research", &"[RESEARCH READ AUTHORITY]")
             .field("decisions", &"[DECISION AUTHORITY]")
             .field("jobs", &"[JOB AUTHORITY]")
             .finish()
@@ -329,31 +400,23 @@ fn map_decision(_error: DecisionApplicationError) -> ServiceError {
     ServiceError::Unavailable
 }
 
-fn map_instrument_search(error: CatalogError) -> ServiceError {
-    match error {
-        CatalogError::InstrumentDefinitionReadCancelled => ServiceError::Cancelled,
-        CatalogError::InstrumentDefinitionReadDeadlineExceeded => ServiceError::DeadlineExceeded,
-        CatalogError::InvalidLimit | CatalogError::InvalidRecord => ServiceError::InvalidRequest,
-        _ => ServiceError::Unavailable,
-    }
-}
-
-fn instrument_lookup_match(search_match: &InstrumentSearchMatch) -> Value {
-    let definition = search_match.definition();
-    json!({
+fn instrument_lookup_match(record: &MarketDataInstrumentRecord) -> Result<Value, ServiceError> {
+    let definition = record.definition();
+    let selection_token = individual_selection_token(record)?;
+    Ok(json!({
         "category": PRODUCT_LOOKUP_CATEGORY_INVESTMENT,
         "title": instrument_title(definition),
         "subtitle": format!(
-            "{} · {} · {}",
+            "{} · {}",
             asset_class_label(definition.asset_class()),
             definition.quote_currency(),
-            trading_status_label(definition.trading_status()),
         ),
         "destination": {
             "action": PRODUCT_LOOKUP_ACTION_OPEN_INVESTMENT,
-            "instrumentId": definition.instrument_id().to_string()
+            "instrumentId": definition.instrument_id().to_string(),
+            "selectionToken": selection_token
         }
-    })
+    }))
 }
 
 struct CategoryMatches {
@@ -385,7 +448,7 @@ fn merge_category_matches(categories: Vec<CategoryMatches>, maximum: usize) -> V
     matches
 }
 
-fn instrument_title(definition: &InstrumentDefinition) -> String {
+fn instrument_title(definition: &MarketDataInstrumentDefinition) -> String {
     definition
         .venue_mappings()
         .iter()
@@ -406,15 +469,6 @@ const fn asset_class_label(asset_class: AssetClass) -> &'static str {
         AssetClass::Fund => "Fund",
         AssetClass::Index => "Market index",
         AssetClass::Cash => "Cash",
-    }
-}
-
-const fn trading_status_label(status: TradingStatus) -> &'static str {
-    match status {
-        TradingStatus::Active => "Active",
-        TradingStatus::Halted => "Temporarily halted",
-        TradingStatus::Inactive => "Inactive",
-        TradingStatus::Delisted => "Delisted",
     }
 }
 

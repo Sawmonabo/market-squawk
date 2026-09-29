@@ -9747,8 +9747,9 @@ fn product_lookup_match() -> Value {
                 vec![
                     ("action", constant(PRODUCT_LOOKUP_ACTION_OPEN_INVESTMENT)),
                     ("instrumentId", uuid()),
+                    ("selectionToken", market_token("market")),
                 ],
-                &["action", "instrumentId"],
+                &["action", "instrumentId", "selectionToken"],
             ),
         ),
         product_lookup_saved_screen_match(),

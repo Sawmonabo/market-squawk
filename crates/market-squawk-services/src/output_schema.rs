@@ -34,8 +34,7 @@ const ANALYTICAL_TOKEN_PATTERNS: &[(&str, &str)] = &[
     ("^history_[0-9a-f]{32}$", "history_"),
     ("^workflow_[0-9a-f]{32}$", "workflow_"),
 ];
-const MARKET_SELECTION_TOKEN_PATTERN: &str =
-    "^market_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+const MARKET_SELECTION_TOKEN_PATTERN: &str = "^market_[0-9a-f]{32}$";
 const MAXIMUM_POSITIONAL_ITEMS: usize = 256;
 
 pub(crate) fn validate_data_schema(schema: &Value) -> bool {
@@ -467,7 +466,7 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
                 .is_some_and(|suffix| lowercase_hex_matches(suffix, 32))
         }
         Some(MARKET_SELECTION_TOKEN_PATTERN) => value.strip_prefix("market_").is_some_and(|suffix| {
-            uuid::Uuid::parse_str(suffix).is_ok_and(|id| id.hyphenated().to_string() == suffix)
+            lowercase_hex_matches(suffix, 32)
         }),
         Some(LOWERCASE_SHA256_PATTERN) => lowercase_hex_matches(value, 64),
         Some(LOWERCASE_IEEE754_HEX_PATTERN) => lowercase_hex_matches(value, 16),
@@ -806,9 +805,9 @@ mod tests {
         }
         let market_token = json!({"type":"string", "pattern":MARKET_SELECTION_TOKEN_PATTERN});
         assert!(validate_data_schema(&market_token));
-        assert!(validate_data(&market_token, &json!("market_c127919d-6540-47f8-9f6b-902523578cb5")));
-        assert!(!validate_data(&market_token, &json!("market_C127919D-6540-47F8-9F6B-902523578CB5")));
-        assert!(!validate_data(&market_token, &json!("market_c127919d654047f89f6b902523578cb5")));
+        assert!(validate_data(&market_token, &json!("market_c127919d654047f89f6b902523578cb5")));
+        assert!(!validate_data(&market_token, &json!("market_C127919D654047F89F6B902523578CB5")));
+        assert!(!validate_data(&market_token, &json!("market_c127919d-6540-47f8-9f6b-902523578cb5")));
 
         let unsigned_schema = json!({"type": "string", "pattern": UNSIGNED_INTEGER_PATTERN});
         assert!(validate_data_schema(&unsigned_schema));

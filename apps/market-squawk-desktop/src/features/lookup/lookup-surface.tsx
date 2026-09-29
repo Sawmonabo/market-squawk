@@ -228,7 +228,7 @@ function UnavailableCategories({
         {categories.map((category) => (
           <li key={category.category}>
             <strong className="text-foreground/75">{categoryLabels[category.category]}:</strong>{" "}
-            Search is not available for this category right now.
+            {category.message}
           </li>
         ))}
       </ul>
@@ -257,7 +257,7 @@ function LookupIcon({ category }: { category: LookupCategory }) {
 
 export function lookupRoute(match: ProductLookupMatch) {
   if (match.destination.action === productLookupActions.openInvestment) {
-    return `/markets?instrumentId=${encodeURIComponent(match.destination.instrumentId)}`
+    return `/markets?selectionToken=${encodeURIComponent(match.destination.selectionToken)}`
   }
   return `/opportunities?screenId=${encodeURIComponent(match.destination.screenId)}`
 }
