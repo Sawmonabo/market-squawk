@@ -70,6 +70,11 @@ export function ConnectionSetup({
         already stored securely and checks access before using them. Public
         connections need no account or key.
       </p>
+      <CredentialStorage
+        fallback={connections.encryptedFileFallback}
+        transport={transport}
+        onChanged={onChanged}
+      />
       <Label htmlFor="connection-provider" className="mt-5 block">Provider</Label>
       <select
         id="connection-provider"
@@ -89,7 +94,6 @@ export function ConnectionSetup({
         activationKind={setup?.activationKind ?? null}
         savedConfigurationSessionId={setup?.savedConfigurationSessionId ?? null}
         source={sources.find((source) => source.id === profile.id)}
-        fallback={connections.encryptedFileFallback}
         transport={transport}
         onChanged={onChanged}
         onActivity={onActivity}
@@ -99,13 +103,69 @@ export function ConnectionSetup({
   )
 }
 
+function CredentialStorage({ fallback, transport, onChanged }: {
+  fallback: ProviderBootstrap["encryptedFileFallback"]
+  transport: SystemTransport
+  onChanged: () => Promise<void>
+}) {
+  const [pending, setPending] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+  const [notice, setNotice] = React.useState<string | null>(null)
+  if (fallback === "disabled") return null
+
+  const run = async (request: { action: "unlockFallback"; secret: string } | { action: "lockFallback" }) => {
+    setPending(true)
+    setError(null)
+    setNotice(null)
+    try {
+      await transport.onboard(request)
+      await onChanged()
+      setNotice(request.action === "unlockFallback" ? "Credential storage unlocked." : "Credential storage locked.")
+    } catch (failure) {
+      setError(messageFrom(failure))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return <div className="mt-5 rounded-lg border border-border bg-background/45 p-4">
+    <p className="text-sm font-medium">Credential storage</p>
+    {fallback === "locked" ? <form
+      className="mt-3 space-y-3"
+      onSubmit={(event) => {
+        event.preventDefault()
+        const form = event.currentTarget
+        const secret = field(new FormData(form), "unlock")
+        form.reset()
+        void run({ action: "unlockFallback", secret })
+      }}
+    >
+      <p className="text-sm text-muted-foreground">
+        Unlock secure storage before importing a credential file or using saved credentials.
+      </p>
+      <Field name="unlock" label="Secure storage password" type="password" maxLength={8192} />
+      <Button disabled={pending}>Unlock storage</Button>
+    </form> : <div className="mt-3 flex flex-wrap items-center gap-3">
+      <p className="text-sm text-muted-foreground">Secure storage is unlocked.</p>
+      <Button
+        variant="outline"
+        disabled={pending}
+        onClick={() => void run({ action: "lockFallback" })}
+      >
+        Lock credential storage
+      </Button>
+    </div>}
+    {notice ? <p role="status" className="mt-3 text-sm text-emerald-300">{notice}</p> : null}
+    {error ? <p role="alert" className="mt-3 text-sm text-red-400">{error}</p> : null}
+  </div>
+}
+
 function SelectedConnection({
   profile,
   session,
   activationKind,
   savedConfigurationSessionId,
   source,
-  fallback,
   transport,
   onChanged,
   onActivity,
@@ -116,7 +176,6 @@ function SelectedConnection({
   activationKind: ActivationKind
   savedConfigurationSessionId: string | null
   source?: SourceEvidence
-  fallback: ProviderBootstrap["encryptedFileFallback"]
   transport: SystemTransport
   onChanged: () => Promise<void>
   onActivity: (activity: ConnectionActivity | null) => void
@@ -302,33 +361,6 @@ function SelectedConnection({
           {session ? "Start a new setup" : saved ? "Continue saved setup" : "Set up this connection"}
         </Button>
       </form> : null}
-      {fallback === "locked" ? <form
-        className="mt-5 space-y-3"
-        onSubmit={(event) => {
-          event.preventDefault()
-          const form = event.currentTarget
-          const secret = field(new FormData(form), "unlock")
-          form.reset()
-          void run("Unlocking secure storage", { action: "unlockFallback", secret })
-        }}
-      >
-        <p className="text-sm">Unlock encrypted credential storage to use saved credentials.</p>
-        <Field
-          name="unlock"
-          label="Secure storage password"
-          type="password"
-          maxLength={8192}
-        />
-        <Button disabled={pending !== null}>Unlock storage</Button>
-      </form> : null}
-      {fallback === "ready" ? <Button
-        className="mt-4"
-        variant="outline"
-        disabled={pending !== null || cancelling}
-        onClick={() => void run("Locking secure storage", { action: "lockFallback" })}
-      >
-        Lock credential storage
-      </Button> : null}
       {session && needsSecret ? <CredentialForm
         profile={profile}
         pending={pending !== null || cancelling}

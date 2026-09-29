@@ -333,6 +333,10 @@ check it without rebuilding, and `just reset-model-runtime` to remove only that 
 after stopping the desktop and service. `just reset-dev` separately removes only the development
 workspace-data and service-authority roots.
 
+Repository `just` commands, the model-runtime builder, and editor Cargo checks use one build job
+to reduce concurrent compiler memory use. This is a build setting, not an application memory
+limit; a single compiler or linker can still use substantial memory. Run only one build at a time.
+
 Use `just --list` to see the supported developer commands and `just doctor` to inspect the active
 tool and Tauri host-prerequisite state. For a focused headless release build, the underlying locked
 commands remain:

@@ -4271,6 +4271,7 @@ def _cargo_environment(
     environment = {
         "CARGO_HOME": str(cargo_home),
         "CARGO_BUILD_TARGET": profile.target,
+        "CARGO_BUILD_JOBS": "1",
         "CARGO_INCREMENTAL": "0",
         "CARGO_NET_OFFLINE": "true" if offline else "false",
         "CARGO_TERM_COLOR": "never",

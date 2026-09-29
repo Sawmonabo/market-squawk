@@ -4,7 +4,9 @@ import { z } from "zod"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { messageFrom } from "@/app/product-context"
 import { humanize } from "@/lib/formatters"
+import type { ProviderBootstrap } from "@/lib/schemas"
 import type { SystemTransport } from "@/lib/transport"
 
 const providerOrder = [
@@ -65,10 +67,12 @@ type ProviderCredentialImportResult = z.infer<
 
 export function ProviderCredentialImport({
   available,
+  fallback,
   transport,
   onAttempted,
 }: {
   available: boolean
+  fallback: ProviderBootstrap["encryptedFileFallback"]
   transport: SystemTransport
   onAttempted: () => void
 }) {
@@ -78,6 +82,7 @@ export function ProviderCredentialImport({
   const [error, setError] = React.useState<string | null>(null)
 
   const importBundle = async () => {
+    if (!available || fallback === "locked" || pending) return
     let cancelled = false
     setPending(true)
     setResult(null)
@@ -92,12 +97,13 @@ export function ProviderCredentialImport({
       }
       const parsed = providerCredentialImportSchema.safeParse(value)
       if (!parsed.success) {
-        throw new Error("unsupported_provider_credential_receipt")
+        setError("The installed service returned an unsupported import result. Earlier entries may already have been stored. Refresh connection evidence before trying again.")
+        return
       }
       setResult(parsed.data)
-    } catch {
+    } catch (failure) {
       setError(
-        "Market Squawk could not complete this credential bundle. One or more earlier entries may already have been stored. Source evidence is refreshing; review it before correcting the file or service issue and trying again.",
+        `${messageFrom(failure)} If the import started, earlier entries may already have been stored. Review refreshed connection evidence before trying again.`,
       )
     } finally {
       if (!cancelled) onAttempted()
@@ -129,7 +135,7 @@ export function ProviderCredentialImport({
         </div>
         <Button
           onClick={() => void importBundle()}
-          disabled={!available || pending}
+          disabled={!available || fallback === "locked" || pending}
         >
           {pending ? (
             <LoaderCircle className="animate-spin" aria-hidden="true" />
@@ -151,6 +157,15 @@ export function ProviderCredentialImport({
           <AlertDescription>
             This installed service does not advertise the protected credential-bundle operation.
             No file can be selected through an incomplete authority chain.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {available && fallback === "locked" ? (
+        <Alert className="mt-4">
+          <AlertCircle aria-hidden="true" />
+          <AlertTitle>Unlock credential storage to import</AlertTitle>
+          <AlertDescription>
+            Enter the secure storage password above, then choose your credential file.
           </AlertDescription>
         </Alert>
       ) : null}

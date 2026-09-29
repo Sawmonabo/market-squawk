@@ -1,5 +1,6 @@
 set dotenv-load := false
 set positional-arguments
+export CARGO_BUILD_JOBS := "1"
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
 
 root := justfile_directory()
