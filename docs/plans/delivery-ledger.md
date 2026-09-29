@@ -122,6 +122,38 @@ by an agent.
 Both retained installations remain preserved. The model runtime and live input barriers remain;
 UI fixture success does not establish real-data or installed workflow completion.
 
+### Active client slice — saved chart CLI — 2026-09-29
+
+Acceptance item 6 / reviewed Wave 4 finding C2, refreshed at `93c3b0be`: the saved chart
+operation already owns exact viewport/layer reads, but `analysis` has no command for it.
+Lead owns `apps/market-squawk/src/cli.rs` and `src/local_product/cli_transport.rs`, ledger,
+Git and verification. Add a thin installed-service adapter for the saved action token,
+optional nanosecond window, layer and display point limit. Preserve service validation and
+structured evidence; no financial logic or new history materialization. Sol High owns only
+`docs/reference/cli.md` for the corresponding operator instructions, after the command contract
+is supplied. These files are disjoint; no other assignments are active. Reuse the existing
+closed-operation schema check plus compilation; live three-client/restart equivalence remains
+part of I1 and is not proved by this adapter check. Native secure setup remains independently
+pending owner input; no native rebuild is scheduled for this slice.
+
+Implemented: `analysis chart` forwards the original saved token and optional viewport/layer to
+`Decision.GetInvestmentChart`, with nanoseconds encoded as exact strings and no client financial
+calculation. Omitted fields retain service defaults; existing shared admission owns valid layers
+and viewport bounds. Lead inspected the docs helper's changes, the command mapping and the existing
+saved reader; docs ownership is released. The whole application library compiled with one job,
+and existing `saved_benchmark_chart_accepts_retained_series_and_unavailability` passed (1 passed,
+125 filtered, 0.08 seconds; compilation 3m50s). `git diff --check` passed. No tests or harnesses were
+added; this verifies compilation and the existing chart publication contract, not live CLI dispatch
+or three-client restart equality. Those require the original saved-stock evidence in I1.
+
+Independent native-startup investigation: Astra High has read-only ownership of the existing
+Desktop visibility/bootstrap path (`src-tauri/src/lib.rs`, `service.rs`, related bootstrap state
+and retained native diagnostics). Concrete failure: Desktop process is alive but no usable window
+was verified, while secure setup timed out. Determine whether source/runtime evidence identifies
+an application defect before treating this solely as owner delay. No edits, builds, restarts,
+credential access or user interaction; lead retains application composition. Return a bounded
+diagnosis and exact next action, not a new infrastructure plan.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved

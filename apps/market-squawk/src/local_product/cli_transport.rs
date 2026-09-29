@@ -294,6 +294,36 @@ async fn analysis_workflow(
             json_object(json!({"actionToken":action_token}))?,
             "saved investment analysis reopened",
         ),
+        AnalysisCommand::Chart {
+            action_token,
+            start_unix_nanos,
+            end_unix_nanos,
+            point_limit,
+            layer,
+        } => {
+            let mut arguments = json_object(json!({"actionToken":action_token}))?;
+            for (name, value) in [
+                (
+                    "startUnixNanos",
+                    start_unix_nanos.map(|value| json!(value.to_string())),
+                ),
+                (
+                    "endUnixNanos",
+                    end_unix_nanos.map(|value| json!(value.to_string())),
+                ),
+                ("pointLimit", point_limit.map(|value| json!(value))),
+                ("layer", layer.map(Value::String)),
+            ] {
+                if let Some(value) = value {
+                    arguments.insert(name.into(), value);
+                }
+            }
+            (
+                "Decision.GetInvestmentChart",
+                arguments,
+                "saved investment chart read",
+            )
+        }
         command => {
             let (request, confirmed) = match command {
                 AnalysisCommand::Start {

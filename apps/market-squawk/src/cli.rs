@@ -2044,6 +2044,24 @@ pub enum AnalysisCommand {
         #[arg(long)]
         action_token: Uuid,
     },
+    /// Read a selected period and evidence layer from one saved investment analysis.
+    Chart {
+        /// Original saved-analysis action token returned by analysis results.
+        #[arg(long)]
+        action_token: Uuid,
+        /// Inclusive window start in exact Unix nanoseconds; omit for the saved beginning.
+        #[arg(long, allow_negative_numbers = true)]
+        start_unix_nanos: Option<i64>,
+        /// Inclusive window end in exact Unix nanoseconds; omit for the saved end.
+        #[arg(long, allow_negative_numbers = true)]
+        end_unix_nanos: Option<i64>,
+        /// Display points (8..4096; service default 1000); does not limit analytical inputs.
+        #[arg(long)]
+        point_limit: Option<u16>,
+        /// Saved layer: all, history, forecast, benchmark, price_pattern, or action_ranges.
+        #[arg(long)]
+        layer: Option<String>,
+    },
 }
 /// Explicit recommendation setup; every numeric choice comes from the operator.
 #[derive(Debug, Subcommand)]

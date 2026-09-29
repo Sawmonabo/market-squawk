@@ -9,7 +9,7 @@ typed operation registry rather than this operator-oriented command projection.
 | --- | --- |
 | Document type | Reference |
 | Status | Current implementation contract |
-| Last substantive review | 2026-08-03 |
+| Last substantive review | 2026-09-29 |
 | Authority | `apps/market-squawk/src/cli.rs` and `src/main.rs` |
 
 ## Invocation and global options
@@ -41,7 +41,7 @@ the verified packaged `market-squawk-service` sibling and waits up to 15 seconds
 readiness. It never accepts a caller-provided port, URL, bearer token, or service executable.
 
 The commands in the following table connect as the CLI client and require that installed service:
-`source`, `ingest`, `dataset`, `query`, `feature`, `model`, `portfolio`, `backtest`, `bot`,
+`source`, `ingest`, `dataset`, `query`, `feature`, `model`, `analysis`, `portfolio`, `backtest`, `bot`,
 `execution`, `fair-value`, `job`, `operations`, and `setup`. `init`, `config`, `capture`,
 `doctor`, `release`, and the named-client MCP relay have their documented dedicated compositions.
 
@@ -78,6 +78,26 @@ that name one; MCP never receives a filesystem path.
 | `query dataset <dataset> [--maximum-rows <n>]` | Bounded dataset-history read; default row request is `1000`. |
 | `query sql --dataset <dataset> <statement> [--maximum-rows <n>]` | CLI-only bounded, read-only DataFusion SQL. It does not exist as an MCP tool. |
 | `query artifact --artifact-id <id> --sha256 <digest> --byte-count <n> [--media-type <type>] [--offset <n>] [--maximum-bytes <n>]` | Digest-verified artifact chunk; defaults are `application/json`, `0`, and `32768` bytes. |
+| `analysis results [--after <UUID>] [--limit 1..1000]` | Read saved generated, no-action, and unavailable analyses in creation order; default `100`. Each entry includes its original `actionToken`; pass `nextAfterActionToken` as `--after` for the next page. |
+| `analysis show --action-token <UUID>` | Reopen one exact saved analysis. This read reports chart availability; retrieve chart evidence separately with `analysis chart`. |
+| `analysis chart --action-token <UUID> [--start-unix-nanos <i64>] [--end-unix-nanos <i64>] [--point-limit <u16>] [--layer <NAME>]` | Read the selected display window and layer of the saved analysis through `Decision.GetInvestmentChart`; no confirmation is required. |
+
+For chart reads, either time bound may be omitted independently; supplied bounds are inclusive,
+and a start after the end is rejected. Times are exact signed Unix nanoseconds and are serialized
+as JSON strings. The service defaults to layer `all` and `1000` display points, admits point limits
+from `8` through `4096`, and supports `all`, `history`, `forecast`, `benchmark`, `price_pattern`,
+and `action_ranges`. The selected window and point limit affect display only, preserving the
+complete analytical inputs and original saved evidence. These reads do not run a new analysis or
+establish current trading eligibility.
+
+Use `--output json` to retrieve the structured service result, including available series,
+original evidence, viewport metadata, and explanations of unavailable layers:
+
+```text
+market-squawk --output json analysis results
+market-squawk --output json analysis show --action-token <UUID>
+market-squawk --output json analysis chart --action-token <UUID> --layer history --point-limit 1000
+```
 
 CLI SQL has fixed limits: 64 KiB statement text, 1,000 default requested rows, 256 KiB inline
 Arrow IPC, 64 MiB complete result, 256 MiB query memory, four partitions, 2,048 syntax-tree nodes,
