@@ -108,13 +108,17 @@ preserves seven unavailable range slots, then explicitly switches to the listed 
 admits the backend's required null method-set case. Final selected run passed (1 passed, 7 skipped,
 1.46 seconds); TypeScript and `git diff --check` passed. No broad CI or new test harness ran. These
 are critical fixture checks; real stock calculation and installed saved-result restart remain open.
-The exact pushed identity and validation are recorded in PR #43 with the integration commit.
+The pushed implementation is `3b25b647`; its verification is recorded in PR #43.
 
 The lead's one-job native Desktop build completed successfully in 11m55s. The current Desktop and
-shared-service processes are live against `.market-squawk/v1-owner-test`; the current CLI's
-`service status` returns `bootstrap_required` / `encrypted_fallback_locked`. Local secure setup
-requires the owner to enter the password in the native app; no password is requested in chat or
-invented by an agent. A visible usable window and unlocked workspace have not yet been verified.
+shared service initially started against `.market-squawk/v1-owner-test`; the current CLI confirmed
+`bootstrap_required` / `encrypted_fallback_locked`. At final observation the Desktop process remains
+open, but the service is terminal and `service status` is unavailable; its startup receipt records
+`failed/runtime-composition`. This is consistent with the existing five-minute bootstrap deadline
+elapsing before local password entry. No unlocked workspace or visible usable window was verified.
+Reopen native secure setup when the owner is present, using the built binaries rather than another
+build. The owner enters the password only in the app; no password is requested in chat or invented
+by an agent.
 Both retained installations remain preserved. The model runtime and live input barriers remain;
 UI fixture success does not establish real-data or installed workflow completion.
 
