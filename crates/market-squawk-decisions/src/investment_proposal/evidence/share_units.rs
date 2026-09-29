@@ -72,8 +72,8 @@ impl CurrentShareDecisionProjection {
         &self.conversion
     }
     /// Valuation-owned source and calculation validation.
-    pub const fn valuation_projection(&self) -> CurrentShareValuationProjection {
-        self.valuation_projection
+    pub const fn valuation_projection(&self) -> &CurrentShareValuationProjection {
+        &self.valuation_projection
     }
 }
 
@@ -117,7 +117,10 @@ impl InvestmentAnalysisEvidence {
             || market_admission.authorized_at > self.admitted_at
             || self.admitted_at >= market_admission.authorization_expires_at
             || market.window.expires_at > market_admission.authorization_expires_at
-            || market_admission.authorization_decision_digest.evidence_digest().algorithm()
+            || market_admission
+                .authorization_decision_digest
+                .evidence_digest()
+                .algorithm()
                 != DigestAlgorithm::Sha256
             || conversion.instrument_id() != self.instrument_id
             || conversion.currency() != self.currency
@@ -129,7 +132,7 @@ impl InvestmentAnalysisEvidence {
             || original_financial_model.account_id != self.account_id
             || valuation_projection.account_id() != self.account_id
             || valuation_projection.instrument_id() != self.instrument_id
-            || method != AutomaticValuationMethod::ForecastDistribution
+            || method != valuation_projection.method()
             || original_financial_model.method != method
             || valuation_projection.calculation_identity() != calculation_identity
             || valuation_projection.input_set_identity() != input_set_identity
@@ -156,13 +159,14 @@ impl InvestmentAnalysisEvidence {
             || conversion.knowledge_cutoff() > self.admitted_at
             || valuation_projection.admitted_at() != self.admitted_at
             || valuation_projection.expires_at() <= self.admitted_at
-            || original_forecast.vintage_id.bytes()
-                != valuation_projection.vintage_identity().bytes()
+            || valuation_projection.vintage_identity().map(|id| id.bytes())
+                != Some(original_forecast.vintage_id.bytes())
             || original_forecast.horizon_at != valuation_projection.horizon_at()
             || original_valuation.horizon_at != valuation_projection.horizon_at()
             || original_financial_model.horizon_at != valuation_projection.horizon_at()
-            || original_forecast.window.source_knowledge_cutoff
-                != original_valuation.window.source_knowledge_cutoff
+            || (method == AutomaticValuationMethod::ForecastDistribution
+                && original_forecast.window.source_knowledge_cutoff
+                    != original_valuation.window.source_knowledge_cutoff)
             || original_financial_model.range.central() != original_valuation.fair_value
             || self.forecast_chart.as_ref().is_some_and(|chart| {
                 chart.basis_identity().evidence_digest().bytes()
@@ -259,40 +263,24 @@ impl InvestmentAnalysisEvidence {
             original_forecast.window,
         )?;
         let projected_range = valuation_projection.range();
+        // The valuation owner performs method-specific share normalization. A total-equity
+        // model must never inherit the independently selected price forecast's split ratio.
         let model_range = FinancialModelValueRange::try_new(
-            project(
-                original_financial_model.range.lower(),
-                ShareConversionRounding::Lower,
-            )?,
-            project(
-                original_financial_model.range.central(),
-                ShareConversionRounding::Central,
-            )?,
-            project(
-                original_financial_model.range.upper(),
-                ShareConversionRounding::Upper,
-            )?,
+            projected_range.lower().money(),
+            projected_range.central().money(),
+            projected_range.upper().money(),
         )?;
-        let sensitivity_range = range(original_financial_model.sensitivity_range)?;
+        let sensitivity_range = strict_range(
+            valuation_projection.sensitivity_lower(),
+            valuation_projection.sensitivity_upper(),
+        )?;
         let scenarios = TargetPriceCases::try_new(
-            project(
-                original_financial_model.scenarios.downside(),
-                ShareConversionRounding::Lower,
-            )?,
-            project(
-                original_financial_model.scenarios.base(),
-                ShareConversionRounding::Central,
-            )?,
-            project(
-                original_financial_model.scenarios.upside(),
-                ShareConversionRounding::Upper,
-            )?,
+            model_range.lower(),
+            model_range.central(),
+            model_range.upper(),
         )
         .map_err(|_| InvestmentProposalError::InvalidPrice)?;
-        let fair_value = project(
-            original_valuation.fair_value,
-            ShareConversionRounding::Central,
-        )?;
+        let fair_value = model_range.central();
         if model_range.lower() != projected_range.lower().money()
             || model_range.central() != projected_range.central().money()
             || model_range.upper() != projected_range.upper().money()
@@ -315,8 +303,18 @@ impl InvestmentAnalysisEvidence {
         hash.update(conversion.identity().bytes());
         hash.update(valuation_projection.identity().bytes());
         hash.update(market_admission.authorized_at.unix_nanos().to_be_bytes());
-        hash.update(market_admission.authorization_expires_at.unix_nanos().to_be_bytes());
-        hash.update(market_admission.authorization_decision_digest.evidence_digest().bytes());
+        hash.update(
+            market_admission
+                .authorization_expires_at
+                .unix_nanos()
+                .to_be_bytes(),
+        );
+        hash.update(
+            market_admission
+                .authorization_decision_digest
+                .evidence_digest()
+                .bytes(),
+        );
         let identity = sha256_content(hash.finalize().into())?;
         let proof = CurrentShareDecisionProjection {
             identity,
@@ -327,7 +325,7 @@ impl InvestmentAnalysisEvidence {
             market,
             market_admission,
             conversion,
-            valuation_projection,
+            valuation_projection: valuation_projection.clone(),
         };
         let mut model = original_financial_model.clone();
         model.range = model_range;
@@ -344,6 +342,7 @@ impl InvestmentAnalysisEvidence {
         // Their monetary endpoints are exposed in proof.original_financial_model, never rewritten.
         let mut valuation = original_valuation;
         valuation.fair_value = fair_value;
+        valuation.basis = ValuationAmountBasis::PerInstrumentUnit;
         valuation.window.expires_at = valuation
             .window
             .expires_at

@@ -629,7 +629,10 @@ impl PreparedProviderCaptureBinding {
             physical_claims,
         };
         evidence.verify_integrity()?;
-        Ok(Self { evidence, metadata: None })
+        Ok(Self {
+            evidence,
+            metadata: None,
+        })
     }
 
     pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
@@ -1079,7 +1082,10 @@ impl Catalog {
     /// The ingest owner has compared the original canonical/native rows. This transaction
     /// preserves exact physical evidence, current request rights, original custody consumption,
     /// recovery capacity, and an audit relationship to the unchanged publication binding.
-    #[allow(clippy::too_many_arguments, reason = "exact replay retention keeps each authority explicit")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact replay retention keeps each authority explicit"
+    )]
     pub(crate) fn retain_macro_reobservation(
         &self,
         reservation: &crate::IngestReservation,
@@ -1515,7 +1521,10 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
                 object_input_ordinal,
                 digest_bytes(evidence.binding_digest),
                 evidence.capture.source_id().as_str(),
-                binding.metadata.as_ref().map(|metadata| metadata.digest.bytes())
+                binding
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.digest.bytes())
             ],
         )?;
         if inserted != 1 {
@@ -1536,7 +1545,10 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
                 object_input_ordinal,
                 digest_bytes(evidence.binding_digest),
                 evidence.capture.source_id().as_str(),
-                binding.metadata.as_ref().map(|metadata| metadata.digest.bytes())
+                binding
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.digest.bytes())
             ],
             |row| row.get(0),
         )?;

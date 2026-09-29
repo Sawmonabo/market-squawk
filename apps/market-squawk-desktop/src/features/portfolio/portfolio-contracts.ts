@@ -61,6 +61,21 @@ export const portfolioAccountSchema = z
   })
   .strict()
 
+export const portfolioAccountSummarySchema = z.strictObject({
+  accountToken: z.string().min(16).max(512).refine((value) => !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(value), "Expected an opaque account token."),
+  displayName: z.string().min(1).max(256), currency: z.string().regex(/^[A-Z]{3,8}$/),
+  holdings: z.number().int().nonnegative(), dataIssues: z.number().int().nonnegative(),
+})
+export type PortfolioAccountSummary = z.infer<typeof portfolioAccountSummarySchema>
+const portfolioAccountPageSchema = z.strictObject({
+  accounts: z.array(portfolioAccountSummarySchema).max(100), nextCursor: z.string().min(1).max(512).nullable(),
+})
+export function parsePortfolioAccountPage(result: ApplicationResult) {
+  const page = portfolioAccountPageSchema.parse(result.data)
+  if (result.metadata.returnedItems !== page.accounts.length) throw new Error("Portfolio account counts are inconsistent.")
+  return page
+}
+
 const costBasisChoiceSchema = z
   .object({
     choiceToken: portfolioActionTokenSchema,

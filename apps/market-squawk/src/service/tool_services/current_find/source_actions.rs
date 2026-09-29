@@ -1,13 +1,15 @@
 //! Current feature source acquisition within the existing serialized Find preparation.
 use super::*;
-use market_squawk_data::{CompleteMarketBarHistoryOutput, MarketDataInstrumentRecord,
-    MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationDisposition};
-use market_squawk_domain::{CalendarDate, InstrumentId, VenueId};
 use crate::application::RecommendationBenchmarkSelectionReadCapability;
 use crate::application::{
     PendingCurrentPriceActions, PreparedFindPopulation,
     market_calendar::ForecastSessionCohortReference,
 };
+use market_squawk_data::{
+    CompleteMarketBarHistoryCursor, MarketDataInstrumentPopulationDisposition,
+    MarketDataInstrumentPopulationQuery, MarketDataInstrumentRecord,
+};
+use market_squawk_domain::{CalendarDate, InstrumentId, VenueId};
 
 impl InstalledCurrentFind {
     pub(super) async fn publish_current_sources(
@@ -77,21 +79,41 @@ impl InstalledCurrentFind {
         // Calendar arithmetic chooses finite request bounds only. The source publisher and
         // native calendar independently establish every genuine observation and session.
         use chrono::Datelike as _;
-        let last_date = chrono::NaiveDate::from_ymd_opt(i32::from(last.year()),
-            u32::from(last.month()), u32::from(last.day())).ok_or(ServiceError::InvalidResult)?;
-        let first = last_date.checked_sub_days(chrono::Days::new(3649)).ok_or(ServiceError::InvalidRequest)?;
-        let training_dates = (CalendarDate::new(u16::try_from(first.year()).map_err(|_| ServiceError::InvalidRequest)?,
-            u8::try_from(first.month()).map_err(|_| ServiceError::InvalidRequest)?,
-            u8::try_from(first.day()).map_err(|_| ServiceError::InvalidRequest)?).map_err(|_| ServiceError::InvalidRequest)?, last);
-        let (selected_benchmark, benchmark) = self.training_benchmark(benchmark_instrument_id, selected_at, context)?;
+        let last_date = chrono::NaiveDate::from_ymd_opt(
+            i32::from(last.year()),
+            u32::from(last.month()),
+            u32::from(last.day()),
+        )
+        .ok_or(ServiceError::InvalidResult)?;
+        let first = last_date
+            .checked_sub_days(chrono::Days::new(3649))
+            .ok_or(ServiceError::InvalidRequest)?;
+        let training_dates = (
+            CalendarDate::new(
+                u16::try_from(first.year()).map_err(|_| ServiceError::InvalidRequest)?,
+                u8::try_from(first.month()).map_err(|_| ServiceError::InvalidRequest)?,
+                u8::try_from(first.day()).map_err(|_| ServiceError::InvalidRequest)?,
+            )
+            .map_err(|_| ServiceError::InvalidRequest)?,
+            last,
+        );
+        let (selected_benchmark, benchmark) =
+            self.training_benchmark(benchmark_instrument_id, selected_at, context)?;
         // Two adjacent observations remain the fixed current price-return lookback. Independent
         // long histories are acquired now, before the caller freezes the one saved Find cutoff.
         let mut pending = Vec::with_capacity(population.candidates().len().div_ceil(32));
         for batch in population.candidates().chunks(32) {
             let mut training = Vec::with_capacity(batch.len());
             for candidate in batch {
-                let prepared = self.publish_training_pair(candidate.canonical_record(), candidate.context().listing_venue(),
-                    benchmark.as_ref(), training_dates, context).await;
+                let prepared = self
+                    .publish_training_pair(
+                        candidate.canonical_record(),
+                        candidate.context().listing_venue(),
+                        benchmark.as_ref(),
+                        training_dates,
+                        context,
+                    )
+                    .await;
                 let prepared = match prepared {
                     Ok(value) => Some(value),
                     Err(ServiceError::Unavailable | ServiceError::NotFound) => None,
@@ -104,15 +126,25 @@ impl InstalledCurrentFind {
                 self.authorize(context)?;
                 let record = candidate.canonical_record();
                 let venue = candidate.context().listing_venue();
-                let history = self.acquire_nominal_history(record, venue, dates, context).await?;
-                if history.bars().len() != 2 {
+                let history = self
+                    .acquire_nominal_history(record, venue, dates, context)
+                    .await?;
+                if history.bar_count() != 2 {
                     return Err(ServiceError::Unavailable);
                 }
                 histories.push(history);
             }
-            let mut page = self.actions.publish_current_price_actions(&histories, dates, context).await?;
+            let mut page = self
+                .actions
+                .publish_current_price_actions(&histories, dates, context)
+                .await?;
             for (subject, training) in training {
-                page.retain_training(subject, benchmark_instrument_id, selected_benchmark, training)?;
+                page.retain_training(
+                    subject,
+                    benchmark_instrument_id,
+                    selected_benchmark,
+                    training,
+                )?;
             }
             pending.push(page);
             drop(histories);
@@ -123,77 +155,158 @@ impl InstalledCurrentFind {
 
     /// Resolves the actual comparison before observing any training outcomes. Missing canonical
     /// or supported listing evidence stays absent, with the requested identity retained separately.
-    #[allow(clippy::type_complexity, reason = "requested identity and admitted source listing are distinct")]
+    #[allow(
+        clippy::type_complexity,
+        reason = "requested identity and admitted source listing are distinct"
+    )]
     fn training_benchmark(
-        &self, requested: Option<InstrumentId>, selected_at: Timestamp, context: &RequestContext,
-    ) -> Result<(Option<InstrumentId>, Option<(MarketDataInstrumentRecord, VenueId)>), ServiceError> {
+        &self,
+        requested: Option<InstrumentId>,
+        selected_at: Timestamp,
+        context: &RequestContext,
+    ) -> Result<
+        (
+            Option<InstrumentId>,
+            Option<(MarketDataInstrumentRecord, VenueId)>,
+        ),
+        ServiceError,
+    > {
         self.authorize(context)?;
         let reader = self.research.market_data_instruments();
         let selected = RecommendationBenchmarkSelectionReadCapability::new(reader.clone())
-            .select_comparison(requested, selected_at, selected_at, context.deadline(), context.cancellation())?;
-        let Some(selected) = selected else { return Ok((None, None)); };
+            .select_comparison(
+                requested,
+                selected_at,
+                selected_at,
+                context.deadline(),
+                context.cancellation(),
+            )?;
+        let Some(selected) = selected else {
+            return Ok((None, None));
+        };
         let instrument = selected.instrument_id();
-        let query = MarketDataInstrumentPopulationQuery::try_new(vec![instrument], selected_at, selected_at)
+        let query = MarketDataInstrumentPopulationQuery::try_new(
+            vec![instrument],
+            selected_at,
+            selected_at,
+        )
+        .map_err(crate::application::map_market_definition_read_error)?;
+        let population = reader
+            .pin_population_as_of(query, context.deadline(), context.cancellation())
             .map_err(crate::application::map_market_definition_read_error)?;
-        let population = reader.pin_population_as_of(query, context.deadline(), context.cancellation())
-            .map_err(crate::application::map_market_definition_read_error)?;
-        if population.disposition() != MarketDataInstrumentPopulationDisposition::Complete || !population.exclusions().is_empty() {
+        if population.disposition() != MarketDataInstrumentPopulationDisposition::Complete
+            || !population.exclusions().is_empty()
+        {
             return Ok((Some(instrument), None));
         }
-        let [record] = population.records() else { return Err(ServiceError::InvalidResult); };
-        if record.definition().instrument_id() != instrument || record.revision_digest() != selected.reference_revision_digest() {
+        let [record] = population.records() else {
+            return Err(ServiceError::InvalidResult);
+        };
+        if record.definition().instrument_id() != instrument
+            || record.revision_digest() != selected.reference_revision_digest()
+        {
             return Err(ServiceError::InvalidResult);
         }
-        let mut listings = record.definition().venue_mappings().iter().filter(|mapping|
-            mapping.venue_symbol().as_str() == selected.display_symbol()
-                && matches!(mapping.venue_id().as_str(), "ARCX" | "XNYS" | "XNAS"));
-        let Some(listing) = listings.next() else { return Ok((Some(instrument), None)); };
-        if listings.next().is_some() { return Ok((Some(instrument), None)); }
-        Ok((Some(instrument), Some((record.clone(), listing.venue_id().clone()))))
+        let mut listings = record
+            .definition()
+            .venue_mappings()
+            .iter()
+            .filter(|mapping| {
+                mapping.venue_symbol().as_str() == selected.display_symbol()
+                    && matches!(mapping.venue_id().as_str(), "ARCX" | "XNYS" | "XNAS")
+            });
+        let Some(listing) = listings.next() else {
+            return Ok((Some(instrument), None));
+        };
+        if listings.next().is_some() {
+            return Ok((Some(instrument), None));
+        }
+        Ok((
+            Some(instrument),
+            Some((record.clone(), listing.venue_id().clone())),
+        ))
     }
 
     async fn publish_training_pair(
-        &self, subject: &MarketDataInstrumentRecord, venue: &VenueId,
+        &self,
+        subject: &MarketDataInstrumentRecord,
+        venue: &VenueId,
         benchmark: Option<&(MarketDataInstrumentRecord, VenueId)>,
-        dates: (CalendarDate, CalendarDate), context: &RequestContext,
+        dates: (CalendarDate, CalendarDate),
+        context: &RequestContext,
     ) -> Result<PendingCurrentPriceActions, ServiceError> {
-        let mut histories = vec![self.acquire_nominal_history(subject, venue, dates, context).await?];
-        if let Some((record, venue)) = benchmark.filter(|(record, _)|
-            record.definition().instrument_id() != subject.definition().instrument_id()) {
-            match self.acquire_nominal_history(record, venue, dates, context).await {
+        let mut histories = vec![
+            self.acquire_nominal_history(subject, venue, dates, context)
+                .await?,
+        ];
+        if let Some((record, venue)) = benchmark.filter(|(record, _)| {
+            record.definition().instrument_id() != subject.definition().instrument_id()
+        }) {
+            match self
+                .acquire_nominal_history(record, venue, dates, context)
+                .await
+            {
                 Ok(history) => histories.push(history),
-                Err(ServiceError::Unavailable | ServiceError::NotFound) => {},
+                Err(ServiceError::Unavailable | ServiceError::NotFound) => {}
                 Err(error) => return Err(error),
             }
         }
-        let mut prepared = self.actions.publish_training_price_actions(&histories, dates, context).await;
-        if histories.len() == 2 && matches!(prepared, Err(ServiceError::Unavailable | ServiceError::NotFound)) {
+        let mut prepared = self
+            .actions
+            .publish_training_price_actions(&histories, dates, context)
+            .await;
+        if histories.len() == 2
+            && matches!(
+                prepared,
+                Err(ServiceError::Unavailable | ServiceError::NotFound)
+            )
+        {
             // A missing comparison never becomes a fabricated flat series or prevents genuine
             // subject-only price/profit evidence. Its selected identity remains in saved custody.
-            prepared = self.actions.publish_training_price_actions(&histories[..1], dates, context).await;
+            prepared = self
+                .actions
+                .publish_training_price_actions(&histories[..1], dates, context)
+                .await;
         }
         prepared
     }
 
     async fn acquire_nominal_history(
-        &self, record: &MarketDataInstrumentRecord, venue: &VenueId,
-        dates: (CalendarDate, CalendarDate), context: &RequestContext,
-    ) -> Result<CompleteMarketBarHistoryOutput, ServiceError> {
+        &self,
+        record: &MarketDataInstrumentRecord,
+        venue: &VenueId,
+        dates: (CalendarDate, CalendarDate),
+        context: &RequestContext,
+    ) -> Result<CompleteMarketBarHistoryCursor, ServiceError> {
         self.authorize(context)?;
-        let publication = self.activation.prepare_instrument_eod_history(record, venue, &self.calendars, dates, context).await?;
-        let cutoff = super::super::super::runtime::current_timestamp().map_err(|_| ServiceError::Internal)?;
-        self.ingest.read_complete_tiingo_eod_publication(&publication, record, venue, dates, &self.calendars,
-            cutoff, context.deadline(), context.cancellation()).await.map_err(|error| {
-            use crate::application::TiingoHistoryApplicationError as E;
-            match error {
-                E::Read(error) => crate::application::map_source_analytical_error(error),
-                E::Calendar(error) => map_calendar(error),
-                E::Research(error) => crate::application::map_source_research_error(error),
-                _ => ServiceError::InvalidResult,
-            }
-        })
+        let publication = self
+            .activation
+            .prepare_instrument_eod_history(record, venue, &self.calendars, dates, context)
+            .await?;
+        let cutoff = super::super::super::runtime::current_timestamp()
+            .map_err(|_| ServiceError::Internal)?;
+        self.ingest
+            .read_complete_tiingo_eod_publication(
+                &publication,
+                record,
+                venue,
+                dates,
+                &self.calendars,
+                cutoff,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await
+            .map_err(|error| {
+                use crate::application::TiingoHistoryApplicationError as E;
+                match error {
+                    E::Read(error) => crate::application::map_source_analytical_error(error),
+                    E::Calendar(error) => map_calendar(error),
+                    E::Research(error) => crate::application::map_source_research_error(error),
+                    _ => ServiceError::InvalidResult,
+                }
+            })
     }
-
 }
 
 pub(super) fn require_same_source_population(

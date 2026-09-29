@@ -176,6 +176,8 @@ enum BackendAdmissionWire {
         output_shape: Vec<usize>,
         #[serde(rename = "outputSemantics")]
         output_semantics: OnnxOutputSemanticsWire,
+        #[serde(rename = "forecastHorizons", default)]
+        forecast_horizons: Option<Vec<u32>>,
         #[serde(rename = "inferenceDeadlineMillis")]
         inference_deadline_millis: u64,
         fallback: OnnxFallbackWire,
@@ -192,20 +194,36 @@ impl BackendAdmissionWire {
                 input_shape,
                 output_shape,
                 output_semantics,
+                forecast_horizons,
                 inference_deadline_millis,
                 fallback,
             } => {
                 let model_digest = Sha256Digest::new(parse_sha256(&model_sha256)?);
                 let deadline = Duration::from_millis(inference_deadline_millis);
-                let policy = OnnxModelPolicy::try_new_with_output_semantics(
-                    model_digest,
-                    opset,
-                    &input_shape,
-                    &output_shape,
-                    output_semantics.into_domain(),
-                    deadline,
-                    fallback.into_domain(),
-                )
+                let policy = if let Some(horizons) = forecast_horizons {
+                    if !matches!(output_semantics, OnnxOutputSemanticsWire::Regression) {
+                        return Err(ProductionModelRuntimeError::InvalidAdmission);
+                    }
+                    OnnxModelPolicy::try_new_forecast(
+                        model_digest,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        &horizons,
+                        deadline,
+                        fallback.into_domain(),
+                    )
+                } else {
+                    OnnxModelPolicy::try_new_with_output_semantics(
+                        model_digest,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        output_semantics.into_domain(),
+                        deadline,
+                        fallback.into_domain(),
+                    )
+                }
                 .map_err(|_| ProductionModelRuntimeError::InvalidAdmission)?;
                 Ok(ModelBackendAdmission::Onnx(policy))
             }

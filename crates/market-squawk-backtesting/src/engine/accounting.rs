@@ -9,8 +9,8 @@ use market_squawk_domain::{
 };
 use market_squawk_portfolio::{
     CashFlow, CashFlowKind, CorporateActionBinding, LedgerEntry, LedgerEntryKind, LotSelection,
-    PortfolioLedger, PortfolioRevision, PriceEvidence, RevisionEvidence, Trade, TradeSide,
-    TransactionRevision, ValuationSet,
+    PortfolioError, PortfolioLedger, PortfolioRevision, PriceEvidence, RevisionEvidence, Trade,
+    TradeSide, TransactionRevision, ValuationSet,
 };
 use rust_decimal::Decimal;
 
@@ -53,32 +53,12 @@ impl ShadowPortfolio {
 
     pub(super) fn replay(
         request: &BacktestRequest,
-        fills: &[ResearchFill],
+        fills: &super::RunHistory,
         as_of: Timestamp,
     ) -> Result<Self, BacktestError> {
+        // Merge the chronological fill cursor with the much smaller corporate-action schedule.
+        // Ordering is identical to ShadowOperation::key: actions, fills, then cash settlement.
         let mut operations = Vec::new();
-        operations
-            .try_reserve_exact(
-                fills.len().saturating_add(
-                    request
-                        .corporate_actions
-                        .as_ref()
-                        .map_or(0, |plan| plan.steps().len().saturating_mul(2)),
-                ),
-            )
-            .map_err(|_| BacktestError::LimitExceeded)?;
-        for (index, fill) in fills.iter().enumerate() {
-            if fill.executed_at() <= as_of {
-                let terms = request
-                    .dataset
-                    .observations
-                    .iter()
-                    .find(|observation| observation.instrument_id() == fill.instrument_id())
-                    .map(|observation| observation.execution_terms)
-                    .ok_or(BacktestError::InvalidIntent)?;
-                operations.push(ShadowOperation::Fill { index, fill, terms });
-            }
-        }
         if let Some(plan) = &request.corporate_actions {
             for step in plan.steps() {
                 let record = plan
@@ -90,7 +70,48 @@ impl ShadowPortfolio {
                 }
             }
         }
-        Self::replay_operations(request.portfolio.initial_cash, operations)
+        operations.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
+        let mut actions = operations.into_iter().peekable();
+        let mut shadow = Self::new(request.portfolio.initial_cash);
+        for (index, fill) in fills.iter().enumerate() {
+            let fill = fill?;
+            if fill.executed_at() > as_of {
+                break;
+            }
+            let key = (fill.executed_at(), 1, "backtest-research-fill", index);
+            while actions.peek().is_some_and(|action| action.key() <= key) {
+                shadow.apply_operation(actions.next().ok_or(BacktestError::AccountingMismatch)?)?;
+            }
+            let terms = request
+                .dataset
+                .observations
+                .first_for_instrument(fill.instrument_id())?
+                .execution_terms;
+            shadow.apply(&fill, terms)?;
+        }
+        for action in actions {
+            shadow.apply_operation(action)?;
+        }
+        Ok(shadow)
+    }
+
+    fn apply_operation(&mut self, operation: ShadowOperation<'_>) -> Result<(), BacktestError> {
+        match operation {
+            ShadowOperation::Fill { fill, terms, .. } => self.apply(fill, terms)?,
+            ShadowOperation::Action { step, record } => self.apply_action(step, record)?,
+            ShadowOperation::CashSettlement { index, .. } => {
+                let entitlement = self
+                    .entitlements
+                    .get_mut(&index)
+                    .ok_or(BacktestError::AccountingMismatch)?;
+                if entitlement.settled {
+                    return Err(BacktestError::AccountingMismatch);
+                }
+                self.cash = self.cash.checked_add(entitlement.amount)?;
+                entitlement.settled = true;
+            }
+        }
+        Ok(())
     }
 
     fn replay_operations(
@@ -594,7 +615,8 @@ fn ratio(numerator: u32, denominator: u32) -> Result<Decimal, BacktestError> {
 
 pub(super) fn reconcile(
     request: &BacktestRequest,
-    fills: &[ResearchFill],
+    fills: &super::RunHistory,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<PortfolioRevision, BacktestError> {
     let first = request
         .dataset
@@ -607,11 +629,7 @@ pub(super) fn reconcile(
         .last()
         .ok_or(BacktestError::InvalidDataset)?
         .decision_at;
-    let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(fills.len().saturating_add(1))
-        .map_err(|_| BacktestError::LimitExceeded)?;
-    entries.push(LedgerEntry::try_new(
+    let initial = LedgerEntry::try_new(
         request.portfolio.account_id,
         TransactionRevision::try_new(
             SourceIdentifier::try_from("backtest-initial-capital")?,
@@ -625,44 +643,47 @@ pub(super) fn reconcile(
             request.portfolio.initial_cash,
             None,
         )?),
-    )?);
-    for (index, fill) in fills.iter().enumerate() {
-        let terms = request
-            .dataset
-            .observations
+    )?;
+    let fill_entries =
+        fills
             .iter()
-            .find(|observation| observation.instrument_id() == fill.instrument_id())
-            .map(|observation| observation.execution_terms)
-            .ok_or(BacktestError::InvalidIntent)?;
-        let quantity = fill.quantity().checked_to_decimal(terms.lot_size())?;
-        let price = fill
-            .price()
-            .checked_to_decimal(terms.price_tick())?
-            .checked_mul(terms.contract_multiplier())
-            .ok_or(BacktestError::AccountingMismatch)?;
-        let side = match fill.side() {
-            OrderSide::Buy => TradeSide::Buy,
-            OrderSide::Sell => TradeSide::Sell,
-        };
-        entries.push(LedgerEntry::try_new(
-            request.portfolio.account_id,
-            TransactionRevision::try_new(
-                SourceIdentifier::try_from(format!("backtest-fill-{index:016x}"))?,
-                RevisionNumber::new(1)?,
-                None,
-            )?,
-            fill.executed_at(),
-            SourceIdentifier::try_from("backtest-research-fill")?,
-            LedgerEntryKind::Trade(Trade::try_new(
-                side,
-                terms.instrument_id(),
-                quantity,
-                Money::new(price, terms.quote_currency()),
-                fill.fee(),
-                LotSelection::Fifo,
-            )?),
-        )?);
-    }
+            .enumerate()
+            .map(|(index, fill)| -> Result<LedgerEntry, BacktestError> {
+                let fill = fill?;
+                let terms = request
+                    .dataset
+                    .observations
+                    .first_for_instrument(fill.instrument_id())?
+                    .execution_terms;
+                let quantity = fill.quantity().checked_to_decimal(terms.lot_size())?;
+                let price = fill
+                    .price()
+                    .checked_to_decimal(terms.price_tick())?
+                    .checked_mul(terms.contract_multiplier())
+                    .ok_or(BacktestError::AccountingMismatch)?;
+                let side = match fill.side() {
+                    OrderSide::Buy => TradeSide::Buy,
+                    OrderSide::Sell => TradeSide::Sell,
+                };
+                Ok(LedgerEntry::try_new(
+                    request.portfolio.account_id,
+                    TransactionRevision::try_new(
+                        SourceIdentifier::try_from(format!("backtest-fill-{index:016x}"))?,
+                        RevisionNumber::new(1)?,
+                        None,
+                    )?,
+                    fill.executed_at(),
+                    SourceIdentifier::try_from("backtest-research-fill")?,
+                    LedgerEntryKind::Trade(Trade::try_new(
+                        side,
+                        terms.instrument_id(),
+                        quantity,
+                        Money::new(price, terms.quote_currency()),
+                        fill.fee(),
+                        LotSelection::Fifo,
+                    )?),
+                )?)
+            });
     let valuation = ValuationSet::try_new(
         request.portfolio.initial_cash.currency(),
         as_of,
@@ -689,22 +710,51 @@ pub(super) fn reconcile(
         request.portfolio.initial_cash.currency(),
         request.portfolio.limits,
     )?;
-    ledger
-        .try_apply(
+    if let Some(scratch) = request.dataset.observations.operation_scratch() {
+        let mut fill_error = None;
+        let entries = std::iter::once(Ok(initial))
+            .chain(fill_entries)
+            .map(|entry| {
+                entry.map_err(|error| {
+                    fill_error = Some(error);
+                    PortfolioError::EvidenceMismatch
+                })
+            });
+        let revision = ledger.try_apply_stream(
             entries,
             request.corporate_actions.as_ref(),
             valuation,
             evidence,
-        )
-        .map_err(Into::into)
+            scratch,
+            16 * 1024 * 1024 * 1024,
+            cancellation,
+        );
+        if let Some(error) = fill_error {
+            return Err(error);
+        }
+        revision.map_err(Into::into)
+    } else {
+        let entries = std::iter::once(Ok(initial))
+            .chain(fill_entries)
+            .collect::<Result<Vec<_>, BacktestError>>()?;
+        ledger
+            .try_apply(
+                entries,
+                request.corporate_actions.as_ref(),
+                valuation,
+                evidence,
+            )
+            .map_err(Into::into)
+    }
 }
 
 fn latest_prices(
-    observations: &[BacktestObservation],
+    observations: &crate::dataset::observation_store::ObservationStore,
     as_of: Timestamp,
 ) -> Result<Vec<PriceEvidence>, BacktestError> {
-    let mut latest = BTreeMap::<InstrumentId, &BacktestObservation>::new();
-    for observation in observations {
+    let mut latest = BTreeMap::<InstrumentId, BacktestObservation>::new();
+    for observation in observations.iter() {
+        let observation = observation?;
         if observation.decision_at <= as_of
             && observation.stale_at >= as_of
             && observation.mid_price.is_some()

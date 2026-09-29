@@ -29,9 +29,15 @@ pub(crate) struct GenerateRequest {
     pub(crate) portfolio: PortfolioAnalysisReadReference,
     pub(crate) price_forecast: Option<ForecastReference>,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub(crate) source_action_reference: Option<crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference>,
+    pub(crate) source_action_reference: Option<
+        crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
+    >,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub(crate) current_share_action_reference: Option<crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference>,
+    pub(crate) current_share_action_reference: Option<
+        crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
+    >,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub(crate) fundamental_share_sources: Option<String>,
     pub(crate) probability_forecasts: ProbabilityForecastReferences,
     #[serde(deserialize_with = "Option::deserialize")]
     pub(crate) benchmark_instrument_id: Option<InstrumentId>,
@@ -152,13 +158,19 @@ pub(crate) fn parse_digest(value: &str) -> Result<EvidenceDigest, ServiceError> 
 
 /// Saved bytes are audit references, never a substitute for current source admission.
 pub(crate) fn validate_canonical_request(bytes: &[u8]) -> Result<(), ServiceError> {
-    if bytes.is_empty() || bytes.len() > 65_536 {
+    if bytes.is_empty()
+        || bytes.len() > market_squawk_decisions::MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES
+    {
         return Err(ServiceError::InvalidRequest);
     }
     let input: GenerateRequest = serde_json::from_slice(bytes).map_err(invalid)?;
     if input.financial_forecasts.len() > 16 || serde_json::to_vec(&input).map_err(invalid)? != bytes
     {
         return Err(ServiceError::InvalidRequest);
+    }
+    if let Some(sources) = &input.fundamental_share_sources {
+        crate::application::fair_value::validate_fundamental_share_sources(sources.as_bytes())
+            .map_err(invalid)?;
     }
     if input
         .benchmark_instrument_id
@@ -179,16 +191,25 @@ pub(crate) fn validate_canonical_request(bytes: &[u8]) -> Result<(), ServiceErro
     }
     if let Some(reference) = &input.source_action_reference {
         if reference.knowledge_cutoff() > cutoff
-            || !reference.requested_instruments().contains(&input.portfolio.prerequisites().candidate_instrument_id())
+            || !reference
+                .requested_instruments()
+                .contains(&input.portfolio.prerequisites().candidate_instrument_id())
             || input.price_forecast.is_none()
-        { return Err(ServiceError::InvalidRequest); }
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
     }
     if let Some(reference) = &input.current_share_action_reference {
-        if input.market.is_none() || input.price_forecast.is_none()
+        if input.market.is_none()
+            || input.price_forecast.is_none()
             || input.source_action_reference.is_none()
             || reference.knowledge_cutoff() < market_cutoff
-            || !reference.requested_instruments().contains(&input.portfolio.prerequisites().candidate_instrument_id())
-        { return Err(ServiceError::InvalidRequest); }
+            || !reference
+                .requested_instruments()
+                .contains(&input.portfolio.prerequisites().candidate_instrument_id())
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
     }
     if let Some(market) = &input.market {
         if market.source_cutoff()? != market_cutoff

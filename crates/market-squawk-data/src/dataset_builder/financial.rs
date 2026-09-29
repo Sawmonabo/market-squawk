@@ -671,7 +671,7 @@ impl DatasetBuilderService<'_> {
         let (concept, _, instant) = selection.mapping()?;
         let mut pairs = Vec::<(FinancialSourceInputs<usize>, usize)>::new();
         let mut currency = None;
-        let mut scope: Option<&FundamentalObservation> = None;
+        let mut scope: Option<FundamentalObservation> = None;
         let mut facts = 0usize;
         for (index, selected_row) in selected.selected().iter().enumerate() {
             if index % 32 == 0 {
@@ -699,14 +699,16 @@ impl DatasetBuilderService<'_> {
                 selection.basis == FinancialAmountBasis::PerCommonShare,
             )?;
             if currency.is_some_and(|v| v != row_currency)
-                || scope.is_some_and(|v| !same_scope(v, row))
+                || scope.as_ref().is_some_and(|v| !same_scope(v, &row))
             {
                 return Err(DatasetBuildError::ComponentEvidenceMismatch);
             }
             currency = Some(row_currency);
-            scope = Some(row);
+            if scope.is_none() {
+                scope = Some(row.clone());
+            }
             validate_fact(
-                row,
+                &row,
                 source.request().instrument_id(),
                 selected.request().knowledge_at(),
             )?;
@@ -724,7 +726,7 @@ impl DatasetBuilderService<'_> {
                     let candidate = selected_fact(selected, selected_anchor.row().row_ordinal())?;
                     if frame_cadence(candidate.fact_context())? == Some(cadence)
                         && anchor_matches(row.fact_context(), candidate.fact_context())
-                        && same_scope(row, candidate)
+                        && same_scope(&row, &candidate)
                         && source_currency(candidate.unit().as_str(), false).ok()
                             == Some(row_currency)
                     {
@@ -761,12 +763,12 @@ impl DatasetBuilderService<'_> {
                     let fact = selected_fact(selected, selected_preferred.row().row_ordinal())?;
                     if fact.concept().as_str()
                         == "us-gaap:PreferredStockIncludingAdditionalPaidInCapitalNetOfDiscount"
-                        && same_scope(row, fact)
+                        && same_scope(&row, &fact)
                         && common_book_context_matches(row.fact_context(), fact.fact_context())
                         && row.unit() == fact.unit()
                     {
                         validate_fact(
-                            fact,
+                            &fact,
                             source.request().instrument_id(),
                             selected.request().knowledge_at(),
                         )?;
@@ -796,14 +798,22 @@ impl DatasetBuilderService<'_> {
         if pairs.is_empty() {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         }
+        let mut sort_error = None;
         pairs.sort_unstable_by_key(|(amount, _)| {
-            selected_fact(
+            match selected_fact(
                 selected,
                 selected.selected()[*amount.primary()].row().row_ordinal(),
-            )
-            .ok()
-            .map(|v| v.fact_context().period().end())
+            ) {
+                Ok(value) => Some(value.fact_context().period().end()),
+                Err(error) => {
+                    sort_error = Some(error);
+                    None
+                }
+            }
         });
+        if let Some(error) = sort_error {
+            return Err(error);
+        }
         for pair in pairs.windows(2) {
             let left = selected_fact(selected, selected.selected()[pair[0].1].row().row_ordinal())?;
             let right =
@@ -827,7 +837,7 @@ impl DatasetBuilderService<'_> {
                     continue;
                 }
                 let observation = selected_fact(selected, ordinal)?;
-                let bytes = serde_json::to_vec(observation)
+                let bytes = serde_json::to_vec(&observation)
                     .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
                 retained = retained
                     .checked_add(size_of::<SourceRow>())
@@ -1097,7 +1107,7 @@ impl FinancialSeriesSource {
     }
     pub(super) fn revalidate(
         &self,
-        candidates: &[PointInTimeCandidate],
+        candidates: &crate::pit::disk::CandidateStore,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), DatasetBuildError> {
@@ -1105,17 +1115,9 @@ impl FinancialSeriesSource {
             check_control(deadline, cancellation)?;
             let fact: FundamentalObservation = serde_json::from_slice(&row.canonical_json)
                 .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
-            let mut count = 0usize;
-            for (index, candidate) in candidates.iter().enumerate() {
-                if index % 32 == 0 {
-                    check_control(deadline, cancellation)?;
-                }
-                if candidate.source_manifest() == &self.manifest
-                    && matches!(candidate.observation(),ResearchObservation::Fundamental(value) if value==&fact)
-                {
-                    count += 1;
-                }
-            }
+            let count = candidates
+                .count_observation(&ResearchObservation::Fundamental(fact), &self.manifest)
+                .map_err(DatasetBuildError::IndexedPointInTime)?;
             if count != 1 {
                 return Err(DatasetBuildError::ComponentEvidenceMismatch);
             }
@@ -1139,7 +1141,7 @@ impl FinancialExampleSource {
     pub(super) fn validate_component(
         &self,
         component: &FeatureLabelComponentInput,
-        selection: &crate::PointInTimeSelection<'_>,
+        selection: &crate::pit::disk::Selection,
     ) -> Result<(), DatasetBuildError> {
         let references = match component.spec().kind() {
             ComponentKind::Feature => self.binding.observed_inputs(),
@@ -1190,8 +1192,12 @@ pub(super) fn component_spec(
 fn selected_fact(
     source: &SecResearchSelection,
     ordinal: u32,
-) -> Result<&FundamentalObservation, DatasetBuildError> {
-    match source.decoded_rows().get(ordinal as usize) {
+) -> Result<FundamentalObservation, DatasetBuildError> {
+    match source
+        .decoded_rows()
+        .get(ordinal as usize)
+        .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?
+    {
         Some(ResearchObservation::Fundamental(value)) => Ok(value),
         _ => Err(DatasetBuildError::ComponentEvidenceMismatch),
     }

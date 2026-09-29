@@ -187,21 +187,21 @@ use super::{
     timestamp_calendar_date,
 };
 use market_squawk_data::{
-    AnalyticalObservationTemplate, AnalyticalReadLimit,
-    CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryOutput,
-    MarketHistorySelectionPolicy, ChronologicalSplitPolicy, ComponentKind,
-    ComponentScope, ComponentValue, CorporateActionAdjustment, CorporateActionPolicy, CorporateActionSensitivity,
+    AnalyticalObservationTemplate, AnalyticalReadLimit, CanonicalMarketBarHistoryRequest,
+    ChronologicalSplitPolicy, CompleteMarketBarHistoryCursor, ComponentKind, ComponentScope,
+    ComponentValue, CorporateActionAdjustment, CorporateActionPolicy, CorporateActionSensitivity,
     DatasetBuildInputs, DatasetBuildPolicy, DatasetBuildPurpose, DatasetExample,
     DatasetManifestRef, DatasetSchemaRegistry, DatasetStudyPolicy, FeatureDatasetProductContract,
-    FeatureLabelComponentSpec, MissingValuePolicy, PointInTimeCandidate, PointInTimeLimits,
-    PointInTimePolicy, PointInTimeRequest, PointInTimeRevisionMode, PointInTimeService,
+    FeatureLabelComponentSpec, MarketHistorySelectionPolicy, MissingValuePolicy,
+    PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy, PointInTimeRequest,
+    PointInTimeRevisionMode, PointInTimeService,
 };
 use market_squawk_domain::{
     CalendarDate, HistoricalStudyBasis, InstrumentId, MarketBarAdjustment, ResearchObservation,
     ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
 };
-use std::time::Instant;
 use rust_decimal::Decimal;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const MAXIMUM_COHORT_EXAMPLES: usize = 2 * MAXIMUM_OBSERVATIONS_PER_GENERATION;
@@ -222,7 +222,9 @@ pub(crate) struct RecommendationCohortPreparationRequest {
     /// Inclusive authentic completed-close population anchor, shared across every purpose/fold.
     pub(crate) population_ends_at: Timestamp,
     pub(crate) split: ChronologicalSplitPolicy,
-    pub(crate) source_action_reference: Option<crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference>,
+    pub(crate) source_action_reference: Option<
+        crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
+    >,
 }
 
 pub(super) struct CohortPreparationRequest {
@@ -233,7 +235,9 @@ pub(super) struct CohortPreparationRequest {
     pub(super) population_starts_at: Timestamp,
     pub(super) population_ends_at: Timestamp,
     pub(super) split: ChronologicalSplitPolicy,
-    pub(super) source_action_reference: Option<crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference>,
+    pub(super) source_action_reference: Option<
+        crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
+    >,
     pub(super) event: Option<market_squawk_data::ProbabilityEventTarget>,
     pub(super) probability_subject: Option<market_squawk_data::ProbabilityEventTarget>,
     pub(super) costs: Option<Arc<market_squawk_backtesting::AllOriginRoundTripEvaluationV1>>,
@@ -257,8 +261,13 @@ impl DatasetPreparationAuthority {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<PreparedFeatureDatasetBuild, DatasetPreparationError> {
-        if request.study.target_horizon().exact_elapsed().map(|horizon| horizon.as_nanos())
-            != Some(RECOMMENDATION_TARGET_HORIZON_NANOS_V1 as u128) {
+        if request
+            .study
+            .target_horizon()
+            .exact_elapsed()
+            .map(|horizon| horizon.as_nanos())
+            != Some(RECOMMENDATION_TARGET_HORIZON_NANOS_V1 as u128)
+        {
             return Err(DatasetPreparationError::InvalidSelection);
         }
         let training = request.study.purpose() == DatasetBuildPurpose::Training;
@@ -267,26 +276,56 @@ impl DatasetPreparationAuthority {
         } else {
             FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonStudyInputsV1
         };
-        let cohort = self.prepare_source_cohort(CohortPreparationRequest {
-            subject_instrument: request.subject_instrument, subject_manifest: request.subject_manifest,
-            benchmark: Some((request.primary_benchmark_instrument, request.primary_benchmark_manifest)),
-            study: request.study, population_starts_at: request.population_starts_at,
-            population_ends_at: request.population_ends_at, split: request.split,
-            source_action_reference: request.source_action_reference, event: None, probability_subject: None, costs: None,
-        }, deadline, &cancellation).await?;
-        self.finalize_source_cohort(&cohort, if training { DatasetPreparationUse::Train }
-            else { DatasetPreparationUse::LocalAnalysis }, contract, deadline, &cancellation)
+        let cohort = self
+            .prepare_source_cohort(
+                CohortPreparationRequest {
+                    subject_instrument: request.subject_instrument,
+                    subject_manifest: request.subject_manifest,
+                    benchmark: Some((
+                        request.primary_benchmark_instrument,
+                        request.primary_benchmark_manifest,
+                    )),
+                    study: request.study,
+                    population_starts_at: request.population_starts_at,
+                    population_ends_at: request.population_ends_at,
+                    split: request.split,
+                    source_action_reference: request.source_action_reference,
+                    event: None,
+                    probability_subject: None,
+                    costs: None,
+                },
+                deadline,
+                &cancellation,
+            )
+            .await?;
+        self.finalize_source_cohort(
+            &cohort,
+            if training {
+                DatasetPreparationUse::Train
+            } else {
+                DatasetPreparationUse::LocalAnalysis
+            },
+            contract,
+            deadline,
+            &cancellation,
+        )
     }
 
     pub(super) async fn prepare_source_cohort(
-        &self, request: CohortPreparationRequest, deadline: Instant, cancellation: &CancellationToken,
+        &self,
+        request: CohortPreparationRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<PreparedSourceCohort, DatasetPreparationError> {
         check_control(deadline, cancellation)?;
         let boundaries = request
             .split
             .timestamp_boundaries()
             .ok_or(DatasetPreparationError::InvalidSelection)?;
-        if request.benchmark.as_ref().is_some_and(|(instrument, _)| request.subject_instrument == *instrument)
+        if request
+            .benchmark
+            .as_ref()
+            .is_some_and(|(instrument, _)| request.subject_instrument == *instrument)
             || request.population_starts_at >= boundaries[0]
             || request.population_starts_at >= request.population_ends_at
             || request.population_ends_at > request.study.snapshot_as_of()
@@ -327,7 +366,13 @@ impl DatasetPreparationAuthority {
                 (
                     AnalyticalObservationTemplate::CorporateAction,
                     std::iter::once(request.subject_instrument)
-                        .chain(request.benchmark.as_ref().map(|(instrument, _)| *instrument)).collect(),
+                        .chain(
+                            request
+                                .benchmark
+                                .as_ref()
+                                .map(|(instrument, _)| *instrument),
+                        )
+                        .collect(),
                 ),
             ];
             let mut market_instruments = Vec::new();
@@ -335,7 +380,9 @@ impl DatasetPreparationAuthority {
                 market_instruments.push(request.subject_instrument);
             }
             if let Some((instrument, manifest)) = &request.benchmark {
-                if generation.manifest() == manifest { market_instruments.push(*instrument); }
+                if generation.manifest() == manifest {
+                    market_instruments.push(*instrument);
+                }
             }
             if !market_instruments.is_empty() {
                 templates.push((AnalyticalObservationTemplate::MarketBar, market_instruments));
@@ -361,8 +408,14 @@ impl DatasetPreparationAuthority {
         }
         let support = CanonicalSupport::from_generations(&generations)?;
         let mut sources = Vec::with_capacity(2);
-        for (instrument, manifest) in std::iter::once((request.subject_instrument, &request.subject_manifest))
-            .chain(request.benchmark.as_ref().map(|(instrument, manifest)| (*instrument, manifest))) {
+        for (instrument, manifest) in
+            std::iter::once((request.subject_instrument, &request.subject_manifest)).chain(
+                request
+                    .benchmark
+                    .as_ref()
+                    .map(|(instrument, manifest)| (*instrument, manifest)),
+            )
+        {
             let (_, observations) = generations
                 .iter()
                 .find(|(generation, _)| generation.manifest() == manifest)
@@ -385,59 +438,151 @@ impl DatasetPreparationAuthority {
         if let Some(reference) = &request.source_action_reference {
             let reader = &self.source_actions;
             for (lane, source) in sources.iter_mut().enumerate() {
-                if source.nominal_history.is_some() { continue; }
-                let instrument = if lane == 0 { request.subject_instrument }
-                    else { request.benchmark.as_ref().ok_or(DatasetPreparationError::InvalidEvidence)?.0 };
-                let history = reader.read_history_reference(reference, instrument, deadline, cancellation.child_token(), None)
-                    .await.map_err(super::map_source_action_error)?.ok_or(DatasetPreparationError::Unavailable)?;
+                if source.nominal_history.is_some() {
+                    continue;
+                }
+                let instrument = if lane == 0 {
+                    request.subject_instrument
+                } else {
+                    request
+                        .benchmark
+                        .as_ref()
+                        .ok_or(DatasetPreparationError::InvalidEvidence)?
+                        .0
+                };
+                let history = reader
+                    .read_history_reference(
+                        reference,
+                        instrument,
+                        deadline,
+                        cancellation.child_token(),
+                        None,
+                    )
+                    .await
+                    .map_err(super::map_source_action_error)?
+                    .ok_or(DatasetPreparationError::Unavailable)?;
                 if history.read_receipt().knowledge_cutoff() != request.study.snapshot_as_of()
                     || history.selection().receipt().date_windows().is_some()
-                    || history.bars().len() != source.points.len()
-                    || history.bars().iter().zip(&source.points).any(|(bar, point)| bar != &point.observation) {
+                    || history.bar_count() != source.points.len()
+                {
                     return Err(DatasetPreparationError::InvalidEvidence);
                 }
+                let mut bars = history.bars();
+                for point in &source.points {
+                    let bar = bars
+                        .next()
+                        .transpose()
+                        .map_err(|_| DatasetPreparationError::InvalidEvidence)?
+                        .ok_or(DatasetPreparationError::InvalidEvidence)?;
+                    if bar != point.observation {
+                        return Err(DatasetPreparationError::InvalidEvidence);
+                    }
+                }
+                if bars
+                    .next()
+                    .transpose()
+                    .map_err(|_| DatasetPreparationError::InvalidEvidence)?
+                    .is_some()
+                {
+                    return Err(DatasetPreparationError::InvalidEvidence);
+                }
+                drop(bars);
                 source.completed_history = Some(history);
             }
         }
-        let native = sources.iter().filter_map(|source| source.nominal_history.as_ref().or(source.completed_history.as_ref())).collect::<Vec<_>>();
-        let source_plan = if native.is_empty() { None } else {
-            let reference = request.source_action_reference.as_ref().ok_or(DatasetPreparationError::Unavailable)?;
+        let native = sources
+            .iter()
+            .filter_map(|source| {
+                source
+                    .nominal_history
+                    .as_ref()
+                    .or(source.completed_history.as_ref())
+            })
+            .collect::<Vec<_>>();
+        let source_plan = if native.is_empty() {
+            None
+        } else {
+            let reference = request
+                .source_action_reference
+                .as_ref()
+                .ok_or(DatasetPreparationError::Unavailable)?;
             if reference.knowledge_cutoff() != request.study.snapshot_as_of() {
                 return Err(DatasetPreparationError::InvalidEvidence);
             }
             let reader = &self.source_actions;
-            let source = reader.read_price_reference_for_histories(reference, &native, deadline, cancellation.child_token(), None)
-                .await.map_err(super::map_source_action_error)?.ok_or(DatasetPreparationError::Unavailable)?;
-            let plan = source.into_covered_price_plan().map_err(super::map_source_action_error)?;
-            retained_bytes.checked_add(plan.retained_bytes()).filter(|bytes| *bytes <= MAXIMUM_COHORT_SOURCE_BYTES)
+            let source = reader
+                .read_price_reference_for_histories(
+                    reference,
+                    &native,
+                    deadline,
+                    cancellation.child_token(),
+                    None,
+                )
+                .await
+                .map_err(super::map_source_action_error)?
+                .ok_or(DatasetPreparationError::Unavailable)?;
+            let plan = source
+                .into_covered_price_plan()
+                .map_err(super::map_source_action_error)?;
+            retained_bytes
+                .checked_add(plan.retained_bytes())
+                .filter(|bytes| *bytes <= MAXIMUM_COHORT_SOURCE_BYTES)
                 .ok_or(DatasetPreparationError::Capacity)?;
             Some(Arc::new(plan))
         };
         drop(native);
-        let output =
-            build_cohort(self, &request, &sources, &support, source_plan.as_ref(), deadline, &cancellation).await?;
+        let output = build_cohort(
+            self,
+            &request,
+            &sources,
+            &support,
+            source_plan.as_ref(),
+            deadline,
+            &cancellation,
+        )
+        .await?;
         Ok(output)
     }
 
     pub(super) fn finalize_source_cohort(
-        &self, cohort: &PreparedSourceCohort, use_case: DatasetPreparationUse,
-        contract: FeatureDatasetProductContract, deadline: Instant, cancellation: &CancellationToken,
+        &self,
+        cohort: &PreparedSourceCohort,
+        use_case: DatasetPreparationUse,
+        contract: FeatureDatasetProductContract,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<PreparedFeatureDatasetBuild, DatasetPreparationError> {
         check_control(deadline, cancellation)?;
-        let build = dataset_request(cohort.identity, use_case, cohort.inputs.clone(),
-            cohort.policy.clone(), cohort.examples)?;
+        let build = dataset_request(
+            cohort.identity,
+            use_case,
+            cohort.inputs.clone(),
+            cohort.policy.clone(),
+            cohort.examples,
+        )?;
         for parent in build.parent_manifests() {
-            let latest = self.reader.latest(parent.dataset_id(), deadline, cancellation)
+            let latest = self
+                .reader
+                .latest(parent.dataset_id(), deadline, cancellation)
                 .map_err(|_| DatasetPreparationError::Unavailable)?
                 .ok_or(DatasetPreparationError::StaleCatalog)?;
-            if latest.manifest() != parent { return Err(DatasetPreparationError::StaleCatalog); }
+            if latest.manifest() != parent {
+                return Err(DatasetPreparationError::StaleCatalog);
+            }
         }
-        self.research.analytical().dataset_builder().validate_request_authority(&build, cancellation)
+        self.research
+            .analytical()
+            .dataset_builder()
+            .validate_request_authority(&build, cancellation)
             .map_err(|_| DatasetPreparationError::Authority)?;
         Ok(PreparedFeatureDatasetBuild {
-            finalizer: FeatureDatasetProductionFinalizer { contract,
-                build_spec: build.build_spec_digest().digest(), evidence: Some(cohort.evidence.clone()),
-                maximum_currentness_expires_at: None }, request: build,
+            finalizer: FeatureDatasetProductionFinalizer {
+                contract,
+                build_spec: build.build_spec_digest().digest(),
+                evidence: Some(cohort.evidence.clone()),
+                maximum_currentness_expires_at: None,
+            },
+            request: build,
         })
     }
 }
@@ -463,10 +608,21 @@ async fn select_series(
         .cloned()
         .map(|value| PointInTimeCandidate::new(value, manifest.clone()))
         .collect();
-    if candidates.iter().any(|candidate| matches!(candidate.observation(),
-        ResearchObservation::MarketBar(bar) if bar.time_semantics().nominal_daily_date().is_some())) {
-        return select_nominal_series(authority, &candidates, manifest, instrument, snapshot,
-            basis, deadline, cancellation).await;
+    if candidates.iter().any(|candidate| {
+        matches!(candidate.observation(),
+        ResearchObservation::MarketBar(bar) if bar.time_semantics().nominal_daily_date().is_some())
+    }) {
+        return select_nominal_series(
+            authority,
+            &candidates,
+            manifest,
+            instrument,
+            snapshot,
+            basis,
+            deadline,
+            cancellation,
+        )
+        .await;
     }
     let count = candidates.len().max(1);
     if count > MAXIMUM_OBSERVATIONS_PER_GENERATION {
@@ -503,7 +659,9 @@ async fn select_series(
             .availability()
             .conservative_available_at()
             .ok_or(DatasetPreparationError::InvalidEvidence)?;
-        let effective = bar.completed_at().ok_or(DatasetPreparationError::InvalidEvidence)?;
+        let effective = bar
+            .completed_at()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
         if provenance.received_at() > snapshot
             || provenance.ingested_at() > snapshot
             || effective > snapshot
@@ -516,8 +674,11 @@ async fn select_series(
             effective,
             available_at,
             manifest: manifest.clone(),
-            session_evidence: bar.time_semantics().session()
-                .ok_or(DatasetPreparationError::InvalidEvidence)?.evidence(),
+            session_evidence: bar
+                .time_semantics()
+                .session()
+                .ok_or(DatasetPreparationError::InvalidEvidence)?
+                .evidence(),
         });
     }
     points.sort_unstable_by_key(|point| point.effective);
@@ -557,7 +718,14 @@ async fn select_series(
         }
     }
     drop(selection);
-    Ok(CohortSeries { points, candidates, nominal_history: None, completed_history: None, nominal_calendar_manifest: None, nominal_snapshot: None })
+    Ok(CohortSeries {
+        points,
+        candidates,
+        nominal_history: None,
+        completed_history: None,
+        nominal_calendar_manifest: None,
+        nominal_snapshot: None,
+    })
 }
 
 /// Reads nominal daily bars through the actual canonical history/calendar authority. The
@@ -582,45 +750,72 @@ async fn select_nominal_series(
         let ResearchObservation::MarketBar(bar) = candidate.observation() else {
             return Err(DatasetPreparationError::InvalidEvidence);
         };
-        let date = bar.time_semantics().nominal_daily_date()
-            .ok_or(DatasetPreparationError::InvalidEvidence)?.date();
+        let date = bar
+            .time_semantics()
+            .nominal_daily_date()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?
+            .date();
         dates.insert(date);
     }
-    let (&start, &end) = dates.first().zip(dates.last())
+    let (&start, &end) = dates
+        .first()
+        .zip(dates.last())
         .ok_or(DatasetPreparationError::InvalidEvidence)?;
     let request = CanonicalMarketBarHistoryRequest::try_exact_nominal(
-        instrument, start, end, MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
-        snapshot, manifest.clone(),
-    ).map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-    let history = authority.reader.read_canonical_market_bar_history(
-        request, deadline, cancellation.child_token(),
-    ).await.map_err(|_| DatasetPreparationError::Unavailable)?
+        instrument,
+        start,
+        end,
+        MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+        snapshot,
+        manifest.clone(),
+    )
+    .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+    let history = authority
+        .reader
+        .read_canonical_market_bar_history_cursor(request, deadline, cancellation.child_token())
+        .await
+        .map_err(|_| DatasetPreparationError::Unavailable)?
         .ok_or(DatasetPreparationError::Unavailable)?;
     if history.selection().pinned().manifest() != manifest
         || history.selection().receipt().instrument_id() != instrument
-        || history.bars().len() > MAXIMUM_OBSERVATIONS_PER_GENERATION
-        || history.bars().len() < 2
+        || history.bar_count() > MAXIMUM_OBSERVATIONS_PER_GENERATION
+        || history.bar_count() < 2
     {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
-    let (history, calendar) = authority.rejoin_nominal_history(
-        history, deadline, cancellation,
-    ).await?;
-    let native = history.native_sessions().ok_or(DatasetPreparationError::InvalidEvidence)?;
-    let mut points = Vec::with_capacity(history.bars().len());
+    let (history, calendar) = authority
+        .rejoin_nominal_history(history, deadline, cancellation)
+        .await?;
+    let native = history
+        .native_sessions()
+        .ok_or(DatasetPreparationError::InvalidEvidence)?;
+    let mut points = Vec::with_capacity(history.bar_count());
     for bar in history.bars() {
         check_control(deadline, cancellation)?;
-        let date = bar.time_semantics().nominal_daily_date()
-            .ok_or(DatasetPreparationError::InvalidEvidence)?.date();
-        let index = native.sessions().binary_search_by_key(&date, |session| session.native_date())
-            .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-        let session = &native.sessions()[index];
-        let available_at = bar.context().provenance().availability()
-            .conservative_available_at().ok_or(DatasetPreparationError::InvalidEvidence)?;
-        if !session.bar_present() || session.provider_timestamp().is_some()
-            || session.provider_period().is_some() || bar.completed_at().is_some()
+        let bar = bar.map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+        let date = bar
+            .time_semantics()
+            .nominal_daily_date()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?
+            .date();
+        let session = native
+            .sessions()
+            .find_date(date)
+            .map_err(|_| DatasetPreparationError::InvalidEvidence)?
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        let available_at = bar
+            .context()
+            .provenance()
+            .availability()
+            .conservative_available_at()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        if !session.bar_present()
+            || session.provider_timestamp().is_some()
+            || session.provider_period().is_some()
+            || bar.completed_at().is_some()
             || session.opens_at() >= session.closes_at_exclusive()
-            || session.closes_at_exclusive() > snapshot || available_at > snapshot
+            || session.closes_at_exclusive() > snapshot
+            || available_at > snapshot
             || available_at < session.closes_at_exclusive()
             || bar.context().time().effective().calendar_date_value() != Some(date)
             || bar.adjustment() != MarketBarAdjustment::Raw
@@ -645,18 +840,29 @@ async fn select_nominal_series(
             ],
         );
         points.push(MarketSeriesPoint {
-            observation: bar.clone(), manifest: manifest.clone(), session_evidence,
-            effective: session.closes_at_exclusive(), available_at,
+            observation: bar.clone(),
+            manifest: manifest.clone(),
+            session_evidence,
+            effective: session.closes_at_exclusive(),
+            available_at,
         });
     }
-    if points.windows(2).any(|pair| pair[0].effective >= pair[1].effective
-        || source_date(&pair[0]).ok() >= source_date(&pair[1]).ok()) {
+    if points.windows(2).any(|pair| {
+        pair[0].effective >= pair[1].effective
+            || source_date(&pair[0]).ok() >= source_date(&pair[1]).ok()
+    }) {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
     // Nominal selections already retain the exact complete history and source-issued epochs.
     // No duplicate revision-candidate array is needed by their coordinate lookup.
-    Ok(CohortSeries { points, candidates: Vec::new(), nominal_history: Some(history), completed_history: None,
-        nominal_calendar_manifest: Some(calendar.source_action_calendar().manifest().clone()), nominal_snapshot: Some(snapshot) })
+    Ok(CohortSeries {
+        points,
+        candidates: Vec::new(),
+        nominal_history: Some(history),
+        completed_history: None,
+        nominal_calendar_manifest: Some(calendar.source_action_calendar().manifest().clone()),
+        nominal_snapshot: Some(snapshot),
+    })
 }
 
 fn source_date(point: &MarketSeriesPoint) -> Result<CalendarDate, DatasetPreparationError> {
@@ -676,8 +882,8 @@ fn source_coordinate(point: &MarketSeriesPoint) -> ResearchTemporalCoordinate {
 struct CohortSeries {
     points: Vec<MarketSeriesPoint>,
     candidates: Vec<PointInTimeCandidate>,
-    nominal_history: Option<CompleteMarketBarHistoryOutput>,
-    completed_history: Option<CompleteMarketBarHistoryOutput>,
+    nominal_history: Option<CompleteMarketBarHistoryCursor>,
+    completed_history: Option<CompleteMarketBarHistoryCursor>,
     nominal_calendar_manifest: Option<DatasetManifestRef>,
     nominal_snapshot: Option<Timestamp>,
 }
@@ -704,8 +910,16 @@ async fn select_coordinate_sources(
         if series.nominal_snapshot != Some(cutoff) {
             return Err(DatasetPreparationError::InvalidEvidence);
         }
-        return indices.iter().map(|index| series.points.get(*index).cloned()
-            .ok_or(DatasetPreparationError::InvalidEvidence)).collect();
+        return indices
+            .iter()
+            .map(|index| {
+                series
+                    .points
+                    .get(*index)
+                    .cloned()
+                    .ok_or(DatasetPreparationError::InvalidEvidence)
+            })
+            .collect();
     }
     let families = indices
         .iter()
@@ -788,8 +1002,12 @@ async fn build_cohort(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<PreparedSourceCohort, DatasetPreparationError> {
-    let horizon = request.study.target_horizon().exact_elapsed()
-        .and_then(|value| i64::try_from(value.as_nanos()).ok()).filter(|value| *value > 0)
+    let horizon = request
+        .study
+        .target_horizon()
+        .exact_elapsed()
+        .and_then(|value| i64::try_from(value.as_nanos()).ok())
+        .filter(|value| *value > 0)
         .ok_or(DatasetPreparationError::InvalidSelection)?;
     let training = request.study.purpose() == DatasetBuildPurpose::Training;
     let contract = if training {
@@ -831,21 +1049,33 @@ async fn build_cohort(
         .timestamp_boundaries()
         .ok_or(DatasetPreparationError::InvalidSelection)?;
     let instruments = std::iter::once(request.subject_instrument)
-        .chain(request.benchmark.as_ref().map(|(instrument, _)| *instrument)).collect::<Vec<_>>();
+        .chain(
+            request
+                .benchmark
+                .as_ref()
+                .map(|(instrument, _)| *instrument),
+        )
+        .collect::<Vec<_>>();
     if sources.len() != instruments.len() || sources.is_empty() {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
-    if request.event.is_some() && sources.len() == 2
-        && sources[0].nominal_history.is_some() != sources[1].nominal_history.is_some() {
+    if request.event.is_some()
+        && sources.len() == 2
+        && sources[0].nominal_history.is_some() != sources[1].nominal_history.is_some()
+    {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
     let mut coverage = super::probability::ProbabilityCohortCoverage::default();
     let mut all_parents = Vec::new();
     push_parent(&mut all_parents, &request.subject_manifest)?;
-    if let Some((_, manifest)) = &request.benchmark { push_parent(&mut all_parents, manifest)?; }
+    if let Some((_, manifest)) = &request.benchmark {
+        push_parent(&mut all_parents, manifest)?;
+    }
     if let Some(evaluation) = &request.costs {
         push_parent(&mut all_parents, evaluation.dataset_manifest())?;
-        for row in evaluation.results() { push_parent(&mut all_parents, row.source_manifest())?; }
+        for row in evaluation.results() {
+            push_parent(&mut all_parents, row.source_manifest())?;
+        }
     }
     for source in sources {
         match (&source.nominal_history, &source.nominal_calendar_manifest) {
@@ -858,10 +1088,17 @@ async fn build_cohort(
         }
     }
     if let Some(plan) = source_plan {
-        let coverage = plan.source_split_admission().ok_or(DatasetPreparationError::InvalidEvidence)?;
-        for manifest in coverage.source_manifests() { push_parent(&mut all_parents, manifest)?; }
+        let coverage = plan
+            .source_split_admission()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        for manifest in coverage.source_manifests() {
+            push_parent(&mut all_parents, manifest)?;
+        }
     }
-    let actions = instruments.iter().map(|instrument| support.actions_for(*instrument)).collect::<Vec<_>>();
+    let actions = instruments
+        .iter()
+        .map(|instrument| support.actions_for(*instrument))
+        .collect::<Vec<_>>();
     for candidate in actions.iter().flatten() {
         push_parent(&mut all_parents, candidate.source_manifest())?;
     }
@@ -872,15 +1109,27 @@ async fn build_cohort(
         {
             continue;
         }
-        let benchmark_index = sources.get(1).and_then(|source|
-            source.binary_search_by_key(&current.effective, |point| point.effective).ok()).filter(|index| *index > 0);
+        let benchmark_index = sources
+            .get(1)
+            .and_then(|source| {
+                source
+                    .binary_search_by_key(&current.effective, |point| point.effective)
+                    .ok()
+            })
+            .filter(|index| *index > 0);
         if request.event.is_none() && sources.len() == 2 && benchmark_index.is_none() {
             return Err(DatasetPreparationError::InvalidEvidence);
         }
         let decision = match request.study.basis() {
-            HistoricalStudyBasis::HistoricalAsKnown => if request.event.is_none() {
-                benchmark_index.map_or(current.available_at, |index| current.available_at.max(sources[1][index].available_at))
-            } else { current.available_at },
+            HistoricalStudyBasis::HistoricalAsKnown => {
+                if request.event.is_none() {
+                    benchmark_index.map_or(current.available_at, |index| {
+                        current.available_at.max(sources[1][index].available_at)
+                    })
+                } else {
+                    current.available_at
+                }
+            }
             HistoricalStudyBasis::RetrospectiveFrozenSnapshot => current
                 .effective
                 .checked_add_nanos(
@@ -910,8 +1159,13 @@ async fn build_cohort(
             return Err(DatasetPreparationError::Capacity);
         }
     }
-    if coordinates.is_empty() { return Err(if request.event.is_some() { DatasetPreparationError::Unavailable }
-        else { DatasetPreparationError::InvalidEvidence }); }
+    if coordinates.is_empty() {
+        return Err(if request.event.is_some() {
+            DatasetPreparationError::Unavailable
+        } else {
+            DatasetPreparationError::InvalidEvidence
+        });
+    }
     coverage.original_origins = coordinates.len();
     if let Some(evaluation) = &request.costs {
         if evaluation.results().len() != coordinates.len() {
@@ -920,12 +1174,19 @@ async fn build_cohort(
         let mut observed_origins = BTreeSet::new();
         for row in evaluation.results() {
             check_control(deadline, cancellation)?;
-            let index = coordinates.binary_search_by_key(&Some(row.target_origin()), |(indices, _, _)|
-                indices[0].and_then(|index| sources[0].get(index)).map(|point| point.effective))
+            let index = coordinates
+                .binary_search_by_key(&Some(row.target_origin()), |(indices, _, _)| {
+                    indices[0]
+                        .and_then(|index| sources[0].get(index))
+                        .map(|point| point.effective)
+                })
                 .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-            if !observed_origins.insert(row.target_origin()) || row.instrument_id() != request.subject_instrument
+            if !observed_origins.insert(row.target_origin())
+                || row.instrument_id() != request.subject_instrument
                 || row.source_manifest() != &request.subject_manifest
-                || row.decision_at() != coordinates[index].1 || row.target_at() != coordinates[index].2 {
+                || row.decision_at() != coordinates[index].1
+                || row.target_at() != coordinates[index].2
+            {
                 return Err(DatasetPreparationError::InvalidEvidence);
             }
         }
@@ -959,7 +1220,10 @@ async fn build_cohort(
         push_parent(&mut all_parents, &membership.manifest)?;
         memberships.push(membership);
     }
-    if memberships.iter().any(|membership| membership.universe_id != memberships[0].universe_id) {
+    if memberships
+        .iter()
+        .any(|membership| membership.universe_id != memberships[0].universe_id)
+    {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
     let mut macro_parents = Vec::new();
@@ -974,7 +1238,10 @@ async fn build_cohort(
         } else {
             request.study.snapshot_as_of()
         };
-        let key = (cutoff, source_date(&sources[0][indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?])?);
+        let key = (
+            cutoff,
+            source_date(&sources[0][indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?])?,
+        );
         if !macros.contains_key(&key) {
             let vector = read_macro_feature_vector(
                 &authority.macro_context,
@@ -1021,16 +1288,30 @@ async fn build_cohort(
     identity.update(b"market-squawk/predeclared-recommendation-cohort/v1");
     identity.update(horizon.to_be_bytes());
     identity.update(request.subject_instrument.as_uuid().as_bytes());
-    if let Some((instrument, _)) = &request.benchmark { identity.update(instrument.as_uuid().as_bytes()); }
-    if let Some(event) = request.event {
-        identity.update(b"probability-event/v1"); identity.update(event.digest().bytes());
-        for (indices, decision, target) in &coordinates {
-            identity.update(sources[0][indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?].effective.unix_nanos().to_be_bytes());
-            identity.update(decision.unix_nanos().to_be_bytes()); identity.update(target.unix_nanos().to_be_bytes());
-        }
-        if let Some(evaluation) = &request.costs { identity.update(evaluation.cohort_digest().bytes()); }
+    if let Some((instrument, _)) = &request.benchmark {
+        identity.update(instrument.as_uuid().as_bytes());
     }
-    if let Some(event)=request.probability_subject {identity.update(b"probability-subject/v1");identity.update(event.digest().bytes());}
+    if let Some(event) = request.event {
+        identity.update(b"probability-event/v1");
+        identity.update(event.digest().bytes());
+        for (indices, decision, target) in &coordinates {
+            identity.update(
+                sources[0][indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?]
+                    .effective
+                    .unix_nanos()
+                    .to_be_bytes(),
+            );
+            identity.update(decision.unix_nanos().to_be_bytes());
+            identity.update(target.unix_nanos().to_be_bytes());
+        }
+        if let Some(evaluation) = &request.costs {
+            identity.update(evaluation.cohort_digest().bytes());
+        }
+    }
+    if let Some(event) = request.probability_subject {
+        identity.update(b"probability-subject/v1");
+        identity.update(event.digest().bytes());
+    }
     identity.update(request.population_starts_at.unix_nanos().to_be_bytes());
     identity.update(request.population_ends_at.unix_nanos().to_be_bytes());
     identity.update(request.study.snapshot_as_of().unix_nanos().to_be_bytes());
@@ -1074,60 +1355,116 @@ async fn build_cohort(
             // The common population and all parents have already been frozen. A model's own
             // Training export contains only its predeclared partitions; StudyInputs keeps every
             // original coordinate and therefore must admit its complete source-known interval.
-            None if training => { coverage.outside_partitions += 1; continue; },
+            None if training => {
+                coverage.outside_partitions += 1;
+                continue;
+            }
             None => return Err(DatasetPreparationError::InvalidEvidence),
         };
-        if sources.len() == 2 && (indices[1].is_none() || (request.event.is_some()
-            && (sources[1][indices[1].ok_or(DatasetPreparationError::InvalidEvidence)?].available_at > source_cutoff
-                || sources[1][indices[1].ok_or(DatasetPreparationError::InvalidEvidence)? - 1].available_at > source_cutoff
-                || sources[0][indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?].observation.currency()
-                    != sources[1][indices[1].ok_or(DatasetPreparationError::InvalidEvidence)?].observation.currency()))) {
-            coverage.missing_benchmark += 1; continue;
+        if sources.len() == 2
+            && (indices[1].is_none()
+                || (request.event.is_some()
+                    && (sources[1][indices[1].ok_or(DatasetPreparationError::InvalidEvidence)?]
+                        .available_at
+                        > source_cutoff
+                        || sources[1]
+                            [indices[1].ok_or(DatasetPreparationError::InvalidEvidence)? - 1]
+                            .available_at
+                            > source_cutoff
+                        || sources[0]
+                            [indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?]
+                        .observation
+                        .currency()
+                            != sources[1]
+                                [indices[1].ok_or(DatasetPreparationError::InvalidEvidence)?]
+                            .observation
+                            .currency())))
+        {
+            coverage.missing_benchmark += 1;
+            continue;
         }
-        let terminals = (0..sources.len()).map(|lane| {
-            if training {
-                sources[lane]
-                    .binary_search_by_key(target, |point| point.effective)
-                    .ok()
-            } else {
-                None
-            }
-        }).collect::<Vec<_>>();
+        let terminals = (0..sources.len())
+            .map(|lane| {
+                if training {
+                    sources[lane]
+                        .binary_search_by_key(target, |point| point.effective)
+                        .ok()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         let cost = if let Some(evaluation) = &request.costs {
-            let origin = sources[0][indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?].effective;
-            let Some(value) = super::probability::cost_attestation(evaluation, request.subject_instrument,
-                origin, *target, *decision, source_cutoff)? else {
-                coverage.unavailable_cost_outcome += 1; continue;
+            let origin =
+                sources[0][indices[0].ok_or(DatasetPreparationError::InvalidEvidence)?].effective;
+            let Some(value) = super::probability::cost_attestation(
+                evaluation,
+                request.subject_instrument,
+                origin,
+                *target,
+                *decision,
+                source_cutoff,
+            )?
+            else {
+                coverage.unavailable_cost_outcome += 1;
+                continue;
             };
             Some(value)
-        } else { None };
+        } else {
+            None
+        };
         let label_cutoff = if training {
-            let Some(subject_terminal) = terminals[0] else { coverage.missing_subject_terminal += 1; continue; };
-            if terminals.iter().skip(1).any(Option::is_none) { coverage.missing_benchmark += 1; continue; }
+            let Some(subject_terminal) = terminals[0] else {
+                coverage.missing_subject_terminal += 1;
+                continue;
+            };
+            if terminals.iter().skip(1).any(Option::is_none) {
+                coverage.missing_benchmark += 1;
+                continue;
+            }
             let mut actual_known = sources[0][subject_terminal].available_at;
             for lane in 1..sources.len() {
-                actual_known = actual_known.max(sources[lane][terminals[lane].ok_or(DatasetPreparationError::InvalidEvidence)?].available_at);
+                actual_known = actual_known.max(
+                    sources[lane]
+                        [terminals[lane].ok_or(DatasetPreparationError::InvalidEvidence)?]
+                    .available_at,
+                );
             }
-            if let Some(value) = &cost { actual_known = actual_known.max(value.label_available_at); }
+            if let Some(value) = &cost {
+                actual_known = actual_known.max(value.label_available_at);
+            }
             let known = if request.study.basis() == HistoricalStudyBasis::HistoricalAsKnown {
                 actual_known
             } else {
                 request.study.snapshot_as_of()
             };
-            let window_end = if let Some(market_squawk_data::ProbabilityEventTarget::ProfitAfterCosts { policy }) = request.event {
-                target.checked_add_nanos(policy.maximum_exit_lag_nanos).map_err(|_| DatasetPreparationError::InvalidEvidence)?
-            } else { *target };
+            let window_end =
+                if let Some(market_squawk_data::ProbabilityEventTarget::ProfitAfterCosts {
+                    policy,
+                }) = request.event
+                {
+                    target
+                        .checked_add_nanos(policy.maximum_exit_lag_nanos)
+                        .map_err(|_| DatasetPreparationError::InvalidEvidence)?
+                } else {
+                    *target
+                };
             let purge = if request.study.basis() == HistoricalStudyBasis::HistoricalAsKnown {
                 known.max(window_end)
-            } else { window_end };
+            } else {
+                window_end
+            };
             if purge > boundaries[partition]
                 || *target > request.study.snapshot_as_of()
                 || known > request.study.snapshot_as_of()
             {
-                coverage.boundary_censored += 1; continue;
+                coverage.boundary_censored += 1;
+                continue;
             }
             Some(known)
-        } else { None };
+        } else {
+            None
+        };
         let mut coordinate_examples = Vec::with_capacity(sources.len());
         let mut comparison_currency = None;
         for lane in 0..sources.len() {
@@ -1147,35 +1484,43 @@ async fn build_cohort(
             if request.event.is_some() {
                 let currency = current.observation.currency();
                 if prior.observation.currency() != currency
-                    || comparison_currency.is_some_and(|value| value != currency) {
+                    || comparison_currency.is_some_and(|value| value != currency)
+                {
                     return Err(DatasetPreparationError::InvalidEvidence);
                 }
                 comparison_currency = Some(currency);
             }
-            let valuation_cutoff =
-                if sources[lane].completed_history.is_some() {
-                    current.effective
-                } else if request.study.basis() == HistoricalStudyBasis::HistoricalAsKnown {
-                    source_cutoff
-                } else {
-                    *decision
-                };
+            let valuation_cutoff = if sources[lane].completed_history.is_some() {
+                current.effective
+            } else if request.study.basis() == HistoricalStudyBasis::HistoricalAsKnown {
+                source_cutoff
+            } else {
+                *decision
+            };
             let feature_plan = if source_plan.is_some() {
-                super::project_source_price_plan(source_plan.ok_or(DatasetPreparationError::InvalidEvidence)?,
-                    instruments[lane], source_cutoff, valuation_cutoff, prior, current, deadline, cancellation)?
+                super::project_source_price_plan(
+                    source_plan.ok_or(DatasetPreparationError::InvalidEvidence)?,
+                    instruments[lane],
+                    source_cutoff,
+                    valuation_cutoff,
+                    prior,
+                    current,
+                    deadline,
+                    cancellation,
+                )?
             } else {
                 action_plan(
-                &actions[lane],
-                pit,
-                adjustment,
-                valuation_cutoff,
-                source_cutoff,
-                ResearchTemporalCoordinate::exact(*decision),
-                None,
-                deadline,
-                cancellation,
-            )
-            .await?
+                    &actions[lane],
+                    pit,
+                    adjustment,
+                    valuation_cutoff,
+                    source_cutoff,
+                    ResearchTemporalCoordinate::exact(*decision),
+                    None,
+                    deadline,
+                    cancellation,
+                )
+                .await?
             };
             let feature_return = split_adjusted_return(prior, current, &feature_plan)?;
             let feature = return_component(
@@ -1214,7 +1559,9 @@ async fn build_cohort(
                 )
                 .await?;
                 let terminal = &selected_terminal[0];
-                if request.event.is_some() && terminal.observation.currency() != current.observation.currency() {
+                if request.event.is_some()
+                    && terminal.observation.currency() != current.observation.currency()
+                {
                     return Err(DatasetPreparationError::InvalidEvidence);
                 }
                 let valuation_cutoff =
@@ -1224,21 +1571,29 @@ async fn build_cohort(
                         *target
                     };
                 let plan = if source_plan.is_some() {
-                    super::project_source_price_plan(source_plan.ok_or(DatasetPreparationError::InvalidEvidence)?,
-                        instruments[lane], known, valuation_cutoff, current, terminal, deadline, cancellation)?
+                    super::project_source_price_plan(
+                        source_plan.ok_or(DatasetPreparationError::InvalidEvidence)?,
+                        instruments[lane],
+                        known,
+                        valuation_cutoff,
+                        current,
+                        terminal,
+                        deadline,
+                        cancellation,
+                    )?
                 } else {
                     action_plan(
-                    &actions[lane],
-                    pit,
-                    adjustment,
-                    valuation_cutoff,
-                    known,
-                    ResearchTemporalCoordinate::exact(*target),
-                    None,
-                    deadline,
-                    cancellation,
-                )
-                .await?
+                        &actions[lane],
+                        pit,
+                        adjustment,
+                        valuation_cutoff,
+                        known,
+                        ResearchTemporalCoordinate::exact(*target),
+                        None,
+                        deadline,
+                        cancellation,
+                    )
+                    .await?
                 };
                 let value = split_adjusted_return(current, terminal, &plan)?;
                 let label = return_component(
@@ -1279,22 +1634,42 @@ async fn build_cohort(
             let example_id = format!("cohort-{}-{coordinate:05}-{lane}", short_hex(identity));
             let example = if let Some(history) = &sources[lane].nominal_history {
                 let source_plan = source_plan.ok_or(DatasetPreparationError::InvalidEvidence)?;
-                history.try_nominal_daily_dataset_example(
-                    &example_id, source_date(current)?, request.study, components,
-                    deadline, cancellation,
-                ).and_then(|example| example.try_with_source_price_plan(Arc::clone(source_plan)))
+                history
+                    .try_nominal_daily_dataset_example(
+                        &example_id,
+                        source_date(current)?,
+                        request.study,
+                        components,
+                        deadline,
+                        cancellation,
+                    )
+                    .and_then(|example| example.try_with_source_price_plan(Arc::clone(source_plan)))
             } else if let Some(history) = &sources[lane].completed_history {
                 let source_plan = source_plan.ok_or(DatasetPreparationError::InvalidEvidence)?;
-                history.try_timestamp_history_dataset_example(&example_id, request.study, *decision, *target,
-                    components, deadline, cancellation)
+                history
+                    .try_timestamp_history_dataset_example(
+                        &example_id,
+                        request.study,
+                        *decision,
+                        *target,
+                        components,
+                        deadline,
+                        cancellation,
+                    )
                     .and_then(|example| example.try_with_source_price_plan(Arc::clone(source_plan)))
             } else {
                 DatasetExample::try_new_with_temporal_cutoffs(
-                    example_id, instruments[lane], source_cutoff, label_cutoff, *decision,
+                    example_id,
+                    instruments[lane],
+                    source_cutoff,
+                    label_cutoff,
+                    *decision,
                     ResearchTemporalCoordinate::exact(current.effective),
-                    ResearchTemporalCoordinate::exact(*target), components,
+                    ResearchTemporalCoordinate::exact(*target),
+                    components,
                 )
-            }.map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+            }
+            .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
             coordinate_examples.push(example);
             feature_content.push(component_content_evidence(&feature));
             feature_audit.push(plan_audit_evidence(&feature_plan));
@@ -1311,52 +1686,105 @@ async fn build_cohort(
         }
         if let Some(event) = request.event {
             let benchmark = coordinate_examples.get(1).cloned();
-            let subject = coordinate_examples.into_iter().next().ok_or(DatasetPreparationError::InvalidEvidence)?;
-            let example = subject.try_derive_probability_label(event, benchmark.as_ref(), cost)
+            let subject = coordinate_examples
+                .into_iter()
+                .next()
+                .ok_or(DatasetPreparationError::InvalidEvidence)?;
+            let example = subject
+                .try_derive_probability_label(event, benchmark.as_ref(), cost)
                 .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-            let label = example.components().iter().find(|value| value.spec().kind() == ComponentKind::Label)
+            let label = example
+                .components()
+                .iter()
+                .find(|value| value.spec().kind() == ComponentKind::Label)
                 .ok_or(DatasetPreparationError::InvalidEvidence)?;
             label_content.push(component_content_evidence(label));
-            returns.push(evidence_digest(b"market-squawk/original-probability-event-output/v1", &[
-                EvidencePart::Sha256(event.digest()), EvidencePart::Digest(component_content_evidence(label)),
-            ]));
-            let features = example.components().iter().filter(|value| value.spec().kind() == ComponentKind::Feature).collect::<Vec<_>>();
+            returns.push(evidence_digest(
+                b"market-squawk/original-probability-event-output/v1",
+                &[
+                    EvidencePart::Sha256(event.digest()),
+                    EvidencePart::Digest(component_content_evidence(label)),
+                ],
+            ));
+            let features = example
+                .components()
+                .iter()
+                .filter(|value| value.spec().kind() == ComponentKind::Feature)
+                .collect::<Vec<_>>();
             let expected_names = std::iter::once(contract.feature_component_name())
-                .chain(contract.macro_components().iter().map(|value| value.component_name())).collect::<Vec<_>>();
-            if features.len() != expected_names.len() || expected_names.iter().any(|name|
-                features.iter().filter(|value| value.spec().name() == *name).count() != 1) {
+                .chain(
+                    contract
+                        .macro_components()
+                        .iter()
+                        .map(|value| value.component_name()),
+                )
+                .collect::<Vec<_>>();
+            if features.len() != expected_names.len()
+                || expected_names.iter().any(|name| {
+                    features
+                        .iter()
+                        .filter(|value| value.spec().name() == *name)
+                        .count()
+                        != 1
+                })
+            {
                 return Err(DatasetPreparationError::InvalidEvidence);
             }
             coverage.feature_count = expected_names.len();
-            if features.iter().all(|value| matches!(value.value(), ComponentValue::Decimal { .. })) {
+            if features
+                .iter()
+                .all(|value| matches!(value.value(), ComponentValue::Decimal { .. }))
+            {
                 let class = match label.value() {
                     ComponentValue::Decimal { value, .. } if *value == Decimal::ZERO => 0,
                     ComponentValue::Decimal { value, .. } if *value == Decimal::ONE => 1,
                     _ => return Err(DatasetPreparationError::InvalidEvidence),
                 };
                 coverage.complete_classes[partition][class] += 1;
-            } else { coverage.missing_features += 1; }
+            } else {
+                coverage.missing_features += 1;
+            }
             examples.push(example);
             split_counts[partition] += 1;
         } else {
-            split_counts[partition] += coordinate_examples.len(); examples.extend(coordinate_examples);
+            split_counts[partition] += coordinate_examples.len();
+            examples.extend(coordinate_examples);
         }
     }
-    coverage.retained_examples = examples.len(); coverage.split_counts = split_counts;
+    coverage.retained_examples = examples.len();
+    coverage.split_counts = split_counts;
     if request.event.is_some() {
-        let counts = [coverage.original_origins, coverage.outside_partitions, coverage.missing_subject_terminal,
-            coverage.missing_benchmark, coverage.unavailable_cost_outcome, coverage.boundary_censored, coverage.retained_examples];
+        let counts = [
+            coverage.original_origins,
+            coverage.outside_partitions,
+            coverage.missing_subject_terminal,
+            coverage.missing_benchmark,
+            coverage.unavailable_cost_outcome,
+            coverage.boundary_censored,
+            coverage.retained_examples,
+        ];
         if counts[1..].iter().sum::<usize>() != coverage.original_origins {
             return Err(DatasetPreparationError::InvalidEvidence);
         }
         let mut bytes = Vec::with_capacity(counts.len() * 8);
-        for count in counts.into_iter().chain(coverage.complete_classes.into_iter().flatten())
-            .chain([coverage.missing_features, coverage.feature_count]) { bytes.extend_from_slice(&(count as u64).to_be_bytes()); }
-        returns.push(evidence_digest(b"market-squawk/probability-original-cohort-coverage/v1", &[EvidencePart::Bytes(&bytes)]));
+        for count in counts
+            .into_iter()
+            .chain(coverage.complete_classes.into_iter().flatten())
+            .chain([coverage.missing_features, coverage.feature_count])
+        {
+            bytes.extend_from_slice(&(count as u64).to_be_bytes());
+        }
+        returns.push(evidence_digest(
+            b"market-squawk/probability-original-cohort-coverage/v1",
+            &[EvidencePart::Bytes(&bytes)],
+        ));
     }
     if examples.is_empty() || split_counts.contains(&0) {
-        return Err(if request.event.is_some() { DatasetPreparationError::Unavailable }
-            else { DatasetPreparationError::InvalidEvidence });
+        return Err(if request.event.is_some() {
+            DatasetPreparationError::Unavailable
+        } else {
+            DatasetPreparationError::InvalidEvidence
+        });
     }
     let mut specs = vec![feature_spec];
     for descriptor in contract.macro_components() {
@@ -1373,10 +1801,17 @@ async fn build_cohort(
     }
     if let Some(spec) = label_spec {
         specs.push(if let Some(event) = request.event {
-            FeatureLabelComponentSpec::try_new(ComponentKind::Label, ComponentScope::Instrument,
-                CorporateActionSensitivity::RequiresAdjustment, event.label_component_name(), std::num::NonZeroU32::MIN)
-                .map_err(|_| DatasetPreparationError::InvalidEvidence)?
-        } else { spec });
+            FeatureLabelComponentSpec::try_new(
+                ComponentKind::Label,
+                ComponentScope::Instrument,
+                CorporateActionSensitivity::RequiresAdjustment,
+                event.label_component_name(),
+                std::num::NonZeroU32::MIN,
+            )
+            .map_err(|_| DatasetPreparationError::InvalidEvidence)?
+        } else {
+            spec
+        });
     }
     let example_count = examples.len();
     let inputs = DatasetBuildInputs::try_new(
@@ -1390,18 +1825,30 @@ async fn build_cohort(
         examples,
     )
     .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-    let inputs=match request.probability_subject {
-        Some(event)=>inputs.try_with_probability_subject(event,request.subject_instrument)
-            .map_err(|_|DatasetPreparationError::InvalidEvidence)?,None=>inputs,
+    let inputs = match request.probability_subject {
+        Some(event) => inputs
+            .try_with_probability_subject(event, request.subject_instrument)
+            .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
+        None => inputs,
     };
     let policy = DatasetBuildPolicy::new(
         request.split,
         pit,
         adjustment,
-        if request.event.is_some() || request.probability_subject.is_some() {MissingValuePolicy::Preserve}else{MissingValuePolicy::Reject},
-        SourceIdentifier::try_from(request.event.map_or(contract, |event|
-            super::probability::event_contract(event, DatasetPreparationUse::Train)).implementation_revision())
-            .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
+        if request.event.is_some() || request.probability_subject.is_some() {
+            MissingValuePolicy::Preserve
+        } else {
+            MissingValuePolicy::Reject
+        },
+        SourceIdentifier::try_from(
+            request
+                .event
+                .map_or(contract, |event| {
+                    super::probability::event_contract(event, DatasetPreparationUse::Train)
+                })
+                .implementation_revision(),
+        )
+        .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
         Some(request.study),
     );
     let aggregate = |domain, values: &Vec<_>| aggregate_evidence(domain, values);
@@ -1422,9 +1869,12 @@ async fn build_cohort(
         ),
         instrument_population_query: aggregate_evidence(
             b"market-squawk/cohort-population-query/v1",
-            &instruments.iter().map(|instrument| {
-                instrument_population_query_evidence(*instrument, first_source, last_source)
-            }).collect::<Vec<_>>(),
+            &instruments
+                .iter()
+                .map(|instrument| {
+                    instrument_population_query_evidence(*instrument, first_source, last_source)
+                })
+                .collect::<Vec<_>>(),
         ),
         instrument_population_receipt: aggregate_evidence(
             b"market-squawk/cohort-population-receipt/v1",
@@ -1454,5 +1904,12 @@ async fn build_cohort(
             .then(|| aggregate(b"market-squawk/label-pit-audit-set/v1", &label_audit)),
         return_kernel_output: aggregate(b"market-squawk/return-kernel-output-set/v1", &returns),
     };
-    Ok(PreparedSourceCohort { identity, inputs, policy, examples: example_count, evidence, coverage })
+    Ok(PreparedSourceCohort {
+        identity,
+        inputs,
+        policy,
+        examples: example_count,
+        evidence,
+        coverage,
+    })
 }

@@ -6,7 +6,7 @@ use crate::application::market_calendar::{
     CompletedMarketSessionReadCapability, CompletedMarketSessionReference,
 };
 use market_squawk_data::{
-    CompleteMarketBarHistoryOutput, LatestCanonicalMarketBarHistoryWindowRequest,
+    CompleteMarketBarHistoryCursor, LatestCanonicalMarketBarHistoryWindowRequest,
     MarketHistorySelectionPolicy,
 };
 
@@ -120,7 +120,7 @@ pub(in crate::application::research) fn check_selection_control(
 pub(super) async fn rejoin_source_with_original_calendar(
     research: &crate::ResearchService,
     calendars: &CompletedMarketSessionReadCapability,
-    history: CompleteMarketBarHistoryOutput,
+    history: CompleteMarketBarHistoryCursor,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<TiingoCompletedEodActionRead, EquityPremiumReadError> {
@@ -172,7 +172,7 @@ pub(super) async fn read_annual_source_superset(
     end: CalendarDate,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<CompleteMarketBarHistoryOutput, EquityPremiumReadError> {
+) -> Result<CompleteMarketBarHistoryCursor, EquityPremiumReadError> {
     check_selection_control(deadline, cancellation)?;
     let reader = research.analytical_reader();
     let request = LatestCanonicalMarketBarHistoryWindowRequest::try_new(
@@ -205,7 +205,7 @@ pub(super) async fn read_annual_source_superset(
         .clone();
     let history = research
         .analytical_reader()
-        .read_canonical_market_bar_history(exact, deadline, cancellation.child_token())
+        .read_canonical_market_bar_history_cursor(exact, deadline, cancellation.child_token())
         .await
         .map_err(map_read_error)?
         .ok_or(EquityPremiumUnavailable::AnnualHistoryNotPublished)?;

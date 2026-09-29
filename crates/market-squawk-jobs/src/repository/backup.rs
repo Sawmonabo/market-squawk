@@ -639,7 +639,10 @@ pub(super) fn verify_database(connection: &Connection) -> Result<(), JobReposito
         .map_err(map_sql)?;
     if application_id != JOB_DATABASE_APPLICATION_ID
         || user_version != SCHEMA_VERSION
-        || objects.as_deref() != Some("table:job_events,table:job_start_requests,table:jobs")
+        || objects.as_deref()
+            != Some(
+                "index:jobs_kind_identity,table:job_backtest_tokens,table:job_events,table:job_list_revision,table:job_start_requests,table:jobs,trigger:jobs_list_revision_delete,trigger:jobs_list_revision_insert,trigger:jobs_list_revision_update",
+            )
         || integrity != "ok"
         || foreign_key_violation.is_some()
     {
@@ -773,6 +776,12 @@ fn restore_fresh_blocking(
                 ],
             )
             .map_err(map_sql)?;
+        super::engine::register_backtest_token(
+            &transaction,
+            snapshot.id(),
+            snapshot.generation(),
+            snapshot.spec().kind().as_str(),
+        )?;
     }
     for record in &envelope.payload.events {
         let event: JobEvent = record.event.clone().try_into()?;

@@ -5,11 +5,194 @@ use chrono::Datelike as _;
 use market_squawk_adapter_alpaca::{
     AlpacaAuthenticatedCalendarRequest, AlpacaRetainedCalendarSessions, AlpacaTradingApiEnvironment,
 };
-use market_squawk_data::CompleteMarketBarHistoryOutput;
+use market_squawk_data::{
+    AnalyticalReadError, CompleteMarketBarHistoryCursor, CompleteMarketBarHistoryOutput,
+    CompleteMarketBarHistoryReadReceipt, CompleteMarketBarHistorySelection,
+    RetainedCorporateActionCalendar, RetainedHistoryNativeSessions,
+};
 use market_squawk_domain::{CalendarDate, DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::SealedProviderCaptureSetReceipt;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+/// Existing sealed data reads share the same native-source validators; no caller rows enter here.
+pub(crate) trait NativeSessionHistory: Send + Sync + 'static + Sized {
+    fn selection(&self) -> &CompleteMarketBarHistorySelection;
+    fn read_receipt(&self) -> &CompleteMarketBarHistoryReadReceipt;
+    fn native_sessions(&self) -> Option<&RetainedHistoryNativeSessions>;
+    fn into_native_cursor(
+        self,
+        service: &market_squawk_data::AnalyticalDataService,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<CompleteMarketBarHistoryCursor, AnalyticalReadError>;
+    fn bar_count(&self) -> usize;
+    fn bars(
+        &self,
+    ) -> Box<
+        dyn Iterator<Item = Result<market_squawk_domain::MarketBarObservation, AnalyticalReadError>>
+            + '_,
+    >;
+    fn source_actions(
+        &self,
+    ) -> Box<
+        dyn Iterator<
+                Item = Result<
+                    market_squawk_domain::CorporateActionObservation,
+                    AnalyticalReadError,
+                >,
+            > + '_,
+    >;
+    fn ordinary_evidence(
+        &self,
+    ) -> Result<
+        market_squawk_data::CompletedOrdinaryHistoryEvidence,
+        market_squawk_data::CorporateActionError,
+    >;
+
+    fn try_with_native_sessions(
+        self,
+        replay: AlpacaRetainedCalendarSessions,
+        control: &dyn market_squawk_platform::ResearchObjectControl,
+    ) -> Result<Self, AnalyticalReadError>;
+    fn try_with_nominal_native_sessions(
+        self,
+        calendar: &RetainedCorporateActionCalendar,
+        control: &dyn market_squawk_platform::ResearchObjectControl,
+    ) -> Result<Self, AnalyticalReadError>;
+}
+impl NativeSessionHistory for CompleteMarketBarHistoryOutput {
+    fn selection(&self) -> &CompleteMarketBarHistorySelection {
+        CompleteMarketBarHistoryOutput::selection(self)
+    }
+    fn read_receipt(&self) -> &CompleteMarketBarHistoryReadReceipt {
+        CompleteMarketBarHistoryOutput::read_receipt(self)
+    }
+    fn native_sessions(&self) -> Option<&RetainedHistoryNativeSessions> {
+        CompleteMarketBarHistoryOutput::native_sessions(self)
+    }
+    fn bar_count(&self) -> usize {
+        self.bars().len()
+    }
+    fn bars(
+        &self,
+    ) -> Box<
+        dyn Iterator<Item = Result<market_squawk_domain::MarketBarObservation, AnalyticalReadError>>
+            + '_,
+    > {
+        Box::new(self.bars().iter().cloned().map(Ok))
+    }
+    fn source_actions(
+        &self,
+    ) -> Box<
+        dyn Iterator<
+                Item = Result<
+                    market_squawk_domain::CorporateActionObservation,
+                    AnalyticalReadError,
+                >,
+            > + '_,
+    > {
+        Box::new(self.source_actions().iter().cloned().map(Ok))
+    }
+    fn ordinary_evidence(
+        &self,
+    ) -> Result<
+        market_squawk_data::CompletedOrdinaryHistoryEvidence,
+        market_squawk_data::CorporateActionError,
+    > {
+        market_squawk_data::CompletedOrdinaryHistoryEvidence::try_from_history(self)
+    }
+    fn into_native_cursor(
+        self,
+        service: &market_squawk_data::AnalyticalDataService,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<CompleteMarketBarHistoryCursor, AnalyticalReadError> {
+        self.into_cursor(
+            std::sync::Arc::new(service.operation_scratch()?),
+            deadline,
+            cancellation,
+        )
+    }
+    fn try_with_native_sessions(
+        self,
+        replay: AlpacaRetainedCalendarSessions,
+        control: &dyn market_squawk_platform::ResearchObjectControl,
+    ) -> Result<Self, AnalyticalReadError> {
+        CompleteMarketBarHistoryOutput::try_with_native_sessions(self, replay, control)
+    }
+    fn try_with_nominal_native_sessions(
+        self,
+        calendar: &RetainedCorporateActionCalendar,
+        control: &dyn market_squawk_platform::ResearchObjectControl,
+    ) -> Result<Self, AnalyticalReadError> {
+        CompleteMarketBarHistoryOutput::try_with_nominal_native_sessions(self, calendar, control)
+    }
+}
+impl NativeSessionHistory for CompleteMarketBarHistoryCursor {
+    fn selection(&self) -> &CompleteMarketBarHistorySelection {
+        CompleteMarketBarHistoryCursor::selection(self)
+    }
+    fn read_receipt(&self) -> &CompleteMarketBarHistoryReadReceipt {
+        CompleteMarketBarHistoryCursor::read_receipt(self)
+    }
+    fn native_sessions(&self) -> Option<&RetainedHistoryNativeSessions> {
+        CompleteMarketBarHistoryCursor::native_sessions(self)
+    }
+    fn bar_count(&self) -> usize {
+        self.bar_count()
+    }
+    fn bars(
+        &self,
+    ) -> Box<
+        dyn Iterator<Item = Result<market_squawk_domain::MarketBarObservation, AnalyticalReadError>>
+            + '_,
+    > {
+        Box::new(self.bars())
+    }
+    fn source_actions(
+        &self,
+    ) -> Box<
+        dyn Iterator<
+                Item = Result<
+                    market_squawk_domain::CorporateActionObservation,
+                    AnalyticalReadError,
+                >,
+            > + '_,
+    > {
+        Box::new(self.source_actions())
+    }
+    fn ordinary_evidence(
+        &self,
+    ) -> Result<
+        market_squawk_data::CompletedOrdinaryHistoryEvidence,
+        market_squawk_data::CorporateActionError,
+    > {
+        market_squawk_data::CompletedOrdinaryHistoryEvidence::try_from_cursor(self)
+    }
+    fn into_native_cursor(
+        self,
+        _service: &market_squawk_data::AnalyticalDataService,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> Result<CompleteMarketBarHistoryCursor, AnalyticalReadError> {
+        Ok(self)
+    }
+    fn try_with_native_sessions(
+        self,
+        replay: AlpacaRetainedCalendarSessions,
+        control: &dyn market_squawk_platform::ResearchObjectControl,
+    ) -> Result<Self, AnalyticalReadError> {
+        CompleteMarketBarHistoryCursor::try_with_native_sessions(self, replay, control)
+    }
+    fn try_with_nominal_native_sessions(
+        self,
+        calendar: &RetainedCorporateActionCalendar,
+        control: &dyn market_squawk_platform::ResearchObjectControl,
+    ) -> Result<Self, AnalyticalReadError> {
+        CompleteMarketBarHistoryCursor::try_with_nominal_native_sessions(self, calendar, control)
+    }
+}
 
 /// Borrowed immutable coordinates from one of the two privately constructed calendar reads.
 struct NativeSessionCalendar<'a> {
@@ -25,13 +208,15 @@ impl ResearchService {
     /// Associates source-native dates only with the exact already-reopened calendar retained by
     /// the original price publication. This supplies named-session simulated clocks, never a
     /// provider observation timestamp or a historical ticker-continuity assertion.
-    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar(
+    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar<
+        H: NativeSessionHistory,
+    >(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         calendar: &crate::application::market_calendar::CompletedMarketSessionRead,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         self.rejoin_market_history_native_sessions_with_calendar_with_job_context(
             output,
             calendar,
@@ -42,14 +227,16 @@ impl ResearchService {
         .await
     }
 
-    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar_for_job(
+    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar_for_job<
+        H: NativeSessionHistory,
+    >(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         calendar: &crate::application::market_calendar::CompletedMarketSessionRead,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: &market_squawk_jobs::JobRunContext,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         self.rejoin_market_history_native_sessions_with_calendar_with_job_context(
             output,
             calendar,
@@ -60,14 +247,16 @@ impl ResearchService {
         .await
     }
 
-    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar_with_job_context(
+    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar_with_job_context<
+        H: NativeSessionHistory,
+    >(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         calendar: &crate::application::market_calendar::CompletedMarketSessionRead,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         let calendar = NativeSessionCalendar {
             reference: calendar.reference(),
             calendar_id: calendar.calendar_id(),
@@ -87,14 +276,16 @@ impl ResearchService {
     }
 
     /// Original historical replay only; this accepts no live authority or publication guard.
-    pub(crate) async fn rejoin_market_history_native_sessions_with_retained_calendar_with_job_context(
+    pub(crate) async fn rejoin_market_history_native_sessions_with_retained_calendar_with_job_context<
+        H: NativeSessionHistory,
+    >(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         calendar: &crate::application::market_calendar::RetainedMarketSessionRead,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         let calendar = NativeSessionCalendar {
             reference: calendar.reference(),
             calendar_id: calendar.calendar_id(),
@@ -113,14 +304,16 @@ impl ResearchService {
         .await
     }
 
-    async fn rejoin_market_history_native_sessions_with_original_calendar(
+    async fn rejoin_market_history_native_sessions_with_original_calendar<
+        H: NativeSessionHistory,
+    >(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         calendar: NativeSessionCalendar<'_>,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         let invalid = || ResearchServiceError::IngestAuthorityMismatch;
         let receipt = output.selection().receipt();
         if receipt.requested_range().is_some() {
@@ -190,12 +383,12 @@ impl ResearchService {
     /// Rejoins native sessions from the exact creating generation through the existing bounded
     /// raw worker. Unsupported source associations remain explicitly unattached; consumers that
     /// require native execution sessions must reject that state.
-    pub(crate) async fn rejoin_market_history_native_sessions(
+    pub(crate) async fn rejoin_market_history_native_sessions<H: NativeSessionHistory>(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         self.rejoin_market_history_native_sessions_with_job_context(
             output,
             deadline,
@@ -205,13 +398,13 @@ impl ResearchService {
         .await
     }
 
-    pub(crate) async fn rejoin_market_history_native_sessions_for_job(
+    pub(crate) async fn rejoin_market_history_native_sessions_for_job<H: NativeSessionHistory>(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: &market_squawk_jobs::JobRunContext,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         self.rejoin_market_history_native_sessions_with_job_context(
             output,
             deadline,
@@ -221,13 +414,15 @@ impl ResearchService {
         .await
     }
 
-    pub(crate) async fn rejoin_market_history_native_sessions_with_job_context(
+    pub(crate) async fn rejoin_market_history_native_sessions_with_job_context<
+        H: NativeSessionHistory,
+    >(
         &self,
-        output: CompleteMarketBarHistoryOutput,
+        output: H,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<H, ResearchServiceError> {
         if output.native_sessions().is_some() {
             return Ok(output);
         }

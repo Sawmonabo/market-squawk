@@ -359,7 +359,10 @@ impl InstalledMarketEvidence {
         models: Option<&ForecastPreparationCatalog>,
     ) -> Result<TypedToolResult, ServiceError> {
         let profile = revalidate(&input.financial_profile, models)?;
-        if input.share_origin_unix_nanos.is_some() && input.purpose != PreparationPurpose::CurrentMarket {
+        if (input.share_origin_unix_nanos.is_some()
+            || input.original_knowledge_at_unix_nanos.is_some())
+            && input.purpose != PreparationPurpose::CurrentMarket
+        {
             return Err(ServiceError::InvalidRequest);
         }
         let unavailable = |instrument_id, reason| InvestmentPreparationResult::Unavailable {
@@ -370,6 +373,7 @@ impl InstalledMarketEvidence {
             prepared_at_unix_nanos: None,
             reference: None,
             source_action_reference: None,
+            fundamental_share_sources: None,
             sources: Vec::new(),
         };
         let selection_at =
@@ -457,24 +461,32 @@ impl InstalledMarketEvidence {
         // Options are bounded research context across the already selected investment horizon.
         // Acquire before source actions freeze the original analytical cutoff; reads stay pure.
         let option_range = if input.purpose == PreparationPurpose::InvestmentAnalysis
-            && matches!(identity.asset_class(), AssetClass::Equity | AssetClass::Fund)
-        {
+            && matches!(
+                identity.asset_class(),
+                AssetClass::Equity | AssetClass::Fund
+            ) {
             use chrono::Datelike as _;
-            let end = selection_at.checked_add_nanos(profile.recommendation_policy().horizon_nanos())
+            let end = selection_at
+                .checked_add_nanos(profile.recommendation_policy().horizon_nanos())
                 .map_err(|_| ServiceError::InvalidRequest)?;
             let date = |at: Timestamp| {
                 let civil = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(at.unix_nanos())
-                    .with_timezone(&chrono_tz::America::New_York).date_naive();
+                    .with_timezone(&chrono_tz::America::New_York)
+                    .date_naive();
                 market_squawk_domain::CalendarDate::new(
                     u16::try_from(civil.year()).map_err(|_| ServiceError::InvalidRequest)?,
                     u8::try_from(civil.month()).map_err(|_| ServiceError::InvalidRequest)?,
                     u8::try_from(civil.day()).map_err(|_| ServiceError::InvalidRequest)?,
-                ).map_err(|_| ServiceError::InvalidRequest)
+                )
+                .map_err(|_| ServiceError::InvalidRequest)
             };
-            Some(market_squawk_sources::OptionExpirationRange::try_new(
-                date(selection_at)?,
-                date(end)?,
-            ).map_err(|_| ServiceError::InvalidRequest)?)
+            Some(
+                market_squawk_sources::OptionExpirationRange::try_new(
+                    date(selection_at)?,
+                    date(end)?,
+                )
+                .map_err(|_| ServiceError::InvalidRequest)?,
+            )
         } else {
             None
         };
@@ -491,31 +503,49 @@ impl InstalledMarketEvidence {
                     .await?,
             );
         }
+        let mut fundamental_share_sources = None;
         let acquisition = if input.purpose == PreparationPurpose::InvestmentAnalysis {
             let acquired = self
                 .sources
-                .acquire(&identity_read, &self.calendars,
+                .acquire(
+                    &identity_read,
+                    &self.calendars,
                     input.benchmark_instrument_id,
                     context,
                 )
                 .await?;
             sources.extend(acquired.steps);
             Some((acquired.source_cutoff, acquired.source_action_reference))
-        } else if let Some(origin) = input.share_origin_unix_nanos.as_ref() {
-            let origin = parse_cutoff(origin)?;
-            let started = clock()?;
-            let acquired = self.sources.acquire_current_share_sources(
-                &identity_read, origin, &self.markets, &profile, context,
-            ).await;
-            let (cutoff, reference, outcome) = match acquired {
-                Ok((cutoff, reference)) => {
-                    let digest = reference_digest(&reference)?;
-                    (cutoff, Some(reference), Ok(digest))
-                }
-                Err(error) => (clock()?, None, Err(error)),
-            };
-            sources.push(SourcePreparationStep::from_attempt("current_share_actions", started, outcome, context)?);
-            Some((cutoff, reference))
+        } else if input.share_origin_unix_nanos.is_some()
+            || input.original_knowledge_at_unix_nanos.is_some()
+        {
+            let origin = input
+                .share_origin_unix_nanos
+                .as_deref()
+                .map(parse_cutoff)
+                .transpose()?;
+            let knowledge_at = input
+                .original_knowledge_at_unix_nanos
+                .as_deref()
+                .map(parse_cutoff)
+                .transpose()?;
+            if knowledge_at.is_some_and(|at| at > selection_at) {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let acquired = self
+                .sources
+                .acquire_current_investment_sources(
+                    &identity_read,
+                    origin,
+                    knowledge_at,
+                    &self.markets,
+                    &profile,
+                    context,
+                )
+                .await?;
+            sources.extend(acquired.steps);
+            fundamental_share_sources = acquired.fundamental_share_sources;
+            Some((acquired.cutoff, acquired.source_action_reference))
         } else {
             None
         };
@@ -620,7 +650,10 @@ impl InstalledMarketEvidence {
         ensure_live(context)?;
         // Options enrich equity/fund evidence; absent derivatives do not invalidate the underlying.
         // A failed original/identity/publication check has already returned a typed fatal error.
-        if sources.iter().all(|step| step.source == "option_context" || step.is_available()) {
+        if sources
+            .iter()
+            .all(|step| step.source == "option_context" || step.is_available())
+        {
             result(
                 InvestmentPreparationResult::Prepared {
                     scope: input.purpose.scope(),
@@ -629,6 +662,7 @@ impl InstalledMarketEvidence {
                     prepared_at_unix_nanos: prepared_at.unix_nanos().to_string(),
                     reference,
                     source_action_reference,
+                    fundamental_share_sources,
                     sources,
                 },
                 context,
@@ -643,6 +677,7 @@ impl InstalledMarketEvidence {
                     reason: PreparationUnavailableReason::SourceEvidenceUnavailable,
                     reference,
                     source_action_reference,
+                    fundamental_share_sources,
                     sources,
                 },
                 context,
@@ -654,6 +689,7 @@ impl InstalledMarketEvidence {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PrepareRequest {
+    original_knowledge_at_unix_nanos: Option<String>,
     share_origin_unix_nanos: Option<String>,
     benchmark_instrument_id: Option<InstrumentId>,
     find_member: Option<crate::application::decision::current_find::member::FindMemberContext>,
@@ -693,6 +729,7 @@ enum InvestmentPreparationResult {
         prepared_at_unix_nanos: String,
         reference: Option<CompletedMarketSessionReference>,
         source_action_reference: Option<SourceAppliedCorporateActionPlanReference>,
+        fundamental_share_sources: Option<String>,
         sources: Vec<SourcePreparationStep>,
     },
     Unavailable {
@@ -703,6 +740,7 @@ enum InvestmentPreparationResult {
         prepared_at_unix_nanos: Option<String>,
         reference: Option<CompletedMarketSessionReference>,
         source_action_reference: Option<SourceAppliedCorporateActionPlanReference>,
+        fundamental_share_sources: Option<String>,
         sources: Vec<SourcePreparationStep>,
     },
 }

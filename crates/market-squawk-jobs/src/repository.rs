@@ -9,9 +9,10 @@ use std::{
 use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_platform::JobDatabaseLocation;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::task::TaskTracker;
+use uuid::Uuid;
 
 mod backup;
 mod codec;
@@ -75,6 +76,7 @@ pub struct SqliteJobRepository {
 
 #[derive(Debug)]
 struct RepositoryInner {
+    cursor_epoch: Uuid,
     location: JobDatabaseLocation,
     config: JobRepositoryConfig,
     writer: mpsc::Sender<WriteCommand>,
@@ -161,6 +163,7 @@ impl SqliteJobRepository {
         });
         Ok(Self {
             inner: Arc::new(RepositoryInner {
+                cursor_epoch: Uuid::new_v4(),
                 location,
                 config,
                 writer,
@@ -168,6 +171,133 @@ impl SqliteJobRepository {
                 closing: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Reads only model activity through the existing transaction-fenced job authority.
+    pub async fn list_model_activity(
+        &self,
+        cursor: Option<&JobListCursor>,
+        limit: JobListPageLimit,
+    ) -> Result<JobListPage, JobRepositoryError> {
+        self.list_scope(
+            cursor,
+            limit,
+            "model",
+            &["model.training.v1", "model.forecast-generation.v1"],
+        )
+        .await
+    }
+
+    /// Reads only backtest activity through the existing transaction-fenced job authority.
+    pub async fn list_backtest_activity(
+        &self,
+        cursor: Option<&JobListCursor>,
+        limit: JobListPageLimit,
+    ) -> Result<JobListPage, JobRepositoryError> {
+        self.list_scope(cursor, limit, "backtest", &["analysis.backtest.v1"])
+            .await
+    }
+
+    /// Mints the same exact product identity retained by the backtest lookup index.
+    pub fn backtest_product_token(id: JobId, generation: JobGeneration) -> Uuid {
+        engine::backtest_product_token(id, generation)
+    }
+
+    /// Opens one exact backtest job generation through its persisted product identity.
+    pub async fn get_product_backtest(
+        &self,
+        token: Uuid,
+    ) -> Result<JobSnapshot, JobRepositoryError> {
+        self.read(move |connection| {
+            let bytes = connection.query_row("SELECT job.snapshot_json FROM job_backtest_tokens AS token
+                JOIN jobs AS job ON job.job_id=token.job_id AND job.generation=token.generation WHERE token.token=?1",
+                params![token.as_bytes().as_slice()], |row| row.get::<_,Vec<u8>>(0)).optional().map_err(map_sql)?
+                .ok_or(JobRepositoryError::NotFound)?;
+            let snapshot = decode_snapshot(&bytes)?;
+            if snapshot.spec().kind().as_str() != "analysis.backtest.v1"
+                || engine::backtest_product_token(snapshot.id(), snapshot.generation()) != token {
+                return Err(JobRepositoryError::InvalidState);
+            }
+            Ok(snapshot)
+        }).await
+    }
+
+    async fn list_scope(
+        &self,
+        cursor: Option<&JobListCursor>,
+        limit: JobListPageLimit,
+        scope: &'static str,
+        kinds: &'static [&'static str],
+    ) -> Result<JobListPage, JobRepositoryError> {
+        let epoch = self.inner.cursor_epoch;
+        let cursor = cursor
+            .map(|value| {
+                let text = value.as_source_identifier().as_str();
+                let parts = text.split(':').collect::<Vec<_>>();
+                let ["v2", cursor_epoch, revision, cursor_scope, id] = parts.as_slice() else {
+                    return Err(JobRepositoryError::InvalidState);
+                };
+                if *cursor_scope != scope {
+                    return Err(JobRepositoryError::InvalidState);
+                }
+                if *cursor_epoch != epoch.to_string() {
+                    return Err(JobRepositoryError::Conflict);
+                }
+                let revision = revision
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|value| *value > 0 && value.to_string() == *revision)
+                    .ok_or(JobRepositoryError::InvalidState)?;
+                let id = JobId::try_from_str(id).map_err(|_| JobRepositoryError::InvalidState)?;
+                Ok((revision, id))
+            })
+            .transpose()?;
+        self.read(move |connection| {
+            let transaction = connection.unchecked_transaction().map_err(map_sql)?;
+            let revision = transaction.query_row("SELECT revision FROM job_list_revision WHERE singleton = 1", [],
+                |row| row.get::<_, i64>(0)).map_err(map_sql)?;
+            if cursor.as_ref().is_some_and(|(expected, _)| *expected != revision) {
+                return Err(JobRepositoryError::Conflict);
+            }
+            let cursor = cursor.map_or_else(Vec::new, |(_, id)| id.as_uuid().as_bytes().to_vec());
+            let fetch = limit.get().saturating_add(1);
+            let sql = if kinds.is_empty() {
+                "SELECT current.snapshot_json FROM jobs AS current
+                 WHERE current.job_id > ?1 AND current.generation = (
+                    SELECT MAX(candidate.generation) FROM jobs AS candidate WHERE candidate.job_id=current.job_id)
+                 ORDER BY current.job_id LIMIT ?2"
+            } else {
+                "SELECT current.snapshot_json FROM jobs AS current
+                 WHERE json_extract(CAST(current.snapshot_json AS TEXT), '$.kind') IN (?3,?4)
+                 AND current.job_id > ?1 AND current.generation = (
+                    SELECT MAX(candidate.generation) FROM jobs AS candidate WHERE candidate.job_id=current.job_id)
+                 ORDER BY current.job_id LIMIT ?2"
+            };
+            let mut statement = transaction.prepare(sql).map_err(map_sql)?;
+            let mut rows = if kinds.is_empty() {
+                statement.query(params![cursor,sql_usize(fetch)?]).map_err(map_sql)?
+            } else {
+                statement.query(params![cursor,sql_usize(fetch)?,kinds[0],kinds.get(1).copied().unwrap_or(kinds[0])]).map_err(map_sql)?
+            };
+            let mut snapshots = Vec::with_capacity(fetch);
+            while let Some(row) = rows.next().map_err(map_sql)? {
+                snapshots.push(decode_snapshot(&row.get::<_,Vec<u8>>(0).map_err(map_sql)?)?);
+            }
+            let next = if snapshots.len() > limit.get() {
+                Some(JobListCursor::new(
+                    SourceIdentifier::try_from(
+                        format!("v2:{epoch}:{revision}:{scope}:{}", snapshots[limit.get() - 1].id().as_uuid()),
+                    )
+                    .map_err(|_| JobRepositoryError::InvalidState)?,
+                ))
+            } else {
+                None
+            };
+            snapshots.truncate(limit.get());
+            JobListPage::try_new(snapshots, next, limit)
+                .map_err(|_| JobRepositoryError::InvalidState)
+        })
+        .await
     }
 
     /// Stops admission, drains the one writer, and releases its cross-process lease only afterward.
@@ -396,48 +526,7 @@ impl JobRepository for SqliteJobRepository {
         cursor: Option<&JobListCursor>,
         limit: JobListPageLimit,
     ) -> Result<JobListPage, JobRepositoryError> {
-        let cursor = cursor
-            .map(|value| value.as_source_identifier().as_str().to_owned())
-            .map(|value| JobId::try_from_str(&value).map_err(|_| JobRepositoryError::InvalidState))
-            .transpose()?;
-        self.read(move |connection| {
-            let cursor = cursor.map_or_else(Vec::new, |id| id.as_uuid().as_bytes().to_vec());
-            let fetch = limit.get().saturating_add(1);
-            let mut statement = connection
-                .prepare(
-                    "SELECT current.snapshot_json FROM jobs AS current
-                     WHERE current.job_id > ?1
-                       AND current.generation = (
-                         SELECT MAX(candidate.generation) FROM jobs AS candidate
-                         WHERE candidate.job_id = current.job_id
-                       )
-                     ORDER BY current.job_id LIMIT ?2",
-                )
-                .map_err(map_sql)?;
-            let rows = statement
-                .query_map(params![cursor, sql_usize(fetch)?], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })
-                .map_err(map_sql)?;
-            let mut snapshots = Vec::with_capacity(fetch);
-            for row in rows {
-                snapshots.push(decode_snapshot(&row.map_err(map_sql)?)?);
-            }
-            let next = if snapshots.len() > limit.get() {
-                Some(JobListCursor::new(
-                    SourceIdentifier::try_from(
-                        snapshots[limit.get() - 1].id().as_uuid().to_string(),
-                    )
-                    .map_err(|_| JobRepositoryError::InvalidState)?,
-                ))
-            } else {
-                None
-            };
-            snapshots.truncate(limit.get());
-            JobListPage::try_new(snapshots, next, limit)
-                .map_err(|_| JobRepositoryError::InvalidState)
-        })
-        .await
+        self.list_scope(cursor, limit, "all", &[]).await
     }
 
     async fn events_after(

@@ -633,10 +633,18 @@ impl ResearchService {
     ) -> Result<market_squawk_data::ProviderMacroMetadataCapture, ResearchServiceError> {
         let analytical = Arc::clone(&self.analytical);
         let store = Arc::clone(&self.provider_captures);
-        self.provider_capture_worker.run(deadline, cancellation, move |worker_cancellation| {
-            analytical.verify_provider_macro_metadata_capture(receipt, store.as_ref(), deadline, &worker_cancellation)
-                .map_err(ResearchServiceError::from)
-        }).await?
+        self.provider_capture_worker
+            .run(deadline, cancellation, move |worker_cancellation| {
+                analytical
+                    .verify_provider_macro_metadata_capture(
+                        receipt,
+                        store.as_ref(),
+                        deadline,
+                        &worker_cancellation,
+                    )
+                    .map_err(ResearchServiceError::from)
+            })
+            .await?
     }
 
     /// Runs synchronous capture, verification or source-preparation work on the existing lane.
@@ -899,7 +907,13 @@ impl ResearchService {
             precommit_authority,
         } = request;
         let reservation = analytical
-            .reserve_source_ingest(&source, registered_at, rights.clone(), &identity, &cancellation)
+            .reserve_source_ingest(
+                &source,
+                registered_at,
+                rights.clone(),
+                &identity,
+                &cancellation,
+            )
             .await?;
         match payload {
             ResearchIngestPayload::Provider {
@@ -1004,6 +1018,11 @@ impl ResearchService {
         self.analytical.analytical_reader()
     }
 
+    /// Reads and publishes source-bound chart projections through the existing catalog owner.
+    pub fn chart_projections(&self) -> market_squawk_data::ChartProjectionCatalogCapability {
+        self.analytical.chart_projections()
+    }
+
     /// Publishes an authenticated source reference through the existing analytical owner.
     pub(crate) async fn publish_market_data_source_reference(
         &self,
@@ -1060,10 +1079,19 @@ impl ResearchService {
         expected_current: Option<market_squawk_data::MarketDataInstrumentRecord>,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<market_squawk_data::MarketDataInstrumentRecord, market_squawk_data::MarketDataInstrumentCatalogError> {
-        self.analytical.publish_market_data_issuer_reference(
-            issuer, listing, expected_current, deadline, cancellation,
-        ).await
+    ) -> Result<
+        market_squawk_data::MarketDataInstrumentRecord,
+        market_squawk_data::MarketDataInstrumentCatalogError,
+    > {
+        self.analytical
+            .publish_market_data_issuer_reference(
+                issuer,
+                listing,
+                expected_current,
+                deadline,
+                cancellation,
+            )
+            .await
     }
 
     /// Returns fair-value persistence authority over this service's sole catalog writer.

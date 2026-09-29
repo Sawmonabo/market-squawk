@@ -1,10 +1,16 @@
 //! Bounded, source-neutral provider response capture receipts.
 
-mod market_event;
-mod date_windows;
 mod calendar_relationship;
+mod date_windows;
+mod market_event;
 pub use calendar_relationship::ReviewedMarketCalendarRelationship;
-pub use date_windows::{CompleteMarketBarDateWindowsV1, CompleteMarketBarDateWindowsInputV1, CompleteMarketBarDateWindowV1, CompleteMarketBarDateSessionV1, RetainedMarketHistoryNormalizationV1, RetainedMarketHistoryNativeCoverageV1, RetainedMarketHistoryCashUnitV1, MarketHistoryCashUnitStatus, ProviderNativeExchangeCode, RetainedMarketHistoryCalendarV1};
+pub use date_windows::{
+    CompleteMarketBarDateSessionV1, CompleteMarketBarDateWindowV1,
+    CompleteMarketBarDateWindowsInputV1, CompleteMarketBarDateWindowsV1,
+    MarketHistoryCashUnitStatus, ProviderNativeExchangeCode, RetainedMarketHistoryCalendarV1,
+    RetainedMarketHistoryCashUnitV1, RetainedMarketHistoryNativeCoverageV1,
+    RetainedMarketHistoryNormalizationV1,
+};
 
 pub use market_event::{
     MAX_PROVIDER_MARKET_EVENT_BATCH_BYTES, MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS,
@@ -734,7 +740,9 @@ impl ProviderCaptureSetReceipt {
                         request_set_identity,
                         &request_graph_components,
                     )?;
-                    if let ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) = semantic_binding {
+                    if let ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) =
+                        semantic_binding
+                    {
                         binding.validate_capture_pages(&pages)?;
                     }
                 }
@@ -1045,7 +1053,9 @@ impl ProviderCaptureMaterial {
             ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => {
                 binding.graph_purpose()
             }
-            ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => binding.graph_purpose(),
+            ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => {
+                binding.graph_purpose()
+            }
         };
         let request_set_identity = semantic_material_request_graph_identity(
             &owner_source_id,
@@ -1919,6 +1929,73 @@ pub struct SealedProviderCaptureSetReceipt {
 }
 
 impl SealedProviderCaptureSetReceipt {
+    /// Checks persisted capture/physical-claim correspondence without recreating live authority.
+    /// Logical publications can retain this original custody evidence while independently
+    /// verifying exact provider bodies through their logical payload objects.
+    pub fn verify_persisted_claim(
+        capture: &ProviderCaptureSetReceipt,
+        segment: &SealedResearchJournalSegmentClaim,
+        expected_receipt_digest: EvidenceDigest,
+    ) -> Result<(), ProviderCaptureError> {
+        if capture.pages().len() != segment.frames().len()
+            || sealed_provider_capture_receipt_digest(
+                capture.observation_digest(),
+                segment.physical_receipt_digest(),
+            ) != expected_receipt_digest
+        {
+            return Err(ProviderCaptureError::PhysicalReceiptMismatch);
+        }
+        for (page, frame) in capture.pages().iter().zip(segment.frames()) {
+            if frame.ordinal() != u32::from(page.ordinal())
+                || frame.provider_payload_bytes() != page.body_bytes()
+                || frame.provider_payload_digest() != page.body_digest()
+                || frame.received_at() != page.received_at()
+                || frame.source_sequence() != Some(u64::from(page.ordinal()))
+            {
+                return Err(ProviderCaptureError::PhysicalReceiptMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates one global canonical row's original physical response coordinate without
+    /// retaining the other row mappings. This is value evidence, not publication authority.
+    pub fn row_frame(
+        &self,
+        canonical_row_ordinal: u32,
+        capture_page_ordinal: u16,
+    ) -> Result<ProviderCaptureRowFrame, ProviderCaptureError> {
+        let page_index = usize::from(capture_page_ordinal);
+        let page = self
+            .capture()
+            .pages()
+            .get(page_index)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        let frame = self
+            .segment()
+            .frames()
+            .get(page_index)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        if page.ordinal() != capture_page_ordinal
+            || frame.ordinal() != u32::from(capture_page_ordinal)
+            || frame.provider_payload_bytes() != page.body_bytes()
+            || frame.provider_payload_digest() != page.body_digest()
+            || frame.received_at() != page.received_at()
+            || frame.source_sequence() != Some(u64::from(capture_page_ordinal))
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        Ok(ProviderCaptureRowFrame {
+            canonical_row_ordinal,
+            capture_page_ordinal,
+            segment_ordinal: 0,
+            physical_frame_ordinal: frame.ordinal(),
+            page_body_digest: page.body_digest(),
+            received_at: page.received_at(),
+            source_sequence: frame.source_sequence(),
+        })
+    }
+
     /// Rebinds persisted capture evidence to a freshly verified immutable frame receipt.
     ///
     /// This returns cloneable restart evidence only; it does not recreate any one-use live
@@ -2279,20 +2356,31 @@ impl ProviderOrderedCaptureSegments {
         if !(2..=MAX_PROVIDER_CAPTURE_PAGES).contains(&segments.len()) {
             return Err(ProviderCaptureError::RequestGraphInvalid);
         }
-        let first = segments.first().ok_or(ProviderCaptureError::RequestGraphInvalid)?.persisted_receipt().capture();
+        let first = segments
+            .first()
+            .ok_or(ProviderCaptureError::RequestGraphInvalid)?
+            .persisted_receipt()
+            .capture();
         let source_id = first.source_id().clone();
         let metadata_revision = first.metadata_revision().clone();
         let mut pages = Vec::new();
         let mut components = Vec::new();
-        pages.try_reserve_exact(segments.len()).map_err(|_| ProviderCaptureError::AllocationFailed)?;
-        components.try_reserve_exact(segments.len()).map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        pages
+            .try_reserve_exact(segments.len())
+            .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        components
+            .try_reserve_exact(segments.len())
+            .map_err(|_| ProviderCaptureError::AllocationFailed)?;
         for (index, segment) in segments.iter().enumerate() {
             let capture = segment.persisted_receipt().capture();
-            let [page] = capture.pages() else { return Err(ProviderCaptureError::RequestGraphInvalid); };
+            let [page] = capture.pages() else {
+                return Err(ProviderCaptureError::RequestGraphInvalid);
+            };
             if capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse {
                 return Err(ProviderCaptureError::NestedRequestGraph);
             }
-            let ordinal = u16::try_from(index).map_err(|_| ProviderCaptureError::RequestGraphInvalid)?;
+            let ordinal =
+                u16::try_from(index).map_err(|_| ProviderCaptureError::RequestGraphInvalid)?;
             pages.push(page.with_ordinal(ordinal));
             components.push(ProviderCaptureRequestGraphComponent {
                 ordinal,
@@ -2309,13 +2397,29 @@ impl ProviderOrderedCaptureSegments {
             });
         }
         let purpose = match &semantic_binding {
-            ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => binding.graph_purpose(),
-            ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => binding.graph_purpose(),
+            ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => {
+                binding.graph_purpose()
+            }
+            ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => {
+                binding.graph_purpose()
+            }
         };
-        let identity = semantic_request_graph_identity(&source_id, &metadata_revision, &dataset, purpose, &components);
+        let identity = semantic_request_graph_identity(
+            &source_id,
+            &metadata_revision,
+            &dataset,
+            purpose,
+            &components,
+        );
         let capture = ProviderCaptureSetReceipt::try_new_with_request_graph(
-            source_id, metadata_revision, dataset, identity,
-            ProviderCaptureTerminalDisposition::CompleteRequestGraph, pages, components, Some(semantic_binding),
+            source_id,
+            metadata_revision,
+            dataset,
+            identity,
+            ProviderCaptureTerminalDisposition::CompleteRequestGraph,
+            pages,
+            components,
+            Some(semantic_binding),
         )?;
         Self::try_rejoin(capture, segments)
     }
@@ -2328,15 +2432,21 @@ impl ProviderOrderedCaptureSegments {
         if segments.is_empty()
             || segments.len() != root_capture.pages().len()
             || segments.len() > MAX_PROVIDER_CAPTURE_PAGES
-            || !matches!(root_capture.terminal(),
+            || !matches!(
+                root_capture.terminal(),
                 ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
-                | ProviderCaptureTerminalDisposition::CompleteRequestGraph)
+                    | ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            )
         {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
         for (ordinal, (root_page, token)) in root_capture.pages().iter().zip(&segments).enumerate()
         {
-            validate_ordered_graph_component(&root_capture, ordinal, token.persisted_receipt().capture())?;
+            validate_ordered_graph_component(
+                &root_capture,
+                ordinal,
+                token.persisted_receipt().capture(),
+            )?;
             let ordinal =
                 u16::try_from(ordinal).map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
             let sealed = token.persisted_receipt();
@@ -2418,7 +2528,9 @@ fn validate_ordered_graph_component(
     if root.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph {
         return Ok(());
     }
-    let component = root.request_graph_components().get(ordinal)
+    let component = root
+        .request_graph_components()
+        .get(ordinal)
         .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
     if usize::from(component.ordinal()) != ordinal
         || usize::from(component.first_page_ordinal()) != ordinal
@@ -3127,10 +3239,11 @@ fn validate_provider_capture_binding_evidence(
             Some((first, end))
         }
         (ProviderCaptureScope::Whole, ProviderCaptureBindingLayout::OrderedSegments) => {
-            if !matches!(root_capture.terminal(),
+            if !matches!(
+                root_capture.terminal(),
                 ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
-                | ProviderCaptureTerminalDisposition::CompleteRequestGraph)
-                || physical_claims.len() != root_capture.pages().len()
+                    | ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            ) || physical_claims.len() != root_capture.pages().len()
             {
                 return Err(ProviderCaptureError::SealedBindingMismatch);
             }
@@ -3163,14 +3276,21 @@ fn validate_provider_capture_binding_evidence(
         }
         ProviderCaptureBindingLayout::OrderedSegments => {
             for (page, physical) in root_capture.pages().iter().zip(physical_claims) {
-                if root_capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph {
-                    let component = root_capture.request_graph_components().get(usize::from(page.ordinal()))
+                if root_capture.terminal()
+                    == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+                {
+                    let component = root_capture
+                        .request_graph_components()
+                        .get(usize::from(page.ordinal()))
                         .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
-                    if component.ordinal() != page.ordinal() || component.first_page_ordinal() != page.ordinal()
+                    if component.ordinal() != page.ordinal()
+                        || component.first_page_ordinal() != page.ordinal()
                         || component.page_count().get() != 1
                         || component.content_digest() != physical.capture_content_digest
                         || component.observation_digest() != physical.capture_observation_digest
-                    { return Err(ProviderCaptureError::SealedBindingMismatch); }
+                    {
+                        return Err(ProviderCaptureError::SealedBindingMismatch);
+                    }
                 }
                 let [frame] = physical.claim.frames() else {
                     return Err(ProviderCaptureError::SealedBindingMismatch);
@@ -3500,35 +3620,10 @@ fn single_segment_row_frames(
         if allowed_page_range.is_some_and(|(start, end)| page_index < start || page_index >= end) {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
-        let page = receipt
-            .capture()
-            .pages()
-            .get(page_index)
-            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
-        let frame = receipt
-            .segment()
-            .frames()
-            .get(page_index)
-            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
-        if page.ordinal() != capture_page_ordinal
-            || frame.ordinal() != u32::from(capture_page_ordinal)
-            || frame.provider_payload_bytes() != page.body_bytes()
-            || frame.provider_payload_digest() != page.body_digest()
-            || frame.received_at() != page.received_at()
-            || frame.source_sequence() != Some(u64::from(capture_page_ordinal))
-        {
-            return Err(ProviderCaptureError::SealedBindingMismatch);
-        }
-        mappings.push(ProviderCaptureRowFrame {
-            canonical_row_ordinal: u32::try_from(row_ordinal)
-                .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?,
+        mappings.push(receipt.row_frame(
+            u32::try_from(row_ordinal).map_err(|_| ProviderCaptureError::SealedBindingMismatch)?,
             capture_page_ordinal,
-            segment_ordinal: 0,
-            physical_frame_ordinal: frame.ordinal(),
-            page_body_digest: page.body_digest(),
-            received_at: page.received_at(),
-            source_sequence: frame.source_sequence(),
-        });
+        )?);
     }
     Ok(mappings.into_boxed_slice())
 }
@@ -3890,8 +3985,14 @@ fn validate_semantic_graph_binding(
         ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => {
             if components.len() != binding.windows().len() + 1
                 || &binding.normalization().source_contract_revision != metadata_revision
-                || request_set_identity != semantic_request_graph_identity(
-                    source_id, metadata_revision, dataset, binding.graph_purpose(), components)
+                || request_set_identity
+                    != semantic_request_graph_identity(
+                        source_id,
+                        metadata_revision,
+                        dataset,
+                        binding.graph_purpose(),
+                        components,
+                    )
             {
                 return Err(ProviderCaptureError::RequestGraphInvalid);
             }
@@ -3902,7 +4003,9 @@ fn validate_semantic_graph_binding(
                     || component.source_id != *source_id
                     || component.metadata_revision != *metadata_revision
                     || component.terminal != ProviderCaptureTerminalDisposition::StandaloneResponse
-                    || index > 0 && component.request_set_identity != binding.windows()[index - 1].request_identity
+                    || index > 0
+                        && component.request_set_identity
+                            != binding.windows()[index - 1].request_identity
                 {
                     return Err(ProviderCaptureError::RequestGraphInvalid);
                 }

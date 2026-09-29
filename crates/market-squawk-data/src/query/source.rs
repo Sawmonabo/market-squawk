@@ -232,7 +232,15 @@ impl QuerySource {
                     max_memory_bytes,
                 )?;
                 let memory_pool = Arc::clone(&context.runtime_env().memory_pool);
-                let verified = store.capture_pinned_async(dataset, supervisor).await?;
+                let verified = store
+                    .capture_pinned_async(
+                        dataset,
+                        supervisor,
+                        input_memory.new_empty(),
+                        admission.capture_lease(),
+                        max_memory_bytes,
+                    )
+                    .await?;
                 PinnedRegistrationBundle::complete(
                     Arc::clone(schema),
                     verified,

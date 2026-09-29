@@ -1,10 +1,10 @@
 import * as React from "react"
 
-import { formatChartTimestamp } from "@/components/charts/market-price-chart"
+import { formatChartTimestamp, useDebouncedChartCallback, type ChartViewport } from "@/components/charts/market-price-chart"
 
-import type { InvestmentAnalysis } from "./contracts"
+import type { InvestmentChart } from "./contracts"
 
-type Benchmark = InvestmentAnalysis["chart"]["benchmark"]
+type Benchmark = InvestmentChart["benchmark"]
 type AvailableBenchmark = Extract<Benchmark, { state: "available" }>
 
 const WIDTH = 960
@@ -23,12 +23,19 @@ const UNAVAILABLE = {
   missing_selected_comparison: "Price history for the selected comparison was unavailable at the saved cutoff.",
   no_common_observation: "The two investments had no shared session with recorded prices.",
   storage_unavailable: "The original saved comparison data could not be reopened.",
+  not_requested: "Open the comparison layer to load its saved observations.",
   integrity_unproven: "The original comparison could not be verified.",
 } as const
 
-export function SavedBenchmarkChart({ benchmark, currency }: { benchmark: Benchmark; currency: string }) {
+export function SavedBenchmarkChart({ benchmark, currency, onViewportChange, onObservationSelect }: {
+  benchmark: Benchmark; currency: string
+  onViewportChange: (viewport: ChartViewport) => void
+  onObservationSelect: (point: AvailableBenchmark["points"][number]) => void
+}) {
+  const subject = benchmark.members[0]
+  if (subject === undefined) return <section className="rounded-xl border border-border bg-card/35 p-4"><h4 className="text-sm font-semibold">Saved comparisons</h4><p className="mt-2 text-xs text-muted-foreground">Open the comparison layer to load its saved observations.</p></section>
   const selected = benchmark.members[1]
-  const sameSelection = selected !== undefined && benchmark.members[0].instrumentId === selected.instrumentId
+  const sameSelection = selected !== undefined && subject.instrumentId === selected.instrumentId
   const accompanying = benchmark.members[2]
   const duplicateAccompanying = accompanying !== undefined && benchmark.members.slice(0, 2)
     .some((member) => member.instrumentId === accompanying.instrumentId)
@@ -37,7 +44,7 @@ export function SavedBenchmarkChart({ benchmark, currency }: { benchmark: Benchm
       <h4 className="text-sm font-semibold">{benchmark.state === "available"
         ? `Price change since ${benchmark.baseline.date}` : "Comparison data unavailable"}</h4>
       <p className="mt-2 text-xs leading-5 text-muted-foreground">
-        {benchmark.members[0].label}{selected ? ` compared with ${selected.label}` : " has no saved comparison investment"}
+        {subject.label}{selected ? ` compared with ${selected.label}` : " has no saved comparison investment"}
         {selected && accompanying && !duplicateAccompanying ? `, with ${accompanying.label} alongside` : ""}.
       </p>
       <p className="mt-1 text-xs leading-5 text-muted-foreground">
@@ -57,11 +64,17 @@ export function SavedBenchmarkChart({ benchmark, currency }: { benchmark: Benchm
         <p className="mt-1 text-xs leading-5 text-muted-foreground">{benchmark.summary}</p>
       </>}
     </div>
-    {benchmark.state === "available" ? <AvailableChart benchmark={benchmark} currency={currency} /> : null}
+    {benchmark.state === "available" && benchmark.points.length > 0
+      ? <AvailableChart benchmark={benchmark} currency={currency} onViewportChange={onViewportChange} onObservationSelect={onObservationSelect} />
+      : benchmark.state === "available" ? <p className="p-4 text-xs text-muted-foreground">No original comparison observations fall within this requested window.</p> : null}
   </section>
 }
 
-function AvailableChart({ benchmark, currency }: { benchmark: AvailableBenchmark; currency: string }) {
+function AvailableChart({ benchmark, currency, onViewportChange, onObservationSelect }: {
+  benchmark: AvailableBenchmark; currency: string
+  onViewportChange: (viewport: ChartViewport) => void
+  onObservationSelect: (point: AvailableBenchmark["points"][number]) => void
+}) {
   const id = React.useId()
   const [window, setWindow] = React.useState<(typeof WINDOWS)[number]["key"]>("all")
   const [hidden, setHidden] = React.useState<ReadonlySet<number>>(new Set())
@@ -69,13 +82,20 @@ function AvailableChart({ benchmark, currency }: { benchmark: AvailableBenchmark
   const displayMembers = React.useMemo(() => benchmark.members.map((member, index) => ({ member, index }))
     .filter(({ member, index }) => index !== 2 || !benchmark.members.slice(0, 2)
       .some((earlier) => earlier.instrumentId === member.instrumentId)), [benchmark.members])
-  const rows = React.useMemo(() => {
-    const lastTime = BigInt(benchmark.points.at(-1)!.coordinate.sessionCloseUnixNanos)
-    const days = WINDOWS.find((choice) => choice.key === window)?.days ?? null
-    const from = days === null ? null : lastTime - BigInt(days) * 86_400_000_000_000n
-    return benchmark.points.filter((point) => from === null
-      || BigInt(point.coordinate.sessionCloseUnixNanos) >= from)
-  }, [benchmark.points, window])
+  const rows = benchmark.points
+  const selectedOriginal = selectedTime === null ? null : rows.find((point) => point.coordinate.sessionCloseUnixNanos === selectedTime) ?? null
+  useDebouncedChartCallback(selectedOriginal === null ? null : `${selectedOriginal.coordinate.sessionCloseUnixNanos}:${selectedOriginal.originalOrdinal}`,
+    selectedOriginal, onObservationSelect)
+  const requestWindow = (next: typeof window) => {
+    setWindow(next)
+    setSelectedTime(null)
+    const first = benchmark.display.firstTimeUnixNanos
+    const last = benchmark.display.lastTimeUnixNanos
+    if (first === null || last === null) return
+    const days = WINDOWS.find((choice) => choice.key === next)?.days ?? null
+    const from = days === null ? BigInt(first) : BigInt(last) - BigInt(days) * 86_400_000_000_000n
+    onViewportChange({ fromUnixNanos: (from < BigInt(first) ? BigInt(first) : from).toString(), throughUnixNanos: last, pointLimit: 512 })
+  }
   const rowIndexes = React.useMemo(() => new Map<string, number>(rows.map((row, index): [string, number] =>
     [row.coordinate.sessionCloseUnixNanos, index])), [rows])
   const plot = React.useMemo(() => {
@@ -103,6 +123,10 @@ function AvailableChart({ benchmark, currency }: { benchmark: AvailableBenchmark
       for (const row of rows) {
         const value = row.observations[memberIndex]?.priceIndex
         const numeric = value === undefined ? NaN : Number(value)
+        if (row.breakBefore[memberIndex] && segment.length) {
+          result.push(segment)
+          segment = []
+        }
         if (value !== undefined && Number.isFinite(numeric)) {
           segment.push({ time: row.coordinate.sessionCloseUnixNanos, value: numeric })
         } else if (segment.length) {
@@ -148,7 +172,7 @@ function AvailableChart({ benchmark, currency }: { benchmark: AvailableBenchmark
       </label>)}
       <label className="ml-auto inline-flex items-center gap-2 text-xs">History window
         <select className="rounded-md border border-input bg-background px-2 py-1.5" value={window}
-          onChange={(event) => { setWindow(event.target.value as typeof window); setSelectedTime(null) }}>
+          onChange={(event) => requestWindow(event.target.value as typeof window)}>
           {WINDOWS.map((choice) => <option key={choice.key} value={choice.key}>{choice.label}</option>)}
         </select>
       </label>
@@ -211,6 +235,11 @@ function AvailableChart({ benchmark, currency }: { benchmark: AvailableBenchmark
       <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
         Lines connect recorded observations only. A break means that investment has no saved price on the intervening session.
         Moving the pointer or using the date slider shows the original date and exact recorded values.
+      </p>
+      <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+        {benchmark.display.returnedPointCount} original observations shown from {benchmark.display.visibleOriginalPointCount} within the requested window
+        {benchmark.display.reduced ? "; the service preserves the first, last, minimum and maximum observations for drawing." : "."}
+        Select a date to load its exact saved evidence.
       </p>
       <p className="mt-2 text-[11px] leading-5 text-muted-foreground">{benchmark.summary}</p>
     </div>

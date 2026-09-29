@@ -3,20 +3,32 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
 use market_squawk_data::Sha256Digest;
-use market_squawk_decisions::{CurrentShareDecisionProjection, CurrentShareMarketAdmission, InvestmentAnalysisEvidence, MarketReferenceEvidence, MarketReferenceAdjustmentBasis, MarketReferencePriceKind, ProposalEvidenceWindow};
+use market_squawk_decisions::{
+    CurrentShareDecisionProjection, CurrentShareMarketAdmission, InvestmentAnalysisEvidence,
+    MarketReferenceAdjustmentBasis, MarketReferenceEvidence, MarketReferencePriceKind,
+    ProposalEvidenceWindow,
+};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Money, Timestamp};
 use market_squawk_services::{ArtifactReadContext, RequestContext, ServiceError};
 use serde::{Deserialize, Serialize};
 
-use crate::{ResearchService, application::{
-    SourceAppliedCorporateActionReadCapability,
-    fair_value::{FairValueAutomaticReadCapability, ForecastValuationSourceFactory},
-    market_calendar::ForecastSessionReadCapability,
-    market_selection::{MarketInvestmentReadCapability, MarketInvestmentReadReceipt, MarketInvestmentMarkBasis},
-    model::forecast::{ForecastEvidenceReadContext, ForecastEvidenceReader, ForecastPriceEvidence, replay_price_history_inputs},
-    research::corporate_actions::ApplicableActionPlanError,
-}};
 use super::investment_request::{GenerateRequest, digest, validate_canonical_request};
+use crate::{
+    ResearchService,
+    application::{
+        SourceAppliedCorporateActionReadCapability,
+        fair_value::{FairValueAutomaticReadCapability, ForecastValuationSourceFactory},
+        market_calendar::ForecastSessionReadCapability,
+        market_selection::{
+            MarketInvestmentMarkBasis, MarketInvestmentReadCapability, MarketInvestmentReadReceipt,
+        },
+        model::forecast::{
+            ForecastEvidenceReadContext, ForecastEvidenceReader, ForecastPriceEvidence,
+            replay_price_history_inputs,
+        },
+        research::corporate_actions::ApplicableActionPlanError,
+    },
+};
 
 /// Strict inert coordinates, independently compared against all three reconstructed identities.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -30,19 +42,31 @@ pub(crate) struct CurrentShareReplayRecipe {
     authorization_expires_at: Timestamp,
     authorization_decision_digest: EvidenceDigest,
     output_scale: u32,
+    forecast_selected_at: Timestamp,
+    fundamental_sources: Option<Box<[u8]>>,
 }
 impl From<&CurrentShareDecisionProjection> for CurrentShareReplayRecipe {
     fn from(value: &CurrentShareDecisionProjection) -> Self {
         let admission = value.market_admission();
         Self {
             projection_identity: value.identity().evidence_digest().bytes(),
-            original_monetary_identity: value.original_monetary_identity().evidence_digest().bytes(),
+            original_monetary_identity: value
+                .original_monetary_identity()
+                .evidence_digest()
+                .bytes(),
             conversion_identity: value.conversion().identity().bytes(),
             valuation_projection_identity: value.valuation_projection().identity().bytes(),
             authorized_at: admission.authorized_at,
             authorization_expires_at: admission.authorization_expires_at,
-            authorization_decision_digest: admission.authorization_decision_digest.evidence_digest(),
+            authorization_decision_digest: admission
+                .authorization_decision_digest
+                .evidence_digest(),
             output_scale: value.conversion().output_scale(),
+            forecast_selected_at: value.valuation_projection().forecast_selected_at(),
+            fundamental_sources: value
+                .valuation_projection()
+                .fundamental_source_reference()
+                .map(Into::into),
         }
     }
 }
@@ -70,83 +94,192 @@ impl CurrentShareReplayCapability {
         context: &RequestContext,
     ) -> Result<InvestmentAnalysisEvidence, ServiceError> {
         validate_canonical_request(canonical_request)?;
-        let request: GenerateRequest = serde_json::from_slice(canonical_request)
-            .map_err(|_| ServiceError::InvalidResult)?;
+        let request: GenerateRequest =
+            serde_json::from_slice(canonical_request).map_err(|_| ServiceError::InvalidResult)?;
         let invalid = ServiceError::InvalidResult;
         if original.current_share_projection().is_some()
             || recipe.output_scale > 28
             || recipe.authorized_at > original.admitted_at()
             || original.admitted_at() >= recipe.authorization_expires_at
             || recipe.authorization_decision_digest.algorithm() != DigestAlgorithm::Sha256
-            || [recipe.projection_identity, recipe.original_monetary_identity,
-                recipe.conversion_identity, recipe.valuation_projection_identity,
-                recipe.authorization_decision_digest.bytes()].contains(&[0; 32])
-        { return Err(invalid); }
+            || [
+                recipe.projection_identity,
+                recipe.original_monetary_identity,
+                recipe.conversion_identity,
+                recipe.valuation_projection_identity,
+                recipe.authorization_decision_digest.bytes(),
+            ]
+            .contains(&[0; 32])
+        {
+            return Err(invalid);
+        }
         let method = original.valuation_method_set().ok_or(invalid)?;
-        let receipt = self.valuations.read_automatic_valuation(method.selected_measurement_id().ok_or(invalid)?, context).await?;
-        let mut source_references = receipt.inputs().iter().filter_map(|input| match input.input().evidence().origin() {
-            market_squawk_valuation::EvidenceOrigin::ForecastDistribution { evidence } => Some(evidence.source().reference()),
-            _ => None,
-        });
-        let source_reference = source_references.next().ok_or(invalid)?;
-        if source_references.any(|reference| reference != source_reference)
-            || source_reference.selected_at() > original.admitted_at() { return Err(invalid); }
+        let receipt = self
+            .valuations
+            .read_automatic_valuation(method.selected_measurement_id().ok_or(invalid)?, context)
+            .await?;
+        if recipe.forecast_selected_at > original.admitted_at() {
+            return Err(invalid);
+        }
         let saved = original.forecast_chart().ok_or(invalid)?;
         let forecast = original.price_forecast().ok_or(invalid)?;
-        let selected = self.forecasts.exact_distribution_for_identity(
-            Sha256Digest::new(forecast.vintage_id().bytes()), original.instrument_id(), source_reference.selected_at(),
-            ForecastEvidenceReadContext::new(ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
-                self.maximum_forecast_artifact_bytes),
-        ).await.map_err(crate::application::model::map_forecast_selection_error)?;
-        let ForecastPriceEvidence::Available(price) = selected.price_evidence() else { return Err(ServiceError::Unavailable); };
-        let horizon = std::num::NonZeroU64::new(u64::try_from(policy.horizon_nanos()).map_err(|_| invalid)?).ok_or(invalid)?;
-        let crate::application::model::forecast::ExactHorizonPriceForecastEvidence::Available(projection) = selected
-            .exact_horizon_price_projection(horizon).map_err(|_| invalid)? else { return Err(invalid); };
+        let selected = self
+            .forecasts
+            .exact_distribution_for_identity(
+                Sha256Digest::new(forecast.vintage_id().bytes()),
+                original.instrument_id(),
+                recipe.forecast_selected_at,
+                ForecastEvidenceReadContext::new(
+                    ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+                    self.maximum_forecast_artifact_bytes,
+                ),
+            )
+            .await
+            .map_err(crate::application::model::map_forecast_selection_error)?;
+        let ForecastPriceEvidence::Available(price) = selected.price_evidence() else {
+            return Err(ServiceError::Unavailable);
+        };
+        let horizon =
+            std::num::NonZeroU64::new(u64::try_from(policy.horizon_nanos()).map_err(|_| invalid)?)
+                .ok_or(invalid)?;
+        let crate::application::model::forecast::ExactHorizonPriceForecastEvidence::Available(
+            projection,
+        ) = selected
+            .exact_horizon_price_projection(horizon)
+            .map_err(|_| invalid)?
+        else {
+            return Err(invalid);
+        };
         let authenticated_forecast = super::recommendation::adapt_price_forecast_evidence(
-            projection, policy, original.as_of(), original.admitted_at(),
-        ).map_err(|_| invalid)?;
-        if authenticated_forecast != *forecast { return Err(invalid); }
+            projection,
+            policy,
+            original.as_of(),
+            original.admitted_at(),
+        )
+        .map_err(|_| invalid)?;
+        if authenticated_forecast != *forecast {
+            return Err(invalid);
+        }
 
-        let history = replay_price_history_inputs(price, &self.research, &self.calendars, &self.source_actions,
-            request.source_action_reference.as_ref().ok_or(invalid)?, Some(saved), context)
-            .await?.ok_or(ServiceError::Unavailable)?;
-        let market = self.market.read_reference(request.market.as_ref().ok_or(invalid)?,
-            context.deadline(), context.cancellation().clone()).await?;
+        let history = replay_price_history_inputs(
+            price,
+            &self.research,
+            &self.calendars,
+            &self.source_actions,
+            request.source_action_reference.as_ref().ok_or(invalid)?,
+            Some(saved),
+            context,
+        )
+        .await?
+        .ok_or(ServiceError::Unavailable)?;
+        let market = self
+            .market
+            .read_reference(
+                request.market.as_ref().ok_or(invalid)?,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await?;
         let original_market = *original.market().ok_or(invalid)?;
-        if market_evidence(&market, recipe.authorization_expires_at)? != original_market { return Err(invalid); }
+        if market_evidence(&market, recipe.authorization_expires_at)? != original_market {
+            return Err(invalid);
+        }
         let original_model = original.financial_model().ok_or(invalid)?;
         let cases = crate::application::fair_value::automatic_valuation_model_cases(&receipt)?;
-        let authenticated_model = super::recommendation::adapt_financial_model_evidence(
-            &receipt, None, receipt.macro_assumptions().cloned(), cases.scenarios(),
-            cases.scenario_identity(), cases.sensitivity_range(), cases.sensitivity_identity(),
-            original_model.horizon_at(), original_model.window(),
-        ).map_err(|_| invalid)?;
-        if authenticated_model != *original_model { return Err(invalid); }
-        let conversion = self.source_actions.read_retained_forecast_share_conversion(
-            request.current_share_action_reference.as_ref().ok_or(invalid)?, &history.epoch, &history.history,
-            &history.original_plan, &market, original.admitted_at(), recipe.authorized_at,
-            recipe.authorization_expires_at, Sha256Digest::new(recipe.conversion_identity), recipe.output_scale,
-            context.deadline(), context.cancellation().clone(),
-        ).await.map_err(source_error)?.ok_or(ServiceError::Unavailable)?;
-        let valuation = receipt.project_current_share_units(&history.epoch, &conversion, original.admitted_at())
+        let authenticated_model =
+            market_squawk_decisions::FinancialModelEvidence::try_from_automatic_valuation_receipt(
+                &receipt,
+                cases.scenarios(),
+                cases.scenario_identity(),
+                cases.sensitivity_range(),
+                cases.sensitivity_identity(),
+                receipt.macro_assumptions().cloned(),
+                original_model.horizon_at(),
+                original_model.window(),
+            )
             .map_err(|_| invalid)?;
-        let source = self.valuation_sources.source_for_selected_forecast(&selected,
-            &ArtifactReadContext::new(context.cancellation().clone(), context.deadline())).await
-            .map_err(|error| match error {
-                market_squawk_valuation::FairValueError::Cancelled => ServiceError::Cancelled,
-                market_squawk_valuation::FairValueError::DeadlineExceeded => ServiceError::DeadlineExceeded,
-                market_squawk_valuation::FairValueError::ResourceExhausted => ServiceError::ResourceExhausted,
-                _ => ServiceError::InvalidResult,
-            })?;
-        if source.reference() != source_reference || source.reference().identity() != valuation.source_identity() { return Err(invalid); }
+        if authenticated_model != *original_model {
+            return Err(invalid);
+        }
+        let conversion = self
+            .source_actions
+            .read_retained_forecast_share_conversion(
+                request
+                    .current_share_action_reference
+                    .as_ref()
+                    .ok_or(invalid)?,
+                &history.epoch,
+                &history.history,
+                &history.original_plan,
+                &market,
+                original.admitted_at(),
+                recipe.authorized_at,
+                recipe.authorization_expires_at,
+                Sha256Digest::new(recipe.conversion_identity),
+                recipe.output_scale,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map_err(source_error)?
+            .ok_or(ServiceError::Unavailable)?;
+        let source = self
+            .valuation_sources
+            .source_for_selected_forecast(
+                &selected,
+                &ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+            )
+            .await
+            .map_err(crate::application::fair_value::map_fair_value_error)?;
+        let valuation = if let Some(reference) = recipe.fundamental_sources.as_deref() {
+            let sources = crate::application::fair_value::replay_fundamental_share_sources(
+                &receipt,
+                reference,
+                &self.research,
+                &self.source_actions,
+                context,
+            )
+            .await?;
+            receipt
+                .project_fundamental_current_share_units(
+                    &history.epoch,
+                    &source,
+                    &conversion,
+                    &sources.bases,
+                    sources.reference,
+                    original.admitted_at(),
+                    original_model.horizon_at(),
+                )
+                .map_err(|_| invalid)?
+        } else {
+            let mut refs = receipt.inputs().iter().filter_map(|input| {
+                match input.input().evidence().origin() {
+                    market_squawk_valuation::EvidenceOrigin::ForecastDistribution { evidence } => {
+                        Some(evidence.source().reference())
+                    }
+                    _ => None,
+                }
+            });
+            let first = refs.next().ok_or(invalid)?;
+            if refs.any(|reference| reference != first) || source.reference() != first {
+                return Err(invalid);
+            }
+            receipt
+                .project_current_share_units(&history.epoch, &conversion, original.admitted_at())
+                .map_err(|_| invalid)?
+        };
         let admission = CurrentShareMarketAdmission {
-            market: original_market, authorized_at: recipe.authorized_at,
+            market: original_market,
+            authorized_at: recipe.authorized_at,
             authorization_expires_at: recipe.authorization_expires_at,
             authorization_decision_digest: digest(recipe.authorization_decision_digest)?,
         };
-        let projected = original.try_project_current_share_units(conversion, valuation, market.publication(), admission)
+        let projected = original
+            .try_project_current_share_units(conversion, valuation, market.publication(), admission)
             .map_err(|_| invalid)?;
-        if CurrentShareReplayRecipe::from(projected.current_share_projection().ok_or(invalid)?) != *recipe {
+        if CurrentShareReplayRecipe::from(projected.current_share_projection().ok_or(invalid)?)
+            != *recipe
+        {
             return Err(invalid);
         }
         Ok(projected)
@@ -171,8 +304,12 @@ pub(crate) fn recovery_request_context(
         .map_err(|_| ServiceError::Internal)?;
     let limits = market_squawk_services::ServiceLimits::try_new(4096, 1, 4096, 1, structure)
         .map_err(|_| ServiceError::Internal)?;
-    Ok(RequestContext::new(market_squawk_services::RequestId::Integer(1),
-        context.cancellation().clone(), context.deadline(), limits))
+    Ok(RequestContext::new(
+        market_squawk_services::RequestId::Integer(1),
+        context.cancellation().clone(),
+        context.deadline(),
+        limits,
+    ))
 }
 
 /// Canonical market evidence; retained replay keeps the original admission expiry.

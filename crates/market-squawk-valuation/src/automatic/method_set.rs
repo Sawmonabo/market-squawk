@@ -187,8 +187,8 @@ impl AutomaticValuationResultAudit {
             || expires_at <= calculated_at
             || recommendation.assessed_at() < calculated_at
             || (recommendation.outcome()
-                == AutomaticValuationRecommendationOutcome::NotPerInstrumentUnit)
-                != (range.central().basis() != ValuationAmountBasis::PerInstrumentUnit)
+                == AutomaticValuationRecommendationOutcome::NotPerInstrumentUnit
+                && range.central().basis() == ValuationAmountBasis::PerInstrumentUnit)
             || (recommendation.outcome() == AutomaticValuationRecommendationOutcome::Selected
                 && recommendation.assessed_at() >= expires_at)
         {
@@ -370,11 +370,9 @@ impl AutomaticValuationMethodSetAudit {
                             != (method == AutomaticValuationMethod::DiscountedCashFlow))
                             || (result.residual_terminal.is_some()
                                 != (method == AutomaticValuationMethod::ResidualIncome))
-                            || ((result.recommendation.outcome()
-                                == AutomaticValuationRecommendationOutcome::ShareUnitBasisUnproven)
-                                != (method == AutomaticValuationMethod::ComparableCompanies
-                                    && result.range.central().basis()
-                                        == ValuationAmountBasis::PerInstrumentUnit))
+                            || (result.recommendation.outcome()
+                                == AutomaticValuationRecommendationOutcome::ShareUnitBasisUnproven
+                                && method != AutomaticValuationMethod::ComparableCompanies)
                     })
             })
             || attempts
@@ -384,8 +382,15 @@ impl AutomaticValuationMethodSetAudit {
                 !attempts.iter().any(|attempt| {
                     attempt.outcome.as_ref().is_ok_and(|result| {
                         result.measurement_id == id
-                            && result.range.central().basis()
+                            && (result.range.central().basis()
                                 == ValuationAmountBasis::PerInstrumentUnit
+                                || (result.range.central().basis()
+                                    == ValuationAmountBasis::TotalCommonEquity
+                                    && matches!(
+                                        attempt.method,
+                                        AutomaticValuationMethod::DiscountedCashFlow
+                                            | AutomaticValuationMethod::ResidualIncome
+                                    )))
                     })
                 })
             })

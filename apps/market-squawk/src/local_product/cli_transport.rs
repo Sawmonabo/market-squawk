@@ -24,16 +24,16 @@ use crate::application::{
     setup::{SetupGoal, SetupPlanSelection, SetupStarterPlan},
 };
 use crate::cli::{
-    AnalysisCommand, AnalysisSetupCommand, BacktestCommand, BackupOperationsCommand, BackupRetentionCommand, BotCommand, Command,
-    DatasetCommand, ExecutionCommand, FairValueCommand, FeatureCommand, ForecastCommand,
-    IngestCommand, JobCommand, LogDomainArgument, LogOperationsCommand, LogQueryArguments,
-    LogSeverityArgument, MarketCommand, ModelCommand, OperationsCommand,
-    OperationsPreviewConfirmationArguments, PortfolioCommand, PortfolioImportCommand,
-    ProgramRollbackCommand, QueryCommand, RestoreCommand, SettingsChangeArguments,
-    SettingsChangeCommand, SettingsOperationsCommand, SettingsRollbackCommand, SetupApplyArguments,
-    SetupCommand, SetupGoalArgument, SetupPreviewArguments, SetupStarterPlanArgument,
-    SourceCommand, UpdateChannelArgument, UpdateOperationsCommand, WorkspaceOperationsCommand,
-    WorkspaceSwitchCommand,
+    AnalysisCommand, AnalysisSetupCommand, BacktestCommand, BackupOperationsCommand,
+    BackupRetentionCommand, BotCommand, Command, DatasetCommand, ExecutionCommand,
+    FairValueCommand, FeatureCommand, ForecastCommand, IngestCommand, JobCommand,
+    LogDomainArgument, LogOperationsCommand, LogQueryArguments, LogSeverityArgument, MarketCommand,
+    ModelCommand, OperationsCommand, OperationsPreviewConfirmationArguments, PortfolioCommand,
+    PortfolioImportCommand, ProgramRollbackCommand, QueryCommand, RestoreCommand,
+    SettingsChangeArguments, SettingsChangeCommand, SettingsOperationsCommand,
+    SettingsRollbackCommand, SetupApplyArguments, SetupCommand, SetupGoalArgument,
+    SetupPreviewArguments, SetupStarterPlanArgument, SourceCommand, UpdateChannelArgument,
+    UpdateOperationsCommand, WorkspaceOperationsCommand, WorkspaceSwitchCommand,
 };
 use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
@@ -188,12 +188,33 @@ async fn execute(
             series_id,
             knowledge_cutoff,
             effective_date_cutoff,
-        } => economic_context(authority, list_series, series_id, knowledge_cutoff, effective_date_cutoff).await,
+        } => {
+            economic_context(
+                authority,
+                list_series,
+                series_id,
+                knowledge_cutoff,
+                effective_date_cutoff,
+            )
+            .await
+        }
         Command::EconomicSeriesHistory {
-            series_id, start_effective_date, knowledge_cutoff,
-            effective_date_cutoff, after_effective_period,
-        } => economic_series_history(authority, series_id, start_effective_date,
-            knowledge_cutoff, effective_date_cutoff, after_effective_period).await,
+            series_id,
+            start_effective_date,
+            knowledge_cutoff,
+            effective_date_cutoff,
+            after_effective_period,
+        } => {
+            economic_series_history(
+                authority,
+                series_id,
+                start_effective_date,
+                knowledge_cutoff,
+                effective_date_cutoff,
+                after_effective_period,
+            )
+            .await
+        }
         Command::Ingest { command } => ingest(authority, command).await,
         Command::Dataset { command } => dataset(authority, command).await,
         Command::Query { command } => query(authority, command).await,
@@ -221,63 +242,161 @@ async fn execute(
     }
 }
 
-async fn analysis_workflow(authority:CliAuthority<'_>,command:AnalysisCommand)->Result<CliProductResult,CliProductError> {
-    let (operation,mut arguments,summary)=match command {
-        AnalysisCommand::Setup {command} => match command {
-            AnalysisSetupCommand::Status => ("Portfolio.GetRecommendationSetup",Map::new(),"recommendation setup read"),
-            AnalysisSetupCommand::Preview {request} => ("Portfolio.PreviewRecommendationSetup",read_json_object(&request)?,"recommendation setup previewed"),
-            AnalysisSetupCommand::Commit {preview_id,preview_digest,confirm} => {
+async fn analysis_workflow(
+    authority: CliAuthority<'_>,
+    command: AnalysisCommand,
+) -> Result<CliProductResult, CliProductError> {
+    let (operation, mut arguments, summary) = match command {
+        AnalysisCommand::Setup { command } => match command {
+            AnalysisSetupCommand::Catalog { cursor, limit } => (
+                "AnalyticalProfile.GetCatalog",
+                product_page_arguments(cursor, limit, 512)?,
+                "financial model choices read",
+            ),
+            AnalysisSetupCommand::Status => (
+                "Portfolio.GetRecommendationSetup",
+                Map::new(),
+                "recommendation setup read",
+            ),
+            AnalysisSetupCommand::Preview { request } => (
+                "Portfolio.PreviewRecommendationSetup",
+                read_json_object(&request)?,
+                "recommendation setup previewed",
+            ),
+            AnalysisSetupCommand::Commit {
+                preview_id,
+                preview_digest,
+                confirm,
+            } => {
                 require_confirmation(confirm)?;
-                ("Portfolio.CommitRecommendationSetup",json_object(json!({"previewId":preview_id,"previewDigest":preview_digest,"confirm":true}))?,"recommendation setup confirmed")
+                (
+                    "Portfolio.CommitRecommendationSetup",
+                    json_object(
+                        json!({"previewId":preview_id,"previewDigest":preview_digest,"confirm":true}),
+                    )?,
+                    "recommendation setup confirmed",
+                )
             }
         },
-        AnalysisCommand::Results {after,limit} => {
-            let mut arguments=json_object(json!({"limit":limit}))?;
-            if let Some(after)=after{arguments.insert("afterActionToken".into(),json!(after));}
-            ("Decision.ListInvestmentAnalyses",arguments,"saved investment analyses read")
+        AnalysisCommand::Results { after, limit } => {
+            let mut arguments = json_object(json!({"limit":limit}))?;
+            if let Some(after) = after {
+                arguments.insert("afterActionToken".into(), json!(after));
+            }
+            (
+                "Decision.ListInvestmentAnalyses",
+                arguments,
+                "saved investment analyses read",
+            )
         }
-        AnalysisCommand::Show {action_token} => ("Decision.GetInvestmentAnalysis",json_object(json!({"actionToken":action_token}))?,"saved investment analysis reopened"),
+        AnalysisCommand::Show { action_token } => (
+            "Decision.GetInvestmentAnalysis",
+            json_object(json!({"actionToken":action_token}))?,
+            "saved investment analysis reopened",
+        ),
         command => {
-            let (request,confirmed)=match command {
-                AnalysisCommand::Start {selection_token,benchmark_instrument_id,confirm} => {
-                    let mut request=json!({"action":"analyzeInvestment","selectionToken":selection_token});
-                    if let Some(benchmark)=benchmark_instrument_id {request["benchmarkInstrumentId"]=json!(benchmark);}
-                    (request,confirm)
-                },
-                AnalysisCommand::Find {benchmark_instrument_id,confirm} => {
-                    let mut request=json!({"action":"findOpportunities"});
-                    if let Some(benchmark)=benchmark_instrument_id {request["benchmarkInstrumentId"]=json!(benchmark);}
-                    (request,confirm)
-                },
-                AnalysisCommand::Status => (json!({"action":"status"}),false),
-                AnalysisCommand::Resume {workflow_token,confirm} => (json!({"action":"resumeWorkflow","workflowToken":workflow_token}),confirm),
-                AnalysisCommand::Cancel {workflow_token,confirm} => (json!({"action":"cancelWorkflow","workflowToken":workflow_token}),confirm),
-                AnalysisCommand::Coverage {workflow_token,after} => {
-                    let after=after.as_deref().map(read_json_object).transpose()?;
-                    (json!({"action":"workflowCoverage","workflowToken":workflow_token,"after":after}),false)
-                }
-                AnalysisCommand::Profile {request,confirm} => {
-                    let request=Value::Object(read_json_object(&request)?);
-                    match request.get("action").and_then(Value::as_str) {
-                        Some("profileOptions"|"copyRecommended"|"updateProfile"|"validateProfile"|"compareWithRecommended"|"activateProfile"|"restoreRecommended"|"history")=>{},
-                        _=>return Err(CliProductError::RequestShape),
+            let (request, confirmed) = match command {
+                AnalysisCommand::Start {
+                    selection_token,
+                    benchmark_instrument_id,
+                    confirm,
+                } => {
+                    let mut request =
+                        json!({"action":"analyzeInvestment","selectionToken":selection_token});
+                    if let Some(benchmark) = benchmark_instrument_id {
+                        request["benchmarkInstrumentId"] = json!(benchmark);
                     }
-                    (request,confirm)
+                    (request, confirm)
                 }
-                _=>return Err(CliProductError::WrongCommand),
+                AnalysisCommand::Find {
+                    benchmark_instrument_id,
+                    confirm,
+                } => {
+                    let mut request = json!({"action":"findOpportunities"});
+                    if let Some(benchmark) = benchmark_instrument_id {
+                        request["benchmarkInstrumentId"] = json!(benchmark);
+                    }
+                    (request, confirm)
+                }
+                AnalysisCommand::Status => (json!({"action":"status"}), false),
+                AnalysisCommand::Resume {
+                    workflow_token,
+                    confirm,
+                } => (
+                    json!({"action":"resumeWorkflow","workflowToken":workflow_token}),
+                    confirm,
+                ),
+                AnalysisCommand::Cancel {
+                    workflow_token,
+                    confirm,
+                } => (
+                    json!({"action":"cancelWorkflow","workflowToken":workflow_token}),
+                    confirm,
+                ),
+                AnalysisCommand::Coverage {
+                    workflow_token,
+                    after,
+                } => {
+                    let after = after.as_deref().map(read_json_object).transpose()?;
+                    (
+                        json!({"action":"workflowCoverage","workflowToken":workflow_token,"after":after}),
+                        false,
+                    )
+                }
+                AnalysisCommand::Profile { request, confirm } => {
+                    let request = Value::Object(read_json_object(&request)?);
+                    match request.get("action").and_then(Value::as_str) {
+                        Some(
+                            "profileOptions"
+                            | "copyRecommended"
+                            | "updateProfile"
+                            | "validateProfile"
+                            | "compareWithRecommended"
+                            | "activateProfile"
+                            | "restoreRecommended"
+                            | "history",
+                        ) => {}
+                        _ => return Err(CliProductError::RequestShape),
+                    }
+                    (request, confirm)
+                }
+                _ => return Err(CliProductError::WrongCommand),
             };
-            let admitted:crate::application::analytical_workflow::AnalyticalControllerCommand=serde_json::from_value(request.clone()).map_err(|_|CliProductError::RequestShape)?;
-            let update=admitted.requires_confirmation();
-            if update{require_confirmation(confirmed)?;}
-            let mut arguments=json_object(json!({"request":request}))?;
-            if update {arguments.insert("confirm".into(),Value::Bool(true));}
-            (if update{"Analysis.UpdateWorkflow"}else{"Analysis.ReadWorkflow"},arguments,if update{"investment workflow command accepted"}else{"investment workflow read"})
+            let admitted: crate::application::analytical_workflow::AnalyticalControllerCommand =
+                serde_json::from_value(request.clone())
+                    .map_err(|_| CliProductError::RequestShape)?;
+            let update = admitted.requires_confirmation();
+            if update {
+                require_confirmation(confirmed)?;
+            }
+            let mut arguments = json_object(json!({"request":request}))?;
+            if update {
+                arguments.insert("confirm".into(), Value::Bool(true));
+            }
+            (
+                if update {
+                    "Analysis.UpdateWorkflow"
+                } else {
+                    "Analysis.ReadWorkflow"
+                },
+                arguments,
+                if update {
+                    "investment workflow command accepted"
+                } else {
+                    "investment workflow read"
+                },
+            )
         }
     };
-    require_installed(authority,operation)?;
-    let result=invoke(authority,operation,&mut arguments,None,summary).await?;
-    if result.value().pointer("/data/kind").and_then(Value::as_str)==Some("unavailable") {
-        let message=result.value().pointer("/data/message").and_then(Value::as_str).filter(|s|s.len()<=2048).ok_or(CliProductError::RequestShape)?;
+    require_installed(authority, operation)?;
+    let result = invoke(authority, operation, &mut arguments, None, summary).await?;
+    if result.value().pointer("/data/kind").and_then(Value::as_str) == Some("unavailable") {
+        let message = result
+            .value()
+            .pointer("/data/message")
+            .and_then(Value::as_str)
+            .filter(|s| s.len() <= 2048)
+            .ok_or(CliProductError::RequestShape)?;
         return Err(CliProductError::Workflow(message.to_owned()));
     }
     Ok(result)
@@ -307,11 +426,22 @@ async fn economic_context(
         (true, None) => ("Macro.ListSeries", 64, "saved economic series listed"),
         (false, Some(series_id)) if !series_id.is_empty() && series_id.len() <= 512 => {
             arguments.insert("seriesId".into(), Value::String(series_id));
-            ("Macro.GetLatestSeriesObservation", 1, "latest saved economic observation read")
+            (
+                "Macro.GetLatestSeriesObservation",
+                1,
+                "latest saved economic observation read",
+            )
         }
         _ => return Err(CliProductError::RequestShape),
     };
-    invoke(authority, operation, &mut arguments, Some(maximum_items), summary).await
+    invoke(
+        authority,
+        operation,
+        &mut arguments,
+        Some(maximum_items),
+        summary,
+    )
+    .await
 }
 
 async fn economic_series_history(
@@ -322,7 +452,9 @@ async fn economic_series_history(
     effective_date_cutoff: Option<String>,
     after_effective_period: Option<String>,
 ) -> Result<CliProductResult, CliProductError> {
-    if series_id.is_empty() || series_id.len() > 512 { return Err(CliProductError::RequestShape); }
+    if series_id.is_empty() || series_id.len() > 512 {
+        return Err(CliProductError::RequestShape);
+    }
     let mut arguments = match (knowledge_cutoff, effective_date_cutoff) {
         (None, None) => Map::new(),
         (Some(knowledge_cutoff), Some(effective_date_cutoff)) => json_object(json!({
@@ -332,11 +464,21 @@ async fn economic_series_history(
         _ => return Err(CliProductError::RequestShape),
     };
     arguments.insert("seriesId".into(), Value::String(series_id));
-    arguments.insert("startEffectiveDate".into(), Value::String(start_effective_date));
+    arguments.insert(
+        "startEffectiveDate".into(),
+        Value::String(start_effective_date),
+    );
     if let Some(after) = after_effective_period {
         arguments.insert("afterEffectivePeriod".into(), Value::String(after));
     }
-    invoke(authority, "Macro.GetSeriesHistory", &mut arguments, Some(32), "saved economic history read").await
+    invoke(
+        authority,
+        "Macro.GetSeriesHistory",
+        &mut arguments,
+        Some(32),
+        "saved economic history read",
+    )
+    .await
 }
 
 async fn market(
@@ -344,7 +486,11 @@ async fn market(
     command: MarketCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
-        MarketCommand::GetSessionContext { product, date, confirm } => {
+        MarketCommand::GetSessionContext {
+            product,
+            date,
+            confirm,
+        } => {
             require_confirmation(confirm)?;
             require_installed(authority, "Market.GetSessionContext")?;
             let mut arguments = json_object(json!({
@@ -358,7 +504,8 @@ async fn market(
                 &mut arguments,
                 Some(64),
                 "reported trading sessions acquired",
-            ).await
+            )
+            .await
         }
         MarketCommand::ReadSessionContext { reference } => {
             require_installed(authority, "Market.ReadSessionContext")?;
@@ -370,7 +517,8 @@ async fn market(
                 &mut arguments,
                 Some(64),
                 "saved trading sessions read",
-            ).await
+            )
+            .await
         }
         MarketCommand::PrepareInvestmentEvidence { request, confirm } => {
             require_confirmation(confirm)?;
@@ -421,8 +569,30 @@ async fn market(
             )
             .await
         }
-        MarketCommand::History { history_token } => {
-            let arguments = json_object(json!({"historyToken": history_token}))?;
+        MarketCommand::History {
+            history_token,
+            start_unix_nanos,
+            end_unix_nanos,
+            start_date,
+            end_date,
+            point_limit,
+            generation_token,
+        } => {
+            let mut arguments =
+                json_object(json!({"historyToken": history_token, "pointLimit": point_limit}))?;
+            insert_optional_string(&mut arguments, "startUnixNanos", start_unix_nanos);
+            insert_optional_string(&mut arguments, "endUnixNanos", end_unix_nanos);
+            insert_optional_string(
+                &mut arguments,
+                "startDate",
+                start_date.map(|date| date.to_string()),
+            );
+            insert_optional_string(
+                &mut arguments,
+                "endDate",
+                end_date.map(|date| date.to_string()),
+            );
+            insert_optional_string(&mut arguments, "generationToken", generation_token);
             invoke_without_result_limits(
                 authority,
                 "Market.GetHistory",
@@ -456,7 +626,8 @@ async fn source(
             "source status read",
         ),
         SourceCommand::Verify { provider, confirm } => {
-            return source_lifecycle(authority, &provider, "Source.Verify", "verify", confirm).await;
+            return source_lifecycle(authority, &provider, "Source.Verify", "verify", confirm)
+                .await;
         }
         SourceCommand::Start { provider, confirm } => {
             return source_lifecycle(authority, &provider, "Source.Start", "start", confirm).await;
@@ -471,7 +642,11 @@ async fn source(
             source_filter(provider),
             "source health read",
         ),
-        SourceCommand::Discover { provider, dataset, confirm } => (
+        SourceCommand::Discover {
+            provider,
+            dataset,
+            confirm,
+        } => (
             "Source.Discover",
             json_object(json!({
                 "provider": provider,
@@ -1047,7 +1222,7 @@ async fn model(
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         ModelCommand::List => ("Model.ListBundles", Map::new(), "model evidence listed"),
-        ModelCommand::Activity => {
+        ModelCommand::Activity { cursor, limit } => {
             if matches!(authority, CliAuthority::Local(_)) {
                 return Err(CliProductError::InstalledServiceRequired {
                     operation: "Model.ListProductActivity",
@@ -1055,7 +1230,7 @@ async fn model(
             }
             (
                 "Model.ListProductActivity",
-                Map::new(),
+                product_page_arguments(cursor, limit, 512)?,
                 "model activity listed",
             )
         }
@@ -1091,9 +1266,9 @@ async fn forecast(
     command: ForecastCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
-        ForecastCommand::Options => (
+        ForecastCommand::Options { cursor, limit } => (
             "Model.GetForecastPreparation",
-            Map::new(),
+            product_page_arguments(cursor, limit, 512)?,
             "forecast choices read",
         ),
         ForecastCommand::Preview {
@@ -1127,7 +1302,11 @@ async fn forecast(
                 "forecast started",
             )
         }
-        ForecastCommand::List => ("Model.ListForecasts", Map::new(), "forecasts listed"),
+        ForecastCommand::List { cursor, limit } => (
+            "Model.ListForecasts",
+            product_page_arguments(cursor, limit, 256)?,
+            "forecasts listed",
+        ),
         ForecastCommand::Show { forecast_token } => (
             "Model.GetForecast",
             json_object(json!({"forecastToken": forecast_token}))?,
@@ -1154,11 +1333,19 @@ async fn forecast(
                 "forecast outcome measurement completed",
             )
         }
-        ForecastCommand::Outcomes { forecast_token } => (
-            "Model.GetForecastOutcomes",
-            json_object(json!({"forecastToken": forecast_token}))?,
-            "forecast outcomes read",
-        ),
+        ForecastCommand::Outcomes {
+            forecast_token,
+            cursor,
+            limit,
+        } => {
+            let mut arguments = product_page_arguments(cursor, limit, 256)?;
+            arguments.insert("forecastToken".to_owned(), json!(forecast_token));
+            (
+                "Model.GetForecastOutcomes",
+                arguments,
+                "forecast outcomes read",
+            )
+        }
     };
     require_installed(authority, operation)?;
     invoke(authority, operation, &mut arguments, None, summary).await
@@ -1169,15 +1356,11 @@ async fn portfolio(
     command: PortfolioCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
-        PortfolioCommand::Accounts {
-            after_account_token,
-        } => {
-            let mut arguments = Map::new();
-            if let Some(token) = after_account_token {
-                arguments.insert("afterAccountToken".to_owned(), json!(token));
-            }
-            ("Portfolio.ListAccounts", arguments, "portfolios listed")
-        }
+        PortfolioCommand::Accounts { cursor, limit } => (
+            "Portfolio.ListAccounts",
+            product_page_arguments(cursor, limit, 512)?,
+            "portfolios listed",
+        ),
         PortfolioCommand::Import {
             path,
             account,
@@ -1366,9 +1549,9 @@ async fn backtest(
                 "investment test started",
             )
         }
-        BacktestCommand::List => (
+        BacktestCommand::List { cursor, limit } => (
             "Analysis.ListProductBacktests",
-            Map::new(),
+            product_page_arguments(cursor, limit, 512)?,
             "investment tests listed",
         ),
         BacktestCommand::Show { backtest_token } => (
@@ -1537,12 +1720,18 @@ async fn execution(
     let (operation, mut arguments, summary) = match command {
         ExecutionCommand::Orders => ("Execution.GetOrders", Map::new(), "paper orders listed"),
         ExecutionCommand::Fills => ("Execution.GetFills", Map::new(), "paper fills listed"),
-        ExecutionCommand::Targets { analysis_action_token } => {
+        ExecutionCommand::Targets {
+            analysis_action_token,
+        } => {
             let mut arguments = Map::new();
             if let Some(token) = analysis_action_token {
                 arguments.insert("analysisActionToken".to_owned(), json!(token));
             }
-            ("Execution.GetManualPaperTargets", arguments, "paper investment choices listed")
+            (
+                "Execution.GetManualPaperTargets",
+                arguments,
+                "paper investment choices listed",
+            )
         }
         ExecutionCommand::PrepareManual { request } => (
             "Execution.PrepareManualPaperDraft",
@@ -1655,7 +1844,7 @@ async fn job(
             if let Some(after_job_id) = after_job_id {
                 arguments.insert(
                     "afterJobId".to_owned(),
-                    Value::String(after_job_id.to_string()),
+                    Value::String(opaque_cursor(after_job_id, 256)?),
                 );
             }
             ("Job.List", Value::Object(arguments), "durable jobs listed")
@@ -1769,7 +1958,7 @@ async fn backup_operations(
             if let Some(after_backup_id) = after_backup_id {
                 arguments.insert(
                     "afterBackupId".to_owned(),
-                    Value::String(lowercase_sha256(&after_backup_id)?.to_owned()),
+                    Value::String(opaque_cursor(after_backup_id, 256)?),
                 );
             }
             invoke(
@@ -2230,10 +2419,35 @@ fn log_query_arguments(
     insert_optional_string(&mut result, "jobId", arguments.job_id);
     insert_optional_string(&mut result, "correlationId", arguments.correlation_id);
     insert_optional_string(&mut result, "search", arguments.search);
-    if let Some(after_sequence) = arguments.after_sequence {
-        result.insert("afterSequence".to_owned(), json!(after_sequence));
+    if let Some(cursor) = arguments.cursor {
+        result.insert(
+            "cursor".to_owned(),
+            Value::String(opaque_cursor(cursor, 1_024)?),
+        );
     }
     Ok(result)
+}
+
+fn opaque_cursor(value: String, maximum_bytes: usize) -> Result<String, CliProductError> {
+    if value.is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control) {
+        return Err(CliProductError::RequestShape);
+    }
+    Ok(value)
+}
+
+fn product_page_arguments(
+    cursor: Option<String>,
+    limit: u16,
+    maximum_cursor_bytes: usize,
+) -> Result<Map<String, Value>, CliProductError> {
+    let mut arguments = json_object(json!({"limit": limit}))?;
+    if let Some(cursor) = cursor {
+        arguments.insert(
+            "cursor".to_owned(),
+            Value::String(opaque_cursor(cursor, maximum_cursor_bytes)?),
+        );
+    }
+    Ok(arguments)
 }
 
 fn insert_optional_string(

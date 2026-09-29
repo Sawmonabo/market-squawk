@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Link } from "react-router-dom"
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   Archive,
   CircleAlert,
@@ -48,8 +48,9 @@ import {
   type RetentionPreview,
 } from "./contracts"
 
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+
 const INVENTORY_LIMIT = 64
-const MAXIMUM_INVENTORY_PAGES = 4
 const JOB_LIMIT = 50
 
 type PendingConfirmation =
@@ -100,44 +101,44 @@ function ReadyBackupRecovery({
   const [receipt, setReceipt] = React.useState<BackupJobReceipt | null>(null)
   const [announcement, setAnnouncement] = React.useState("")
 
-  const inventory = useInfiniteQuery({
+  const navigation = useCursorNavigation()
+  const inventory = useQuery({
     queryKey: productKeys.operation(scope, "Operations", "Operations.ListBackups", {
       limit: INVENTORY_LIMIT,
+      afterBackupId: navigation.after,
     }),
-    initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) =>
+    gcTime: 0,
+    queryFn: ({ signal }) =>
       transport
         .systemQuery({
           query: "operationBackups",
-          afterBackupId: pageParam,
+          afterBackupId: navigation.after,
           limit: INVENTORY_LIMIT,
-        })
+        }, { signal })
         .then(parseBackupInventory),
-    getNextPageParam: (page, pages) =>
-      pages.length < MAXIMUM_INVENTORY_PAGES
-        ? (page.nextAfterBackupId ?? undefined)
-        : undefined,
   })
 
-  const inventoryPages = inventory.data?.pages ?? []
-  const backups = React.useMemo(() => {
-    const seen = new Map<string, BackupManifest>()
-    for (const page of inventoryPages) {
-      for (const manifest of page.manifests) seen.set(manifest.backupId, manifest)
-    }
-    return [...seen.values()]
-  }, [inventoryPages])
-  const inventoryRevision = inventoryPages[0]?.revision ?? null
-  const pendingDeletions = inventoryPages[0]?.pendingDeletions ?? 0
+  const backups = inventory.data?.manifests ?? []
+  const inventoryRevision = inventory.data?.revision ?? null
+  const pendingDeletions = inventory.data?.pendingDeletions ?? 0
   const retentionStale =
     retentionPreview !== null &&
     (inventoryRevision === null || retentionPreview.evidence.revision !== inventoryRevision)
 
   const retainedJob = useQuery({
     queryKey: productKeys.operation(scope, "job", "Job.List", { limit: JOB_LIMIT }),
-    queryFn: () => transport.systemQuery({ query: "jobs", limit: JOB_LIMIT }).then(parseBackupJobs),
+    queryFn: ({ signal }) => transport.systemQuery({ query: "jobs", limit: JOB_LIMIT }, { signal }),
+    select: parseBackupJobs,
+    gcTime: 0,
     enabled: receipt !== null,
-    refetchInterval: receipt ? 5_000 : false,
+    refetchInterval: (query) => {
+      if (!receipt) return false
+      try {
+        const job = query.state.data ? parseBackupJobs(query.state.data).find((item) => item.jobId === receipt.jobId && item.generation === receipt.generation) : undefined
+        return !job || ["queued", "preparing", "running", "recovering", "awaiting_confirmation", "cancelling"].includes(job.state) ? 5_000 : false
+      } catch { return false }
+    },
+    refetchIntervalInBackground: false,
   })
   const trackedJob = receipt
     ? retainedJob.data?.find(
@@ -277,17 +278,8 @@ function ReadyBackupRecovery({
             ))}
           </div>
         ) : null}
-        {inventory.hasNextPage ? (
-          <Button
-            className="mt-4"
-            variant="outline"
-            onClick={() => void inventory.fetchNextPage()}
-            disabled={inventory.isFetchingNextPage}
-          >
-            {inventory.isFetchingNextPage ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : null}
-            Load more verified backups
-          </Button>
-        ) : null}
+        <CursorNavigation navigation={navigation} next={inventory.data?.nextAfterBackupId} busy={inventory.isFetching} error={inventory.isError}
+          onRestart={() => { if (navigation.after === undefined) void inventory.refetch() }} />
       </section>
 
       <section className="mt-6 grid gap-4 xl:grid-cols-2" aria-label="Retention and restore controls">

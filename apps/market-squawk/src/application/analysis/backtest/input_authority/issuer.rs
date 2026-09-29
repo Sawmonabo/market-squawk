@@ -75,7 +75,9 @@ pub(crate) struct HistoricalRecommendationAlphaProducerReference {
 }
 
 impl HistoricalRecommendationAlphaProducerReference {
-    pub(crate) const fn fiscal_recipe_reference(&self) -> &crate::application::research::HistoricalFiscalRecipeReference {
+    pub(crate) const fn fiscal_recipe_reference(
+        &self,
+    ) -> &crate::application::research::HistoricalFiscalRecipeReference {
         &self.fiscal_recipe
     }
 
@@ -163,7 +165,9 @@ pub(crate) struct HistoricalRecommendationAlphaProducerReadCapability {
 }
 
 impl HistoricalRecommendationAlphaProducerReadCapability {
-    pub(crate) fn fiscal_reader(&self) -> &Arc<crate::application::research::HistoricalFiscalForecastReadCapability> {
+    pub(crate) fn fiscal_reader(
+        &self,
+    ) -> &Arc<crate::application::research::HistoricalFiscalForecastReadCapability> {
         &self.fiscal_reader
     }
 
@@ -202,9 +206,9 @@ impl HistoricalRecommendationAlphaProducerReadCapability {
         }
         let catalog = match reference.profile.configuration.model_bundle_policy {
             AnalyticalModelBundlePolicy::BestAdmittedCalibratedMeanV1 => None,
-            AnalyticalModelBundlePolicy::Exact { .. } => Some(
+            AnalyticalModelBundlePolicy::Exact { model_token } => Some(
                 self.forecast_preparation
-                    .catalog(
+                    .catalog_for_model_token(
                         context.origin().ok_or(ServiceError::InvalidRequest)?,
                         self.workspace,
                         // Revalidate the current compatible model inventory, as financial settings
@@ -212,6 +216,7 @@ impl HistoricalRecommendationAlphaProducerReadCapability {
                         // current-feature selection exists in this original issuer reference.
                         wall_now()?,
                         None,
+                        model_token,
                         context.deadline(),
                         context.cancellation().clone(),
                     )
@@ -792,10 +797,14 @@ impl HistoricalRecommendationAlphaProducer {
             Err(crate::application::research::MarketHistoryUnavailableReason::CapacityExceeded) => {
                 return Err(ServiceError::ResourceExhausted);
             }
-            Err(crate::application::research::MarketHistoryUnavailableReason::StorageUnavailable) => {
+            Err(
+                crate::application::research::MarketHistoryUnavailableReason::StorageUnavailable,
+            ) => {
                 return Err(ServiceError::Unavailable);
             }
-            Err(crate::application::research::MarketHistoryUnavailableReason::IntegrityUnproven) => {
+            Err(
+                crate::application::research::MarketHistoryUnavailableReason::IntegrityUnproven,
+            ) => {
                 return Err(ServiceError::InvalidResult);
             }
         }

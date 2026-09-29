@@ -5,6 +5,33 @@ use crate::{ProviderLogicalOriginalReceipt, ProviderLogicalPublicationOrigin};
 use market_squawk_platform::SealedResearchJournalStore;
 use market_squawk_sources::SealedLogicalObjectInput;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogicalOriginalSourceRevisionKind {
+    Metadata,
+    ContractPayload,
+}
+impl LogicalOriginalSourceRevisionKind {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::ContractPayload => "contract_payload",
+        }
+    }
+    pub(crate) fn digest(
+        self,
+        metadata: &SourceMetadata,
+        registered: EvidenceDigest,
+    ) -> EvidenceDigest {
+        match self {
+            Self::Metadata => registered,
+            Self::ContractPayload => metadata
+                .revision_evidence()
+                .payload_evidence()
+                .content_digest(),
+        }
+    }
+}
+
 impl AnalyticalDataService {
     /// Retains an already sealed original under exact source Persist rights. The producer holds
     /// the existing analytical operation lease continuously from raw sealing through publication;
@@ -24,7 +51,77 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<ProviderLogicalOriginalReceipt, IngestError> {
+        self.retain_provider_logical_original_with_revision(
+            metadata,
+            dataset,
+            native_schema,
+            LogicalOriginalSourceRevisionKind::Metadata,
+            original_digest,
+            received_at,
+            checkpoint,
+            objects,
+            rights,
+            store,
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Retains a logical original using the exact source contract revision payload identity.
+    /// This derives authority from the supplied typed metadata, never a caller-provided digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain_provider_logical_original_for_contract(
+        &self,
+        metadata: &SourceMetadata,
+        dataset: &DatasetId,
+        native_schema: EvidenceDigest,
+        original_digest: EvidenceDigest,
+        received_at: Timestamp,
+        checkpoint: &[u8],
+        objects: &[SealedLogicalObjectInput],
+        rights: &RightsDecisionInput,
+        store: &SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderLogicalOriginalReceipt, IngestError> {
+        self.retain_provider_logical_original_with_revision(
+            metadata,
+            dataset,
+            native_schema,
+            LogicalOriginalSourceRevisionKind::ContractPayload,
+            original_digest,
+            received_at,
+            checkpoint,
+            objects,
+            rights,
+            store,
+            deadline,
+            cancellation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retain_provider_logical_original_with_revision(
+        &self,
+        metadata: &SourceMetadata,
+        dataset: &DatasetId,
+        native_schema: EvidenceDigest,
+        revision_kind: LogicalOriginalSourceRevisionKind,
+        original_digest: EvidenceDigest,
+        received_at: Timestamp,
+        checkpoint: &[u8],
+        objects: &[SealedLogicalObjectInput],
+        rights: &RightsDecisionInput,
+        store: &SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderLogicalOriginalReceipt, IngestError> {
         check_market_event_read(deadline, cancellation)?;
+        let registered_revision = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(serde_json::to_vec(metadata)?).into(),
+        );
+        let revision = revision_kind.digest(metadata, registered_revision);
         if rights.source_id != *metadata.source_id()
             || rights.payload_digest != original_digest
             || !rights
@@ -37,13 +134,6 @@ impl AnalyticalDataService {
         {
             return Err(IngestError::ReservationPayloadMismatch);
         }
-        let revision = EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            Sha256::digest(
-                serde_json::to_vec(metadata).map_err(|_| IngestError::InvalidProviderMacroPlan)?,
-            )
-            .into(),
-        );
         let control = MarketEventReadControl {
             deadline,
             cancellation,
@@ -68,6 +158,8 @@ impl AnalyticalDataService {
                     metadata.source_id(),
                     native_schema,
                     revision,
+                    registered_revision,
+                    revision_kind,
                     original_digest,
                     received_at,
                     checkpoint,

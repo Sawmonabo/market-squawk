@@ -10,8 +10,8 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use market_squawk_domain::{InstrumentId, ResearchTemporalCoordinate, Timestamp};
-use tokio_util::sync::CancellationToken;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use super::{AnalyticalFeatureDataset, AnalyticalReadCapability, AnalyticalReadError};
 use crate::manifest::CatalogFeatureDatasetSelection;
@@ -21,30 +21,39 @@ use crate::{
     PythonDatasetCatalogError, PythonDatasetRow, PythonDatasetValue, Sha256Digest,
 };
 
-const MAX_FORECAST_ROWS: usize = 100_000;
+#[path = "forecast/indexed_rows.rs"]
+mod indexed_rows;
+use indexed_rows::RowsBuilder;
+pub use indexed_rows::{ForecastFeatureRows, ForecastSortedDigests};
 const MAX_FORECAST_BYTES: usize = 256 * 1024 * 1024;
 
-/// Bounded work and retained-memory policy for one forecast-evidence materialization.
+/// Caller work count, active batch memory, and independent temporary disk policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForecastDatasetReadLimits {
     max_rows: usize,
     max_bytes: usize,
+    max_spill_bytes: u64,
 }
 
 impl ForecastDatasetReadLimits {
-    /// Constructs limits under the installed feature-dataset ceilings.
+    /// Constructs positive work limits with bounded active batch memory.
     pub fn try_new(max_rows: usize, max_bytes: usize) -> Result<Self, AnalyticalReadError> {
-        if max_rows == 0
-            || max_rows > MAX_FORECAST_ROWS
-            || max_bytes == 0
-            || max_bytes > MAX_FORECAST_BYTES
-        {
+        if max_rows == 0 || max_bytes == 0 || max_bytes > MAX_FORECAST_BYTES {
             return Err(AnalyticalReadError::InvalidLimit);
         }
         Ok(Self {
             max_rows,
             max_bytes,
+            max_spill_bytes: 16 * 1024 * 1024 * 1024,
         })
+    }
+    /// Sets an independent disk allowance for complete indexed evidence and digest ordering.
+    pub fn with_spill_bytes(mut self, max_spill_bytes: u64) -> Result<Self, AnalyticalReadError> {
+        if max_spill_bytes < 4096 || max_spill_bytes > i64::MAX as u64 {
+            return Err(AnalyticalReadError::InvalidLimit);
+        }
+        self.max_spill_bytes = max_spill_bytes;
+        Ok(self)
     }
 }
 
@@ -193,7 +202,7 @@ impl ForecastDatasetEvidenceFence {
 pub struct ForecastDatasetEvidence {
     dataset: AnalyticalFeatureDataset,
     fence: ForecastDatasetEvidenceFence,
-    rows: Box<[ForecastFeatureRow]>,
+    rows: ForecastFeatureRows,
     probability_event_target: Option<crate::ProbabilityEventTarget>,
 }
 
@@ -206,7 +215,7 @@ impl ForecastDatasetEvidence {
         &self.fence
     }
 
-    pub fn rows(&self) -> &[ForecastFeatureRow] {
+    pub const fn rows(&self) -> &ForecastFeatureRows {
         &self.rows
     }
 }
@@ -232,31 +241,65 @@ pub struct ForecastProbabilityOutcome {
 impl ForecastProbabilityOutcome {
     /// Stable original economic observation identity across independently retained captures.
     /// This creates no outcome authority; original history receipt admission remains required.
-    pub fn original_observation_identity(bar: &market_squawk_domain::MarketBarObservation) -> Result<Sha256Digest, AnalyticalReadError> {
+    pub fn original_observation_identity(
+        bar: &market_squawk_domain::MarketBarObservation,
+    ) -> Result<Sha256Digest, AnalyticalReadError> {
         probability_origin_observation(bar)
     }
     /// Requires the exact original economic values and native time coordinate. A new capture
     /// may provide new provenance, but cannot revise the saved event's starting observation.
-    pub fn matches_origin_observation(&self, bar: &market_squawk_domain::MarketBarObservation) -> bool {
+    pub fn matches_origin_observation(
+        &self,
+        bar: &market_squawk_domain::MarketBarObservation,
+    ) -> bool {
         probability_origin_series(bar).is_ok_and(|digest| digest == self.origin_series_sha256)
-            && probability_origin_observation(bar).is_ok_and(|digest| digest == self.origin_observation_sha256)
+            && probability_origin_observation(bar)
+                .is_ok_and(|digest| digest == self.origin_observation_sha256)
     }
-    pub const fn origin_observation_sha256(&self) -> Sha256Digest { self.origin_observation_sha256 }
-    pub const fn origin_series_sha256(&self) -> Sha256Digest { self.origin_series_sha256 }
-    pub const fn event(&self) -> crate::ProbabilityEventTarget { self.event }
-    pub const fn instrument_id(&self) -> InstrumentId { self.instrument_id }
-    pub const fn origin(&self) -> Timestamp { self.origin }
-    pub const fn origin_basis(&self) -> crate::FixedHorizonOriginBasis { self.origin_basis }
-    pub const fn target_at(&self) -> Timestamp { self.target_at }
-    pub const fn label_maturity(&self) -> Timestamp { self.label_maturity }
-    pub const fn available_at(&self) -> Timestamp { self.available_at }
-    pub const fn value(&self) -> bool { self.value }
-    pub const fn lineage_sha256(&self) -> Sha256Digest { self.lineage_sha256 }
-    pub const fn production_receipt_sha256(&self) -> Sha256Digest { self.production_receipt_sha256 }
-    pub const fn fence(&self) -> &ForecastDatasetEvidenceFence { &self.fence }
+    pub const fn origin_observation_sha256(&self) -> Sha256Digest {
+        self.origin_observation_sha256
+    }
+    pub const fn origin_series_sha256(&self) -> Sha256Digest {
+        self.origin_series_sha256
+    }
+    pub const fn event(&self) -> crate::ProbabilityEventTarget {
+        self.event
+    }
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+    pub const fn origin(&self) -> Timestamp {
+        self.origin
+    }
+    pub const fn origin_basis(&self) -> crate::FixedHorizonOriginBasis {
+        self.origin_basis
+    }
+    pub const fn target_at(&self) -> Timestamp {
+        self.target_at
+    }
+    pub const fn label_maturity(&self) -> Timestamp {
+        self.label_maturity
+    }
+    pub const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+    pub const fn value(&self) -> bool {
+        self.value
+    }
+    pub const fn lineage_sha256(&self) -> Sha256Digest {
+        self.lineage_sha256
+    }
+    pub const fn production_receipt_sha256(&self) -> Sha256Digest {
+        self.production_receipt_sha256
+    }
+    pub const fn fence(&self) -> &ForecastDatasetEvidenceFence {
+        &self.fence
+    }
     pub const fn quality(&self) -> market_squawk_domain::DataQuality {
         match self.event {
-            crate::ProbabilityEventTarget::ProfitAfterCosts { .. } => market_squawk_domain::DataQuality::Modeled,
+            crate::ProbabilityEventTarget::ProfitAfterCosts { .. } => {
+                market_squawk_domain::DataQuality::Modeled
+            }
             _ => market_squawk_domain::DataQuality::Aggregated,
         }
     }
@@ -276,77 +319,146 @@ impl ForecastDatasetEvidence {
         origin: Timestamp,
         target_at: Timestamp,
     ) -> Result<Option<ForecastProbabilityOutcome>, AnalyticalReadError> {
-        let invalid = || AnalyticalReadError::PythonDataset(PythonDatasetCatalogError::CorruptAdmission);
-        if expected_event.validate().is_err() || origin >= target_at { return Err(invalid()); }
+        let invalid =
+            || AnalyticalReadError::PythonDataset(PythonDatasetCatalogError::CorruptAdmission);
+        if expected_event.validate().is_err() || origin >= target_at {
+            return Err(invalid());
+        }
         if self.dataset.product_contract().required_use() != crate::ResearchUse::LocalAnalysis
-            || !self.dataset.product_contract().admits_probability_target(expected_event)
-            || self.probability_event_target != Some(expected_event) {
+            || !self
+                .dataset
+                .product_contract()
+                .admits_probability_target(expected_event)
+            || self.probability_event_target != Some(expected_event)
+        {
             return Ok(None);
         }
-        let mut selected = self.rows.iter().filter(|row| {
-            row.instrument_id == instrument && row.observed_effective_at == Some(origin)
-                && row.label_effective_at == Some(target_at) && row.component_kind == 2
-                && row.component_name.as_ref() == expected_event.label_component_name()
-                && row.component_version == 1
-        });
-        let Some(row) = selected.next() else { return Ok(None); };
-        if selected.next().is_some() || row.lineage_sha256.bytes() == [0;32] { return Err(invalid()); }
+        let mut selected = None;
+        for row in self.rows.iter_component(
+            Some(instrument),
+            2,
+            expected_event.label_component_name(),
+            1,
+        ) {
+            let row = row?;
+            if row.observed_effective_at != Some(origin)
+                || row.label_effective_at != Some(target_at)
+            {
+                continue;
+            }
+            if selected.is_some() || row.lineage_sha256.bytes() == [0; 32] {
+                return Err(invalid());
+            }
+            selected = Some(row);
+        }
+        let Some(row) = selected else {
+            return Ok(None);
+        };
         let value = match row.value {
             ForecastFeatureValue::Missing => return Ok(None),
             ForecastFeatureValue::Decimal { mantissa, scale } => {
-                let value = rust_decimal::Decimal::try_from_i128_with_scale(mantissa, u32::from(scale)).map_err(|_| invalid())?;
-                if value != rust_decimal::Decimal::ZERO && value != rust_decimal::Decimal::ONE { return Err(invalid()); }
+                let value =
+                    rust_decimal::Decimal::try_from_i128_with_scale(mantissa, u32::from(scale))
+                        .map_err(|_| invalid())?;
+                if value != rust_decimal::Decimal::ZERO && value != rust_decimal::Decimal::ONE {
+                    return Err(invalid());
+                }
                 value == rust_decimal::Decimal::ONE
             }
             ForecastFeatureValue::Float(_) => return Err(invalid()),
         };
         let origin_basis = row.origin_basis.ok_or_else(invalid)?;
         let label_maturity = match expected_event {
-            crate::ProbabilityEventTarget::ProfitAfterCosts { policy } => target_at.checked_add_nanos(policy.maximum_exit_lag_nanos).map_err(|_| invalid())?,
+            crate::ProbabilityEventTarget::ProfitAfterCosts { policy } => target_at
+                .checked_add_nanos(policy.maximum_exit_lag_nanos)
+                .map_err(|_| invalid())?,
             _ => target_at,
         };
-        let available_at = row.label_selection_as_of.ok_or_else(invalid)?.max(label_maturity);
-        if available_at > self.fence.as_of { return Ok(None); }
+        let available_at = row
+            .label_selection_as_of
+            .ok_or_else(invalid)?
+            .max(label_maturity);
+        if available_at > self.fence.as_of {
+            return Ok(None);
+        }
         if row.source_selection_as_of > self.fence.as_of
-            || row.decision_at().is_none_or(|decision| decision < origin || decision >= target_at) {
+            || row
+                .decision_at()
+                .is_none_or(|decision| decision < origin || decision >= target_at)
+        {
             return Err(invalid());
         }
         Ok(Some(ForecastProbabilityOutcome {
-            event: expected_event, origin_series_sha256: row.origin_series_sha256.ok_or_else(invalid)?,
+            event: expected_event,
+            origin_series_sha256: row.origin_series_sha256.ok_or_else(invalid)?,
             origin_observation_sha256: row.origin_observation_sha256.ok_or_else(invalid)?,
-            instrument_id: instrument, origin, origin_basis, target_at,
-            label_maturity, available_at, value, lineage_sha256: row.lineage_sha256,
+            instrument_id: instrument,
+            origin,
+            origin_basis,
+            target_at,
+            label_maturity,
+            available_at,
+            value,
+            lineage_sha256: row.lineage_sha256,
             production_receipt_sha256: self.dataset.production_receipt().receipt_sha256(),
             fence: self.fence.clone(),
         }))
     }
 }
 
-fn probability_origin_series(bar: &market_squawk_domain::MarketBarObservation) -> Result<Sha256Digest, AnalyticalReadError> {
+fn probability_origin_series(
+    bar: &market_squawk_domain::MarketBarObservation,
+) -> Result<Sha256Digest, AnalyticalReadError> {
     let provenance = bar.context().provenance();
-    let bytes = serde_json::to_vec(&(provenance.instrument_id(), provenance.source_id(), provenance.venue_id(),
-        bar.provider_instrument_id(), bar.feed(), bar.interval(), bar.adjustment(), bar.currency(),
+    let bytes = serde_json::to_vec(&(
+        provenance.instrument_id(),
+        provenance.source_id(),
+        provenance.venue_id(),
+        bar.provider_instrument_id(),
+        bar.feed(),
+        bar.interval(),
+        bar.adjustment(),
+        bar.currency(),
         bar.time_semantics().timestamp_basis(),
-        bar.time_semantics().session().map(|session| (session.kind(), session.ruleset())),
-        bar.time_semantics().nominal_daily_date().map(|date| date.ruleset())))
-        .map_err(|_| AnalyticalReadError::PythonDataset(PythonDatasetCatalogError::CorruptAdmission))?;
+        bar.time_semantics()
+            .session()
+            .map(|session| (session.kind(), session.ruleset())),
+        bar.time_semantics()
+            .nominal_daily_date()
+            .map(|date| date.ruleset()),
+    ))
+    .map_err(|_| AnalyticalReadError::PythonDataset(PythonDatasetCatalogError::CorruptAdmission))?;
     Ok(Sha256Digest::new(Sha256::digest(bytes).into()))
 }
 
-fn probability_origin_observation(bar: &market_squawk_domain::MarketBarObservation) -> Result<Sha256Digest, AnalyticalReadError> {
+fn probability_origin_observation(
+    bar: &market_squawk_domain::MarketBarObservation,
+) -> Result<Sha256Digest, AnalyticalReadError> {
     // Acquisition timestamps and native payload digests remain in the full input epoch and
     // source receipt. Equality here proves the economic coordinate across separate acquisitions.
     let bytes = serde_json::to_vec(&(
         probability_origin_series(bar)?.bytes(),
-        (bar.time_semantics().effective_coordinate(), bar.time_semantics().period_start(),
-            bar.time_semantics().period_end_exclusive()),
-        (bar.open(), bar.high(), bar.low(), bar.close(), bar.volume(), bar.trade_count(), bar.vwap()),
-    )).map_err(|_| AnalyticalReadError::PythonDataset(PythonDatasetCatalogError::CorruptAdmission))?;
+        (
+            bar.time_semantics().effective_coordinate(),
+            bar.time_semantics().period_start(),
+            bar.time_semantics().period_end_exclusive(),
+        ),
+        (
+            bar.open(),
+            bar.high(),
+            bar.low(),
+            bar.close(),
+            bar.volume(),
+            bar.trade_count(),
+            bar.vwap(),
+        ),
+    ))
+    .map_err(|_| AnalyticalReadError::PythonDataset(PythonDatasetCatalogError::CorruptAdmission))?;
     Ok(Sha256Digest::new(Sha256::digest(bytes).into()))
 }
 
 impl AnalyticalReadCapability {
-    /// Materializes one exact Python-admitted generation under a point-in-time cutoff.
+    /// Indexes one complete Python-admitted generation under a point-in-time cutoff.
     pub async fn forecast_dataset_evidence(
         &self,
         expected_contract: FeatureDatasetProductContract,
@@ -356,9 +468,7 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<ForecastDatasetEvidence, AnalyticalReadError> {
-        if cancellation.is_cancelled() || Instant::now() >= deadline {
-            return Err(AnalyticalReadError::InvalidLimit);
-        }
+        indexed_rows::check_control(deadline, &cancellation)?;
         let page = self.manifests.read_feature_dataset_snapshot(
             expected_contract,
             CatalogFeatureDatasetSelection::ExactManifest(manifest),
@@ -376,26 +486,48 @@ impl AnalyticalReadCapability {
             return Err(AnalyticalReadError::ForecastDatasetUnavailable);
         }
         let export_sha256 = retained.export_sha256;
-        let probability_event_target = crate::python_dataset::feature_dataset_summary(
-            &retained.descriptor, export_sha256,
-        )?.probability_event_target;
+        let probability_event_target =
+            crate::python_dataset::feature_dataset_summary(&retained.descriptor, export_sha256)?
+                .probability_event_target;
         let pinned = retained.pinned.clone();
         let dataset = AnalyticalFeatureDataset::from_catalog(retained, expected_contract)?;
         let catalog_identity =
             CatalogEndpointIdentity::try_from_bytes(self.manifests.catalog_binding()).ok_or(
                 AnalyticalReadError::Manifest(crate::ManifestCatalogError::CorruptCatalog),
             )?;
-        let batches = self
-            .objects
-            .read_pinned_bounded_async(&pinned, limits.max_rows, limits.max_bytes, &cancellation)
-            .await
-            .map_err(AnalyticalReadError::from)?;
-        let mut rows = Vec::new();
+        let mut batches =
+            self.objects
+                .pinned_batch_cursor(&pinned, 1024, limits.max_bytes / 2, &cancellation)?;
+        let scratch = std::sync::Arc::new(self.objects.operation_scratch()?);
+        let mut rows = RowsBuilder::new(
+            scratch,
+            limits.max_bytes / 4,
+            limits.max_spill_bytes,
+            deadline,
+            cancellation.clone(),
+        )?;
         let mut hasher = new_selection_hasher(catalog_identity, export_sha256, as_of);
-        for batch in batches {
+        let mut input_rows = 0usize;
+        while let Some(batch) = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            batches.next_batch(),
+        )
+        .await
+        .map_err(|_| AnalyticalReadError::Query(crate::QueryError::DeadlineExceeded))??
+        {
+            input_rows = input_rows
+                .checked_add(batch.num_rows())
+                .ok_or(AnalyticalReadError::InvalidLimit)?;
+            if input_rows > limits.max_rows {
+                return Err(AnalyticalReadError::Query(
+                    crate::QueryError::RowLimitExceeded {
+                        limit: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+                    },
+                ));
+            }
             for index in 0..batch.num_rows() {
-                if index % 128 == 0 && (cancellation.is_cancelled() || Instant::now() >= deadline) {
-                    return Err(AnalyticalReadError::Query(crate::QueryError::Cancelled));
+                if index % 128 == 0 {
+                    indexed_rows::check_control(deadline, &cancellation)?;
                 }
                 let (canonical, mut view) = decode_row(&batch, index)?;
                 let epoch = crate::FeatureDatasetInputEpoch::decode(
@@ -404,8 +536,14 @@ impl AnalyticalReadCapability {
                 )
                 .map_err(|_| AnalyticalReadError::InvalidInputEpoch)?;
                 view.origin_basis = epoch.fixed_horizon_origin_basis();
-                view.origin_series_sha256 = epoch.market_bar().map(probability_origin_series).transpose()?;
-                view.origin_observation_sha256 = epoch.market_bar().map(probability_origin_observation).transpose()?;
+                view.origin_series_sha256 = epoch
+                    .market_bar()
+                    .map(probability_origin_series)
+                    .transpose()?;
+                view.origin_observation_sha256 = epoch
+                    .market_bar()
+                    .map(probability_origin_observation)
+                    .transpose()?;
                 if epoch.population_basis() != dataset.population_basis() {
                     return Err(AnalyticalReadError::InvalidInputEpoch);
                 }
@@ -414,7 +552,7 @@ impl AnalyticalReadCapability {
                         return Err(AnalyticalReadError::InvalidLimit);
                     }
                     update_selection_hash(&mut hasher, &canonical);
-                    rows.push(view);
+                    rows.push(&view)?;
                 }
             }
         }
@@ -433,7 +571,7 @@ impl AnalyticalReadCapability {
                 selected_rows,
                 as_of,
             },
-            rows: rows.into_boxed_slice(),
+            rows: rows.finish()?,
             probability_event_target,
         })
     }

@@ -1675,6 +1675,8 @@ CREATE TABLE provider_logical_originals (
     source_id TEXT NOT NULL REFERENCES sources(source_id),
     native_schema_digest BLOB NOT NULL CHECK (length(native_schema_digest)=32 AND native_schema_digest<>zeroblob(32)),
     source_revision_digest BLOB NOT NULL CHECK (length(source_revision_digest)=32 AND source_revision_digest<>zeroblob(32)),
+    registered_source_revision_digest BLOB NOT NULL CHECK (length(registered_source_revision_digest)=32 AND registered_source_revision_digest<>zeroblob(32)),
+    source_revision_kind TEXT NOT NULL CHECK (source_revision_kind IN ('metadata','contract_payload')),
     original_digest BLOB NOT NULL CHECK (length(original_digest)=32 AND original_digest<>zeroblob(32)),
     received_at_ns INTEGER NOT NULL,
     checkpoint_digest BLOB NOT NULL CHECK (length(checkpoint_digest)=32 AND checkpoint_digest<>zeroblob(32)),
@@ -1687,7 +1689,8 @@ CREATE TABLE provider_logical_originals (
     publication_digest BLOB UNIQUE REFERENCES provider_logical_publication_bindings(binding_digest),
     published_at_ns INTEGER,
     UNIQUE(dataset_id, source_id, native_schema_digest, source_revision_digest, original_digest),
-    FOREIGN KEY(source_id, source_revision_digest) REFERENCES source_revisions(source_id, revision_digest),
+    FOREIGN KEY(source_id, registered_source_revision_digest) REFERENCES source_revisions(source_id, revision_digest),
+    CHECK (source_revision_kind<>'metadata' OR source_revision_digest=registered_source_revision_digest),
     CHECK ((publication_digest IS NULL AND published_at_ns IS NULL)
         OR (publication_digest IS NOT NULL AND published_at_ns IS NOT NULL AND published_at_ns>=retained_at_ns))
 ) STRICT, WITHOUT ROWID;
@@ -1715,8 +1718,6 @@ ON provider_logical_original_objects(raw_claim_digest, physical_receipt_digest);
 CREATE TRIGGER provider_logical_originals_guarded_insert
 BEFORE INSERT ON provider_logical_originals
 WHEN NEW.publication_digest IS NOT NULL OR NEW.published_at_ns IS NOT NULL
-    OR (SELECT COUNT(*) FROM provider_logical_originals)>=4096
-    OR (SELECT COALESCE(SUM(length(checkpoint_bytes)),0) FROM provider_logical_originals)>134217728-length(NEW.checkpoint_bytes)
     OR NOT EXISTS (
         SELECT 1 FROM source_rights AS rights
         JOIN source_revisions AS revision ON revision.source_id=rights.source_id
@@ -1724,10 +1725,10 @@ WHEN NEW.publication_digest IS NOT NULL OR NEW.published_at_ns IS NOT NULL
           AND rights.payload_algorithm=1 AND rights.payload_digest=NEW.original_digest
           AND (rights.operation_mask & 4)<>0 AND rights.admitted_at_ns<=NEW.retained_at_ns
           AND (rights.authorization_expires_at_ns IS NULL OR rights.authorization_expires_at_ns>NEW.retained_at_ns)
-          AND revision.revision_digest=NEW.source_revision_digest AND revision.registered_at_ns<=NEW.retained_at_ns
+          AND revision.revision_digest=NEW.registered_source_revision_digest AND revision.registered_at_ns<=NEW.retained_at_ns
     )
 BEGIN
-    SELECT RAISE(ABORT, 'logical original custody requires exact admitted Persist evidence and bounded retention');
+    SELECT RAISE(ABORT, 'logical original custody requires exact admitted Persist evidence');
 END;
 
 CREATE TRIGGER provider_logical_original_objects_guarded_insert
@@ -1750,6 +1751,8 @@ WHEN OLD.publication_digest IS NOT NULL OR OLD.published_at_ns IS NOT NULL
     OR NEW.publication_digest IS NULL OR NEW.published_at_ns IS NULL
     OR NEW.coordinate_digest<>OLD.coordinate_digest OR NEW.dataset_id<>OLD.dataset_id
     OR NEW.source_id<>OLD.source_id OR NEW.native_schema_digest<>OLD.native_schema_digest
+    OR NEW.registered_source_revision_digest<>OLD.registered_source_revision_digest
+    OR NEW.source_revision_kind<>OLD.source_revision_kind
     OR NEW.source_revision_digest<>OLD.source_revision_digest OR NEW.original_digest<>OLD.original_digest
     OR NEW.received_at_ns<>OLD.received_at_ns OR NEW.checkpoint_digest<>OLD.checkpoint_digest
     OR NEW.checkpoint_bytes<>OLD.checkpoint_bytes OR NEW.object_count<>OLD.object_count
@@ -2600,8 +2603,9 @@ CREATE TABLE market_bar_history_publications (
         origin_object_ordinal BETWEEN 0 AND 1023
     ),
     source_id TEXT NOT NULL REFERENCES sources(source_id),
-    binding_digest BLOB NOT NULL UNIQUE
-        REFERENCES provider_capture_bindings(binding_digest),
+    binding_digest BLOB NOT NULL UNIQUE CHECK (
+        length(binding_digest) = 32 AND binding_digest <> zeroblob(32)
+    ),
     capture_receipt_digest BLOB NOT NULL UNIQUE CHECK (
         length(capture_receipt_digest) = 32
         AND capture_receipt_digest <> zeroblob(32)
@@ -2671,9 +2675,9 @@ CREATE TABLE market_bar_history_publications (
     ),
     requested_start_date INTEGER,
     requested_end_date INTEGER,
-    origin_record_count INTEGER NOT NULL CHECK (origin_record_count BETWEEN 1 AND 40000),
+    origin_record_count INTEGER NOT NULL CHECK (origin_record_count BETWEEN 1 AND 4294967295),
     expected_bar_count INTEGER NOT NULL CHECK (
-        expected_bar_count BETWEEN 1 AND 10000
+        expected_bar_count BETWEEN 1 AND 4294967295
     ),
     returned_bar_count INTEGER NOT NULL CHECK (
         returned_bar_count = expected_bar_count
@@ -2747,11 +2751,7 @@ CREATE TABLE market_bar_history_publications (
        AND requested_start_date IS NOT NULL AND requested_end_date IS NOT NULL AND requested_start_date <= requested_end_date
        AND session_calendar_component_ordinal IS NULL AND session_calendar_component_content_digest IS NULL AND session_calendar_component_page_count IS NULL)
     ),
-    UNIQUE (origin_generation_sequence, binding_digest),
-    FOREIGN KEY (origin_generation_sequence, binding_digest)
-        REFERENCES analytical_generation_provider_capture_bindings(
-            generation_sequence, binding_digest
-        )
+    UNIQUE (origin_generation_sequence, binding_digest)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE analytical_generation_market_bar_history_inputs (
@@ -2793,13 +2793,6 @@ WHEN NOT EXISTS (
       ON object.dataset_id = generation.dataset_id
      AND object.manifest_version = generation.manifest_version
      AND object.ordinal = NEW.origin_object_ordinal
-    JOIN analytical_generation_provider_capture_bindings AS capture_input
-      ON capture_input.generation_sequence = generation.generation_sequence
-     AND capture_input.run_id = run.run_id
-    JOIN provider_capture_bindings AS binding
-      ON binding.binding_digest = capture_input.binding_digest
-    JOIN provider_raw_observations AS capture
-      ON capture.capture_observation_digest = binding.capture_observation_digest
     JOIN market_data_instrument_revisions AS instrument_revision
       ON instrument_revision.revision_digest = NEW.instrument_revision_digest
      AND instrument_revision.instrument_id = NEW.instrument_id
@@ -2813,14 +2806,37 @@ WHEN NOT EXISTS (
       AND artifact.artifact_id = NEW.origin_artifact_id
       AND object.artifact_id = NEW.origin_artifact_id
       AND object.row_count = NEW.origin_record_count
-      AND capture_input.binding_digest = NEW.binding_digest
-      AND capture_input.source_id = NEW.source_id
-      AND capture.source_id = NEW.source_id
-      AND capture.provider_dataset = NEW.provider_dataset
-      AND capture.terminal_disposition = 'complete_request_graph'
-      AND capture.capture_content_digest = NEW.capture_content_digest
-      AND capture.capture_observation_digest = NEW.capture_observation_digest
-      AND capture.recorded_at_ns = NEW.capture_recorded_at_ns
+      AND (
+        (NEW.requested_start_ns IS NOT NULL AND EXISTS (
+          SELECT 1 FROM analytical_generation_provider_capture_bindings AS capture_input
+          JOIN provider_capture_bindings AS binding USING (binding_digest)
+          JOIN provider_raw_observations AS capture
+            ON capture.capture_observation_digest = binding.capture_observation_digest
+          WHERE capture_input.generation_sequence = generation.generation_sequence
+            AND capture_input.run_id = run.run_id
+            AND capture_input.binding_digest = NEW.binding_digest
+            AND capture_input.source_id = NEW.source_id
+            AND capture.source_id = NEW.source_id
+            AND capture.provider_dataset = NEW.provider_dataset
+            AND capture.terminal_disposition = 'complete_request_graph'
+            AND capture.capture_content_digest = NEW.capture_content_digest
+            AND capture.capture_observation_digest = NEW.capture_observation_digest
+            AND capture.recorded_at_ns = NEW.capture_recorded_at_ns
+        )) OR (NEW.requested_start_date IS NOT NULL AND EXISTS (
+          SELECT 1 FROM analytical_generation_provider_publication_bindings AS logical_input
+          JOIN provider_logical_publication_bindings AS logical
+            ON logical.binding_digest = logical_input.publication_digest
+          WHERE logical_input.generation_sequence = generation.generation_sequence
+            AND logical_input.run_id = run.run_id
+            AND logical_input.publication_kind = 'provider_logical'
+            AND logical_input.publication_digest = NEW.binding_digest
+            AND logical_input.source_id = NEW.source_id
+            AND logical.source_id = NEW.source_id
+            AND logical.terminal_receipt_digest = NEW.capture_receipt_digest
+            AND logical.recorded_at_ns = NEW.capture_recorded_at_ns
+            AND json_extract(logical.terminal_json, '$.total_canonical_rows') = NEW.origin_record_count
+        ))
+      )
       AND instrument_revision.published_at_ns <= run.requested_at_ns
       AND (
           (NEW.requested_start_ns IS NOT NULL
@@ -2844,11 +2860,22 @@ BEFORE INSERT ON analytical_generation_market_bar_history_inputs
 WHEN NOT EXISTS (
     SELECT 1
     FROM market_bar_history_publications AS publication
-    JOIN analytical_generation_provider_capture_bindings AS capture_input
-      ON capture_input.generation_sequence = NEW.generation_sequence
-     AND capture_input.binding_digest = publication.binding_digest
     WHERE publication.publication_receipt_digest = NEW.publication_receipt_digest
       AND publication.origin_generation_sequence = NEW.generation_sequence
+      AND (
+        (publication.requested_start_ns IS NOT NULL AND EXISTS (
+          SELECT 1 FROM analytical_generation_provider_capture_bindings AS input
+          WHERE input.generation_sequence = NEW.generation_sequence
+            AND input.binding_digest = publication.binding_digest
+            AND input.source_id = publication.source_id
+        )) OR (publication.requested_start_date IS NOT NULL AND EXISTS (
+          SELECT 1 FROM analytical_generation_provider_publication_bindings AS input
+          WHERE input.generation_sequence = NEW.generation_sequence
+            AND input.publication_digest = publication.binding_digest
+            AND input.publication_kind = 'provider_logical'
+            AND input.source_id = publication.source_id
+        ))
+      )
 )
 AND NOT EXISTS (
     SELECT 1
@@ -2860,12 +2887,23 @@ AND NOT EXISTS (
       ON parent_input.generation_sequence = edge.parent_generation_sequence
     JOIN market_bar_history_publications AS publication
       ON publication.publication_receipt_digest = parent_input.publication_receipt_digest
-    JOIN analytical_generation_provider_capture_bindings AS capture_input
-      ON capture_input.generation_sequence = NEW.generation_sequence
-     AND capture_input.binding_digest = publication.binding_digest
     WHERE child.generation_sequence = NEW.generation_sequence
       AND child.generation_kind IN ('ingest', 'compaction', 'derived')
       AND parent_input.publication_receipt_digest = NEW.publication_receipt_digest
+      AND (
+        (publication.requested_start_ns IS NOT NULL AND EXISTS (
+          SELECT 1 FROM analytical_generation_provider_capture_bindings AS input
+          WHERE input.generation_sequence = NEW.generation_sequence
+            AND input.binding_digest = publication.binding_digest
+            AND input.source_id = publication.source_id
+        )) OR (publication.requested_start_date IS NOT NULL AND EXISTS (
+          SELECT 1 FROM analytical_generation_provider_publication_bindings AS input
+          WHERE input.generation_sequence = NEW.generation_sequence
+            AND input.publication_digest = publication.binding_digest
+            AND input.publication_kind = 'provider_logical'
+            AND input.source_id = publication.source_id
+        ))
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'analytical generation market-bar history input is invalid');
@@ -4279,8 +4317,8 @@ END;
 -- Root-owned addition to the existing analytical catalog migration; no new database or raw root.
 CREATE TABLE provider_capture_originals (
  session_digest BLOB NOT NULL CHECK(length(session_digest)=32 AND session_digest<>zeroblob(32)),
- ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 63),
- expected_count INTEGER NOT NULL CHECK(expected_count BETWEEN 1 AND 64 AND ordinal<expected_count),
+ ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 65534),
+ expected_count INTEGER NOT NULL CHECK(expected_count BETWEEN 1 AND 65535 AND ordinal<expected_count),
  dataset_id TEXT NOT NULL CHECK(length(CAST(dataset_id AS BLOB)) BETWEEN 1 AND 256),
  context_bytes BLOB NOT NULL CHECK(length(context_bytes)<=131072 AND ((ordinal=0 AND length(context_bytes)>0) OR (ordinal>0 AND length(context_bytes)=0))),
  decoded_at_ns INTEGER NOT NULL,
@@ -4293,15 +4331,15 @@ CREATE TABLE provider_capture_originals (
  retained_at_ns INTEGER NOT NULL CHECK(decoded_at_ns<=retained_at_ns),
  published_binding BLOB REFERENCES provider_capture_bindings(binding_digest),
  published_option_binding BLOB REFERENCES provider_option_market_bindings(option_binding_digest),
- CHECK(published_binding IS NULL OR published_option_binding IS NULL),
+ published_logical_binding BLOB REFERENCES provider_logical_publication_bindings(binding_digest),
+ CHECK((published_binding IS NOT NULL)+(published_option_binding IS NOT NULL)+(published_logical_binding IS NOT NULL)<=1),
  PRIMARY KEY(session_digest,ordinal), UNIQUE(raw_claim_digest),
  FOREIGN KEY(raw_claim_digest,physical_receipt_digest) REFERENCES sealed_raw_objects(raw_claim_digest,physical_receipt_digest),
  CHECK((ordinal=0 AND predecessor_digest IS NULL) OR (ordinal>0 AND length(predecessor_digest)=32))
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX provider_capture_original_pending ON provider_capture_originals(session_digest,ordinal) WHERE published_binding IS NULL AND published_option_binding IS NULL;
+CREATE INDEX provider_capture_original_pending ON provider_capture_originals(session_digest,ordinal) WHERE published_binding IS NULL AND published_option_binding IS NULL AND published_logical_binding IS NULL;
 CREATE TRIGGER provider_capture_original_insert BEFORE INSERT ON provider_capture_originals
-WHEN NEW.published_binding IS NOT NULL OR NEW.published_option_binding IS NOT NULL OR (SELECT COUNT(*) FROM provider_capture_originals)>=25000
- OR (SELECT COALESCE(SUM(length(context_bytes)),0) FROM provider_capture_originals)>134217728-length(NEW.context_bytes)
+WHEN NEW.published_binding IS NOT NULL OR NEW.published_option_binding IS NOT NULL OR NEW.published_logical_binding IS NOT NULL
  OR NOT EXISTS(SELECT 1 FROM provider_raw_observations AS observation
    JOIN source_rights AS rights ON rights.rights_id=NEW.rights_id AND rights.source_id=observation.source_id
    JOIN provider_raw_observation_objects AS object ON object.capture_observation_digest=observation.capture_observation_digest AND object.input_ordinal=0
@@ -4313,16 +4351,15 @@ WHEN NEW.published_binding IS NOT NULL OR NEW.published_option_binding IS NOT NU
  OR (NEW.ordinal=0 AND EXISTS(SELECT 1 FROM provider_capture_originals AS pending
    JOIN provider_raw_observations AS prior ON prior.capture_observation_digest=pending.capture_observation_digest
    JOIN provider_raw_observations AS incoming ON incoming.capture_observation_digest=NEW.capture_observation_digest
-   WHERE pending.ordinal=0 AND pending.published_binding IS NULL AND pending.published_option_binding IS NULL AND pending.session_digest<>NEW.session_digest AND prior.source_id=incoming.source_id))
+   WHERE pending.ordinal=0 AND pending.published_binding IS NULL AND pending.published_option_binding IS NULL AND pending.published_logical_binding IS NULL AND pending.session_digest<>NEW.session_digest AND prior.source_id=incoming.source_id))
  OR (NEW.ordinal>0 AND NOT EXISTS(SELECT 1 FROM provider_capture_originals AS previous
    WHERE previous.session_digest=NEW.session_digest AND previous.ordinal=NEW.ordinal-1
     AND previous.original_digest=NEW.predecessor_digest AND previous.expected_count=NEW.expected_count
-    AND previous.dataset_id=NEW.dataset_id AND previous.published_binding IS NULL AND previous.published_option_binding IS NULL AND previous.decoded_at_ns<=NEW.decoded_at_ns))
+    AND previous.dataset_id=NEW.dataset_id AND previous.published_binding IS NULL AND previous.published_option_binding IS NULL AND previous.published_logical_binding IS NULL AND previous.decoded_at_ns<=NEW.decoded_at_ns))
 BEGIN SELECT RAISE(ABORT,'original capture requires exact bounded custody predecessor and raw Persist grant'); END;
 CREATE TRIGGER provider_capture_original_update BEFORE UPDATE ON provider_capture_originals
-WHEN OLD.published_binding IS NOT NULL OR OLD.published_option_binding IS NOT NULL
- OR (NEW.published_binding IS NULL AND NEW.published_option_binding IS NULL)
- OR (NEW.published_binding IS NOT NULL AND NEW.published_option_binding IS NOT NULL)
+WHEN OLD.published_binding IS NOT NULL OR OLD.published_option_binding IS NOT NULL OR OLD.published_logical_binding IS NOT NULL
+ OR ((NEW.published_binding IS NOT NULL)+(NEW.published_option_binding IS NOT NULL)+(NEW.published_logical_binding IS NOT NULL)<>1)
  OR NEW.session_digest<>OLD.session_digest OR NEW.ordinal<>OLD.ordinal OR NEW.expected_count<>OLD.expected_count
  OR NEW.dataset_id<>OLD.dataset_id OR NEW.context_bytes<>OLD.context_bytes OR NEW.decoded_at_ns<>OLD.decoded_at_ns
  OR NEW.capture_observation_digest<>OLD.capture_observation_digest OR NEW.raw_claim_digest<>OLD.raw_claim_digest
@@ -4350,6 +4387,16 @@ WHEN OLD.published_binding IS NOT NULL OR OLD.published_option_binding IS NOT NU
     AND original_capture.source_id=option_capture.source_id
     AND original_capture.metadata_revision=option_capture.metadata_revision
     AND original_capture.source_revision_digest=option_capture.source_revision_digest
+    AND NEW.retained_at_ns<=binding.recorded_at_ns)
+  OR EXISTS(SELECT 1 FROM ingest_run_provider_publication_bindings AS input
+   JOIN ingest_runs AS run ON run.run_id=input.run_id AND run.state='reserved' AND run.operation='persist'
+   JOIN provider_logical_publication_bindings AS binding ON binding.binding_digest=input.logical_binding_digest
+   JOIN provider_raw_observations AS original_capture ON original_capture.capture_observation_digest=NEW.capture_observation_digest
+   WHERE input.publication_kind='provider_logical'
+    AND input.logical_binding_digest=NEW.published_logical_binding
+    AND input.source_id=original_capture.source_id
+    AND run.source_id=original_capture.source_id
+    AND binding.source_id=original_capture.source_id
     AND NEW.retained_at_ns<=binding.recorded_at_ns))
 BEGIN SELECT RAISE(ABORT,'original capture publication requires its exact existing run transaction'); END;
 CREATE TRIGGER provider_capture_original_delete BEFORE DELETE ON provider_capture_originals
@@ -4363,6 +4410,9 @@ WHEN EXISTS(SELECT 1 FROM ingest_run_provider_capture_bindings AS binding
  WHERE binding.run_id=NEW.run_id AND original.dataset_id<>NEW.dataset_name)
  OR EXISTS(SELECT 1 FROM ingest_run_provider_publication_bindings AS binding
  JOIN provider_capture_originals AS original ON original.published_option_binding=binding.option_binding_digest
+ WHERE binding.run_id=NEW.run_id AND original.dataset_id<>NEW.dataset_name)
+ OR EXISTS(SELECT 1 FROM ingest_run_provider_publication_bindings AS binding
+ JOIN provider_capture_originals AS original ON original.published_logical_binding=binding.logical_binding_digest
  WHERE binding.run_id=NEW.run_id AND original.dataset_id<>NEW.dataset_name)
 BEGIN SELECT RAISE(ABORT,'original capture publication target differs from retained custody'); END;
 
@@ -4420,14 +4470,12 @@ CREATE INDEX market_data_native_reference_recovery
 ON market_data_native_reference_captures(raw_claim_digest, physical_receipt_digest);
 CREATE TRIGGER market_data_native_reference_guarded_insert
 BEFORE INSERT ON market_data_native_reference_captures
-WHEN (SELECT COUNT(*) FROM market_data_native_reference_captures)>=65536
-    OR (SELECT COALESCE(SUM(length(CAST(coordinate_json AS BLOB))),0) FROM market_data_native_reference_captures)>134217728-length(CAST(NEW.coordinate_json AS BLOB))
-    OR NOT EXISTS (SELECT 1 FROM market_data_instrument_revisions AS revision
+WHEN NOT EXISTS (SELECT 1 FROM market_data_instrument_revisions AS revision
         WHERE revision.revision_digest=NEW.origin_revision_digest AND revision.published_at_ns<=NEW.retained_at_ns)
     OR NOT EXISTS (SELECT 1 FROM sealed_raw_objects AS raw
         WHERE raw.raw_claim_digest=NEW.raw_claim_digest AND raw.physical_receipt_digest=NEW.physical_receipt_digest
           AND raw.recorded_at_ns<=NEW.retained_at_ns)
-BEGIN SELECT RAISE(ABORT,'native reference custody requires exact bounded original evidence'); END;
+BEGIN SELECT RAISE(ABORT,'native reference custody requires exact original evidence'); END;
 CREATE TRIGGER market_data_native_reference_immutable_update
 BEFORE UPDATE ON market_data_native_reference_captures BEGIN
     SELECT RAISE(ABORT,'native reference custody is immutable');

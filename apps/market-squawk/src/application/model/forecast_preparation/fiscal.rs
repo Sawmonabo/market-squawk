@@ -44,23 +44,25 @@ impl ForecastPreparationAuthority {
             return Err(ForecastPreparationError::InvalidSelection);
         }
         let retained = self.runtime.retain_forecast_runtime()?;
-        let backup = self.runtime.retain_backup()?;
-        let catalog = catalog_request(&retained, &backup, product_identity.knowledge_at(), None)?;
-        let mut candidates = catalog.models.iter().filter(|model| {
-            let metadata = model.metadata();
-            metadata.model_id() == admitted_model.model_id()
-                && metadata.bundle_id() == admitted_model.bundle_id()
-                && metadata.bundle_version() == admitted_model.bundle_version()
-                && metadata.metadata_hash() == admitted_model.metadata_sha256()
-                && metadata.artifact_hash() == admitted_model.artifact_sha256()
-                && metadata.training_run_hash() == admitted_model.training_run_sha256()
-                && metadata.dataset().selection_digest()
-                    == admitted_model.dataset_selection_sha256()
-        });
-        let model = candidates
-            .next()
+        let bundle = retained
+            .image
+            .registry
+            .selection(
+                admitted_model.bundle_id(),
+                admitted_model.bundle_version(),
+                deadline,
+                &cancellation,
+            )?
             .ok_or(ForecastPreparationError::ModelUnavailable)?;
-        if candidates.next().is_some() {
+        let model = model_requirement(&retained, &bundle)?;
+        drop(bundle);
+        let metadata = model.metadata();
+        if metadata.model_id() != admitted_model.model_id()
+            || metadata.metadata_hash() != admitted_model.metadata_sha256()
+            || metadata.artifact_hash() != admitted_model.artifact_sha256()
+            || metadata.training_run_hash() != admitted_model.training_run_sha256()
+            || metadata.dataset().selection_digest() != admitted_model.dataset_selection_sha256()
+        {
             return Err(ForecastPreparationError::InvalidEvidence);
         }
         let output = self
@@ -95,7 +97,7 @@ impl ForecastPreparationAuthority {
             "effectiveAtUnixNanos": product_identity.effective_at().unix_nanos(),
         });
         let (arguments, pairing) =
-            financial_arguments(model, &output, index, identity, validity_nanos)?;
+            financial_arguments(&model, &output, index, identity, validity_nanos)?;
         let request = self
             .generate_descriptor
             .admit(arguments)
@@ -132,17 +134,21 @@ impl ForecastPreparationAuthority {
         let coordinates = forecast_recovery_coordinates(input.request())
             .map_err(|_| ForecastPreparationError::InvalidEvidence)?;
         let retained = self.runtime.retain_forecast_runtime()?;
-        let backup = self.runtime.retain_backup()?;
-        let catalog = catalog_request(&retained, &backup, coordinates.serving_evidence.knowledge_cutoff(), None)?;
-        let model = catalog
-            .models
-            .iter()
-            .find(|model| {
-                model.metadata().model_id() == coordinates.model_id
-                    && model.metadata().bundle_id() == &coordinates.bundle_id
-                    && model.metadata().bundle_version() == coordinates.bundle_version
-            })
+        let bundle = retained
+            .image
+            .registry
+            .selection(
+                &coordinates.bundle_id,
+                coordinates.bundle_version,
+                deadline,
+                &cancellation,
+            )?
             .ok_or(ForecastPreparationError::ModelUnavailable)?;
+        let model = model_requirement(&retained, &bundle)?;
+        drop(bundle);
+        if model.metadata().model_id() != coordinates.model_id {
+            return Err(ForecastPreparationError::ModelUnavailable);
+        }
         let output = self
             .evidence
             .financial_input(
@@ -162,7 +168,7 @@ impl ForecastPreparationAuthority {
             .cloned()
             .ok_or(ForecastPreparationError::InvalidEvidence)?;
         let (arguments, pairing) = financial_arguments(
-            model,
+            &model,
             &output,
             index,
             original_identity,

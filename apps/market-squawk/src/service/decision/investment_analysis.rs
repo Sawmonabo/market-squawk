@@ -41,6 +41,7 @@ use crate::portfolio_application::{
 use super::{decode, ensure_live, map_application, page_fetch_limit};
 
 pub(super) const GET_INVESTMENT_ANALYSIS: &str = "Decision.GetInvestmentAnalysis";
+pub(super) const GET_INVESTMENT_CHART: &str = "Decision.GetInvestmentChart";
 pub(super) const LIST_INVESTMENT_ANALYSES: &str = "Decision.ListInvestmentAnalyses";
 pub(super) const GET_RECOMMENDATION_TRACK_RECORD: &str = "Decision.GetRecommendationTrackRecord";
 
@@ -70,7 +71,10 @@ impl InvestmentAnalysisOperations {
     pub(super) fn owns(operation: &str) -> bool {
         matches!(
             operation,
-            GET_INVESTMENT_ANALYSIS | LIST_INVESTMENT_ANALYSES | GET_RECOMMENDATION_TRACK_RECORD
+            GET_INVESTMENT_ANALYSIS
+                | GET_INVESTMENT_CHART
+                | LIST_INVESTMENT_ANALYSES
+                | GET_RECOMMENDATION_TRACK_RECORD
         )
     }
 
@@ -103,10 +107,36 @@ impl InvestmentAnalysisOperations {
                     self.instrument_display(analysis.decision.evidence().instrument_id(), context)?,
                     portfolio_label(&account_catalog, analysis.decision.evidence().account_id())?,
                 )?;
-                value["chart"] = self.chart.read(&analysis.decision, context).await?;
+                value["chart"] = Value::Null;
+                value["chartAvailable"] =
+                    json!(analysis.decision.evidence().forecast_chart().is_some());
                 self.accounts
                     .recheck(&account_catalog, context.deadline(), context.cancellation())
                     .map_err(map_account_catalog)?;
+                ensure_live(context)?;
+                TypedToolResult::try_new(
+                    value,
+                    1,
+                    ToolResultMetadata::complete_not_applicable(),
+                    context.limits(),
+                )
+                .map_err(Into::into)
+            }
+            GET_INVESTMENT_CHART => {
+                let input: chart::ChartViewportRequest = decode(&arguments)?;
+                let token = action_token(&input.action_token)?;
+                let analysis_id = self
+                    .decisions
+                    .resolve_investment_analysis_product_token(token)
+                    .map_err(map_application)?;
+                let analysis = self
+                    .decisions
+                    .read_investment_analysis(analysis_id)
+                    .map_err(map_application)?;
+                let value = self
+                    .chart
+                    .read_viewport(&analysis.decision, input.viewport()?, context)
+                    .await?;
                 ensure_live(context)?;
                 TypedToolResult::try_new(
                     value,
@@ -888,6 +918,17 @@ fn investment_risks(decision: &InvestmentProposalDecision) -> Vec<&str> {
     if evidence.price_forecast().is_some() || evidence.valuation().is_some() {
         risks.push("Forecast and valuation ranges are estimates, not guaranteed prices.");
     }
+    if evidence.current_share_projection().is_some_and(|proof| {
+        let valuation = proof.valuation_projection();
+        valuation.fundamental_source_reference().is_some()
+            && matches!(
+                valuation.method(),
+                market_squawk_valuation::AutomaticValuationMethod::DiscountedCashFlow
+                    | market_squawk_valuation::AutomaticValuationMethod::ResidualIncome
+            )
+    }) {
+        risks.push(market_squawk_valuation::REPORTED_COMMON_SHARE_ASSUMPTION);
+    }
     if evidence.backtest().is_some() {
         risks.push("Historical test results may not repeat in future markets.");
     }
@@ -1325,7 +1366,9 @@ const fn unavailable_reason_summary(reason: ProposalUnavailableReason) -> &'stat
         ProposalUnavailableReason::UnprovenCurrentShareUnits => {
             "Current and historical share prices could not be put on the same verified basis. Action ranges are unavailable."
         }
-        ProposalUnavailableReason::MissingEvidence(market_squawk_decisions::RecommendationEvidenceKind::Market) => {
+        ProposalUnavailableReason::MissingEvidence(
+            market_squawk_decisions::RecommendationEvidenceKind::Market,
+        ) => {
             "Completed analysis is saved. Current price evidence is unavailable, so investment action and sizing must wait for fresh market information."
         }
         ProposalUnavailableReason::MissingEvidence(_) => {

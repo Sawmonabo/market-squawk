@@ -2,17 +2,18 @@
 
 use std::{fmt, time::Instant};
 
+use market_squawk_adapter_tiingo::{TiingoEodHistoryDescriptor, ValidatedTiingoEodHistory};
 use market_squawk_domain::{
     AssetClass, AvailabilityEvidence as ResearchAvailabilityEvidence, BarTimestampBasis,
-    CalendarDate, Currency, DataQuality, DigestAlgorithm,
-    EvidenceDigest, InstrumentId, MarketBarAdjustment, MarketBarObservation, MarketBarSessionKind,
+    CalendarDate, Currency, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    MarketBarAdjustment, MarketBarObservation, MarketBarSessionKind,
     MarketDataInstrumentDefinition, PayloadReference, ProviderInstrumentId, ResearchObservation,
     ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, CanonicalObservationPayload,
-    CompleteMarketBarDateWindowsV1, ExtractionBatch, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS,
-    ProviderCaptureSemanticBinding, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ExtractionBatch, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS, ProviderCaptureSemanticBinding,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
 };
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -192,7 +193,7 @@ pub(crate) struct MarketBarHistoryPublicationCandidate {
     max_available_at: Timestamp,
     max_received_at: Timestamp,
     max_ingested_at: Timestamp,
-    date_windows: Option<CompleteMarketBarDateWindowsV1>,
+    date_windows: Option<TiingoEodHistoryDescriptor>,
     origin_record_count: u32,
     all_bar_count: u32,
     all_bar_set_digest: Option<Sha256Digest>,
@@ -213,8 +214,9 @@ impl MarketBarHistoryPublicationCandidate {
         let capture = prepared.evidence.capture();
         let binding = match capture.semantic_binding() {
             Some(ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding)) => binding,
-            Some(ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(graph)) => {
-                return Self::try_from_nominal_batch(batch, observations, prepared, graph);
+            Some(ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(_)) => {
+                // Nominal histories require the shared streamed logical publication terminal.
+                return Err(ManifestCatalogError::MarketBarHistoryMismatch);
             }
             None if capture.terminal()
                 == ProviderCaptureTerminalDisposition::CompleteRequestGraph
@@ -979,7 +981,7 @@ pub struct MarketBarHistoryPublicationReceipt {
     max_received_at: Timestamp,
     max_ingested_at: Timestamp,
     published_at: Timestamp,
-    date_windows: Option<CompleteMarketBarDateWindowsV1>,
+    date_windows: Option<TiingoEodHistoryDescriptor>,
     origin_record_count: u32,
     all_bar_count: u32,
     all_bar_set_digest: Option<Sha256Digest>,
@@ -1241,10 +1243,18 @@ impl MarketBarHistoryPublicationReceipt {
         &self,
         bars: &[MarketBarObservation],
     ) -> Result<(), ManifestCatalogError> {
+        self.validate_selected_bar_iter(bars.iter().cloned().map(Ok), bars.len())
+    }
+
+    pub(crate) fn validate_selected_bar_iter(
+        &self,
+        bars: impl Iterator<Item = Result<MarketBarObservation, ManifestCatalogError>>,
+        count: usize,
+    ) -> Result<(), ManifestCatalogError> {
         if self.date_windows.is_some() {
-            return self.validate_nominal_bars(bars);
+            return self.validate_nominal_bar_iter(bars, count);
         }
-        if bars.len() != self.expected_bar_count
+        if count != self.expected_bar_count
             || expected_timestamp_set_digest(&self.expected_provider_timestamps)?
                 != self.expected_timestamp_set_digest
         {
@@ -1252,11 +1262,18 @@ impl MarketBarHistoryPublicationReceipt {
         }
         let mut bar_set = Sha256::new();
         bar_set.update(BAR_SET_DOMAIN);
-        bar_set.update((bars.len() as u64).to_be_bytes());
+        bar_set.update((count as u64).to_be_bytes());
         let mut max_available_at = None;
         let mut max_received_at = None;
         let mut max_ingested_at = None;
-        for (bar, expected_timestamp) in bars.iter().zip(self.expected_provider_timestamps.iter()) {
+        let mut actual = 0_usize;
+        for bar in bars {
+            let bar = bar?;
+            let expected_timestamp = self
+                .expected_provider_timestamps
+                .get(actual)
+                .ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?;
+            actual += 1;
             let context = bar.context();
             let provenance = context.provenance();
             let semantics = bar
@@ -1325,7 +1342,8 @@ impl MarketBarHistoryPublicationReceipt {
             bar_set.update(provider_timestamp.unix_nanos().to_be_bytes());
             hash_evidence(&mut bar_set, semantic_payload.identity());
         }
-        if max_available_at != Some(self.max_available_at)
+        if actual != count
+            || max_available_at != Some(self.max_available_at)
             || max_received_at != Some(self.max_received_at)
             || max_ingested_at != Some(self.max_ingested_at)
             || nonzero_sha256(bar_set.finalize().into())? != self.bar_set_digest
@@ -1337,7 +1355,7 @@ impl MarketBarHistoryPublicationReceipt {
 }
 
 /// Restart-safe selection of one complete window under an immutable descendant generation.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CompleteMarketBarHistorySelection {
     surface_requirement: MarketHistoryPriceSurfaceRequirement,
     knowledge_cutoff: Timestamp,
@@ -1435,7 +1453,7 @@ struct MarketBarHistoryReceiptWire {
     backtest_eligible: bool,
     retrospective_training_eligible: bool,
     admission_reason: String,
-    date_windows: Option<CompleteMarketBarDateWindowsV1>,
+    date_windows: Option<TiingoEodHistoryDescriptor>,
     origin_record_count: u32,
     all_bar_count: u32,
     all_bar_set_digest: Option<[u8; 32]>,
@@ -1936,9 +1954,24 @@ fn insert_market_bar_history_publication(
         .ok()
         .filter(|version| *version > 0)
         .ok_or(ManifestCatalogError::CorruptCatalog)?;
-    let capture_recorded_at_ns: i64 = transaction
-        .query_row(
-            "SELECT capture.recorded_at_ns
+    let capture_recorded_at_ns: i64 = if candidate.date_windows.is_some() {
+        transaction
+            .query_row(
+                "SELECT recorded_at_ns FROM provider_logical_publication_bindings
+             WHERE binding_digest=?1 AND terminal_receipt_digest=?2 AND source_id=?3",
+                params![
+                    candidate.binding_digest.bytes(),
+                    candidate.capture_receipt_digest.bytes(),
+                    candidate.source_id.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?
+    } else {
+        transaction
+            .query_row(
+                "SELECT capture.recorded_at_ns
              FROM provider_capture_bindings AS binding
              JOIN provider_raw_observations AS capture
                ON capture.capture_observation_digest=binding.capture_observation_digest
@@ -1948,17 +1981,18 @@ fn insert_market_bar_history_publication(
                AND capture.source_id=?4
                AND capture.provider_dataset=?5
                AND capture.terminal_disposition='complete_request_graph'",
-            params![
-                candidate.binding_digest.bytes(),
-                candidate.capture_content_digest.bytes(),
-                candidate.capture_observation_digest.bytes(),
-                candidate.source_id.as_str(),
-                candidate.provider_dataset.as_str(),
-            ],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?;
+                params![
+                    candidate.binding_digest.bytes(),
+                    candidate.capture_content_digest.bytes(),
+                    candidate.capture_observation_digest.bytes(),
+                    candidate.source_id.as_str(),
+                    candidate.provider_dataset.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ManifestCatalogError::MarketBarHistoryMismatch)?
+    };
     if capture_recorded_at_ns > anchor.created_at().unix_nanos() {
         return Err(ManifestCatalogError::MarketBarHistoryMismatch);
     }
@@ -2730,7 +2764,10 @@ impl LatestCanonicalMarketBarHistoryWindowCandidate {
 
 /// Reconstructs only the original content-addressed window, then delegates all admission,
 /// source, schema, rights and clock checks to the existing exact canonical selector.
-#[allow(clippy::too_many_arguments, reason = "immutable identity and bounded read controls remain explicit")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "immutable identity and bounded read controls remain explicit"
+)]
 pub(super) fn exact_canonical_market_bar_history_window(
     connection: &Connection,
     max_objects: usize,
@@ -2756,10 +2793,18 @@ pub(super) fn exact_canonical_market_bar_history_window(
          WHERE generation.content_hash=?1 AND publication.instrument_id=?2
            AND generation.schema_name=?3 AND generation.schema_version=?4
            AND generation.schema_fingerprint=?5
-         LIMIT 2")?;
-    let mut rows = statement.query(params![selected_content_hash.bytes(), instrument_id.to_string(),
-        schema.name(), schema.version().get(), schema.fingerprint()])?;
-    let Some(row) = rows.next()? else { return Ok(None) };
+         LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![
+        selected_content_hash.bytes(),
+        instrument_id.to_string(),
+        schema.name(),
+        schema.version().get(),
+        schema.fingerprint()
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
     let dataset: String = row.get(0)?;
     let version: i64 = row.get(1)?;
     let json: String = row.get(2)?;
@@ -2773,27 +2818,52 @@ pub(super) fn exact_canonical_market_bar_history_window(
         u64::try_from(version).map_err(|_| ManifestCatalogError::CorruptCatalog)?,
         schema,
         selected_content_hash,
-    ).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-    let wire: MarketBarHistoryReceiptWire = serde_json::from_str(&json)
-        .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    )
+    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    let wire: MarketBarHistoryReceiptWire =
+        serde_json::from_str(&json).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
     // These fields locate evidence; they do not authorize it. The existing exact reader below
     // verifies the complete receipt against SQL, capture custody, manifest and original clocks.
     let request = if let Some(graph) = wire.date_windows {
         let (start, end) = graph.requested_dates();
         CanonicalMarketBarHistoryRequest::try_exact_nominal(
-            instrument_id, start, end, policy, cutoff, manifest)?
+            instrument_id,
+            start,
+            end,
+            policy,
+            cutoff,
+            manifest,
+        )?
     } else {
         CanonicalMarketBarHistoryRequest::try_exact(
             instrument_id,
-            Timestamp::from_unix_nanos(wire.requested_start_ns.ok_or(ManifestCatalogError::CorruptCatalog)?),
-            Timestamp::from_unix_nanos(wire.requested_end_ns.ok_or(ManifestCatalogError::CorruptCatalog)?),
-            policy, cutoff, manifest)?
+            Timestamp::from_unix_nanos(
+                wire.requested_start_ns
+                    .ok_or(ManifestCatalogError::CorruptCatalog)?,
+            ),
+            Timestamp::from_unix_nanos(
+                wire.requested_end_ns
+                    .ok_or(ManifestCatalogError::CorruptCatalog)?,
+            ),
+            policy,
+            cutoff,
+            manifest,
+        )?
     };
     check_operation(deadline, cancellation)?;
     let Some(selected) = select_canonical_market_bar_history(
-        connection, max_objects, &request, deadline, cancellation)? else { return Ok(None) };
+        connection,
+        max_objects,
+        &request,
+        deadline,
+        cancellation,
+    )?
+    else {
+        return Ok(None);
+    };
     if selected.pinned().manifest().content_hash() != selected_content_hash
-        || selected.receipt().instrument_id() != instrument_id {
+        || selected.receipt().instrument_id() != instrument_id
+    {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
     Ok(Some(request))
@@ -3510,28 +3580,41 @@ fn load_market_bar_history_receipt(
               AND object.ordinal=publication.origin_object_ordinal
               AND object.artifact_id=artifact.artifact_id
               AND object.row_count=publication.origin_record_count
-             JOIN analytical_generation_provider_capture_bindings AS capture_input
-               ON capture_input.generation_sequence=origin_generation.generation_sequence
-              AND capture_input.binding_digest=publication.binding_digest
-              AND capture_input.run_id=origin_run.run_id
-              AND capture_input.source_id=publication.source_id
-             JOIN provider_capture_bindings AS binding
-               ON binding.binding_digest=publication.binding_digest
-             JOIN provider_raw_observations AS capture
-               ON capture.capture_observation_digest=binding.capture_observation_digest
-              AND capture.capture_content_digest=publication.capture_content_digest
-              AND capture.capture_observation_digest=publication.capture_observation_digest
-              AND capture.recorded_at_ns=publication.capture_recorded_at_ns
-              AND capture.source_id=publication.source_id
-              AND capture.provider_dataset=publication.provider_dataset
-              AND capture.terminal_disposition='complete_request_graph'
              JOIN market_data_instrument_revisions AS instrument_revision
                ON instrument_revision.revision_digest=publication.instrument_revision_digest
               AND instrument_revision.instrument_id=publication.instrument_id
              WHERE publication.publication_receipt_digest=?1
                AND origin_run.state='succeeded'
                AND origin_run.operation='persist'
-               AND origin_run.source_id=publication.source_id",
+               AND origin_run.source_id=publication.source_id
+               AND (
+                 (publication.requested_start_ns IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM analytical_generation_provider_capture_bindings AS input
+                   JOIN provider_capture_bindings AS binding USING (binding_digest)
+                   JOIN provider_raw_observations AS capture
+                     ON capture.capture_observation_digest=binding.capture_observation_digest
+                   WHERE input.generation_sequence=origin_generation.generation_sequence
+                     AND input.binding_digest=publication.binding_digest
+                     AND input.run_id=origin_run.run_id AND input.source_id=publication.source_id
+                     AND capture.capture_content_digest=publication.capture_content_digest
+                     AND capture.capture_observation_digest=publication.capture_observation_digest
+                     AND capture.recorded_at_ns=publication.capture_recorded_at_ns
+                     AND capture.source_id=publication.source_id
+                     AND capture.provider_dataset=publication.provider_dataset
+                     AND capture.terminal_disposition='complete_request_graph'
+                 )) OR (publication.requested_start_date IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM analytical_generation_provider_publication_bindings AS input
+                   JOIN provider_logical_publication_bindings AS binding
+                     ON binding.binding_digest=input.publication_digest
+                   WHERE input.generation_sequence=origin_generation.generation_sequence
+                     AND input.publication_digest=publication.binding_digest
+                     AND input.publication_kind='provider_logical'
+                     AND input.run_id=origin_run.run_id AND input.source_id=publication.source_id
+                     AND binding.source_id=publication.source_id
+                     AND binding.terminal_receipt_digest=publication.capture_receipt_digest
+                     AND binding.recorded_at_ns=publication.capture_recorded_at_ns
+                 ))
+               )",
             [publication_digest.bytes()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -3572,16 +3655,26 @@ fn load_market_bar_history_receipt(
     if !publication_wire_matches_row(connection, publication_digest, &wire, &receipt_json)? {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
-    let persisted_capture = load_provider_capture_for_run(connection, wire.origin_run_id)?
+    let expected_provider_timestamps: Box<[Timestamp]> = if let Some(graph) = &wire.date_windows {
+        let binding = crate::catalog::load_provider_logical_publication_binding(
+            connection,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, wire.binding_digest),
+        )
+        .map_err(|_| ManifestCatalogError::CorruptCatalog)?
         .ok_or(ManifestCatalogError::CorruptCatalog)?;
-    if sha256_evidence(persisted_capture.sealed_capture_receipt_digest())?.bytes()
-        != wire.capture_receipt_digest
-        || sha256_evidence(persisted_capture.binding_digest())?.bytes() != wire.binding_digest
-    {
-        return Err(ManifestCatalogError::CorruptCatalog);
-    }
-    let expected_provider_timestamps =
-        validate_capture_against_wire(persisted_capture.capture(), &wire)?;
+        nominal::validate_nominal_logical(&binding, &wire, graph)?;
+        Box::new([])
+    } else {
+        let persisted_capture = load_provider_capture_for_run(connection, wire.origin_run_id)?
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
+        if sha256_evidence(persisted_capture.sealed_capture_receipt_digest())?.bytes()
+            != wire.capture_receipt_digest
+            || sha256_evidence(persisted_capture.binding_digest())?.bytes() != wire.binding_digest
+        {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        validate_capture_against_wire(persisted_capture.capture(), &wire)?
+    };
     receipt_from_wire(
         publication_digest,
         wire,
@@ -3746,9 +3839,8 @@ fn validate_capture_against_wire(
     capture: &ProviderCaptureSetReceipt,
     wire: &MarketBarHistoryReceiptWire,
 ) -> Result<Box<[Timestamp]>, ManifestCatalogError> {
-    if let Some(graph) = &wire.date_windows {
-        nominal::validate_nominal_capture(capture, wire, graph)?;
-        return Ok(Box::new([]));
+    if wire.date_windows.is_some() {
+        return Err(ManifestCatalogError::CorruptCatalog);
     }
     let Some(ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding)) =
         capture.semantic_binding()
@@ -3864,7 +3956,9 @@ fn receipt_from_wire(
                 || wire.interval.as_str() != ALPACA_HISTORY_INTERVAL
                 || !matches!(
                     wire.adjustment,
-                    MarketBarAdjustment::Raw | MarketBarAdjustment::Split | MarketBarAdjustment::All
+                    MarketBarAdjustment::Raw
+                        | MarketBarAdjustment::Split
+                        | MarketBarAdjustment::All
                 )
                 || wire.timestamp_basis.map(timestamp_basis_name)
                     != Some(ALPACA_HISTORY_TIMESTAMP_BASIS)
@@ -3876,9 +3970,10 @@ fn receipt_from_wire(
         || wire.origin_record_count < wire.returned_bar_count
         || wire.expected_bar_count == 0
         || wire.expected_bar_count != wire.returned_bar_count
-        || usize::try_from(wire.expected_bar_count)
-            .ok()
-            .is_none_or(|count| count > MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS)
+        || (wire.date_windows.is_none()
+            && usize::try_from(wire.expected_bar_count)
+                .ok()
+                .is_none_or(|count| count > MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS))
         || (wire.date_windows.is_none() && wire.requested_start_ns >= wire.requested_end_ns)
         || wire.coverage_first_ns < wire.requested_start_ns
         || wire.coverage_last_ns < wire.coverage_first_ns
@@ -3886,7 +3981,10 @@ fn receipt_from_wire(
         || wire.coverage_last_complete_ns < wire.coverage_last_ns
         || wire
             .coverage_last_complete_ns
-            .map(|end| end.checked_sub(1).ok_or(ManifestCatalogError::CorruptCatalog))
+            .map(|end| {
+                end.checked_sub(1)
+                    .ok_or(ManifestCatalogError::CorruptCatalog)
+            })
             .transpose()?
             > wire.requested_end_ns
         || max_available_at > max_ingested_at

@@ -112,20 +112,20 @@ function ReadyLifecycle({
   const status = useQuery({
     queryKey: productKeys.operation(scope, "operations", "Operations.GetUpdateStatus", {}),
     enabled: supportsUpdateStatus,
-    queryFn: async () => parseUpdateStatus(await transport.systemQuery({ query: "operationUpdateStatus" })),
+    queryFn: async ({ signal }) => parseUpdateStatus(await transport.systemQuery({ query: "operationUpdateStatus" }, { signal })),
     refetchInterval: 15_000,
   })
   const updatePreview = useQuery({
     queryKey: updatePreviewKey,
     enabled: false,
-    queryFn: async () => parseUpdatePreview(await transport.systemQuery({ query: "operationUpdatePreview" })),
+    queryFn: async ({ signal }) => parseUpdatePreview(await transport.systemQuery({ query: "operationUpdatePreview" }, { signal })),
   })
   const rollbackPreview = useQuery({
     queryKey: rollbackPreviewKey,
     enabled: false,
-    queryFn: async () =>
+    queryFn: async ({ signal }) =>
       parseProgramRollbackPreview(
-        await transport.systemQuery({ query: "operationProgramRollbackPreview" }),
+        await transport.systemQuery({ query: "operationProgramRollbackPreview" }, { signal }),
       ),
   })
   const installation = useQuery({

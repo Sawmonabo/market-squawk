@@ -96,17 +96,22 @@ impl SelectedForecastRuntime {
             fit.dependence_assumptions(),
         )
         .map_err(|_| ServiceError::InvalidResult)?;
-        let path = self.retained.image.backends[self.backend_ordinal]
+        let active = self
+            .retained
+            .image
+            .activate(
+                metadata.bundle_id(),
+                metadata.bundle_version(),
+                context.deadline(),
+                context.cancellation(),
+            )
+            .map_err(super::super::super::runtime_service_error)?;
+        let path = active
+            .backend()
             .forecast(&request, Some(&calibration))
             .map_err(|_| ServiceError::Unavailable)?;
         ensure_live(context)?;
-        let bundle = self
-            .retained
-            .image
-            .registry
-            .get(metadata.bundle_id(), metadata.bundle_version())
-            .map_err(|_| ServiceError::Unavailable)?
-            .ok_or(ServiceError::Unavailable)?;
+        let bundle = active.bundle();
         let distribution =
             ForecastStudyDistribution::try_from_admitted_path(&bundle, path, coordinate)
                 .map_err(|_| ServiceError::InvalidResult)?;

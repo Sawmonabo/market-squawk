@@ -4,8 +4,8 @@ use market_squawk_services::ToolInputError;
 use serde_json::{Map, Value, json};
 
 use crate::application::decision::investment_request::{
-    CandidateReference, ForecastReference, GenerateRequest, ProfileBinding, StudyReference,
-    WorkflowBinding, ProbabilityForecastReferences, timestamp, validate_canonical_request,
+    CandidateReference, ForecastReference, GenerateRequest, ProbabilityForecastReferences,
+    ProfileBinding, StudyReference, WorkflowBinding, timestamp, validate_canonical_request,
 };
 
 use super::{ArgumentKind, argument_schema};
@@ -18,6 +18,7 @@ pub(super) enum Argument {
     OptionalMarket,
     OptionalForecast,
     OptionalSourceAction,
+    OptionalFundamentalShareSources,
     ProbabilityForecasts,
     OptionalBenchmarkInstrument,
     FinancialForecasts,
@@ -61,6 +62,13 @@ pub(super) fn schema(argument: Argument) -> Value {
         }),
         Argument::OptionalSourceAction => json!({
             "oneOf": [{"type": "null"}, crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference::json_schema()],
+        }),
+        Argument::OptionalFundamentalShareSources => json!({
+            "oneOf": [{"type": "null"}, {
+                "type": "string", "minLength": 1,
+                "maxLength": crate::application::fair_value::MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES,
+                "contentMediaType": "application/json",
+            }],
         }),
         Argument::ProbabilityForecasts => json!({
             "type": "object", "additionalProperties": false,
@@ -165,6 +173,18 @@ pub(super) fn admit_argument(value: &Value, argument: Argument) -> Result<(), To
         Argument::OptionalSourceAction => {
             serde_json::from_value::<Option<crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference>>(value.clone()).map(drop)
         }
+        Argument::OptionalFundamentalShareSources => {
+            return if value.is_null() {
+                Ok(())
+            } else {
+                let sources = value.as_str().ok_or(ToolInputError::Invalid)?;
+                if sources.len() > crate::application::fair_value::MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES {
+                    return Err(ToolInputError::Invalid);
+                }
+                crate::application::fair_value::validate_fundamental_share_sources(sources.as_bytes())
+                    .map_err(|_| ToolInputError::Invalid)
+            };
+        }
         Argument::ProbabilityForecasts => {
             serde_json::from_value::<ProbabilityForecastReferences>(value.clone()).map(drop)
         }
@@ -193,8 +213,8 @@ pub(super) fn admit_request(arguments: &Map<String, Value>) -> Result<(), ToolIn
     let mut business = arguments.clone();
     business.remove("confirm");
     business.remove("resultLimits");
-    let request: GenerateRequest = serde_json::from_value(Value::Object(business))
-        .map_err(|_| ToolInputError::Invalid)?;
+    let request: GenerateRequest =
+        serde_json::from_value(Value::Object(business)).map_err(|_| ToolInputError::Invalid)?;
     // Normalize optional fields and JSON key order exactly as publication and recovery do.
     let canonical = serde_json::to_vec(&request).map_err(|_| ToolInputError::Invalid)?;
     validate_canonical_request(&canonical).map_err(|_| ToolInputError::Invalid)

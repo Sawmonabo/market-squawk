@@ -304,6 +304,9 @@ pub enum DatasetBuildError {
     /// Point-in-time selection rejected the bounded candidate set.
     #[error("point-in-time dataset selection failed")]
     PointInTime,
+    /// An indexed selection failed before output publication; retains cancellation and disk cause.
+    #[error("indexed dataset selection failed: {0}")]
+    IndexedPointInTime(crate::PointInTimeError<'static>),
     /// Historical-universe construction failed closed.
     #[error("historical-universe construction failed: {0}")]
     Universe(#[from] crate::UniverseError),

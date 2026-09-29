@@ -223,7 +223,8 @@ const backtestActivitySchema = z
 
 const backtestActivitiesSchema = z
   .object({
-    activities: z.array(backtestActivitySchema).max(1_000),
+    activities: z.array(backtestActivitySchema).max(100),
+    nextCursor: z.string().min(1).max(512).nullable(),
   })
   .strict()
 
@@ -381,10 +382,11 @@ export function parseBacktestStart(result: ApplicationResult): BacktestStartResu
   return parsed.data
 }
 
-export function parseBacktestActivities(result: ApplicationResult): BacktestActivity[] {
+export function parseBacktestActivities(result: ApplicationResult): { activities: BacktestActivity[]; nextCursor: string | null } {
   const parsed = backtestActivitiesSchema.safeParse(result.data)
   if (!parsed.success) throw new Error("Backtest activity is unavailable right now.")
-  return parsed.data.activities
+  if (result.metadata.returnedItems !== parsed.data.activities.length) throw new Error("Backtest activity counts are inconsistent.")
+  return parsed.data
 }
 
 export function parseBacktestResult(result: ApplicationResult): BacktestResult {

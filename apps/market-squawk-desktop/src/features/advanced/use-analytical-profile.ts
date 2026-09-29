@@ -16,8 +16,8 @@ export function useAnalyticalProductProjection(
       "Analysis.GetSettingsSummary",
       {},
     ),
-    queryFn: async () => {
-      const response = await transport.query({ query: "analysisSettings" })
+    queryFn: async ({ signal }) => {
+      const response = await transport.query({ query: "analysisSettings" }, { signal })
       return analyticalProductProjectionSchema.parse(response.data)
     },
   })
@@ -29,8 +29,8 @@ export function useAnalyticalControllerStatus(
 ) {
   return useQuery({
     queryKey: productKeys.operation(scope, "analysis", "Desktop.AnalyticalProfiles", {}),
-    queryFn: async () => {
-      const response = await transport.analyticalController({ action: "status" })
+    queryFn: async ({ signal }) => {
+      const response = await transport.analyticalController({ action: "status" }, false, { signal })
       if (response.kind !== "status") throw new Error("Analysis settings could not be opened.")
       return response
     },

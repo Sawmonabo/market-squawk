@@ -2,15 +2,18 @@
 
 mod authority;
 mod backup;
+mod chart_projection;
 mod company_identity;
 mod company_security;
 mod diagnostics;
 mod evidence;
 mod fair_value;
+mod forecast_inventory;
 mod listing_reference;
 mod market_data_instruments;
 mod market_recovery;
 mod migration_preflight;
+mod model_inventory;
 mod observed_revisions;
 mod official_options_reference;
 mod official_options_reference_stage;
@@ -33,6 +36,15 @@ mod types;
 use market_squawk_platform::{CatalogFileGuard, CatalogWriterGuard, PathError};
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags};
+
+pub use self::chart_projection::{
+    ChartProjectionCatalogCapability, ChartProjectionError, ChartProjectionReference,
+    ChartProjectionRow, ChartProjectionValue,
+};
+pub use self::model_inventory::{
+    ModelInventoryCatalogCapability, ModelInventoryEntry, ModelInventoryError, ModelInventoryHead,
+    ModelInventoryRecord,
+};
 
 pub(crate) use self::authority::exact_catalog_file_binding;
 pub use self::backup::BackupReceipt;
@@ -81,8 +93,8 @@ pub use self::listing_reference::{
     MAX_LISTING_REFERENCE_SEARCH_ROWS,
 };
 pub use self::market_data_instruments::{
-    AcceptedNativeReferenceCapture, AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission, CurrentListedPopulation,
-    CurrentListedPopulationAdmission, CurrentListedPopulationMember,
+    AcceptedNativeReferenceCapture, AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission,
+    CurrentListedPopulation, CurrentListedPopulationAdmission, CurrentListedPopulationMember,
     CurrentListedPopulationPartition, CurrentListedPopulationScope,
     CurrentListedPopulationSourceScope, CurrentPopulationError, CurrentPopulationExclusion,
     CurrentPopulationExclusionReason, DatasetPopulationPartition, DatasetPopulationSourceUse,
@@ -182,7 +194,7 @@ pub(crate) use provider_event::{
     PreparedProviderPublicationBinding, retain_prepared_provider_publication_binding,
 };
 pub(crate) use provider_logical::{
-    MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES,
+    MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES, load_provider_logical_publication_binding,
     retain_sealed_provider_logical_publication_binding,
 };
 pub use provider_logical::{
@@ -454,3 +466,8 @@ pub(super) fn map_catalog_location_error(error: PathError) -> CatalogError {
         CatalogError::UnsafePath
     }
 }
+
+pub use self::forecast_inventory::{
+    ForecastInventoryCatalogCapability, ForecastInventoryError, ForecastInventoryHead,
+    ForecastInventoryLookup, ForecastInventoryOutcome, ForecastInventoryVintage,
+};

@@ -203,18 +203,22 @@ impl BacktestService {
                 })));
             }
         };
-        let artifact_bytes =
-            match artifact::encode(&request, &run, self.inventory.limits().max_artifact_bytes()) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    self.commit_failure(
-                        reservation,
-                        "backtest-artifact-encoding",
-                        "bounded encoding",
-                    )?;
-                    return Err(error);
-                }
-            };
+        let mut artifact_file = match artifact::encode(
+            &request,
+            &run,
+            self.inventory.limits().max_artifact_bytes(),
+            cancellation,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.commit_failure(
+                    reservation,
+                    "backtest-artifact-encoding",
+                    "bounded encoding",
+                )?;
+                return Err(error);
+            }
+        };
         let metrics = match run_metrics(&request, &run) {
             Ok(metrics) => metrics,
             Err(error) => {
@@ -222,7 +226,10 @@ impl BacktestService {
                 return Err(error);
             }
         };
-        let artifact = match self.inventory.prepare_artifact(&artifact_bytes) {
+        let artifact = match self
+            .inventory
+            .prepare_artifact_reader(artifact_file.as_file_mut())
+        {
             Ok(artifact) => artifact,
             Err(error) => {
                 self.commit_failure(
@@ -252,9 +259,9 @@ impl BacktestService {
                 return Err(error.into());
             }
         };
-        let trial = self
-            .inventory
-            .complete(reservation, completion, &artifact_bytes)?;
+        let trial =
+            self.inventory
+                .complete_reader(reservation, completion, artifact_file.as_file_mut())?;
         Ok(BacktestOutcome::Completed(Box::new(BacktestResult {
             run,
             trial,
@@ -466,7 +473,7 @@ fn run_metrics(
         )?,
         TrialMetric::try_new(
             SourceIdentifier::try_from("fill-count")?,
-            run.fills().len() as f64,
+            run.fill_count() as f64,
         )?,
         TrialMetric::try_new(
             SourceIdentifier::try_from(COST_ADJUSTED_TOTAL_RETURN_METRIC)?,

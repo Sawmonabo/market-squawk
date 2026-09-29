@@ -6,7 +6,7 @@
 use super::*;
 use crate::application::model::forecast::{HistoricalFinancialForecast, SelectedForecastRuntime};
 use market_squawk_data::{
-    FeatureDatasetInputEpoch, FeatureDatasetInputEpochOutput, PythonDatasetSelection,
+    FeatureDatasetInputEpoch, FeatureDatasetInputEpochCursor, PythonDatasetSelection,
 };
 use market_squawk_jobs::{JobSnapshot, JobState};
 
@@ -204,7 +204,7 @@ impl HistoricalFiscalDatasetExpectation {
         &self,
         research: &crate::ResearchService,
         runtime: &SelectedForecastRuntime,
-        output: &FeatureDatasetInputEpochOutput,
+        output: &FeatureDatasetInputEpochCursor,
         price_coordinate: market_squawk_data::FeatureDatasetInputCoordinate<'_>,
         context: &RequestContext,
     ) -> Result<HistoricalOriginFinancialForecast, ServiceError> {
@@ -219,7 +219,7 @@ impl HistoricalFiscalDatasetExpectation {
                 != Some(self.inputs_build)
             || output.dataset().product_contract()
                 != FeatureDatasetProductContract::FinancialAmountFiscalPeriodsStudyInputsV1
-            || output.epochs().len() != 1
+            || output.len() != 1
             || Sha256::digest(
                 price_epoch
                     .canonical_bytes()
@@ -230,7 +230,11 @@ impl HistoricalFiscalDatasetExpectation {
         {
             return Err(ServiceError::InvalidRequest);
         }
-        let coordinate = output.coordinate(0).ok_or(ServiceError::InvalidResult)?;
+        let owned_coordinate = output
+            .coordinate(0)
+            .map_err(super::super::super::map_read_error)?
+            .ok_or(ServiceError::InvalidResult)?;
+        let coordinate = owned_coordinate.coordinate();
         let epoch = coordinate.epoch();
         let origin = price_epoch
             .target_origin()

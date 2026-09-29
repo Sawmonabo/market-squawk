@@ -10,6 +10,9 @@ import {
   ShieldCheck,
 } from "lucide-react"
 
+import { CursorNavigation } from "../shared/cursor-navigation"
+import { usePortfolioAccounts } from "../portfolio/use-portfolio"
+
 import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
@@ -21,7 +24,6 @@ import type { ProductTransport } from "@/lib/transport"
 import {
   type PortfolioAccountRiskSummary,
   type PortfolioRiskReport,
-  parseRiskAccounts,
   parseRiskReport,
 } from "./contracts"
 
@@ -50,20 +52,11 @@ function ReadyRiskPage({
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
-  const accounts = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.productSessionToken,
-      "portfolio",
-      "Portfolio.ListAccounts",
-      {},
-    ),
-    queryFn: async () =>
-      parseRiskAccounts(await transport.query({ query: "portfolioAccounts" })),
-  })
-  const availableAccounts = accounts.data?.value ?? []
-  const [selectedIndex, setSelectedIndex] = React.useState("")
-  const index = parseSelectedIndex(selectedIndex, availableAccounts.length)
-  const selected = index === null ? null : availableAccounts[index] ?? null
+  const accountDirectory = usePortfolioAccounts(transport, bootstrap)
+  const accounts = accountDirectory.query
+  const availableAccounts = accounts.data?.accounts ?? []
+  const [selectedToken, setSelectedToken] = React.useState("")
+  const selected = availableAccounts.find((account) => account.accountToken === selectedToken) ?? null
 
   return (
     <PageFrame
@@ -80,6 +73,8 @@ function ReadyRiskPage({
       }
     >
       <RiskBoundary />
+      <CursorNavigation navigation={accountDirectory.navigation} next={accounts.data?.nextCursor} busy={accounts.isFetching} error={accounts.isError}
+        onNavigate={() => setSelectedToken("")} onRestart={() => { if (accountDirectory.navigation.after === undefined) void accounts.refetch() }} />
       {accounts.isLoading ? (
         <RiskGridLoading />
       ) : accounts.isError ? (
@@ -103,13 +98,13 @@ function ReadyRiskPage({
             </label>
             <select
               id="risk-account"
-              value={selectedIndex}
-              onChange={(event) => setSelectedIndex(event.target.value)}
+              value={selected?.accountToken ?? ""}
+              onChange={(event) => setSelectedToken(event.target.value)}
               className="mt-2 block min-w-64 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <option value="">Select a portfolio</option>
-              {availableAccounts.map((account, accountIndex) => (
-                <option key={`${account.displayName}:${accountIndex}`} value={String(accountIndex)}>
+              {availableAccounts.map((account) => (
+                <option key={account.accountToken} value={account.accountToken}>
                   {account.displayName} · {account.currency}
                 </option>
               ))}
@@ -136,8 +131,7 @@ function ReadyRiskPage({
             </div>
           )}
           <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
-            Showing {accounts.data?.returnedItems ?? 0} of {accounts.data?.availableItems ?? 0}{" "}
-            portfolios.
+            Showing {availableAccounts.length} portfolios on this page.
             Risk guidance informs a decision but never approves or places a trade.
           </p>
         </>
@@ -162,12 +156,13 @@ function AccountRisk({
       "Portfolio.GetRisk",
       { accountToken: account.accountToken },
     ),
-    queryFn: async () =>
+    gcTime: 0,
+    queryFn: async ({ signal }) =>
       parseRiskReport(
         await transport.query({
           query: "portfolioRisk",
           accountToken: account.accountToken,
-        }),
+        }, { signal }),
       ),
   })
 
@@ -498,12 +493,6 @@ function RiskGridLoading() {
       </div>
     </div>
   )
-}
-
-function parseSelectedIndex(value: string, length: number): number | null {
-  if (!/^\d+$/.test(value)) return null
-  const index = Number(value)
-  return Number.isSafeInteger(index) && index >= 0 && index < length ? index : null
 }
 
 function actionLabel(value: PortfolioRiskReport["recommendation"]["action"]): string {

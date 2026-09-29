@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -31,6 +30,8 @@ mod feature_receipt;
 mod receipt;
 #[path = "query/source.rs"]
 mod source;
+#[path = "query/spool.rs"]
+mod spool;
 #[cfg(test)]
 #[path = "query/tests.rs"]
 mod tests;
@@ -45,6 +46,7 @@ pub use self::feature_receipt::PinnedFeatureMonetaryValue;
 pub use self::receipt::{PinnedMonetaryValue, PinnedQueryOutput};
 use self::receipt::{RESEARCH_MONETARY_COLUMNS, pinned_object_graph_digest};
 use self::source::{PinnedObjectStoreRegistry, QuerySource, RetainedSourceReceipt};
+pub use self::spool::{SealedQueryBatchCursor, SealedQueryBatchStore};
 use self::validation::{validate_read_only_statement, validate_relations};
 use crate::blocking_supervisor::BlockingIoSupervisor;
 use crate::schema::DatasetSchemaRegistry;
@@ -63,6 +65,7 @@ const MAX_AST_NODES: usize = 10_000;
 const MAX_PLAN_NODES: usize = 10_000;
 const MAX_DEADLINE: Duration = Duration::from_secs(60);
 const INLINE_RESULT_BYTES: u64 = 256 * 1024;
+const DEFAULT_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[cfg(test)]
 struct QueryArtifactMemoryTestWitness {
@@ -91,6 +94,7 @@ pub struct QueryLimits {
     max_inline_bytes: u64,
     max_bytes: u64,
     max_memory_bytes: u64,
+    max_spill_bytes: u64,
     max_partitions: usize,
     max_ast_nodes: usize,
     max_plan_nodes: usize,
@@ -98,6 +102,8 @@ pub struct QueryLimits {
     operation_deadline: Option<tokio::time::Instant>,
     #[cfg(test)]
     bind_precommit_deadline: Option<tokio::time::Instant>,
+    #[cfg(test)]
+    require_spill: bool,
 }
 
 impl QueryLimits {
@@ -149,7 +155,7 @@ impl QueryLimits {
             || max_inline_bytes > max_bytes
             || max_bytes == 0
             || max_bytes > MAX_RESULT_BYTES
-            || max_memory_bytes < max_bytes
+            || max_memory_bytes == 0
             || max_memory_bytes > MAX_MEMORY_BYTES
             || max_partitions == 0
             || max_partitions > MAX_PARTITIONS
@@ -167,6 +173,7 @@ impl QueryLimits {
             max_inline_bytes,
             max_bytes,
             max_memory_bytes,
+            max_spill_bytes: DEFAULT_SPILL_BYTES,
             max_partitions,
             max_ast_nodes,
             max_plan_nodes,
@@ -174,12 +181,33 @@ impl QueryLimits {
             operation_deadline: None,
             #[cfg(test)]
             bind_precommit_deadline: None,
+            #[cfg(test)]
+            require_spill: false,
         })
+    }
+
+    /// Sets the operation-local temporary-disk budget independently of RAM and result bytes.
+    pub fn with_spill_bytes(mut self, max_spill_bytes: u64) -> Result<Self, QueryError> {
+        if max_spill_bytes == 0 || max_spill_bytes > i64::MAX as u64 {
+            return Err(QueryError::InvalidLimits);
+        }
+        self.max_spill_bytes = max_spill_bytes;
+        Ok(self)
+    }
+
+    /// Returns the independent temporary-disk budget.
+    pub const fn max_spill_bytes(self) -> u64 {
+        self.max_spill_bytes
     }
 
     /// Returns the result-byte ceiling also used by durable artifact authority.
     pub const fn max_bytes(self) -> u64 {
         self.max_bytes
+    }
+
+    /// Returns the working-RAM budget independently of complete result and temporary-disk bytes.
+    pub const fn max_memory_bytes(self) -> u64 {
+        self.max_memory_bytes
     }
 
     /// Returns the largest Arrow IPC result that may remain inline.
@@ -205,6 +233,12 @@ impl QueryLimits {
     }
 
     #[cfg(test)]
+    fn with_test_required_spill(mut self) -> Self {
+        self.require_spill = true;
+        self
+    }
+
+    #[cfg(test)]
     fn with_test_bind_precommit_deadline(mut self, deadline: tokio::time::Instant) -> Self {
         self.bind_precommit_deadline = Some(deadline);
         self
@@ -218,7 +252,10 @@ pub(crate) struct QueryArtifactMemoryLease {
 }
 
 impl QueryArtifactMemoryLease {
-    fn try_new(reservation: MemoryReservation, expected: usize) -> Result<Self, QueryError> {
+    pub(crate) fn try_new(
+        reservation: MemoryReservation,
+        expected: usize,
+    ) -> Result<Self, QueryError> {
         if reservation.size() != expected {
             return Err(QueryError::DependencyAllocationContract);
         }
@@ -227,6 +264,12 @@ impl QueryArtifactMemoryLease {
             #[cfg(test)]
             _witness: None,
         })
+    }
+
+    pub(crate) fn resize(&self, bytes: usize, limit: u64) -> Result<(), ParquetStoreError> {
+        self._reservation
+            .try_resize(bytes)
+            .map_err(|_| ParquetStoreError::WriterMemoryLimitExceeded { limit })
     }
 
     #[cfg(test)]
@@ -285,7 +328,7 @@ impl QueryRequest {
     /// Computes the exact SHA-256 identity of manifest, SQL, and every execution limit.
     pub fn artifact_identity(&self, limits: &QueryLimits) -> EvidenceDigest {
         let mut identity = sha2::Sha256::new();
-        identity.update(b"market-squawk/query-artifact-request/v3");
+        identity.update(b"market-squawk/query-artifact-request/v4");
         identity.update(
             u64::try_from(self.manifest.dataset_id().as_str().len())
                 .unwrap_or(u64::MAX)
@@ -312,6 +355,7 @@ impl QueryRequest {
         identity.update(limits.max_inline_bytes.to_be_bytes());
         identity.update(limits.max_bytes.to_be_bytes());
         identity.update(limits.max_memory_bytes.to_be_bytes());
+        identity.update(limits.max_spill_bytes.to_be_bytes());
         identity.update(
             u64::try_from(limits.max_partitions)
                 .unwrap_or(u64::MAX)
@@ -357,6 +401,23 @@ pub enum QueryResult {
         /// Returned batches.
         batches: Vec<RecordBatch>,
         /// Exact Arrow IPC stream size used for the result bound.
+        byte_count: u64,
+    },
+    /// Complete result consumed incrementally by a data-owned operation; the receipt retains
+    /// counts and digest while the consumer owns its bounded calculation or durable staging.
+    Consumed {
+        /// Complete streamed row count.
+        row_count: u64,
+        /// Exact IPC byte count included in the result digest.
+        byte_count: u64,
+    },
+    /// Complete operation-owned IPC batches authenticated by this query receipt.
+    Spooled {
+        /// Sealed batches retained until the last cursor is released.
+        batches: SealedQueryBatchStore,
+        /// Complete streamed row count.
+        row_count: u64,
+        /// Exact IPC result byte count.
         byte_count: u64,
     },
     /// Larger result published through the controlled content-addressed artifact boundary.
@@ -520,7 +581,7 @@ impl ResearchQueryEngine {
         limits: QueryLimits,
         cancellation: CancellationToken,
     ) -> Result<QueryResult, QueryError> {
-        self.execute(request, limits, cancellation)
+        self.execute(request, limits, cancellation, None)
             .await
             .map(|executed| executed.result)
     }
@@ -540,7 +601,7 @@ impl ResearchQueryEngine {
         let manifest = dataset.manifest().clone();
         let object_graph_digest = pinned_object_graph_digest(dataset);
         let query_identity = request.artifact_identity(&limits);
-        let executed = self.execute(request, limits, cancellation).await?;
+        let executed = self.execute(request, limits, cancellation, None).await?;
         Ok(PinnedQueryOutput::new(
             manifest,
             object_graph_digest,
@@ -548,6 +609,72 @@ impl ResearchQueryEngine {
             executed.result_digest,
             executed.result,
         ))
+    }
+
+    /// Consumes bounded batches without artifact-write authority and issues the same immutable
+    /// receipt only after the complete query succeeds. Consumers must keep partial work private.
+    pub(crate) async fn query_pinned_consume(
+        &self,
+        request: QueryRequest,
+        limits: QueryLimits,
+        cancellation: CancellationToken,
+        mut consume: impl FnMut(RecordBatch) -> Result<(), QueryError> + Send,
+    ) -> Result<PinnedQueryOutput, QueryError> {
+        let dataset = self
+            .source
+            .pinned_dataset()
+            .ok_or(QueryError::PinnedQuerySourceRequired)?;
+        let manifest = dataset.manifest().clone();
+        let object_graph_digest = pinned_object_graph_digest(dataset);
+        let query_identity = request.artifact_identity(&limits);
+        let executed = self
+            .execute(request, limits, cancellation, Some(&mut consume))
+            .await?;
+        Ok(PinnedQueryOutput::new(
+            manifest,
+            object_graph_digest,
+            query_identity,
+            executed.result_digest,
+            executed.result,
+        ))
+    }
+
+    /// Streams a complete pinned result into private scratch for bounded synchronous consumers.
+    pub async fn query_pinned_spooled(
+        &self,
+        request: QueryRequest,
+        limits: QueryLimits,
+        cancellation: CancellationToken,
+    ) -> Result<PinnedQueryOutput, QueryError> {
+        let scratch = match &self.source {
+            QuerySource::Pinned { store, .. } => store.operation_scratch()?,
+            #[cfg(test)]
+            QuerySource::Batches { .. } => return Err(QueryError::PinnedQuerySourceRequired),
+        };
+        let deadline = match limits.operation_deadline {
+            Some(deadline) => deadline,
+            None => tokio::time::Instant::now()
+                .checked_add(limits.deadline)
+                .ok_or(QueryError::InvalidLimits)?,
+        };
+        let mut pending =
+            spool::PendingQueryBatchStore::new(scratch, deadline, cancellation.clone())?;
+        let receipt = self
+            .query_pinned_consume(request, limits, cancellation, |batch| pending.write(batch))
+            .await?;
+        let (row_count, byte_count) = match receipt.result() {
+            QueryResult::Consumed {
+                row_count,
+                byte_count,
+            } => (*row_count, *byte_count),
+            _ => return Err(QueryError::InvalidSource),
+        };
+        let batches = pending.finish()?;
+        Ok(receipt.with_result(QueryResult::Spooled {
+            batches,
+            row_count,
+            byte_count,
+        }))
     }
 
     /// Reads one stable row from the canonical research-observation schema using an engine-owned
@@ -628,6 +755,7 @@ impl ResearchQueryEngine {
         request: QueryRequest,
         limits: QueryLimits,
         cancellation: CancellationToken,
+        mut consumer: Option<&mut (dyn FnMut(RecordBatch) -> Result<(), QueryError> + Send)>,
     ) -> Result<ExecutedQuery, QueryError> {
         if request.manifest != self.manifest {
             return Err(QueryError::ManifestPinMismatch);
@@ -669,11 +797,22 @@ impl ResearchQueryEngine {
             let _planning_admission = planning_receipt.acquire(&execution_cancellation).await?;
             let memory = planning_receipt.execution_bytes(limits.max_memory_bytes)?;
             let object_store_registry = Arc::new(PinnedObjectStoreRegistry::default());
+            let scratch = match &self.source {
+                QuerySource::Pinned { store, .. } => store.operation_scratch()?,
+                #[cfg(test)]
+                QuerySource::Batches { .. } => {
+                    crate::parquet_store::OperationScratchDirectory::for_test()?
+                }
+            };
             let runtime = RuntimeEnvBuilder::new()
                 .with_memory_limit(memory, 1.0)
                 .with_object_store_registry(object_store_registry.clone())
                 .with_disk_manager_builder(
-                    DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+                    DiskManagerBuilder::default()
+                        .with_mode(DiskManagerMode::Directories(vec![
+                            scratch.path().to_path_buf(),
+                        ]))
+                        .with_max_temp_directory_size(limits.max_spill_bytes),
                 )
                 .build_arc()
                 .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
@@ -688,15 +827,20 @@ impl ResearchQueryEngine {
                 MemoryConsumer::new("market-squawk-query-output").register(&runtime.memory_pool);
             let ipc_memory =
                 MemoryConsumer::new("market-squawk-query-ipc").register(&runtime.memory_pool);
-            let artifact_memory =
-                MemoryConsumer::new("market-squawk-query-artifact").register(&runtime.memory_pool);
-            let config = SessionConfig::new()
+            let mut artifact_memory = Some(
+                MemoryConsumer::new("market-squawk-query-artifact").register(&runtime.memory_pool),
+            );
+            let mut config = SessionConfig::new()
                 .with_target_partitions(limits.max_partitions)
                 .with_batch_size(8_192)
                 .with_information_schema(false)
                 .with_repartition_joins(false)
                 .with_repartition_aggregations(false)
                 .with_repartition_file_scans(false);
+            config.options_mut().execution.sort_spill_reservation_bytes =
+                (memory / 8).min(8 * 1024 * 1024);
+            config.options_mut().execution.sort_in_place_threshold_bytes =
+                (memory / 16).min(1024 * 1024);
             let context = SessionContext::new_with_config_rt(config, runtime);
             self.source
                 .register(
@@ -741,12 +885,28 @@ impl ResearchQueryEngine {
                     .ok_or(QueryError::InvalidLimits)?,
             )
             .map_err(|_| QueryError::InvalidLimits)?;
-            let limited = dataframe
-                .limit(0, Some(requested_rows))
-                .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
-            let mut stream = limited
-                .execute_stream()
-                .await
+            // Enforce the service's safety limit above the already optimized physical plan.
+            // A logical LIMIT is pushed into ORDER BY as TopK, whose full K-row heap cannot
+            // spill; it would turn an otherwise external sort into a memory-only operation.
+            let physical: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+                if physical.output_partitioning().partition_count() > 1 {
+                    Arc::new(
+                        datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                            physical,
+                        ),
+                    )
+                } else {
+                    physical
+                };
+            let limited: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+                Arc::new(datafusion::physical_plan::limit::GlobalLimitExec::new(
+                    physical,
+                    0,
+                    Some(requested_rows),
+                ));
+            #[cfg(test)]
+            let metrics_plan = Arc::clone(&limited);
+            let mut stream = datafusion::physical_plan::execute_stream(limited, context.task_ctx())
                 .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
             let result_schema = stream.schema();
             let schema_memory = schema_retained_bytes(&result_schema)?;
@@ -758,7 +918,11 @@ impl ResearchQueryEngine {
             resize_memory(&ipc_memory, 0, limits.max_memory_bytes)?;
             let mut rows = 0_u64;
             let mut batches = Vec::new();
+            let mut staging: Option<crate::ingest::QueryArtifactStaging> = None;
             while let Some(batch) = stream.next().await {
+                if execution_cancellation.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
                 let batch =
                     batch.map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
                 rows = rows
@@ -773,23 +937,95 @@ impl ResearchQueryEngine {
                 }
                 let batch_memory = record_batch_retained_bytes(&batch)?;
                 reserve_memory(&output_memory, batch_memory, limits.max_memory_bytes)?;
-                batches
-                    .try_reserve_exact(1)
-                    .map_err(|_| QueryError::MemoryLimitExceeded {
-                        limit: limits.max_memory_bytes,
-                    })?;
                 let ipc_work = batch_memory
                     .checked_add(schema_memory)
                     .ok_or(QueryError::SizeOverflow)?;
                 resize_memory(&ipc_memory, ipc_work, limits.max_memory_bytes)?;
                 ipc.write(&batch)?;
-                resize_memory(&ipc_memory, 0, limits.max_memory_bytes)?;
                 if ipc.get_ref().byte_count > limits.max_bytes {
                     return Err(QueryError::ByteLimitExceeded {
                         limit: limits.max_bytes,
                     });
                 }
-                batches.push(batch);
+                if let Some(consume) = consumer.as_mut() {
+                    // Keep the encoding receipt through a consumer that may write a second
+                    // bounded IPC stream into its private operation store.
+                    consume(batch)?;
+                    resize_memory(&ipc_memory, 0, limits.max_memory_bytes)?;
+                    output_memory.shrink(batch_memory);
+                    continue;
+                }
+                resize_memory(&ipc_memory, 0, limits.max_memory_bytes)?;
+                if staging.is_none() && ipc.get_ref().byte_count > limits.max_inline_bytes {
+                    let publication = self
+                        .artifact_publication
+                        .as_ref()
+                        .ok_or(QueryError::ArtifactStoreRequired)?;
+                    let reservation = request
+                        .artifact_reservation
+                        .as_ref()
+                        .ok_or(QueryError::ArtifactAuthorityRequired)?;
+                    let memory = artifact_memory
+                        .take()
+                        .ok_or(QueryError::DependencyAllocationContract)?;
+                    let initial = schema_memory
+                        .checked_mul(16)
+                        .and_then(|bytes| bytes.checked_add(128 * 1024))
+                        .ok_or(QueryError::SizeOverflow)?;
+                    resize_memory(&memory, initial, limits.max_memory_bytes)?;
+                    let memory = QueryArtifactMemoryLease::try_new(memory, initial)?;
+                    #[cfg(test)]
+                    let memory = memory.with_test_witness(publication.test_writer_memory_witness());
+                    let mut writer = publication
+                        .begin_streaming(
+                            result_schema.clone(),
+                            &execution_cancellation,
+                            reservation,
+                            memory,
+                            limits.max_memory_bytes,
+                        )
+                        .await?;
+                    for retained in batches.drain(..) {
+                        let retained_bytes = record_batch_retained_bytes(&retained)?;
+                        writer
+                            .writer
+                            .write_query_batch(retained, output_memory.split(retained_bytes))
+                            .await
+                            .map_err(map_streaming_writer)?;
+                    }
+                    staging = Some(writer);
+                }
+                if let Some(staging) = staging.as_mut() {
+                    staging
+                        .writer
+                        .write_query_batch(batch, output_memory.split(batch_memory))
+                        .await
+                        .map_err(map_streaming_writer)?;
+                } else {
+                    batches
+                        .try_reserve_exact(1)
+                        .map_err(|_| QueryError::MemoryLimitExceeded {
+                            limit: limits.max_memory_bytes,
+                        })?;
+                    batches.push(batch);
+                }
+            }
+            #[cfg(test)]
+            if limits.require_spill {
+                fn spill_count(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> usize {
+                    plan.metrics()
+                        .and_then(|metrics| metrics.spill_count())
+                        .unwrap_or(0)
+                        + plan
+                            .children()
+                            .iter()
+                            .map(|child| spill_count(child.as_ref()))
+                            .sum::<usize>()
+                }
+                assert!(
+                    spill_count(metrics_plan.as_ref()) > 0,
+                    "complete query must exercise native disk spill"
+                );
             }
             resize_memory(&ipc_memory, schema_memory, limits.max_memory_bytes)?;
             ipc.finish()?;
@@ -800,13 +1036,13 @@ impl ResearchQueryEngine {
                     limit: limits.max_bytes,
                 });
             }
-            if byte_count <= limits.max_inline_bytes {
+            if consumer.is_some() {
                 if execution_cancellation.is_cancelled() {
                     return Err(QueryError::Cancelled);
                 }
                 return Ok(ExecutedQuery {
-                    result: QueryResult::Inline {
-                        batches,
+                    result: QueryResult::Consumed {
+                        row_count: rows,
                         byte_count,
                     },
                     result_digest: EvidenceDigest::new(
@@ -815,6 +1051,60 @@ impl ResearchQueryEngine {
                     ),
                 });
             }
+            // The IPC end marker can itself cross the threshold for a small result.
+            if staging.is_none() && byte_count > limits.max_inline_bytes {
+                let publication = self
+                    .artifact_publication
+                    .as_ref()
+                    .ok_or(QueryError::ArtifactStoreRequired)?;
+                let reservation = request
+                    .artifact_reservation
+                    .as_ref()
+                    .ok_or(QueryError::ArtifactAuthorityRequired)?;
+                let memory = artifact_memory
+                    .take()
+                    .ok_or(QueryError::DependencyAllocationContract)?;
+                let initial = schema_memory
+                    .checked_mul(16)
+                    .and_then(|bytes| bytes.checked_add(128 * 1024))
+                    .ok_or(QueryError::SizeOverflow)?;
+                resize_memory(&memory, initial, limits.max_memory_bytes)?;
+                let memory = QueryArtifactMemoryLease::try_new(memory, initial)?;
+                #[cfg(test)]
+                let memory = memory.with_test_witness(publication.test_writer_memory_witness());
+                let mut writer = publication
+                    .begin_streaming(
+                        result_schema.clone(),
+                        &execution_cancellation,
+                        reservation,
+                        memory,
+                        limits.max_memory_bytes,
+                    )
+                    .await?;
+                for batch in batches.drain(..) {
+                    let retained = record_batch_retained_bytes(&batch)?;
+                    writer
+                        .writer
+                        .write_query_batch(batch, output_memory.split(retained))
+                        .await
+                        .map_err(map_streaming_writer)?;
+                }
+                staging = Some(writer);
+            }
+            let result_digest =
+                EvidenceDigest::new(DigestAlgorithm::Sha256, ipc.get_ref().digest());
+            let Some(staging) = staging else {
+                if execution_cancellation.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+                return Ok(ExecutedQuery {
+                    result: QueryResult::Inline {
+                        batches,
+                        byte_count,
+                    },
+                    result_digest,
+                });
+            };
             let publication = self
                 .artifact_publication
                 .as_ref()
@@ -823,33 +1113,11 @@ impl ResearchQueryEngine {
                 .artifact_reservation
                 .as_ref()
                 .ok_or(QueryError::ArtifactAuthorityRequired)?;
-            let retained_output = batches.iter().try_fold(0_usize, |total, batch| {
-                total
-                    .checked_add(record_batch_retained_bytes(batch)?)
-                    .ok_or(QueryError::SizeOverflow)
-            })?;
-            resize_memory(&artifact_memory, retained_output, limits.max_memory_bytes)?;
-            let compact = concat_batches(&result_schema, &batches)?;
-            drop(batches);
-            output_memory.free();
-            let compact_memory = record_batch_retained_bytes(&compact)?;
-            let writer_admission = publication.writer_admission(&compact)?;
-            let publication_work = compact_memory
-                .checked_add(writer_admission.bytes())
-                .ok_or(QueryError::SizeOverflow)?;
-            resize_memory(&artifact_memory, publication_work, limits.max_memory_bytes)?;
-            let artifact_memory =
-                QueryArtifactMemoryLease::try_new(artifact_memory, publication_work)?;
-            #[cfg(test)]
-            let artifact_memory =
-                artifact_memory.with_test_witness(publication.test_writer_memory_witness());
             let (object, artifact, ownership) = publication
-                .publish_and_bind(
-                    compact,
+                .finish_and_bind(
+                    staging,
                     &execution_cancellation,
                     reservation,
-                    writer_admission,
-                    artifact_memory,
                     &execution_io_supervisor,
                     deadline_at,
                     #[cfg(test)]
@@ -863,7 +1131,7 @@ impl ResearchQueryEngine {
                     artifact: Box::new(artifact),
                     ownership,
                 },
-                result_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, ipc.get_ref().digest()),
+                result_digest,
             })
         });
         let deadline = tokio::time::sleep_until(deadline_at);
@@ -890,6 +1158,16 @@ impl ResearchQueryEngine {
         };
         io_supervisor.cancel();
         result
+    }
+}
+
+fn map_streaming_writer(error: ParquetStoreError) -> QueryError {
+    match error {
+        ParquetStoreError::Cancelled => QueryError::Cancelled,
+        ParquetStoreError::WriterMemoryLimitExceeded { limit } => {
+            QueryError::MemoryLimitExceeded { limit }
+        }
+        error => QueryError::Artifact(error),
     }
 }
 
@@ -964,6 +1242,9 @@ pub enum QueryError {
     /// Result exceeded its serialized byte limit.
     #[error("query byte limit {limit} exceeded")]
     ByteLimitExceeded { limit: u64 },
+    /// Native DataFusion spill exhausted the operation's temporary disk allocation.
+    #[error("query temporary disk allocation exhausted; retry with available temporary storage")]
+    SpillStorageExhausted,
     /// Retained input, execution, output, or serialization work exceeded one memory budget.
     #[error("query memory limit {limit} exceeded")]
     MemoryLimitExceeded { limit: u64 },

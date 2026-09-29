@@ -60,8 +60,44 @@ impl ExtractionContentIdentity {
     /// Returns [`ExtractionError::ByteCountOverflow`] if a platform length cannot be represented
     /// in the architecture-independent framing format.
     pub fn try_from_batch(batch: &ExtractionBatch) -> Result<Self, ExtractionError> {
-        let object = batch.request.object();
-        let records = batch.records();
+        let mut identity =
+            ExtractionContentAccumulator::try_new(batch.request(), batch.records().len())?;
+        for record in batch.records() {
+            identity.push(record)?;
+        }
+        identity.finish()
+    }
+
+    /// Returns the version-qualified semantic content digest.
+    pub const fn digest(self) -> EvidenceDigest {
+        self.digest
+    }
+
+    /// Returns the ordered record count bound into the digest.
+    pub const fn record_count(self) -> usize {
+        self.record_count
+    }
+}
+
+/// Incremental semantic identity for one complete extraction, independent of chunk boundaries.
+///
+/// The expected count is hashed before rows, preserving the established v3 identity exactly.
+/// A partial stream cannot finalize. Each record is checked against the original request.
+#[derive(Debug)]
+pub struct ExtractionContentAccumulator {
+    request: ExtractionRequest,
+    identity: Sha256,
+    expected_records: usize,
+    observed_records: usize,
+}
+
+impl ExtractionContentAccumulator {
+    /// Starts the complete-extraction identity with its declared terminal row count.
+    pub fn try_new(
+        request: &ExtractionRequest,
+        expected_records: usize,
+    ) -> Result<Self, ExtractionError> {
+        let object = request.object();
         let mut identity = Sha256::new();
         identity.update(b"market-squawk/extraction-content/v3");
         hash_text(&mut identity, object.source_id().as_str())?;
@@ -79,39 +115,50 @@ impl ExtractionContentIdentity {
         hash_optional_timestamp(&mut identity, object.published_at());
         hash_availability(&mut identity, object.availability())?;
         hash_optional_u64(&mut identity, object.expected_bytes());
-        hash_length(&mut identity, records.len())?;
-        for (ordinal, record) in records.iter().enumerate() {
-            hash_length(&mut identity, ordinal)?;
-            hash_text(&mut identity, record.source_id().as_str())?;
-            hash_text(
-                &mut identity,
-                record.metadata_revision().as_source_identifier().as_str(),
-            )?;
-            hash_text(&mut identity, record.dataset().as_str())?;
-            hash_text(&mut identity, record.object_id().as_str())?;
-            hash_evidence(&mut identity, record.object_evidence());
-            hash_text(&mut identity, record.schema().as_str())?;
-            hash_evidence(&mut identity, record.evidence());
-            hash_temporal_coordinate(&mut identity, record.effective_time())?;
-            hash_optional_temporal_coordinate(&mut identity, record.published_time())?;
-            hash_availability(&mut identity, record.availability())?;
-            hash_text(&mut identity, record.revision().as_str())?;
-            hash_optional_temporal_coordinate(&mut identity, record.superseded_time())?;
-        }
+        hash_length(&mut identity, expected_records)?;
         Ok(Self {
-            digest: EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into()),
-            record_count: records.len(),
+            request: request.clone(),
+            identity,
+            expected_records,
+            observed_records: 0,
         })
     }
 
-    /// Returns the version-qualified semantic content digest.
-    pub const fn digest(self) -> EvidenceDigest {
-        self.digest
+    /// Appends the next globally ordered record without retaining its payload.
+    pub fn push(&mut self, record: &ExtractionRecord) -> Result<(), ExtractionError> {
+        if self.observed_records >= self.expected_records || !record.matches_request(&self.request)
+        {
+            return Err(ExtractionError::ObjectBindingMismatch);
+        }
+        hash_length(&mut self.identity, self.observed_records)?;
+        hash_text(&mut self.identity, record.source_id().as_str())?;
+        hash_text(
+            &mut self.identity,
+            record.metadata_revision().as_source_identifier().as_str(),
+        )?;
+        hash_text(&mut self.identity, record.dataset().as_str())?;
+        hash_text(&mut self.identity, record.object_id().as_str())?;
+        hash_evidence(&mut self.identity, record.object_evidence());
+        hash_text(&mut self.identity, record.schema().as_str())?;
+        hash_evidence(&mut self.identity, record.evidence());
+        hash_temporal_coordinate(&mut self.identity, record.effective_time())?;
+        hash_optional_temporal_coordinate(&mut self.identity, record.published_time())?;
+        hash_availability(&mut self.identity, record.availability())?;
+        hash_text(&mut self.identity, record.revision().as_str())?;
+        hash_optional_temporal_coordinate(&mut self.identity, record.superseded_time())?;
+        self.observed_records += 1;
+        Ok(())
     }
 
-    /// Returns the ordered record count bound into the digest.
-    pub const fn record_count(self) -> usize {
-        self.record_count
+    /// Seals only an exact complete stream.
+    pub fn finish(self) -> Result<ExtractionContentIdentity, ExtractionError> {
+        if self.observed_records != self.expected_records {
+            return Err(ExtractionError::ObjectBindingMismatch);
+        }
+        Ok(ExtractionContentIdentity {
+            digest: EvidenceDigest::new(DigestAlgorithm::Sha256, self.identity.finalize().into()),
+            record_count: self.observed_records,
+        })
     }
 }
 
@@ -166,6 +213,40 @@ impl ExtractionBatchAccumulator {
         self.records.push(record);
         self.retained_record_bytes = retained_record_bytes;
         Ok(())
+    }
+
+    /// Appends a record or returns it unchanged when this nonempty working batch is full.
+    /// An individually oversized record and invalid lineage remain errors, never omissions.
+    pub fn try_push_or_return(
+        &mut self,
+        record: ExtractionRecord,
+    ) -> Result<Option<ExtractionRecord>, ExtractionError> {
+        if !record.matches_request(&self.request) {
+            return Err(ExtractionError::ObjectBindingMismatch);
+        }
+        let prospective_len = self
+            .records
+            .len()
+            .checked_add(1)
+            .ok_or(ExtractionError::ByteCountOverflow)?;
+        let admitted_capacity =
+            prospective_capacity_admission(self.records.capacity(), prospective_len)?
+                .map_or(self.records.capacity(), |(_, admitted)| admitted);
+        let record_bytes = record.retained_bytes()?;
+        let slack = unused_record_capacity_bytes(admitted_capacity, prospective_len)?;
+        let retained = batch_base_bytes(&self.request)?
+            .checked_add(self.retained_record_bytes)
+            .and_then(|bytes| bytes.checked_add(record_bytes))
+            .and_then(|bytes| bytes.checked_add(slack))
+            .ok_or(ExtractionError::ByteCountOverflow)?;
+        if !self.records.is_empty()
+            && (prospective_len > self.request.max_records() as usize
+                || retained > request_byte_limit(&self.request))
+        {
+            return Ok(Some(record));
+        }
+        self.push(record)?;
+        Ok(None)
     }
 
     /// Finalizes the batch by moving the already-bounded record vector without copying it.

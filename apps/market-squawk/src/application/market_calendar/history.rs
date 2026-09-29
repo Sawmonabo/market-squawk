@@ -6,8 +6,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     CompletedMarketSessionAuthority, CompletedMarketSessionCurrentnessReceipt,
-    CompletedMarketSessionDateReceipt, CompletedMarketSessionRead, CompletedMarketSessionReference,
-    CompletedMarketSessionCurrentnessResolution, CompletedMarketSessionError,
+    CompletedMarketSessionCurrentnessResolution, CompletedMarketSessionDateReceipt,
+    CompletedMarketSessionError, CompletedMarketSessionRead, CompletedMarketSessionReference,
     CompletedMarketSessionResolution, CompletedMarketSessionUnavailable, MarketCalendarClock,
     SystemMarketCalendarClock,
 };
@@ -73,11 +73,16 @@ impl HistoryCurrentSessionQualification {
         let original = graph.calendar();
         let native = history.native_sessions().ok_or_else(invalid)?;
         let last = history.bars().last().ok_or_else(invalid)?;
-        let date = last.time_semantics().nominal_daily_date().ok_or_else(invalid)?.date();
-        let index = native.sessions()
-            .binary_search_by_key(&date, |session| session.native_date())
-            .map_err(|_| invalid())?;
-        let actual = &native.sessions()[index];
+        let date = last
+            .time_semantics()
+            .nominal_daily_date()
+            .ok_or_else(invalid)?
+            .date();
+        let actual = native
+            .sessions()
+            .find_date(date)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
         let (available, received, ingested) = publication.knowledge_clocks();
         if history.read_receipt().knowledge_cutoff() != as_of
             || calendar.source_action_calendar().knowledge_cutoff() != as_of
@@ -86,7 +91,11 @@ impl HistoryCurrentSessionQualification {
             || native.calendar_origin_content_digest() != original.origin_content_digest
             || native.calendar_capture_binding_digest() != original.capture_binding_digest
             || native.source_replay_digest() != calendar.source_action_calendar().evidence_digest()
-            || !original.relationship.matches(calendar.venue_id(), publication.venue_id(), graph.requested_dates())
+            || !original.relationship.matches(
+                calendar.venue_id(),
+                publication.venue_id(),
+                graph.requested_dates(),
+            )
             || last.context().provenance().venue_id() != Some(publication.venue_id())
             || last.interval() != publication.interval()
             || last.context().time().effective().calendar_date_value() != Some(date)
@@ -95,21 +104,33 @@ impl HistoryCurrentSessionQualification {
             || actual.provider_period().is_some()
             || actual.opens_at() >= actual.closes_at_exclusive()
             || actual.closes_at_exclusive() > as_of
-            || [available, received, ingested, publication.published_at(),
-                publication.capture_recorded_at(), native.published_at(), native.received_at(),
-                calendar.available_at()].into_iter().any(|at| at > as_of)
+            || [
+                available,
+                received,
+                ingested,
+                publication.published_at(),
+                publication.capture_recorded_at(),
+                native.published_at(),
+                native.received_at(),
+                calendar.available_at(),
+            ]
+            .into_iter()
+            .any(|at| at > as_of)
         {
             return Err(invalid());
         }
-        let (expected, currentness) = calendar.latest_completed_regular_session(as_of, as_of, as_of)?;
+        let (expected, currentness) =
+            calendar.latest_completed_regular_session(as_of, as_of, as_of)?;
         let mut digest = Sha256::new();
         digest.update(b"market-squawk/history-current-nominal-regular-session/v1\0");
         for identity in [
             history.read_receipt().result_digest().bytes(),
             publication.receipt_digest().bytes(),
             native.mapping_digest().bytes(),
-            original.origin_content_digest.bytes(), original.capture_binding_digest.bytes(),
-            original.relationship.relationship_digest().bytes(), currentness.evidence().bytes(),
+            original.origin_content_digest.bytes(),
+            original.capture_binding_digest.bytes(),
+            original.relationship.relationship_digest().bytes(),
+            currentness.evidence().bytes(),
         ] {
             digest.update(identity);
         }
@@ -119,7 +140,8 @@ impl HistoryCurrentSessionQualification {
         digest.update(actual.opens_at().unix_nanos().to_be_bytes());
         digest.update(actual.closes_at_exclusive().unix_nanos().to_be_bytes());
         let status = if let Some(expected) = &expected {
-            if expected.provider_period().is_some() || expected.reference() != calendar.reference() {
+            if expected.provider_period().is_some() || expected.reference() != calendar.reference()
+            {
                 return Err(invalid());
             }
             let covered = expected.date() == date
@@ -131,17 +153,26 @@ impl HistoryCurrentSessionQualification {
             digest.update([expected.date().month(), expected.date().day()]);
             digest.update(expected.opens_at().unix_nanos().to_be_bytes());
             digest.update(expected.closes_at_exclusive().unix_nanos().to_be_bytes());
-            if covered { HistoryCurrentSessionStatus::Covered }
-            else { HistoryCurrentSessionStatus::MissingLatestCompletedPeriod }
+            if covered {
+                HistoryCurrentSessionStatus::Covered
+            } else {
+                HistoryCurrentSessionStatus::MissingLatestCompletedPeriod
+            }
         } else {
             digest.update([0]);
-            HistoryCurrentSessionStatus::CalendarUnavailable(CompletedMarketSessionUnavailable::NoCompletedPeriod)
+            HistoryCurrentSessionStatus::CalendarUnavailable(
+                CompletedMarketSessionUnavailable::NoCompletedPeriod,
+            )
         };
         Ok(Self {
-            status, as_of, expected_provider_timestamp: None, currentness: Some(currentness),
+            status,
+            as_of,
+            expected_provider_timestamp: None,
+            currentness: Some(currentness),
             evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
             nominal: Some(NominalHistoryCurrentSession {
-                reference: calendar.reference().clone(), expected,
+                reference: calendar.reference().clone(),
+                expected,
             }),
         })
     }
@@ -153,22 +184,36 @@ impl HistoryCurrentSessionQualification {
         calendar: &CompletedMarketSessionRead,
         as_of: Timestamp,
     ) -> Result<(), CompletedMarketSessionError> {
-        let nominal = self.nominal.as_ref().ok_or(CompletedMarketSessionError::InvalidRequest)?;
+        let nominal = self
+            .nominal
+            .as_ref()
+            .ok_or(CompletedMarketSessionError::InvalidRequest)?;
         if as_of != self.as_of || calendar.reference() != &nominal.reference {
             return Err(CompletedMarketSessionError::InvalidRequest);
         }
         if !self.current_session_covered() {
             return Err(CompletedMarketSessionError::Unavailable);
         }
-        let expected = nominal.expected.as_ref().ok_or(CompletedMarketSessionError::Unavailable)?;
-        let expected_currentness = self.currentness.as_ref().ok_or(CompletedMarketSessionError::Unavailable)?;
-        let (original, currentness) = calendar.latest_completed_regular_session(as_of, as_of, as_of)?;
+        let expected = nominal
+            .expected
+            .as_ref()
+            .ok_or(CompletedMarketSessionError::Unavailable)?;
+        let expected_currentness = self
+            .currentness
+            .as_ref()
+            .ok_or(CompletedMarketSessionError::Unavailable)?;
+        let (original, currentness) =
+            calendar.latest_completed_regular_session(as_of, as_of, as_of)?;
         if original.as_ref() != Some(expected) || &currentness != expected_currentness {
             return Err(CompletedMarketSessionError::Unavailable);
         }
-        let now = SystemMarketCalendarClock.now().map_err(|_| CompletedMarketSessionError::Unavailable)?;
+        let now = SystemMarketCalendarClock
+            .now()
+            .map_err(|_| CompletedMarketSessionError::Unavailable)?;
         let (latest, currentness) = calendar.latest_completed_regular_session(as_of, now, now)?;
-        if latest.as_ref() != Some(expected) || currentness.identity() != expected_currentness.identity() {
+        if latest.as_ref() != Some(expected)
+            || currentness.identity() != expected_currentness.identity()
+        {
             return Err(CompletedMarketSessionError::Unavailable);
         }
         Ok(())

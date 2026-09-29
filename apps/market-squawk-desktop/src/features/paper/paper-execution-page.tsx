@@ -114,7 +114,7 @@ function ReadyPaperExecution({
   const status = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "bot", "Bot.GetStatus", {}),
     enabled: statusAvailable,
-    queryFn: async () => parsePaperStatus(await transport.query({ query: "paperStatus" })),
+    queryFn: async ({ signal }) => parsePaperStatus(await transport.query({ query: "paperStatus" }, { signal })),
   })
   const orders = useQuery({
     queryKey: productKeys.operation(
@@ -124,7 +124,7 @@ function ReadyPaperExecution({
       {},
     ),
     enabled: ordersAvailable,
-    queryFn: async () => parsePaperOrders(await transport.query({ query: "paperOrders" })),
+    queryFn: async ({ signal }) => parsePaperOrders(await transport.query({ query: "paperOrders" }, { signal })),
   })
   const fills = useQuery({
     queryKey: productKeys.operation(
@@ -134,7 +134,7 @@ function ReadyPaperExecution({
       {},
     ),
     enabled: fillsAvailable,
-    queryFn: async () => parsePaperFills(await transport.query({ query: "paperFills" })),
+    queryFn: async ({ signal }) => parsePaperFills(await transport.query({ query: "paperFills" }, { signal })),
   })
   const control = useMutation({
     mutationFn: async (request: PaperControlIntent) =>

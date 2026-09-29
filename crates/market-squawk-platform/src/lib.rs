@@ -8,6 +8,9 @@ mod journal;
 mod paths;
 mod raw_record;
 mod secrets;
+mod tls;
+
+pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 
 pub use authority_state::{
     AuthorityCommitContext, AuthorityStateSnapshot, InstalledServiceInstanceGuard,
@@ -45,8 +48,7 @@ pub use config::{
     ConfigSetting, ConfigSources, EffectiveConfig, EffectiveConfigView, EffectiveSettingView,
     KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation, KrakenConfigurationError,
     KrakenInstrumentMapping, KrakenSourceConfig, RECOMMENDED_PUBLIC_BTC_USD_INSTRUMENT_ID,
-    SecretError, SecretProvider, SecretReference,
-    SecretValue,
+    SecretError, SecretProvider, SecretReference, SecretValue,
 };
 pub use input::{
     BoundedInput, ControlledImportInputRoot, ControlledInputFileError, InputFileCapability,

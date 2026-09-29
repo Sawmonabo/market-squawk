@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use thiserror::Error;
 
-const RING_PROVIDER_ID: &str = "rustls-ring-0.23.42";
+const RING_PROVIDER_ID: &str = "rustls-ring-0.23.45";
 static RING_INSTALLATION: OnceLock<Result<(), TlsProviderError>> = OnceLock::new();
 
 /// Unforgeable proof that Market Squawk installed its pinned ring crypto provider.

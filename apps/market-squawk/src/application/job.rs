@@ -174,7 +174,7 @@ pub struct JobView {
 }
 
 impl JobView {
-    fn from_snapshot(snapshot: &JobSnapshot) -> Result<Self, JobApplicationError> {
+    pub(crate) fn from_snapshot(snapshot: &JobSnapshot) -> Result<Self, JobApplicationError> {
         let progress = snapshot.current_progress();
         let recovery = match snapshot.state() {
             JobState::Interrupted => Some(identifier("interrupted-requires-explicit-retry")?),

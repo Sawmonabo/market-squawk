@@ -483,10 +483,10 @@ pub(super) fn source_session_close(
         .native_sessions()
         .ok_or(PortfolioApplicationServiceError::CorruptPublication)?
         .sessions();
-    let index = sessions
-        .binary_search_by_key(&nominal.date(), |session| session.native_date())
-        .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
-    let session = &sessions[index];
+    let session = sessions
+        .find_date(nominal.date())
+        .map_err(|error| source_error(map_analytical_error(error)))?
+        .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
     if !session.bar_present()
         || session.provider_timestamp().is_some()
         || session.provider_period().is_some()

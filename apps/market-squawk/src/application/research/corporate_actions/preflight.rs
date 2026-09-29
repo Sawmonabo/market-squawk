@@ -5,19 +5,21 @@
 
 mod current_inputs;
 mod current_paper;
-pub(crate) use current_paper::PreparedCurrentPaperSources;
+pub(crate) use current_paper::{PreparedCurrentPaperSources, PreparedFinancialShareSources};
 mod forecast_outcome;
 mod outcome_coordinates;
 mod outcome_preparation;
 pub(crate) use forecast_outcome::PreparedForecastOutcomeSource;
 pub(crate) use outcome_coordinates::ForecastOutcomePreparationCoordinates;
-pub(crate) use outcome_preparation::{ForecastOutcomeSourcePreparation, PreparedForecastOutcomeMeasurement};
+pub(crate) use outcome_preparation::{
+    ForecastOutcomeSourcePreparation, PreparedForecastOutcomeMeasurement,
+};
 mod history;
 mod history_plan;
 mod identity;
 
-pub(crate) use history_plan::PreparedHistorySourceActions;
 pub(crate) use current_inputs::PendingCurrentPriceActions;
+pub(crate) use history_plan::PreparedHistorySourceActions;
 
 use super::source_errors::*;
 use super::{

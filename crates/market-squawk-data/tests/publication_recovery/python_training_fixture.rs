@@ -74,21 +74,22 @@ pub(super) async fn publish(root: &Path) -> TestResult {
     let wall = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?);
-    let publication = publisher.publish(
-        &service,
-        contract,
-        &request,
-        &dataset,
-        closed_price_return_proof(
+    let publication = publisher
+        .publish(
+            &service,
+            contract,
             &request,
-            membership.manifest().clone(),
-            wall.checked_sub_nanos(1_000_000_000)?,
-            wall.checked_add_nanos(120_000_000_000)?,
-            96,
-        )?,
-        &cancellation,
-    )
-    .inspect_err(|_| eprintln!("dataset fixture stage=publish"))?;
+            &dataset,
+            closed_price_return_proof(
+                &request,
+                membership.manifest().clone(),
+                wall.checked_sub_nanos(1_000_000_000)?,
+                wall.checked_add_nanos(120_000_000_000)?,
+                96,
+            )?,
+            &cancellation,
+        )
+        .inspect_err(|_| eprintln!("dataset fixture stage=publish"))?;
     assert_eq!(
         publication.disposition(),
         FeatureDatasetProductionPublicationDisposition::Published

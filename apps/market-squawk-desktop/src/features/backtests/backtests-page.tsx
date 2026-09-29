@@ -1,3 +1,5 @@
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+import { DemandPanel } from "../shared/demand-panel"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
@@ -31,7 +33,6 @@ import { cn } from "@/lib/utils"
 import { formatLosslessInteger, formatUnixNanos } from "@/features/opportunities/format"
 
 import {
-  newestBacktests,
   parseBacktestActivities,
   parseBacktestPreparationOptions,
   parseBacktestPreparationPreview,
@@ -63,42 +64,32 @@ export function RecommendationStudyPanel({
   transport: ProductTransport
   scope: ProductScope
 }) {
-  const [opened, setOpened] = React.useState(false)
+  return <section className="mt-6 rounded-lg border border-border p-4">
+    <h3 className="text-sm font-semibold">Saved historical study</h3>
+    <p className="mt-1 text-xs leading-5 text-muted-foreground">Open the study used by this analysis to review simulated results, comparisons, costs, and every included or incomplete observation.</p>
+    <DemandPanel title="Open saved study" className="mt-3">
+      <RecommendationStudyRead actionToken={actionToken} transport={transport} scope={scope} />
+    </DemandPanel>
+  </section>
+}
+
+function RecommendationStudyRead({ actionToken, transport, scope }: {
+  actionToken: string
+  transport: ProductTransport
+  scope: ProductScope
+}) {
   const study = useQuery({
     queryKey: productKeys.operation(scope, "backtest", "Analysis.GetRecommendationBacktest", { actionToken }),
-    enabled: opened,
+    gcTime: 0,
     retry: false,
-    queryFn: async () => parseRecommendationBacktest(
-      await transport.backtestProducts({ action: "recommendationStudy", actionToken }),
-    ),
+    queryFn: async ({ signal }) => parseRecommendationBacktest(await transport.backtestProducts({ action: "recommendationStudy", actionToken }, { signal })),
   })
-  return (
-    <section className="mt-6 rounded-lg border border-border p-4">
-      <h3 className="text-sm font-semibold">Saved historical study</h3>
-      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-        Open the study used by this analysis to review simulated results, comparisons, costs,
-        and every included or incomplete observation.
-      </p>
-      <Button
-        type="button"
-        size="sm"
-        variant="outline"
-        className="mt-3"
-        disabled={opened && study.isFetching}
-        onClick={() => opened ? void study.refetch() : setOpened(true)}
-      >
-        {opened ? "Refresh saved study" : "Open saved study"}
-      </Button>
-      {opened && study.isPending ? <Loading label="Opening the saved study…" /> : null}
-      {opened && study.isError ? (
-        <Unavailable
-          title="This saved study could not be opened"
-          detail="Its complete historical evidence could not be retrieved. Try refreshing the saved study."
-        />
-      ) : null}
-      {opened && study.isSuccess ? <RecommendationStudyReport report={study.data} /> : null}
-    </section>
-  )
+  return <>
+    <Button type="button" size="sm" variant="outline" disabled={study.isFetching} onClick={() => void study.refetch()}>Refresh saved study</Button>
+    {study.isPending ? <Loading label="Opening the saved study…" /> : null}
+    {study.isError ? <Unavailable title="This saved study could not be opened" detail="Its complete historical evidence could not be retrieved. Try refreshing the saved study." /> : null}
+    {study.isSuccess ? <RecommendationStudyReport report={study.data} /> : null}
+  </>
 }
 
 function RecommendationStudyReport({ report }: { report: RecommendationBacktest }) {
@@ -326,35 +317,40 @@ function BacktestsWorkspace({
   const activityAvailable = capabilities.has("backtest_activity")
   const resultAvailable = capabilities.has("backtest_result")
   const [selectedToken, setSelectedToken] = React.useState<string | null>(null)
+  const activityNavigation = useCursorNavigation()
   const activitiesKey = productKeys.operation(
     scope,
     "backtest",
-    "Backtest.ListProductResults",
-    {},
+    "Analysis.ListProductBacktests",
+    { cursor: activityNavigation.after, limit: 25 },
   )
   const activitiesQuery = useQuery({
     queryKey: activitiesKey,
+    queryFn: ({ signal }) => transport.backtestProducts({ action: "list", cursor: activityNavigation.after, limit: 25 }, { signal }),
+    select: parseBacktestActivities,
     enabled: activityAvailable,
-    refetchInterval: 5_000,
-    queryFn: async () => {
-      return parseBacktestActivities(
-        await transport.backtestProducts({ action: "list" }),
-      ).sort(newestBacktests)
+    gcTime: 0,
+    refetchInterval: (query) => {
+      if (!query.state.data || activityNavigation.after !== undefined) return false
+      try { return parseBacktestActivities(query.state.data).activities.some((activity) => ["queued", "running", "recovering", "awaiting_confirmation"].includes(activity.state)) ? 5_000 : false }
+      catch { return false }
     },
+    refetchIntervalInBackground: false,
   })
   const selected =
-    activitiesQuery.data?.find(
+    activitiesQuery.data?.activities.find(
       (activity) => activity.backtestToken === selectedToken,
     ) ?? null
   const resultQuery = useQuery({
     queryKey: productKeys.operation(
       scope,
       "backtest",
-      "Backtest.GetProductResult",
+      "Analysis.GetProductBacktest",
       { backtestToken: selected?.backtestToken ?? null },
     ),
     enabled: resultAvailable && selected?.state === "completed",
-    queryFn: async () => {
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
       if (!selected) {
         throw new Error("No completed backtest is selected.")
       }
@@ -362,7 +358,7 @@ function BacktestsWorkspace({
         await transport.backtestProducts({
           action: "get",
           backtestToken: selected.backtestToken,
-        }),
+        }, { signal }),
       )
     },
   })
@@ -374,7 +370,8 @@ function BacktestsWorkspace({
         scope={scope}
         capabilities={capabilities}
         onStarted={async () => {
-          await queryClient.invalidateQueries({ queryKey: activitiesKey })
+          activityNavigation.restart(); setSelectedToken(null)
+          await queryClient.invalidateQueries({ queryKey: activitiesKey.slice(0, -1) })
         }}
       />
 
@@ -413,14 +410,14 @@ function BacktestsWorkspace({
               title="Backtests could not be loaded"
               detail="Refresh the page and try again."
             />
-          ) : activitiesQuery.data.length === 0 ? (
+          ) : activitiesQuery.data.activities.length === 0 ? (
             <Unavailable
               title="No backtests yet"
               detail="Prepare a backtest above to measure an investment approach against historical conditions."
             />
           ) : (
             <div className="mt-4 grid gap-2">
-              {activitiesQuery.data.map((activity) => (
+              {activitiesQuery.data.activities.map((activity) => (
                 <ActivityButton
                   key={activity.backtestToken}
                   activity={activity}
@@ -432,6 +429,8 @@ function BacktestsWorkspace({
               ))}
             </div>
           )}
+          {activityAvailable ? <CursorNavigation navigation={activityNavigation} next={activitiesQuery.data?.nextCursor} busy={activitiesQuery.isFetching} error={activitiesQuery.isError}
+            onNavigate={() => setSelectedToken(null)} onRestart={() => { if (activityNavigation.after === undefined) void activitiesQuery.refetch() }} /> : null}
         </div>
 
         <BacktestEvidence

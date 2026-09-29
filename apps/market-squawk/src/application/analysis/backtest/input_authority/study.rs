@@ -9,7 +9,7 @@ use market_squawk_backtesting::{
     RecommendationBenchmarkPolicyV1, recommendation_conservative_execution_assumptions_v1,
 };
 use market_squawk_data::{
-    AnalyticalFeatureDataset, CompleteMarketBarHistoryOutput, CorporateActionAdjustment,
+    AnalyticalFeatureDataset, CompleteMarketBarHistoryCursor, CorporateActionAdjustment,
     CorporateActionLimits, CorporateActionPlan, DatasetBuildPurpose, FeatureDatasetProductContract,
 };
 use market_squawk_domain::{Money, QuantityLots, SourceIdentifier};
@@ -32,9 +32,10 @@ use crate::{
 pub(crate) struct RecommendationStudyPreparationInputV1 {
     pub(crate) producer: HistoricalRecommendationAlphaProducer,
     pub(crate) dataset: AnalyticalFeatureDataset,
-    pub(crate) histories: [CompleteMarketBarHistoryOutput; 3],
+    pub(crate) histories: [CompleteMarketBarHistoryCursor; 3],
     pub(crate) corporate_actions: CorporateActionPlan,
-    pub(crate) source_action_reference: crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
+    pub(crate) source_action_reference:
+        crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
 }
 
 /// The request and its concrete issuer are admitted together and cannot be exchanged between jobs.
@@ -139,7 +140,9 @@ impl ProductionGovernedBacktestInputAuthority {
         let currency = histories
             .iter()
             .find(|history| history.selection().receipt().instrument_id() == subject)
-            .and_then(|history| history.bars().first())
+            .and_then(|history| history.bars().next())
+            .transpose()
+            .map_err(|_| ServiceError::Unavailable)?
             .map(|bar| bar.currency())
             .ok_or(ServiceError::Unavailable)?;
         let mut roots = vec![dataset.generation().manifest().clone()];
@@ -152,10 +155,12 @@ impl ProductionGovernedBacktestInputAuthority {
             let first = sessions
                 .sessions()
                 .first()
+                .map_err(|_| ServiceError::Unavailable)?
                 .ok_or(ServiceError::Unavailable)?;
             let last = sessions
                 .sessions()
                 .last()
+                .map_err(|_| ServiceError::Unavailable)?
                 .ok_or(ServiceError::Unavailable)?;
             if !receipt.realized_outcome_eligible()
                 || clocks
@@ -170,7 +175,12 @@ impl ProductionGovernedBacktestInputAuthority {
                     < ends_at
                         .checked_sub_nanos(1)
                         .map_err(|_| ServiceError::InvalidRequest)?
-                || history.bars().iter().any(|bar| bar.currency() != currency)
+                || history
+                    .bars()
+                    .try_fold(false, |mismatch, bar| {
+                        bar.map(|bar| mismatch || bar.currency() != currency)
+                    })
+                    .map_err(|_| ServiceError::Unavailable)?
             {
                 return Err(ServiceError::Unavailable);
             }

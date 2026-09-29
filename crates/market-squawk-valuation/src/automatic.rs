@@ -26,6 +26,10 @@ use crate::{
     ValuationAmountBasis, ValuationInput,
 };
 
+mod common_shares;
+pub use common_shares::{
+    CommonShareFilingEvidence, CommonShareValuationBasis, REPORTED_COMMON_SHARE_ASSUMPTION,
+};
 mod current_share;
 pub use current_share::CurrentShareValuationProjection;
 

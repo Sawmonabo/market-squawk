@@ -3,7 +3,7 @@
 use super::super::unavailable_reason;
 use super::{
     BenchmarkHistoryCoordinate, BenchmarkHistoryObservation, BenchmarkSourceReference, Error,
-    MAX_POINTS, MarketHistoryReadCapability, SourceSeries, check, reserved,
+    MarketHistoryReadCapability, SourceSeries, check, reserved,
 };
 use crate::application::research::corporate_actions::map_research_error;
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
     },
 };
 use market_squawk_data::{
-    CompleteMarketBarHistoryOutput, LatestCanonicalMarketBarHistoryWindowRequest,
+    CompleteMarketBarHistoryCursor, LatestCanonicalMarketBarHistoryWindowRequest,
     MAX_RESEARCH_USE_EDGES, MAX_RESEARCH_USE_GRAPH_NODES, MAX_RESEARCH_USE_PERMIT_LIFETIME_SECS,
     MAX_RESEARCH_USE_RETAINED_BYTES, MAX_RESEARCH_USE_SOURCES,
     MAX_RESEARCH_USE_TRAVERSAL_DEADLINE_SECS, MarketHistorySelectionPolicy, ResearchUse,
@@ -28,12 +28,10 @@ use rust_decimal::Decimal;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-// These are genuine source observations, including expected-session gaps. They remain private
-// and cannot become a financial comparison before the current LocalAnalysis permit is issued.
-type SourcePoints = Vec<(
+pub(super) type SourcePoint = (
     BenchmarkHistoryCoordinate,
     Option<BenchmarkHistoryObservation>,
-)>;
+);
 
 impl MarketHistoryReadCapability {
     #[allow(
@@ -78,7 +76,7 @@ impl MarketHistoryReadCapability {
         };
         let Some(output) = self
             .reader
-            .read_canonical_market_bar_history(request, deadline, cancellation.clone())
+            .read_canonical_market_bar_history_cursor(request, deadline, cancellation.clone())
             .await
             .map_err(|error| unavailable_reason(&error))?
         else {
@@ -133,11 +131,9 @@ impl MarketHistoryReadCapability {
                 roots.push(manifest.clone());
             }
         }
-        // Retain only the bounded original observations, then drop the complete decoded
-        // history before rights traversal. No financial calculation or caller-visible output
-        // occurs until LocalAnalysis authorization succeeds.
-        let (reference, points) = project_source(
-            output,
+        // Verify every source row before financial use; retain only its sealed disk cursor.
+        let reference = project_source(
+            &output,
             instrument,
             currency,
             cutoff,
@@ -153,10 +149,7 @@ impl MarketHistoryReadCapability {
         if duration.is_zero() {
             return Err(Error::DeadlineExceeded);
         }
-        // Rights metadata is independent of price-row count. Use the data owner's full
-        // 100,000-node / 400,000-edge / 100,000-source, 64 MiB ceilings, not a chart-local
-        // 4 MiB ancestry restriction. The large decoded history has already been dropped;
-        // only <=4096 compact original observations survive while this graph is loaded.
+        // Rights traversal and source history have independent bounded working sets.
         let request = ResearchUseRequest::try_new(
             roots.clone(),
             ResearchUse::LocalAnalysis,
@@ -198,7 +191,11 @@ impl MarketHistoryReadCapability {
         }
         Ok(Some(SourceSeries {
             reference,
-            points,
+            history: output,
+            instrument,
+            currency,
+            cutoff,
+            observed,
             permit: authorization.into_permit(),
         }))
     }
@@ -209,14 +206,14 @@ impl MarketHistoryReadCapability {
     reason = "source receipts, clocks and cancellation remain explicit"
 )]
 fn project_source(
-    output: CompleteMarketBarHistoryOutput,
+    output: &CompleteMarketBarHistoryCursor,
     instrument: InstrumentId,
     currency: Currency,
     cutoff: Timestamp,
     observed: Timestamp,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<(BenchmarkSourceReference, SourcePoints), Error> {
+) -> Result<BenchmarkSourceReference, Error> {
     let publication = output.selection().receipt();
     let receipt = output.read_receipt();
     let native = output.native_sessions().ok_or(Error::IntegrityUnproven)?;
@@ -226,84 +223,24 @@ fn project_source(
         || !publication.current_research_eligible()
         || publication.published_at() > cutoff
         || receipt.knowledge_cutoff() != cutoff
-        || output.bars().len() != publication.bar_count()
-        || output.bars().len() > market_squawk_sources::MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS
-        || native.sessions().len()
-            > market_squawk_sources::MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS
+        || output.bar_count() != publication.bar_count()
         || native.published_at() > cutoff
         || native.received_at() > cutoff
     {
         return Err(Error::IntegrityUnproven);
     }
-    let mut points = reserved(native.sessions().len().min(MAX_POINTS))?;
-    // The source reader bounds full rows. Retain only a suffix after inspecting every original
-    // native mapping; no interior missing session is removed from this suffix.
-    let eligible = native.sessions().partition_point(|session| {
-        session.closes_at_exclusive() <= observed
-            && session
-                .provider_period()
-                .is_none_or(|(_, end)| end <= observed)
-    });
-    let start = eligible.saturating_sub(MAX_POINTS);
-    let mut bar_index = 0;
-    let mut previous = None;
-    for (index, session) in native.sessions().iter().enumerate() {
-        check(deadline, cancellation)?;
-        let coordinate = BenchmarkHistoryCoordinate {
-            date: session.native_date(),
-            session_close: session.closes_at_exclusive(),
-        };
-        if session.opens_at() >= coordinate.session_close
-            || previous.is_some_and(|prior: BenchmarkHistoryCoordinate| {
-                prior >= coordinate || prior.date >= coordinate.date
-            })
-        {
-            return Err(Error::IntegrityUnproven);
-        }
-        previous = Some(coordinate);
-        let observation = if session.bar_present() {
-            let bar = output
-                .bars()
-                .get(bar_index)
-                .ok_or(Error::IntegrityUnproven)?;
-            bar_index += 1;
-            validate_bar(bar, session, instrument, currency, cutoff)?;
-            // Keep the original as-of boundary explicit at the actual row-retention seam.
-            // completed_at is the bar's period end; validate_bar independently equates
-            // that period with the retained native session's provider period.
-            if (start..eligible).contains(&index)
-                && bar
-                    .completed_at()
-                    .is_some_and(|completed| completed > observed)
-            {
-                return Err(Error::IntegrityUnproven);
-            }
-            let provenance = bar.context().provenance();
-            Some(BenchmarkHistoryObservation {
-                close: bar.close().amount(),
-                price_index: Decimal::ZERO,
-                available_at: provenance
-                    .availability()
-                    .conservative_available_at()
-                    .ok_or(Error::IntegrityUnproven)?
-                    .max(provenance.ingested_at())
-                    .max(publication.published_at())
-                    .max(native.received_at())
-                    .max(native.published_at()),
-                provider_completed_at: bar.completed_at(),
-                quality: provenance.quality(),
-            })
-        } else {
-            None
-        };
-        if (start..eligible).contains(&index) {
-            points.push((coordinate, observation));
-        }
+    for point in source_points(
+        output,
+        instrument,
+        currency,
+        cutoff,
+        observed,
+        deadline,
+        cancellation,
+    )? {
+        let _ = point?;
     }
-    if bar_index != output.bars().len() {
-        return Err(Error::IntegrityUnproven);
-    }
-    let reference = BenchmarkSourceReference {
+    Ok(BenchmarkSourceReference {
         selected_manifest: output
             .selection()
             .pinned()
@@ -317,8 +254,145 @@ fn project_source(
         history_sha256: receipt.history_content_digest().bytes(),
         result_sha256: receipt.result_digest().bytes(),
         native_sessions_sha256: native.mapping_digest().bytes(),
-    };
-    Ok((reference, points))
+        parents: [
+            output.selection().pinned().manifest(),
+            receipt.origin_manifest(),
+        ]
+        .into_iter()
+        .map(market_squawk_modeling::ForecastArtifactManifestRecord::from_manifest)
+        .collect(),
+    })
+}
+
+impl SourceSeries {
+    pub(super) fn points<'a>(
+        &'a self,
+        deadline: Instant,
+        cancellation: &'a CancellationToken,
+    ) -> Result<impl Iterator<Item = Result<SourcePoint, Error>> + 'a, Error> {
+        source_points(
+            &self.history,
+            self.instrument,
+            self.currency,
+            self.cutoff,
+            self.observed,
+            deadline,
+            cancellation,
+        )
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "original source identity and both clocks remain explicit"
+)]
+fn source_points<'a>(
+    output: &'a CompleteMarketBarHistoryCursor,
+    instrument: InstrumentId,
+    currency: Currency,
+    cutoff: Timestamp,
+    observed: Timestamp,
+    deadline: Instant,
+    cancellation: &'a CancellationToken,
+) -> Result<impl Iterator<Item = Result<SourcePoint, Error>> + 'a, Error> {
+    let native = output.native_sessions().ok_or(Error::IntegrityUnproven)?;
+    let publication = output.selection().receipt();
+    let mut sessions = native.sessions().iter();
+    let mut bars = output.bars();
+    let mut previous = None;
+    let mut bar_count = 0_usize;
+    let mut ineligible = false;
+    let mut done = false;
+    Ok(std::iter::from_fn(move || {
+        if done {
+            return None;
+        };
+        let next = (|| {
+            loop {
+                check(deadline, cancellation)?;
+                let Some(session) = sessions.next() else {
+                    if bars
+                        .next()
+                        .transpose()
+                        .map_err(|error| unavailable_reason(&error))?
+                        .is_some()
+                        || bar_count != output.bar_count()
+                    {
+                        return Err(Error::IntegrityUnproven);
+                    };
+                    return Ok(None);
+                };
+                let session = session.map_err(|error| unavailable_reason(&error))?;
+                let coordinate = BenchmarkHistoryCoordinate {
+                    date: session.native_date(),
+                    session_close: session.closes_at_exclusive(),
+                };
+                if session.opens_at() >= coordinate.session_close
+                    || previous.is_some_and(|prior: BenchmarkHistoryCoordinate| {
+                        prior >= coordinate || prior.date >= coordinate.date
+                    })
+                {
+                    return Err(Error::IntegrityUnproven);
+                };
+                previous = Some(coordinate);
+                let eligible = session.closes_at_exclusive() <= observed
+                    && session
+                        .provider_period()
+                        .is_none_or(|(_, end)| end <= observed);
+                if eligible && ineligible {
+                    return Err(Error::IntegrityUnproven);
+                };
+                ineligible |= !eligible;
+                let observation = if session.bar_present() {
+                    let bar = bars
+                        .next()
+                        .transpose()
+                        .map_err(|error| unavailable_reason(&error))?
+                        .ok_or(Error::IntegrityUnproven)?;
+                    bar_count = bar_count.checked_add(1).ok_or(Error::CapacityExceeded)?;
+                    validate_bar(&bar, &session, instrument, currency, cutoff)?;
+                    if eligible
+                        && bar
+                            .completed_at()
+                            .is_some_and(|completed| completed > observed)
+                    {
+                        return Err(Error::IntegrityUnproven);
+                    };
+                    let provenance = bar.context().provenance();
+                    Some(BenchmarkHistoryObservation {
+                        close: bar.close().amount(),
+                        price_index: Decimal::ZERO,
+                        available_at: provenance
+                            .availability()
+                            .conservative_available_at()
+                            .ok_or(Error::IntegrityUnproven)?
+                            .max(provenance.ingested_at())
+                            .max(publication.published_at())
+                            .max(native.received_at())
+                            .max(native.published_at()),
+                        provider_completed_at: bar.completed_at(),
+                        quality: provenance.quality(),
+                    })
+                } else {
+                    None
+                };
+                if eligible {
+                    return Ok(Some((coordinate, observation)));
+                };
+            }
+        })();
+        match next {
+            Ok(Some(point)) => Some(Ok(point)),
+            Ok(None) => {
+                done = true;
+                None
+            }
+            Err(error) => {
+                done = true;
+                Some(Err(error))
+            }
+        }
+    }))
 }
 
 fn validate_bar(

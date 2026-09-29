@@ -8,6 +8,30 @@ This file preserves project-level decisions that must survive context compaction
 and later implementation sessions. It is not a transient progress report. Root
 [`AGENTS.md`](../AGENTS.md) requires future agents to read and follow it.
 
+## Owner correction: whole-application memory and complete capability — 2026-09-28
+
+The owner clarified the intended RAM range as **500 MB to 1.5 GB, with a 2 GB maximum**
+for the complete single-user application. This supersedes every earlier 500 MB maximum in
+handoffs, goal attachments and historical ledger entries. It is a measurement objective, not a
+runtime admission rule; lower usage is welcome, not a required minimum allocation.
+
+Do not hard-code data, model, workflow, startup or feature restrictions merely to satisfy a
+resource target. A run that rejects required normal data, drops required evidence, omits a
+capability or avoids the representative workload does not pass performance acceptance. Existing
+limits are implementation choices requiring evidence, not authoritative product requirements.
+Preserve genuine integrity and resource-exhaustion protection; correct unjustified restrictions
+through appropriate processing, storage, scheduling and ownership changes. Do not simply raise
+all limits or replace them with a new 2 GB application kill switch.
+
+Measure the installed Desktop/WebView, shared service and active analytical/model/Python helpers
+together, including concurrent CLI/MCP use when active. Record idle, active and peak usage,
+platform counters, units and the complete exercised workload. No whole-app RAM acceptance is
+currently established. The ongoing limit audit must report its scope and unresolved paths honestly.
+
+The owner subsequently directed that whole-application RAM measurement wait until the complete
+application and workflows are ready. It does not block the current resource-remediation commit;
+that batch requires critical correctness checks, commit and push, then a pause.
+
 ## Product and quality posture
 
 Market Squawk is implemented as hardened local production infrastructure. "Production-ready" is an

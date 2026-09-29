@@ -78,11 +78,12 @@ pub(crate) use board_full_history::BoardFullHistoryApplicationError;
 mod yahoo_enrichment;
 
 pub(crate) use alpaca_historical::{
-    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError, AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
-    AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector, AlpacaOptionMarketPointInTimeSelector,
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    AlpacaHistoricalSourceSlotError,
+    AlpacaHistoricalSourceSlotError, AlpacaMarketPublicationClosure, AlpacaMarketPublicationError,
+    AlpacaOptionMarketPointInTimeSelector, AlpacaOptionMarketPublicationReceipt,
+    AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector,
+    AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
 };
 pub(crate) use bea::{
     BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaDoctorActivationState, BeaLivePublicationError,
@@ -1246,6 +1247,8 @@ struct RegisteredPublicationSource {
 
 struct CoordinatorAuthority {
     registry: Option<AuthoritativeSourceRegistry>,
+    // Shared SEC taxonomy publishers retain metadata authority, not callable adapters.
+    filing_taxonomy_sources: Vec<RegisteredSource>,
     sources: BTreeMap<SourceIdentifier, RegisteredExtractionSource>,
     publication_sources: BTreeMap<SourceIdentifier, RegisteredPublicationSource>,
     pending_replacements: BTreeMap<SourceIdentifier, Uuid>,
@@ -1704,6 +1707,7 @@ impl ProductionResearchIngestCoordinator {
             lifecycle: DomainLifecycle::new(),
             authority: Arc::new(Mutex::new(CoordinatorAuthority {
                 registry: Some(registry),
+                filing_taxonomy_sources: Vec::new(),
                 sources: BTreeMap::new(),
                 publication_sources: BTreeMap::new(),
                 pending_replacements: BTreeMap::new(),

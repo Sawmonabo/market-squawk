@@ -8,19 +8,11 @@ use super::*;
 use crate::application::ResearchProviderPublicationOperation;
 use crate::provider_activation::tiingo::{TiingoEodHistoryOperation, TiingoHistoryMetadataInput};
 use market_squawk_adapter_tiingo::{
-    TiingoCompletedEodHistoryCandidate, TiingoEodExpectedSessionAuthority,
-    TiingoEodExpectedSessionEvidence, TiingoEodHistoryActionProjection, TiingoEodMappingInput,
-    TiingoHistoryPlan, TiingoHttpSource, TiingoPreparedEodHistoryCapture, TiingoSealedHistoryPage,
-    map_eod_page_candidate,
+    TiingoEodHistoryStage, TiingoHistoryPlan, TiingoHttpSource, ValidatedTiingoEodHistory,
 };
-use market_squawk_data::{CatalogAuthority, CompleteMarketBarHistoryOutput};
-use market_squawk_domain::{EffectiveInterval, ExactPayloadEvidence, ResearchObservation};
-use market_squawk_sources::{
-    AvailabilityEvidence, DiscoveryRequest, ProviderCapturePageReceipt,
-    ProviderCaptureSemanticBinding, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt, SourceObject, SourceObjectCaptureIdentity,
-};
-use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use market_squawk_data::CatalogAuthority;
+use market_squawk_domain::ExactPayloadEvidence;
+use std::num::{NonZeroU32, NonZeroU64};
 
 /// Exact existing canonical generation containing the complete source date-window graph.
 #[derive(Clone, Debug)]
@@ -72,9 +64,7 @@ impl ProductionResearchIngestCoordinator {
         source_deadline: Timestamp,
         seal_deadline: Instant,
     ) -> Result<TiingoEodHistoryPublicationReceipt, TiingoHistoryApplicationError> {
-        if operation.plan.pages().is_empty()
-            || operation.plan.pages().len() >= market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGES
-        {
+        if operation.plan.pages().is_empty() {
             return Err(TiingoHistoryApplicationError::Admission);
         }
         let original_lease = Arc::new(
@@ -118,7 +108,7 @@ impl ProductionResearchIngestCoordinator {
         {
             return Err(TiingoHistoryApplicationError::Admission);
         }
-        let metadata_token = self
+        let (metadata_token, metadata_body) = self
             .reseal_tiingo_original(
                 original_metadata,
                 Arc::clone(&original_lease),
@@ -144,28 +134,50 @@ impl ProductionResearchIngestCoordinator {
         {
             return Err(TiingoHistoryApplicationError::Admission);
         }
-        let mut tokens = Vec::new();
-        let mut responses = Vec::new();
-        let mut sealed_pages = Vec::new();
-        let mut pages = Vec::new();
-        tokens
-            .try_reserve_exact(operation.plan.pages().len() + 1)
-            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
-        responses
-            .try_reserve_exact(operation.plan.pages().len())
-            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
-        sealed_pages
-            .try_reserve_exact(operation.plan.pages().len())
-            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
-        pages
-            .try_reserve_exact(operation.plan.pages().len())
-            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
-        let mut retained_body_bytes = metadata_token
-            .persisted_receipt()
-            .capture()
-            .total_body_bytes();
-        let mut retained_rows = 0usize;
-        tokens.push(metadata_token);
+        let scratch = Arc::new(
+            self.research
+                .analytical()
+                .operation_scratch()
+                .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+        );
+        let stage_scratch = Arc::clone(&scratch);
+        let plan = operation.plan.clone();
+        let instrument = operation.instrument.clone();
+        let contract = operation.contract.clone();
+        let cash_unit = operation.cash_unit.clone();
+        let admitted_plan_digest = operation.admitted_plan_digest;
+        let store = self.research.provider_capture_store();
+        let (mut stage, mut pack) = self
+            .research
+            .run_owned_research_io(seal_deadline, &cancellation, move |worker| {
+                let control = HistoryStreamControl {
+                    deadline: seal_deadline,
+                    cancellation: worker,
+                };
+                let stage = TiingoEodHistoryStage::try_new(
+                    plan,
+                    metadata,
+                    metadata_token.persisted_receipt().clone(),
+                    instrument,
+                    contract,
+                    cash_unit,
+                    admitted_plan_digest,
+                    stage_scratch.path(),
+                )
+                .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                let mut pack = market_squawk_sources::PendingProviderCapturePack::begin(
+                    Arc::clone(&store),
+                    history_object_admission(8 * 1024 * 1024 * 1024)?,
+                )
+                .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                pack.append(metadata_token, vec![metadata_body], &control)
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                Ok::<_, TiingoHistoryApplicationError>((stage, pack))
+            })
+            .await??;
+        let mut last_page_identity = None;
+        let mut observed_at = Timestamp::from_unix_nanos(i64::MIN);
+        let mut native_rows = 0_u64;
         for index in 0..operation.plan.pages().len() {
             publication
                 .validate_precommit()
@@ -209,47 +221,42 @@ impl ProductionResearchIngestCoordinator {
                     .await?
                 }
             };
-            retained_body_bytes = retained_body_bytes
-                .checked_add(original.capture().total_body_bytes())
-                .filter(|bytes| *bytes <= 64 * 1024 * 1024)
-                .ok_or(TiingoHistoryApplicationError::Admission)?;
-            let response = self
-                .decode_tiingo_original_page(
-                    &original,
+            let (response, token, body) = self
+                .reopen_tiingo_original_page(
+                    original,
                     operation.plan.pages()[index].clone(),
                     &operation.original_context,
-                    seal_deadline,
-                    &cancellation,
-                )
-                .await?;
-            retained_rows = retained_rows
-                .checked_add(response.rows().len())
-                .filter(|rows| {
-                    *rows <= market_squawk_sources::MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS
-                })
-                .ok_or(TiingoHistoryApplicationError::Admission)?;
-            let token = self
-                .reseal_tiingo_original(
-                    original,
                     Arc::clone(&original_lease),
                     seal_deadline,
                     &cancellation,
                 )
                 .await?;
-            let sealed_page = TiingoSealedHistoryPage::try_new(
-                &operation.plan.pages()[index],
-                &response,
-                token.persisted_receipt(),
-            )?;
-            let page = map_eod_page_candidate(TiingoEodMappingInput {
-                response: &response,
-                metadata: &metadata,
-                sealed_capture: token.persisted_receipt(),
-                sealed_metadata_capture: tokens[0].persisted_receipt(),
-                instrument: &operation.instrument,
-                contract: &operation.contract,
-                ingested_at: response.evidence().decoded_at(),
-            })?;
+            native_rows = native_rows
+                .checked_add(response.rows().len() as u64)
+                .ok_or(TiingoHistoryApplicationError::Admission)?;
+            observed_at = observed_at.max(response.evidence().received_at());
+            let (returned_stage, returned_pack, sealed_page) = self
+                .research
+                .run_owned_research_io(seal_deadline, &cancellation, move |worker| {
+                    let control = HistoryStreamControl {
+                        deadline: seal_deadline,
+                        cancellation: worker.clone(),
+                    };
+                    let sealed_page = stage
+                        .push_page(
+                            &response,
+                            token.persisted_receipt(),
+                            response.evidence().decoded_at(),
+                            &worker,
+                        )
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    pack.append(token, vec![body], &control)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    Ok::<_, TiingoHistoryApplicationError>((stage, pack, sealed_page))
+                })
+                .await??;
+            stage = returned_stage;
+            pack = returned_pack;
             if index + 1 == checkpoint.next_page_index() as usize
                 && checkpoint.predecessor_page_identity() != Some(sealed_page.page_identity())
             {
@@ -262,77 +269,46 @@ impl ProductionResearchIngestCoordinator {
                 checkpoint =
                     source.checkpoint_history_page(&operation.plan, &checkpoint, &sealed_page)?;
             }
-            tokens.push(token);
-            responses.push(response);
-            sealed_pages.push(sealed_page);
-            pages.push(page);
+            last_page_identity = Some(sealed_page.page_identity());
+            // The checkpoint commits only after durable original custody and source validation.
+            // Drop every decoded/mapped row from this page before acquiring its successor.
         }
-        let complete =
-            source.complete_history_capture(operation.plan, sealed_pages, &checkpoint)?;
-        let history = TiingoCompletedEodHistoryCandidate::try_new(
-            complete,
-            pages,
-            &operation.instrument,
-            operation.expected_session_authority.as_ref(),
-        )?
-        .into_pending_publication();
-        let expected = history.expected_session_evidence().clone();
-        let prepared = TiingoPreparedEodHistoryCapture::try_new(
-            history,
-            metadata,
-            responses,
-            tokens,
-            operation
-                .instrument
-                .instrument_definition()
-                .payload_evidence()
-                .content_digest(),
-            operation.admitted_plan_digest,
-            operation.cash_unit.as_ref(),
-            operation.expected_session_authority.as_ref(),
-        )?;
-        let graph = prepared.capture();
-        let observed_at = graph
-            .pages()
-            .last()
-            .ok_or(TiingoHistoryApplicationError::Admission)?
-            .received_at();
-        let discovery = DiscoveryRequest::try_new(
-            graph.dataset().clone(),
-            None,
-            NonZeroU16::MIN,
-            source_deadline,
-        )?;
-        let object = SourceObject::try_new_with_capture_identity(
-            graph.source_id().clone(),
-            graph.metadata_revision().clone(),
-            &discovery,
-            SourceIdentifier::try_from("tiingo-complete-eod-history")
-                .map_err(|_| TiingoHistoryApplicationError::Admission)?,
-            SourceIdentifier::try_from("application-json")
-                .map_err(|_| TiingoHistoryApplicationError::Admission)?,
-            ExactPayloadEvidence::from_content_digest(graph.content_digest()),
-            SourceObjectCaptureIdentity::try_from_capture(graph)?,
-            EffectiveInterval::new(graph.pages()[0].received_at(), None)
-                .map_err(|_| TiingoHistoryApplicationError::Admission)?,
-            None,
-            AvailabilityEvidence::LocalFirstObserved { observed_at },
-            Some(graph.total_body_bytes()),
-        )?;
-        let request = ExtractionRequest::try_new(
-            object,
-            NonZeroU32::new(40_000).ok_or(TiingoHistoryApplicationError::Admission)?,
-            NonZeroU64::new(64 * 1024 * 1024).ok_or(TiingoHistoryApplicationError::Admission)?,
-            source_deadline,
-        )?;
-        let sealed = prepared.try_into_publication(request)?;
-        let (revisions, binding) = sealed.into_parts();
-        let closure = TiingoLatestApplicationClosure::try_new(
-            Arc::clone(&self.research),
-            publication.source().clone(),
-            publication.rights().clone(),
-            publication.source_registered_at(),
-        )?;
+        let terminal =
+            source.validate_history_terminal(&operation.plan, &checkpoint, last_page_identity)?;
+        let expected = Arc::clone(&operation.expected_session_authority);
+        let store = self.research.provider_capture_store();
+        let (validated, pack) = self
+            .research
+            .run_owned_research_io(seal_deadline, &cancellation, move |worker| {
+                let validated = stage
+                    .finish(terminal, expected.as_ref(), &worker)
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                let control = HistoryStreamControl {
+                    deadline: seal_deadline,
+                    cancellation: worker,
+                };
+                let pack = pack
+                    .finish(&store, &control, 0)
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                Ok::<_, TiingoHistoryApplicationError>((validated, pack))
+            })
+            .await??;
+        let expected = operation
+            .expected_session_authority
+            .expected_evidence()
+            .clone();
+        let (validated, objects, pack_seal) = self
+            .retain_tiingo_history_logical_original(
+                validated,
+                pack,
+                operation.analytical_dataset.clone(),
+                &publication,
+                Arc::clone(&original_lease),
+                observed_at,
+                seal_deadline,
+                &cancellation,
+            )
+            .await?;
         drop(original_lease);
         let calendar = operation
             .expected_session_authority
@@ -343,20 +319,21 @@ impl ProductionResearchIngestCoordinator {
             inner: publication.precommit_authority(),
             calendar,
         });
-        let result = closure
-            .publish_binding(
-                binding,
-                revisions,
-                ProviderNativeLineageImplementation::TiingoEodMarketBarV1,
-                operation.analytical_dataset,
-                observed_at,
-                precommit,
-                cancellation,
-            )
-            .await?;
-        Ok(TiingoEodHistoryPublicationReceipt {
-            restart: result.restart_binding(),
-        })
+        self.publish_tiingo_history_stream(
+            validated,
+            objects,
+            pack_seal,
+            scratch,
+            operation.analytical_dataset,
+            &publication,
+            precommit,
+            observed_at,
+            native_rows,
+            source_deadline,
+            seal_deadline,
+            cancellation,
+        )
+        .await
     }
 }
 
@@ -367,13 +344,15 @@ pub(crate) struct TiingoCompletedEodActionRead {
     source: Arc<market_squawk_data::RetainedTiingoEodActionHistory>,
 }
 impl TiingoCompletedEodActionRead {
-    pub(crate) fn history(&self) -> &CompleteMarketBarHistoryOutput {
+    pub(crate) fn history(&self) -> &market_squawk_data::CompleteMarketBarHistoryCursor {
         self.source.history()
     }
-    pub(crate) fn binding(&self) -> &PersistedProviderCaptureBindingEvidence {
+    pub(crate) fn binding(
+        &self,
+    ) -> &market_squawk_data::PersistedProviderLogicalPublicationBinding {
         self.source.binding()
     }
-    pub(crate) fn actions(&self) -> &TiingoEodHistoryActionProjection {
+    pub(crate) fn actions(&self) -> &ValidatedTiingoEodHistory {
         self.source.actions()
     }
     pub(crate) fn knowledge_cutoff(&self) -> Timestamp {
@@ -417,4 +396,439 @@ pub(crate) enum TiingoHistoryApplicationError {
     Read(#[from] market_squawk_data::AnalyticalReadError),
     #[error(transparent)]
     Ingest(#[from] market_squawk_data::IngestError),
+}
+
+struct HistoryStreamControl {
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+impl market_squawk_platform::ResearchObjectControl for HistoryStreamControl {
+    fn checkpoint(
+        &self,
+        _: market_squawk_platform::ResearchObjectControlPoint,
+    ) -> Result<(), market_squawk_platform::ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            return Err(market_squawk_platform::ResearchObjectControlError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(market_squawk_platform::ResearchObjectControlError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+fn history_object_admission(
+    bytes: u64,
+) -> Result<market_squawk_platform::ResearchObjectAdmission, TiingoHistoryApplicationError> {
+    market_squawk_platform::ResearchObjectAdmission::try_new(bytes.max(1), 4095)
+        .map_err(|_| TiingoHistoryApplicationError::Admission)
+}
+
+impl ProductionResearchIngestCoordinator {
+    /// Seals and retains the completed logical original before releasing acquisition custody.
+    #[allow(clippy::too_many_arguments)]
+    async fn retain_tiingo_history_logical_original(
+        &self,
+        proof: ValidatedTiingoEodHistory,
+        pack: market_squawk_sources::SealedProviderCapturePack,
+        dataset: DatasetId,
+        publication: &ResearchProviderPublicationOperation,
+        original_lease: Arc<market_squawk_data::ProviderCaptureOriginalLease>,
+        observed_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        (
+            ValidatedTiingoEodHistory,
+            Vec<market_squawk_sources::SealedLogicalObjectInput>,
+            market_squawk_sources::ProviderCapturePackSeal,
+        ),
+        TiingoHistoryApplicationError,
+    > {
+        use market_squawk_sources::{LogicalObjectRole, SealedLogicalObjectInput};
+        use std::io::Write as _;
+        let descriptor = serde_json::to_vec(proof.descriptor())
+            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let rights = publication
+            .rights()
+            .decision(history_digest(&descriptor), observed_at)
+            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let source = publication.source().clone();
+        let data = self.research.analytical_service();
+        let store = self.research.provider_capture_store();
+        let (pack, pack_seal) = pack.into_parts();
+        let worker_store = Arc::clone(&store);
+        let (proof, objects, _) = self
+            .research
+            .run_owned_research_io(deadline, cancellation, move |worker| {
+                let _lease = original_lease;
+                let control = HistoryStreamControl {
+                    deadline,
+                    cancellation: worker.clone(),
+                };
+                let descriptor = serde_json::to_vec(proof.descriptor())
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                let terminal_digest = history_digest(&descriptor);
+                let mut objects = vec![pack];
+                let mut pending = worker_store
+                    .begin_logical_object(history_object_admission(descriptor.len() as u64)?)
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                if pending.write_all(&descriptor).is_err() {
+                    let _ = worker_store.abort_logical_object(pending);
+                    return Err(TiingoHistoryApplicationError::Admission);
+                }
+                let object = worker_store
+                    .finish_logical_object(pending, &control)
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                objects.push(
+                    SealedLogicalObjectInput::try_from_verified(
+                        LogicalObjectRole::Catalog,
+                        1,
+                        terminal_digest,
+                        object,
+                        &control,
+                    )
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+                );
+                for ordinal in 2..=4 {
+                    let mut pending = worker_store
+                        .begin_logical_object(history_object_admission(8 * 1024 * 1024 * 1024)?)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    let written = match ordinal {
+                        2 => proof.write_page_index(&mut pending, &worker),
+                        3 => proof.write_session_index(&mut pending, &worker),
+                        _ => proof.write_action_index(&mut pending, &worker),
+                    };
+                    if written.is_err() {
+                        let _ = worker_store.abort_logical_object(pending);
+                        return Err(TiingoHistoryApplicationError::Admission);
+                    }
+                    let object = worker_store
+                        .finish_logical_object(pending, &control)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    let digest = object.content_digest();
+                    objects.push(
+                        SealedLogicalObjectInput::try_from_verified(
+                            LogicalObjectRole::ProviderComponent,
+                            ordinal,
+                            digest,
+                            object,
+                            &control,
+                        )
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+                    );
+                }
+                data.retain_provider_logical_original_for_contract(
+                    &source,
+                    &dataset,
+                    market_squawk_sources::ProviderNativeLineageSchema::for_implementation(
+                        ProviderNativeLineageImplementation::TiingoEodMarketBarV1,
+                    )
+                    .fingerprint(),
+                    terminal_digest,
+                    proof.descriptor().max_received_at(),
+                    &descriptor,
+                    &objects,
+                    &rights,
+                    &worker_store,
+                    deadline,
+                    &worker,
+                )?;
+                Ok::<_, TiingoHistoryApplicationError>((proof, objects, terminal_digest))
+            })
+            .await??;
+        Ok((proof, objects, pack_seal))
+    }
+
+    /// Publishes the complete native history through the common logical stream owner. Original
+    /// payloads, all ordered indexes and canonical chunks cross one atomic terminal commit.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_tiingo_history_stream(
+        &self,
+        mut proof: ValidatedTiingoEodHistory,
+        mut objects: Vec<market_squawk_sources::SealedLogicalObjectInput>,
+        pack_seal: market_squawk_sources::ProviderCapturePackSeal,
+        _scratch: Arc<market_squawk_data::OperationScratchDirectory>,
+        dataset: DatasetId,
+        publication: &ResearchProviderPublicationOperation,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        observed_at: Timestamp,
+        native_rows: u64,
+        source_deadline: Timestamp,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<TiingoEodHistoryPublicationReceipt, TiingoHistoryApplicationError> {
+        use market_squawk_data::{IngestIdentity, SourceOperation};
+        use market_squawk_sources::{
+            LogicalItemRange, LogicalPartitionFamily, LogicalPartitionSetAdmission,
+            PendingLogicalPartitionSet, ProviderLogicalTerminalInput, SealedLogicalPartitionInput,
+            SealedProviderLogicalPublicationBinding,
+        };
+        use sha2::{Digest as _, Sha256};
+        let source = publication.source().clone();
+        if observed_at < publication.source_registered_at() || !source.is_effective_at(observed_at)
+        {
+            return Err(TiingoHistoryApplicationError::Admission);
+        }
+        precommit.validate_precommit()?;
+        let store = self.research.provider_capture_store();
+        let mut staging = self.research.analytical().begin_tiingo_history_stream(
+            dataset.clone(),
+            &proof,
+            &cancellation,
+        )?;
+        let partition_admission = LogicalPartitionSetAdmission::try_new(
+            history_object_admission(32 * 1024 * 1024)?,
+            4096,
+            1024,
+            128 * 1024,
+        )
+        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let schema = market_squawk_sources::ProviderNativeLineageSchema::for_implementation(
+            ProviderNativeLineageImplementation::TiingoEodMarketBarV1,
+        );
+        let mut native_partitions = PendingLogicalPartitionSet::begin(
+            LogicalPartitionFamily::ProviderNative,
+            schema.fingerprint(),
+            partition_admission,
+            0,
+        )
+        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let mut row_partitions = PendingLogicalPartitionSet::begin(
+            LogicalPartitionFamily::CanonicalRowMap,
+            history_digest(b"market-squawk/tiingo-history/logical-row-map/v1"),
+            partition_admission,
+            0,
+        )
+        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let mut expectations = Vec::new();
+        let mut canonical_rows = 0_u64;
+        loop {
+            let returned = self
+                .research
+                .run_owned_research_io(deadline, &cancellation, move |worker| {
+                    let request = proof
+                        .extraction_request(
+                            source_deadline,
+                            NonZeroU32::new(1024)
+                                .ok_or(TiingoHistoryApplicationError::Admission)?,
+                            NonZeroU64::new(32 * 1024 * 1024)
+                                .ok_or(TiingoHistoryApplicationError::Admission)?,
+                        )
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    let Some(request) = request else {
+                        return Ok((proof, None));
+                    };
+                    let ordinal = proof
+                        .next_page_ordinal()
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?
+                        .ok_or(TiingoHistoryApplicationError::Admission)?;
+                    let receipt = proof
+                        .page_at(ordinal)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?
+                        .ok_or(TiingoHistoryApplicationError::Admission)?
+                        .sealed_receipt()
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?
+                        .clone();
+                    let chunk = proof
+                        .next_chunk(&request, &worker)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?
+                        .ok_or(TiingoHistoryApplicationError::Admission)?;
+                    Ok::<_, TiingoHistoryApplicationError>((proof, Some((chunk, receipt, ordinal))))
+                })
+                .await??;
+            proof = returned.0;
+            let Some((chunk, receipt, original_page_ordinal)) = returned.1 else {
+                break;
+            };
+            if chunk.global_start() != canonical_rows
+                || chunk.original_page_ordinal() != original_page_ordinal
+            {
+                return Err(TiingoHistoryApplicationError::Admission);
+            }
+            let row_count = chunk.batch().records().len();
+            let raw_store = Arc::clone(&store);
+            let start = canonical_rows;
+            let (returned_chunk, returned_native, returned_rows, returned_receipt) = self.research.run_owned_research_io(
+                deadline, &cancellation, move |worker| {
+                    let control = HistoryStreamControl { deadline, cancellation: worker };
+                    let native = chunk.native_lineage();
+                    native.validate(chunk.batch()).map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    for (local, (record, row)) in chunk.batch().records().iter().zip(native.rows()).enumerate() {
+                        let ordinal = start.checked_add(local as u64).ok_or(TiingoHistoryApplicationError::Admission)?;
+                        native_partitions.stage_frame(&raw_store, &control, ordinal,
+                            row.semantic_payload(), row.semantic_payload_digest())
+                            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                        let frame = receipt.row_frame(u32::try_from(ordinal).map_err(|_| TiingoHistoryApplicationError::Admission)?, 0)?;
+                        let mapping = serde_json::to_vec(&serde_json::json!({
+                            "canonical_row_ordinal": frame.canonical_row_ordinal(), "capture_page_ordinal": frame.capture_page_ordinal(),
+                            "segment_ordinal": frame.segment_ordinal(), "physical_frame_ordinal": frame.physical_frame_ordinal(),
+                            "page_body_digest": frame.page_body_digest(), "received_at": frame.received_at(), "source_sequence": frame.source_sequence(),
+                            "canonical_record_digest": record.evidence().content_digest(), "native_semantic_digest": row.semantic_payload_digest(),
+                            "original_page_ordinal": original_page_ordinal,
+                        })).map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                        row_partitions.stage_frame(&raw_store, &control, ordinal, &mapping, history_digest(&mapping))
+                            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    }
+                    native_partitions.seal_current_partition(&raw_store, &control)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    row_partitions.seal_current_partition(&raw_store, &control)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                    Ok::<_, TiingoHistoryApplicationError>((chunk, native_partitions, row_partitions, receipt))
+                }).await??;
+            native_partitions = returned_native;
+            row_partitions = returned_rows;
+            expectations.push(
+                self.research
+                    .analytical()
+                    .stage_tiingo_history_chunk(
+                        &mut staging,
+                        returned_chunk,
+                        &returned_receipt,
+                        &cancellation,
+                    )
+                    .await?,
+            );
+            canonical_rows = canonical_rows
+                .checked_add(row_count as u64)
+                .ok_or(TiingoHistoryApplicationError::Admission)?;
+        }
+        let session_index = objects
+            .get(3)
+            .ok_or(TiingoHistoryApplicationError::Admission)?
+            .object()
+            .clone();
+        let session_count = NonZeroU32::new(
+            u32::try_from(proof.descriptor().session_count())
+                .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+        )
+        .ok_or(TiingoHistoryApplicationError::Admission)?;
+        let raw_store = Arc::clone(&store);
+        let partitions = self
+            .research
+            .run_owned_research_io(deadline, &cancellation, move |worker| {
+                let control = HistoryStreamControl {
+                    deadline,
+                    cancellation: worker,
+                };
+                let decoded = SealedLogicalPartitionInput::try_from_framed_object(
+                    LogicalPartitionFamily::DecodedEvent,
+                    0,
+                    LogicalItemRange::try_new(0, session_count)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+                    history_digest(b"market-squawk/tiingo-history/session-index/v1"),
+                    128 * 1024,
+                    raw_store
+                        .open_verified_logical_object(&session_index, &control)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+                    &control,
+                )
+                .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                let mut partitions = vec![decoded];
+                partitions.extend(
+                    native_partitions
+                        .finish(&raw_store, &control)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?
+                        .into_partitions()
+                        .into_vec(),
+                );
+                partitions.extend(
+                    row_partitions
+                        .finish(&raw_store, &control)
+                        .map_err(|_| TiingoHistoryApplicationError::Admission)?
+                        .into_partitions()
+                        .into_vec(),
+                );
+                Ok::<_, TiingoHistoryApplicationError>(partitions)
+            })
+            .await??;
+        let logical_bytes = objects
+            .iter()
+            .try_fold(0_u64, |total, object| {
+                total.checked_add(object.object().size_bytes())
+            })
+            .ok_or(TiingoHistoryApplicationError::Admission)?;
+        let terminal_digest = history_digest(
+            &serde_json::to_vec(proof.descriptor())
+                .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+        );
+        let binding = SealedProviderLogicalPublicationBinding::try_new(
+            ProviderLogicalTerminalInput {
+                source_id: source.source_id().clone(),
+                source_revision_digest: source
+                    .revision_evidence()
+                    .payload_evidence()
+                    .content_digest(),
+                execution_attempt_digest: Some(pack_seal.captures_digest()),
+                provider_terminal_evidence_digest: terminal_digest,
+                total_decoded_events: native_rows,
+                total_canonical_rows: canonical_rows,
+                total_logical_object_bytes: logical_bytes,
+            },
+            &[
+                LogicalPartitionFamily::DecodedEvent,
+                LogicalPartitionFamily::ProviderNative,
+                LogicalPartitionFamily::CanonicalRowMap,
+            ],
+            std::mem::take(&mut objects),
+            partitions,
+            expectations,
+        )
+        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let digest = binding.binding_digest();
+        let rights = publication
+            .rights()
+            .decision(digest, observed_at)
+            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let identity = IngestIdentity::try_new(
+            source.source_id().clone(),
+            digest,
+            SourceOperation::Persist,
+            format!(
+                "tiingo-history-logical:{}:{:x}",
+                dataset.as_str(),
+                Sha256::digest(digest.bytes())
+            ),
+        )
+        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        let reservation = self
+            .research
+            .analytical()
+            .reserve_source_ingest(&source, observed_at, rights, &identity, &cancellation)
+            .await?;
+        precommit.validate_precommit()?;
+        let (committed, retained_digest) = self
+            .research
+            .analytical()
+            .finish_tiingo_history_stream(
+                staging,
+                reservation,
+                binding,
+                proof,
+                pack_seal,
+                precommit,
+                cancellation,
+            )
+            .await?;
+        if retained_digest != digest {
+            return Err(TiingoHistoryApplicationError::Admission);
+        }
+        Ok(TiingoEodHistoryPublicationReceipt {
+            restart: TiingoLatestRestartBinding {
+                manifest: committed.manifest().clone(),
+                binding_digest: digest,
+                source_id: source.source_id().clone(),
+                expected_record_count: usize::try_from(canonical_rows)
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+                native_schema_version: schema.version(),
+                native_schema_fingerprint: schema.fingerprint(),
+            },
+        })
+    }
+}
+fn history_digest(bytes: &[u8]) -> EvidenceDigest {
+    use sha2::{Digest as _, Sha256};
+    EvidenceDigest::new(
+        market_squawk_domain::DigestAlgorithm::Sha256,
+        Sha256::digest(bytes).into(),
+    )
 }

@@ -29,7 +29,7 @@ pub(crate) use fiscal::HistoricalFinancialForecast;
 #[derive(Debug)]
 pub(crate) struct SelectedForecastRuntime {
     retained: RetainedForecastRuntime,
-    backend_ordinal: usize,
+    metadata: ModelMetadata,
     reference: ForecastStudyRuntimeReference,
     reopened_at: Option<Timestamp>,
 }
@@ -115,23 +115,21 @@ impl ProductionModelRuntime {
             .try_reserve_exact(N)
             .map_err(|_| ServiceError::ResourceExhausted)?;
         for admission in admissions {
-            let ordinal = retained
+            let bundle = retained
                 .image
-                .backends
-                .iter()
-                .position(|backend| {
-                    let metadata = backend.metadata();
-                    metadata.model_id() == admission.model_id()
-                        && metadata.bundle_id() == admission.bundle_id()
-                        && metadata.bundle_version() == admission.bundle_version()
-                        && metadata.metadata_hash() == admission.metadata_sha256()
-                        && metadata.artifact_hash() == admission.artifact_sha256()
-                        && metadata.training_run_hash() == admission.training_run_sha256()
-                        && metadata.dataset().selection_digest()
-                            == admission.dataset_selection_sha256()
-                })
+                .registry
+                .get(admission.bundle_id(), admission.bundle_version())
+                .map_err(|_| ServiceError::Unavailable)?
                 .ok_or(ServiceError::InvalidResult)?;
-            let metadata = retained.image.backends[ordinal].metadata();
+            let metadata = bundle.metadata();
+            if metadata.model_id() != admission.model_id()
+                || metadata.metadata_hash() != admission.metadata_sha256()
+                || metadata.artifact_hash() != admission.artifact_sha256()
+                || metadata.training_run_hash() != admission.training_run_sha256()
+                || metadata.dataset().selection_digest() != admission.dataset_selection_sha256()
+            {
+                return Err(ServiceError::InvalidResult);
+            }
             let reference = ForecastStudyRuntimeReference {
                 model_id: metadata.model_id(),
                 bundle_id: metadata.bundle_id().clone(),
@@ -148,7 +146,7 @@ impl ProductionModelRuntime {
                     generation_sha256: retained.generation_sha256,
                     image: std::sync::Arc::clone(&retained.image),
                 },
-                backend_ordinal: ordinal,
+                metadata: metadata.clone(),
                 reference,
                 reopened_at: None,
             });
@@ -169,18 +167,16 @@ impl ProductionModelRuntime {
         if retained.generation_sha256 != expected_generation {
             return Err(ServiceError::Unavailable);
         }
-        let backend_ordinal = retained
+        let bundle = retained
             .image
-            .backends
-            .iter()
-            .position(|backend| {
-                let metadata = backend.metadata();
-                metadata.model_id() == model_id
-                    && metadata.bundle_id() == bundle_id
-                    && metadata.bundle_version() == bundle_version
-            })
+            .registry
+            .get(bundle_id, bundle_version)
+            .map_err(|_| ServiceError::Unavailable)?
             .ok_or(ServiceError::NotFound)?;
-        let metadata = retained.image.backends[backend_ordinal].metadata();
+        let metadata = bundle.metadata();
+        if metadata.model_id() != model_id {
+            return Err(ServiceError::NotFound);
+        }
         let reference = ForecastStudyRuntimeReference {
             model_id,
             bundle_id: metadata.bundle_id().clone(),
@@ -194,7 +190,7 @@ impl ProductionModelRuntime {
         };
         Ok(SelectedForecastRuntime {
             retained,
-            backend_ordinal,
+            metadata: metadata.clone(),
             reference,
             reopened_at: None,
         })
@@ -220,15 +216,19 @@ impl ProductionModelRuntime {
         let retained = self
             .retain_forecast_runtime()
             .map_err(|_| ServiceError::Unavailable)?;
-        let backend_ordinal = retained
+        let bundle = retained
             .image
-            .backends
-            .iter()
-            .position(|backend| reference.matches(backend.metadata()))
+            .registry
+            .get(&reference.bundle_id, reference.bundle_version)
+            .map_err(|_| ServiceError::Unavailable)?
             .ok_or(ServiceError::NotFound)?;
+        let metadata = bundle.metadata();
+        if !reference.matches(metadata) {
+            return Err(ServiceError::NotFound);
+        }
         Ok(SelectedForecastRuntime {
             retained,
-            backend_ordinal,
+            metadata: metadata.clone(),
             reference: reference.clone(),
             reopened_at: Some(reopened_at),
         })
@@ -237,7 +237,7 @@ impl ProductionModelRuntime {
 
 impl SelectedForecastRuntime {
     fn metadata(&self) -> &ModelMetadata {
-        self.retained.image.backends[self.backend_ordinal].metadata()
+        &self.metadata
     }
 
     pub(crate) const fn runtime_generation(&self) -> Sha256Digest {
@@ -411,7 +411,18 @@ impl SelectedForecastRuntime {
             artifacts.dependence_assumptions(),
         )
         .map_err(|_| ServiceError::InvalidResult)?;
-        let path = self.retained.image.backends[self.backend_ordinal]
+        let active = self
+            .retained
+            .image
+            .activate(
+                metadata.bundle_id(),
+                metadata.bundle_version(),
+                context.deadline(),
+                context.cancellation(),
+            )
+            .map_err(super::super::runtime_service_error)?;
+        let path = active
+            .backend()
             .forecast(&request, Some(&calibration))
             .map_err(|_| ServiceError::Unavailable)?;
         ensure_live(context)?;
@@ -447,13 +458,7 @@ impl SelectedForecastRuntime {
         if calculated_at < epoch.calculated_at() || calculated_at < epoch.snapshot_as_of() {
             return Err(ServiceError::Unavailable);
         }
-        let bundle = self
-            .retained
-            .image
-            .registry
-            .get(metadata.bundle_id(), metadata.bundle_version())
-            .map_err(|_| ServiceError::Unavailable)?
-            .ok_or(ServiceError::Unavailable)?;
+        let bundle = active.bundle();
         let native_distribution =
             ForecastStudyDistribution::try_from_admitted_path(&bundle, path, inputs)
                 .map_err(|_| ServiceError::InvalidResult)?;

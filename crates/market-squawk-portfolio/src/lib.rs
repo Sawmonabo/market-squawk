@@ -58,7 +58,6 @@ pub use transaction::{
 const HARD_MAX_ACCOUNTS: usize = 16_384;
 const HARD_MAX_INSTRUMENTS: usize = 1_000_000;
 const HARD_MAX_LOTS: usize = 4_000_000;
-const HARD_MAX_TRANSACTIONS: usize = 4_000_000;
 const HARD_MAX_FACTORS: usize = 16_384;
 const HARD_MAX_SCENARIOS: usize = 16_384;
 const HARD_MAX_HISTORY: usize = 65_536;
@@ -103,7 +102,7 @@ pub struct PortfolioLimits {
 }
 
 impl PortfolioLimits {
-    /// Validates positive caller limits against fixed process ceilings.
+    /// Validates positive caller work limits and fixed resident-state ceilings.
     ///
     /// # Errors
     ///
@@ -113,7 +112,7 @@ impl PortfolioLimits {
             (input.max_accounts, HARD_MAX_ACCOUNTS),
             (input.max_instruments, HARD_MAX_INSTRUMENTS),
             (input.max_lots, HARD_MAX_LOTS),
-            (input.max_transactions, HARD_MAX_TRANSACTIONS),
+            (input.max_transactions, usize::MAX),
             (input.max_factors, HARD_MAX_FACTORS),
             (input.max_scenarios, HARD_MAX_SCENARIOS),
             (input.max_history, HARD_MAX_HISTORY),
@@ -167,6 +166,15 @@ impl PortfolioLimits {
 /// Typed portfolio construction, accounting, evidence, and analytics failures.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PortfolioError {
+    /// Private immutable transaction storage is unavailable or corrupt.
+    #[error("portfolio transaction snapshot storage failed")]
+    Storage,
+    /// The independent temporary disk allowance or available disk space is exhausted.
+    #[error("portfolio transaction snapshot disk capacity is exhausted")]
+    StorageCapacity,
+    /// The current portfolio operation was cancelled before publication.
+    #[error("portfolio operation was cancelled")]
+    Cancelled,
     /// A caller-selected bound is zero or above its fixed ceiling.
     #[error("portfolio limits are invalid")]
     InvalidLimits,

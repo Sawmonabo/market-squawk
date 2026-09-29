@@ -77,14 +77,20 @@ pub(in crate::application::contracts) fn command(update: bool) -> Value {
                 "restoreRecommended",
                 vec![("activationToken", token("activation"))],
             ),
-            closed(vec![
-                ("action", constant("findOpportunities")),
-                ("benchmarkInstrumentId", uuid()),
-            ], &["action"]),
+            closed(
+                vec![
+                    ("action", constant("findOpportunities")),
+                    ("benchmarkInstrumentId", uuid()),
+                ],
+                &["action"],
+            ),
             closed(
                 vec![
                     ("action", constant("analyzeInvestment")),
-                    ("selectionToken", json!({"type":"string","pattern":"^market_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$","maxLength":128})),
+                    (
+                        "selectionToken",
+                        json!({"type":"string","pattern":"^market_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$","maxLength":128}),
+                    ),
                     ("benchmarkInstrumentId", uuid()),
                 ],
                 &["action", "selectionToken"],
@@ -95,7 +101,14 @@ pub(in crate::application::contracts) fn command(update: bool) -> Value {
     } else {
         one_of(vec![
             command_variant("status", vec![]),
-            command_variant("profileOptions", vec![]),
+            closed(
+                vec![
+                    ("action", constant("profileOptions")),
+                    ("cursor", nullable(text(512))),
+                    ("limit", json!({"type":"integer","minimum":1,"maximum":100})),
+                ],
+                &["action"],
+            ),
             command_variant(
                 "compareWithRecommended",
                 vec![("profileToken", token("profile"))],
@@ -330,13 +343,14 @@ pub(super) fn result(update: bool) -> Value {
                 vec![(
                     "options",
                     object(vec![
-                        ("benchmarkChoices", super::analytical_profile::benchmark_choices()),
+                        ("nextCursor", nullable(text(512))),
+                        (
+                            "benchmarkChoices",
+                            super::analytical_profile::benchmark_choices(),
+                        ),
                         (
                             "modelChoices",
-                            array(
-                                object(vec![("token", text(64)), ("label", text(256))]),
-                                1001,
-                            ),
+                            array(object(vec![("token", text(64)), ("label", text(256))]), 101),
                         ),
                         (
                             "fixedSettings",

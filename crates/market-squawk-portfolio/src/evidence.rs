@@ -1,6 +1,6 @@
 //! Immutable portfolio revision, evidence, valuation, and read-model types.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use market_squawk_analytics::{FeatureKey, FeatureMetadata, FeatureSemanticDigest};
 use market_squawk_data::{CorporateActionPlan, DatasetManifestRef, Sha256Digest};
@@ -8,8 +8,8 @@ use market_squawk_domain::{AccountId, Currency, InstrumentId, Money, SourceIdent
 use rust_decimal::Decimal;
 
 use crate::ledger::PortfolioLedger;
+use crate::ledger::snapshot::LedgerSnapshot;
 use crate::lots::Lot;
-use crate::transaction::LedgerEntry;
 use crate::{PortfolioError, PortfolioLimits};
 
 /// Opaque content identity of one immutable portfolio revision.
@@ -635,8 +635,7 @@ pub struct PortfolioRevision {
     pub(crate) evidence: RevisionEvidence,
     pub(crate) corporate_actions: Vec<CorporateActionBinding>,
     pub(crate) retained_bytes: usize,
-    pub(crate) active_entries: BTreeMap<SourceIdentifier, LedgerEntry>,
-    pub(crate) seen_revisions: BTreeSet<(SourceIdentifier, u32)>,
+    pub(crate) snapshot: LedgerSnapshot,
     pub(crate) plan: Option<CorporateActionPlan>,
     pub(crate) limits: PortfolioLimits,
 }
@@ -795,8 +794,7 @@ impl PortfolioRevision {
             account_id: self.account_id,
             base_currency: self.base_currency,
             limits: self.limits,
-            active_entries: self.active_entries,
-            seen_revisions: self.seen_revisions,
+            snapshot: self.snapshot,
             plan: self.plan,
             history,
         })

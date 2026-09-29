@@ -1,6 +1,9 @@
 //! Bounded point-in-time portfolio request admission and result construction.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    ops::Bound::{Excluded, Unbounded},
+};
 
 use chrono::{DateTime, Utc};
 use market_squawk_adapter_portfolio::{LotMethod, TransactionKind};
@@ -8,6 +11,7 @@ use market_squawk_domain::{AccountId, InstrumentId, Money, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -158,6 +162,14 @@ pub(super) fn call(
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountPageCursor {
+    version: u8,
+    catalog_digest: [u8; 32],
+    after_account: Uuid,
+}
+
 fn list_accounts(
     image: &PortfolioReadImage,
     request: &TypedToolRequest,
@@ -165,32 +177,119 @@ fn list_accounts(
     application_limits: PortfolioApplicationLimits,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     let (maximum_items, maximum_bytes) = read_result_limits(request, application_limits)?;
-    let catalog = super::product::account_catalog(image)?;
-    let after_account = request
+    let limit = request
         .arguments()
-        .get("afterAccountToken")
-        .and_then(Value::as_str)
-        .map(|token| super::product::resolve_account_token(&catalog, token))
-        .transpose()?;
-    let rows = catalog
-        .iter()
-        .filter(|binding| after_account.is_none_or(|after| binding.account_id() > after))
-        .map(|binding| {
-            let revision = image
-                .accounts
-                .get(&binding.account_id())
-                .and_then(|history| history.revisions.last())
-                .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
-            account_summary(binding, revision)
+        .get("limit")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| (1..=100).contains(value))
+                .ok_or(PortfolioApplicationServiceError::InvalidRequest)
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    portfolio_page(
-        rows,
-        maximum_items,
-        maximum_bytes,
-        context,
-        json!({"scope": "portfolio_accounts"}),
+        .transpose()?
+        .unwrap_or(25)
+        .min(maximum_items)
+        .min(context.limits().maximum_result_items());
+    if limit == 0 {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
+    let after = request
+        .arguments()
+        .get("cursor")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let encoded = value
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 512)
+                .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+            let cursor: AccountPageCursor = serde_json::from_str(encoded)
+                .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+            if cursor.version != 1 || cursor.catalog_digest != image.account_catalog_digest {
+                return Err(PortfolioApplicationServiceError::InvalidRequest);
+            }
+            let account = AccountId::try_from(cursor.after_account)
+                .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+            if image
+                .account_ordinals
+                .binary_search_by_key(&account, |(id, _)| *id)
+                .is_err()
+            {
+                return Err(PortfolioApplicationServiceError::InvalidRequest);
+            }
+            Ok(account)
+        })
+        .transpose()?;
+    let start = after.map_or(Unbounded, Excluded);
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(limit.saturating_add(1))
+        .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
+    for (account_id, history) in image
+        .accounts
+        .range((start, Unbounded))
+        .take(limit.saturating_add(1))
+    {
+        if context.cancellation().is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        if std::time::Instant::now() >= context.deadline() {
+            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
+        }
+        let ordinal = image
+            .account_ordinals
+            .binary_search_by_key(account_id, |(id, _)| *id)
+            .ok()
+            .and_then(|index| image.account_ordinals.get(index))
+            .map(|(_, ordinal)| *ordinal)
+            .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+        let binding = super::product::account_binding(*account_id, ordinal)?;
+        let head = history
+            .revisions
+            .last()
+            .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+        rows.push((*account_id, account_summary(&binding, head)?));
+    }
+    let limits = narrowed_limits(context, maximum_items, maximum_bytes)?;
+    let metadata = ToolResultMetadata::try_complete(
+        json!({"scope":"portfolio_accounts","snapshotDigest":hex(&image.account_catalog_digest)}),
+        json!({"state":"available","confidence":"limited"}),
     )
+    .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+    let mut count = rows.len().min(limit);
+    loop {
+        let next_cursor = if count < rows.len() {
+            let account = rows
+                .get(count.saturating_sub(1))
+                .filter(|_| count > 0)
+                .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?
+                .0;
+            Some(
+                serde_json::to_string(&AccountPageCursor {
+                    version: 1,
+                    catalog_digest: image.account_catalog_digest,
+                    after_account: account.as_uuid(),
+                })
+                .map_err(|_| PortfolioApplicationServiceError::Publication)?,
+            )
+        } else {
+            None
+        };
+        let accounts = rows[..count]
+            .iter()
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        match TypedToolResult::try_new(
+            json!({"accounts":accounts,"nextCursor":next_cursor}),
+            count,
+            metadata.clone(),
+            limits,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(_) if count > 1 => count -= 1,
+            Err(_) => return Err(PortfolioApplicationServiceError::ResourceExhausted),
+        }
+    }
 }
 
 fn list_revisions(

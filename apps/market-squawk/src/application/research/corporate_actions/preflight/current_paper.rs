@@ -11,13 +11,194 @@ use market_squawk_domain::{
 pub(crate) struct PreparedCurrentPaperSources {
     source: PublishedActionQuery,
     publications: Vec<crate::application::research::ingest::PublishedCurrentOrdinaryActions>,
+    histories: Vec<OriginalFinancialHistory>,
     reference: CompletedMarketSessionReference,
     requested: BTreeSet<InstrumentId>,
     interval: (CalendarDate, CalendarDate),
     bootstrap_at: Timestamp,
     started: Timestamp,
 }
+/// Bounded pending original publications. Final quotes are sampled only after ready_at.
+pub(crate) struct PreparedFinancialShareSources {
+    originals: Vec<(InstrumentId, PreparedCurrentPaperSources)>,
+    ready_at: Timestamp,
+}
+
+/// Compact original coordinates; complete price bodies do not accumulate across the peer set.
+struct OriginalFinancialHistory {
+    instrument: InstrumentId,
+    provider: ProviderInstrumentId,
+    venue: VenueId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    ruleset: SourceIdentifier,
+    dates: (CalendarDate, CalendarDate),
+    manifest: DatasetManifestRef,
+    receipt_digest: market_squawk_data::Sha256Digest,
+    content_digest: market_squawk_data::Sha256Digest,
+    surface: market_squawk_data::MarketHistoryPriceSurfaceRequirement,
+    calendar: CompletedMarketSessionReference,
+}
+impl OriginalFinancialHistory {
+    fn retain(
+        history: &market_squawk_data::CompleteMarketBarHistoryCursor,
+    ) -> Result<Self, ServiceError> {
+        let receipt = history.selection().receipt();
+        let graph = receipt.date_windows().ok_or(ServiceError::InvalidResult)?;
+        if receipt.adjustment() != market_squawk_domain::MarketBarAdjustment::Raw
+            || history.native_sessions().is_none()
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(Self {
+            instrument: receipt.instrument_id(),
+            provider: receipt.provider_instrument_id().clone(),
+            venue: receipt.venue_id().clone(),
+            feed: receipt.feed().clone(),
+            interval: receipt.interval().clone(),
+            ruleset: receipt.session_ruleset().clone(),
+            dates: graph.requested_dates(),
+            manifest: history.selection().pinned().manifest().clone(),
+            receipt_digest: receipt.receipt_digest(),
+            content_digest: history.read_receipt().history_content_digest(),
+            surface: history.selection().surface_requirement(),
+            calendar: CompletedMarketSessionReference::try_from_retained_digests(
+                graph.calendar().origin_content_digest,
+                graph.calendar().capture_binding_digest,
+            )
+            .map_err(|_| ServiceError::InvalidResult)?,
+        })
+    }
+}
+
 impl SourceActionPreparationCapability {
+    /// Publishes source evidence using preliminary quote dates; no final quote is retained.
+    pub(crate) async fn acquire_financial_share_sources(
+        &self,
+        requirements: &[(InstrumentId, CalendarDate, Timestamp)],
+        context: &RequestContext,
+    ) -> Result<PreparedFinancialShareSources, ServiceError> {
+        check(context)?;
+        // The existing comparable calculation admits at most sixteen peers and one subject.
+        if requirements.is_empty() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if requirements.len() > 17 {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let mut selected = BTreeSet::new();
+        let mut originals = Vec::new();
+        originals
+            .try_reserve_exact(requirements.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        for &(instrument, starts_on, quote_at) in requirements {
+            check(context)?;
+            if !selected.insert(instrument) {
+                return Err(ServiceError::InvalidRequest);
+            }
+            // UTC midnight would fall on the preceding New York date. Preserve the filing's
+            // complete civil date using the same market calendar as the action reader.
+            let start = chrono::NaiveDate::from_ymd_opt(
+                i32::from(starts_on.year()),
+                u32::from(starts_on.month()),
+                u32::from(starts_on.day()),
+            )
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .and_then(|date| date.and_local_timezone(New_York).single())
+            .and_then(|date| date.timestamp_nanos_opt())
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(ServiceError::InvalidRequest)?;
+            let knowledge_at = now()?;
+            if start > quote_at || quote_at > knowledge_at {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let query = market_squawk_data::MarketDataInstrumentPopulationQuery::try_new(
+                vec![instrument],
+                knowledge_at,
+                quote_at,
+            )
+            .map_err(|_| ServiceError::InvalidRequest)?;
+            let population = self
+                .research
+                .market_data_instruments()
+                .pin_population_as_of(query, context.deadline(), context.cancellation())
+                .map_err(crate::application::research::map_market_definition_read_error)?;
+            if population.disposition()
+                != market_squawk_data::MarketDataInstrumentPopulationDisposition::Complete
+                || !population.exclusions().is_empty()
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            let [record] = population.records() else {
+                return Err(ServiceError::InvalidResult);
+            };
+            if record.definition().instrument_id() != instrument {
+                return Err(ServiceError::InvalidResult);
+            }
+            let prepared = self
+                .acquire_action_sources(
+                    std::slice::from_ref(record),
+                    start,
+                    quote_at,
+                    true,
+                    context,
+                )
+                .await?;
+            originals.push((instrument, prepared));
+        }
+        check(context)?;
+        Ok(PreparedFinancialShareSources {
+            originals,
+            ready_at: now()?,
+        })
+    }
+
+    /// Reopens acquired originals at each final actual market event. The read selection clock
+    /// must follow acquisition, while an authentic closing/last-trade event may be older.
+    pub(crate) async fn finish_financial_share_sources(
+        &self,
+        prepared: PreparedFinancialShareSources,
+        quotes: &[(InstrumentId, Timestamp, Timestamp)],
+        context: &RequestContext,
+    ) -> Result<Vec<super::super::SourceAppliedCorporateActionPlanReference>, ServiceError> {
+        check(context)?;
+        if quotes.len() != prepared.originals.len() || quotes.is_empty() || quotes.len() > 17 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let admitted_at = now()?;
+        let mut selected = std::collections::BTreeMap::new();
+        for &(instrument, effective_at, selected_at) in quotes {
+            if effective_at > selected_at
+                || selected_at < prepared.ready_at
+                || selected_at > admitted_at
+                || selected.insert(instrument, effective_at).is_some()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(quotes.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        for (instrument, original) in prepared.originals {
+            check(context)?;
+            let quote_at = selected
+                .remove(&instrument)
+                .ok_or(ServiceError::InvalidRequest)?;
+            let plan = self
+                .finish_current_action_sources(original, quote_at, context)
+                .await?;
+            plan.share_plan()
+                .map_err(|error| map_plan_error(error, context))?;
+            references.push(
+                plan.source_reference()
+                    .map_err(|_| ServiceError::InvalidResult)?,
+            );
+        }
+        check(context)?;
+        Ok(references)
+    }
+
     /// Acquires genuine source publications before the caller samples its current paper quote.
     pub(crate) async fn acquire_current_action_sources(
         &self,
@@ -26,10 +207,23 @@ impl SourceActionPreparationCapability {
         request_at: Timestamp,
         context: &RequestContext,
     ) -> Result<PreparedCurrentPaperSources, ServiceError> {
+        self.acquire_action_sources(instruments, bootstrap_at, request_at, false, context)
+            .await
+    }
+
+    async fn acquire_action_sources(
+        &self,
+        instruments: &[MarketDataInstrumentRecord],
+        bootstrap_at: Timestamp,
+        request_at: Timestamp,
+        completed_prefix: bool,
+        context: &RequestContext,
+    ) -> Result<PreparedCurrentPaperSources, ServiceError> {
         check(context)?;
         let started = now()?;
         if instruments.is_empty()
             || instruments.len() > 32
+            || (completed_prefix && instruments.len() != 1)
             || bootstrap_at > request_at
             || request_at > started
         {
@@ -84,13 +278,17 @@ impl SourceActionPreparationCapability {
             .len()
             .checked_mul(2)
             .ok_or(ServiceError::ResourceExhausted)?;
-        let maximum_dates = publication_limit
-            .checked_div(publications_per_date)
-            .ok_or(ServiceError::ResourceExhausted)?;
+        let maximum_dates = if completed_prefix {
+            64_000
+        } else {
+            publication_limit
+                .checked_div(publications_per_date)
+                .ok_or(ServiceError::ResourceExhausted)?
+        };
         let date_probe_limit = maximum_dates
             .checked_add(1)
             .ok_or(ServiceError::ResourceExhausted)?;
-        let dates: Vec<_> = calendar
+        let mut dates: Vec<_> = calendar
             .native_session_replay()
             .sessions()
             .iter()
@@ -105,6 +303,67 @@ impl SourceActionPreparationCapability {
             .outcome_history_activation
             .as_ref()
             .ok_or(ServiceError::Unavailable)?;
+        let mut histories = Vec::new();
+        if completed_prefix && dates.len() > 1 {
+            let end = dates[dates.len() - 2];
+            let session = calendar
+                .date_session_on(end, calendar_at, calendar_at)
+                .ok_or(ServiceError::Unavailable)?;
+            if session.closes_at_exclusive() > request_at {
+                return Err(ServiceError::Unavailable);
+            }
+            let record = &instruments[0];
+            let mut listings = record
+                .definition()
+                .venue_mappings()
+                .iter()
+                .filter(|mapping| matches!(mapping.venue_id().as_str(), "ARCX" | "XNYS" | "XNAS"));
+            let listing = listings.next().ok_or(ServiceError::Unavailable)?;
+            if listings.next().is_some() {
+                return Err(ServiceError::Unavailable);
+            }
+            let history_dates = (interval.0, end);
+            let publication = activation
+                .prepare_instrument_eod_history(
+                    record,
+                    listing.venue_id(),
+                    &self.calendars,
+                    history_dates,
+                    context,
+                )
+                .await?;
+            let history = self
+                .ingest
+                .read_complete_tiingo_eod_publication(
+                    &publication,
+                    record,
+                    listing.venue_id(),
+                    history_dates,
+                    &self.calendars,
+                    now()?,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await
+                .map_err(|error| {
+                    use crate::application::research::ingest::TiingoHistoryApplicationError as E;
+                    match error {
+                        E::Read(error) => map_analytical_error(error),
+                        E::Calendar(error) => map_calendar_error(error),
+                        E::Research(error) => map_research_error(error),
+                        E::Ingest(error) => map_ingest_error(error),
+                        _ => ServiceError::InvalidResult,
+                    }
+                })?;
+            histories
+                .try_reserve_exact(1)
+                .map_err(|_| ServiceError::ResourceExhausted)?;
+            histories.push(OriginalFinancialHistory::retain(&history)?);
+            drop(history);
+            let tail = *dates.last().ok_or(ServiceError::Unavailable)?;
+            dates.clear();
+            dates.push(tail);
+        }
         let tiingo = SourceId::try_from("tiingo-starter").map_err(|_| ServiceError::Internal)?;
         let maximum_publications = dates
             .len()
@@ -226,6 +485,7 @@ impl SourceActionPreparationCapability {
         Ok(PreparedCurrentPaperSources {
             source,
             publications,
+            histories,
             reference,
             requested,
             interval,
@@ -245,6 +505,7 @@ impl SourceActionPreparationCapability {
         let PreparedCurrentPaperSources {
             source,
             publications,
+            histories,
             reference,
             requested,
             interval,
@@ -316,8 +577,83 @@ impl SourceActionPreparationCapability {
                 .map_err(|_| ServiceError::ResourceExhausted)?;
             reads.push(read);
         }
+        let mut ordinary = Vec::new();
+        ordinary
+            .try_reserve_exact(histories.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        for original in histories {
+            check(context)?;
+            let request = market_squawk_data::CompleteMarketBarHistoryRequest::try_exact_nominal(
+                original.instrument,
+                original.dates.0,
+                original.dates.1,
+                original.provider,
+                original.venue,
+                original.feed,
+                original.interval,
+                market_squawk_domain::MarketBarAdjustment::Raw,
+                original.ruleset,
+                cutoff,
+                original.manifest,
+            )
+            .and_then(|request| request.try_with_surface_requirement(original.surface))
+            .map_err(|_| ServiceError::InvalidResult)?;
+            let history = self
+                .research
+                .analytical_reader()
+                .read_complete_market_bar_history_cursor(
+                    request,
+                    context.deadline(),
+                    context.cancellation().clone(),
+                )
+                .await
+                .map_err(map_analytical_error)?
+                .ok_or(ServiceError::Unavailable)?;
+            if history.selection().receipt().receipt_digest() != original.receipt_digest
+                || history.read_receipt().history_content_digest() != original.content_digest
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            let calendar = self
+                .calendars
+                .read_reference(
+                    &original.calendar,
+                    cutoff,
+                    context.deadline(),
+                    context.cancellation().clone(),
+                )
+                .await
+                .map_err(map_calendar_error)?
+                .ok_or(ServiceError::Unavailable)?;
+            let history = self
+                .research
+                .rejoin_market_history_native_sessions_with_calendar(
+                    history,
+                    &calendar,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await
+                .map_err(map_research_error)?;
+            let read = self
+                .research
+                .rejoin_tiingo_eod_history_actions(
+                    history,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await
+                .map_err(map_research_error)?;
+            ordinary.push((read, calendar));
+        }
         let plan = plan
-            .with_current_ordinary_reads(reads, bound, context.deadline(), context.cancellation())
+            .with_hybrid_ordinary_reads(
+                ordinary,
+                reads,
+                bound,
+                context.deadline(),
+                context.cancellation(),
+            )
             .map_err(|error| map_plan_error(error, context))?;
         let plan = self
             .reads
@@ -438,15 +774,22 @@ impl SourceActionPreparationCapability {
 impl SourceActionPreparationCapability {
     /// Paper retains the same acquisition and bounded original-source custody.
     pub(crate) async fn acquire_current_paper_sources(
-        &self, instruments: &[MarketDataInstrumentRecord], bootstrap_at: Timestamp,
-        request_at: Timestamp, context: &RequestContext,
+        &self,
+        instruments: &[MarketDataInstrumentRecord],
+        bootstrap_at: Timestamp,
+        request_at: Timestamp,
+        context: &RequestContext,
     ) -> Result<PreparedCurrentPaperSources, ServiceError> {
-        self.acquire_current_action_sources(instruments, bootstrap_at, request_at, context).await
+        self.acquire_current_action_sources(instruments, bootstrap_at, request_at, context)
+            .await
     }
     pub(crate) async fn finish_current_paper_sources(
-        &self, prepared: PreparedCurrentPaperSources, valuation_cutoff: Timestamp,
+        &self,
+        prepared: PreparedCurrentPaperSources,
+        valuation_cutoff: Timestamp,
         context: &RequestContext,
     ) -> Result<SourceAppliedCorporateActionPlan, ServiceError> {
-        self.finish_current_action_sources(prepared, valuation_cutoff, context).await
+        self.finish_current_action_sources(prepared, valuation_cutoff, context)
+            .await
     }
 }

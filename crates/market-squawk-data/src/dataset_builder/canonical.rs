@@ -106,7 +106,7 @@ pub(super) fn build_spec_digest(
     universe_digest: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-build-spec/v5");
+    hash.update(b"market-squawk/feature-label-build-spec/v6");
     if let Some(subject) = inputs.probability_subject() {
         hash.update(b"probability-subject-composition/v1\0");
         hash.update(subject.event.digest().bytes());
@@ -238,6 +238,7 @@ fn encode_build_limits(hash: &mut Sha256, limits: DatasetBuildLimits) {
     ] {
         put_len(hash, value);
     }
+    hash.update(limits.max_spill_bytes().to_be_bytes());
     hash.update(limits.max_duration().as_nanos().to_be_bytes());
 
     let point_in_time = limits.point_in_time();

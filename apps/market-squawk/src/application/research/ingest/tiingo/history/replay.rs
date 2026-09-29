@@ -1,7 +1,8 @@
 //! Reconstructs original native fields through the existing controlled raw-generation reader.
 
 use super::*;
-use market_squawk_data::CompleteMarketBarHistoryRequest;
+use crate::application::research::market_history::NativeSessionHistory;
+use market_squawk_data::{CompleteMarketBarHistoryCursor, CompleteMarketBarHistoryRequest};
 use market_squawk_domain::MarketBarAdjustment;
 use market_squawk_domain::{CalendarDate, InstrumentId, ProviderInstrumentId, VenueId};
 use serde::{Deserialize, Serialize};
@@ -311,7 +312,7 @@ impl ResearchService {
         reference: &TiingoCompletedEodHistoryReference,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<CompleteMarketBarHistoryCursor, ResearchServiceError> {
         let invalid = || ResearchServiceError::IngestAuthorityMismatch;
         reference.validate()?;
         let request = CompleteMarketBarHistoryRequest::try_exact_nominal(
@@ -331,7 +332,7 @@ impl ResearchService {
         .map_err(|_| invalid())?;
         let history = self
             .analytical_reader()
-            .read_complete_market_bar_history(request, deadline, cancellation.clone())
+            .read_complete_market_bar_history_cursor(request, deadline, cancellation.clone())
             .await
             .map_err(map_history_read_error)?
             .ok_or_else(invalid)?;
@@ -363,7 +364,7 @@ impl ResearchService {
         bytes: &[u8],
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+    ) -> Result<CompleteMarketBarHistoryCursor, ResearchServiceError> {
         let reference = TiingoCompletedEodHistoryReference::decode_canonical_bytes(bytes)?;
         self.read_tiingo_eod_history_reference(&reference, deadline, cancellation)
             .await
@@ -436,9 +437,9 @@ impl ResearchService {
 
     /// Joins only an existing sealed canonical output to its exact physically replayed source
     /// pages. Deserialized summaries, native payloads and action projections cannot mint this read.
-    pub(crate) async fn rejoin_tiingo_eod_history_actions(
+    pub(crate) async fn rejoin_tiingo_eod_history_actions<H: NativeSessionHistory>(
         &self,
-        history: CompleteMarketBarHistoryOutput,
+        history: H,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<TiingoCompletedEodActionRead, ResearchServiceError> {
@@ -451,62 +452,98 @@ impl ResearchService {
         .await
     }
 
-    pub(crate) async fn rejoin_tiingo_eod_history_actions_with_job_context(
+    pub(crate) async fn rejoin_tiingo_eod_history_actions_with_job_context<
+        H: NativeSessionHistory,
+    >(
         &self,
-        history: CompleteMarketBarHistoryOutput,
+        history: H,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
     ) -> Result<TiingoCompletedEodActionRead, ResearchServiceError> {
-        let manifest = history.selection().receipt().origin_manifest().clone();
-        self.read_provider_capture_generation_with_job_context(
-            job,
-            manifest,
-            deadline,
-            cancellation,
-            move |owned, store, control, analytical, _| {
-                let source = std::sync::Arc::new(
-                    analytical.rejoin_tiingo_eod_action_history(history, &owned, store, control)?,
-                );
-                let history = source.history();
-                let receipt = history.selection().receipt();
-                let invalid = || ResearchServiceError::IngestAuthorityMismatch;
-                let graph = receipt.date_windows().ok_or_else(invalid)?;
-                let (start, end) = graph.requested_dates();
-                let cutoff = source.knowledge_cutoff();
-                let first_date = graph
-                    .sessions()
-                    .first()
-                    .and_then(|session| session.time.nominal_daily_date())
-                    .ok_or_else(invalid)?;
-                let reference = TiingoCompletedEodHistoryReference {
-                    version: 1,
-                    selected_manifest: history.selection().pinned().manifest().clone(),
-                    publication_digest: receipt.receipt_digest(),
-                    binding_digest: source.binding().binding_digest(),
-                    knowledge_cutoff: cutoff,
-                    read_digest: history.read_receipt().source_result_digest(),
-                    instrument_id: receipt.instrument_id(),
-                    provider_instrument_id: receipt.provider_instrument_id().clone(),
-                    venue_id: receipt.venue_id().clone(),
-                    feed: receipt.feed().clone(),
-                    interval: receipt.interval().clone(),
-                    adjustment: receipt.adjustment(),
-                    surface_requirement: history.selection().surface_requirement(),
-                    start_date: start,
-                    end_date: end,
-                    ruleset: first_date.ruleset().clone(),
-                };
-                reference.validate()?;
-                Ok(TiingoCompletedEodActionRead { reference, source })
-            },
-        )
-        .await
+        let history = history
+            .into_native_cursor(self.analytical(), deadline, cancellation.clone())
+            .map_err(map_history_read_error)?;
+        let analytical = self.analytical_service();
+        let store = self.provider_capture_store();
+        let job_cancellation = job.map(|job| job.cancellation().clone());
+        self.run_owned_research_io(deadline, cancellation, move |worker_cancellation| {
+            let control = TiingoHistoryReplayControl {
+                deadline,
+                cancellation: worker_cancellation.clone(),
+                job_cancellation,
+            };
+            market_squawk_platform::ResearchObjectControl::checkpoint(
+                &control,
+                market_squawk_platform::ResearchObjectControlPoint::BeforeVerification,
+            )
+            .map_err(market_squawk_platform::SealedResearchJournalStoreError::ObjectControl)?;
+            let receipt = history.selection().receipt();
+            let manifest = receipt.origin_manifest();
+            let native = market_squawk_sources::ProviderNativeLineageSchema::for_implementation(
+                market_squawk_sources::ProviderNativeLineageImplementation::TiingoEodMarketBarV1,
+            );
+            let owned = analytical
+                .provider_logical_origin(
+                    manifest.dataset_id(),
+                    receipt.source_id(),
+                    native.fingerprint(),
+                    EvidenceDigest::new(
+                        market_squawk_domain::DigestAlgorithm::Sha256,
+                        receipt.binding_digest().bytes(),
+                    ),
+                    manifest.content_hash(),
+                    history.read_receipt().knowledge_cutoff(),
+                    deadline,
+                    &worker_cancellation,
+                )?
+                .ok_or(ResearchServiceError::IngestAuthorityMismatch)?;
+            let source = std::sync::Arc::new(analytical.rejoin_tiingo_eod_action_history(
+                history,
+                &owned,
+                store.as_ref(),
+                &control,
+                deadline,
+                worker_cancellation.clone(),
+            )?);
+            let history = source.history();
+            let receipt = history.selection().receipt();
+            let invalid = || ResearchServiceError::IngestAuthorityMismatch;
+            let graph = receipt.date_windows().ok_or_else(invalid)?;
+            let (start, end) = graph.requested_dates();
+            let cutoff = source.knowledge_cutoff();
+
+            let reference = TiingoCompletedEodHistoryReference {
+                version: 1,
+                selected_manifest: history.selection().pinned().manifest().clone(),
+                publication_digest: receipt.receipt_digest(),
+                binding_digest: source.binding().binding_digest(),
+                knowledge_cutoff: cutoff,
+                read_digest: history.read_receipt().source_result_digest(),
+                instrument_id: receipt.instrument_id(),
+                provider_instrument_id: receipt.provider_instrument_id().clone(),
+                venue_id: receipt.venue_id().clone(),
+                feed: receipt.feed().clone(),
+                interval: receipt.interval().clone(),
+                adjustment: receipt.adjustment(),
+                surface_requirement: history.selection().surface_requirement(),
+                start_date: start,
+                end_date: end,
+                ruleset: receipt.session_ruleset().clone(),
+            };
+            reference.validate()?;
+            Ok(TiingoCompletedEodActionRead { reference, source })
+        })
+        .await?
     }
 }
 
-fn map_history_read_error(error: market_squawk_data::AnalyticalReadError) -> ResearchServiceError {
-    use market_squawk_data::{AnalyticalReadError as E, DatasetBuildError, IngestError, QueryError as Q};
+pub(super) fn map_history_read_error(
+    error: market_squawk_data::AnalyticalReadError,
+) -> ResearchServiceError {
+    use market_squawk_data::{
+        AnalyticalReadError as E, DatasetBuildError, IngestError, QueryError as Q,
+    };
     match error {
         E::NativeSessionControl(control) => {
             market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(control).into()
@@ -514,10 +551,11 @@ fn map_history_read_error(error: market_squawk_data::AnalyticalReadError) -> Res
         E::Manifest(error) => error.into(),
         E::Parquet(error) => IngestError::Parquet(error).into(),
         E::PythonDataset(error) => DatasetBuildError::PythonDataset(error).into(),
-        E::InvalidLimit | E::InstrumentLimitExceeded | E::InvalidMarketBarLimit
-        | E::MarketBarResultRequiresInline | E::InputEpochResultRequiresInline => {
-            DatasetBuildError::LimitExceeded.into()
-        }
+        E::InvalidLimit
+        | E::InstrumentLimitExceeded
+        | E::InvalidMarketBarLimit
+        | E::MarketBarResultRequiresInline
+        | E::InputEpochResultRequiresInline => DatasetBuildError::LimitExceeded.into(),
         E::Query(error) => match error {
             Q::Cancelled => IngestError::Cancelled.into(),
             Q::DeadlineExceeded => IngestError::DeadlineExceeded.into(),
@@ -526,23 +564,32 @@ fn map_history_read_error(error: market_squawk_data::AnalyticalReadError) -> Res
             Q::ArrowConversion(error) => IngestError::Arrow(error).into(),
             // ResearchServiceError has no query carrier. Its existing dataset-bound variant
             // preserves resource classification without inventing a Parquet/source failure.
-            Q::InvalidLimits | Q::AstLimitExceeded | Q::PlanLimitExceeded | Q::PartitionLimitExceeded
-            | Q::RowLimitExceeded { .. } | Q::ByteLimitExceeded { .. } | Q::MemoryLimitExceeded { .. }
-            | Q::SizeOverflow | Q::DependencyAllocationContract | Q::BlockingTaskLimitExceeded
-            | Q::ReaderMemoryBoundExceeded | Q::ArtifactStoreRequired | Q::ArtifactAuthorityRequired => {
-                DatasetBuildError::LimitExceeded.into()
-            }
+            Q::InvalidLimits
+            | Q::AstLimitExceeded
+            | Q::PlanLimitExceeded
+            | Q::PartitionLimitExceeded
+            | Q::RowLimitExceeded { .. }
+            | Q::ByteLimitExceeded { .. }
+            | Q::MemoryLimitExceeded { .. }
+            | Q::SizeOverflow
+            | Q::DependencyAllocationContract
+            | Q::BlockingTaskLimitExceeded
+            | Q::ReaderMemoryBoundExceeded
+            | Q::ArtifactStoreRequired
+            | Q::ArtifactAuthorityRequired => DatasetBuildError::LimitExceeded.into(),
             _ => ResearchServiceError::IngestAuthorityMismatch,
         },
         _ => ResearchServiceError::IngestAuthorityMismatch,
     }
 }
 
-
 impl ProductionResearchIngestCoordinator {
     /// Reuses only a complete exact-source/date publication after reopening its original native
     /// fields and calendar. No source checkpoint is reset and no seal is made from a digest.
-    #[allow(clippy::too_many_arguments, reason = "independent identity, source, dates and calendar bounds")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent identity, source, dates and calendar bounds"
+    )]
     pub(crate) async fn reuse_complete_tiingo_eod_history(
         &self,
         record: &market_squawk_data::MarketDataInstrumentRecord,
@@ -556,44 +603,80 @@ impl ProductionResearchIngestCoordinator {
         cancellation: &CancellationToken,
     ) -> Result<Option<TiingoEodHistoryPublicationReceipt>, TiingoHistoryApplicationError> {
         let request = history_request(record, venue, dates, cutoff, None)?;
-        let Some(history) = self.research.analytical_reader()
-            .read_complete_market_bar_history(request, deadline, cancellation.clone()).await?
-        else { return Ok(None); };
+        let Some(history) = self
+            .research
+            .analytical_reader()
+            .read_complete_market_bar_history_cursor(request, deadline, cancellation.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
         if history.selection().receipt().source_id() != source_id {
             return Err(TiingoHistoryApplicationError::Admission);
         }
-        let history = attach_original_calendar(&self.research, history, calendars, cutoff, deadline, cancellation).await?;
-        let read = self.research.rejoin_tiingo_eod_history_actions(history, deadline, cancellation).await?;
+        let history = attach_original_calendar(
+            &self.research,
+            history,
+            calendars,
+            cutoff,
+            deadline,
+            cancellation,
+        )
+        .await?;
+        let read = self
+            .research
+            .rejoin_tiingo_eod_history_actions(history, deadline, cancellation)
+            .await?;
         if let Some(assertion) = required_cash_assertion {
-            let Some(unit) = read.actions().cash_unit() else { return Ok(None); };
-            if unit.status() != market_squawk_sources::MarketHistoryCashUnitStatus::ReviewedInference
+            let Some(unit) = read.actions().cash_unit() else {
+                return Ok(None);
+            };
+            if unit.status()
+                != market_squawk_sources::MarketHistoryCashUnitStatus::ReviewedInference
                 || unit.assertion().payload_evidence() != &assertion
                 || unit.instrument() != record.definition().instrument_id()
                 || unit.currency() != record.definition().quote_currency()
-            { return Ok(None); }
+            {
+                return Ok(None);
+            }
         }
         let binding = read.binding();
         let source = read.history().selection().receipt();
         // Reuse may not replace the source definition retained by the original history graph.
-        let graph = source.date_windows().ok_or(TiingoHistoryApplicationError::Admission)?;
-        if graph.instrument_revision_digest() != record.definition().reference_evidence().payload_evidence().content_digest() {
+        let graph = source
+            .date_windows()
+            .ok_or(TiingoHistoryApplicationError::Admission)?;
+        if graph.instrument_revision_digest()
+            != record
+                .definition()
+                .reference_evidence()
+                .payload_evidence()
+                .content_digest()
+        {
             return Ok(None);
         }
+        let native = market_squawk_sources::ProviderNativeLineageSchema::for_implementation(
+            market_squawk_sources::ProviderNativeLineageImplementation::TiingoEodMarketBarV1,
+        );
         Ok(Some(TiingoEodHistoryPublicationReceipt {
             restart: TiingoLatestRestartBinding {
                 manifest: read.history().selection().pinned().manifest().clone(),
                 binding_digest: binding.binding_digest(),
-                source_id: binding.capture().source_id().clone(),
-                expected_record_count: binding.record_count(),
-                native_schema_version: binding.native_lineage().version(),
-                native_schema_fingerprint: binding.native_lineage().fingerprint(),
+                source_id: binding.terminal().source_id().clone(),
+                expected_record_count: usize::try_from(binding.terminal().total_canonical_rows())
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+                native_schema_version: native.version(),
+                native_schema_fingerprint: native.fingerprint(),
             },
         }))
     }
 
     /// Exact immutable raw publication read with its original calendar attached. The returned
     /// data-owned output is consumed directly by source action preparation, never reconstructed.
-    #[allow(clippy::too_many_arguments, reason = "exact publication and independent source coordinates")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact publication and independent source coordinates"
+    )]
     pub(crate) async fn read_complete_tiingo_eod_publication(
         &self,
         publication: &TiingoEodHistoryPublicationReceipt,
@@ -604,19 +687,49 @@ impl ProductionResearchIngestCoordinator {
         cutoff: Timestamp,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<CompleteMarketBarHistoryOutput, TiingoHistoryApplicationError> {
-        let request = history_request(record, venue, dates, cutoff, Some(publication.manifest().clone()))?;
-        let history = self.research.analytical_reader()
-            .read_complete_market_bar_history(request, deadline, cancellation.clone()).await?
+    ) -> Result<CompleteMarketBarHistoryCursor, TiingoHistoryApplicationError> {
+        let request = history_request(
+            record,
+            venue,
+            dates,
+            cutoff,
+            Some(publication.manifest().clone()),
+        )?;
+        let history = self
+            .research
+            .analytical_reader()
+            .read_complete_market_bar_history_cursor(request, deadline, cancellation.clone())
+            .await?
             .ok_or(TiingoHistoryApplicationError::Admission)?;
-        if history.selection().receipt().binding_digest().bytes() != publication.binding_digest().bytes()
+        if history.selection().receipt().binding_digest().bytes()
+            != publication.binding_digest().bytes()
             || history.selection().receipt().source_id() != &publication.restart.source_id
-        { return Err(TiingoHistoryApplicationError::Admission); }
-        let graph = history.selection().receipt().date_windows().ok_or(TiingoHistoryApplicationError::Admission)?;
-        if graph.instrument_revision_digest() != record.definition().reference_evidence().payload_evidence().content_digest() {
+        {
             return Err(TiingoHistoryApplicationError::Admission);
         }
-        attach_original_calendar(&self.research, history, calendars, cutoff, deadline, cancellation).await
+        let graph = history
+            .selection()
+            .receipt()
+            .date_windows()
+            .ok_or(TiingoHistoryApplicationError::Admission)?;
+        if graph.instrument_revision_digest()
+            != record
+                .definition()
+                .reference_evidence()
+                .payload_evidence()
+                .content_digest()
+        {
+            return Err(TiingoHistoryApplicationError::Admission);
+        }
+        attach_original_calendar(
+            &self.research,
+            history,
+            calendars,
+            cutoff,
+            deadline,
+            cancellation,
+        )
+        .await
     }
 }
 
@@ -627,42 +740,108 @@ fn history_request(
     cutoff: Timestamp,
     exact: Option<DatasetManifestRef>,
 ) -> Result<CompleteMarketBarHistoryRequest, TiingoHistoryApplicationError> {
-    let mut mappings = record.definition().venue_mappings().iter().filter(|mapping| mapping.venue_id() == venue);
-    let mapping = mappings.next().ok_or(TiingoHistoryApplicationError::Admission)?;
-    if mappings.next().is_some() { return Err(TiingoHistoryApplicationError::Admission); }
-    let provider = ProviderInstrumentId::try_from(mapping.venue_symbol().as_str()).map_err(|_| TiingoHistoryApplicationError::Admission)?;
-    let identifier = |value| SourceIdentifier::try_from(value).map_err(|_| TiingoHistoryApplicationError::Admission);
+    let mut mappings = record
+        .definition()
+        .venue_mappings()
+        .iter()
+        .filter(|mapping| mapping.venue_id() == venue);
+    let mapping = mappings
+        .next()
+        .ok_or(TiingoHistoryApplicationError::Admission)?;
+    if mappings.next().is_some() {
+        return Err(TiingoHistoryApplicationError::Admission);
+    }
+    let provider = ProviderInstrumentId::try_from(mapping.venue_symbol().as_str())
+        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+    let identifier = |value| {
+        SourceIdentifier::try_from(value).map_err(|_| TiingoHistoryApplicationError::Admission)
+    };
     let request = if let Some(manifest) = exact {
         CompleteMarketBarHistoryRequest::try_exact_nominal(
-            record.definition().instrument_id(), dates.0, dates.1, provider, venue.clone(),
-            identifier("tiingo-starter-daily-eod-raw")?, identifier("tiingo-calendar-day")?,
-            MarketBarAdjustment::Raw, identifier("tiingo-eod-native-nominal-date-v1")?, cutoff, manifest,
+            record.definition().instrument_id(),
+            dates.0,
+            dates.1,
+            provider,
+            venue.clone(),
+            identifier("tiingo-starter-daily-eod-raw")?,
+            identifier("tiingo-calendar-day")?,
+            MarketBarAdjustment::Raw,
+            identifier("tiingo-eod-native-nominal-date-v1")?,
+            cutoff,
+            manifest,
         )
     } else {
         CompleteMarketBarHistoryRequest::try_latest_nominal(
-            record.definition().instrument_id(), dates.0, dates.1, provider, venue.clone(),
-            identifier("tiingo-starter-daily-eod-raw")?, identifier("tiingo-calendar-day")?,
-            MarketBarAdjustment::Raw, identifier("tiingo-eod-native-nominal-date-v1")?, cutoff,
+            record.definition().instrument_id(),
+            dates.0,
+            dates.1,
+            provider,
+            venue.clone(),
+            identifier("tiingo-starter-daily-eod-raw")?,
+            identifier("tiingo-calendar-day")?,
+            MarketBarAdjustment::Raw,
+            identifier("tiingo-eod-native-nominal-date-v1")?,
+            cutoff,
         )
-    }.map_err(|_| TiingoHistoryApplicationError::Admission)?;
+    }
+    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
     Ok(request)
 }
 
 async fn attach_original_calendar(
     research: &ResearchService,
-    history: CompleteMarketBarHistoryOutput,
+    history: CompleteMarketBarHistoryCursor,
     calendars: &crate::application::market_calendar::CompletedMarketSessionReadCapability,
     cutoff: Timestamp,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<CompleteMarketBarHistoryOutput, TiingoHistoryApplicationError> {
+) -> Result<CompleteMarketBarHistoryCursor, TiingoHistoryApplicationError> {
     use crate::application::market_calendar::CompletedMarketSessionReference;
-    let retained = history.selection().receipt().date_windows()
-        .ok_or(TiingoHistoryApplicationError::Admission)?.calendar();
+    let retained = history
+        .selection()
+        .receipt()
+        .date_windows()
+        .ok_or(TiingoHistoryApplicationError::Admission)?
+        .calendar();
     let reference = CompletedMarketSessionReference::try_from_retained_digests(
-        retained.origin_content_digest, retained.capture_binding_digest,
+        retained.origin_content_digest,
+        retained.capture_binding_digest,
     )?;
-    let calendar = calendars.read_reference(&reference, cutoff, deadline, cancellation.clone()).await?
+    let calendar = calendars
+        .read_reference(&reference, cutoff, deadline, cancellation.clone())
+        .await?
         .ok_or(TiingoHistoryApplicationError::Admission)?;
-    Ok(research.rejoin_market_history_native_sessions_with_calendar(history, &calendar, deadline, cancellation).await?)
+    Ok(research
+        .rejoin_market_history_native_sessions_with_calendar(
+            history,
+            &calendar,
+            deadline,
+            cancellation,
+        )
+        .await?)
+}
+
+struct TiingoHistoryReplayControl {
+    deadline: Instant,
+    cancellation: CancellationToken,
+    job_cancellation: Option<CancellationToken>,
+}
+impl market_squawk_platform::ResearchObjectControl for TiingoHistoryReplayControl {
+    fn checkpoint(
+        &self,
+        _: market_squawk_platform::ResearchObjectControlPoint,
+    ) -> Result<(), market_squawk_platform::ResearchObjectControlError> {
+        if self.cancellation.is_cancelled()
+            || self
+                .job_cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(market_squawk_platform::ResearchObjectControlError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(market_squawk_platform::ResearchObjectControlError::DeadlineExceeded);
+        }
+        Ok(())
+    }
 }

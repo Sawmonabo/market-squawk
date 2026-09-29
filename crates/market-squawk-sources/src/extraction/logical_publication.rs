@@ -5,6 +5,12 @@
 //! staging and immutable publication. Value claims remain restart evidence only. The final
 //! noncloneable binding is minted only from live, store-issued logical-object receipts.
 
+mod capture_pack;
+pub use capture_pack::{
+    PackedProviderCapture, PackedProviderCaptureBody, PendingProviderCapturePack,
+    ProviderCapturePackAccumulator, ProviderCapturePackSeal, SealedProviderCapturePack,
+};
+
 use std::{
     collections::BTreeSet,
     io::{Read, Write},
@@ -270,6 +276,52 @@ impl SealedLogicalObjectInput {
         })
     }
 
+    /// Consumes one complete capture authority and binds every ordered response body to a
+    /// verified logical payload object. The returned receipt is restart evidence only and
+    /// must be retained in the provider's logical metadata component, preserving graph topology.
+    pub fn try_from_whole_capture(
+        token: super::capture::ProviderWholeCaptureToken,
+        objects: Vec<VerifiedResearchObject>,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<
+        (Vec<Self>, super::capture::SealedProviderCaptureSetReceipt),
+        ProviderLogicalPublicationError,
+    > {
+        let receipt = token.persisted_receipt();
+        if objects.len() != receipt.capture().pages().len()
+            || objects.len() != receipt.segment().frames().len()
+            || objects.is_empty()
+            || objects.len() > MAX_PROVIDER_LOGICAL_OBJECTS
+        {
+            return Err(ProviderLogicalPublicationError::CaptureObjectMismatch);
+        }
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(objects.len())
+            .map_err(|_| ProviderLogicalPublicationError::Allocation)?;
+        for (ordinal, object) in objects.into_iter().enumerate() {
+            let ordinal = u16::try_from(ordinal)
+                .map_err(|_| ProviderLogicalPublicationError::OrdinalOverflow)?;
+            let frame = receipt
+                .row_frame(0, ordinal)
+                .map_err(|_| ProviderLogicalPublicationError::CaptureObjectMismatch)?;
+            let page = &receipt.capture().pages()[usize::from(ordinal)];
+            if page.body_bytes() != object.size_bytes()
+                || frame.page_body_digest() != object.content_digest()
+            {
+                return Err(ProviderLogicalPublicationError::CaptureObjectMismatch);
+            }
+            inputs.push(Self::try_from_verified(
+                LogicalObjectRole::ProviderPayload,
+                u32::from(ordinal),
+                receipt.receipt_digest(),
+                object,
+                control,
+            )?);
+        }
+        Ok((inputs, receipt.clone()))
+    }
+
     /// Returns the closed object role.
     pub const fn role(&self) -> LogicalObjectRole {
         self.role
@@ -303,6 +355,34 @@ pub struct SealedLogicalPartitionInput {
 }
 
 impl SealedLogicalPartitionInput {
+    /// Binds an existing immutable framed index without rewriting its bytes. Every ordinal,
+    /// frame length, terminal byte and physical digest is verified before authority is issued.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_framed_object(
+        family: LogicalPartitionFamily,
+        partition_ordinal: u32,
+        item_range: LogicalItemRange,
+        schema_identity: EvidenceDigest,
+        maximum_frame_bytes: u64,
+        mut object: VerifiedResearchObject,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<Self, ProviderLogicalPublicationError> {
+        use std::io::{Seek as _, SeekFrom};
+        if maximum_frame_bytes == 0 {
+            return Err(ProviderLogicalPublicationError::InvalidAdmission);
+        }
+        object.seek(SeekFrom::Start(0))?;
+        verify_partition_frames(&mut object, item_range, maximum_frame_bytes, control)?;
+        let receipt = object.reverify_for_commit(control)?;
+        Self::try_from_verified(
+            family,
+            partition_ordinal,
+            item_range,
+            schema_identity,
+            receipt,
+        )
+    }
+
     fn try_from_verified(
         family: LogicalPartitionFamily,
         partition_ordinal: u32,
@@ -853,6 +933,7 @@ impl PendingLogicalPartitionSet {
                 &mut verified,
                 claimed.item_range,
                 admission.maximum_frame_bytes,
+                control,
             )?;
             let receipt = verified.reverify_for_commit(control)?;
             let input = SealedLogicalPartitionInput::try_from_verified(
@@ -1120,7 +1201,12 @@ impl PendingLogicalPartitionSet {
             .ok_or(ProviderLogicalPublicationError::EmptyPartitionSet)?;
         let range = LogicalItemRange::try_new(self.current_first_ordinal, item_count)?;
         let mut verified = store.finish_logical_object(pending, control)?;
-        verify_partition_frames(&mut verified, range, self.admission.maximum_frame_bytes)?;
+        verify_partition_frames(
+            &mut verified,
+            range,
+            self.admission.maximum_frame_bytes,
+            control,
+        )?;
         let receipt = verified.reverify_for_commit(control)?;
         let partition = SealedLogicalPartitionInput::try_from_verified(
             self.family,
@@ -1252,6 +1338,9 @@ pub enum ProviderLogicalPublicationError {
     /// A prior partial write made the current stage unusable except for abort/recovery.
     #[error("logical partition stage is poisoned after a partial write")]
     Poisoned,
+    /// A captured physical response and its logical payload object differed.
+    #[error("captured response does not match the verified logical payload object")]
+    CaptureObjectMismatch,
     /// Internal single-owner state was inconsistent.
     #[error("logical publication state is inconsistent")]
     StateConflict,
@@ -1422,12 +1511,20 @@ fn verify_partition_frames(
     object: &mut VerifiedResearchObject,
     range: LogicalItemRange,
     maximum_frame_bytes: u64,
+    control: &dyn ResearchObjectControl,
 ) -> Result<(), ProviderLogicalPublicationError> {
     let mut expected_ordinal = range.first_ordinal;
     let end = range.end_exclusive()?;
     let mut observed_bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     while expected_ordinal < end {
+        control
+            .checkpoint(
+                market_squawk_platform::ResearchObjectControlPoint::BeforeVerificationChunk {
+                    offset_bytes: observed_bytes,
+                },
+            )
+            .map_err(SealedResearchJournalStoreError::ObjectControl)?;
         let mut header = [0_u8; 16];
         object.read_exact(&mut header)?;
         observed_bytes = observed_bytes
@@ -1449,6 +1546,13 @@ fn verify_partition_frames(
         }
         let mut remaining = payload_bytes;
         while remaining > 0 {
+            control
+                .checkpoint(
+                    market_squawk_platform::ResearchObjectControlPoint::BeforeVerificationChunk {
+                        offset_bytes: observed_bytes + payload_bytes - remaining,
+                    },
+                )
+                .map_err(SealedResearchJournalStoreError::ObjectControl)?;
             let read = usize::try_from(remaining)
                 .unwrap_or(usize::MAX)
                 .min(buffer.len());

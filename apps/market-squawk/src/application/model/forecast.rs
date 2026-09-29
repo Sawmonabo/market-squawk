@@ -2,7 +2,6 @@
 
 use std::{
     num::{NonZeroU64, NonZeroUsize},
-    path::Path,
     sync::Arc,
 };
 
@@ -19,7 +18,6 @@ use market_squawk_modeling::{
     ForecastMeasurement, ForecastOutcome, ForecastOutputBinding, ForecastPath,
     ForecastTargetMeaning, ForecastValue, ForecastVintage, ModelMetadata,
 };
-use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReadContext,
     ArtifactReadRequest, ArtifactReference, ArtifactRepository, RequestContext, ServiceError,
@@ -38,14 +36,14 @@ use persistence::{
 
 use super::{
     ForecastModelEvidenceProjection, ModelDomainService,
-    runtime::{
-        ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
-        RetainedRuntimeBackup,
-    },
+    runtime::{ProductionModelRuntime, ProductionModelRuntimeError, RetainedRuntimeBackup},
 };
 
 mod chart_history;
-pub(crate) use chart_history::{SavedForecastChart, replay_price_history, replay_price_history_inputs};
+pub(crate) use chart_history::{
+    SavedForecastChart, authorize_projection_parents, chart_quality, chart_storage_error,
+    read_chart_display, read_chart_display_from_catalog, replay_price_history_inputs,
+};
 mod current_input;
 mod distribution;
 pub(crate) use current_input::{
@@ -56,7 +54,11 @@ mod generation;
 mod outcome;
 pub(crate) use outcome::EventOutcomePreparation;
 pub(super) use outcome::prepare_event as prepare_event_outcome;
+mod inventory;
 pub(in crate::application::model) mod persistence;
+use market_squawk_data::{
+    ForecastInventoryCatalogCapability, ForecastInventoryHead, ForecastInventoryLookup,
+};
 pub(super) use persistence::event_product_value;
 mod price;
 mod snapshot;
@@ -68,7 +70,8 @@ pub(crate) use generation::{
 };
 pub(crate) use outcome::{ForecastOutcomeMeasurement, ForecastOutcomePreparationOrigin};
 pub(crate) use snapshot::{
-    ForecastStudyRuntimeReference, HistoricalFinancialForecast, HistoricalPriceForecast, SelectedForecastRuntime,
+    ForecastStudyRuntimeReference, HistoricalFinancialForecast, HistoricalPriceForecast,
+    SelectedForecastRuntime,
 };
 
 /// Job authority claimed at the existing durable forecast-index commit boundary.
@@ -125,13 +128,10 @@ pub const LIST_FORECASTS: &str = "Model.ListForecasts";
 /// Reads bounded immutable outcomes appended to one vintage.
 pub const GET_FORECAST_OUTCOMES: &str = "Model.GetForecastOutcomes";
 
-const INDEX_SCHEMA_VERSION: u32 = 6;
 const FORECAST_PAYLOAD_SCHEMA_VERSION: u32 = 6;
-const MAXIMUM_VINTAGES: usize = 100_000;
-const MAXIMUM_OUTCOMES: usize = 1_000_000;
 const MAXIMUM_DRIFT_OUTCOMES: usize = 4_096;
 pub(crate) const MAXIMUM_FORECAST_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
-const FORECAST_SELECTION_POLICY_REVISION: u32 = 4;
+const FORECAST_SELECTION_POLICY_REVISION: u32 = 5;
 
 const MAXIMUM_PRODUCT_INVESTMENT_NAME_BYTES: usize = 240;
 const MAXIMUM_PRODUCT_INVESTMENT_SYMBOL_BYTES: usize = 64;
@@ -268,13 +268,19 @@ impl ForecastProductTarget {
             unit_label,
             currency_code,
             event: match target {
-                ForecastTargetMeaning::FixedHorizonEvent { horizon_nanos, origin_basis, event } => Some(event_product_value(horizon_nanos, origin_basis, event)),
+                ForecastTargetMeaning::FixedHorizonEvent {
+                    horizon_nanos,
+                    origin_basis,
+                    event,
+                } => Some(event_product_value(horizon_nanos, origin_basis, event)),
                 _ => None,
             },
         })
     }
 
-    pub(crate) fn event(&self) -> Option<&Value> { self.event.as_ref() }
+    pub(crate) fn event(&self) -> Option<&Value> {
+        self.event.as_ref()
+    }
 
     pub(crate) fn label(&self) -> &str {
         &self.label
@@ -880,7 +886,7 @@ struct ForecastSelectionReceiptBody {
     instrument_id: InstrumentId,
     as_of_unix_nanos: i64,
     considered_vintage_count: usize,
-    retained_vintage_hard_ceiling: usize,
+    inventory_vintage_count: usize,
     eligible_vintage_count: usize,
     competing_eligible_vintage_count: usize,
     selection_complete: bool,
@@ -953,10 +959,10 @@ impl ForecastSelectionReceipt {
         self.body.considered_vintage_count
     }
 
-    /// Hard retained ceiling under which the complete selection was performed.
+    /// Exact immutable inventory population bound to this selection.
     #[must_use]
-    pub(crate) const fn retained_vintage_hard_ceiling(&self) -> usize {
-        self.body.retained_vintage_hard_ceiling
+    pub(crate) const fn inventory_vintage_count(&self) -> usize {
+        self.body.inventory_vintage_count
     }
 
     /// Number of exact-instrument, available, published, nonexpired vintages satisfying the
@@ -1057,7 +1063,7 @@ fn forecast_selection_receipt_digest(
     update_receipt_digest_field(
         &mut digest,
         b"domain",
-        b"market-squawk/forecast-selection-receipt/v4",
+        b"market-squawk/forecast-selection-receipt/v5",
     )?;
     update_receipt_digest_field(
         &mut digest,
@@ -1084,8 +1090,8 @@ fn forecast_selection_receipt_digest(
     )?;
     update_receipt_digest_count(
         &mut digest,
-        b"retained_vintage_hard_ceiling",
-        body.retained_vintage_hard_ceiling,
+        b"inventory_vintage_count",
+        body.inventory_vintage_count,
     )?;
     update_receipt_digest_count(
         &mut digest,
@@ -1931,11 +1937,21 @@ pub(crate) struct ReopenedProbabilityForecast {
     serving_evidence: ForecastServingEvidence,
 }
 impl ReopenedProbabilityForecast {
-    pub(crate) const fn vintage(&self) -> &ForecastVintage { &self.vintage }
-    pub(crate) const fn model_metadata(&self) -> &ModelMetadata { &self.model_metadata }
-    pub(crate) fn source_knowledge_cutoff(&self) -> Timestamp { self.serving_evidence.knowledge_cutoff() }
-    pub(crate) fn source_selection_sha256(&self) -> Sha256Digest { self.serving_evidence.selection_sha256() }
-    pub(crate) fn source_feature_sha256(&self) -> Sha256Digest { self.serving_evidence.feature_sha256() }
+    pub(crate) const fn vintage(&self) -> &ForecastVintage {
+        &self.vintage
+    }
+    pub(crate) const fn model_metadata(&self) -> &ModelMetadata {
+        &self.model_metadata
+    }
+    pub(crate) fn source_knowledge_cutoff(&self) -> Timestamp {
+        self.serving_evidence.knowledge_cutoff()
+    }
+    pub(crate) fn source_selection_sha256(&self) -> Sha256Digest {
+        self.serving_evidence.selection_sha256()
+    }
+    pub(crate) fn source_feature_sha256(&self) -> Sha256Digest {
+        self.serving_evidence.feature_sha256()
+    }
 }
 
 /// Least-authority typed forecast read retained before model service trait erasure.
@@ -1961,7 +1977,10 @@ pub(crate) trait ForecastEvidenceReader: Send + Sync {
 
     /// Reopens one original current source and exact target before later source acquisition.
     async fn exact_probability_for_vintage(
-        &self, forecast_token: Uuid, as_of: Timestamp, context: ForecastEvidenceReadContext,
+        &self,
+        forecast_token: Uuid,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
     ) -> Result<ReopenedProbabilityForecast, ForecastApplicationError>;
 
     async fn outcome_preparation_origin(
@@ -2009,48 +2028,12 @@ pub(crate) trait ForecastEvidenceReader: Send + Sync {
     ) -> Result<LatestValidForecast, ForecastApplicationError>;
 }
 
-/// Closed storage and result ceilings for one installed forecast authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ForecastApplicationLimits {
-    maximum_vintages: NonZeroUsize,
-    maximum_outcomes: NonZeroUsize,
-    maximum_index_bytes: NonZeroUsize,
-}
-
-impl ForecastApplicationLimits {
-    /// Constructs hard retained-index ceilings.
-    pub fn try_new(
-        maximum_vintages: NonZeroUsize,
-        maximum_outcomes: NonZeroUsize,
-        maximum_index_bytes: NonZeroUsize,
-    ) -> Result<Self, ForecastApplicationError> {
-        if maximum_vintages.get() > MAXIMUM_VINTAGES
-            || maximum_outcomes.get() > MAXIMUM_OUTCOMES
-            || maximum_index_bytes.get() > LocalAuthorityStateStore::maximum_payload_bytes()
-        {
-            return Err(ForecastApplicationError::InvalidLimits);
-        }
-        Ok(Self {
-            maximum_vintages,
-            maximum_outcomes,
-            maximum_index_bytes,
-        })
-    }
-
-    /// Maximum result rows a caller may request from this authority.
-    #[must_use]
-    pub const fn maximum_vintages(self) -> NonZeroUsize {
-        self.maximum_vintages
-    }
-}
-
 /// Sole append authority for durable immutable forecast records.
 pub struct ForecastApplicationService {
-    store: LocalAuthorityStateStore,
-    index: Mutex<ForecastIndex>,
+    catalog: ForecastInventoryCatalogCapability,
+    charts: market_squawk_data::ChartProjectionCatalogCapability,
     publication: Mutex<()>,
     artifacts: Arc<dyn ArtifactRepository>,
-    limits: ForecastApplicationLimits,
 }
 
 /// Bounded collection content plus the complete logical population count.
@@ -2083,50 +2066,93 @@ impl ForecastCollection {
 
 pub(super) struct RetainedForecastBackup {
     pub(super) runtime: RetainedRuntimeBackup,
+    /// Canonical immutable inventory fence, independent of history length.
     pub(super) canonical_index: Box<[u8]>,
-    pub(super) artifact_references: Vec<ArtifactReference>,
+    inventory: inventory::ForecastBackupInventory,
 }
 
+pub(super) struct ForecastBackupRecord {
+    pub(super) kind: u8,
+    pub(super) sequence: u64,
+    pub(super) record: Box<[u8]>,
+    pub(super) artifact: ArtifactReference,
+}
+
+impl ForecastBackupRecord {
+    pub(super) fn decode(
+        kind: u8,
+        sequence: u64,
+        record: Box<[u8]>,
+    ) -> Result<Self, ForecastApplicationError> {
+        if sequence == 0 {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let artifact = match kind {
+            1 => persistence::StoredVintageRecord::decode(&record)?.artifact_reference()?,
+            2 => {
+                let outcome: OutcomeRecord = serde_json::from_slice(&record)
+                    .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+                outcome.artifact_reference()?
+            }
+            _ => return Err(ForecastApplicationError::InvalidRecord),
+        };
+        Ok(Self {
+            kind,
+            sequence,
+            record,
+            artifact,
+        })
+    }
+}
+impl RetainedForecastBackup {
+    pub(super) fn page(
+        &self,
+        kind: u8,
+        after: u64,
+    ) -> Result<Vec<ForecastBackupRecord>, ForecastApplicationError> {
+        let page = match kind {
+            1 => self
+                .inventory
+                .catalog
+                .vintages(self.inventory.head, after, 32, false, None)?,
+            2 => self
+                .inventory
+                .catalog
+                .outcomes(self.inventory.head, after, 32, None)?,
+            _ => return Err(ForecastApplicationError::InvalidRecord),
+        };
+        page.into_iter()
+            .map(|(sequence, record)| ForecastBackupRecord::decode(kind, sequence, record))
+            .collect()
+    }
+}
 impl std::fmt::Debug for RetainedForecastBackup {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RetainedForecastBackup")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedForecastBackup")
             .field("runtime", &self.runtime)
-            .field("canonical_index", &"[CANONICAL FORECAST INDEX]")
-            .field("artifact_count", &self.artifact_references.len())
+            .field("head", &self.inventory.head)
             .finish()
     }
 }
 
 impl ForecastApplicationService {
-    /// Opens and semantically verifies the complete durable forecast index.
+    /// Opens the shared immutable forecast inventory; selected artifacts are verified on demand.
     pub fn try_open(
-        root: impl AsRef<Path>,
+        catalog: ForecastInventoryCatalogCapability,
+        charts: market_squawk_data::ChartProjectionCatalogCapability,
         artifacts: Arc<dyn ArtifactRepository>,
-        limits: ForecastApplicationLimits,
     ) -> Result<Self, ForecastApplicationError> {
-        let store = LocalAuthorityStateStore::try_open(root)?;
-        let index = match store.load()? {
-            Some(payload) => serde_json::from_slice::<ForecastIndex>(&payload)
-                .map_err(|_error| ForecastApplicationError::CorruptIndex)?,
-            None => ForecastIndex::default(),
-        };
-        index.validate(limits)?;
+        catalog.head()?;
         Ok(Self {
-            store,
-            index: Mutex::new(index),
+            catalog,
+            charts,
             publication: Mutex::new(()),
             artifacts,
-            limits,
         })
     }
 
     pub(super) fn artifact_repository(&self) -> Arc<dyn ArtifactRepository> {
         Arc::clone(&self.artifacts)
-    }
-
-    pub(super) const fn backup_limits(&self) -> ForecastApplicationLimits {
-        self.limits
     }
 
     /// Publishes one complete path, then durably appends its immutable vintage record.
@@ -2158,9 +2184,20 @@ impl ForecastApplicationService {
             guard = self.publication.lock() => guard,
         };
         context.ensure_live()?;
-        if let Some(existing) = self.vintage_for_request(request_hash).await {
+        if let Some(existing) = self
+            .vintage_for_request(
+                request_hash,
+                &ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+            )
+            .await?
+        {
             let artifact = self.read_vintage_artifact(&existing, &context).await?;
-            let content = self.get_forecast_by_identity(&existing.vintage_id).await?;
+            let content = self
+                .get_forecast_by_identity(
+                    &existing.vintage_id,
+                    &ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+                )
+                .await?;
             let result = project(content, artifact)?;
             context.ensure_live()?;
             if let Some(precommit) = precommit {
@@ -2190,32 +2227,20 @@ impl ForecastApplicationService {
             .map_err(|_error| ForecastApplicationError::InvalidRecord)?;
         let record = VintageRecord::from_publication(request_hash, &vintage, payload, &artifact)?;
         // Construct and bound the complete transport result before claiming terminal authority.
-        let content = {
-            let index = self.index.lock().await;
-            record.product_detail(drift_monitoring_value(&index, &record)?)?
-        };
+        let index = self.index_for_vintage(record.clone())?;
+        let content = record.product_detail(drift_monitoring_value(&index, &record)?)?;
         let result = project(content, artifact)?;
-        self.commit_with_precommit(
-            |index| {
-                match index
-                    .vintages
-                    .iter()
-                    .find(|existing| existing.request_hash == record.request_hash)
-                {
-                    Some(existing) if existing == &record => return Ok(false),
-                    Some(_) => return Err(ForecastApplicationError::Conflict),
-                    None => {}
-                }
-                if index.vintages.len() >= self.limits.maximum_vintages.get() {
-                    return Err(ForecastApplicationError::Capacity);
-                }
-                index.vintages.push(record.clone());
-                Ok(true)
-            },
-            precommit,
-            Some(&context),
-        )
-        .await?;
+        let chart = record.publish_chart(&self.charts, &context)?;
+        context.ensure_live()?;
+        if let Some(precommit) = precommit {
+            precommit.validate_precommit()?;
+        }
+        self.catalog.publish_vintage(
+            &persistence::StoredVintageRecord::from_vintage(&record, chart)?.envelope()?,
+        )?;
+        if let Some(precommit) = precommit {
+            precommit.commit_succeeded();
+        }
         Ok(result)
     }
 
@@ -2223,185 +2248,248 @@ impl ForecastApplicationService {
     async fn append_outcome(
         &self,
         outcome: &ForecastOutcome,
+        vintage: &VintageRecord,
         measurement_artifact: &ArtifactReference,
         recorded_at: Timestamp,
     ) -> Result<(), ForecastApplicationError> {
-        self.commit(|index| {
-            let vintage_id = hex(outcome.vintage_id().bytes());
-            let vintage = index
-                .vintages
-                .iter()
-                .find(|value| value.vintage_id == vintage_id)
-                .ok_or(ForecastApplicationError::NotFound)?;
-            let record =
-                OutcomeRecord::from_outcome(outcome, vintage, measurement_artifact, recorded_at)?;
-            match index.outcomes.iter().find(|existing| *existing == &record) {
-                Some(_) => return Ok(false),
-                None if index.outcomes.iter().any(|existing| {
-                    existing.id() == record.id() || existing.same_target(&record)
-                }) =>
-                {
-                    return Err(ForecastApplicationError::Conflict);
-                }
-                None => {}
-            }
-            if index.outcomes.len() >= self.limits.maximum_outcomes.get() {
-                return Err(ForecastApplicationError::Capacity);
-            }
-            index.outcomes.push(record);
-            Ok(true)
-        })
-        .await
+        let record =
+            OutcomeRecord::from_outcome(outcome, vintage, measurement_artifact, recorded_at)?;
+        let envelope = record.envelope()?;
+        OutcomeRecord::decode(&envelope.record, vintage)?;
+        self.catalog.publish_outcome(&envelope)?;
+        Ok(())
     }
 
     /// Returns an investment-facing projection for one opaque forecast token.
-    pub async fn get_forecast(&self, token: &str) -> Result<Value, ForecastApplicationError> {
-        let token = Uuid::parse_str(token).map_err(|_| ForecastApplicationError::InvalidRecord)?;
-        let index = self.index.lock().await;
-        let vintage = product_vintage(&index, token)?;
-        vintage.product_detail(drift_monitoring_value(&index, vintage)?)
+    pub async fn get_forecast(
+        &self,
+        token: &str,
+        context: &ArtifactReadContext,
+    ) -> Result<Value, ForecastApplicationError> {
+        let parsed = Uuid::parse_str(token).map_err(|_| ForecastApplicationError::InvalidRecord)?;
+        if parsed.to_string() != token {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        self.stored_detail(ForecastInventoryLookup::Token(token), context)
     }
 
-    /// Lists newest stored vintages first under the lower caller/storage ceiling.
     pub(super) async fn list_forecasts(
         &self,
         maximum: NonZeroUsize,
+        cursor: Option<&str>,
     ) -> Result<ForecastCollection, ForecastApplicationError> {
-        let maximum = maximum.get().min(self.limits.maximum_vintages.get());
-        let index = self.index.lock().await;
-        let available = index.vintages.len();
-        let records = index
-            .vintages
-            .iter()
-            .rev()
-            .take(maximum)
-            .map(VintageRecord::product_summary)
-            .collect::<Result<Vec<_>, _>>()?;
-        let returned = records.len();
+        let (fence, mut after) = forecast_page_position(&self.catalog, cursor, None)?;
+        let mut values = Vec::new();
+        let maximum = maximum.get().min(100);
+        while values.len() < maximum {
+            let page = self.catalog.vintages(
+                fence,
+                after,
+                (maximum - values.len()).min(32),
+                true,
+                None,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for (sequence, bytes) in page {
+                after = sequence;
+                values.push(persistence::StoredVintageRecord::decode(&bytes)?.summary);
+            }
+        }
+        let next = if after > 1 && !values.is_empty() {
+            Some(forecast_page_cursor(fence, after, None)?)
+        } else {
+            None
+        };
+        let returned = values.len();
         ForecastCollection::try_new(
-            json!({
-                "forecasts": records,
-                "available": available,
-                "truncated": returned < available,
-            }),
+            json!({"forecasts":values,"nextCursor":next}),
             returned,
-            available,
+            returned,
         )
     }
 
-    /// Returns immutable stored outcomes for one exact vintage.
     pub(super) async fn get_forecast_outcomes(
         &self,
         token: &str,
         maximum: NonZeroUsize,
+        cursor: Option<&str>,
+        context: &ArtifactReadContext,
     ) -> Result<ForecastCollection, ForecastApplicationError> {
-        let token = Uuid::parse_str(token).map_err(|_| ForecastApplicationError::InvalidRecord)?;
-        let index = self.index.lock().await;
-        let vintage = product_vintage(&index, token)?;
-        let available = index
-            .outcomes
-            .iter()
-            .filter(|value| value.vintage_id == vintage.vintage_id)
-            .count();
-        let outcomes = index
-            .outcomes
-            .iter()
-            .filter(|value| value.vintage_id == vintage.vintage_id)
-            .take(maximum.get().min(self.limits.maximum_outcomes.get()))
-            .map(|outcome| vintage.product_outcome(outcome))
-            .collect::<Result<Vec<_>, _>>()?;
-        let returned = outcomes.len();
+        let parsed = Uuid::parse_str(token).map_err(|_| ForecastApplicationError::InvalidRecord)?;
+        let (fence, mut after) = forecast_page_position(&self.catalog, cursor, Some(token))?;
+        let bytes = self
+            .catalog
+            .get(fence, ForecastInventoryLookup::Token(token))?
+            .ok_or(ForecastApplicationError::NotFound)?;
+        context.ensure_live()?;
+        let vintage = persistence::StoredVintageRecord::decode(&bytes)?;
+        let maximum = maximum.get().min(100);
+        let mut values = Vec::new();
+        while values.len() < maximum {
+            context.ensure_live()?;
+            let page = self.catalog.outcomes(
+                fence,
+                after,
+                (maximum - values.len()).min(32),
+                Some(&vintage.vintage_id),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            for (sequence, bytes) in page {
+                after = sequence;
+                let outcome = OutcomeRecord::decode_stored(&bytes)?;
+                values.push(vintage.product_outcome(&outcome)?);
+            }
+        }
+        let more = !self
+            .catalog
+            .outcomes(fence, after, 1, Some(&vintage.vintage_id))?
+            .is_empty();
+        let next = if more {
+            Some(forecast_page_cursor(fence, after, Some(token))?)
+        } else {
+            None
+        };
+        let returned = values.len();
         ForecastCollection::try_new(
-            json!({
-                "forecastToken": token,
-                "outcomes": outcomes,
-                "available": available,
-                "truncated": returned < available,
-            }),
+            json!({"forecastToken":parsed,"outcomes":values,"nextCursor":next}),
             returned,
-            available,
+            returned,
         )
     }
 
     async fn get_forecast_by_identity(
         &self,
         identity: &str,
+        context: &ArtifactReadContext,
     ) -> Result<Value, ForecastApplicationError> {
-        let index = self.index.lock().await;
-        let vintage = index
-            .vintages
-            .iter()
-            .find(|value| value.vintage_id == identity)
-            .ok_or(ForecastApplicationError::NotFound)?;
-        vintage.product_detail(drift_monitoring_value(&index, vintage)?)
+        self.stored_detail(ForecastInventoryLookup::Vintage(identity), context)
     }
 
     pub(super) async fn retain_backup_with_runtime(
         &self,
         runtime: Option<&ProductionModelRuntime>,
-        runtime_limits: ProductionModelRuntimeLimits,
     ) -> Result<RetainedForecastBackup, ForecastBackupCaptureError> {
-        let index = self.index.lock().await;
-        let canonical_index = index.canonical_bytes(self.limits)?.into_boxed_slice();
-        let artifact_references = index.artifact_references()?;
+        let head = self
+            .catalog
+            .head()
+            .map_err(ForecastApplicationError::from)?;
         let runtime = match runtime {
             Some(runtime) => runtime.retain_backup()?,
-            None => ProductionModelRuntime::empty_backup(runtime_limits)?,
+            None => ProductionModelRuntime::empty_backup()?,
         };
-        let runtime_coordinates = runtime
-            .models
-            .iter()
-            .map(|(coordinate, _bundle)| {
-                (
-                    coordinate.model_id.to_string(),
-                    coordinate.bundle_id.as_str().to_owned(),
-                    coordinate.bundle_version.get(),
-                )
-            })
-            .collect::<Vec<_>>();
-        if index.model_coordinates().any(|coordinate| {
-            !runtime_coordinates.iter().any(|candidate| {
-                candidate.0 == coordinate.0
-                    && candidate.1 == coordinate.1
-                    && candidate.2 == coordinate.2
-            })
-        }) {
-            return Err(ForecastBackupCaptureError::ModelCoordinateMismatch);
+        let mut after = 0;
+        loop {
+            let page = self
+                .catalog
+                .vintages(head, after, 32, false, None)
+                .map_err(ForecastApplicationError::from)?;
+            if page.is_empty() {
+                break;
+            }
+            for (sequence, bytes) in page {
+                let stored = persistence::StoredVintageRecord::decode(&bytes)?;
+                let (model, bundle, version) = stored.model_coordinate();
+                if !runtime.contains(model, bundle, version)? {
+                    return Err(ForecastBackupCaptureError::ModelCoordinateMismatch);
+                }
+                after = sequence;
+            }
         }
         Ok(RetainedForecastBackup {
             runtime,
-            canonical_index,
-            artifact_references,
+            canonical_index: serde_json::to_vec(&head)
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?
+                .into_boxed_slice(),
+            inventory: inventory::ForecastBackupInventory {
+                catalog: self.catalog.clone(),
+                head,
+            },
         })
     }
 
-    pub(super) fn stage_backup_index(
-        root: impl AsRef<Path>,
-        canonical_index: &[u8],
-        expected_artifacts: &[ArtifactReference],
-        limits: ForecastApplicationLimits,
+    pub(super) fn validate_backup_head(
+        catalog: &ForecastInventoryCatalogCapability,
+        bytes: &[u8],
     ) -> Result<(), ForecastApplicationError> {
-        let index = ForecastIndex::decode_canonical(canonical_index, limits)?;
-        if index.artifact_references()? != expected_artifacts {
+        let head: ForecastInventoryHead =
+            serde_json::from_slice(bytes).map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        if serde_json::to_vec(&head).map_err(|_| ForecastApplicationError::CorruptIndex)? != bytes
+            || catalog.head()? != head
+        {
             return Err(ForecastApplicationError::CorruptIndex);
         }
-        let store = LocalAuthorityStateStore::try_open(root)?;
-        if store.load()?.is_some() {
-            return Err(ForecastApplicationError::RestoreTargetNotFresh);
+        Ok(())
+    }
+    pub(super) async fn stage_backup_record(
+        &self,
+        row: &ForecastBackupRecord,
+        context: &ArtifactReadContext,
+    ) -> Result<(), ForecastApplicationError> {
+        let head = self.catalog.head()?;
+        let page = match row.kind {
+            1 => self.catalog.vintages(
+                head,
+                row.sequence
+                    .checked_sub(1)
+                    .ok_or(ForecastApplicationError::CorruptIndex)?,
+                1,
+                false,
+                None,
+            )?,
+            _ => self.catalog.outcomes(
+                head,
+                row.sequence
+                    .checked_sub(1)
+                    .ok_or(ForecastApplicationError::CorruptIndex)?,
+                1,
+                None,
+            )?,
+        };
+        if page.first().is_none_or(|(sequence, bytes)| {
+            *sequence != row.sequence || bytes.as_ref() != row.record.as_ref()
+        }) {
+            return Err(ForecastApplicationError::CorruptIndex);
         }
-        store.store(canonical_index)?;
+        match row.kind {
+            1 => {
+                let stored = persistence::StoredVintageRecord::decode(&row.record)?;
+                if stored.artifact_reference()? != row.artifact {
+                    return Err(ForecastApplicationError::CorruptIndex);
+                }
+                self.read_stored(&stored, context).await?;
+                stored.verify_chart(&self.charts, context)?;
+            }
+            2 => {
+                let raw: OutcomeRecord = serde_json::from_slice(&row.record)
+                    .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+                let vintage = self
+                    .lookup_vintage(ForecastInventoryLookup::Vintage(&raw.vintage_id), context)
+                    .await?
+                    .ok_or(ForecastApplicationError::CorruptIndex)?;
+                let outcome = OutcomeRecord::decode(&row.record, &vintage)?;
+                if outcome.artifact_reference()? != row.artifact {
+                    return Err(ForecastApplicationError::CorruptIndex);
+                }
+            }
+            _ => return Err(ForecastApplicationError::InvalidRecord),
+        }
         Ok(())
     }
 
-    async fn vintage_for_request(&self, request_hash: Sha256Digest) -> Option<VintageRecord> {
-        let request_hash = hex(request_hash.bytes());
-        self.index
-            .lock()
-            .await
-            .vintages
-            .iter()
-            .find(|value| value.request_hash == request_hash)
-            .cloned()
+    async fn vintage_for_request(
+        &self,
+        request_hash: Sha256Digest,
+        context: &ArtifactReadContext,
+    ) -> Result<Option<VintageRecord>, ForecastApplicationError> {
+        self.lookup_vintage(
+            ForecastInventoryLookup::Request(&hex(request_hash.bytes())),
+            context,
+        )
+        .await
     }
 
     async fn read_vintage_artifact(
@@ -2427,63 +2515,75 @@ impl ForecastApplicationService {
     async fn vintage_for_artifact(
         &self,
         artifact: &ArtifactReference,
+        context: &ArtifactReadContext,
     ) -> Result<VintageRecord, ForecastApplicationError> {
-        let index = self.index.lock().await;
-        let mut selected = None;
-        for vintage in &index.vintages {
-            if &vintage.artifact_reference()? == artifact {
-                if selected.is_some() {
-                    return Err(ForecastApplicationError::CorruptIndex);
-                }
-                selected = Some(vintage.clone());
-            }
+        let vintage = self
+            .lookup_vintage(ForecastInventoryLookup::Artifact(artifact.id()), context)
+            .await?
+            .ok_or(ForecastApplicationError::NotFound)?;
+        if vintage.artifact_reference()? != *artifact {
+            return Err(ForecastApplicationError::CorruptIndex);
         }
-        selected.ok_or(ForecastApplicationError::NotFound)
+        Ok(vintage)
     }
+}
 
-    async fn commit(
-        &self,
-        change: impl FnOnce(&mut ForecastIndex) -> Result<bool, ForecastApplicationError>,
-    ) -> Result<(), ForecastApplicationError> {
-        self.commit_with_precommit(change, None, None).await
-    }
-
-    async fn commit_with_precommit(
-        &self,
-        change: impl FnOnce(&mut ForecastIndex) -> Result<bool, ForecastApplicationError>,
-        precommit: Option<&dyn ForecastPrecommitAuthority>,
-        context: Option<&ArtifactPublicationContext>,
-    ) -> Result<(), ForecastApplicationError> {
-        let mut index = self.index.lock().await;
-        if let Some(context) = context {
-            context.ensure_live()?;
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForecastPageCursor {
+    fence: ForecastInventoryHead,
+    after: u64,
+    token: Option<String>,
+}
+fn forecast_page_cursor(
+    fence: ForecastInventoryHead,
+    after: u64,
+    token: Option<&str>,
+) -> Result<String, ForecastApplicationError> {
+    serde_json::to_string(&ForecastPageCursor {
+        fence,
+        after,
+        token: token.map(str::to_owned),
+    })
+    .map_err(|_| ForecastApplicationError::CorruptIndex)
+}
+fn forecast_page_position(
+    catalog: &ForecastInventoryCatalogCapability,
+    cursor: Option<&str>,
+    token: Option<&str>,
+) -> Result<(ForecastInventoryHead, u64), ForecastApplicationError> {
+    match cursor {
+        None => {
+            let fence = catalog.head()?;
+            Ok((
+                fence,
+                if token.is_none() {
+                    fence
+                        .vintages
+                        .checked_add(1)
+                        .ok_or(ForecastApplicationError::Capacity)?
+                } else {
+                    0
+                },
+            ))
         }
-        let mut candidate = index.clone();
-        if !change(&mut candidate)? {
-            if let Some(precommit) = precommit {
-                precommit.validate_precommit()?;
-                precommit.commit_succeeded();
+        Some(value) if value.len() <= 256 => {
+            let position: ForecastPageCursor =
+                serde_json::from_str(value).map_err(|_| ForecastApplicationError::InvalidRecord)?;
+            if position.token.as_deref() != token
+                || forecast_page_cursor(position.fence, position.after, token)? != value
+                || position.after
+                    > if token.is_some() {
+                        position.fence.outcomes
+                    } else {
+                        position.fence.vintages.saturating_add(1)
+                    }
+            {
+                return Err(ForecastApplicationError::InvalidRecord);
             }
-            return Ok(());
+            Ok((position.fence, position.after))
         }
-        candidate.validate(self.limits)?;
-        let payload = serde_json::to_vec(&candidate)
-            .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
-        if payload.len() > self.limits.maximum_index_bytes.get() {
-            return Err(ForecastApplicationError::Capacity);
-        }
-        if let Some(context) = context {
-            context.ensure_live()?;
-        }
-        if let Some(precommit) = precommit {
-            precommit.validate_precommit()?;
-        }
-        self.store.store(&payload)?;
-        *index = candidate;
-        if let Some(precommit) = precommit {
-            precommit.commit_succeeded();
-        }
-        Ok(())
+        Some(_) => Err(ForecastApplicationError::InvalidRecord),
     }
 }
 
@@ -2501,16 +2601,21 @@ impl ForecastEvidenceReader for ModelDomainService {
             .as_ref()
             .ok_or(ForecastApplicationError::Unavailable)?;
         context.ensure_live()?;
-        let selected = {
-            let index = forecasts.index.lock().await;
-            context.ensure_live()?;
-            index.exact_distribution_for_identity(
-                vintage_id,
-                instrument_id,
-                as_of,
-                forecasts.limits.maximum_vintages,
-            )?
-        };
+        let vintage = forecasts
+            .lookup_vintage(
+                ForecastInventoryLookup::Vintage(&hex(vintage_id.bytes())),
+                &context.artifact,
+            )
+            .await?
+            .ok_or(ForecastApplicationError::NotFound)?;
+        let mut index = ForecastIndex::default();
+        index.vintages.push(vintage);
+        let selected = index.exact_distribution_for_identity(
+            vintage_id,
+            instrument_id,
+            as_of,
+            NonZeroUsize::MIN,
+        )?;
         let selected = read_forecast_index_selection(self, forecasts, selected, context).await?;
         if selected.distribution.is_none() {
             return Err(ForecastApplicationError::NotFound);
@@ -2530,17 +2635,16 @@ impl ForecastEvidenceReader for ModelDomainService {
             .as_ref()
             .ok_or(ForecastApplicationError::Unavailable)?;
         context.ensure_live()?;
-        let selected = {
-            let index = forecasts.index.lock().await;
-            context.ensure_live()?;
-            let vintage = product_vintage(&index, forecast_token)?;
-            index.exact_distribution_for_identity(
-                digest_from_hex(&vintage.vintage_id)?,
-                instrument_id,
-                as_of,
-                forecasts.limits.maximum_vintages,
-            )?
-        };
+        let index = forecasts
+            .selected_index(forecast_token, &context.artifact)
+            .await?;
+        let vintage = product_vintage(&index, forecast_token)?;
+        let selected = index.exact_distribution_for_identity(
+            digest_from_hex(&vintage.vintage_id)?,
+            instrument_id,
+            as_of,
+            NonZeroUsize::MIN,
+        )?;
         let selected = read_forecast_index_selection(self, forecasts, selected, context).await?;
         if selected.distribution.is_none() {
             return Err(ForecastApplicationError::NotFound);
@@ -2549,9 +2653,15 @@ impl ForecastEvidenceReader for ModelDomainService {
     }
 
     async fn exact_probability_for_vintage(
-        &self, forecast_token: Uuid, as_of: Timestamp, context: ForecastEvidenceReadContext,
+        &self,
+        forecast_token: Uuid,
+        as_of: Timestamp,
+        context: ForecastEvidenceReadContext,
     ) -> Result<ReopenedProbabilityForecast, ForecastApplicationError> {
-        let analytical = self.forecast_analytical.as_ref().ok_or(ForecastApplicationError::Unavailable)?;
+        let analytical = self
+            .forecast_analytical
+            .as_ref()
+            .ok_or(ForecastApplicationError::Unavailable)?;
         outcome::exact_probability(self, forecast_token, as_of, analytical, &context).await
     }
 
@@ -2599,17 +2709,16 @@ impl ForecastEvidenceReader for ModelDomainService {
             .as_ref()
             .ok_or(ForecastApplicationError::Unavailable)?;
         context.ensure_live()?;
-        let selected = {
-            let index = forecasts.index.lock().await;
-            context.ensure_live()?;
-            index.exact_horizon_price_for_vintage(
-                forecast_token,
-                instrument_id,
-                requested_horizon_nanos,
-                as_of,
-                forecasts.limits.maximum_vintages,
-            )?
-        };
+        let index = forecasts
+            .selected_index(forecast_token, &context.artifact)
+            .await?;
+        let selected = index.exact_horizon_price_for_vintage(
+            forecast_token,
+            instrument_id,
+            requested_horizon_nanos,
+            as_of,
+            NonZeroUsize::MIN,
+        )?;
         read_forecast_index_selection(self, forecasts, selected, context).await
     }
     async fn latest_valid_for_instrument(
@@ -2623,17 +2732,9 @@ impl ForecastEvidenceReader for ModelDomainService {
             .as_ref()
             .ok_or(ForecastApplicationError::Unavailable)?;
         context.ensure_live()?;
-        let selected = {
-            let index = forecasts.index.lock().await;
-            context.ensure_live()?;
-            let selected = index.latest_valid_for_instrument(
-                instrument_id,
-                as_of,
-                forecasts.limits.maximum_vintages,
-            )?;
-            context.ensure_live()?;
-            selected
-        };
+        let selected = forecasts
+            .latest_selection(instrument_id, as_of, None, &context)
+            .await?;
         read_forecast_index_selection(self, forecasts, selected, context).await
     }
 
@@ -2649,18 +2750,14 @@ impl ForecastEvidenceReader for ModelDomainService {
             .as_ref()
             .ok_or(ForecastApplicationError::Unavailable)?;
         context.ensure_live()?;
-        let selected = {
-            let index = forecasts.index.lock().await;
-            context.ensure_live()?;
-            let selected = index.latest_valid_exact_horizon_price_for_instrument(
+        let selected = forecasts
+            .latest_selection(
                 instrument_id,
-                requested_horizon_nanos,
                 as_of,
-                forecasts.limits.maximum_vintages,
-            )?;
-            context.ensure_live()?;
-            selected
-        };
+                Some(requested_horizon_nanos),
+                &context,
+            )
+            .await?;
         read_forecast_index_selection(self, forecasts, selected, context).await
     }
 }
@@ -2757,7 +2854,10 @@ async fn read_forecast_index_selection(
             .ok_or(ForecastApplicationError::CorruptIndex)?;
         let cohort = current_input::current_price_cohort_reference(current)
             .map_err(|_| ForecastApplicationError::CorruptIndex)?;
-        let original_calendar = service.forecast_calendar.as_ref().map(|calendar| calendar.retained());
+        let original_calendar = service
+            .forecast_calendar
+            .as_ref()
+            .map(|calendar| calendar.retained());
         current_input::current_price_session_origin(
             original_calendar.as_ref(),
             cohort.as_ref(),
@@ -2824,13 +2924,28 @@ fn drift_monitoring_value(
     index: &ForecastIndex,
     vintage: &VintageRecord,
 ) -> Result<Value, ForecastApplicationError> {
+    drift_monitoring_parts(
+        &index.outcomes,
+        &vintage.vintage_id,
+        vintage
+            .decimal_scale()
+            .ok_or(ForecastApplicationError::CorruptIndex)?,
+        |value, scale| vintage.product_amount(value, scale),
+    )
+}
+
+fn drift_monitoring_parts(
+    outcomes: &[OutcomeRecord],
+    vintage_id: &str,
+    scale: u8,
+    product_amount: impl Fn(&str, u8) -> Result<Value, ForecastApplicationError>,
+) -> Result<Value, ForecastApplicationError> {
     let mut observed = 0_usize;
     let mut included = 0_usize;
     let mut total_absolute_error = 0_i128;
-    for outcome in index
-        .outcomes
+    for outcome in outcomes
         .iter()
-        .filter(|outcome| outcome.vintage_id == vintage.vintage_id)
+        .filter(|outcome| outcome.vintage_id == vintage_id)
     {
         observed = observed
             .checked_add(1)
@@ -2851,9 +2966,6 @@ fn drift_monitoring_value(
             .checked_add(1)
             .ok_or(ForecastApplicationError::CorruptIndex)?;
     }
-    let scale = vintage
-        .decimal_scale()
-        .ok_or(ForecastApplicationError::CorruptIndex)?;
     let state = if observed == 0 {
         "awaiting_outcomes"
     } else {
@@ -2864,7 +2976,7 @@ fn drift_monitoring_value(
     } else {
         let mean = checked_decimal_mean(total_absolute_error, included, scale)?;
         Some(json!({
-            "value": vintage.product_amount(&mean.mantissa.to_string(), mean.scale)?,
+            "value": product_amount(&mean.mantissa.to_string(), mean.scale)?,
             "rounding": {
                 "state": mean.state.as_str(),
                 "decimalPlaces": mean.scale,
@@ -2997,7 +3109,6 @@ impl std::fmt::Debug for ForecastApplicationService {
             .debug_struct("ForecastApplicationService")
             .field("index", &"[DURABLE IMMUTABLE FORECAST INDEX]")
             .field("artifacts", &"[CONTROLLED ARTIFACT AUTHORITY]")
-            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -3005,6 +3116,10 @@ impl std::fmt::Debug for ForecastApplicationService {
 /// Durable forecast authority failure.
 #[derive(Debug, Error)]
 pub enum ForecastApplicationError {
+    /// Indexed immutable publication or integrity failure.
+    #[error(transparent)]
+    Inventory(#[from] market_squawk_data::ForecastInventoryError),
+
     /// Reopening the original current feature input or source calendar failed.
     #[error("forecast current input read failed: {0}")]
     CurrentInputRead(#[source] ServiceError),
@@ -3017,9 +3132,6 @@ pub enum ForecastApplicationError {
     /// A supplied vintage or outcome cannot be represented safely.
     #[error("forecast record is invalid")]
     InvalidRecord,
-    /// A content identity already names different immutable content.
-    #[error("forecast content identity conflicts with retained content")]
-    Conflict,
     /// Retained count or bytes reached its hard ceiling.
     #[error("forecast retained capacity is exhausted")]
     Capacity,
@@ -3029,15 +3141,9 @@ pub enum ForecastApplicationError {
     /// The process-local writer or installed authority is unavailable.
     #[error("forecast authority is unavailable")]
     Unavailable,
-    /// Durable local state is unavailable.
-    #[error(transparent)]
-    State(#[from] LocalAuthorityStateStoreError),
     /// Controlled forecast payload publication or verified access failed.
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
-    /// Restore attempted to reuse an authority outside a fresh inactive workspace.
-    #[error("forecast restore target is not fresh")]
-    RestoreTargetNotFresh,
 }
 
 #[derive(Debug, Error)]

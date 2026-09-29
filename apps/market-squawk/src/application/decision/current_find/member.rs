@@ -57,20 +57,45 @@ pub(crate) struct FindMemberUnavailableValue {
     pub(crate) source_failures: Vec<FindSourceFailure>,
 }
 impl FindMemberUnavailableValue {
-    pub(crate) fn validate(&self)->Result<(),DecisionApplicationError>{
-        if self.member.preparation_id.is_nil() || !digest_text(&self.member.preparation_sha256)
-            || !digest_text(&self.assessment_sha256) || self.member.candidate_id.is_empty() || self.member.candidate_id.len()>256
-            || self.member.screen_run_id.is_empty() || self.member.screen_run_id.len()>256
-            || self.source_failures.len()>6 {return Err(invalid());}
-        let mut names=std::collections::BTreeSet::new();
+    pub(crate) fn validate(&self) -> Result<(), DecisionApplicationError> {
+        if self.member.preparation_id.is_nil()
+            || !digest_text(&self.member.preparation_sha256)
+            || !digest_text(&self.assessment_sha256)
+            || self.member.candidate_id.is_empty()
+            || self.member.candidate_id.len() > 256
+            || self.member.screen_run_id.is_empty()
+            || self.member.screen_run_id.len() > 256
+            || self.source_failures.len() > 6
+        {
+            return Err(invalid());
+        }
+        let mut names = std::collections::BTreeSet::new();
         for f in &self.source_failures {
-            if !matches!(f.source.as_str(),"current_session"|"government_history"|"benchmark_history"|"selected_history"|"source_actions"|"equity_premium")
-                || !names.insert(&f.source) || f.failure.is_empty() || f.failure.len()>1024 {return Err(invalid());}
+            if !matches!(
+                f.source.as_str(),
+                "current_session"
+                    | "government_history"
+                    | "benchmark_history"
+                    | "selected_history"
+                    | "source_actions"
+                    | "equity_premium"
+            ) || !names.insert(&f.source)
+                || f.failure.is_empty()
+                || f.failure.len() > 1024
+            {
+                return Err(invalid());
+            }
         }
         match self.reason {
-            FindSourceUnavailableReason::IdentityUnavailable if self.source_failures.is_empty()=>Ok(()),
-            FindSourceUnavailableReason::SourceEvidenceUnavailable if !self.source_failures.is_empty()=>Ok(()),
-            _=>Err(invalid()),
+            FindSourceUnavailableReason::IdentityUnavailable if self.source_failures.is_empty() => {
+                Ok(())
+            }
+            FindSourceUnavailableReason::SourceEvidenceUnavailable
+                if !self.source_failures.is_empty() =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid()),
         }
     }
 }
@@ -135,7 +160,25 @@ impl FindMemberUnavailableRecord {
             || self.selection_sha256 == [0; 32]
             || self.started_at.unix_nanos() <= 0
             || self.completed_at < self.started_at
-            || b.as_object().is_none_or(|o| o.len() != 9 || !o.keys().all(|key|matches!(key.as_str(),"status"|"scope"|"financialConfigurationDigest"|"instrumentId"|"preparedAtUnixNanos"|"reference"|"sourceActionReference"|"sources"|"reason")))
+            || !b["fundamentalShareSources"].is_null()
+            || b.as_object().is_none_or(|o| {
+                o.len() != 10
+                    || !o.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "status"
+                                | "scope"
+                                | "financialConfigurationDigest"
+                                | "instrumentId"
+                                | "preparedAtUnixNanos"
+                                | "reference"
+                                | "sourceActionReference"
+                                | "fundamentalShareSources"
+                                | "sources"
+                                | "reason"
+                        )
+                    })
+            })
             || b["status"] != "unavailable"
             || b["scope"] != "investment_analysis"
             || b["financialConfigurationDigest"].as_str() != Some(self.profile_sha256.as_str())
@@ -155,17 +198,28 @@ impl FindMemberUnavailableRecord {
         let mut names = std::collections::BTreeSet::new();
         for source in sources {
             let name = source["source"].as_str().ok_or_else(invalid)?;
-            if source.as_object().is_none_or(|o| o.len() != 6 || !o.keys().all(|key|matches!(key.as_str(),"source"|"status"|"evidenceDigest"|"failure"|"startedAtUnixNanos"|"completedAtUnixNanos")))
-                || !matches!(
-                    name,
-                    "current_session"
-                        | "government_history"
-                        | "benchmark_history"
-                        | "selected_history"
-                        | "source_actions"
-                        | "equity_premium"
-                )
-                || !names.insert(name)
+            if source.as_object().is_none_or(|o| {
+                o.len() != 6
+                    || !o.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "source"
+                                | "status"
+                                | "evidenceDigest"
+                                | "failure"
+                                | "startedAtUnixNanos"
+                                | "completedAtUnixNanos"
+                        )
+                    })
+            }) || !matches!(
+                name,
+                "current_session"
+                    | "government_history"
+                    | "benchmark_history"
+                    | "selected_history"
+                    | "source_actions"
+                    | "equity_premium"
+            ) || !names.insert(name)
             {
                 return Err(invalid());
             }
@@ -200,7 +254,9 @@ impl FindMemberUnavailableRecord {
         } else {
             let cutoff = time(&b["preparedAtUnixNanos"])?;
             if !b["sourceActionReference"].is_null()
-                || !sources.iter().any(|s|s["source"]=="source_actions"&&s["status"]=="unavailable")
+                || !sources
+                    .iter()
+                    .any(|s| s["source"] == "source_actions" && s["status"] == "unavailable")
                 || cutoff < self.started_at.unix_nanos()
                 || cutoff > self.completed_at.unix_nanos()
                 || !sources.iter().any(|s| s["status"] == "unavailable")
@@ -258,28 +314,46 @@ impl DecisionApplication {
         admitted: &AdmittedFindMember,
         requested_benchmark: Option<InstrumentId>,
         context: &RequestContext,
-    ) -> Result<Option<(crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference, Option<InstrumentId>)>, ServiceError> {
+    ) -> Result<Option<(crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference, Option<InstrumentId>)>, ServiceError>{
         admitted.parent.authorize(context)?;
         check_live(context)?;
-        let sources = self.current_find_sources(&admitted.parent.source_pages, admitted.source_cutoff()).map_err(map)?;
+        let sources = self
+            .current_find_sources(&admitted.parent.source_pages, admitted.source_cutoff())
+            .map_err(map)?;
         let mut found = None;
         let mut matched = false;
         for (index, page) in sources.pages().iter().enumerate() {
             check_live(context)?;
-            if !page.intersects(&[admitted.instrument_id()]) { continue; }
+            if !page.intersects(&[admitted.instrument_id()]) {
+                continue;
+            }
             let original = sources.read(index).map_err(map)?;
-            if original.knowledge_cutoff() != admitted.source_cutoff() { return Err(ServiceError::InvalidResult); }
-            if original.requested_instruments().binary_search(&admitted.instrument_id()).is_ok() {
-                if matched { return Err(ServiceError::InvalidResult); }
+            if original.knowledge_cutoff() != admitted.source_cutoff() {
+                return Err(ServiceError::InvalidResult);
+            }
+            if original
+                .requested_instruments()
+                .binary_search(&admitted.instrument_id())
+                .is_ok()
+            {
+                if matched {
+                    return Err(ServiceError::InvalidResult);
+                }
                 matched = true;
-                found = sources.read_training(index, admitted.instrument_id(), requested_benchmark).map_err(map)?;
-                if found.as_ref().is_some_and(|(training, _)| training.knowledge_cutoff() != admitted.source_cutoff()) {
+                found = sources
+                    .read_training(index, admitted.instrument_id(), requested_benchmark)
+                    .map_err(map)?;
+                if found.as_ref().is_some_and(|(training, _)| {
+                    training.knowledge_cutoff() != admitted.source_cutoff()
+                }) {
                     return Err(ServiceError::InvalidResult);
                 }
             }
         }
         check_live(context)?;
-        if !matched { return Err(ServiceError::InvalidResult); }
+        if !matched {
+            return Err(ServiceError::InvalidResult);
+        }
         Ok(found)
     }
     pub(crate) fn admit_find_member(

@@ -10,10 +10,10 @@ use market_squawk_domain::{HistoricalStudyBasis, MarketBarAdjustment, MarketBarO
 use market_squawk_modeling::ForecastMeasurement;
 use market_squawk_valuation::ForecastValueArithmetic;
 
-use crate::application::model::HistoricalPriceForecast;
 use crate::application::market_calendar::{
     CompletedMarketSessionReadCapability, CompletedMarketSessionReference,
 };
+use crate::application::model::HistoricalPriceForecast;
 
 use super::*;
 
@@ -537,11 +537,23 @@ impl FairValueDomainService {
         {
             return Err(ServiceError::InvalidRequest);
         }
-        let fundamentals = self
-            .select_comparable_fundamentals(research, request.subject, &request, context)
-            .await?;
+        let fundamentals = Self::select_comparable_fundamentals(
+            research,
+            request.subject,
+            request.knowledge_at,
+            request.effective_date,
+            context,
+        )
+        .await?;
         let cohort_evidence = if request.peers.is_empty() {
-            let (peers, identity) = discover_peers(research, &fundamentals, &request, context).await?;
+            let (peers, identity) = discover_peers(
+                research,
+                &fundamentals,
+                request.subject,
+                request.knowledge_at,
+                context,
+            )
+            .await?;
             request.peers = peers;
             Some(identity)
         } else {
@@ -549,14 +561,20 @@ impl FairValueDomainService {
         };
         let subject = HistoricalComparableSource {
             fundamentals,
-            price: select_historical_price(research, calendars, epoch, request.subject, context).await?,
+            price: select_historical_price(research, calendars, epoch, request.subject, context)
+                .await?,
         };
         let mut peers = Vec::with_capacity(request.peers.len());
         for instrument in &request.peers {
             ensure_request_live(context, &self.lifecycle)?;
-            let fundamentals = self
-                .select_comparable_fundamentals(research, *instrument, &request, context)
-                .await?;
+            let fundamentals = Self::select_comparable_fundamentals(
+                research,
+                *instrument,
+                request.knowledge_at,
+                request.effective_date,
+                context,
+            )
+            .await?;
             if fundamentals.industry != subject.fundamentals.industry
                 || fundamentals.period != subject.fundamentals.period
                 || fundamentals.metric.amount().money().currency()
@@ -564,7 +582,8 @@ impl FairValueDomainService {
             {
                 return Err(ServiceError::Unavailable);
             }
-            let price = select_historical_price(research, calendars, epoch, *instrument, context).await?;
+            let price =
+                select_historical_price(research, calendars, epoch, *instrument, context).await?;
             if price.bar.currency() != fundamentals.metric.amount().money().currency() {
                 return Err(ServiceError::Unavailable);
             }
@@ -617,24 +636,39 @@ async fn select_historical_price(
             .exact_manifest()
             .ok_or(ServiceError::InvalidResult)?
             .clone();
-        (manifest, Some(selection.lookup_digest()), Some(selection.into_exact_request()))
+        (
+            manifest,
+            Some(selection.lookup_digest()),
+            Some(selection.into_exact_request()),
+        )
     };
     // Query the original source coordinate, then independently require the economic completion.
     // The selection cannot read a later completed day merely because its snapshot is today.
     let nominal = if origin.time_semantics().nominal_daily_date().is_some() {
-        Some(rejoin_historical_nominal_price(
-            research, calendars, epoch, instrument, history_request, context,
-        ).await?)
+        Some(
+            rejoin_historical_nominal_price(
+                research,
+                calendars,
+                epoch,
+                instrument,
+                history_request,
+                context,
+            )
+            .await?,
+        )
     } else {
         None
     };
     let range = if let Some(date) = origin.time_semantics().nominal_daily_date() {
         MarketBarEffectiveRange::try_nominal_dates(date.date(), date.date())
     } else {
-        let source_coordinate = origin.time_semantics().provider_timestamp()
+        let source_coordinate = origin
+            .time_semantics()
+            .provider_timestamp()
             .ok_or(ServiceError::InvalidResult)?;
         MarketBarEffectiveRange::try_new(source_coordinate, source_coordinate)
-    }.map_err(|_| ServiceError::InvalidRequest)?;
+    }
+    .map_err(|_| ServiceError::InvalidRequest)?;
     let request = AnalyticalMarketBarReadRequest::try_new(
         manifest.clone(),
         instrument,
@@ -667,7 +701,9 @@ async fn select_historical_price(
         return Err(ServiceError::Unavailable);
     };
     if (nominal.is_none() && bar.completed_at() != Some(target_origin))
-        || nominal.as_ref().is_some_and(|(original, _, _)| bar != original)
+        || nominal
+            .as_ref()
+            .is_some_and(|(original, _, _)| bar != original)
         || bar.adjustment() != MarketBarAdjustment::Raw
         || bar.context().provenance().source_id() != origin.context().provenance().source_id()
         || bar.context().provenance().venue_id() != origin.context().provenance().venue_id()
@@ -687,7 +723,10 @@ async fn select_historical_price(
         query_identity: output.output().query_identity(),
         result_identity: output.output().result_digest(),
         native_evidence: nominal.as_ref().map(|(_, _, evidence)| *evidence),
-        native_parents: nominal.map_or_else(|| Vec::new().into_boxed_slice(), |(_, parents, _)| parents.into_boxed_slice()),
+        native_parents: nominal.map_or_else(
+            || Vec::new().into_boxed_slice(),
+            |(_, parents, _)| parents.into_boxed_slice(),
+        ),
     })
 }
 
@@ -701,9 +740,18 @@ async fn rejoin_historical_nominal_price(
     instrument: InstrumentId,
     history_request: Option<market_squawk_data::CanonicalMarketBarHistoryRequest>,
     context: &RequestContext,
-) -> Result<(MarketBarObservation, Vec<DatasetManifestRef>, EvidenceDigest), ServiceError> {
+) -> Result<
+    (
+        MarketBarObservation,
+        Vec<DatasetManifestRef>,
+        EvidenceDigest,
+    ),
+    ServiceError,
+> {
     let origin = epoch.market_bar().ok_or(ServiceError::Unavailable)?;
-    let named = epoch.named_session_origin().ok_or(ServiceError::Unavailable)?;
+    let named = epoch
+        .named_session_origin()
+        .ok_or(ServiceError::Unavailable)?;
     let economic_origin = epoch.target_origin().ok_or(ServiceError::Unavailable)?;
     let cutoff = epoch.source_selection_as_of();
     if !named.matches_origin_bar(origin, epoch.source_manifest(), economic_origin, cutoff) {
@@ -712,15 +760,26 @@ async fn rejoin_historical_nominal_price(
     let history = match history_request {
         Some(request) => {
             let (start, end) = request.requested_dates().ok_or(ServiceError::Unavailable)?;
-            if request.instrument_id() != instrument || request.knowledge_cutoff() != cutoff
-                || named.native_date() < start || named.native_date() > end
+            if request.instrument_id() != instrument
+                || request.knowledge_cutoff() != cutoff
+                || named.native_date() < start
+                || named.native_date() > end
             {
                 return Err(ServiceError::InvalidResult);
             }
-            let exact = request.exact_manifest().ok_or(ServiceError::InvalidResult)?.clone();
-            let history = research.analytical_reader()
-                .read_canonical_market_bar_history(request, context.deadline(), context.cancellation().child_token())
-                .await.map_err(crate::application::research::corporate_actions::map_analytical_error)?
+            let exact = request
+                .exact_manifest()
+                .ok_or(ServiceError::InvalidResult)?
+                .clone();
+            let history = research
+                .analytical_reader()
+                .read_canonical_market_bar_history(
+                    request,
+                    context.deadline(),
+                    context.cancellation().child_token(),
+                )
+                .await
+                .map_err(crate::application::research::corporate_actions::map_analytical_error)?
                 .ok_or(ServiceError::Unavailable)?;
             if history.selection().pinned().manifest() != &exact
                 || history.read_receipt().knowledge_cutoff() != cutoff
@@ -734,18 +793,38 @@ async fn rejoin_historical_nominal_price(
     };
     let (content, binding) = match history.as_ref() {
         Some(history) => {
-            let calendar = history.selection().receipt().date_windows()
-                .ok_or(ServiceError::InvalidResult)?.calendar();
-            (calendar.origin_content_digest, calendar.capture_binding_digest)
+            let calendar = history
+                .selection()
+                .receipt()
+                .date_windows()
+                .ok_or(ServiceError::InvalidResult)?
+                .calendar();
+            (
+                calendar.origin_content_digest,
+                calendar.capture_binding_digest,
+            )
         }
-        None => (named.calendar_origin_content_digest(), named.calendar_capture_binding_digest()),
+        None => (
+            named.calendar_origin_content_digest(),
+            named.calendar_capture_binding_digest(),
+        ),
     };
     let reference = CompletedMarketSessionReference::try_from_retained_digests(content, binding)
         .map_err(|_| ServiceError::InvalidResult)?;
-    let calendar = calendars.read_reference(&reference, cutoff, context.deadline(), context.cancellation().child_token())
-        .await.map_err(|error| crate::application::research::EquityPremiumReadError::from(error).into_service_error())?
+    let calendar = calendars
+        .read_reference(
+            &reference,
+            cutoff,
+            context.deadline(),
+            context.cancellation().child_token(),
+        )
+        .await
+        .map_err(|error| {
+            crate::application::research::EquityPremiumReadError::from(error).into_service_error()
+        })?
         .ok_or(ServiceError::Unavailable)?;
-    let session = calendar.date_session_on(named.native_date(), cutoff, cutoff)
+    let session = calendar
+        .date_session_on(named.native_date(), cutoff, cutoff)
         .ok_or(ServiceError::Unavailable)?;
     if session.closes_at_exclusive() != economic_origin
         || session.opens_at() != named.opens_at()
@@ -759,31 +838,66 @@ async fn rejoin_historical_nominal_price(
     evidence.update(named.evidence_digest().bytes());
     evidence.update(calendar.source_action_calendar().evidence_digest().bytes());
     let bar = if let Some(history) = history {
-        let history = research.rejoin_market_history_native_sessions_with_calendar(
-            history, &calendar, context.deadline(), context.cancellation(),
-        ).await.map_err(|error| crate::application::research::EquityPremiumReadError::from(error).into_service_error())?;
-        let source = research.rejoin_tiingo_eod_history_actions(
-            history, context.deadline(), context.cancellation(),
-        ).await.map_err(|error| crate::application::research::EquityPremiumReadError::from(error).into_service_error())?;
+        let history = research
+            .rejoin_market_history_native_sessions_with_calendar(
+                history,
+                &calendar,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await
+            .map_err(|error| {
+                crate::application::research::EquityPremiumReadError::from(error)
+                    .into_service_error()
+            })?;
+        let source = research
+            .rejoin_tiingo_eod_history_actions(history, context.deadline(), context.cancellation())
+            .await
+            .map_err(|error| {
+                crate::application::research::EquityPremiumReadError::from(error)
+                    .into_service_error()
+            })?;
         let history = source.history();
-        let native = history.native_sessions().ok_or(ServiceError::InvalidResult)?;
-        let member = native.sessions().iter().find(|row| row.native_date() == named.native_date())
+        let native = history
+            .native_sessions()
+            .ok_or(ServiceError::InvalidResult)?;
+        let member = native
+            .sessions()
+            .find_date(named.native_date())
+            .map_err(crate::application::research::corporate_actions::map_analytical_error)?
             .ok_or(ServiceError::Unavailable)?;
-        if !member.bar_present() || member.provider_timestamp().is_some()
-            || member.provider_period().is_some() || member.closes_at_exclusive() != economic_origin
+        if !member.bar_present()
+            || member.provider_timestamp().is_some()
+            || member.provider_period().is_some()
+            || member.closes_at_exclusive() != economic_origin
             || member.opens_at() != session.opens_at()
         {
             return Err(ServiceError::InvalidResult);
         }
-        let mut bars = history.bars().iter().filter(|bar| {
-            bar.time_semantics().nominal_daily_date().is_some_and(|date| date.date() == named.native_date())
-        });
-        let bar = bars.next().ok_or(ServiceError::Unavailable)?;
-        if bars.next().is_some() || bar.completed_at().is_some() {
+        let mut selected = None;
+        for bar in history.bars() {
+            let bar = bar.map_err(|_| ServiceError::InvalidResult)?;
+            if bar
+                .time_semantics()
+                .nominal_daily_date()
+                .is_some_and(|date| date.date() == named.native_date())
+            {
+                if selected.replace(bar).is_some() {
+                    return Err(ServiceError::InvalidResult);
+                }
+            }
+        }
+        let bar = selected.ok_or(ServiceError::Unavailable)?;
+        if bar.completed_at().is_some() {
             return Err(ServiceError::InvalidResult);
         }
-        for parent in [history.selection().pinned().manifest(), history.read_receipt().origin_manifest()] {
-            if !parents.contains(parent) { parents.push(parent.clone()); }
+        for parent in [
+            history.selection().pinned().manifest(),
+            history.read_receipt().origin_manifest(),
+        ] {
+            if !parents.contains(parent) {
+                parents.push(parent.clone());
+            }
         }
         evidence.update(native.mapping_digest().bytes());
         evidence.update(history.read_receipt().result_digest().bytes());
@@ -795,7 +909,15 @@ async fn rejoin_historical_nominal_price(
         }
         origin.clone()
     };
-    if context.cancellation().is_cancelled() { return Err(ServiceError::Cancelled); }
-    if std::time::Instant::now() >= context.deadline() { return Err(ServiceError::DeadlineExceeded); }
-    Ok((bar, parents, EvidenceDigest::new(DigestAlgorithm::Sha256, evidence.finalize().into())))
+    if context.cancellation().is_cancelled() {
+        return Err(ServiceError::Cancelled);
+    }
+    if std::time::Instant::now() >= context.deadline() {
+        return Err(ServiceError::DeadlineExceeded);
+    }
+    Ok((
+        bar,
+        parents,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, evidence.finalize().into()),
+    ))
 }

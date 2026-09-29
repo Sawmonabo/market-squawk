@@ -5,12 +5,12 @@ use super::{
     FeatureLabelComponentInput,
 };
 use crate::{
-    CompleteMarketBarHistoryOutput, CompletedOrdinaryHistoryEvidence, CorporateActionPlan,
-    DatasetManifestRef, ObservationFamilyKey, PointInTimeCandidate, Sha256Digest,
+    CompleteMarketBarHistoryCursor, CompleteMarketBarHistoryOutput,
+    CompletedOrdinaryHistoryEvidence, CorporateActionPlan, DatasetManifestRef,
+    ObservationFamilyKey, Sha256Digest,
 };
 use market_squawk_domain::{
-    HistoricalStudyBasis, InstrumentId, MarketBarObservation, ResearchObservation,
-    ResearchTemporalCoordinate, Timestamp,
+    HistoricalStudyBasis, InstrumentId, MarketBarObservation, ResearchTemporalCoordinate, Timestamp,
 };
 use sha2::{Digest as _, Sha256};
 use std::time::Instant;
@@ -98,7 +98,57 @@ impl TimestampHistoryExampleSource {
     }
 }
 
+use super::nominal_daily::DatasetHistory;
+
 impl CompleteMarketBarHistoryOutput {
+    /// Constructs an example using the shared original-history validation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_timestamp_history_dataset_example(
+        &self,
+        example_id: &str,
+        study: DatasetStudyPolicy,
+        decision_at: Timestamp,
+        target_at: Timestamp,
+        components: Vec<FeatureLabelComponentInput>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<DatasetExample, DatasetBuildError> {
+        DatasetHistory::Memory(self).try_timestamp_history_dataset_example(
+            example_id,
+            study,
+            decision_at,
+            target_at,
+            components,
+            deadline,
+            cancellation,
+        )
+    }
+}
+impl CompleteMarketBarHistoryCursor {
+    /// Constructs the same example using its exact original indexed rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_timestamp_history_dataset_example(
+        &self,
+        example_id: &str,
+        study: DatasetStudyPolicy,
+        decision_at: Timestamp,
+        target_at: Timestamp,
+        components: Vec<FeatureLabelComponentInput>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<DatasetExample, DatasetBuildError> {
+        DatasetHistory::Indexed(self).try_timestamp_history_dataset_example(
+            example_id,
+            study,
+            decision_at,
+            target_at,
+            components,
+            deadline,
+            cancellation,
+        )
+    }
+}
+impl DatasetHistory<'_> {
     /// Constructs a frozen retrospective example only from original timestamp bars and native
     /// session replay. Caller cutoffs are checked against those rows and the study horizon.
     #[allow(clippy::too_many_arguments)]
@@ -120,7 +170,10 @@ impl CompleteMarketBarHistoryOutput {
         {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         }
-        let history = CompletedOrdinaryHistoryEvidence::try_from_history(self)?;
+        let history = match self {
+            Self::Memory(history) => CompletedOrdinaryHistoryEvidence::try_from_history(history)?,
+            Self::Indexed(history) => CompletedOrdinaryHistoryEvidence::try_from_cursor(history)?,
+        };
         let feature = unique_component(&components, "research.price-return")?;
         if feature.spec().kind() != ComponentKind::Feature || feature.selectors().len() != 2 {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
@@ -178,31 +231,14 @@ impl CompleteMarketBarHistoryOutput {
         let ObservationFamilyKey::MarketBar { effective, .. } = family else {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         };
-        let effective = effective
+        effective
             .exact_timestamp()
             .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?;
-        let index = self
-            .bars()
-            .binary_search_by_key(&Some(effective), |bar| {
-                bar.context().time().effective().exact_timestamp()
-            })
-            .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
-        let bar = &self.bars()[index];
-        let candidate = PointInTimeCandidate::new(
-            ResearchObservation::MarketBar(bar.clone()),
-            self.selection().pinned().manifest().clone(),
-        );
-        if candidate
-            .family_key()
-            .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?
-            != *family
-        {
-            return Err(DatasetBuildError::ComponentEvidenceMismatch);
-        }
+        let bar = self.selected_bar(family)?;
         Ok((
             bar.completed_at()
                 .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?,
-            original_bar_digest(bar)?,
+            original_bar_digest(&bar)?,
         ))
     }
 }

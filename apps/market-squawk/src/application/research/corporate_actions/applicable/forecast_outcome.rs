@@ -113,18 +113,27 @@ impl SourceAppliedCorporateActionReadCapability {
                     .native_sessions()
                     .ok_or(ApplicableActionPlanError::InvalidEvidence)?
                     .sessions();
-                let mut origin_sessions = sessions
-                    .iter()
-                    .filter(|session| session.closes_at_exclusive() == origin_at);
-                let mut target_sessions = sessions
-                    .iter()
-                    .filter(|session| session.closes_at_exclusive() == target_at);
-                let (Some(os), Some(ts)) = (origin_sessions.next(), target_sessions.next()) else {
+                let mut origin_session = None;
+                let mut target_session = None;
+                for session in sessions.iter() {
+                    let session = session.map_err(|error| {
+                        ApplicableActionPlanError::SourceRead(map_analytical_error(error))
+                    })?;
+                    if session.closes_at_exclusive() == origin_at
+                        && origin_session.replace(session.clone()).is_some()
+                    {
+                        return Ok(None);
+                    }
+                    if session.closes_at_exclusive() == target_at
+                        && target_session.replace(session).is_some()
+                    {
+                        return Ok(None);
+                    }
+                }
+                let (Some(os), Some(ts)) = (origin_session, target_session) else {
                     return Ok(None);
                 };
-                if origin_sessions.next().is_some()
-                    || target_sessions.next().is_some()
-                    || !os.bar_present()
+                if !os.bar_present()
                     || !ts.bar_present()
                     || os.provider_timestamp().is_some()
                     || ts.provider_timestamp().is_some()
@@ -186,16 +195,22 @@ impl SourceAppliedCorporateActionReadCapability {
                         at,
                         at,
                     )
-                    .map_err(|error| ApplicableActionPlanError::SourceRead(map_analytical_error(error)))
+                    .map_err(|error| {
+                        ApplicableActionPlanError::SourceRead(map_analytical_error(error))
+                    })
                 };
                 let left = analytical
                     .select_outcome_market_bar(select(origin_at)?, deadline, cancellation.clone())
                     .await
-                    .map_err(|error| ApplicableActionPlanError::SourceRead(map_analytical_error(error)))?;
+                    .map_err(|error| {
+                        ApplicableActionPlanError::SourceRead(map_analytical_error(error))
+                    })?;
                 let right = analytical
                     .select_outcome_market_bar(select(target_at)?, deadline, cancellation.clone())
                     .await
-                    .map_err(|error| ApplicableActionPlanError::SourceRead(map_analytical_error(error)))?;
+                    .map_err(|error| {
+                        ApplicableActionPlanError::SourceRead(map_analytical_error(error))
+                    })?;
                 let (
                     OutcomeMarketBarSelection::Selected(left),
                     OutcomeMarketBarSelection::Selected(right),
@@ -292,21 +307,27 @@ impl SourceAppliedCorporateActionReadCapability {
     }
 }
 
-fn unique_nominal_bar<'a>(
-    bars: &'a [MarketBarObservation],
+fn unique_nominal_bar(
+    bars: impl IntoIterator<
+        Item = Result<MarketBarObservation, market_squawk_data::AnalyticalReadError>,
+    >,
     series: &MarketBarObservation,
     date: CalendarDate,
-) -> Result<Option<&'a MarketBarObservation>, ApplicableActionPlanError> {
-    let mut rows = bars.iter().filter(|bar| {
-        same_raw_series(series, bar)
+) -> Result<Option<MarketBarObservation>, ApplicableActionPlanError> {
+    let mut selected = None;
+    for bar in bars {
+        let bar = bar
+            .map_err(|error| ApplicableActionPlanError::SourceRead(map_analytical_error(error)))?;
+        if same_raw_series(series, &bar)
             && bar
                 .time_semantics()
                 .nominal_daily_date()
                 .is_some_and(|value| value.date() == date)
-    });
-    let selected = rows.next();
-    if rows.next().is_some() {
-        return Err(ApplicableActionPlanError::InvalidEvidence);
+        {
+            if selected.replace(bar).is_some() {
+                return Err(ApplicableActionPlanError::InvalidEvidence);
+            }
+        }
     }
     Ok(selected)
 }
@@ -324,8 +345,10 @@ fn same_raw_series(a: &MarketBarObservation, b: &MarketBarObservation) -> bool {
             (
                 market_squawk_domain::BarTimeSemantics::TimestampedPeriod(a),
                 market_squawk_domain::BarTimeSemantics::TimestampedPeriod(b),
-            ) => a.session().kind() == b.session().kind()
-                && a.session().ruleset() == b.session().ruleset(),
+            ) => {
+                a.session().kind() == b.session().kind()
+                    && a.session().ruleset() == b.session().ruleset()
+            }
             (
                 market_squawk_domain::BarTimeSemantics::NominalDailyDate(a),
                 market_squawk_domain::BarTimeSemantics::NominalDailyDate(b),
@@ -376,7 +399,10 @@ fn timestamp_session(
         else {
             continue;
         };
-        let Some(period) = session.provider_period().and_then(|p| p.timestamped_period()) else {
+        let Some(period) = session
+            .provider_period()
+            .and_then(|p| p.timestamped_period())
+        else {
             continue;
         };
         if period.period_start() == exact.period_start()

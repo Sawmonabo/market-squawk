@@ -56,7 +56,8 @@ const forecastPreparationModelSchema = forecastModelSchema.extend({
 
 const forecastPreparationOptionsSchema = z
   .object({
-    models: z.array(forecastPreparationModelSchema).max(4_096),
+    models: z.array(forecastPreparationModelSchema).max(100),
+    nextCursor: z.string().min(1).max(512).nullable(),
   })
   .strict()
 

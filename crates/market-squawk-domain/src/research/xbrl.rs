@@ -13,6 +13,10 @@ use crate::{CalendarDate, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier
 /// Current schema version for [`XbrlFactEvidence`].
 pub const XBRL_FACT_EVIDENCE_SCHEMA_VERSION: u16 = 2;
 
+/// Maximum occurrences retained by a production SEC parse, including the upper
+/// bound on direct structural children. Aggregate parser/read byte bounds also apply.
+pub const MAX_XBRL_OCCURRENCES: usize = 250_000;
+
 /// Maximum dimensions retained for one XBRL context.
 pub const MAX_XBRL_DIMENSIONS: usize = 128;
 
@@ -900,7 +904,7 @@ pub struct XbrlOccurrenceRelationships {
 struct XbrlOccurrenceRelationshipsWire {
     #[serde(default)]
     parent_occurrence_id: Option<SourceIdentifier>,
-    child_occurrence_ids: BoundedSourceIdentifiers,
+    child_occurrence_ids: BoundedSourceIdentifiers<MAX_XBRL_OCCURRENCES>,
     continuation_chain: BoundedSourceIdentifiers,
     relationships: BoundedRelationships,
 }
@@ -929,7 +933,7 @@ impl XbrlOccurrenceRelationships {
         continuation_chain: Vec<SourceIdentifier>,
         relationships: Vec<XbrlRelationshipEvidence>,
     ) -> Result<Self, XbrlEvidenceError> {
-        validate_source_identifier_set(&child_occurrence_ids, MAX_XBRL_RELATIONSHIP_REFS, false)?;
+        validate_source_identifier_set(&child_occurrence_ids, MAX_XBRL_OCCURRENCES, false)?;
         validate_source_identifier_set(&continuation_chain, MAX_XBRL_RELATIONSHIP_REFS, false)?;
         if relationships.len() > MAX_XBRL_RELATIONSHIPS {
             return Err(XbrlEvidenceError::TooManyRelationships);
@@ -950,6 +954,26 @@ impl XbrlOccurrenceRelationships {
             continuation_chain: Vec::new(),
             relationships: Vec::new(),
         }
+    }
+
+    /// Returns the original parent occurrence identity.
+    pub const fn parent_occurrence_id(&self) -> Option<&SourceIdentifier> {
+        self.parent_occurrence_id.as_ref()
+    }
+
+    /// Returns the original nested child occurrence identities.
+    pub fn child_occurrence_ids(&self) -> &[SourceIdentifier] {
+        &self.child_occurrence_ids
+    }
+
+    /// Returns original continuation identities in source traversal order.
+    pub fn continuation_chain(&self) -> &[SourceIdentifier] {
+        &self.continuation_chain
+    }
+
+    /// Returns complete explanatory source relationship edges.
+    pub fn relationships(&self) -> &[XbrlRelationshipEvidence] {
+        &self.relationships
     }
 
     /// Validates that graph edges do not self-reference their owning occurrence.
@@ -984,12 +1008,14 @@ fn validate_source_identifier_set(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-struct BoundedSourceIdentifiers(Vec<SourceIdentifier>);
+struct BoundedSourceIdentifiers<const LIMIT: usize = MAX_XBRL_RELATIONSHIP_REFS>(
+    Vec<SourceIdentifier>,
+);
 
-struct BoundedSourceIdentifiersVisitor;
+struct BoundedSourceIdentifiersVisitor<const LIMIT: usize>;
 
-impl<'de> Visitor<'de> for BoundedSourceIdentifiersVisitor {
-    type Value = BoundedSourceIdentifiers;
+impl<'de, const LIMIT: usize> Visitor<'de> for BoundedSourceIdentifiersVisitor<LIMIT> {
+    type Value = BoundedSourceIdentifiers<LIMIT>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a bounded XBRL source-reference list")
@@ -1000,7 +1026,7 @@ impl<'de> Visitor<'de> for BoundedSourceIdentifiersVisitor {
         A: SeqAccess<'de>,
     {
         let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(16));
-        while values.len() < MAX_XBRL_RELATIONSHIP_REFS {
+        while values.len() < LIMIT {
             let Some(value) = sequence.next_element()? else {
                 return Ok(BoundedSourceIdentifiers(
                     values.into_boxed_slice().into_vec(),
@@ -1020,12 +1046,12 @@ impl<'de> Visitor<'de> for BoundedSourceIdentifiersVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for BoundedSourceIdentifiers {
+impl<'de, const LIMIT: usize> Deserialize<'de> for BoundedSourceIdentifiers<LIMIT> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_seq(BoundedSourceIdentifiersVisitor)
+        deserializer.deserialize_seq(BoundedSourceIdentifiersVisitor::<LIMIT>)
     }
 }
 
@@ -1169,10 +1195,20 @@ impl XbrlTaxonomySet {
     pub const fn status(&self) -> XbrlTaxonomyStatus {
         self.status
     }
+
+    /// Returns the retained exact artifact-set digest.
+    pub const fn digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+
+    /// Returns the retained taxonomy-set version.
+    pub const fn version(&self) -> &SourceIdentifier {
+        &self.version
+    }
 }
 
 /// Unvalidated construction input for [`XbrlFactEvidence`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct XbrlFactEvidenceInput {
     pub occurrence_id: SourceIdentifier,
     pub accession: SourceIdentifier,
@@ -1298,6 +1334,46 @@ impl XbrlFactEvidence {
     /// Returns source period semantics.
     pub const fn period(&self) -> XbrlPeriod {
         self.period
+    }
+
+    /// Returns the source-reported entity for this exact occurrence.
+    pub const fn entity(&self) -> &XbrlEntity {
+        &self.entity
+    }
+
+    /// Returns the admitted exact taxonomy set.
+    pub const fn taxonomy_set(&self) -> &XbrlTaxonomySet {
+        &self.taxonomy_set
+    }
+
+    /// Returns the exact filing payload carrying this occurrence.
+    pub const fn source_payload(&self) -> &ExactPayloadEvidence {
+        &self.source_payload
+    }
+
+    /// Returns the original parser evaluation clock.
+    pub const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+
+    /// Returns source decimals or precision, without inventing an accuracy.
+    pub const fn accuracy(&self) -> XbrlAccuracy {
+        self.accuracy
+    }
+
+    /// Returns the original bounded lexical value.
+    pub const fn lexical_value(&self) -> &XbrlText {
+        &self.lexical_value
+    }
+
+    /// Returns the source Inline-XBRL decimal scale transform.
+    pub const fn inline_scale(&self) -> Option<i32> {
+        self.inline_scale
+    }
+
+    /// Returns the source Inline-XBRL sign transform.
+    pub const fn inline_sign(&self) -> Option<XbrlSign> {
+        self.inline_sign
     }
 
     /// Returns the source lexical and resolved concept QName.

@@ -491,3 +491,54 @@ pub enum ResearchFillError {
     #[error("research fill financial arithmetic failed: {0}")]
     Financial(#[from] FinancialError),
 }
+
+// Private persistence wire: deserializing it cannot mint an execution intent or approval.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredResearchFill {
+    order_id: OrderId,
+    intent_digest: [u8; 32],
+    instrument_id: InstrumentId,
+    signal_at: Timestamp,
+    executed_at: Timestamp,
+    side: OrderSide,
+    quantity: QuantityLots,
+    price: PriceTicks,
+    fee: Money,
+    partial: bool,
+    assumption_digest: [u8; 32],
+}
+impl ResearchFill {
+    pub(crate) fn storage_bytes(&self) -> Result<Vec<u8>, crate::BacktestError> {
+        serde_json::to_vec(&StoredResearchFill {
+            order_id: self.order_id,
+            intent_digest: self.intent_digest.as_bytes(),
+            instrument_id: self.instrument_id,
+            signal_at: self.signal_at,
+            executed_at: self.executed_at,
+            side: self.side,
+            quantity: self.quantity,
+            price: self.price,
+            fee: self.fee,
+            partial: self.partial,
+            assumption_digest: self.assumption_digest.bytes(),
+        })
+        .map_err(|_| crate::BacktestError::InvalidDataset)
+    }
+    pub(crate) fn from_storage_bytes(bytes: &[u8]) -> Result<Self, crate::BacktestError> {
+        let value: StoredResearchFill =
+            serde_json::from_slice(bytes).map_err(|_| crate::BacktestError::InvalidDataset)?;
+        Ok(Self {
+            order_id: value.order_id,
+            intent_digest: OrderIntentDigest::from_bytes(value.intent_digest),
+            instrument_id: value.instrument_id,
+            signal_at: value.signal_at,
+            executed_at: value.executed_at,
+            side: value.side,
+            quantity: value.quantity,
+            price: value.price,
+            fee: value.fee,
+            partial: value.partial,
+            assumption_digest: Sha256Digest::new(value.assumption_digest),
+        })
+    }
+}

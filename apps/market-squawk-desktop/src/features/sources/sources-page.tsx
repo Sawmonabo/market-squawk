@@ -1,5 +1,5 @@
 import * as React from "react"
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useQueries, useQuery, useQueryClient, type QueryFunctionContext } from "@tanstack/react-query"
 import {
   Activity,
   CircleAlert,
@@ -128,12 +128,12 @@ export function ConnectionsWorkspace({
           ),
           refetchInterval: pendingSelectedWork && selectedProvider === profile.id ? 5_000 : false,
           refetchIntervalInBackground: false,
-          queryFn: async () =>
+          queryFn: async ({ signal }: QueryFunctionContext) =>
             parseSourceStatusResult(
               await transport.systemQuery({
                 query: "sourceStatus",
                 sourceIds: [profile.id],
-              }),
+              }, { signal }),
               [profile.id],
             ),
         }))
@@ -146,7 +146,7 @@ export function ConnectionsWorkspace({
       "Source.GetCoverage",
       {},
     ),
-    queryFn: () => transport.systemQuery({ query: "sourceCoverage" }),
+    queryFn: ({ signal }) => transport.systemQuery({ query: "sourceCoverage" }, { signal }),
     enabled: capabilities.coverage,
   })
   const health = useQuery({
@@ -156,7 +156,7 @@ export function ConnectionsWorkspace({
       "Source.GetHealth",
       {},
     ),
-    queryFn: () => transport.systemQuery({ query: "sourceHealth" }),
+    queryFn: ({ signal }) => transport.systemQuery({ query: "sourceHealth" }, { signal }),
     enabled: capabilities.health,
   })
   const statusRows = statusReads.flatMap((query) => query.data ?? [])
@@ -198,9 +198,9 @@ export function ConnectionsWorkspace({
         "Research.GetManifest",
         { dataset },
       ),
-      queryFn: async () =>
+      queryFn: async ({ signal }: QueryFunctionContext) =>
         parseResearchManifest(
-          await transport.systemQuery({ query: "researchManifest", dataset }),
+          await transport.systemQuery({ query: "researchManifest", dataset }, { signal }),
           dataset,
         ),
     })),

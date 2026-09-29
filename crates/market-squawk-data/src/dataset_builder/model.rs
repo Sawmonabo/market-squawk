@@ -30,10 +30,8 @@ const MAX_COMPONENT_SELECTORS: usize = 64;
 const MAX_COMPONENT_NAME_BYTES: usize = 256;
 const MAX_EXAMPLE_ID_BYTES: usize = 256;
 const MAX_BUILD_DURATION: Duration = Duration::from_secs(300);
-const MAX_BUILD_INPUT_ROWS: usize = 1_000_000;
 const MAX_BUILD_EXAMPLES: usize = 1_000_000;
 const MAX_COMPONENTS_PER_EXAMPLE: usize = 1_024;
-const MAX_BUILD_OUTPUT_ROWS: usize = 10_000_000;
 const MAX_BUILD_RETAINED_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Closed semantic role of one versioned output component.
@@ -872,11 +870,17 @@ impl DatasetExample {
             return Err(DatasetBuildError::ComponentAdjustmentMismatch);
         }
         if let Some(source) = self.nominal_daily_source.as_ref() {
-            source.origin.validate_price_plan(&source.manifest, self.instrument_id,
-                self.source_selection_as_of, &plan)?;
+            source.origin.validate_price_plan(
+                &source.manifest,
+                self.instrument_id,
+                self.source_selection_as_of,
+                &plan,
+            )?;
         } else if let Some(source) = self.timestamp_history_source.as_ref() {
             source.validate_price_plan(self.instrument_id, self.source_selection_as_of, &plan)?;
-        } else { return Err(DatasetBuildError::ComponentAdjustmentMismatch); }
+        } else {
+            return Err(DatasetBuildError::ComponentAdjustmentMismatch);
+        }
         if self
             .label_selection_as_of
             .is_some_and(|cutoff| cutoff != self.source_selection_as_of)
@@ -887,16 +891,23 @@ impl DatasetExample {
         Ok(self)
     }
 
-    pub(super) fn attach_timestamp_history(&mut self, source: super::timestamp_history::TimestampHistoryExampleSource)
-        -> Result<(), DatasetBuildError> {
-        if self.timestamp_history_source.is_some() || self.nominal_daily_source.is_some()
-            || self.financial_source.is_some() || self.source_price_plan.is_some() {
+    pub(super) fn attach_timestamp_history(
+        &mut self,
+        source: super::timestamp_history::TimestampHistoryExampleSource,
+    ) -> Result<(), DatasetBuildError> {
+        if self.timestamp_history_source.is_some()
+            || self.nominal_daily_source.is_some()
+            || self.financial_source.is_some()
+            || self.source_price_plan.is_some()
+        {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         }
         self.timestamp_history_source = Some(source);
         Ok(())
     }
-    pub(super) fn timestamp_history_source(&self) -> Option<&super::timestamp_history::TimestampHistoryExampleSource> {
+    pub(super) fn timestamp_history_source(
+        &self,
+    ) -> Option<&super::timestamp_history::TimestampHistoryExampleSource> {
         self.timestamp_history_source.as_ref()
     }
     pub(super) fn source_price_plan(&self) -> Option<&std::sync::Arc<crate::CorporateActionPlan>> {
@@ -1431,11 +1442,23 @@ impl DatasetBuildInputs {
                 }
             }
             if let Some(source) = example.timestamp_history_source() {
-                let plan = example.source_price_plan().ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
-                source.validate_price_plan(example.instrument_id(), example.source_selection_as_of(), plan)?;
-                let coverage = plan.source_split_admission().ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
-                if !parents.as_slice().contains(source.manifest()) || coverage.source_manifests().iter()
-                    .any(|parent| !parents.as_slice().contains(parent)) {
+                let plan = example
+                    .source_price_plan()
+                    .ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
+                source.validate_price_plan(
+                    example.instrument_id(),
+                    example.source_selection_as_of(),
+                    plan,
+                )?;
+                let coverage = plan
+                    .source_split_admission()
+                    .ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
+                if !parents.as_slice().contains(source.manifest())
+                    || coverage
+                        .source_manifests()
+                        .iter()
+                        .any(|parent| !parents.as_slice().contains(parent))
+                {
                     return Err(DatasetBuildError::InvalidRequest);
                 }
             }
@@ -1605,6 +1628,7 @@ pub struct DatasetBuildLimits {
     max_components_per_example: usize,
     max_output_rows: usize,
     max_retained_bytes: usize,
+    max_spill_bytes: u64,
     max_duration: Duration,
     point_in_time: PointInTimeLimits,
     universe: UniverseLimits,
@@ -1629,13 +1653,11 @@ impl DatasetBuildLimits {
         corporate_actions: CorporateActionLimits,
     ) -> Result<Self, DatasetBuildError> {
         if max_input_rows == 0
-            || max_input_rows > MAX_BUILD_INPUT_ROWS
             || max_examples == 0
             || max_examples > MAX_BUILD_EXAMPLES
             || max_components_per_example == 0
             || max_components_per_example > MAX_COMPONENTS_PER_EXAMPLE
             || max_output_rows == 0
-            || max_output_rows > MAX_BUILD_OUTPUT_ROWS
             || max_retained_bytes == 0
             || max_retained_bytes > MAX_BUILD_RETAINED_BYTES
             || max_duration.is_zero()
@@ -1649,11 +1671,25 @@ impl DatasetBuildLimits {
             max_components_per_example,
             max_output_rows,
             max_retained_bytes,
+            max_spill_bytes: 16 * 1024 * 1024 * 1024,
             max_duration,
             point_in_time,
             universe,
             corporate_actions,
         })
+    }
+
+    /// Sets the operation-owned disk budget independently of its resident working set.
+    pub fn with_spill_bytes(mut self, max_spill_bytes: u64) -> Result<Self, DatasetBuildError> {
+        if max_spill_bytes < 4096 || max_spill_bytes > i64::MAX as u64 {
+            return Err(DatasetBuildError::InvalidLimits);
+        }
+        self.max_spill_bytes = max_spill_bytes;
+        Ok(self)
+    }
+
+    pub(super) const fn max_spill_bytes(self) -> u64 {
+        self.max_spill_bytes
     }
 
     pub(super) const fn max_input_rows(self) -> usize {
@@ -1840,11 +1876,9 @@ impl DatasetBuildRequest {
             });
         let preserves_probability_origins = policy.missing_values() == MissingValuePolicy::Preserve
             && (inputs.probability_subject().is_some() || probability_training);
-        if inputs
-            .examples
-            .iter()
-            .any(|value| value.nominal_daily_source().is_some() || value.timestamp_history_source().is_some())
-        {
+        if inputs.examples.iter().any(|value| {
+            value.nominal_daily_source().is_some() || value.timestamp_history_source().is_some()
+        }) {
             let study = policy
                 .study_policy()
                 .ok_or(DatasetBuildError::InvalidRequest)?;
@@ -1929,10 +1963,12 @@ impl DatasetBuildRequest {
                                 .examples
                                 .iter()
                                 .all(|v| v.financial_source().is_some()),
-                            super::DatasetTargetHorizon::ExactElapsed(_) => inputs
-                                .examples
-                                .iter()
-                                .all(|v| v.nominal_daily_source().is_some() || v.timestamp_history_source().is_some()),
+                            super::DatasetTargetHorizon::ExactElapsed(_) => {
+                                inputs.examples.iter().all(|v| {
+                                    v.nominal_daily_source().is_some()
+                                        || v.timestamp_history_source().is_some()
+                                })
+                            }
                         }
                 }
                 DatasetPopulationBasis::PublishedHistoricalMembership => false,
@@ -1971,7 +2007,10 @@ impl DatasetBuildRequest {
                 return Err(DatasetBuildError::InvalidRequest);
             }
             if let Some(study) = policy.study_policy() {
-                if example.timestamp_history_source().is_some_and(|source| source.study() != *study) {
+                if example
+                    .timestamp_history_source()
+                    .is_some_and(|source| source.study() != *study)
+                {
                     return Err(DatasetBuildError::ComponentEvidenceMismatch);
                 }
                 study.validate_example(example)?;
@@ -2322,7 +2361,9 @@ fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetB
             }
         }
         if let Some(source) = example.timestamp_history_source() {
-            retained = retained.checked_add(source.retained_bytes()).ok_or(DatasetBuildError::LimitExceeded)?;
+            retained = retained
+                .checked_add(source.retained_bytes())
+                .ok_or(DatasetBuildError::LimitExceeded)?;
         }
         if let Some(source) = example.nominal_daily_source() {
             retained = retained

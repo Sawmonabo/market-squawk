@@ -101,6 +101,35 @@ fn bundle_metadata_reference_rejects_non_local_paths() {
 }
 
 #[test]
+fn selection_metadata_does_not_read_weights_and_still_checks_provenance() -> TestResult {
+    let fixture = valid_fixture("native_linear", 1, 1, |_, _| {})?;
+    let admitted = fixture.load()?;
+    let expected = admitted.selection_metadata();
+    drop(admitted);
+    fs::remove_file(fixture.artifact_path())?;
+    let selected = ModelBundle::load_selection_metadata(
+        &fixture.root,
+        &fixture.reference,
+        &fixture.expectations,
+        &fixture.registry,
+    )?;
+    assert_eq!(selected.metadata(), expected.metadata());
+    assert_eq!(selected.training_run_bytes(), expected.training_run_bytes());
+    assert!(fixture.load().is_err());
+    fs::write(fixture.training_run_path(), b"{}")?;
+    assert!(
+        ModelBundle::load_selection_metadata(
+            &fixture.root,
+            &fixture.reference,
+            &fixture.expectations,
+            &fixture.registry,
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn exact_bundle_load_and_registry_retain_immutable_generations() -> TestResult {
     let first_fixture = valid_fixture("native_linear", 1, 1, |_, _| {})?;
     let first = first_fixture.load()?;
@@ -478,13 +507,14 @@ fn with_direct_calibration(mut fixture: Fixture, forged_coverage: bool) -> TestR
         .into_iter()
         .flat_map(f64::to_le_bytes)
         .collect::<Vec<_>>();
-    let realized = [0, 1, 2]
-        .map(|_| json!({"covered": u64::from(forged_coverage), "total": 1}));
-    let bands = [5_000, 8_000, 9_500].map(|coverage| json!({
-        "target_coverage_basis_points": coverage,
-        "lower_offset": -0.2,
-        "upper_offset": 0.1
-    }));
+    let realized = [0, 1, 2].map(|_| json!({"covered": u64::from(forged_coverage), "total": 1}));
+    let bands = [5_000, 8_000, 9_500].map(|coverage| {
+        json!({
+            "target_coverage_basis_points": coverage,
+            "lower_offset": -0.2,
+            "upper_offset": 0.1
+        })
+    });
     let policy = serde_json::to_vec(&json!({
         "schema_version": 1,
         "kind": "residual_quantile",
@@ -818,10 +848,16 @@ fn valid_fixture_with_identity(
             "selection_as_of_unix_nanos": expectations.dataset().selection_as_of().unix_nanos(),
             "selected_component_rows": expectations.dataset().selected_component_rows().get(),
             "study": null,
-            "split_boundaries_unix_nanos": split_boundaries_unix_nanos
+            "split_policy": {
+                "kind": "exact_time",
+                "train_end_unix_nanos": split_boundaries_unix_nanos[0],
+                "validation_end_unix_nanos": split_boundaries_unix_nanos[1],
+                "test_end_unix_nanos": split_boundaries_unix_nanos[2]
+            }
         },
         "training_universe_id": expectations.universe_id().as_str(),
         "training_period": {
+            "kind": "exact_time",
             "start_unix_nanos": training_start_unix_nanos,
             "end_unix_nanos": training_end_unix_nanos
         },

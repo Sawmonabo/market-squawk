@@ -196,14 +196,17 @@ impl SourceAppliedCorporateActionPlan {
             .anchor
             .as_ref()
             .ok_or(SourceForecastUnitContinuityError::MissingFreshSourceAnchor)?;
-        let index = anchor
-            .raw
-            .bars()
-            .iter()
-            .position(|bar| anchor::same_coordinate(origin, bar))
-            .ok_or(SourceForecastUnitContinuityError::OriginalCoordinateUnavailable)?;
-        let raw = &anchor.raw.bars()[index];
-        let split = &anchor.split.bars()[index];
+        let mut original = None;
+        for (raw, split) in anchor.raw.bars().zip(anchor.split.bars()) {
+            let raw = raw.map_err(|_| invalid)?;
+            let split = split.map_err(|_| invalid)?;
+            if anchor::same_coordinate(origin, &raw) {
+                original = Some((raw, split));
+                break;
+            }
+        }
+        let (raw, split) =
+            original.ok_or(SourceForecastUnitContinuityError::OriginalCoordinateUnavailable)?;
         // These are independently acquired source snapshots. Reuse the exact final market
         // configuration's age bound at one immutable cutoff; never chase a newer tick or imply
         // that the captures and market event happened atomically. The original manifests retain
@@ -214,28 +217,30 @@ impl SourceAppliedCorporateActionPlan {
             deadline,
             cancellation,
         )?;
-        if !anchor::same_reported_values(origin, split) {
+        if !anchor::same_reported_values(origin, &split) {
             return Err(SourceForecastUnitContinuityError::OriginalSourceFrameChanged);
         }
-        if !anchor::reciprocal_price_volume(raw, split) {
+        if !anchor::reciprocal_price_volume(&raw, &split) {
             return Err(SourceForecastUnitContinuityError::SourceShareRelationUnavailable);
         }
-        let native = anchor
-            .raw
-            .native_sessions()
-            .ok_or(invalid)?
-            .sessions()
-            .iter()
-            .find(|session| {
-                session.provider_timestamp() == Some(origin_time.provider_timestamp())
-                    && session.provider_period()
-                        == Some((
-                            origin_time.period_start(),
-                            origin_time.period_end_exclusive(),
-                        ))
-                    && session.bar_present()
-            })
-            .ok_or(SourceForecastUnitContinuityError::OriginalCoordinateUnavailable)?;
+        let sessions = anchor.raw.native_sessions().ok_or(invalid)?.sessions();
+        let mut native = None;
+        for session in sessions.iter() {
+            let session = session.map_err(|_| invalid)?;
+            if session.provider_timestamp() == Some(origin_time.provider_timestamp())
+                && session.provider_period()
+                    == Some((
+                        origin_time.period_start(),
+                        origin_time.period_end_exclusive(),
+                    ))
+                && session.bar_present()
+            {
+                native = Some(session);
+                break;
+            }
+        }
+        let native =
+            native.ok_or(SourceForecastUnitContinuityError::OriginalCoordinateUnavailable)?;
         let origin_date = native.native_date();
         // The exact captured calendar supplies the nominal current date. No timezone conversion,
         // guessed midnight, holiday rolling, or daily aggregation timestamp is used as an open.
@@ -265,7 +270,8 @@ impl SourceAppliedCorporateActionPlan {
                 if read.history().selection().receipt().instrument_id() != instrument {
                     continue;
                 }
-                for row in read.actions().rows() {
+                for row in read.source_history().action_rows() {
+                    let row = row.map_err(|_| invalid)?;
                     if row.date <= origin_date || row.date > final_date {
                         continue;
                     }

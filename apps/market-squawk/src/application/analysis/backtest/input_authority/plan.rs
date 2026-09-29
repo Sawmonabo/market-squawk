@@ -3,6 +3,9 @@
 //! A deserialized reference is a reopening recipe. Only `read`/`reopen` return the opaque plan;
 //! their complete-history and benchmark reads re-admit its exact original source evidence.
 
+use crate::application::research::corporate_actions::{
+    SourceAppliedCorporateActionPlanReference, SourceAppliedCorporateActionReadCapability,
+};
 use crate::{
     ResearchService,
     application::{
@@ -20,17 +23,15 @@ use market_squawk_backtesting::{
     RecommendationSignalPlanMaterializerV1,
 };
 use market_squawk_data::{
-    AnalyticalReadCapability, ChronologicalSplitPolicy, CompleteMarketBarHistoryOutput,
-    DatasetBuildPurpose, DatasetStudyPolicy, DatasetTargetHorizon, FeatureDatasetProductContract,
-    PythonDatasetSelection, Sha256Digest,
+    AnalyticalReadCapability, ChronologicalSplitPolicy, DatasetBuildPurpose, DatasetStudyPolicy,
+    DatasetTargetHorizon, FeatureDatasetProductContract, PythonDatasetSelection, Sha256Digest,
 };
 use market_squawk_domain::{HistoricalStudyBasis, InstrumentId, Timestamp};
-use crate::application::research::corporate_actions::{SourceAppliedCorporateActionPlanReference, SourceAppliedCorporateActionReadCapability};
 use market_squawk_jobs::{JobSnapshot, JobState};
 use market_squawk_services::{RequestContext, ServiceError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -46,7 +47,9 @@ pub(crate) struct HistoricalStudyPlanReferenceV1 {
     plan_digest: [u8; 32],
 }
 impl HistoricalStudyPlanReferenceV1 {
-    pub(crate) const fn source_action_reference(&self) -> &SourceAppliedCorporateActionPlanReference {
+    pub(crate) const fn source_action_reference(
+        &self,
+    ) -> &SourceAppliedCorporateActionPlanReference {
         &self.source_action_reference
     }
     pub(crate) const fn financial_profile(&self) -> &AnalyticalProfileResolution {
@@ -72,7 +75,7 @@ pub(crate) struct HistoricalStudyPlanV1 {
     reference: HistoricalStudyPlanReferenceV1,
     profile: ValidatedAnalyticalProfile,
     benchmarks: RecommendationBenchmarkSelection,
-    histories: [CompleteMarketBarHistoryOutput; 3],
+    histories: [market_squawk_data::CompleteMarketBarHistoryCursor; 3],
     folds: [RecommendationOosFoldV1; 3],
     population_starts_at: Timestamp,
     population_ends_at: Timestamp,
@@ -102,14 +105,32 @@ impl HistoricalStudyPlanReadCapabilityV1 {
     }
     /// Reopens full accounting authority separately from the narrower price-feature plan.
     pub(crate) async fn reopen_accounting_actions(
-        &self, plan: &HistoricalStudyPlanV1, context: &RequestContext,
+        &self,
+        plan: &HistoricalStudyPlanV1,
+        context: &RequestContext,
     ) -> Result<market_squawk_data::CorporateActionPlan, ServiceError> {
-        let histories = plan.histories.iter().collect::<Vec<_>>();
-        let source = self.actions.read_reference_for_histories(
-            &plan.reference.source_action_reference, &histories, context.deadline(),
-            context.cancellation().clone(), None,
-        ).await.map_err(|error| map_action_source(error, context))?.ok_or(ServiceError::Unavailable)?;
-        source.into_covered_accounting_plan().map_err(|error| map_action_source(error, context))
+        let source = self
+            .actions
+            .read_reference(
+                &plan.reference.source_action_reference,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map_err(|error| map_action_source(error, context))?
+            .ok_or(ServiceError::Unavailable)?;
+        for history in &plan.histories {
+            source
+                .validate_accounting_histories(
+                    &[history],
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .map_err(|error| map_action_source(error, context))?;
+        }
+        source
+            .into_covered_accounting_plan()
+            .map_err(|error| map_action_source(error, context))
     }
     pub(crate) async fn read(
         &self,
@@ -125,8 +146,15 @@ impl HistoricalStudyPlanReadCapabilityV1 {
         else {
             return Ok(None);
         };
-        self.select(subject, cutoff, profile, benchmarks, source_action_reference, context)
-            .await
+        self.select(
+            subject,
+            cutoff,
+            profile,
+            benchmarks,
+            source_action_reference,
+            context,
+        )
+        .await
     }
     pub(crate) async fn reopen(
         &self,
@@ -197,40 +225,89 @@ impl HistoricalStudyPlanReadCapabilityV1 {
         if source_action_reference.knowledge_cutoff() != cutoff {
             return Err(ServiceError::InvalidRequest);
         }
-        let Some(source) = self.actions.read_reference(source_action_reference, context.deadline(), context.cancellation().clone())
-            .await.map_err(|error| map_action_source(error, context))? else { return Ok(None); };
-        source.covered_price_plan().map_err(|error| map_action_source(error, context))?;
-        let ordinary = source.ordinary_coverage().ok_or(ServiceError::Unavailable)?;
+        let Some(source) = self
+            .actions
+            .read_reference(
+                source_action_reference,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map_err(|error| map_action_source(error, context))?
+        else {
+            return Ok(None);
+        };
+        source
+            .covered_price_plan()
+            .map_err(|error| map_action_source(error, context))?;
+        let ordinary = source
+            .ordinary_coverage()
+            .ok_or(ServiceError::Unavailable)?;
         let mut outputs = Vec::with_capacity(3);
         for instrument in instruments {
-            let (original, _) = ordinary.reads().iter().find(|(read, _)| read.history().selection().receipt().instrument_id() == instrument)
+            let (original, _) = ordinary
+                .reads()
+                .iter()
+                .find(|(read, _)| {
+                    read.history().selection().receipt().instrument_id() == instrument
+                })
                 .ok_or(ServiceError::InvalidRequest)?;
             let original = original.history();
             let receipt = original.selection().receipt();
-            let dates = receipt.date_windows().ok_or(ServiceError::Unavailable)?.requested_dates();
-            let request = market_squawk_data::CompleteMarketBarHistoryRequest::try_exact_nominal(instrument,
-                dates.0, dates.1, receipt.provider_instrument_id().clone(), receipt.venue_id().clone(),
-                receipt.feed().clone(), receipt.interval().clone(), receipt.adjustment(), receipt.session_ruleset().clone(),
-                cutoff, original.selection().pinned().manifest().clone())
-                .and_then(|request| request.try_with_surface_requirement(original.selection().surface_requirement()))
-                .map_err(|_| ServiceError::InvalidRequest)?;
-            let Some(output) = self.reader.read_complete_market_bar_history(request,
-                context.deadline(), context.cancellation().clone()).await.map_err(|_| ServiceError::Unavailable)?
-            else { return Ok(None); };
+            let dates = receipt
+                .date_windows()
+                .ok_or(ServiceError::Unavailable)?
+                .requested_dates();
+            let request = market_squawk_data::CompleteMarketBarHistoryRequest::try_exact_nominal(
+                instrument,
+                dates.0,
+                dates.1,
+                receipt.provider_instrument_id().clone(),
+                receipt.venue_id().clone(),
+                receipt.feed().clone(),
+                receipt.interval().clone(),
+                receipt.adjustment(),
+                receipt.session_ruleset().clone(),
+                cutoff,
+                original.selection().pinned().manifest().clone(),
+            )
+            .and_then(|request| {
+                request.try_with_surface_requirement(original.selection().surface_requirement())
+            })
+            .map_err(|_| ServiceError::InvalidRequest)?;
+            let Some(output) = self
+                .reader
+                .read_complete_market_bar_history_cursor(
+                    request,
+                    context.deadline(),
+                    context.cancellation().clone(),
+                )
+                .await
+                .map_err(|_| ServiceError::Unavailable)?
+            else {
+                return Ok(None);
+            };
             if output.selection().receipt().receipt_digest() != receipt.receipt_digest()
-                || output.read_receipt().history_content_digest() != original.read_receipt().history_content_digest()
-                || output.bars() != original.bars() {
+                || output.read_receipt().history_content_digest()
+                    != original.read_receipt().history_content_digest()
+                || !same_retained_bars(output.bars(), original.bars())?
+            {
                 return Err(ServiceError::InvalidResult);
             }
-            let (output, _) = self.datasets.rejoin_nominal_history(output, context.deadline(), context.cancellation())
-                .await.map_err(ServiceError::from)?;
-            if !output.selection().receipt().realized_outcome_eligible() || output.native_sessions().is_none() {
+            let (output, _) = self
+                .datasets
+                .rejoin_nominal_history(output, context.deadline(), context.cancellation())
+                .await
+                .map_err(ServiceError::from)?;
+            if !output.selection().receipt().realized_outcome_eligible()
+                || output.native_sessions().is_none()
+            {
                 return Ok(None);
             }
             outputs.push(output);
         }
         drop(source);
-        let histories: [CompleteMarketBarHistoryOutput; 3] =
+        let histories: [market_squawk_data::CompleteMarketBarHistoryCursor; 3] =
             outputs.try_into().map_err(|_| ServiceError::Internal)?;
         // Calendar membership determines the study, never observed returns, entry success or target maturity.
         let subject_sessions = histories[0]
@@ -239,18 +316,43 @@ impl HistoricalStudyPlanReadCapabilityV1 {
         let benchmark_sessions = histories[1]
             .native_sessions()
             .ok_or(ServiceError::Unavailable)?;
-        let primary_closes: BTreeSet<_> = benchmark_sessions
-            .sessions()
-            .iter()
-            .map(|s| s.closes_at_exclusive())
-            .collect();
-        let common: Vec<_> = subject_sessions
-            .sessions()
-            .iter()
-            .map(|s| s.closes_at_exclusive())
-            .filter(|at| *at <= cutoff && primary_closes.contains(at))
-            .collect();
-        let (Some(&population_start), Some(&last_close)) = (common.first(), common.last()) else {
+        let mut subjects = subject_sessions.sessions().iter();
+        let mut benchmark_rows = benchmark_sessions.sessions().iter();
+        let mut subject_row = subjects
+            .next()
+            .transpose()
+            .map_err(|_| ServiceError::Unavailable)?;
+        let mut benchmark = benchmark_rows
+            .next()
+            .transpose()
+            .map_err(|_| ServiceError::Unavailable)?;
+        let mut population_start = None;
+        let mut last_close = None;
+        while let (Some(a), Some(b)) = (&subject_row, &benchmark) {
+            let left = a.closes_at_exclusive();
+            let right = b.closes_at_exclusive();
+            if left == right && left <= cutoff {
+                population_start.get_or_insert(left);
+                last_close = Some(left);
+            }
+            if left <= right {
+                subject_row = subjects
+                    .next()
+                    .transpose()
+                    .map_err(|_| ServiceError::Unavailable)?;
+            }
+            if right <= left {
+                benchmark = benchmark_rows
+                    .next()
+                    .transpose()
+                    .map_err(|_| ServiceError::Unavailable)?;
+            }
+        }
+        // Exhaust both sealed reads so cancellation/storage errors cannot hide in an unmatched tail.
+        for row in subjects.chain(benchmark_rows) {
+            row.map_err(|_| ServiceError::Unavailable)?;
+        }
+        let (Some(population_start), Some(last_close)) = (population_start, last_close) else {
             return Ok(None);
         };
         let evaluation_start = last_close
@@ -372,7 +474,7 @@ impl HistoricalStudyPlanV1 {
     pub(crate) const fn folds(&self) -> &[RecommendationOosFoldV1; 3] {
         &self.folds
     }
-    pub(crate) fn into_histories(self) -> [CompleteMarketBarHistoryOutput; 3] {
+    pub(crate) fn into_histories(self) -> [market_squawk_data::CompleteMarketBarHistoryCursor; 3] {
         self.histories
     }
     fn study_policy(
@@ -474,14 +576,56 @@ impl HistoricalFoldTrainingAuthorityV1 {
     }
 }
 
-fn map_action_source(error: crate::application::research::corporate_actions::ApplicableActionPlanError, context: &RequestContext) -> ServiceError {
-    if context.cancellation().is_cancelled() { return ServiceError::Cancelled; }
-    if std::time::Instant::now() >= context.deadline() { return ServiceError::DeadlineExceeded; }
+fn map_action_source(
+    error: crate::application::research::corporate_actions::ApplicableActionPlanError,
+    context: &RequestContext,
+) -> ServiceError {
+    if context.cancellation().is_cancelled() {
+        return ServiceError::Cancelled;
+    }
+    if std::time::Instant::now() >= context.deadline() {
+        return ServiceError::DeadlineExceeded;
+    }
     use crate::application::research::corporate_actions::ApplicableActionPlanError as Error;
     match error {
         Error::SourceRead(error) => error,
         Error::InvalidEvidence => ServiceError::InvalidResult,
         Error::Interrupted => ServiceError::Cancelled,
-        Error::IncompleteOrdinaryCoverage | Error::UnresolvedApplicableActions => ServiceError::Unavailable,
+        Error::IncompleteOrdinaryCoverage | Error::UnresolvedApplicableActions => {
+            ServiceError::Unavailable
+        }
     }
+}
+
+fn same_retained_bars(
+    expected: impl IntoIterator<
+        Item = Result<
+            market_squawk_domain::MarketBarObservation,
+            market_squawk_data::AnalyticalReadError,
+        >,
+    >,
+    rows: impl IntoIterator<
+        Item = Result<
+            market_squawk_domain::MarketBarObservation,
+            market_squawk_data::AnalyticalReadError,
+        >,
+    >,
+) -> Result<bool, ServiceError> {
+    let mut expected = expected.into_iter();
+    for row in rows {
+        let row = row.map_err(|_| ServiceError::Unavailable)?;
+        if expected
+            .next()
+            .transpose()
+            .map_err(|_| ServiceError::Unavailable)?
+            != Some(row)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(expected
+        .next()
+        .transpose()
+        .map_err(|_| ServiceError::Unavailable)?
+        .is_none())
 }

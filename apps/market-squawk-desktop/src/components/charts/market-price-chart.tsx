@@ -8,6 +8,8 @@ export interface ObservedPricePoint {
   value: ChartValue | null
   quality: string | null
   sessionDate?: string
+  originalOrdinal?: string
+  breakBefore?: boolean
 }
 export interface ForecastPricePoint {
   timeUnixNanos: ChartTime
@@ -34,6 +36,19 @@ export interface ScenarioPricePath {
   label: string
   points: readonly { timeUnixNanos: ChartTime; value: ChartValue }[]
 }
+export interface ChartViewport {
+  fromUnixNanos: string
+  throughUnixNanos: string
+  pointLimit: number
+}
+export interface ChartDisplayResolution {
+  method: "first_last_min_max"
+  originalPointCount: string
+  visibleOriginalPointCount: string
+  returnedPointCount: number
+  projectionDigest: string
+  reduced: boolean
+}
 export interface MarketPriceChartProps {
   observed: readonly ObservedPricePoint[]
   forecast: readonly ForecastPricePoint[]
@@ -43,6 +58,12 @@ export interface MarketPriceChartProps {
   ranges?: readonly PriceRangeLayer[]
   pattern?: PricePatternLayer
   onPatternSelect?: (pivot: PricePatternLayer["points"][number]) => void
+  /** Complete immutable chart bounds, independent of the currently returned projection. */
+  viewportBounds?: { fromUnixNanos: ChartTime; throughUnixNanos: ChartTime }
+  viewportPointLimit?: number
+  onViewportChange?: (viewport: ChartViewport) => void
+  onObservationSelect?: (point: ObservedPricePoint) => void
+  displayResolution?: ChartDisplayResolution
   scenarios?: readonly ScenarioPricePath[]
   unit: string
   title?: string
@@ -52,6 +73,7 @@ export interface MarketPriceChartProps {
 type Point = { time: bigint; value: number; exact: string }
 const WIDTH = 960
 const HEIGHT = 390
+const VIEWPORT_DEBOUNCE_MS = 180
 const PAD = { top: 25, right: 28, bottom: 45, left: 80 }
 const BANDS = [
   { key: "interval95", label: "95% calibrated range", color: "rgba(96,165,250,0.09)" },
@@ -66,6 +88,7 @@ const WINDOWS = [
 ] as const
 
 export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets = [], ranges = [], pattern, onPatternSelect, scenarios = [],
+  viewportBounds, viewportPointLimit = 512, onViewportChange, onObservationSelect, displayResolution,
   unit, title = "History and forecast", cutoffLabel = "Observed through", unavailableReason, className }: MarketPriceChartProps) {
   const id = React.useId()
   const [hidden, setHidden] = React.useState<ReadonlySet<string>>(new Set())
@@ -91,15 +114,28 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
     .filter((entry): entry is { source: ForecastPricePoint; plot: Point } => entry.plot !== null)
     .filter(({ plot }) => cutoff !== null && plot.time > cutoff)
     .sort((a, b) => compareTime(a.plot.time, b.plot.time))
-  const anchor = cutoff ?? history.at(-1)?.plot.time ?? projected.at(-1)?.plot.time ?? null
+  const fullStart = parseTime(viewportBounds?.fromUnixNanos ?? null)
+  const fullEnd = parseTime(viewportBounds?.throughUnixNanos ?? null)
+  const anchor = cutoff ?? fullEnd ?? history.at(-1)?.plot.time ?? projected.at(-1)?.plot.time ?? null
   const days = WINDOWS.find((choice) => choice.value === window)?.days ?? null
   const from = anchor !== null && days !== null ? anchor - BigInt(days) * 86_400_000_000_000n : null
+  const viewportStart = fullStart === null || fullEnd === null || fullStart > fullEnd ? null
+    : from !== null && from > fullStart ? from > fullEnd ? fullEnd : from : fullStart
+  const viewport: ChartViewport | null = viewportStart !== null && fullEnd !== null
+    && Number.isSafeInteger(viewportPointLimit) && viewportPointLimit > 0
+    ? { fromUnixNanos: viewportStart.toString(), throughUnixNanos: fullEnd.toString(), pointLimit: viewportPointLimit } : null
+  useDebouncedChartCallback(viewport ? `${viewport.fromUnixNanos}:${viewport.throughUnixNanos}:${viewport.pointLimit}` : null,
+    viewport, onViewportChange)
   const inWindow = (time: bigint) => from === null || time >= from
   const observedRows = historyRows.filter(({ time }) => inWindow(time))
   const observedPoints = history.filter(({ plot }) => inWindow(plot.time))
   const historySegments: Point[][] = []
   let historySegment: Point[] = []
   for (const entry of observedRows) {
+    if (entry.source.breakBefore && historySegment.length) {
+      historySegments.push(historySegment)
+      historySegment = []
+    }
     if (entry.source.value === null) {
       if (historySegment.length) historySegments.push(historySegment)
       historySegment = []
@@ -146,13 +182,21 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
     ...targets.map((target) => ({ key: `target:${target.id}`, label: target.label })),
     ...scenarios.map((scenario) => ({ key: `scenario:${scenario.id}`, label: `Scenario: ${scenario.label}` })),
   ]
+  const selectedHistory = observedPoints.find(({ plot }) => plot.time === selected)
+  const selectedGap = observedRows.find(({ time, source }) => time === selected && source.value === null)
+  const selectedObservation = selectedTime === null || selected !== selectedTime || !visible("history")
+    ? null : selectedHistory?.source ?? selectedGap?.source ?? null
+  useDebouncedChartCallback(selectedObservation
+    ? `${parseTime(selectedObservation.timeUnixNanos)}:${selectedObservation.originalOrdinal ?? ""}` : null,
+    selectedObservation, onObservationSelect)
   if (!times.length || !values.length) return <figure className={`rounded-xl border border-border bg-card/35 p-5 ${className ?? ""}`}>
     <figcaption className="text-sm font-semibold">{title}</figcaption>
     <p className="mt-2 text-sm text-muted-foreground">{unavailableReason ?? "No dated values are available in this window."}</p>
     {window !== "all" ? <button className="mt-3 text-sm underline" onClick={() => setWindow("all")}>Show all history</button> : null}
   </figure>
-  const minTime = times[0]!
-  const maxTime = times.at(-1)!
+  const minTime = viewportStart !== null && viewportStart < times[0]! ? viewportStart : times[0]!
+  const lastPointTime = times.at(-1)!
+  const maxTime = viewportStart !== null && fullEnd !== null && fullEnd > lastPointTime ? fullEnd : lastPointTime
   const span = maxTime - minTime
   const minValue = Math.min(...values)
   const maxValue = Math.max(...values)
@@ -170,8 +214,6 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
     const right = end > maxTime ? maxTime : end
     return left < right || left === right && exclusiveEnd === null ? [x(left), x(right)] as const : null
   }
-  const selectedHistory = observedPoints.find(({ plot }) => plot.time === selected)
-  const selectedGap = observedRows.find(({ time, source }) => time === selected && source.value === null)
   const selectedForecast = forecastPoints.find(({ plot }) => plot.time === selected)
   const selectedSessionDate = selectedHistory?.source.sessionDate ?? selectedGap?.source.sessionDate
   const selectedDate = selectedSessionDate
@@ -180,6 +222,7 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
   const readout: { label: string; value: string; unit?: string }[] = []
   if (visible("history") && selectedHistory) readout.push({ label: "Observed", value: selectedHistory.plot.exact })
   if (visible("history") && selectedGap) readout.push({ label: "Observed", value: "Missing source session", unit: "" })
+  if (visible("history") && selectedObservation?.quality) readout.push({ label: "Source quality", value: selectedObservation.quality, unit: "" })
   if (selectedForecast) {
     const source = selectedForecast.source
     if (visible("central")) readout.push({ label: "Central forecast", value: String(source.central) })
@@ -310,6 +353,9 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
           aria-valuetext={selectedDate} onChange={(event) => setSelectedTime(times[Number(event.target.value)] ?? null)} />
       </label>
       <p className="mt-3 break-all font-mono text-xs">{selectedDate}</p>
+      {displayResolution?.reduced ? <p className="mt-2 text-xs text-muted-foreground">
+        Showing {displayResolution.returnedPointCount.toLocaleString()} original recorded dates from {displayResolution.visibleOriginalPointCount} in this window. Change the history window for more detail.
+      </p> : null}
       <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3" aria-live="polite" aria-atomic="true">
         {readout.map((entry) => <div key={entry.label}><dt className="text-xs text-muted-foreground">{entry.label}</dt><dd className="mt-1 break-all font-mono text-xs">{entry.value} {entry.unit ?? unit}</dd></div>)}
       </dl>
@@ -317,6 +363,22 @@ export function MarketPriceChart({ observed, forecast, cutoffUnixNanos, targets 
       <p className="mt-3 text-[11px] leading-5 text-muted-foreground">Solid: observed. Dashed blue: central forecast. Blue shading: calibrated uncertainty. Amber: saved reference ranges or levels. Purple: recorded pattern geometry where supplied. Pivot positions mark when prices occurred; availability and confirmation show when the evidence became known. Observed lines stop at missing source sessions. Hovering shows the nearest recorded date without estimating a value between points. The history window changes only the view; the saved forecast horizon stays fixed.</p>
     </div>
   </figure>
+}
+export function useDebouncedChartCallback<T>(key: string | null, value: T | null, onChange: ((value: T) => void) | undefined) {
+  const latest = React.useRef({ key, value, onChange })
+  const delivered = React.useRef<string | null>(null)
+  React.useEffect(() => { latest.current = { key, value, onChange } }, [key, value, onChange])
+  const enabled = onChange !== undefined
+  React.useEffect(() => {
+    if (key === null || !enabled || delivered.current === key) return
+    const timer = globalThis.setTimeout(() => {
+      const current = latest.current
+      if (current.key !== key || current.value === null || !current.onChange) return
+      delivered.current = key
+      current.onChange(current.value)
+    }, VIEWPORT_DEBOUNCE_MS)
+    return () => globalThis.clearTimeout(timer)
+  }, [key, enabled])
 }
 function validBounds(source: ForecastPricePoint, key: typeof BANDS[number]["key"]): [number, number] | null {
   const raw = source[key]

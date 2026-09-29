@@ -20,7 +20,8 @@ pub(super) fn result() -> Value {
         ("recommendation", recommendation()),
         ("horizon", horizon()),
         ("priceSummary", price_summary()),
-        ("chart", chart()),
+        ("chart", json!({"type":"null"})),
+        ("chartAvailable", json!({"type":"boolean"})),
         ("probabilities", saved_probabilities()),
         ("reasons", bounded_nonempty_array(product_text(), 32)),
         ("risks", bounded_array(product_text(), 32)),
@@ -908,7 +909,7 @@ fn expected_gross_price_pnl() -> Value {
 }
 
 /// Saved native chart values; no frontend recomputation or cross-basis stitching is authorized.
-fn chart() -> Value {
+pub(super) fn chart() -> Value {
     let positive = super::investment_analysis_positive_decimal();
     let range = || {
         closed_complete(vec![
@@ -932,12 +933,16 @@ fn chart() -> Value {
     ]);
     let history_point = one_of(vec![
         closed_complete(vec![
+            ("originalOrdinal", unsigned_integer_text()),
+            ("breakBefore", fixed_array(json!({"type":"boolean"}), 1)),
             ("coordinate", coordinate.clone()),
             ("availableAtUnixNanos", timestamp_nanos_text()),
             ("value", positive.clone()),
             ("quality", chart_quality()),
         ]),
         closed_complete(vec![
+            ("originalOrdinal", unsigned_integer_text()),
+            ("breakBefore", fixed_array(json!({"type":"boolean"}), 1)),
             ("coordinate", coordinate.clone()),
             ("availableAtUnixNanos", json!({"type":"null"})),
             ("value", json!({"type":"null"})),
@@ -949,10 +954,8 @@ fn chart() -> Value {
             ("state", constant("available")),
             ("summary", product_text()),
             ("basis", constant("split_adjusted_price")),
-            (
-                "points",
-                bounded_nonempty_array(history_point, market_squawk_analytics::MAX_HARMONIC_BARS),
-            ),
+            ("display", chart_display()),
+            ("points", bounded_array(history_point, 4096)),
         ]),
         closed_complete(vec![
             ("state", constant("unavailable")),
@@ -986,7 +989,7 @@ fn chart() -> Value {
             ("basis", constant("saved_price_projection")),
             ("observedThroughUnixNanos", timestamp_nanos_text()),
             ("origin", forecast_origin.clone()),
-            ("points", fixed_array(forecast_point, 1)),
+            ("points", bounded_array(forecast_point, 1)),
         ]),
         closed_complete(vec![
             ("state", constant("unavailable")),
@@ -1003,6 +1006,28 @@ fn chart() -> Value {
         ("history", history),
         ("forecast", forecast),
         ("benchmark", benchmark_chart()),
+        ("actionRanges", chart_action_ranges()),
+        (
+            "viewport",
+            closed_complete(vec![
+                ("startUnixNanos", nullable(timestamp_nanos_text())),
+                ("endUnixNanos", nullable(timestamp_nanos_text())),
+                ("pointLimit", bounded_unsigned_range(8, 4096)),
+                (
+                    "layer",
+                    enumeration(&[
+                        "all",
+                        "history",
+                        "forecast",
+                        "benchmark",
+                        "price_pattern",
+                        "action_ranges",
+                    ]),
+                ),
+                ("fullStartUnixNanos", nullable(timestamp_nanos_text())),
+                ("fullEndUnixNanos", nullable(timestamp_nanos_text())),
+            ]),
+        ),
         (
             "pricePattern",
             closed_complete(vec![
@@ -1096,6 +1121,70 @@ fn chart_quality() -> Value {
     ])
 }
 
+pub(super) fn chart_display() -> Value {
+    closed_complete(vec![
+        ("method", constant("first_last_min_max")),
+        ("originalPointCount", unsigned_integer_text()),
+        ("visibleOriginalPointCount", unsigned_integer_text()),
+        ("returnedPointCount", bounded_unsigned(4096)),
+        ("firstTimeUnixNanos", nullable(timestamp_nanos_text())),
+        ("lastTimeUnixNanos", nullable(timestamp_nanos_text())),
+        ("projectionDigest", sha256()),
+        ("reduced", json!({"type":"boolean"})),
+    ])
+}
+
+fn chart_action_ranges() -> Value {
+    let common = || {
+        vec![
+            ("basis", constant("split_adjusted_price")),
+            ("summary", product_text()),
+            ("informationCurrentThroughUnixNanos", timestamp_nanos_text()),
+            ("admittedAtUnixNanos", timestamp_nanos_text()),
+            ("expiresAtUnixNanos", timestamp_nanos_text()),
+        ]
+    };
+    let mut available = common();
+    available.extend([
+        ("state", constant("available")),
+        (
+            "ranges",
+            fixed_array(
+                closed_complete(vec![
+                    ("kind", enumeration(&["entry", "add", "trim", "exit"])),
+                    ("label", product_text()),
+                    ("lower", super::investment_analysis_positive_decimal()),
+                    ("upper", super::investment_analysis_positive_decimal()),
+                    ("startAtUnixNanos", timestamp_nanos_text()),
+                    ("endAtUnixNanos", timestamp_nanos_text()),
+                    ("summary", product_text()),
+                ]),
+                4,
+            ),
+        ),
+    ]);
+    let mut unavailable = common();
+    unavailable.extend([
+        ("state", constant("unavailable")),
+        (
+            "reason",
+            enumeration(&[
+                "no_supported_action_ranges",
+                "share_conversion_unavailable",
+                "original_history_unavailable",
+                "expired_at_admission",
+                "range_conversion_unavailable",
+                "not_requested",
+            ]),
+        ),
+        ("ranges", bounded_array(json!({"type":"null"}), 0)),
+    ]);
+    one_of(vec![
+        closed_complete(available),
+        closed_complete(unavailable),
+    ])
+}
+
 /// Original, backend-indexed split-price comparisons, including missing saved sources.
 fn benchmark_chart() -> Value {
     let members = |count: usize| {
@@ -1152,10 +1241,13 @@ fn benchmark_chart() -> Value {
             ("members", members(count)),
             ("summary", product_text()),
             ("baseline", coordinate()),
+            ("display", chart_display()),
             (
                 "points",
-                bounded_nonempty_array(
+                bounded_array(
                     closed_complete(vec![
+                        ("originalOrdinal", unsigned_integer_text()),
+                        ("breakBefore", fixed_array(json!({"type":"boolean"}), count)),
                         ("coordinate", coordinate()),
                         (
                             "observations",
@@ -1170,6 +1262,13 @@ fn benchmark_chart() -> Value {
     one_of(vec![
         available(2),
         available(3),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("basis", constant("split_adjusted_price_index")),
+            ("members", bounded_array(json!({"type":"null"}), 0)),
+            ("reason", constant("not_requested")),
+            ("summary", product_text()),
+        ]),
         closed_complete(vec![
             ("state", constant("unavailable")),
             ("basis", constant("split_adjusted_price_index")),
@@ -1207,13 +1306,22 @@ fn saved_probability() -> Value {
             ("endsAt", canonical_market_timestamp()),
             ("expiresAt", canonical_market_timestamp()),
             ("assumptions", bounded_array(product_text(), 5)),
-            ("calibration", closed_complete(vec![
-                ("evaluatedFrom", canonical_market_timestamp()),
-                ("evaluatedThrough", canonical_market_timestamp()),
-                ("completedOutcomes", bounded_unsigned_range(1, u64::from(u32::MAX))),
-                ("brierScore", json!({"type":"number","minimum":0,"maximum":1})),
-                ("logLoss", json!({"type":"number","minimum":0})),
-            ])),
+            (
+                "calibration",
+                closed_complete(vec![
+                    ("evaluatedFrom", canonical_market_timestamp()),
+                    ("evaluatedThrough", canonical_market_timestamp()),
+                    (
+                        "completedOutcomes",
+                        bounded_unsigned_range(1, u64::from(u32::MAX)),
+                    ),
+                    (
+                        "brierScore",
+                        json!({"type":"number","minimum":0,"maximum":1}),
+                    ),
+                    ("logLoss", json!({"type":"number","minimum":0})),
+                ]),
+            ),
         ]),
         closed_complete(vec![
             ("state", constant("unavailable")),
@@ -1244,7 +1352,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let operation = super::super::super::OPERATION_SPECS
             .iter()
-            .find(|operation| operation.name == "Decision.GetInvestmentAnalysis")
+            .find(|operation| operation.name == "Decision.GetInvestmentChart")
             .ok_or("missing investment analysis operation")?;
         let original = super::super::super::descriptor_for(*operation)?;
         // Exercise the advertised nested contract through the actual publication validator.
@@ -1253,7 +1361,7 @@ mod tests {
             "1",
             "Saved benchmark chart contract",
             Value::Object(original.input_schema().clone()),
-            super::result()["properties"]["chart"]["properties"]["benchmark"].clone(),
+            super::chart()["properties"]["benchmark"].clone(),
             original.contract(),
             original.effects(),
             |_: &Map<String, Value>| Ok(()),
@@ -1289,9 +1397,12 @@ mod tests {
             "quality":"aggregated"});
         let available = json!({"state":"available", "basis":"split_adjusted_price_index",
             "members":members, "summary":"Saved split-adjusted comparison.", "baseline":coordinate,
-            "points":[{"coordinate":coordinate, "observations":[observation, observation]},
+            "display":{"method":"first_last_min_max","originalPointCount":"2","visibleOriginalPointCount":"2",
+                "returnedPointCount":2,"firstTimeUnixNanos":"1790107200000000000","lastTimeUnixNanos":"1790193600000000000",
+                "projectionDigest":"1111111111111111111111111111111111111111111111111111111111111111","reduced":false},
+            "points":[{"coordinate":coordinate, "observations":[observation, observation],"originalOrdinal":"0","breakBefore":[false,false]},
                 {"coordinate":{"date":"2026-09-23", "sessionCloseUnixNanos":"1790193600000000000"},
-                    "observations":[observation, null]}]});
+                    "observations":[observation, null],"originalOrdinal":"1","breakBefore":[false,true]}]});
         validate(available.clone())?;
         let mut missing = available.clone();
         missing["points"][0]["observations"][0]

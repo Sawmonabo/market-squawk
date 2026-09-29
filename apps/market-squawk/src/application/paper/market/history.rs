@@ -1,6 +1,6 @@
 //! Provider-neutral immutable history projection for ordinary Market consumers.
 
-use market_squawk_domain::{BarTimeSemantics, DataQuality, InstrumentId};
+use market_squawk_domain::{BarTimeSemantics, CalendarDate, DataQuality, InstrumentId};
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
@@ -14,32 +14,32 @@ use crate::application::research::{
     MarketHistoryInterval, MarketHistoryMissingReason, MarketHistoryPartialReason,
     MarketHistoryQuality, MarketHistoryReadCapability, MarketHistoryReadLimit,
     MarketHistoryReadOutcome, MarketHistorySeries, MarketHistorySessionPolicy,
-    MarketHistoryTimeframe, MarketHistoryUnavailableReason,
+    MarketHistoryTimeframe, MarketHistoryUnavailableReason, MarketHistoryViewport,
 };
 
 const PRODUCT_PERIOD: &str = "daily";
 const PRODUCT_RANGE: &str = "latest_complete_window";
 const PRODUCT_SESSION: &str = "completed_trading_sessions";
 const PRODUCT_ADJUSTMENT: &str = "fully_adjusted";
-const MAXIMUM_PRODUCT_HISTORY_BARS: usize = 1_000;
 
 /// Reads one opaque-token-resolved investment without returning its canonical identity.
 pub(super) async fn build_product_market_history_result(
     reader: &MarketHistoryReadCapability,
+    research: &crate::ResearchService,
     instrument_id: InstrumentId,
     history_token: &str,
+    request: &TypedToolRequest,
     limits: ServiceLimits,
     context: &RequestContext,
 ) -> Result<TypedToolResult, ServiceError> {
-    let maximum_bars = limits
-        .maximum_result_items()
-        .min(MAXIMUM_PRODUCT_HISTORY_BARS);
-    let limit = u32::try_from(maximum_bars)
+    let viewport = product_viewport(request)?;
+    let limit = u32::try_from(viewport.point_limit)
         .ok()
         .and_then(|value| MarketHistoryReadLimit::try_new(value).ok())
         .ok_or(ServiceError::InvalidRequest)?;
-    let outcome = reader
-        .read_latest(
+    let data = reader
+        .read_latest_viewport(
+            research,
             LatestMarketHistoryReadRequest::new(
                 instrument_id,
                 MarketHistoryTimeframe::Daily,
@@ -48,83 +48,139 @@ pub(super) async fn build_product_market_history_result(
                 system_timestamp()?,
                 limit,
             ),
-            context.deadline(),
-            context.cancellation().clone(),
-        )
-        .await;
-    ensure_live(context)?;
-    match outcome {
-        MarketHistoryReadOutcome::Complete(series) => {
-            product_series_result(series, history_token, false, limits, context)
-        }
-        MarketHistoryReadOutcome::Partial { series, .. } => {
-            product_series_result(series, history_token, true, limits, context)
-        }
-        MarketHistoryReadOutcome::Missing(_) => {
-            product_unavailable_result("not_available", limits, context)
-        }
-        MarketHistoryReadOutcome::Unavailable(reason) => product_unavailable_result(
-            match reason {
-                MarketHistoryUnavailableReason::Cancelled
-                | MarketHistoryUnavailableReason::DeadlineExceeded
-                | MarketHistoryUnavailableReason::CapacityExceeded
-                | MarketHistoryUnavailableReason::StorageUnavailable => "temporarily_unavailable",
-                MarketHistoryUnavailableReason::IntegrityUnproven => "not_available",
-            },
-            limits,
+            viewport,
             context,
-        ),
-    }
-}
-
-fn product_series_result(
-    series: MarketHistorySeries,
-    history_token: &str,
-    partial: bool,
-    limits: ServiceLimits,
-    context: &RequestContext,
-) -> Result<TypedToolResult, ServiceError> {
-    validate_series(&series)?;
-    let mut bars = Vec::new();
-    bars.try_reserve_exact(series.bars().len())
-        .map_err(|_error| ServiceError::ResourceExhausted)?;
-    for bar in series.bars() {
-        bars.push(json!({
-            "time": bar_time_value(bar),
-                "open": bar.open().amount().normalize().to_string(),
-                "high": bar.high().amount().normalize().to_string(),
-                "low": bar.low().amount().normalize().to_string(),
-                "close": bar.close().amount().normalize().to_string(),
-                "volume": bar.volume().normalize().to_string(),
-        }));
-    }
+        )
+        .await?;
+    ensure_live(context)?;
+    let Some(mut data) = data else {
+        return product_unavailable_result("not_available", limits, context);
+    };
+    let bars = data
+        .get("bars")
+        .and_then(Value::as_array)
+        .ok_or(ServiceError::InvalidResult)?;
     let count = bars.len();
-    let content = json!({
-        "data": {
-            "historyToken": history_token,
-            "currency": series.currency().as_str(),
-            "bars": bars,
-            "partial": partial,
-        },
-        "unavailableReason": Value::Null,
-    });
-    let metadata = if partial {
-        ToolResultMetadata::try_truncated(
-            series.coverage().materialized_bars(),
-            json!({"availability": "available"}),
-            json!({"quality": "verified"}),
-        )
-    } else {
-        ToolResultMetadata::try_complete(
-            json!({"availability": "available"}),
-            json!({"quality": "verified"}),
-        )
-    }
-    .map_err(|_error| ServiceError::InvalidResult)?;
-    let result = TypedToolResult::try_new(content, count, metadata, limits)
-        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    let generation = data
+        .get("generationToken")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidResult)?
+        .to_owned();
+    let display_digest = data
+        .get("display")
+        .and_then(|display| display.get("projectionDigest"))
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidResult)?
+        .to_owned();
+    data.as_object_mut()
+        .ok_or(ServiceError::InvalidResult)?
+        .insert("historyToken".to_owned(), json!(history_token));
+    let metadata = ToolResultMetadata::try_complete(
+        json!({"availability":"available", "generationToken":generation, "projectionDigest":display_digest}),
+        json!({"quality":"verified", "originalBarsRetained":true, "displayOnly":true}))
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let result = TypedToolResult::try_new(
+        json!({"data":data,"unavailableReason":Value::Null}),
+        count,
+        metadata,
+        limits,
+    )
+    .map_err(Into::<ServiceError>::into)?;
     ensure_live(context)?;
     Ok(result)
+}
+
+fn product_viewport(request: &TypedToolRequest) -> Result<MarketHistoryViewport, ServiceError> {
+    let text = |name: &str| {
+        request
+            .arguments()
+            .get(name)
+            .filter(|value| !value.is_null())
+            .map(|value| value.as_str().ok_or(ServiceError::InvalidRequest))
+            .transpose()
+    };
+    let nanos = |name: &str| {
+        text(name)?
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|parsed| parsed.to_string() == value)
+                    .ok_or(ServiceError::InvalidRequest)
+            })
+            .transpose()
+    };
+    let date = |name: &str| {
+        text(name)?
+            .map(|value| {
+                if value.len() != 10 {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let mut parts = value.split('-');
+                let year = parts
+                    .next()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let month = parts
+                    .next()
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let day = parts
+                    .next()
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let date = CalendarDate::new(year, month, day)
+                    .map_err(|_| ServiceError::InvalidRequest)?;
+                if parts.next().is_some() || date.to_string() != value {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                Ok(date)
+            })
+            .transpose()
+    };
+    let start_unix_nanos = nanos("startUnixNanos")?;
+    let end_unix_nanos = nanos("endUnixNanos")?;
+    let start_date = date("startDate")?;
+    let end_date = date("endDate")?;
+    let point_limit = request
+        .arguments()
+        .get("pointLimit")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(ServiceError::InvalidRequest)
+        })
+        .transpose()?
+        .unwrap_or(1000);
+    let generation_token = text("generationToken")?.map(str::to_owned);
+    if !(8..=4096).contains(&point_limit)
+        || start_unix_nanos
+            .zip(end_unix_nanos)
+            .is_some_and(|(start, end)| start > end)
+        || start_date
+            .zip(end_date)
+            .is_some_and(|(start, end)| start > end)
+        || ((start_unix_nanos.is_some() || end_unix_nanos.is_some())
+            && (start_date.is_some() || end_date.is_some()))
+        || generation_token.as_ref().is_some_and(|value| {
+            value.len() != 64
+                || value
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(MarketHistoryViewport {
+        start_unix_nanos,
+        end_unix_nanos,
+        start_date,
+        end_date,
+        point_limit,
+        generation_token,
+    })
 }
 
 fn product_unavailable_result(

@@ -83,16 +83,25 @@ export type ProductQuery =
   | {
       query: "marketHistory"
       historyToken: string
+      startUnixNanos?: string
+      endUnixNanos?: string
+      startDate?: string
+      endDate?: string
+      pointLimit?: number
+      generationToken?: string
     }
   | { query: "researchCollections"; afterCollection?: string }
   | {
-      query:
-        | "researchCollection"
-        | "researchCollectionHistory"
-        | "researchCollectionAlternativeData"
+      query: "researchCollection"
       collection: string
     }
-  | { query: "portfolioAccounts"; afterAccountToken?: string }
+  | {
+      query: "researchCollectionHistory" | "researchCollectionAlternativeData"
+      collection: string
+      cursor?: string
+      limit?: number
+    }
+  | { query: "portfolioAccounts"; cursor?: string; limit?: number }
   | {
       query:
         | "portfolioHoldings"
@@ -120,15 +129,33 @@ export type ProductQuery =
     }
   | {
       query:
-        | "forecasts"
         | "paperStatus"
         | "paperOrders"
         | "paperFills"
     }
-  | { query: "forecast" | "forecastOutcomes"; forecastToken: string }
+  | { query: "forecasts"; cursor?: string; limit?: number }
+  | { query: "forecast"; forecastToken: string }
+  | {
+      query: "forecastChart"
+      forecastToken: string
+      startUnixNanos?: string
+      endUnixNanos?: string
+      startFiscalOrdinal?: number
+      endFiscalOrdinal?: number
+      pointLimit?: number
+    }
+  | { query: "forecastOutcomes"; forecastToken: string; cursor?: string; limit?: number }
   | { query: "decisionScreens"; limit: number }
   | { query: "decisionScreen"; screenId: string }
   | { query: "decisionInvestmentAnalysis"; actionToken: string }
+  | {
+      query: "decisionInvestmentChart"
+      actionToken: string
+      startUnixNanos?: string
+      endUnixNanos?: string
+      pointLimit?: number
+      layer?: "all" | "history" | "forecast" | "benchmark" | "price_pattern" | "action_ranges"
+    }
   | {
       query: "decisionInvestmentAnalyses"
       afterActionToken?: string
@@ -293,11 +320,12 @@ export type ProviderOnboardingResult<
         : ProviderSession
 
 export type ModelProductRequest =
-  | { action: "list" }
-  | { action: "activity" }
+  | { action: "list"; cursor?: string; limit?: number }
+  | { action: "get"; modelToken: string }
+  | { action: "activity"; cursor?: string; limit?: number }
 
 export type BacktestProductRequest =
-  | { action: "list" }
+  | { action: "list"; cursor?: string; limit?: number }
   | { action: "get"; backtestToken: string }
   | { action: "recommendationStudy"; actionToken: string }
 
@@ -318,15 +346,18 @@ export type RecommendationSetupRequest =
   | { action: "commit"; previewId: string; previewDigest: string }
 
 
+export type ReadOptions = { signal?: AbortSignal }
+
 export interface ProductTransport {
   recommendationSetup(request: RecommendationSetupRequest, confirmed?: boolean): Promise<ApplicationResult>
-  query(request: ProductQuery): Promise<ApplicationResult>
+  query(request: ProductQuery, options?: ReadOptions): Promise<ApplicationResult>
   analyticalController(
     request: AnalyticalControllerRequest,
     confirmed?: boolean,
+    options?: ReadOptions,
   ): Promise<AnalyticalControllerResponse>
-  modelProducts(request: ModelProductRequest): Promise<ApplicationResult>
-  backtestProducts(request: BacktestProductRequest): Promise<ApplicationResult>
+  modelProducts(request: ModelProductRequest, options?: ReadOptions): Promise<ApplicationResult>
+  backtestProducts(request: BacktestProductRequest, options?: ReadOptions): Promise<ApplicationResult>
   datasetPreparation(
     request: DatasetPreparationRequest,
     confirmed?: boolean,
@@ -338,6 +369,7 @@ export interface ProductTransport {
   forecastPreparation(
     request: ForecastPreparationRequest,
     confirmed?: boolean,
+    options?: ReadOptions,
   ): Promise<ApplicationResult>
   researchExport(
     collectionToken: string,
@@ -378,7 +410,7 @@ export type BacktestPreparationRequest =
   | { action: "start"; confirmationToken: string }
 
 export type ForecastPreparationRequest =
-  | { action: "options" }
+  | { action: "options"; cursor?: string; limit?: number }
   | {
       action: "preview"
       selection: {
@@ -397,7 +429,7 @@ export interface SystemTransport {
     request: InstallationControlRequest,
     confirmed?: boolean,
   ): Promise<InstallationControlResult>
-  systemQuery(request: SystemQuery): Promise<NativeEvidenceApplicationResult>
+  systemQuery(request: SystemQuery, options?: ReadOptions): Promise<NativeEvidenceApplicationResult>
   researchControl(
     request: ResearchControlRequest,
     confirmed?: boolean,
@@ -483,7 +515,7 @@ export interface OperationLogFilter {
   jobId?: string
   correlationId?: string
   search?: string
-  afterSequence?: string
+  cursor?: string
   limit: number
 }
 

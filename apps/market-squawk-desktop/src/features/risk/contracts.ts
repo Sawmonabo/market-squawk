@@ -1,13 +1,9 @@
 import { z } from "zod"
 
+import { parsePortfolioAccountPage, type PortfolioAccountSummary } from "../portfolio/portfolio-contracts"
+
 import type { ApplicationResult } from "@/lib/schemas"
 
-const RAW_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const accountTokenSchema = z
-  .string()
-  .min(16)
-  .max(512)
-  .refine((value) => !RAW_UUID.test(value), "Expected an opaque product account token.")
 const timestampSchema = z.string().datetime({ offset: true })
 const productTextSchema = z.string().min(1).max(4_096)
 const percentageSchema = z
@@ -17,16 +13,6 @@ const moneySchema = z
   .object({
     amount: z.string().regex(/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/),
     currency: z.string().regex(/^[A-Z]{3,8}$/),
-  })
-  .strict()
-
-const accountSchema = z
-  .object({
-    accountToken: accountTokenSchema,
-    displayName: z.string().min(1).max(256),
-    currency: z.string().regex(/^[A-Z]{3,8}$/),
-    holdings: z.number().int().nonnegative(),
-    dataIssues: z.number().int().nonnegative(),
   })
   .strict()
 
@@ -114,7 +100,7 @@ const riskReportSchema = z
   })
   .strict()
 
-export type PortfolioAccountRiskSummary = z.infer<typeof accountSchema>
+export type PortfolioAccountRiskSummary = PortfolioAccountSummary
 export type PortfolioRiskReport = z.infer<typeof riskReportSchema>
 
 export interface RiskResult<T> {
@@ -127,7 +113,7 @@ export interface RiskResult<T> {
 export function parseRiskAccounts(
   result: ApplicationResult,
 ): RiskResult<PortfolioAccountRiskSummary[]> {
-  const accounts = z.array(accountSchema).parse(result.data)
+  const accounts = parsePortfolioAccountPage(result).accounts
   if (
     result.metadata.returnedItems !== accounts.length ||
     result.metadata.returnedItems > result.metadata.availableItems

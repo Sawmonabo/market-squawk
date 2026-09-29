@@ -1009,9 +1009,24 @@ impl AnalyticalManifestCatalog {
                 reservation,
                 ContractCompletion::Succeeded,
                 company_identity,
+                match source_evidence {
+                    PublicationSourceEvidence::ProviderLogicalWithCompanyIdentity(
+                        _,
+                        _,
+                        authorization,
+                    ) => Some(authorization),
+                    _ => None,
+                },
                 catalog_now,
             )?;
             if let PublicationSourceEvidence::ProviderLogicalOriginal(
+                _,
+                _,
+                deadline,
+                cancellation,
+            )
+            | PublicationSourceEvidence::ProviderLogicalOriginalCaptures(
+                _,
                 _,
                 _,
                 deadline,
@@ -1025,9 +1040,14 @@ impl AnalyticalManifestCatalog {
             Ok(manifest)
         };
         match source_evidence {
-            PublicationSourceEvidence::ProviderLogicalOriginal(_, _, deadline, cancellation) => {
-                self.read_bounded(deadline, cancellation, commit)
-            }
+            PublicationSourceEvidence::ProviderLogicalOriginal(_, _, deadline, cancellation)
+            | PublicationSourceEvidence::ProviderLogicalOriginalCaptures(
+                _,
+                _,
+                _,
+                deadline,
+                cancellation,
+            ) => self.read_bounded(deadline, cancellation, commit),
             _ => {
                 let connection = self.lock()?;
                 commit(&connection)
@@ -1110,6 +1130,7 @@ impl AnalyticalManifestCatalog {
             &transaction,
             reservation,
             ContractCompletion::Succeeded,
+            None,
             None,
             catalog_now,
         )?;
@@ -1298,6 +1319,7 @@ impl AnalyticalManifestCatalog {
             &transaction,
             reservation,
             ContractCompletion::Succeeded,
+            None,
             None,
             catalog_now,
         )?;
@@ -1499,6 +1521,7 @@ impl AnalyticalManifestCatalog {
             &transaction,
             reservation,
             ContractCompletion::Succeeded,
+            None,
             None,
             catalog_now,
         )?;

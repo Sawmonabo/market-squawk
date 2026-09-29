@@ -180,6 +180,7 @@ impl ProductCapability {
             "Bot.Start" => Self::BotStart,
             "Bot.Stop" => Self::BotStop,
             "Decision.GetInvestmentAnalysis" => Self::DecisionAnalysis,
+            "Decision.GetInvestmentChart" => Self::DecisionAnalysis,
             "Decision.GetScreen" => Self::DecisionScreenList,
             "Decision.GetRecommendationTrackRecord" => Self::DecisionRecommendationHistory,
             "Decision.ListInvestmentAnalyses" => Self::DecisionAnalysisList,
@@ -210,8 +211,10 @@ impl ProductCapability {
             "Market.ReadSessionContext" => Self::MarketSessionRead,
             "Market.SearchUniverse" => Self::MarketUniverse,
             "Model.GetForecast" => Self::ForecastDetail,
+            "Model.GetForecastChart" => Self::ForecastDetail,
             "Model.GetForecastOutcomes" => Self::ForecastOutcomes,
             "Model.GetForecastPreparation" => Self::ForecastPreparation,
+            "Model.GetBundle" => Self::ModelEvidence,
             "Model.ListBundles" => Self::ModelEvidence,
             "Model.ListForecasts" => Self::ForecastList,
             "Model.ListProductActivity" => Self::ModelActivity,
@@ -412,6 +415,12 @@ pub(crate) enum DashboardQueryCommand {
     },
     MarketHistory {
         history_token: String,
+        start_unix_nanos: Option<String>,
+        end_unix_nanos: Option<String>,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        point_limit: Option<u16>,
+        generation_token: Option<String>,
     },
     MarketSessionContext {
         product: MarketSessionProduct,
@@ -438,9 +447,13 @@ pub(crate) enum DashboardQueryCommand {
     },
     ResearchCollectionHistory {
         collection: Uuid,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     ResearchCollectionAlternativeData {
         collection: Uuid,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     ResearchActivities,
     ResearchDatasets {
@@ -451,16 +464,21 @@ pub(crate) enum DashboardQueryCommand {
     },
     ResearchHistory {
         dataset: String,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     ResearchAlternativeData {
         dataset: String,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     ResearchSourceObjects {
         provider: String,
         dataset: String,
     },
     PortfolioAccounts {
-        after_account_token: Option<String>,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     PortfolioHoldings {
         account_id: String,
@@ -502,7 +520,10 @@ pub(crate) enum DashboardQueryCommand {
         proposed_quantity: String,
         scenario_shock: String,
     },
-    Forecasts,
+    Forecasts {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
     LatestValidForecast {
         instrument_id: Uuid,
         as_of: String,
@@ -510,8 +531,18 @@ pub(crate) enum DashboardQueryCommand {
     Forecast {
         forecast_token: Uuid,
     },
+    ForecastChart {
+        forecast_token: Uuid,
+        start_unix_nanos: Option<String>,
+        end_unix_nanos: Option<String>,
+        start_fiscal_ordinal: Option<u32>,
+        end_fiscal_ordinal: Option<u32>,
+        point_limit: Option<u16>,
+    },
     ForecastOutcomes {
         forecast_token: Uuid,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     DecisionScreens {
         limit: u16,
@@ -543,6 +574,13 @@ pub(crate) enum DashboardQueryCommand {
     },
     DecisionInvestmentAnalysis {
         action_token: Uuid,
+    },
+    DecisionInvestmentChart {
+        action_token: Uuid,
+        start_unix_nanos: Option<String>,
+        end_unix_nanos: Option<String>,
+        point_limit: Option<u16>,
+        layer: Option<InvestmentChartLayer>,
     },
     DecisionInvestmentAnalyses {
         after_action_token: Option<Uuid>,
@@ -621,7 +659,7 @@ pub(crate) enum DashboardQueryCommand {
         job_id: Option<String>,
         correlation_id: Option<String>,
         search: Option<String>,
-        after_sequence: Option<String>,
+        cursor: Option<String>,
         limit: u16,
     },
     OperationSettings,
@@ -633,6 +671,17 @@ pub(crate) enum DashboardQueryCommand {
         expected_revision: String,
         target_revision: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvestmentChartLayer {
+    History,
+    Forecast,
+    Benchmark,
+    PricePattern,
+    ActionRanges,
+    All,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -727,7 +776,7 @@ pub(crate) enum OperationsControlCommand {
         job_id: Option<String>,
         correlation_id: Option<String>,
         search: Option<String>,
-        after_sequence: Option<String>,
+        cursor: Option<String>,
         limit: u16,
     },
     StartBackup,
@@ -860,9 +909,16 @@ pub(crate) struct RecommendationReserveInput {
     tag = "action"
 )]
 pub(crate) enum BacktestProductCommand {
-    List,
-    Get { backtest_token: Uuid },
-    RecommendationStudy { action_token: Uuid },
+    List {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
+    Get {
+        backtest_token: Uuid,
+    },
+    RecommendationStudy {
+        action_token: Uuid,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,7 +933,10 @@ pub(crate) enum ModelControlCommand {
         config_ticket_id: Uuid,
         authority_ticket_id: Uuid,
     },
-    ForecastPreparationOptions,
+    ForecastPreparationOptions {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
     PrepareForecast {
         selection: Map<String, Value>,
     },
@@ -894,8 +953,17 @@ pub(crate) enum ModelControlCommand {
     tag = "action"
 )]
 pub(crate) enum ModelProductCommand {
-    List,
-    Activity,
+    List {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
+    Get {
+        model_token: String,
+    },
+    Activity {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]

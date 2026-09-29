@@ -13,12 +13,12 @@ use crate::{
 #[path = "research/corporate_action_source.rs"]
 mod corporate_action_source;
 pub use corporate_action_source::{
-    CorporateActionEconomicQueryContract, CorporateActionEconomicSourceScope, CorporateActionEconomicTerms,
-    CorporateActionEventInstrumentIdentity, CorporateActionQueryInstrumentIdentity,
-    CorporateActionSourceCategory, CorporateActionSourceDates, CorporateActionSourceDisposition,
-    CorporateActionSourceError, CorporateActionSourceObservation,
-    CorporateActionSourceObservationInput, CorporateActionSourcePayload,
-    CorporateActionSourceQueryContract, CorporateActionSourceScope,
+    CorporateActionEconomicQueryContract, CorporateActionEconomicSourceScope,
+    CorporateActionEconomicTerms, CorporateActionEventInstrumentIdentity,
+    CorporateActionQueryInstrumentIdentity, CorporateActionSourceCategory,
+    CorporateActionSourceDates, CorporateActionSourceDisposition, CorporateActionSourceError,
+    CorporateActionSourceObservation, CorporateActionSourceObservationInput,
+    CorporateActionSourcePayload, CorporateActionSourceQueryContract, CorporateActionSourceScope,
 };
 
 #[path = "research/fund_holdings.rs"]
@@ -89,13 +89,14 @@ pub use portfolio_transactions::{
     NormalizedPortfolioTransactionEvidenceInput,
 };
 pub use xbrl::{
-    MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS, MAX_XBRL_RELATIONSHIPS,
-    MAX_XBRL_UNIT_MEASURES, XBRL_FACT_EVIDENCE_SCHEMA_VERSION, XbrlAccuracy, XbrlAccuracyValue,
-    XbrlContextGraph, XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember,
-    XbrlDuplicateClass, XbrlDuplicateEvidence, XbrlEntity, XbrlEvidenceError, XbrlFactEvidence,
-    XbrlFactEvidenceInput, XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName,
-    XbrlRelationshipEvidence, XbrlSign, XbrlTaxonomySet, XbrlTaxonomyStatus, XbrlText,
-    XbrlTypedMemberValidation, XbrlUnitExpression, XbrlXmlEvent,
+    MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_OCCURRENCES, MAX_XBRL_RELATIONSHIP_REFS,
+    MAX_XBRL_RELATIONSHIPS, MAX_XBRL_UNIT_MEASURES, XBRL_FACT_EVIDENCE_SCHEMA_VERSION,
+    XbrlAccuracy, XbrlAccuracyValue, XbrlContextGraph, XbrlDimensionEvidence,
+    XbrlDimensionLocation, XbrlDimensionMember, XbrlDuplicateClass, XbrlDuplicateEvidence,
+    XbrlEntity, XbrlEvidenceError, XbrlFactEvidence, XbrlFactEvidenceInput,
+    XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName, XbrlRelationshipEvidence, XbrlSign,
+    XbrlTaxonomySet, XbrlTaxonomyStatus, XbrlText, XbrlTypedMemberValidation, XbrlUnitExpression,
+    XbrlXmlEvent,
 };
 
 /// Knowledge basis of a producer-qualified historical study.

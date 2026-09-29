@@ -705,7 +705,7 @@ fn append_product_fundamentals(
         let observation = available
             .selection
             .decoded_rows()
-            .get(row)
+            .get(row)?
             .ok_or(SecFundamentalsResearchError::CountOverflow)?;
         let ResearchObservation::Fundamental(fundamental) = observation else {
             continue;
@@ -740,7 +740,7 @@ fn append_product_filings(
         let observation = available
             .selection
             .decoded_rows()
-            .get(row)
+            .get(row)?
             .ok_or(SecFundamentalsResearchError::CountOverflow)?;
         let ResearchObservation::Filing(filing) = observation else {
             continue;
@@ -843,10 +843,16 @@ fn resolve_identity(
         SecResearchFamily::CompanyFacts => CompanyIdentitySurface::SecCompanyFacts,
         SecResearchFamily::FilingXbrl => CompanyIdentitySurface::SecSubmissions,
     };
+    let provider_binding = match selection.request().family() {
+        SecResearchFamily::FilingXbrl => company.provider_logical_binding_digest(),
+        SecResearchFamily::Submissions | SecResearchFamily::CompanyFacts => {
+            company.provider_binding_digest()
+        }
+    };
     if observation.source_id() != selection.origin().source_id()
         || observation.surface() != expected_surface
         || company.observation_digest() != selection.request().company_observation_digest()
-        || company.provider_binding_digest() != Some(selection.request().provider_binding_digest())
+        || provider_binding != Some(selection.request().provider_binding_digest())
     {
         return Err(SecFundamentalsResearchError::IdentityMismatch);
     }
@@ -884,9 +890,9 @@ fn validate_selected_instrument(
             .get(
                 usize::try_from(selected.row().row_ordinal())
                     .map_err(|_| SecFundamentalsResearchError::IdentityMismatch)?,
-            )
+            )?
             .ok_or(SecFundamentalsResearchError::IdentityMismatch)?;
-        if observation_context(observation)
+        if observation_context(&observation)
             .provenance()
             .instrument_id()
             != Some(instrument)
@@ -1009,9 +1015,9 @@ fn four_clock_status(
             .map_err(|_| SecFundamentalsResearchError::CountOverflow)?;
         let observation = selection
             .decoded_rows()
-            .get(row)
+            .get(row)?
             .ok_or(SecFundamentalsResearchError::CountOverflow)?;
-        let provenance = observation_context(observation).provenance();
+        let provenance = observation_context(&observation).provenance();
         let available = provenance
             .availability()
             .conservative_available_at()

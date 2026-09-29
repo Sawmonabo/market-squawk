@@ -51,6 +51,14 @@ const MAXIMUM_RETAINED_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 const MAXIMUM_FISCAL_TARGETS: usize = 9;
 const MAXIMUM_UNAVAILABLE_RECEIPTS: usize = 7 * 32;
 
+fn maximum_receipt_bytes(operation: &str) -> usize {
+    if operation == "Market.PrepareInvestmentEvidence" {
+        market_squawk_decisions::MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES
+    } else {
+        MAXIMUM_RECEIPT_BYTES
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Step {
@@ -116,10 +124,17 @@ impl Receipt {
         super::valid_identifier(&self.operation, 128)
             && valid_digest(&self.sha256)
             && serde_json::to_vec(&self.body).is_ok_and(|bytes| {
-                bytes.len() <= MAXIMUM_RECEIPT_BYTES
+                bytes.len() <= maximum_receipt_bytes(&self.operation)
                     && hex_digest(Sha256::digest(bytes)) == self.sha256
             })
-            && serde_json::to_vec(&self.arguments).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
+            && serde_json::to_vec(&self.arguments).is_ok_and(|bytes| {
+                bytes.len()
+                    <= if self.operation == "Decision.GenerateInvestmentAnalysis" {
+                        market_squawk_decisions::MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES
+                    } else {
+                        64 * 1024
+                    }
+            })
             && (self.operation != "Model.PrepareInvestmentForecast"
                 || price_preparation(self).is_ok())
             && (self.operation != "Analysis.GetHistoricalStudyPlan"
@@ -215,7 +230,9 @@ pub(super) struct DriverState {
 }
 
 impl DriverState {
-    fn new(_kind: WorkflowKind, selection_token: Option<String>,
+    fn new(
+        _kind: WorkflowKind,
+        selection_token: Option<String>,
         benchmark_instrument_id: Option<Uuid>,
     ) -> Self {
         Self {
@@ -672,7 +689,7 @@ impl AnalyticalWorkflowController {
             } else {
                 let body = checkpoint_body(&expected.operation, body)?;
                 let bytes = serde_json::to_vec(&body).map_err(|_| WorkflowError::internal())?;
-                if bytes.len() > MAXIMUM_RECEIPT_BYTES {
+                if bytes.len() > maximum_receipt_bytes(&expected.operation) {
                     return Err(WorkflowError::internal());
                 }
                 let sha256 = hex_digest(Sha256::digest(bytes));
@@ -791,9 +808,9 @@ pub(super) async fn start(
     admit_recommendation_setup(state, generation).await?;
     let _fence = generation.analytical_retirement_fence().await;
     state.admit_current(generation)?;
-    generation
-        .analytical_controller()
-        .begin_workflow(kind, selection,
+    generation.analytical_controller().begin_workflow(
+        kind,
+        selection,
         benchmark_instrument_id,
         generation.origin(),
     )
@@ -1402,8 +1419,11 @@ fn next_invocation(
         Step::FinalPrepare => (
             "Market.PrepareInvestmentEvidence",
             {
-                let mut arguments = json!({"selectionToken": work.selection_token, "financialProfile": DriverState::profile(run)?, "purpose": "current_market"});
-                if let Some(origin) = work.receipts.get("PriceForecast")
+                let mut arguments = json!({"selectionToken": work.selection_token, "financialProfile": DriverState::profile(run)?, "purpose": "current_market",
+                    "originalKnowledgeAtUnixNanos": work.source_cutoff.as_ref().ok_or_else(WorkflowError::internal)?});
+                if let Some(origin) = work
+                    .receipts
+                    .get("PriceForecast")
                     .and_then(|receipt| receipt.body.pointer("/forecast/observedThroughUnixNanos"))
                     .filter(|value| value.is_string())
                 {
@@ -2011,15 +2031,16 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
                 return Err(WorkflowError::internal());
             }
             match receipt.body.get("status").and_then(Value::as_str) {
-                Some("available") if receipt.body.get("reference").is_some_and(Value::is_object) => {}
+                Some("available")
+                    if receipt.body.get("reference").is_some_and(Value::is_object) => {}
                 Some("unavailable")
                     if receipt.body.get("reason").and_then(Value::as_str)
                         == Some("market_evidence_unavailable") => {}
                 _ => {
                     return Err(WorkflowError::new(
-                    "analysis_source_unavailable",
-                    "The selected investment or its evidence changed. Start a fresh analysis.",
-                ));
+                        "analysis_source_unavailable",
+                        "The selected investment or its evidence changed. Start a fresh analysis.",
+                    ));
                 }
             }
             // Missing current prices do not discard completed analytical jobs. Publication
@@ -2054,7 +2075,9 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
             match receipt.arguments.get("market") {
                 Some(Value::Null) if valuation_identity == Some(&Value::Null) => {}
                 Some(Value::Object(_))
-                    if valuation_identity.and_then(Value::as_str).is_some_and(valid_digest) => {}
+                    if valuation_identity
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_digest) => {}
                 _ => return Err(WorkflowError::internal()),
             }
             let digest = receipt
@@ -2096,7 +2119,11 @@ fn apply_receipt(run: &mut WorkflowRun, receipt: Receipt, now: &str) -> Result<(
                 return Err(WorkflowError::internal());
             }
             if work.receipt(Step::Publish)?.arguments.get("market") == Some(&Value::Null)
-                && receipt.body.pointer("/recommendation/kind").and_then(Value::as_str) != Some("unavailable")
+                && receipt
+                    .body
+                    .pointer("/recommendation/kind")
+                    .and_then(Value::as_str)
+                    != Some("unavailable")
             {
                 return Err(WorkflowError::internal());
             }
@@ -2432,10 +2459,10 @@ fn archive_unavailable_receipts(work: &mut DriverState) -> Result<(), WorkflowEr
             receipt.operation.as_str(),
             "Model.PrepareInvestmentForecast" | "Analysis.PrepareProbabilityEvent"
         ) && receipt
-                .body
-                .pointer("/availability/state")
-                .and_then(Value::as_str)
-                == Some("unavailable")
+            .body
+            .pointer("/availability/state")
+            .and_then(Value::as_str)
+            == Some("unavailable")
             || receipt.body.get("status").and_then(Value::as_str) == Some("unavailable")
             || receipt.operation == "Analysis.GetFiscalPreparationPlan"
                 && receipt
@@ -2556,9 +2583,21 @@ fn publication_arguments(run: &WorkflowRun) -> Result<Value, WorkflowError> {
         .map(|receipt| json!({"requestDigest": receipt.body.get("requestDigest"), "evidenceDigest": receipt.body.get("evidenceDigest")}));
     let probabilities = probability::publication(work)?;
     let source_action_reference = work.initial_source_action_reference()?.clone();
-    let current_share_action_reference = work.receipt(Step::FinalPrepare)?.body.get("sourceActionReference").cloned().unwrap_or(Value::Null);
+    let current_share_action_reference = work
+        .receipt(Step::FinalPrepare)?
+        .body
+        .get("sourceActionReference")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let fundamental_share_sources = work
+        .receipt(Step::FinalPrepare)?
+        .body
+        .get("fundamentalShareSources")
+        .cloned()
+        .ok_or_else(WorkflowError::internal)?;
     let binding = json!({"instrumentId": work.instrument_id, "sourceCutoffUnixNanos": work.source_cutoff,
-        "financialProfile": DriverState::profile(run)?, "priceForecast": price, "sourceActionReference": source_action_reference, "currentShareActionReference": current_share_action_reference, "probabilityForecasts": probabilities, "benchmarkInstrumentId":work.benchmark_instrument_id, "financialForecasts": fiscal,
+        "financialProfile": DriverState::profile(run)?, "priceForecast": price, "sourceActionReference": source_action_reference, "currentShareActionReference": current_share_action_reference,
+        "fundamentalShareSources": fundamental_share_sources, "probabilityForecasts": probabilities, "benchmarkInstrumentId":work.benchmark_instrument_id, "financialForecasts": fiscal,
         "historicalStudy": study, "selectedCandidate": selected});
     let digest = hex_digest(Sha256::digest(
         serde_json::to_vec(&binding).map_err(|_| WorkflowError::internal())?,
@@ -2573,6 +2612,7 @@ fn publication_arguments(run: &WorkflowRun) -> Result<Value, WorkflowError> {
         "sourceCutoffUnixNanos": work.source_cutoff, "priceForecast": price,
         "sourceActionReference": source_action_reference,
         "currentShareActionReference": current_share_action_reference,
+        "fundamentalShareSources": fundamental_share_sources,
         "probabilityForecasts": probabilities, "benchmarkInstrumentId":work.benchmark_instrument_id,
         "financialForecasts": fiscal, "historicalStudy": study, "selectedCandidate": selected}))
 }

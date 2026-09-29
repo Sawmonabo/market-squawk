@@ -3,32 +3,32 @@
 mod archive;
 
 use std::{
-    collections::BTreeSet,
-    io::{Read, Write},
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
     num::{NonZeroU64, NonZeroUsize},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use market_squawk_data::AnalyticalReadCapability;
+use market_squawk_data::{
+    AnalyticalReadCapability, ChartProjectionCatalogCapability, ForecastInventoryCatalogCapability,
+    ForecastInventoryHead, ModelInventoryCatalogCapability, ModelInventoryRecord,
+};
 use market_squawk_modeling::{OnnxWorkerProgram, VerifiedTrainingEnvironment};
 use market_squawk_platform::{ArtifactPathError, LocalPaths, PathError};
 use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReadContext,
-    ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    ArtifactReadRequest, ArtifactRepository,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use self::archive::{
-    DecodedArchive, ForecastArtifactManifestRecord, MemberManifestRecord, ModelManifestRecord,
-    ModelMemberManifestRecord, SnapshotManifest, read_archive, write_archive,
-};
+use self::archive::{ArchiveReader, ArchiveWriter, ModelManifestRecord, ModelMemberManifestRecord};
 use super::{
-    ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
-    ModelDomainService, ModelDomainServiceError,
-    forecast::ForecastBackupCaptureError,
+    ForecastApplicationError, ForecastApplicationService, ModelDomainService,
+    ModelDomainServiceError,
+    forecast::{ForecastBackupCaptureError, ForecastBackupRecord},
     runtime::{
         ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
         RuntimeBackupCoordinate,
@@ -38,7 +38,6 @@ use super::{
 pub(crate) const MODEL_BACKUP_SCHEMA_VERSION: u16 = 1;
 const RUNTIME_INDEX_PATH: &str = "runtime-index.json";
 const FORECAST_INDEX_PATH: &str = "forecast-index.json";
-const FORECAST_AUTHORITY_DIRECTORY: &str = "model/forecasts";
 const SEMANTIC_REVISION_DOMAIN: &[u8] = b"market-squawk/model-backup-authority/v1\0";
 const MAXIMUM_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAXIMUM_MEMBER_BYTES: usize = 512 * 1024 * 1024;
@@ -133,6 +132,9 @@ impl ModelBackupAuthority {
         paths: LocalPaths,
         artifacts: Arc<dyn ArtifactRepository>,
         analytical: AnalyticalReadCapability,
+        catalog: ModelInventoryCatalogCapability,
+        forecast_catalog: ForecastInventoryCatalogCapability,
+        charts: ChartProjectionCatalogCapability,
     ) -> Result<FreshModelWorkspaceTarget, ModelBackupError> {
         let (runtime_capabilities, runtime_limits) = match &self.runtime {
             Some(runtime) => {
@@ -146,9 +148,11 @@ impl ModelBackupAuthority {
             paths,
             artifacts,
             analytical,
+            catalog,
+            forecast_catalog,
+            charts,
             runtime_capabilities,
             runtime_limits,
-            self.forecasts.backup_limits(),
         ))
     }
 
@@ -159,10 +163,20 @@ impl ModelBackupAuthority {
         paths: LocalPaths,
         artifacts: Arc<dyn ArtifactRepository>,
         analytical: AnalyticalReadCapability,
+        catalog: ModelInventoryCatalogCapability,
+        forecast_catalog: ForecastInventoryCatalogCapability,
+        charts: ChartProjectionCatalogCapability,
         evaluation_records: NonZeroUsize,
         cancellation: &CancellationToken,
     ) -> Result<RestoredModelAuthorities, ModelBackupError> {
-        let target = self.fresh_workspace_target(paths, artifacts, analytical)?;
+        let target = self.fresh_workspace_target(
+            paths,
+            artifacts,
+            analytical,
+            catalog,
+            forecast_catalog,
+            charts,
+        )?;
         restore_into_fresh_workspace(
             reader,
             target,
@@ -183,108 +197,118 @@ impl ModelBackupAuthority {
         }
         let retained = self
             .forecasts
-            .retain_backup_with_runtime(self.runtime.as_deref(), self.runtime_limits)
+            .retain_backup_with_runtime(self.runtime.as_deref())
             .await
             .map_err(map_capture_error)?;
-        let mut members = Vec::new();
-        let mut models = Vec::new();
-        admit_member(
-            &mut members,
-            RUNTIME_INDEX_PATH,
-            Arc::from(retained.runtime.canonical_index),
-            self.limits,
-        )?;
-        for (coordinate, bundle) in retained.runtime.models {
-            let mut model_members = Vec::new();
-            for (role, relative_path, bytes, digest) in bundle.retained_members() {
-                if <[u8; 32]>::from(Sha256::digest(bytes)) != digest.bytes() {
-                    return Err(ModelBackupError::ArtifactMismatch);
+        // The anonymous file is owned by the snapshot and removed on drop, including failure.
+        // No model corpus or second archive image is retained in RAM.
+        let mut file = tempfile::tempfile()?;
+        let mut archive = ArchiveWriter::new(&mut file, self.limits, cancellation)?;
+        archive.member(RUNTIME_INDEX_PATH, &retained.runtime.canonical_index)?;
+        let head = ProductionModelRuntime::decode_backup_head(&retained.runtime.canonical_index)?;
+        let mut after = 0_u64;
+        loop {
+            let page = retained.runtime.page(after)?;
+            if page.is_empty() {
+                break;
+            }
+            for entry in page {
+                ensure_live(cancellation)?;
+                if after.checked_add(1) != Some(entry.sequence) || entry.sequence > head.sequence {
+                    return Err(ModelBackupError::CoordinateMismatch);
                 }
-                let archive_path = model_archive_path(&coordinate, relative_path)?;
-                admit_member(&mut members, &archive_path, Arc::from(bytes), self.limits)?;
-                model_members.push(ModelMemberManifestRecord {
-                    role: role.to_owned(),
-                    relative_path: relative_path.to_owned(),
-                    archive_path,
-                    byte_length: u64::try_from(bytes.len())
-                        .map_err(|_| ModelBackupError::Capacity)?,
-                    sha256: hex(digest.bytes()),
-                });
+                let bundle = retained.runtime.bundle(&entry.coordinate)?;
+                let members = bundle.retained_members().collect::<Vec<_>>();
+                let mut model_members = Vec::new();
+                for (role, relative_path, bytes, digest) in &members {
+                    if <[u8; 32]>::from(Sha256::digest(bytes)) != digest.bytes() {
+                        return Err(ModelBackupError::ArtifactMismatch);
+                    }
+                    model_members.push(ModelMemberManifestRecord {
+                        role: (*role).to_owned(),
+                        relative_path: (*relative_path).to_owned(),
+                        archive_path: model_archive_path(&entry.coordinate, relative_path)?,
+                        byte_length: u64::try_from(bytes.len())
+                            .map_err(|_| ModelBackupError::Capacity)?,
+                        sha256: hex(digest.bytes()),
+                    });
+                }
+                let model = model_manifest(entry.coordinate, model_members);
+                if !valid_model_members(&model) {
+                    return Err(ModelBackupError::CoordinateMismatch);
+                }
+                archive.member(
+                    &admission_archive_path(entry.sequence),
+                    &encode(&entry.record)?,
+                )?;
+                archive.member(&manifest_archive_path(entry.sequence), &encode(&model)?)?;
+                for (expected, (_, _, bytes, _)) in model.members.iter().zip(members) {
+                    archive.member(&expected.archive_path, bytes)?;
+                }
+                after = entry.sequence;
             }
-            if model_members
-                .iter()
-                .find(|member| member.role == "metadata")
-                .is_none_or(|member| member.relative_path != coordinate.metadata_path.as_ref())
-            {
-                return Err(ModelBackupError::CoordinateMismatch);
-            }
-            models.push(model_manifest(coordinate, model_members));
         }
-        admit_member(
-            &mut members,
-            FORECAST_INDEX_PATH,
-            Arc::from(retained.canonical_index),
-            self.limits,
-        )?;
+        if after != head.sequence {
+            return Err(ModelBackupError::CoordinateMismatch);
+        }
+        archive.member(FORECAST_INDEX_PATH, &retained.canonical_index)?;
+        let forecast_head: ForecastInventoryHead = decode(&retained.canonical_index)?;
         let deadline = Instant::now()
             .checked_add(self.limits.read_time)
             .ok_or(ModelBackupError::Capacity)?;
-        let mut forecast_artifacts = Vec::new();
-        for reference in retained.artifact_references {
-            if cancellation.is_cancelled() {
-                return Err(ModelBackupError::Cancelled);
+        for (kind, count) in [(1, forecast_head.vintages), (2, forecast_head.outcomes)] {
+            let mut after = 0_u64;
+            loop {
+                ensure_live(cancellation)?;
+                let page = retained.page(kind, after)?;
+                if page.is_empty() {
+                    break;
+                }
+                for row in page {
+                    ensure_live(cancellation)?;
+                    if row.kind != kind
+                        || after.checked_add(1) != Some(row.sequence)
+                        || row.sequence > count
+                    {
+                        return Err(ModelBackupError::CoordinateMismatch);
+                    }
+                    archive.member(&forecast_record_path(kind, row.sequence), &row.record)?;
+                    let reference = &row.artifact;
+                    let maximum = NonZeroUsize::new(reference.byte_count())
+                        .ok_or(ModelBackupError::ArtifactMismatch)?;
+                    if maximum.get() > self.limits.maximum_member_bytes.get() {
+                        return Err(ModelBackupError::Capacity);
+                    }
+                    let read = self
+                        .forecasts
+                        .artifact_repository()
+                        .read(
+                            ArtifactReadRequest::try_new(reference.clone(), maximum)?,
+                            ArtifactReadContext::new(cancellation.clone(), deadline),
+                        )
+                        .await?;
+                    if read.reference() != reference
+                        || read.content().len() != reference.byte_count()
+                        || hex(Sha256::digest(read.content()).into()) != reference.sha256()
+                    {
+                        return Err(ModelBackupError::ArtifactMismatch);
+                    }
+                    archive.member(&forecast_artifact_path(kind, row.sequence), read.content())?;
+                    after = row.sequence;
+                }
             }
-            let maximum = NonZeroUsize::new(reference.byte_count())
-                .ok_or(ModelBackupError::ArtifactMismatch)?;
-            if maximum.get() > self.limits.maximum_member_bytes.get() {
-                return Err(ModelBackupError::Capacity);
+            if after != count {
+                return Err(ModelBackupError::CoordinateMismatch);
             }
-            let read = self
-                .forecasts
-                .artifact_repository()
-                .read(
-                    ArtifactReadRequest::try_new(reference.clone(), maximum)?,
-                    ArtifactReadContext::new(cancellation.clone(), deadline),
-                )
-                .await?;
-            if read.reference() != &reference {
-                return Err(ModelBackupError::ArtifactMismatch);
-            }
-            let archive_path = format!("forecast-artifacts/{}.json", reference.sha256());
-            admit_member(
-                &mut members,
-                &archive_path,
-                Arc::from(read.content()),
-                self.limits,
-            )?;
-            forecast_artifacts.push(ForecastArtifactManifestRecord {
-                artifact_id: reference.id().to_owned(),
-                archive_path,
-                byte_length: u64::try_from(reference.byte_count())
-                    .map_err(|_| ModelBackupError::Capacity)?,
-                sha256: reference.sha256().to_owned(),
-                media_type: reference.media_type().to_owned(),
-            });
         }
-        validate_member_order_and_bounds(&members, self.limits)?;
-        let revision = semantic_revision(&members)?;
-        let manifest = SnapshotManifest {
-            schema_version: MODEL_BACKUP_SCHEMA_VERSION,
-            semantic_authority_revision: hex(revision),
-            runtime_index_path: RUNTIME_INDEX_PATH.to_owned(),
-            forecast_index_path: FORECAST_INDEX_PATH.to_owned(),
-            models,
-            forecast_artifacts,
-            members: members
-                .iter()
-                .map(member_manifest)
-                .collect::<Result<Vec<_>, _>>()?,
-        };
+        let (revision, byte_length, sha256) = archive.finish()?;
+        file.sync_all()?;
         Ok(ModelBackupSnapshot {
             authority: Arc::clone(self),
             revision,
-            manifest,
-            members,
+            file: Mutex::new(file),
+            byte_length,
+            sha256,
         })
     }
 }
@@ -299,8 +323,9 @@ impl std::fmt::Debug for ModelBackupAuthority {
 pub struct ModelBackupSnapshot {
     authority: Arc<ModelBackupAuthority>,
     revision: [u8; 32],
-    manifest: SnapshotManifest,
-    members: Vec<RetainedArchiveMember>,
+    file: Mutex<File>,
+    byte_length: u64,
+    sha256: [u8; 32],
 }
 
 impl ModelBackupSnapshot {
@@ -319,13 +344,31 @@ impl ModelBackupSnapshot {
         if cancellation.is_cancelled() {
             return Err(ModelBackupError::Cancelled);
         }
-        let (byte_length, sha256) = write_archive(
-            writer,
-            &self.manifest,
-            &self.members,
-            self.authority.limits,
-            cancellation,
-        )?;
+        let mut file = self.file.lock().map_err(|_| ModelBackupError::Archive)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut digest = Sha256::new();
+        let mut byte_length = 0_u64;
+        loop {
+            ensure_live(cancellation)?;
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            byte_length = byte_length
+                .checked_add(u64::try_from(read).map_err(|_| ModelBackupError::Capacity)?)
+                .ok_or(ModelBackupError::Capacity)?;
+            if byte_length > self.byte_length {
+                return Err(ModelBackupError::Archive);
+            }
+            writer.write_all(&buffer[..read])?;
+            digest.update(&buffer[..read]);
+        }
+        let sha256: [u8; 32] = digest.finalize().into();
+        if byte_length != self.byte_length || sha256 != self.sha256 {
+            return Err(ModelBackupError::Archive);
+        }
+        writer.flush()?;
         Ok(ModelBackupReceipt {
             semantic_authority_revision: self.revision,
             byte_length,
@@ -351,7 +394,7 @@ impl std::fmt::Debug for ModelBackupSnapshot {
         formatter
             .debug_struct("ModelBackupSnapshot")
             .field("semantic_authority_revision", &hex(self.revision))
-            .field("member_count", &self.members.len())
+            .field("byte_length", &self.byte_length)
             .finish()
     }
 }
@@ -386,9 +429,11 @@ pub(crate) struct FreshModelWorkspaceTarget {
     paths: LocalPaths,
     artifacts: Arc<dyn ArtifactRepository>,
     analytical: AnalyticalReadCapability,
+    catalog: ModelInventoryCatalogCapability,
+    forecast_catalog: ForecastInventoryCatalogCapability,
+    charts: ChartProjectionCatalogCapability,
     runtime_capabilities: Option<(VerifiedTrainingEnvironment, Option<OnnxWorkerProgram>)>,
     runtime_limits: ProductionModelRuntimeLimits,
-    forecast_limits: ForecastApplicationLimits,
 }
 
 impl FreshModelWorkspaceTarget {
@@ -396,17 +441,21 @@ impl FreshModelWorkspaceTarget {
         paths: LocalPaths,
         artifacts: Arc<dyn ArtifactRepository>,
         analytical: AnalyticalReadCapability,
+        catalog: ModelInventoryCatalogCapability,
+        forecast_catalog: ForecastInventoryCatalogCapability,
+        charts: ChartProjectionCatalogCapability,
         runtime_capabilities: Option<(VerifiedTrainingEnvironment, Option<OnnxWorkerProgram>)>,
         runtime_limits: ProductionModelRuntimeLimits,
-        forecast_limits: ForecastApplicationLimits,
     ) -> Self {
         Self {
             paths,
             artifacts,
             analytical,
+            catalog,
+            forecast_catalog,
+            charts,
             runtime_capabilities,
             runtime_limits,
-            forecast_limits,
         }
     }
 }
@@ -422,7 +471,6 @@ impl std::fmt::Debug for FreshModelWorkspaceTarget {
                 &self.runtime_capabilities.as_ref().map(|_| "[VERIFIED]"),
             )
             .field("runtime_limits", &self.runtime_limits)
-            .field("forecast_limits", &self.forecast_limits)
             .finish()
     }
 }
@@ -440,8 +488,11 @@ impl RestoredModelAuthorities {
         &mut self,
         calendar: crate::application::market_calendar::RetainedMarketSessionReadCapability,
     ) -> Result<(), ModelBackupError> {
-        let model = Arc::get_mut(&mut self.model_domain).ok_or(ModelBackupError::ArtifactMismatch)?;
-        model.forecast_calendar = Some(crate::application::market_calendar::ForecastSessionReadCapability::Retained(calendar));
+        let model =
+            Arc::get_mut(&mut self.model_domain).ok_or(ModelBackupError::ArtifactMismatch)?;
+        model.forecast_calendar = Some(
+            crate::application::market_calendar::ForecastSessionReadCapability::Retained(calendar),
+        );
         Ok(())
     }
 
@@ -467,47 +518,204 @@ pub(crate) async fn restore_into_fresh_workspace(
     if cancellation.is_cancelled() {
         return Err(ModelBackupError::Cancelled);
     }
-    let archive = match read_archive(reader, limits, cancellation) {
-        Err(ModelBackupError::Io(error))
-            if cancellation.is_cancelled() && error.kind() == std::io::ErrorKind::Interrupted =>
-        {
-            return Err(ModelBackupError::Cancelled);
-        }
-        result => result?,
-    };
-    validate_decoded_archive(&archive, target.runtime_limits, target.forecast_limits)?;
-    let runtime_index = archive_member(&archive, RUNTIME_INDEX_PATH)?;
-    let coordinates =
-        ProductionModelRuntime::backup_coordinates(runtime_index, target.runtime_limits)?;
+    let mut archive = ArchiveReader::new(reader, limits, cancellation)?;
+    let runtime_index = archive.member_bounded(RUNTIME_INDEX_PATH, 1_024)?;
+    let head = ProductionModelRuntime::decode_backup_head(&runtime_index)?;
+    // The catalog component has already restored the exact immutable inventory. Models may
+    // supply files only for those admissions; the archive cannot mint or replace catalog rows.
+    if target
+        .catalog
+        .head()
+        .map_err(ProductionModelRuntimeError::from)?
+        != head
+    {
+        return Err(ModelBackupError::CoordinateMismatch);
+    }
+    target
+        .catalog
+        .verify(head)
+        .map_err(ProductionModelRuntimeError::from)?;
     let artifact_root = target.paths.artifacts()?;
-    for model in &archive.manifest.models {
-        let coordinate = coordinate_for_manifest(&coordinates, model)?;
+    for sequence in 1..=head.sequence {
+        ensure_live(cancellation)?;
+        let record: ModelInventoryRecord =
+            decode(&archive.member_bounded(&admission_archive_path(sequence), 8 * 1024 * 1024)?)?;
+        let coordinate = ProductionModelRuntime::validate_backup_record(&record)?;
+        let existing = target
+            .catalog
+            .get(head, &record.bundle_id, record.bundle_version)
+            .map_err(ProductionModelRuntimeError::from)?
+            .ok_or(ModelBackupError::CoordinateMismatch)?;
+        if existing.head.sequence != sequence || existing.admission != record {
+            return Err(ModelBackupError::CoordinateMismatch);
+        }
+        let model: ModelManifestRecord =
+            decode(&archive.member_bounded(&manifest_archive_path(sequence), 16 * 1024)?)?;
+        coordinate_for_manifest(std::slice::from_ref(&coordinate), &model)?;
+        if !valid_model_members(&model) {
+            return Err(ModelBackupError::CoordinateMismatch);
+        }
         for member in &model.members {
-            let bytes = archive_member(&archive, &member.archive_path)?;
-            let relative = format!(
+            if member.archive_path != model_archive_path(&coordinate, &member.relative_path)? {
+                return Err(ModelBackupError::Archive);
+            }
+            let bytes = archive.member(&member.archive_path)?;
+            if u64::try_from(bytes.len()) != Ok(member.byte_length)
+                || hex(Sha256::digest(&bytes).into()) != member.sha256
+            {
+                return Err(ModelBackupError::ArtifactMismatch);
+            }
+            let resolved = artifact_root.resolve(format!(
                 "{}/{}",
                 coordinate.candidate_directory, member.relative_path
-            );
-            let resolved = artifact_root.resolve(relative)?;
+            ))?;
             let mut file = resolved.create_new()?;
-            file.write_all(bytes)?;
+            for chunk in bytes.chunks(64 * 1024) {
+                ensure_live(cancellation)?;
+                file.write_all(chunk)?;
+            }
             file.sync_all()?;
         }
     }
-    ProductionModelRuntime::stage_backup_index(
-        &target.paths,
-        runtime_index,
-        target.runtime_limits,
-    )?;
-    let runtime = match (coordinates.is_empty(), target.runtime_capabilities) {
+    let forecast_bytes = archive.member_bounded(FORECAST_INDEX_PATH, 1_024)?;
+    let forecast_head: ForecastInventoryHead = decode(&forecast_bytes)?;
+    ForecastApplicationService::validate_backup_head(&target.forecast_catalog, &forecast_bytes)?;
+    let forecasts = Arc::new(ForecastApplicationService::try_open(
+        target.forecast_catalog.clone(),
+        target.charts.clone(),
+        Arc::clone(&target.artifacts),
+    )?);
+    let deadline = Instant::now()
+        .checked_add(limits.read_time)
+        .ok_or(ModelBackupError::Capacity)?;
+    let read_context = ArtifactReadContext::new(cancellation.clone(), deadline);
+    for (kind, count) in [(1, forecast_head.vintages), (2, forecast_head.outcomes)] {
+        for sequence in 1..=count {
+            ensure_live(cancellation)?;
+            let maximum_record_bytes = if kind == 1 {
+                4 * 1024 * 1024
+            } else {
+                64 * 1024
+            };
+            let bytes = archive
+                .member_bounded(&forecast_record_path(kind, sequence), maximum_record_bytes)?;
+            let existing = if kind == 1 {
+                target
+                    .forecast_catalog
+                    .vintages(forecast_head, sequence - 1, 1, false, None)
+            } else {
+                target
+                    .forecast_catalog
+                    .outcomes(forecast_head, sequence - 1, 1, None)
+            }
+            .map_err(ForecastApplicationError::from)?;
+            if existing.len() != 1
+                || existing.first().is_none_or(|(position, record)| {
+                    *position != sequence || record.as_ref() != bytes.as_ref()
+                })
+            {
+                return Err(ModelBackupError::CoordinateMismatch);
+            }
+            drop(existing);
+            if kind == 1 {
+                let stored = super::forecast::persistence::StoredVintageRecord::decode(&bytes)?;
+                let (model_id, bundle_id, version) = stored.model_coordinate();
+                let version =
+                    NonZeroU64::new(version).ok_or(ModelBackupError::CoordinateMismatch)?;
+                let model = target
+                    .catalog
+                    .get(head, bundle_id, version)
+                    .map_err(ProductionModelRuntimeError::from)?
+                    .ok_or(ModelBackupError::CoordinateMismatch)?;
+                if model.admission.model_id.to_string() != model_id {
+                    return Err(ModelBackupError::CoordinateMismatch);
+                }
+            }
+            let row = ForecastBackupRecord::decode(kind, sequence, bytes)?;
+            let expected = &row.artifact;
+            let bytes = archive.member_bounded(
+                &forecast_artifact_path(kind, sequence),
+                expected.byte_count(),
+            )?;
+            if expected.media_type() != "application/json" {
+                return Err(ModelBackupError::ArtifactMismatch);
+            }
+            let publication = ArtifactPublication::try_json(bytes.into_vec())?;
+            if !expected.matches(&publication) {
+                return Err(ModelBackupError::ArtifactMismatch);
+            }
+            let restored = target
+                .artifacts
+                .publish(
+                    publication,
+                    ArtifactPublicationContext::new(cancellation.clone(), deadline),
+                )
+                .await?;
+            if &restored != expected {
+                return Err(ModelBackupError::ArtifactMismatch);
+            }
+            let verified = target
+                .artifacts
+                .read(
+                    ArtifactReadRequest::try_new(
+                        restored.clone(),
+                        NonZeroUsize::new(restored.byte_count())
+                            .ok_or(ModelBackupError::ArtifactMismatch)?,
+                    )?,
+                    read_context.clone(),
+                )
+                .await?;
+            if verified.reference() != expected
+                || verified.content().len() != expected.byte_count()
+                || hex(Sha256::digest(verified.content()).into()) != expected.sha256()
+            {
+                return Err(ModelBackupError::ArtifactMismatch);
+            }
+            drop(verified);
+            forecasts.stage_backup_record(&row, &read_context).await?;
+        }
+    }
+    archive.finish()?;
+    ensure_live(cancellation)?;
+    ForecastApplicationService::validate_backup_head(&target.forecast_catalog, &forecast_bytes)?;
+    if target
+        .catalog
+        .head()
+        .map_err(ProductionModelRuntimeError::from)?
+        != head
+    {
+        return Err(ModelBackupError::CoordinateMismatch);
+    }
+    target
+        .catalog
+        .verify(head)
+        .map_err(ProductionModelRuntimeError::from)?;
+    let runtime = match (head.sequence == 0, target.runtime_capabilities) {
         (true, None) => None,
         (_, Some((training_environment, onnx_worker))) => {
-            Some(Arc::new(ProductionModelRuntime::try_open(
+            let runtime = Arc::new(ProductionModelRuntime::try_open(
                 &target.paths,
+                target.catalog.clone(),
                 training_environment,
                 onnx_worker,
                 target.runtime_limits,
-            )?))
+            )?);
+            // Reopen each saved bundle through the production authority validator without
+            // compiling it or retaining other generations.
+            let retained = runtime.retain_backup()?;
+            let mut after = 0;
+            loop {
+                let page = retained.page(after)?;
+                if page.is_empty() {
+                    break;
+                }
+                for entry in page {
+                    ensure_live(cancellation)?;
+                    retained.bundle(&entry.coordinate)?;
+                    after = entry.sequence;
+                }
+            }
+            Some(runtime)
         }
         _ => {
             return Err(ModelBackupError::Runtime(
@@ -515,76 +723,13 @@ pub(crate) async fn restore_into_fresh_workspace(
             ));
         }
     };
-
-    let deadline = Instant::now()
-        .checked_add(limits.read_time)
-        .ok_or(ModelBackupError::Capacity)?;
-    let mut restored_references = Vec::new();
-    for artifact in &archive.manifest.forecast_artifacts {
-        let bytes = archive_member(&archive, &artifact.archive_path)?;
-        let publication = match artifact.media_type.as_str() {
-            "application/json" => ArtifactPublication::try_json(bytes.to_vec())?,
-            _ => return Err(ModelBackupError::ArtifactMismatch),
-        };
-        let expected = ArtifactReference::try_new(
-            artifact.artifact_id.clone(),
-            artifact.sha256.clone(),
-            usize::try_from(artifact.byte_length).map_err(|_| ModelBackupError::Capacity)?,
-            artifact.media_type.clone(),
-        )?;
-        if !expected.matches(&publication) {
-            return Err(ModelBackupError::ArtifactMismatch);
-        }
-        let restored = target
-            .artifacts
-            .publish(
-                publication,
-                ArtifactPublicationContext::new(cancellation.clone(), deadline),
-            )
-            .await?;
-        if restored != expected {
-            return Err(ModelBackupError::ArtifactMismatch);
-        }
-        let verified = target
-            .artifacts
-            .read(
-                ArtifactReadRequest::try_new(
-                    restored.clone(),
-                    NonZeroUsize::new(restored.byte_count())
-                        .ok_or(ModelBackupError::ArtifactMismatch)?,
-                )?,
-                ArtifactReadContext::new(cancellation.clone(), deadline),
-            )
-            .await?;
-        if verified.reference() != &expected || verified.content() != bytes {
-            return Err(ModelBackupError::ArtifactMismatch);
-        }
-        restored_references.push(restored);
-    }
-    let forecast_root = target
-        .paths
-        .control_root()?
-        .root()
-        .join(FORECAST_AUTHORITY_DIRECTORY);
-    let forecast_index = archive_member(&archive, FORECAST_INDEX_PATH)?;
-    ForecastApplicationService::stage_backup_index(
-        &forecast_root,
-        forecast_index,
-        &restored_references,
-        target.forecast_limits,
-    )?;
-    let forecasts = Arc::new(ForecastApplicationService::try_open(
-        forecast_root,
-        Arc::clone(&target.artifacts),
-        target.forecast_limits,
-    )?);
     if cancellation.is_cancelled() {
         return Err(ModelBackupError::Cancelled);
     }
     let snapshot = match runtime.as_ref().map(|runtime| runtime.snapshot()) {
         Some(Ok(snapshot)) => snapshot,
         None | Some(Err(ProductionModelRuntimeError::EmptyRuntime)) => {
-            ProductionModelRuntime::empty_snapshot(target.runtime_limits)?
+            ProductionModelRuntime::empty_snapshot()?
         }
         Some(Err(error)) => return Err(error.into()),
     };
@@ -603,92 +748,40 @@ pub(crate) async fn restore_into_fresh_workspace(
     })
 }
 
-#[derive(Clone)]
-struct RetainedArchiveMember {
-    path: String,
-    bytes: Arc<[u8]>,
-}
-
-impl std::fmt::Debug for RetainedArchiveMember {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RetainedArchiveMember")
-            .field("path", &self.path)
-            .field("byte_length", &self.bytes.len())
-            .field("bytes", &"[RETAINED AUTHORITY BYTES]")
-            .finish()
-    }
-}
-
-fn member_manifest(
-    member: &RetainedArchiveMember,
-) -> Result<MemberManifestRecord, ModelBackupError> {
-    Ok(MemberManifestRecord {
-        path: member.path.clone(),
-        byte_length: u64::try_from(member.bytes.len()).map_err(|_| ModelBackupError::Capacity)?,
-        sha256: hex(Sha256::digest(&member.bytes).into()),
-    })
-}
-
-fn admit_member(
-    members: &mut Vec<RetainedArchiveMember>,
-    path: &str,
-    bytes: Arc<[u8]>,
-    limits: ModelBackupLimits,
-) -> Result<(), ModelBackupError> {
-    if bytes.is_empty()
-        || bytes.len() > limits.maximum_member_bytes.get()
-        || members.len() >= limits.maximum_members.get().saturating_sub(1)
-        || members.iter().any(|member| member.path == path)
-    {
-        return Err(ModelBackupError::Capacity);
-    }
-    members.push(RetainedArchiveMember {
-        path: path.to_owned(),
-        bytes,
-    });
-    Ok(())
-}
-
-fn validate_member_order_and_bounds(
-    members: &[RetainedArchiveMember],
-    limits: ModelBackupLimits,
-) -> Result<(), ModelBackupError> {
-    let unique = members
-        .iter()
-        .map(|member| member.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let payload_bytes = members.iter().try_fold(0_u64, |total, member| {
-        u64::try_from(member.bytes.len())
-            .ok()
-            .and_then(|length| total.checked_add(length))
-    });
-    if unique.len() != members.len()
-        || payload_bytes.is_none_or(|bytes| bytes >= limits.maximum_archive_bytes.get())
-    {
-        return Err(ModelBackupError::Capacity);
+fn ensure_live(cancellation: &CancellationToken) -> Result<(), ModelBackupError> {
+    if cancellation.is_cancelled() {
+        return Err(ModelBackupError::Cancelled);
     }
     Ok(())
 }
 
-fn semantic_revision(members: &[RetainedArchiveMember]) -> Result<[u8; 32], ModelBackupError> {
-    let mut digest = Sha256::new();
-    digest.update(SEMANTIC_REVISION_DOMAIN);
-    for member in members {
-        digest.update(
-            u64::try_from(member.path.len())
-                .map_err(|_| ModelBackupError::Capacity)?
-                .to_be_bytes(),
-        );
-        digest.update(member.path.as_bytes());
-        digest.update(
-            u64::try_from(member.bytes.len())
-                .map_err(|_| ModelBackupError::Capacity)?
-                .to_be_bytes(),
-        );
-        digest.update(Sha256::digest(&member.bytes));
+fn encode(value: &impl serde::Serialize) -> Result<Vec<u8>, ModelBackupError> {
+    serde_json::to_vec(value).map_err(|_| ModelBackupError::Archive)
+}
+
+fn decode<T: serde::de::DeserializeOwned + serde::Serialize>(
+    bytes: &[u8],
+) -> Result<T, ModelBackupError> {
+    let value: T = serde_json::from_slice(bytes).map_err(|_| ModelBackupError::Archive)?;
+    if encode(&value)? != bytes {
+        return Err(ModelBackupError::Archive);
     }
-    Ok(digest.finalize().into())
+    Ok(value)
+}
+
+fn forecast_record_path(kind: u8, sequence: u64) -> String {
+    format!("forecasts/{kind}/{sequence}/record.json")
+}
+
+fn forecast_artifact_path(kind: u8, sequence: u64) -> String {
+    format!("forecasts/{kind}/{sequence}/artifact.json")
+}
+
+fn admission_archive_path(sequence: u64) -> String {
+    format!("inventory/{sequence}/admission.json")
+}
+fn manifest_archive_path(sequence: u64) -> String {
+    format!("inventory/{sequence}/manifest.json")
 }
 
 fn model_archive_path(
@@ -722,118 +815,6 @@ fn model_manifest(
     }
 }
 
-fn validate_decoded_archive(
-    archive: &DecodedArchive,
-    runtime_limits: ProductionModelRuntimeLimits,
-    forecast_limits: ForecastApplicationLimits,
-) -> Result<(), ModelBackupError> {
-    if archive.manifest.schema_version != MODEL_BACKUP_SCHEMA_VERSION
-        || archive.manifest.runtime_index_path != RUNTIME_INDEX_PATH
-        || archive.manifest.forecast_index_path != FORECAST_INDEX_PATH
-        || archive.manifest.semantic_authority_revision
-            != hex(semantic_revision_from_archive(archive)?)
-    {
-        return Err(ModelBackupError::Archive);
-    }
-    let coordinates = ProductionModelRuntime::backup_coordinates(
-        archive_member(archive, RUNTIME_INDEX_PATH)?,
-        runtime_limits,
-    )?;
-    if coordinates.len() != archive.manifest.models.len() {
-        return Err(ModelBackupError::CoordinateMismatch);
-    }
-    let mut mapped_paths = vec![RUNTIME_INDEX_PATH];
-    for (coordinate, model) in coordinates.iter().zip(&archive.manifest.models) {
-        if coordinate_for_manifest(std::slice::from_ref(coordinate), model).is_err()
-            || !valid_model_members(model)
-        {
-            return Err(ModelBackupError::CoordinateMismatch);
-        }
-        for member in &model.members {
-            if member.archive_path != model_archive_path(coordinate, &member.relative_path)?
-                || !manifest_member_matches(
-                    &archive.manifest.members,
-                    &member.archive_path,
-                    member.byte_length,
-                    &member.sha256,
-                )
-            {
-                return Err(ModelBackupError::Archive);
-            }
-            mapped_paths.push(&member.archive_path);
-        }
-    }
-    mapped_paths.push(FORECAST_INDEX_PATH);
-    let forecast_index = super::forecast::persistence::ForecastIndex::decode_canonical(
-        archive_member(archive, FORECAST_INDEX_PATH)?,
-        forecast_limits,
-    )?;
-    if forecast_index
-        .model_coordinates()
-        .any(|(model_id, bundle_id, version)| {
-            !archive.manifest.models.iter().any(|model| {
-                model.model_id == model_id
-                    && model.bundle_id == bundle_id
-                    && model.bundle_version == version
-            })
-        })
-    {
-        return Err(ModelBackupError::CoordinateMismatch);
-    }
-    let expected = forecast_index.artifact_references()?;
-    let declared = archive
-        .manifest
-        .forecast_artifacts
-        .iter()
-        .map(|artifact| {
-            ArtifactReference::try_new(
-                artifact.artifact_id.clone(),
-                artifact.sha256.clone(),
-                usize::try_from(artifact.byte_length)
-                    .map_err(|_| ArtifactError::InvalidReference)?,
-                artifact.media_type.clone(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if expected != declared {
-        return Err(ModelBackupError::ArtifactMismatch);
-    }
-    for artifact in &archive.manifest.forecast_artifacts {
-        if artifact.archive_path != format!("forecast-artifacts/{}.json", artifact.sha256)
-            || artifact.media_type != "application/json"
-            || !manifest_member_matches(
-                &archive.manifest.members,
-                &artifact.archive_path,
-                artifact.byte_length,
-                &artifact.sha256,
-            )
-        {
-            return Err(ModelBackupError::ArtifactMismatch);
-        }
-        mapped_paths.push(&artifact.archive_path);
-    }
-    if !mapped_paths.into_iter().eq(archive
-        .manifest
-        .members
-        .iter()
-        .map(|member| member.path.as_str()))
-    {
-        return Err(ModelBackupError::Archive);
-    }
-    Ok(())
-}
-
-fn manifest_member_matches(
-    members: &[MemberManifestRecord],
-    path: &str,
-    byte_length: u64,
-    sha256: &str,
-) -> bool {
-    members.iter().any(|member| {
-        member.path == path && member.byte_length == byte_length && member.sha256 == sha256
-    })
-}
-
 fn valid_model_members(model: &ModelManifestRecord) -> bool {
     let roles = model
         .members
@@ -843,7 +824,13 @@ fn valid_model_members(model: &ModelManifestRecord) -> bool {
     matches!(
         roles.as_slice(),
         ["metadata", "artifact", "training_run"]
-            | ["metadata", "artifact", "training_run", "probability_outcomes", "probability_policy"]
+            | [
+                "metadata",
+                "artifact",
+                "training_run",
+                "probability_outcomes",
+                "probability_policy"
+            ]
             | [
                 "metadata",
                 "artifact",
@@ -872,32 +859,6 @@ fn coordinate_for_manifest<'coordinate>(
                 && coordinate.metadata_path.as_ref() == model.metadata_path
         })
         .ok_or(ModelBackupError::CoordinateMismatch)
-}
-
-fn archive_member<'archive>(
-    archive: &'archive DecodedArchive,
-    path: &str,
-) -> Result<&'archive [u8], ModelBackupError> {
-    archive
-        .members
-        .get(path)
-        .map(AsRef::as_ref)
-        .ok_or(ModelBackupError::Archive)
-}
-
-fn semantic_revision_from_archive(archive: &DecodedArchive) -> Result<[u8; 32], ModelBackupError> {
-    let retained = archive
-        .manifest
-        .members
-        .iter()
-        .map(|member| {
-            Ok(RetainedArchiveMember {
-                path: member.path.clone(),
-                bytes: Arc::from(archive_member(archive, &member.path)?),
-            })
-        })
-        .collect::<Result<Vec<_>, ModelBackupError>>()?;
-    semantic_revision(&retained)
 }
 
 fn map_capture_error(error: ForecastBackupCaptureError) -> ModelBackupError {

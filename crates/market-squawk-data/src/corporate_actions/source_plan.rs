@@ -115,16 +115,33 @@ impl CorporateActionPlan {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Self, CorporateActionError> {
-        Self::try_from_source_reads_inner(source, query_identity, calendar, reads,
-            requested_instruments, interval, policy, payment_policy, valuation_cutoff,
-            evaluated_at, limits, deadline, cancellation, true)
+        Self::try_from_source_reads_inner(
+            source,
+            query_identity,
+            calendar,
+            reads,
+            requested_instruments,
+            interval,
+            policy,
+            payment_policy,
+            valuation_cutoff,
+            evaluated_at,
+            limits,
+            deadline,
+            cancellation,
+            true,
+            false,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_from_source_reads_inner(
         source: &CorporateActionSourceSnapshot,
         query_identity: &CorporateActionQueryIdentitySelection,
         calendar: &RetainedCorporateActionCalendar,
-        reads: &[(&RetainedTiingoEodActionHistory, &RetainedCorporateActionCalendar)],
+        reads: &[(
+            &RetainedTiingoEodActionHistory,
+            &RetainedCorporateActionCalendar,
+        )],
         requested_instruments: &BTreeSet<InstrumentId>,
         interval: (CalendarDate, CalendarDate),
         policy: CorporateActionPolicy,
@@ -135,6 +152,7 @@ impl CorporateActionPlan {
         deadline: Instant,
         cancellation: &CancellationToken,
         require_completed_session: bool,
+        completed_prefix: bool,
     ) -> Result<Self, CorporateActionError> {
         check(deadline, cancellation)?;
         let knowledge_cutoff = source.knowledge_cutoff();
@@ -159,7 +177,7 @@ impl CorporateActionPlan {
         let candidate_count = reads
             .iter()
             .try_fold(source.actions().len(), |count, (read, _)| {
-                count.checked_add(read.history().source_actions().len())
+                count.checked_add(read.history().source_action_count())
             })
             .ok_or(CorporateActionError::InvalidApplication)?;
         if candidate_count > limits.max_actions().get() {
@@ -184,38 +202,47 @@ impl CorporateActionPlan {
                 || graph.calendar().origin_content_digest.bytes()
                     != calendar.manifest().content_hash().bytes()
                 || by_instrument.insert(instrument, index).is_some()
-                || read.actions().rows().len() != graph.sessions().len()
-                || read.actions().rows().len() > 64_000
-                || read
-                    .actions()
-                    .rows()
-                    .iter()
-                    .zip(graph.sessions())
-                    .any(|(row, session)| row.date != session.date)
+                || read.action_row_count() != graph.session_count()
             {
                 return Err(CorporateActionError::InvalidApplication);
             }
-            if read
-                .actions()
-                .rows()
-                .iter()
-                .map(|row| row.date)
-                .filter(|date| *date >= interval.0 && *date <= interval.1)
-                .ne(calendar.native_dates_in(interval))
+            let native = graph.requested_dates();
+            let checked_interval = if completed_prefix {
+                // Hybrid authority accepts only a genuine completed prefix of the same native
+                // sessions. The current-source join below must independently cover its tail.
+                if native.0 > interval.0 || native.1 >= interval.1 {
+                    return Err(CorporateActionError::InvalidApplication);
+                }
+                (interval.0, native.1)
+            } else {
+                interval
+            };
+            let mut expected_dates = calendar.native_dates_in(checked_interval);
+            let mut dates_match = true;
+            for row in read.action_rows() {
+                let row = row.map_err(|_| CorporateActionError::InvalidApplication)?;
+                if row.date >= checked_interval.0
+                    && row.date <= checked_interval.1
+                    && expected_dates.next() != Some(row.date)
+                {
+                    dates_match = false;
+                }
+            }
+            if !dates_match
+                || expected_dates.next().is_some()
                 || calendar
-                    .native_session_bounds(interval)
+                    .native_session_bounds(checked_interval)
                     .is_none_or(|(start, end)| {
                         valuation_cutoff < start
-                            || end
-                                .unix_nanos()
-                                .checked_add(1)
-                                .is_none_or(|exclusive| valuation_cutoff.unix_nanos() > exclusive)
+                            || (completed_prefix && end > valuation_cutoff)
+                            || (!completed_prefix
+                                && end.unix_nanos().checked_add(1).is_none_or(|exclusive| {
+                                    valuation_cutoff.unix_nanos() > exclusive
+                                }))
                     })
+                || native.0 > checked_interval.0
+                || native.1 < checked_interval.1
             {
-                gaps.push(OrdinaryActionCoverageGap::NativeIntervalNotCovered { instrument });
-            }
-            let native = graph.requested_dates();
-            if native.0 > interval.0 || native.1 < interval.1 {
                 gaps.push(OrdinaryActionCoverageGap::NativeIntervalNotCovered { instrument });
             }
         }
@@ -283,7 +310,7 @@ impl CorporateActionPlan {
             let Some(session) = calendar_for(
                 descriptor.context().provenance().instrument_id(),
                 calendar,
-                reads,
+                if completed_prefix { &[] } else { reads },
                 &by_instrument,
             )
             .and_then(|calendar| calendar.date_session_on(date, knowledge_cutoff, evaluated_at)) else {
@@ -294,7 +321,8 @@ impl CorporateActionPlan {
                 continue;
             };
             if (require_completed_session && session.closes_at_exclusive > evaluated_at)
-                || (!require_completed_session && session.opens_at > valuation_cutoff) {
+                || (!require_completed_session && session.opens_at > valuation_cutoff)
+            {
                 unresolved.push(ApplicableActionGap::MissingEffectiveSession {
                     action: action_id.clone(),
                     date,
@@ -319,7 +347,7 @@ impl CorporateActionPlan {
                         calendar_for(
                             descriptor.context().provenance().instrument_id(),
                             calendar,
-                            reads,
+                            if completed_prefix { &[] } else { reads },
                             &by_instrument,
                         )
                         .and_then(|calendar| {
@@ -358,9 +386,9 @@ impl CorporateActionPlan {
         let mut reconciled = Vec::new();
         for (read, calendar) in reads {
             let instrument = read.history().selection().receipt().instrument_id();
-            let records = read.records();
             let mut seen = BTreeSet::new();
-            for row in read.actions().rows() {
+            for row in read.action_rows() {
+                let row = row.map_err(|_| CorporateActionError::InvalidApplication)?;
                 check(deadline, cancellation)?;
                 if row.date < interval.0 || row.date > interval.1 {
                     continue;
@@ -385,9 +413,11 @@ impl CorporateActionPlan {
                             }
                         }
                         TiingoEodActionFieldDisposition::Normalized { observation_index } => {
-                            let record = records
-                                .get(observation_index)
+                            let owned_record = read
+                                .record(observation_index)
+                                .map_err(|_| CorporateActionError::InvalidApplication)?
                                 .ok_or(CorporateActionError::InvalidApplication)?;
+                            let record = &owned_record;
                             if instrument_of(record)? != instrument
                                 || date_of(record)? != row.date
                                 || ordinary_field(record.observation().action()) != Some(field)
@@ -466,7 +496,19 @@ impl CorporateActionPlan {
                 }
             }
             for &(other, date, field) in alpaca.keys() {
-                if other == instrument && !seen.contains(&(other, date, field)) {
+                if other == instrument
+                    && (!completed_prefix
+                        || date
+                            <= read
+                                .history()
+                                .selection()
+                                .receipt()
+                                .date_windows()
+                                .ok_or(CorporateActionError::InvalidApplication)?
+                                .requested_dates()
+                                .1)
+                    && !seen.contains(&(other, date, field))
+                {
                     gaps.push(OrdinaryActionCoverageGap::SourceDisagreement {
                         instrument,
                         date,
@@ -555,14 +597,19 @@ fn calendar_for<'a>(
             .map(|index| reads[*index].1)
     }
 }
-pub(super) fn check(deadline: Instant, cancellation: &CancellationToken) -> Result<(), CorporateActionError> {
+pub(super) fn check(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), CorporateActionError> {
     if cancellation.is_cancelled() || Instant::now() >= deadline {
         Err(CorporateActionError::SourceReadInterrupted)
     } else {
         Ok(())
     }
 }
-pub(super) fn instrument_of(record: &CorporateActionRecord) -> Result<InstrumentId, CorporateActionError> {
+pub(super) fn instrument_of(
+    record: &CorporateActionRecord,
+) -> Result<InstrumentId, CorporateActionError> {
     record
         .observation()
         .context()
@@ -570,7 +617,9 @@ pub(super) fn instrument_of(record: &CorporateActionRecord) -> Result<Instrument
         .instrument_id()
         .ok_or(CorporateActionError::InvalidApplication)
 }
-pub(super) fn date_of(record: &CorporateActionRecord) -> Result<CalendarDate, CorporateActionError> {
+pub(super) fn date_of(
+    record: &CorporateActionRecord,
+) -> Result<CalendarDate, CorporateActionError> {
     record
         .observation()
         .context()

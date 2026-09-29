@@ -35,6 +35,7 @@ import type {
   ProviderOnboardingRequest,
   ProviderOnboardingResult,
   ResearchControlRequest,
+  ReadOptions,
   SourceLifecycleAction,
   SourceLifecycleRequest,
   SystemQuery,
@@ -96,9 +97,15 @@ function systemPort(transport: SystemTransport): SystemTransport {
 }
 
 class TauriTransport implements ProductTransport, SystemTransport {
+  private productSessionToken: string | undefined
+
   async bootstrap() {
     const value = await invoke("desktop_bootstrap")
-    return desktopSystemStartupSchema.parse(value)
+    const startup = desktopSystemStartupSchema.parse(value)
+    this.productSessionToken = "productSessionToken" in startup
+      ? startup.productSessionToken
+      : undefined
+    return startup
   }
 
   async bootstrapService(request: Parameters<SystemTransport["bootstrapService"]>[0]) {
@@ -113,36 +120,70 @@ class TauriTransport implements ProductTransport, SystemTransport {
     return installationControlResultSchema.parse(value)
   }
 
-  async query(request: ProductQuery) {
+  async query(request: ProductQuery, options?: ReadOptions) {
     const value =
       request.query === "analysisSettings"
-        ? await invoke("analytical_product")
-        : await invoke("dashboard_query", { request })
+        ? await this.read("analytical_product", {}, options)
+        : request.query === "marketSessionContext"
+          ? await invoke("dashboard_query", { request })
+          : await this.read("dashboard_query", { request }, options)
     return applicationResultSchema.parse(value)
   }
 
-  async systemQuery(request: SystemQuery) {
-    const value = await invoke("dashboard_query", { request })
+  async systemQuery(request: SystemQuery, options?: ReadOptions) {
+    const value = await this.read("dashboard_query", { request }, options)
     return nativeEvidenceApplicationResultSchema.parse(value)
   }
 
-  async modelProducts(request: Parameters<ProductTransport["modelProducts"]>[0]) {
-    const value = await invoke("model_products", { request })
+  async modelProducts(request: Parameters<ProductTransport["modelProducts"]>[0], options?: ReadOptions) {
+    const value = await this.read("model_products", { request }, options)
     return applicationResultSchema.parse(value)
   }
 
   async backtestProducts(
     request: Parameters<ProductTransport["backtestProducts"]>[0],
+    options?: ReadOptions,
   ) {
-    const value = await invoke("backtest_products", { request })
+    const value = await this.read("backtest_products", { request }, options)
     return applicationResultSchema.parse(value)
+  }
+
+  private async read(command: string, args: Record<string, unknown>, options?: ReadOptions) {
+    const signal = options?.signal
+    signal?.throwIfAborted()
+    const productSessionToken = this.productSessionToken
+    if (!productSessionToken) throw new Error("The local application is not connected.")
+    const identity = { requestId: crypto.randomUUID(), productSessionToken }
+    await invoke("register_read", identity)
+    let cancellation: Promise<unknown> | undefined
+    const cancel = () => {
+      cancellation ??= invoke("cancel_read", identity)
+      // The finally block observes failures; an event listener cannot await them.
+      void cancellation.catch(() => undefined)
+    }
+    signal?.addEventListener("abort", cancel, { once: true })
+    try {
+      signal?.throwIfAborted()
+      const result = await invoke(command, { ...args, ...identity })
+      signal?.throwIfAborted()
+      return result
+    } finally {
+      signal?.removeEventListener("abort", cancel)
+      cancel()
+      await cancellation
+    }
   }
 
   async analyticalController(
     request: Parameters<ProductTransport["analyticalController"]>[0],
     confirmed = false,
+    options?: ReadOptions,
   ) {
-    const value = await invoke("analytical_controller", { request, confirmed })
+    const args = { request, confirmed }
+    const read = ["status", "profileOptions", "compareWithRecommended", "history", "workflowCoverage"].includes(request.action)
+    const value = read
+      ? await this.read("analytical_controller", args, options)
+      : await invoke("analytical_controller", args)
     return analyticalControllerResponseSchema.parse(value)
   }
 
@@ -196,15 +237,18 @@ class TauriTransport implements ProductTransport, SystemTransport {
     return applicationResultSchema.parse(value)
   }
 
-  async forecastPreparation(request: unknown, confirmed = false) {
-    const value = await invoke("model_control", {
+  async forecastPreparation(request: Parameters<ProductTransport["forecastPreparation"]>[0], confirmed = false, options?: ReadOptions) {
+    const args = {
       request: mapPreparationAction(request, {
         options: "forecastPreparationOptions",
         preview: "prepareForecast",
         start: "startPreparedForecast",
       }),
       confirmed,
-    })
+    }
+    const value = request.action === "start"
+      ? await invoke("model_control", args)
+      : await this.read("model_control", args, options)
     return applicationResultSchema.parse(value)
   }
 

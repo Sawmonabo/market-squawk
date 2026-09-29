@@ -47,14 +47,14 @@ pub use input_authority::{
     reason = "a generic analysis consumer uses this least-authority seam after composition"
 )]
 pub(crate) use input_authority::{
-    HistoricalRecommendationAlphaProducer, HistoricalRecommendationAlphaProducerReadCapability,
-    PreparedRecommendationStudyV1,
-    RecommendationStudyPreparationInputV1,
-    HistoricalFoldTrainingAuthorityV1, HistoricalStudyDatasetPartV1,
-    HistoricalStudyPlanReadCapabilityV1, HistoricalStudyPlanReferenceV1, HistoricalStudyPlanV1,
-    GovernedRecommendationBacktestEvidenceV1, GovernedRecommendationInputMaterializerV1,
-    GovernedRecommendationMaterializedInputV1, GovernedRecommendationSignalIssuerV1,
+    GovernedRecommendationBacktestEvidenceV1,
     GovernedRecommendationDailyInputRegistrationReceiptV1,
+    GovernedRecommendationInputMaterializerV1, GovernedRecommendationMaterializedInputV1,
+    GovernedRecommendationSignalIssuerV1, HistoricalFoldTrainingAuthorityV1,
+    HistoricalRecommendationAlphaProducer, HistoricalRecommendationAlphaProducerReadCapability,
+    HistoricalStudyDatasetPartV1, HistoricalStudyPlanReadCapabilityV1,
+    HistoricalStudyPlanReferenceV1, HistoricalStudyPlanV1, PreparedRecommendationStudyV1,
+    RecommendationStudyPreparationInputV1,
 };
 pub use repository::{
     GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
@@ -506,6 +506,12 @@ impl GovernedBacktestRecord {
                 let report_digest = encode_hex(completion.artifact().digest().bytes());
                 let reporting_currency = run.portfolio().marked_equity().currency();
                 let partition = completion.dataset_partition();
+                let partial_fill_count = run.fill_iter().try_fold(0usize, |count, fill| {
+                    let fill = fill.map_err(|_| ServiceError::Internal)?;
+                    count
+                        .checked_add(usize::from(fill.partial()))
+                        .ok_or(ServiceError::Internal)
+                })?;
                 json!({
                     "state": "completed",
                     "resultDigest": encode_hex(completion.result_digest().bytes()),
@@ -527,8 +533,8 @@ impl GovernedBacktestRecord {
                         "startsAtUnixNanos": partition.starts_at().unix_nanos(),
                         "endsAtUnixNanos": partition.ends_at().unix_nanos()
                     },
-                    "fillCount": run.fills().len(),
-                    "partialFillCount": run.fills().iter().filter(|fill| fill.partial()).count(),
+                    "fillCount": run.fill_count(),
+                    "partialFillCount": partial_fill_count,
                     "noActionCount": run.no_action_count(),
                     "reportingCurrency": reporting_currency.as_str(),
                     "accountingReconciliation": "independent",

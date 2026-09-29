@@ -99,11 +99,9 @@ pub(super) async fn measure(
         guard = forecasts.publication.lock() => guard,
     };
     context.ensure_live()?;
-    let record = {
-        let index = forecasts.index.lock().await;
-        context.ensure_live()?;
-        product_vintage(&index, token)?.clone()
-    };
+    let index = forecasts.selected_index(token, &context.artifact).await?;
+    let record = product_vintage(&index, token)?.clone();
+    drop(index);
     let image = service.read_image.load();
     let (model_id, bundle_id, bundle_version) = record.typed_model_coordinate()?;
     let bundle = image
@@ -145,11 +143,27 @@ pub(super) async fn measure(
             forecast_token: token,
         });
     }
-    if matches!(vintage.path().output_binding().target(), market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }) {
-        if source_action_reference.is_some() { return Err(ForecastApplicationError::InvalidRecord); }
-        return event::measure(service, token, &record, &vintage, outcome_manifest, as_of, analytical, &context).await;
+    if matches!(
+        vintage.path().output_binding().target(),
+        market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }
+    ) {
+        if source_action_reference.is_some() {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        return event::measure(
+            service,
+            token,
+            &record,
+            &vintage,
+            outcome_manifest,
+            as_of,
+            analytical,
+            &context,
+        )
+        .await;
     }
-    let source_action_reference = source_action_reference.ok_or(ForecastApplicationError::InvalidRecord)?;
+    let source_action_reference =
+        source_action_reference.ok_or(ForecastApplicationError::InvalidRecord)?;
     let source_actions = source_actions.ok_or(ForecastApplicationError::Unavailable)?;
     if retained_serving.current_price_input().is_some() {
         return current::measure(
@@ -168,7 +182,7 @@ pub(super) async fn measure(
     }
     // The original outcome is immutable. Repeated measurement cannot count a revision as a new trial.
     if let Some(existing) = {
-        let index = forecasts.index.lock().await;
+        let index = forecasts.index_for_vintage(record.clone())?;
         index
             .outcomes
             .iter()
@@ -191,7 +205,11 @@ pub(super) async fn measure(
                 context.artifact.clone(),
             )
             .await?;
-        existing.verify_measurement_artifact(&evidence, &vintage, MeasurementSourceKind::TimestampedBars)?;
+        existing.verify_measurement_artifact(
+            &evidence,
+            &vintage,
+            MeasurementSourceKind::TimestampedBars,
+        )?;
         context.ensure_live()?;
         return Ok(ForecastOutcomeMeasurement::Recorded {
             forecast_token: token,
@@ -369,9 +387,9 @@ pub(super) async fn measure(
     .map_err(|_| ForecastApplicationError::InvalidRecord)?;
     context.ensure_live()?;
     forecasts
-        .append_outcome(&outcome, &proof, recorded_at)
+        .append_outcome(&outcome, &record, &proof, recorded_at)
         .await?;
-    let index = forecasts.index.lock().await;
+    let index = forecasts.index_for_vintage(record.clone())?;
     let retained = index
         .outcomes
         .iter()

@@ -5,6 +5,7 @@ use super::{MarketHistoryReadCapability, MarketHistoryUnavailableReason as Error
 use crate::{ResearchService, application::market_calendar::CompletedMarketSessionReadCapability};
 use market_squawk_data::ResearchUsePermit;
 use market_squawk_domain::{CalendarDate, Currency, DataQuality, InstrumentId, Timestamp};
+use market_squawk_services::ServiceError;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -12,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 mod projection;
 mod source;
+mod spool;
 
-const MAX_POINTS: usize = 4096;
 const MAX_MEMBERS: usize = 3;
 const VERSION: u16 = 1;
 
@@ -50,6 +51,7 @@ struct BenchmarkSourceReference {
     history_sha256: [u8; 32],
     result_sha256: [u8; 32],
     native_sessions_sha256: [u8; 32],
+    parents: Vec<market_squawk_modeling::ForecastArtifactManifestRecord>,
 }
 
 impl BenchmarkHistoryReference {
@@ -68,17 +70,49 @@ impl BenchmarkHistoryReference {
     pub(crate) const fn projection_sha256(&self) -> [u8; 32] {
         self.projection_sha256
     }
+    pub(crate) fn parent_manifests(
+        &self,
+    ) -> Result<Vec<market_squawk_data::DatasetManifestRef>, ServiceError> {
+        validate_reference(self).map_err(|_| ServiceError::InvalidResult)?;
+        let mut parents = Vec::new();
+        for source in self
+            .members
+            .iter()
+            .filter_map(|member| member.source.as_ref())
+        {
+            let manifests = source
+                .parents
+                .iter()
+                .map(|record| record.typed().map_err(|_| ServiceError::InvalidResult))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !manifests
+                .iter()
+                .any(|manifest| manifest.content_hash().bytes() == source.selected_manifest)
+                || !manifests
+                    .iter()
+                    .any(|manifest| manifest.content_hash().bytes() == source.origin_manifest)
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            for manifest in manifests {
+                if !parents.contains(&manifest) {
+                    parents.push(manifest);
+                }
+            }
+        }
+        Ok(parents)
+    }
 }
 
 /// A genuine named regular session. Its close is not a provider's daily aggregation timestamp.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) struct BenchmarkHistoryCoordinate {
     pub(crate) session_close: Timestamp,
     pub(crate) date: CalendarDate,
 }
 
 /// Exact original price and Rust-owned comparable value, excluding cash distributions.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct BenchmarkHistoryObservation {
     pub(crate) close: Decimal,
     /// Base 100 at the same original session for every displayed member; eight decimal places,
@@ -89,7 +123,7 @@ pub(crate) struct BenchmarkHistoryObservation {
     pub(crate) quality: DataQuality,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct BenchmarkHistoryPoint {
     pub(crate) coordinate: BenchmarkHistoryCoordinate,
     /// None is a gap and must break the rendered line. Never interpolate or forward-fill.
@@ -104,12 +138,12 @@ pub(crate) enum BenchmarkHistoryDisposition {
     NoCommonObservation,
 }
 
-/// Original economic reference and newly authorized, bounded observations.
+/// Original economic reference and newly authorized exact observations.
 pub(crate) struct BenchmarkHistoryEvaluation {
     reference: BenchmarkHistoryReference,
     disposition: BenchmarkHistoryDisposition,
     baseline: Option<BenchmarkHistoryCoordinate>,
-    points: Vec<BenchmarkHistoryPoint>,
+    points: spool::BenchmarkPoints,
     /// Fresh rights receipts are intentionally outside the immutable economic identity.
     rights: Vec<BenchmarkHistoryRights>,
 }
@@ -132,8 +166,8 @@ impl BenchmarkHistoryEvaluation {
     pub(crate) const fn baseline(&self) -> Option<BenchmarkHistoryCoordinate> {
         self.baseline
     }
-    pub(crate) fn points(&self) -> &[BenchmarkHistoryPoint] {
-        &self.points
+    pub(crate) fn points(&self) -> impl Iterator<Item = Result<BenchmarkHistoryPoint, Error>> + '_ {
+        self.points.iter()
     }
     pub(crate) fn rights(&self) -> &[BenchmarkHistoryRights] {
         &self.rights
@@ -142,11 +176,11 @@ impl BenchmarkHistoryEvaluation {
 
 struct SourceSeries {
     reference: BenchmarkSourceReference,
-    // Includes genuine expected native sessions with missing bars.
-    points: Vec<(
-        BenchmarkHistoryCoordinate,
-        Option<BenchmarkHistoryObservation>,
-    )>,
+    history: market_squawk_data::CompleteMarketBarHistoryCursor,
+    instrument: InstrumentId,
+    currency: Currency,
+    cutoff: Timestamp,
+    observed: Timestamp,
     permit: ResearchUsePermit,
 }
 
@@ -201,29 +235,7 @@ impl MarketHistoryReadCapability {
         .await
     }
 
-    /// Reopens every present source by its exact content hash at its original cutoff. Missing
-    /// sources are never looked up; expiry today does not alter original economics or select latest.
-    pub(crate) async fn read_saved_benchmark_history(
-        &self,
-        research: &ResearchService,
-        calendars: &CompletedMarketSessionReadCapability,
-        saved: &BenchmarkHistoryReference,
-        deadline: Instant,
-        cancellation: CancellationToken,
-    ) -> Result<BenchmarkHistoryEvaluation, Error> {
-        check(deadline, &cancellation)?;
-        validate_reference(saved)?;
-        self.benchmark_history_bound(
-            research,
-            calendars,
-            saved.clone(),
-            true,
-            deadline,
-            cancellation,
-        )
-        .await
-    }
-
+    /// Evaluates the original sources once before publishing their immutable display projection.
     #[allow(
         clippy::too_many_arguments,
         reason = "fresh versus exact source reads share one authority path"
@@ -268,7 +280,8 @@ impl MarketHistoryReadCapability {
             sources.push(source);
         }
         let (disposition, baseline, points) = projection::align(&sources, deadline, &cancellation)?;
-        let projection = projection::digest(disposition, baseline, &points)?;
+        let projection =
+            projection::digest(disposition, baseline, &points, deadline, &cancellation)?;
         if saved && projection != reference.projection_sha256 {
             return Err(Error::IntegrityUnproven);
         }

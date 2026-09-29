@@ -648,7 +648,7 @@ pub(super) fn insert_logical_claim(
     }
 }
 
-pub(super) fn load_provider_logical_publication_binding(
+pub(crate) fn load_provider_logical_publication_binding(
     connection: &Connection,
     binding_digest: EvidenceDigest,
 ) -> Result<Option<PersistedProviderLogicalPublicationBinding>, CatalogError> {

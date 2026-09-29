@@ -44,6 +44,8 @@ pub(super) fn preparation_result() -> Value {
                         "source_actions",
                         "equity_premium",
                         "option_context",
+                        "current_share_actions",
+                        "fundamental_share_actions",
                     ]),
                 ),
                 ("status", enumeration(&["available", "unavailable"])),
@@ -52,7 +54,7 @@ pub(super) fn preparation_result() -> Value {
                 ("startedAtUnixNanos", integer_text()),
                 ("completedAtUnixNanos", integer_text()),
             ]),
-            7,
+            9,
         )
     };
     let mut schema=one_of(vec![
@@ -64,6 +66,7 @@ pub(super) fn preparation_result() -> Value {
             ("preparedAtUnixNanos", integer_text()),
             ("reference", reference()),
             ("sourceActionReference", nullable(crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference::json_schema())),
+            ("fundamentalShareSources", nullable(bounded_text(crate::application::fair_value::MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES))),
             ("sources", sources()),
         ]),
         closed_complete(vec![
@@ -74,6 +77,7 @@ pub(super) fn preparation_result() -> Value {
             ("preparedAtUnixNanos", nullable(integer_text())),
             ("reference", reference()),
             ("sourceActionReference", nullable(crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference::json_schema())),
+            ("fundamentalShareSources", nullable(bounded_text(crate::application::fair_value::MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES))),
             ("sources", sources()),
             (
                 "reason",

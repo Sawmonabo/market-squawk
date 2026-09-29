@@ -2131,10 +2131,13 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             rejected_authority.clone(),
         )
         .await;
-    assert!(matches!(
-        rejected,
-        Err(DatasetBuildError::PublicationAuthorityRevoked)
-    ));
+    assert!(
+        matches!(
+            rejected,
+            Err(DatasetBuildError::PublicationAuthorityRevoked)
+        ),
+        "unexpected publication-authority rejection result: {rejected:?}"
+    );
     assert!(!rejected_authority.committed.load(Ordering::Acquire));
     let rejected_lookup = service.analytical_reader().latest(
         &output_dataset,
@@ -2224,7 +2227,9 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     assert_eq!(membership.output().manifest(), source.manifest());
     let membership_rows: usize = match membership.output().result() {
         QueryResult::Inline { batches, .. } => batches.iter().map(|batch| batch.num_rows()).sum(),
-        QueryResult::Artifact { .. } => return Err("membership result was not inline".into()),
+        QueryResult::Artifact { .. }
+        | QueryResult::Consumed { .. }
+        | QueryResult::Spooled { .. } => return Err("membership result was not inline".into()),
     };
     assert_eq!(membership_rows, 1);
     let saturated = reader
@@ -2358,9 +2363,69 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             cancellation.clone(),
         )
         .await?;
+    // The consumed query preserves the original complete identities and sealed coordinates,
+    // then rejects later scratch mutation before it can mint native financial authority.
+    {
+        let mut cursor = reader
+            .feature_dataset_input_epoch_cursor(
+                production_contract,
+                production_dataset.manifest(),
+                QueryLimits::try_new_with_inline_bytes(
+                    1_000,
+                    4 * 1024 * 1024,
+                    8 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                    1,
+                    256,
+                    256,
+                    Duration::from_secs(30),
+                )?,
+                deadline,
+                cancellation.clone(),
+            )
+            .await?;
+        assert_eq!(
+            cursor.query_output().manifest(),
+            epoch_output.query_output().manifest()
+        );
+        assert_eq!(
+            cursor.query_output().query_identity(),
+            epoch_output.query_output().query_identity()
+        );
+        assert_eq!(
+            cursor.query_output().result_digest(),
+            epoch_output.query_output().result_digest()
+        );
+        assert_eq!(cursor.len(), epoch_output.epochs().len());
+        let (handle, coordinate) = cursor
+            .next_coordinate()?
+            .ok_or("missing sealed coordinate")?;
+        assert_eq!(coordinate.epoch(), &epoch_output.epochs()[0]);
+        assert_eq!(
+            coordinate.rows(),
+            epoch_output
+                .coordinate(0)
+                .ok_or("missing original coordinate")?
+                .rows()
+        );
+        assert!(cursor.next_coordinate()?.is_none());
+        assert_eq!(handle.load()?.epoch(), coordinate.epoch());
+        let scratch = cursor.operation_scratch();
+        let corrupt = rusqlite::Connection::open(scratch.path().join("coordinates.sqlite"))?;
+        corrupt.execute(
+            "UPDATE coordinates SET payload=zeroblob(length(payload)) WHERE ordinal=0",
+            [],
+        )?;
+        assert!(matches!(
+            handle.load(),
+            Err(AnalyticalReadError::InvalidInputEpoch)
+        ));
+    }
     assert_eq!(epoch_output.epochs().len(), 1);
     let epoch = &epoch_output.epochs()[0];
-    let market_bar = epoch.market_bar().ok_or("completed-price epoch has no market bar")?;
+    let market_bar = epoch
+        .market_bar()
+        .ok_or("completed-price epoch has no market bar")?;
     assert_eq!(epoch.target_origin(), Some(Timestamp::from_unix_nanos(95)));
     assert_eq!(epoch.target_at(), Some(Timestamp::from_unix_nanos(105)));
     assert_eq!(epoch.decision_at(), Some(Timestamp::from_unix_nanos(100)));
@@ -2630,6 +2695,18 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             CancellationToken::new(),
         )
         .await?;
+    // Compatibility sorting must preserve repeated row digests and the complete selected count.
+    let sorted = historical_v1.rows().sorted_row_digests(
+        |_| Ok::<[u8; 32], market_squawk_data::AnalyticalReadError>([7; 32]),
+        |error| error,
+    )?;
+    let sorted_count = sorted.iter().try_fold(0_u64, |count, digest| {
+        assert_eq!(digest?, [7; 32]);
+        Ok::<_, market_squawk_data::AnalyticalReadError>(count + 1)
+    })?;
+    assert_eq!(sorted_count, historical_v1.fence().selected_rows().get());
+    assert_eq!(sorted.len(), historical_v1.rows().len());
+    drop(sorted);
     assert_eq!(
         historical_v1.dataset().generation().manifest(),
         production_dataset.manifest(),
@@ -3998,7 +4075,12 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             .receipt()
             .realized_outcome_eligible()
     );
-    assert!(!split_selected.selection().receipt().point_in_time_eligible());
+    assert!(
+        !split_selected
+            .selection()
+            .receipt()
+            .point_in_time_eligible()
+    );
     assert!(!split_selected.selection().receipt().backtest_eligible());
     let split_premature = CanonicalMarketBarHistoryRequest::try_latest(
         instrument_id,
@@ -4006,7 +4088,12 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         Timestamp::from_unix_nanos(inclusive_history_end_ns),
         MarketHistorySelectionPolicy::COMPLETE_DAILY_SPLIT_ADJUSTED_V1,
         Timestamp::from_unix_nanos(
-            split_selected.selection().receipt().published_at().unix_nanos() - 1,
+            split_selected
+                .selection()
+                .receipt()
+                .published_at()
+                .unix_nanos()
+                - 1,
         ),
     )?;
     assert!(
@@ -7581,4 +7668,793 @@ fn count_published_objects(root: &std::path::Path) -> Result<usize, std::io::Err
         }
     }
     Ok(count)
+}
+
+// The adapter owns terminal authority; this fixture supplies only its external checkpoint and
+// calendar collaborators, then crosses the real raw-store, publication and restart boundaries.
+mod tiingo_logical_history_regression {
+    use super::*;
+    use market_squawk_adapter_tiingo::{
+        TiingoApiToken, TiingoDecoder, TiingoEodContractEvidence,
+        TiingoEodExpectedSessionAuthority, TiingoEodExpectedSessionEvidence,
+        TiingoEodExpectedSessionRequest, TiingoEodExpectedSessionValidationReceipt,
+        TiingoEodHistoryStage, TiingoEodInstrumentAuthority, TiingoEodInstrumentKind,
+        TiingoEodMapError, TiingoExchangeCode, TiingoHistoryCheckpointReceipt, TiingoHistoryPlan,
+        TiingoHttpSource, TiingoProviderAdmissionDecision, TiingoProviderAdmissionRequest,
+        TiingoProviderAuthority, TiingoProviderAuthorityError, TiingoProviderAuthorityInstallation,
+        TiingoProviderAuthorityRequirements, TiingoProviderPermit, TiingoRateLimitDisposition,
+        TiingoRequestSpec, TiingoResponseEvidence, TiingoResponseSettlement,
+        TiingoSchemaCircuitState, TiingoSealedHistoryPage, TiingoTicker,
+    };
+    use market_squawk_domain::CalendarDate;
+    use market_squawk_platform::ResearchObjectAdmission;
+    use market_squawk_sources::{
+        LogicalItemRange, LogicalObjectRole, LogicalPartitionFamily, LogicalPartitionSetAdmission,
+        PendingLogicalPartitionSet, PendingProviderCapturePack, ProviderLogicalTerminalInput,
+        ProviderNativeLineageSchema, ProviderRateAuthority, ReviewedMarketCalendarRelationship,
+        SealedLogicalObjectInput, SealedLogicalPartitionInput,
+        SealedProviderLogicalPublicationBinding,
+    };
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct Checkpoints {
+        installation: Mutex<Option<TiingoProviderAuthorityInstallation>>,
+        history: Mutex<Option<(TiingoHistoryPlan, TiingoHistoryCheckpointReceipt)>>,
+    }
+    impl TiingoProviderAuthority for Checkpoints {
+        fn validate_requirements(
+            &self,
+            requirements: &TiingoProviderAuthorityRequirements,
+        ) -> Result<TiingoProviderAuthorityInstallation, TiingoProviderAuthorityError> {
+            let installation = TiingoProviderAuthorityInstallation::try_new(
+                requirements,
+                SourceIdentifier::try_from("fixture-authority").unwrap(),
+                SourceIdentifier::try_from("fixture-store").unwrap(),
+                digest(211),
+                Timestamp::from_unix_nanos(10),
+            )?;
+            *self.installation.lock().unwrap() = Some(installation.clone());
+            Ok(installation)
+        }
+        fn prepare_history_plan(
+            &self,
+            plan: &TiingoHistoryPlan,
+        ) -> Result<TiingoHistoryCheckpointReceipt, TiingoProviderAuthorityError> {
+            let installation = self.installation.lock().unwrap();
+            let installation = installation
+                .as_ref()
+                .ok_or(TiingoProviderAuthorityError::Conflict)?;
+            let mut history = self.history.lock().unwrap();
+            if let Some((existing, checkpoint)) = history.as_ref() {
+                return if existing == plan {
+                    Ok(checkpoint.clone())
+                } else {
+                    Err(TiingoProviderAuthorityError::Conflict)
+                };
+            }
+            let checkpoint = TiingoHistoryCheckpointReceipt::try_new(
+                plan,
+                0,
+                None,
+                SourceIdentifier::try_from("fixture-authority").unwrap(),
+                installation.installation_identity(),
+                digest(212),
+                Timestamp::from_unix_nanos(11),
+            )?;
+            *history = Some((plan.clone(), checkpoint.clone()));
+            Ok(checkpoint)
+        }
+        fn checkpoint_history_page(
+            &self,
+            checkpoint: &TiingoHistoryCheckpointReceipt,
+            page: &TiingoSealedHistoryPage,
+        ) -> Result<TiingoHistoryCheckpointReceipt, TiingoProviderAuthorityError> {
+            let mut history = self.history.lock().unwrap();
+            let (plan, current) = history
+                .as_mut()
+                .ok_or(TiingoProviderAuthorityError::Conflict)?;
+            if current != checkpoint
+                || plan.pages().get(checkpoint.next_page_index() as usize) != Some(page.request())
+            {
+                return Err(TiingoProviderAuthorityError::Conflict);
+            }
+            let next = TiingoHistoryCheckpointReceipt::try_new(
+                plan,
+                checkpoint.next_page_index() + 1,
+                Some(page.page_identity()),
+                SourceIdentifier::try_from("fixture-authority").unwrap(),
+                checkpoint.installation_identity(),
+                digest(213),
+                Timestamp::from_unix_nanos(12),
+            )?;
+            *current = next.clone();
+            Ok(next)
+        }
+        fn try_acquire(
+            &self,
+            _: &TiingoProviderAdmissionRequest,
+        ) -> Result<TiingoProviderAdmissionDecision, TiingoProviderAuthorityError> {
+            Err(TiingoProviderAuthorityError::Unavailable)
+        }
+        fn settle_response(
+            &self,
+            _: &TiingoProviderPermit,
+            _: &TiingoResponseSettlement,
+        ) -> Result<Option<TiingoRateLimitDisposition>, TiingoProviderAuthorityError> {
+            Err(TiingoProviderAuthorityError::Unavailable)
+        }
+        fn schema_circuit_state(
+            &self,
+            _: &SourceIdentifier,
+        ) -> Result<TiingoSchemaCircuitState, TiingoProviderAuthorityError> {
+            Ok(TiingoSchemaCircuitState::Closed)
+        }
+    }
+
+    struct Calendar;
+    impl TiingoEodExpectedSessionAuthority for Calendar {
+        fn resolve_expected_sessions(
+            &self,
+            request: &TiingoEodExpectedSessionRequest,
+            emit: &mut dyn FnMut(CalendarDate) -> Result<(), TiingoEodMapError>,
+        ) -> Result<TiingoEodExpectedSessionEvidence, TiingoEodMapError> {
+            let date = CalendarDate::new(2026, 8, 10).unwrap();
+            if request.start_date() != date
+                || request.end_date() != date
+                || request.venue_id().as_str() != "xnas"
+                || request.ticker().as_str() != "AAPL"
+            {
+                return Err(TiingoEodMapError::InvalidExpectedSessionEvidence);
+            }
+            emit(date)?;
+            TiingoEodExpectedSessionEvidence::try_new(
+                request,
+                SourceIdentifier::try_from("xnas-expected-sessions").unwrap(),
+                RevisionBoundPayloadEvidence::new(
+                    MetadataRevision::new(SourceIdentifier::try_from("xnas-calendar-v1").unwrap()),
+                    ExactPayloadEvidence::from_content_digest(digest(214)),
+                ),
+                SourceIdentifier::try_from("xnas-authority-7").unwrap(),
+                Timestamp::from_unix_nanos(54),
+                Timestamp::from_unix_nanos(55),
+                digest(215),
+                vec![date],
+                digest(216),
+                digest(217),
+                ReviewedMarketCalendarRelationship::try_new(
+                    request.venue_id().clone(),
+                    request.venue_id().clone(),
+                    date,
+                    date,
+                )
+                .map_err(|_| TiingoEodMapError::InvalidExpectedSessionEvidence)?,
+            )
+        }
+        fn validate_current(
+            &self,
+            evidence: &TiingoEodExpectedSessionEvidence,
+        ) -> Result<TiingoEodExpectedSessionValidationReceipt, TiingoEodMapError> {
+            if evidence.calendar_id().as_str() != "xnas-expected-sessions"
+                || evidence.expected_session_count() != 1
+            {
+                return Err(TiingoEodMapError::InvalidExpectedSessionEvidence);
+            }
+            TiingoEodExpectedSessionValidationReceipt::try_new(
+                evidence,
+                SourceIdentifier::try_from("xnas-authority-7").unwrap(),
+                Timestamp::from_unix_nanos(56),
+                digest(218),
+            )
+        }
+    }
+    struct Control;
+    impl ResearchObjectControl for Control {
+        fn checkpoint(
+            &self,
+            _: ResearchObjectControlPoint,
+        ) -> Result<(), ResearchObjectControlError> {
+            Ok(())
+        }
+    }
+    fn hash(bytes: &[u8]) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
+    }
+    fn rights(
+        source: &SourceMetadata,
+        payload: EvidenceDigest,
+        at: Timestamp,
+    ) -> Result<RightsDecisionInput, Box<dyn Error>> {
+        Ok(RightsDecisionInput {
+            source_id: source.source_id().clone(),
+            payload_digest: payload,
+            retrieved_at: at,
+            basis: RightsBasis::reviewed_terms(
+                "https://example.test/tiingo-history-terms/v1",
+                digest(219),
+            )?,
+            authorization_evidence: digest(220),
+            authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+            permitted_operations: vec![SourceOperation::Persist],
+        })
+    }
+    fn material(
+        body: &[u8],
+        evidence: &TiingoResponseEvidence,
+        source: &SourceMetadata,
+        dataset: &str,
+    ) -> Result<ProviderCaptureMaterial, Box<dyn Error>> {
+        let page = ProviderCapturePageReceipt::try_new(
+            0,
+            evidence.request().request_identity(),
+            None,
+            None,
+            200,
+            body.len() as u64,
+            evidence.body_digest(),
+            evidence.received_at(),
+        )?;
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            source.source_id().clone(),
+            source.revision().clone(),
+            SourceIdentifier::try_from(dataset)?,
+            evidence.request().request_identity(),
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![page],
+        )?;
+        let connection = Uuid::from_u128(2);
+        let record = RawCaptureRecord::try_new_live(
+            Uuid::new_v5(&connection, &evidence.body_digest().bytes()),
+            Arc::from(source.source_id().as_str()),
+            connection,
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(evidence.received_at().unix_nanos()),
+            Bytes::copy_from_slice(body),
+        )?;
+        Ok(ProviderCaptureMaterial::try_new(receipt, vec![record])?)
+    }
+
+    #[tokio::test]
+    async fn tiingo_logical_history_survives_restart_and_rejects_index_corruption() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("tiingo-history");
+        let paths = LocalPaths::prepare(&root)?;
+        let location = paths.catalog()?.clone();
+        let config = test_catalog_config(location.clone())?;
+        let store_config =
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 64, Duration::from_secs(60))?;
+        let instrument_id = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+        let source = complete_history_source_for(
+            instrument_id,
+            "tiingo-starter",
+            "tiingo-source-v1",
+            221,
+            222,
+        )?;
+        let authority = CatalogAuthority::open(config.clone())?;
+        authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
+        let service = AnalyticalDataService::initialize(
+            authority,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )?;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let definition =
+            MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+                instrument_id,
+                reference_evidence: RevisionBoundPayloadEvidence::new(
+                    MetadataRevision::new(SourceIdentifier::try_from("tiingo-aapl-instrument-v1")?),
+                    ExactPayloadEvidence::from_content_digest(digest(223)),
+                ),
+                effective_interval: effective,
+                asset_class: AssetClass::Equity,
+                display_name: None,
+                quote_currency: Currency::try_from("USD")?,
+                quote_currency_evidence: ExactPayloadEvidence::from_content_digest(digest(224)),
+                venue_mappings: vec![VenueMapping::new(
+                    VenueId::try_from("xnas")?,
+                    VenueSymbol::try_from("AAPL")?,
+                )],
+                provider_identities: vec![ProviderIdentityRecord::new(
+                    ProviderIdentityRecordInput {
+                        instrument_id,
+                        source_id: source.source_id().clone(),
+                        provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
+                        evidence: ProviderIdentityEvidence::from_content_digest(digest(225)),
+                        source_timestamp: None,
+                        observed_at: Timestamp::from_unix_nanos(20),
+                        metadata_revision: source.revision().clone(),
+                        validity: effective,
+                        supersedes: None,
+                    },
+                )],
+                identifiers: Vec::new(),
+            })?;
+        let instrument_digest = hash(&serde_json::to_vec(&definition)?);
+        service
+            .market_data_instrument_synchronization()
+            .synchronize(
+                MarketDataInstrumentSynchronization::try_new(vec![definition], 1)?,
+                deadline,
+                &cancellation,
+            )?;
+        let raw_store = Arc::new(paths.sealed_research_journal_store()?);
+        let rate = ProviderRateAuthority::try_new(Arc::new(
+            market_squawk_data::SqliteProviderRateStore::try_open(
+                directory.path().join("rate.sqlite"),
+            )?,
+        ))?;
+        let native = SourceIdentifier::try_from("tiingo-daily-native-v1")?;
+        let entitlement = SourceIdentifier::try_from("tiingo-entitlement-generation-11")?;
+        let http = TiingoHttpSource::try_new(
+            TiingoApiToken::try_new("fixture-token".to_owned())?,
+            &rate,
+            Arc::new(Checkpoints::default()),
+            source.source_id().clone(),
+            source.revision().clone(),
+            native.clone(),
+            entitlement.clone(),
+        )?;
+        let ticker = TiingoTicker::try_new("AAPL")?;
+        let date = CalendarDate::new(2026, 8, 10)?;
+        let plan = TiingoHistoryPlan::try_new(ticker.clone(), date, date)?;
+        let initial = http.prepare_history_plan(&plan)?;
+        let decoder = TiingoDecoder::new(native.clone(), entitlement.clone());
+        let metadata_bytes = br#"{"ticker":"AAPL","name":"Apple Inc.","exchangeCode":"NASDAQ","description":"Equity","startDate":"1980-12-12","endDate":"2026-08-10"}"#;
+        let history_bytes = br#"[{"date":"2026-08-10T00:00:00.000Z","open":200,"high":201,"low":199,"close":200,"volume":100,"adjOpen":200,"adjHigh":201,"adjLow":199,"adjClose":200,"adjVolume":100,"divCash":0,"splitFactor":2}]"#;
+        let metadata = decoder.decode_metadata(
+            TiingoRequestSpec::metadata(ticker.clone())?,
+            200,
+            metadata_bytes,
+            Timestamp::from_unix_nanos(50),
+            Timestamp::from_unix_nanos(51),
+        )?;
+        let response = decoder.decode_eod(
+            plan.pages()[0].clone(),
+            200,
+            history_bytes,
+            Timestamp::from_unix_nanos(52),
+            Timestamp::from_unix_nanos(53),
+        )?;
+        let instrument = TiingoEodInstrumentAuthority::try_new(
+            instrument_id,
+            VenueId::try_from("xnas")?,
+            ProviderInstrumentId::try_from("AAPL")?,
+            ticker,
+            TiingoExchangeCode::try_from("NASDAQ")?,
+            TiingoEodInstrumentKind::Equity,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("tiingo-aapl-instrument-v1")?),
+                ExactPayloadEvidence::from_content_digest(instrument_digest),
+            ),
+            ExactPayloadEvidence::from_content_digest(digest(225)),
+            Timestamp::from_unix_nanos(51),
+            Currency::try_from("USD")?,
+        )?;
+        let contract = TiingoEodContractEvidence::try_new(
+            source.revision().clone(),
+            source.revision_evidence().payload_evidence().clone(),
+            native,
+            ExactPayloadEvidence::from_content_digest(digest(226)),
+            NonZeroU64::new(11).ok_or("entitlement")?,
+            entitlement,
+            digest(227),
+            ExactPayloadEvidence::from_content_digest(digest(228)),
+        )?;
+        let dataset = DatasetId::try_from("tiingo-aapl-complete-history")?;
+        let session = digest(229);
+        let admission = ResearchObjectAdmission::try_new(32 * 1024 * 1024, 4095)?;
+        let mut pack = PendingProviderCapturePack::begin(Arc::clone(&raw_store), admission)?;
+        let lease = service
+            .acquire_provider_capture_original_lease(deadline, &cancellation)
+            .await?;
+        let mut receipts = Vec::new();
+        for (ordinal, body, evidence, capture_dataset) in [
+            (
+                0_u16,
+                metadata_bytes.as_slice(),
+                metadata.evidence(),
+                "tiingo-daily-metadata",
+            ),
+            (
+                1,
+                history_bytes.as_slice(),
+                response.evidence(),
+                "tiingo-daily-history-window",
+            ),
+        ] {
+            let capture = material(body, evidence, &source, capture_dataset)?;
+            let original_rights = rights(
+                &source,
+                capture.receipt().observation_digest(),
+                Timestamp::from_unix_nanos(54),
+            )?;
+            let (expected, request) = capture.into_whole_seal_parts();
+            let token = expected
+                .try_rejoin(request.seal(&raw_store)?)?
+                .try_into_whole()?;
+            let original = service.retain_provider_capture_original(
+                &source,
+                session,
+                ordinal,
+                2,
+                &dataset,
+                if ordinal == 0 { b"{}" } else { b"" },
+                evidence.decoded_at(),
+                token,
+                &original_rights,
+                &raw_store,
+                deadline,
+                &cancellation,
+            )?;
+            let (_, capture) = service
+                .reopen_provider_capture_original(&original, &raw_store, deadline, &cancellation)?
+                .into_material()?;
+            let (expected, request) = capture.into_whole_seal_parts();
+            let token = expected
+                .try_rejoin(request.seal(&raw_store)?)?
+                .try_into_whole()?;
+            receipts.push(token.persisted_receipt().clone());
+            let mut pending = raw_store.begin_logical_object(admission)?;
+            pending.write_all(body)?;
+            let object = raw_store.finish_logical_object(pending, &Control)?;
+            pack.append(token, vec![object], &Control)?;
+        }
+        let scratch = service.operation_scratch()?;
+        let mut stage = TiingoEodHistoryStage::try_new(
+            plan.clone(),
+            metadata,
+            receipts[0].clone(),
+            instrument,
+            contract,
+            None,
+            digest(230),
+            scratch.path(),
+        )?;
+        let page = stage.push_page(
+            &response,
+            &receipts[1],
+            Timestamp::from_unix_nanos(54),
+            &cancellation,
+        )?;
+        let checkpoint = http.checkpoint_history_page(&plan, &initial, &page)?;
+        let terminal =
+            http.validate_history_terminal(&plan, &checkpoint, Some(page.page_identity()))?;
+        let mut proof = stage.finish(terminal, &Calendar, &cancellation)?;
+        assert_eq!(
+            (
+                proof.descriptor().session_count(),
+                proof.total_canonical_rows()
+            ),
+            (1, 3)
+        );
+        assert_eq!(proof.descriptor().normalized_action_count(), 1);
+        let expected_descriptor = serde_json::to_vec(proof.descriptor())?;
+        let expected_completion = proof.completion_identity();
+        let (packed, pack_seal) = pack.finish(&raw_store, &Control, 0)?.into_parts();
+        let mut objects = vec![packed];
+        for ordinal in 1..=4 {
+            let mut pending = raw_store.begin_logical_object(admission)?;
+            match ordinal {
+                1 => pending.write_all(&expected_descriptor)?,
+                2 => proof.write_page_index(&mut pending, &cancellation)?,
+                3 => proof.write_session_index(&mut pending, &cancellation)?,
+                _ => proof.write_action_index(&mut pending, &cancellation)?,
+            }
+            let object = raw_store.finish_logical_object(pending, &Control)?;
+            let identity = object.content_digest();
+            objects.push(SealedLogicalObjectInput::try_from_verified(
+                if ordinal == 1 {
+                    LogicalObjectRole::Catalog
+                } else {
+                    LogicalObjectRole::ProviderComponent
+                },
+                ordinal,
+                identity,
+                object,
+                &Control,
+            )?);
+        }
+        let mut staging =
+            service.begin_tiingo_history_stream(dataset.clone(), &proof, &cancellation)?;
+        let schema = ProviderNativeLineageSchema::for_implementation(
+            ProviderNativeLineageImplementation::TiingoEodMarketBarV1,
+        );
+        service.retain_provider_logical_original_for_contract(
+            &source,
+            &dataset,
+            schema.fingerprint(),
+            hash(&expected_descriptor),
+            proof.descriptor().max_received_at(),
+            &expected_descriptor,
+            &objects,
+            &rights(
+                &source,
+                hash(&expected_descriptor),
+                Timestamp::from_unix_nanos(60),
+            )?,
+            &raw_store,
+            deadline,
+            &cancellation,
+        )?;
+        drop(lease);
+        let partition_admission =
+            LogicalPartitionSetAdmission::try_new(admission, 4096, 1024, 128 * 1024)?;
+        let mut native = PendingLogicalPartitionSet::begin(
+            LogicalPartitionFamily::ProviderNative,
+            schema.fingerprint(),
+            partition_admission,
+            0,
+        )?;
+        let mut mappings = PendingLogicalPartitionSet::begin(
+            LogicalPartitionFamily::CanonicalRowMap,
+            hash(b"market-squawk/tiingo-history/logical-row-map/v1"),
+            partition_admission,
+            0,
+        )?;
+        let mut expectations = Vec::new();
+        while let Some(request) = proof.extraction_request(
+            Timestamp::from_unix_nanos(i64::MAX),
+            NonZeroU32::new(1).ok_or("chunk records")?,
+            NonZeroU64::new(1024 * 1024).ok_or("chunk bytes")?,
+        )? {
+            let chunk = proof.next_chunk(&request, &cancellation)?.ok_or("chunk")?;
+            assert_eq!(chunk.batch().records().len(), 1);
+            let receipt = proof
+                .page_at(chunk.original_page_ordinal())?
+                .ok_or("page")?
+                .sealed_receipt()?
+                .clone();
+            for (local, (record, row)) in chunk
+                .batch()
+                .records()
+                .iter()
+                .zip(chunk.native_lineage().rows())
+                .enumerate()
+            {
+                let ordinal = chunk.global_start() + local as u64;
+                native.stage_frame(
+                    &raw_store,
+                    &Control,
+                    ordinal,
+                    row.semantic_payload(),
+                    row.semantic_payload_digest(),
+                )?;
+                let frame = receipt.row_frame(u32::try_from(ordinal)?, 0)?;
+                let mapping = serde_json::to_vec(&serde_json::json!({
+                    "canonical_row_ordinal": frame.canonical_row_ordinal(), "capture_page_ordinal": frame.capture_page_ordinal(),
+                    "segment_ordinal": frame.segment_ordinal(), "physical_frame_ordinal": frame.physical_frame_ordinal(),
+                    "page_body_digest": frame.page_body_digest(), "received_at": frame.received_at(), "source_sequence": frame.source_sequence(),
+                    "canonical_record_digest": record.evidence().content_digest(), "native_semantic_digest": row.semantic_payload_digest(),
+                    "original_page_ordinal": chunk.original_page_ordinal(),
+                }))?;
+                mappings.stage_frame(&raw_store, &Control, ordinal, &mapping, hash(&mapping))?;
+            }
+            native.seal_current_partition(&raw_store, &Control)?;
+            mappings.seal_current_partition(&raw_store, &Control)?;
+            expectations.push(
+                service
+                    .stage_tiingo_history_chunk(&mut staging, chunk, &receipt, &cancellation)
+                    .await?,
+            );
+        }
+        assert_eq!(expectations.len(), 3);
+        let decoded = SealedLogicalPartitionInput::try_from_framed_object(
+            LogicalPartitionFamily::DecodedEvent,
+            0,
+            LogicalItemRange::try_new(
+                0,
+                NonZeroU32::new(u32::try_from(proof.descriptor().session_count())?)
+                    .ok_or("sessions")?,
+            )?,
+            hash(b"market-squawk/tiingo-history/session-index/v1"),
+            128 * 1024,
+            raw_store.open_verified_logical_object(objects[3].object(), &Control)?,
+            &Control,
+        )?;
+        let mut partitions = vec![decoded];
+        partitions.extend(
+            native
+                .finish(&raw_store, &Control)?
+                .into_partitions()
+                .into_vec(),
+        );
+        partitions.extend(
+            mappings
+                .finish(&raw_store, &Control)?
+                .into_partitions()
+                .into_vec(),
+        );
+        let total_bytes = objects
+            .iter()
+            .map(|object| object.object().size_bytes())
+            .sum();
+        let binding = SealedProviderLogicalPublicationBinding::try_new(
+            ProviderLogicalTerminalInput {
+                source_id: source.source_id().clone(),
+                source_revision_digest: source
+                    .revision_evidence()
+                    .payload_evidence()
+                    .content_digest(),
+                execution_attempt_digest: Some(pack_seal.captures_digest()),
+                provider_terminal_evidence_digest: hash(&expected_descriptor),
+                total_decoded_events: 1,
+                total_canonical_rows: 3,
+                total_logical_object_bytes: total_bytes,
+            },
+            &[
+                LogicalPartitionFamily::DecodedEvent,
+                LogicalPartitionFamily::ProviderNative,
+                LogicalPartitionFamily::CanonicalRowMap,
+            ],
+            objects,
+            partitions,
+            expectations,
+        )?;
+        let binding_digest = binding.binding_digest();
+        let identity = IngestIdentity::try_new(
+            source.source_id().clone(),
+            binding_digest,
+            SourceOperation::Persist,
+            "tiingo:logical-history:fixture",
+        )?;
+        let reservation = service
+            .reserve_source_ingest(
+                &source,
+                Timestamp::from_unix_nanos(60),
+                rights(&source, binding_digest, Timestamp::from_unix_nanos(60))?,
+                &identity,
+                &cancellation,
+            )
+            .await?;
+        let (committed, retained_digest) = service
+            .finish_tiingo_history_stream(
+                staging,
+                reservation,
+                binding,
+                proof,
+                pack_seal,
+                Arc::new(AllowProviderEventPublication),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| format!("Tiingo logical commit: {error:?}"))?;
+        assert_eq!(retained_digest, binding_digest);
+        let manifest = committed.manifest().clone();
+        drop(committed);
+        // The stage has been consumed; release its operation directory and root owner before restart.
+        drop(scratch);
+        drop(service);
+        let restarted = AnalyticalDataService::open(
+            CatalogAuthority::open(config)?,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )
+        .map_err(|error| format!("Tiingo service restart: {error:?}"))?;
+        let cutoff = Timestamp::from_unix_nanos(i64::MAX - 1);
+        let request = market_squawk_data::CompleteMarketBarHistoryRequest::try_exact_nominal(
+            instrument_id,
+            date,
+            date,
+            ProviderInstrumentId::try_from("AAPL")?,
+            VenueId::try_from("xnas")?,
+            SourceIdentifier::try_from("tiingo-starter-daily-eod-raw")?,
+            SourceIdentifier::try_from("tiingo-calendar-day")?,
+            MarketBarAdjustment::Raw,
+            SourceIdentifier::try_from("tiingo-eod-native-nominal-date-v1")?,
+            cutoff,
+            manifest.clone(),
+        )?;
+        let history = restarted
+            .analytical_reader()
+            .read_complete_market_bar_history_cursor(
+                request.clone(),
+                deadline,
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| format!("Tiingo history selection: {error:?}"))?
+            .ok_or("complete history after restart")?;
+        assert_eq!((history.bar_count(), history.source_action_count()), (1, 1));
+        let bars = history.bars().collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            bars[0]
+                .time_semantics()
+                .nominal_daily_date()
+                .map(|daily| daily.date()),
+            Some(date)
+        );
+        assert_eq!(bars[0].close().amount(), Decimal::from(200));
+        let origin = restarted
+            .provider_logical_origin(
+                &dataset,
+                source.source_id(),
+                schema.fingerprint(),
+                binding_digest,
+                manifest.content_hash(),
+                cutoff,
+                deadline,
+                &cancellation,
+            )
+            .map_err(|error| format!("Tiingo origin selection: {error:?}"))?
+            .ok_or("logical origin after restart")?;
+        let retained = restarted.rejoin_tiingo_eod_action_history(
+            history,
+            &origin,
+            &raw_store,
+            &Control,
+            deadline,
+            cancellation.clone(),
+        )?;
+        assert_eq!(
+            retained.actions().completion_identity(),
+            expected_completion
+        );
+        assert_eq!(
+            serde_json::to_vec(retained.actions().descriptor())?,
+            expected_descriptor
+        );
+        assert_eq!(retained.records().collect::<Result<Vec<_>, _>>()?.len(), 1);
+        assert_eq!(
+            retained.action_rows().collect::<Result<Vec<_>, _>>()?.len(),
+            1
+        );
+        for ordinal in 0..2 {
+            assert!(
+                restarted
+                    .provider_capture_original(session, ordinal, deadline, &cancellation)?
+                    .ok_or("original")?
+                    .published_binding()
+                    .is_some()
+            );
+        }
+        let action_index = paths
+            .journal_dir()
+            .join("research-segments")
+            .join(retained.binding().objects()[4].claim().relative_reference());
+        drop(retained);
+        let original_permissions = std::fs::metadata(&action_index)?.permissions();
+        let mut writable = original_permissions.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            writable.set_mode(0o600);
+        }
+        #[cfg(not(unix))]
+        writable.set_readonly(false);
+        std::fs::set_permissions(&action_index, writable)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&action_index)?;
+        file.seek(SeekFrom::End(-1))?;
+        file.write_all(&[0xff])?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::set_permissions(&action_index, original_permissions)?;
+        let history = restarted
+            .analytical_reader()
+            .read_complete_market_bar_history_cursor(request, deadline, cancellation.clone())
+            .await?
+            .ok_or("history before original verification")?;
+        assert!(
+            restarted
+                .rejoin_tiingo_eod_action_history(
+                    history,
+                    &origin,
+                    &raw_store,
+                    &Control,
+                    deadline,
+                    cancellation
+                )
+                .is_err(),
+            "a valid catalog locator must not authorize a corrupted retained action index"
+        );
+        Ok(())
+    }
 }

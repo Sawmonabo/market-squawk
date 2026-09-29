@@ -1,5 +1,52 @@
 # Market Squawk Delivery Ledger
 
+## Resource processing checkpoint — 2026-09-29
+
+The owner resumed work after the mockup pause and approved
+[`resource-processing-remediation.md`](resource-processing-remediation.md): implement in the
+current `feature/v1-installed-product-experience` worktree, run critical verification, commit and
+push, then pause. The audit base is `913bb0127fed3866b6411de6225c2467421d169c` plus preserved
+financial WIP. This entry supersedes the older active-lane and parser-blocker descriptions below;
+those entries remain historical evidence. PR #43 records the resulting pushed checkpoint.
+
+The integrated batch uses streamed query/storage output, indexed filing and point-in-time
+processing, disk-backed backtest history/results, paged model/forecast inventories, selected-model
+activation and Desktop demand/viewport reads. Required SEC/common-share financial consumers are
+included with their producer changes. Active formats change in place without compatibility paths.
+
+Critical evidence is listed in the resource plan: million-row disk spill, query cancellation,
+PIT publication, real Microsoft indexed parsing plus separate physical filing restart, financial
+replay/backtest artifacts, model inventory/native inference/retirement, archive/chart integrity,
+live accounting, read cancellation, Desktop types/journey and native compilation. Tiingo history custody, publication,
+restart and corrupted-index rejection also pass. These checks are not release approval.
+The full installed financial workflow, whole-app measurement and unchanged final release gate
+remain open. The owner deferred RAM measurement until complete application workflows are ready.
+No new branches or worktrees are created; old sessions and recovery backups remain preserved.
+
+
+## Owner screen-mock and resource correction — 2026-09-28
+
+The owner requests a complete Desktop screen mockup set, followed immediately by pausing the
+V1 goal and all agents. Mockups live only in the main worktree at `.agents/tmp/screen-mocks/`.
+They cover current Everyday, Advanced, Connections & System routes and important detail flows;
+illustrative data and designed states are explicitly distinct from implemented/live evidence.
+
+The memory objective is corrected to **500 MB–1.5 GB, with 2 GB maximum for the whole app**.
+Earlier 500 MB maximum references below are historical and superseded. The objective must not
+be enforced by rejecting required data or hiding functionality. A bounded read-only restriction
+audit is retained with the mockups; the repository-wide audit remains incomplete. Whole-app
+measurements and full-workflow verification remain open.
+
+Screen mock delivery: **34 rendered views**, including all 17 navigation screens and key detail
+flows, are saved in `.agents/tmp/screen-mocks/index.html`; the screenshot gallery is
+`.agents/tmp/screen-mocks/screens/index.html`. Local README contains the full inventory and
+preview instructions. Browser receipts record navigation/rendering and chart interaction checks.
+These artifacts use illustrative data and do not close implementation or live acceptance gaps.
+All mock agents are finished. Work pauses here as requested; financial integration WIP and the
+original session/recovery backup remain preserved. Resume requires owner direction. The next
+implementation dependency remains genuine SEC filing normalization and complete financial
+workflow/restart proof, alongside completing the resource-restriction audit.
+
 ## Current integration and cleanup barrier — 2026-09-29
 
 The active target is `feature/v1-installed-product-experience`. This combined
@@ -43,7 +90,44 @@ Current dependency and ownership wave:
 | --- | --- | --- |
 | SEC filing context | Sol High; canonical filing context preservation and verified typed reads | Expose complete source facts to valuation without duplicating context graphs |
 | Financial valuation and recovery | Astra High; per-share DCF, residual-income and comparables evidence, persisted replay | Consume verified filing context; prove genuine generated-decision restart |
-| Integration | Lead; shared composition, manifests, Git, documentation and serialized checks | Wire the financial consumers after the filing-reader contract; run focused integrated verification |
+| Financial action acquisition | Astra High; existing action preflight, historical/current source join and original history retention | Candidate integrated locally; verify one completed history plus two final-session action requests per instrument |
+| Workflow request integration | Sol High; investment request, shared operation contracts and workflow driver | Required original financial cutoff and canonical filing/action references; completed locally, awaiting combined verification |
+| Integration | Lead; market preparation service/output contracts, source registry composition, manifests, Git, documentation and serialized checks | Acquire original source intervals before one final quote selection; verify financial consumers and durable filing restart |
+
+Editor resource correction `913bb012` is pushed: manifest-triggered and build-script-on-save
+rust-analyzer Cargo work is disabled; explicit project refresh remains available.
+The running editor used the parent `~/dev` workspace instead of the nested repository settings.
+After stopping its unplanned Cargo check, the parent settings were preserved and corrected;
+the extension log confirms check-on-save, automatic reload and rebuild-on-save are disabled,
+with one compiler job and no incremental output. No editor Cargo process remained afterward.
+
+The next financial checkpoint is still uncommitted. Its integrated application library check
+passed with one compiler job. The focused SEC parser/context roundtrip also passed. The source
+reader, share projection, saved-analysis reconstruction and backup artifact traversal are wired
+locally; these checks do not prove a generated result survives restart. The remaining focused
+barrier is genuine financial classification and generated-result recovery. The existing adapter
+test now passes normalization, durable filing publication, typed reads and restart. Full filing
+memory admission must be measured against a
+representative filing before claiming that live analysis works. Preparation now drops each
+complete peer filing after retaining its compact financial evidence instead of retaining up to
+seventeen filings during network acquisition. The action join uses the original calendar's
+civil-date bounds for closing, after-hours and weekend quote cutoffs. The per-share arithmetic
+regression passed. Cold analysis now prepares source intervals before selecting its final prices;
+the shared workflow retains the original financial cutoff separately from that fresh market
+cutoff. A combined check exposed three historical-valuation callers of the extracted source
+selector; their signatures are corrected and the follow-up application check passed. The physical
+filing proof exposed missing taxonomy-publisher catalog registration; shared metadata now feeds
+the passing fixture and SEC activation. The activation change still needs the integrated check.
+The retained Microsoft annual filing exposed a separate real parser defect: nested continuation
+sections were rejected. Its repair and representative memory measurement remain open. The
+passing synthetic source fixture does not establish live filing availability.
+The same fixture now also passes genuine company-identity selection, reported-common-share
+classification and identical financial evidence after restart. The authentic filing now reaches
+footnote relationships, exposing a second parser gap that is being repaired without discarding
+the footnote text. A measured 17-instrument carrier exceeded the former 64-KiB request limit:
+66,576 carrier bytes and 91,122 full-request bytes. The integrated candidate uses a 128-KiB
+carrier and 256-KiB generation request, with matching workflow, transport and recovery bounds;
+these changes still require the combined check. Source-shaped sizing is not live generation proof.
 
 No new branch or worktree is needed. Only one Cargo command runs at a time,
 with one compiler job. Automatic CI is limited to release-branch pushes; the manual frozen-candidate
@@ -51,7 +135,7 @@ release gate remains available. No full CI/CD or release gate ran. Retained issu
 hashes checked against the source catalog. The final unchanged
 candidate still requires complete provider and Desktop/CLI/MCP workflows,
 installed live shutdown/restart, owner-test packages, whole-application RAM
-measurement against 500 MB, and updated PR #43 delivery evidence. Financial
+measurement against the corrected 500 MB–1.5 GB range / 2 GB maximum, and updated PR #43 delivery evidence. Financial
 model per-share support and genuine generated-decision recovery remain open;
 compilation does not substitute for either.
 

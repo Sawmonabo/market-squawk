@@ -9,7 +9,7 @@ use market_squawk_data::{
     ForecastDatasetReadLimits,
 };
 use market_squawk_domain::{SourceIdentifier, Timestamp};
-use market_squawk_jobs::{JobListPageLimit, JobState};
+use market_squawk_jobs::JobState;
 use market_squawk_runtime::RuntimeIdentity;
 use market_squawk_services::{
     RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
@@ -40,7 +40,6 @@ pub(super) const GET_PRODUCT_BACKTEST: &str = "Analysis.GetProductBacktest";
 
 const DATASET_PAGE: usize = 64;
 const MAXIMUM_DATASETS: usize = 4_096;
-const MAXIMUM_ROWS_PER_DATASET: usize = 100_000;
 const MAXIMUM_BYTES_PER_DATASET: usize = 256 * 1024 * 1024;
 
 /// One process-generation preparation authority over the current analytical catalog.
@@ -122,9 +121,13 @@ impl InstalledBacktestPreparation {
                 (preparation_preview_value(&preview, &resolved)?, 1)
             }
             LIST_PRODUCT_BACKTESTS => {
-                let activities = self.product_activities(jobs, context).await?;
+                let (activities, next_cursor) =
+                    self.product_activities(jobs, request, context).await?;
                 let count = activities.len();
-                (serde_json::json!({"activities": activities}), count)
+                (
+                    serde_json::json!({"activities": activities,"nextCursor":next_cursor}),
+                    count,
+                )
             }
             GET_PRODUCT_BACKTEST => {
                 let input: BacktestProductRequest =
@@ -150,14 +153,20 @@ impl InstalledBacktestPreparation {
     async fn product_activities(
         &self,
         jobs: &InstalledJobOperations,
+        request: &TypedToolRequest,
         context: &RequestContext,
-    ) -> Result<Vec<Value>, ServiceError> {
-        let page = jobs.list_page(product_job_page_limit(context)?).await?;
-        page.jobs()
+    ) -> Result<(Vec<Value>, Value), ServiceError> {
+        let (views, next_cursor) = jobs.product_activity_page(request, context, false).await?;
+        let activities = views
             .iter()
-            .filter(|view| is_backtest_job(view))
-            .map(product_backtest_activity)
-            .collect()
+            .map(|view| {
+                if !is_backtest_job(view) {
+                    return Err(ServiceError::InvalidResult);
+                }
+                product_backtest_activity(view)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((activities, next_cursor))
     }
 
     async fn product_result(
@@ -166,12 +175,10 @@ impl InstalledBacktestPreparation {
         token: Uuid,
         context: &RequestContext,
     ) -> Result<Value, ServiceError> {
-        let page = jobs.list_page(product_job_page_limit(context)?).await?;
-        let view = page
-            .jobs()
-            .iter()
-            .find(|view| is_backtest_job(view) && product_backtest_token(view) == token)
-            .ok_or(ServiceError::NotFound)?;
+        let view = jobs.product_backtest_view(token, context).await?;
+        if !is_backtest_job(&view) || product_backtest_token(&view) != token {
+            return Err(ServiceError::InvalidResult);
+        }
         if view.state() != JobState::Completed {
             return Err(ServiceError::NotFound);
         }
@@ -213,7 +220,7 @@ impl InstalledBacktestPreparation {
         let page_limit = AnalyticalReadLimit::try_new(DATASET_PAGE)
             .map_err(|_error| ServiceError::Unavailable)?;
         let evidence_limits =
-            ForecastDatasetReadLimits::try_new(MAXIMUM_ROWS_PER_DATASET, MAXIMUM_BYTES_PER_DATASET)
+            ForecastDatasetReadLimits::try_new(usize::MAX, MAXIMUM_BYTES_PER_DATASET)
                 .map_err(|_error| ServiceError::Unavailable)?;
         let selection_cutoff =
             super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?;
@@ -252,25 +259,20 @@ impl InstalledBacktestPreparation {
                     )
                     .await
                     .map_err(map_analytical)?;
-                let instruments = evidence
-                    .rows()
-                    .iter()
-                    .map(|row| row.instrument_id())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let first_decision = evidence
-                    .rows()
-                    .first()
-                    .and_then(|row| row.decision_at())
-                    .ok_or(ServiceError::InvalidResult)?;
-                let (starts_at, last_decision) = evidence.rows().iter().try_fold(
-                    (first_decision, first_decision),
-                    |(start, end), row| {
-                        let decision = row.decision_at().ok_or(ServiceError::InvalidResult)?;
-                        Ok::<_, ServiceError>((start.min(decision), end.max(decision)))
-                    },
-                )?;
+                let mut instruments = BTreeSet::new();
+                let mut window: Option<(Timestamp, Timestamp)> = None;
+                for row in evidence.rows().iter() {
+                    ensure_live(context)?;
+                    let row = row.map_err(map_analytical)?;
+                    instruments.insert(row.instrument_id());
+                    let decision = row.decision_at().ok_or(ServiceError::InvalidResult)?;
+                    window = Some(match window {
+                        Some((start, end)) => (start.min(decision), end.max(decision)),
+                        None => (decision, decision),
+                    });
+                }
+                let instruments = instruments.into_iter().collect::<Vec<_>>();
+                let (starts_at, last_decision) = window.ok_or(ServiceError::InvalidResult)?;
                 let ends_at = last_decision
                     .checked_add_nanos(1)
                     .map_err(|_error| ServiceError::InvalidResult)?;
@@ -728,21 +730,14 @@ fn product_date(timestamp: &str) -> Result<&str, ServiceError> {
     timestamp.get(..10).ok_or(ServiceError::InvalidResult)
 }
 
-fn product_job_page_limit(context: &RequestContext) -> Result<JobListPageLimit, ServiceError> {
-    JobListPageLimit::try_new(context.limits().maximum_result_items().min(1_000))
-        .map_err(|_error| ServiceError::InvalidRequest)
-}
-
 fn is_backtest_job(view: &JobView) -> bool {
     view.kind().as_str() == "analysis.backtest.v1"
 }
 
 fn product_backtest_token(view: &JobView) -> Uuid {
-    let job_id = view.job_id().as_uuid();
-    let generation = view.generation().get().to_be_bytes();
-    opaque_product_token(
-        b"market-squawk/product-backtest/v1\0",
-        &[job_id.as_bytes(), &generation],
+    market_squawk_jobs::SqliteJobRepository::backtest_product_token(
+        view.job_id(),
+        view.generation(),
     )
 }
 
@@ -793,6 +788,18 @@ fn map_analytical(error: market_squawk_data::AnalyticalReadError) -> ServiceErro
             ServiceError::NotFound
         }
         market_squawk_data::AnalyticalReadError::InvalidLimit => ServiceError::ResourceExhausted,
+        market_squawk_data::AnalyticalReadError::Query(
+            market_squawk_data::QueryError::SpillStorageExhausted
+            | market_squawk_data::QueryError::MemoryLimitExceeded { .. },
+        ) => ServiceError::ResourceExhausted,
+        market_squawk_data::AnalyticalReadError::Query(
+            market_squawk_data::QueryError::Cancelled,
+        ) => ServiceError::Cancelled,
+        market_squawk_data::AnalyticalReadError::Query(
+            market_squawk_data::QueryError::DeadlineExceeded,
+        ) => ServiceError::DeadlineExceeded,
+        market_squawk_data::AnalyticalReadError::PythonDataset(_) => ServiceError::InvalidResult,
+
         _ => ServiceError::Unavailable,
     }
 }

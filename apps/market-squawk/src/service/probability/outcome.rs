@@ -193,15 +193,19 @@ impl InstalledProbabilityPreparation {
         let first = sessions
             .sessions()
             .first()
+            .map_err(crate::application::map_source_analytical_error)?
             .ok_or(ServiceError::Unavailable)?
             .closes_at_exclusive();
-        let last = sessions
-            .sessions()
-            .iter()
-            .map(|v| v.closes_at_exclusive())
-            .filter(|at| *at <= cutoff)
-            .max()
-            .ok_or(ServiceError::Unavailable)?;
+        let mut last = None;
+        for session in sessions.sessions().iter() {
+            let close = session
+                .map_err(crate::application::map_source_analytical_error)?
+                .closes_at_exclusive();
+            if close <= cutoff {
+                last = Some(last.map_or(close, |previous: Timestamp| previous.max(close)));
+            }
+        }
+        let last = last.ok_or(ServiceError::Unavailable)?;
         if first >= original_boundaries[0] || last < maturity || last <= original_boundaries[1] {
             return Ok(false);
         }
@@ -406,7 +410,10 @@ impl InstalledProbabilityPreparation {
                 if snapshot.spec().input().digest().bytes() != build.digest().bytes() {
                     return Err(ServiceError::InvalidResult);
                 }
-                (snapshot.id().as_uuid().to_string(), snapshot.generation().get())
+                (
+                    snapshot.id().as_uuid().to_string(),
+                    snapshot.generation().get(),
+                )
             }
             JobStartAdmission::Execute(permit) => {
                 let admitted_at = super::super::runtime::current_timestamp()
@@ -423,7 +430,10 @@ impl InstalledProbabilityPreparation {
                     .start_reserved(admission.clone(), &permit, admitted_at)
                     .await
                 {
-                    Ok(receipt) => (receipt.job_id().as_uuid().to_string(), receipt.generation().get()),
+                    Ok(receipt) => (
+                        receipt.job_id().as_uuid().to_string(),
+                        receipt.generation().get(),
+                    ),
                     Err(error) => {
                         let disposition =
                             owner.jobs.cancel_start(&binding).await.map_err(map_job)?;

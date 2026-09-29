@@ -1,11 +1,12 @@
 //! Closed loopback application routing before business-service dispatch.
 
 use std::{
+    collections::HashMap,
     fmt,
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,7 +26,7 @@ use axum::{
 };
 use futures_util::StreamExt as _;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_services::{JsonStructureLimits, RequestContext, ServiceLimits};
+use market_squawk_services::{JsonStructureLimits, RequestContext, RequestId, ServiceLimits};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -218,6 +219,46 @@ struct RouterState {
     inputs: Arc<InputStager>,
     accepting: AtomicBool,
     request_cancellation: CancellationToken,
+    reads: Mutex<HashMap<ReplayKey, Arc<ReadEntry>>>,
+}
+
+struct ReadEntry {
+    digest: EvidenceDigest,
+    credential_generation: CredentialGeneration,
+    cancellation: CancellationToken,
+    deadline: Instant,
+    started: AtomicBool,
+}
+
+struct ReadGuard {
+    state: Arc<RouterState>,
+    key: ReplayKey,
+    entry: Arc<ReadEntry>,
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.entry.cancellation.cancel();
+        if let Ok(mut reads) = self.state.reads.lock()
+            && reads
+                .get(&self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
+            reads.remove(&self.key);
+        }
+    }
+}
+
+fn prune_reads(reads: &mut HashMap<ReplayKey, Arc<ReadEntry>>) {
+    let now = Instant::now();
+    reads.retain(|_, entry| {
+        if entry.deadline <= now {
+            entry.cancellation.cancel();
+            false
+        } else {
+            true
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -368,6 +409,7 @@ impl RuntimeRouter {
                 inputs,
                 accepting: AtomicBool::new(true),
                 request_cancellation: CancellationToken::new(),
+                reads: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -389,14 +431,22 @@ impl RuntimeRouter {
     /// Builds the private routes and optionally merges one separately closed MCP router.
     pub fn into_router(self, mcp: Option<Router>) -> Router {
         let concurrency = self.state.limits.maximum_concurrency.get();
+        // Cancellation must remain reachable when every business-request slot is occupied.
+        let cancellation = Router::new()
+            .route("/app/v1/cancel-read", post(cancel_read))
+            .with_state(Arc::clone(&self.state))
+            .layer(ConcurrencyLimitLayer::new(concurrency));
         let mut router = Router::new()
             .route("/health", get(health))
             .route("/app/v1/bootstrap", get(bootstrap))
             .route("/app/v1/invoke", post(invoke))
+            .route("/app/v1/register-read", post(register_read))
+            .route("/app/v1/invoke-read", post(invoke_read))
             .route("/app/v1/inputs", post(stage_input))
             .route("/app/v1/events", post(read_events))
             .with_state(self.state)
-            .layer(ConcurrencyLimitLayer::new(concurrency));
+            .layer(ConcurrencyLimitLayer::new(concurrency))
+            .merge(cancellation);
         if let Some(mcp) = mcp {
             router = router.merge(mcp);
         }
@@ -534,35 +584,10 @@ async fn bootstrap(State(state): State<Arc<RouterState>>, request: Request<Body>
 }
 
 async fn invoke(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
-    let authentication =
-        match authenticate_transport(&state, &request, Method::POST, Some(JSON_MEDIA_TYPE)) {
-            Ok(value) => value,
-            Err(status) => return rejected(status),
-        };
-    let body = match to_bytes(request.into_body(), state.limits.request_body_bytes.get()).await {
-        Ok(body) => body,
-        Err(_) => return rejected(StatusCode::PAYLOAD_TOO_LARGE),
+    let (envelope, _authentication, now) = match decode_invocation(&state, request).await {
+        Ok(admitted) => admitted,
+        Err(status) => return rejected(status),
     };
-    let now = match wall_now() {
-        Ok(now) => now,
-        Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
-    };
-    let envelope = match AppRequestEnvelope::decode(
-        &body,
-        now,
-        state.limits.request_structure,
-        state.limits.request_body_bytes.get(),
-    ) {
-        Ok(envelope) => envelope,
-        Err(_) => return rejected(StatusCode::BAD_REQUEST),
-    };
-    if envelope.client_id() != authentication.client_id
-        || envelope.credential_generation() != authentication.generation
-        || state.runtime.admit(&envelope).is_err()
-        || !state.protocols.contains(envelope.protocol())
-    {
-        return rejected(StatusCode::CONFLICT);
-    }
     let context = match envelope.to_request_context(
         now,
         Instant::now(),
@@ -573,6 +598,191 @@ async fn invoke(State(state): State<Arc<RouterState>>, request: Request<Body>) -
         Err(_) => return rejected(StatusCode::REQUEST_TIMEOUT),
     };
     match dispatch_request(&state, &envelope, context).await {
+        Ok(response) => axum::Json(response).into_response(),
+        Err(status) => rejected(status),
+    }
+}
+
+async fn decode_invocation(
+    state: &RouterState,
+    request: Request<Body>,
+) -> Result<(AppRequestEnvelope, AuthenticatedClient, Timestamp), StatusCode> {
+    let authentication =
+        authenticate_transport(state, &request, Method::POST, Some(JSON_MEDIA_TYPE))?;
+    let body = to_bytes(request.into_body(), state.limits.request_body_bytes.get())
+        .await
+        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+    let now = wall_now().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let envelope = AppRequestEnvelope::decode(
+        &body,
+        now,
+        state.limits.request_structure,
+        state.limits.request_body_bytes.get(),
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if envelope.client_id() != authentication.client_id
+        || envelope.credential_generation() != authentication.generation
+        || state.runtime.admit(&envelope).is_err()
+        || !state.protocols.contains(envelope.protocol())
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok((envelope, authentication, now))
+}
+
+async fn register_read(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
+    let (envelope, _authentication, now) = match decode_invocation(&state, request).await {
+        Ok(admitted) => admitted,
+        Err(status) => return rejected(status),
+    };
+    if state.dispatcher.effect(envelope.operation()) != Ok(OperationEffect::Read) {
+        return rejected(StatusCode::BAD_REQUEST);
+    }
+    let cancellation = state.request_cancellation.child_token();
+    let context = match envelope.to_request_context(
+        now,
+        Instant::now(),
+        cancellation.clone(),
+        state.limits.service_limits,
+    ) {
+        Ok(context) => context,
+        Err(_) => return rejected(StatusCode::REQUEST_TIMEOUT),
+    };
+    let digest = match request_digest(&envelope) {
+        Ok(digest) => digest,
+        Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let key = ReplayKey::new(envelope.client_id(), envelope.request_id().clone());
+    let mut reads = match state.reads.lock() {
+        Ok(reads) => reads,
+        Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    prune_reads(&mut reads);
+    if reads.contains_key(&key) {
+        return rejected(StatusCode::CONFLICT);
+    }
+    if reads.len() >= state.limits.maximum_concurrency.get() {
+        return rejected(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if reads.try_reserve(1).is_err() {
+        return rejected(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    reads.insert(
+        key,
+        Arc::new(ReadEntry {
+            digest,
+            credential_generation: envelope.credential_generation(),
+            cancellation,
+            deadline: context.deadline(),
+            started: AtomicBool::new(false),
+        }),
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn cancel_read(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
+    let authentication =
+        match authenticate_transport(&state, &request, Method::POST, Some(JSON_MEDIA_TYPE)) {
+            Ok(authentication) => authentication,
+            Err(status) => return rejected(status),
+        };
+    let body = match to_bytes(request.into_body(), state.limits.event_request_bytes.get()).await {
+        Ok(body) => body,
+        Err(_) => return rejected(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: CancelReadRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return rejected(StatusCode::BAD_REQUEST),
+    };
+    let request_id = match request.request_id {
+        Value::String(id) => match RequestId::try_string(id) {
+            Ok(id) => id,
+            Err(_) => return rejected(StatusCode::BAD_REQUEST),
+        },
+        Value::Number(id) => match id.as_i64() {
+            Some(id) => RequestId::Integer(id),
+            None => return rejected(StatusCode::BAD_REQUEST),
+        },
+        _ => return rejected(StatusCode::BAD_REQUEST),
+    };
+    let Some(digest) = decode_sha256(&request.request_sha256) else {
+        return rejected(StatusCode::BAD_REQUEST);
+    };
+    let key = ReplayKey::new(authentication.client_id, request_id);
+    let mut reads = match state.reads.lock() {
+        Ok(reads) => reads,
+        Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    prune_reads(&mut reads);
+    if reads.get(&key).is_some_and(|entry| {
+        entry.digest != digest || entry.credential_generation != authentication.generation
+    }) {
+        return rejected(StatusCode::CONFLICT);
+    }
+    if let Some(entry) = reads.remove(&key) {
+        entry.cancellation.cancel();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CancelReadRequest {
+    request_id: Value,
+    request_sha256: String,
+}
+
+async fn invoke_read(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
+    let (envelope, _authentication, now) = match decode_invocation(&state, request).await {
+        Ok(admitted) => admitted,
+        Err(status) => return rejected(status),
+    };
+    if state.dispatcher.effect(envelope.operation()) != Ok(OperationEffect::Read) {
+        return rejected(StatusCode::BAD_REQUEST);
+    }
+    let key = ReplayKey::new(envelope.client_id(), envelope.request_id().clone());
+    let digest = match request_digest(&envelope) {
+        Ok(digest) => digest,
+        Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let guard = {
+        let mut reads = match state.reads.lock() {
+            Ok(reads) => reads,
+            Err(_) => return rejected(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        prune_reads(&mut reads);
+        let Some(entry) = reads.get(&key) else {
+            return rejected(StatusCode::GONE);
+        };
+        if entry.digest != digest
+            || entry.cancellation.is_cancelled()
+            || entry.started.swap(true, Ordering::AcqRel)
+        {
+            return rejected(StatusCode::CONFLICT);
+        }
+        ReadGuard {
+            state: Arc::clone(&state),
+            key,
+            entry: Arc::clone(entry),
+        }
+    };
+    let context = match envelope.to_request_context(
+        now,
+        Instant::now(),
+        guard.entry.cancellation.clone(),
+        state.limits.service_limits,
+    ) {
+        Ok(context) => context,
+        Err(_) => return rejected(StatusCode::REQUEST_TIMEOUT),
+    };
+    let result = tokio::select! {
+        biased;
+        () = guard.entry.cancellation.cancelled() => Err(StatusCode::REQUEST_TIMEOUT),
+        result = tokio::time::timeout_at(guard.entry.deadline.into(), dispatch_request(&state, &envelope, context)) => {
+            result.unwrap_or(Err(StatusCode::REQUEST_TIMEOUT))
+        }
+    };
+    match result {
         Ok(response) => axum::Json(response).into_response(),
         Err(status) => rejected(status),
     }

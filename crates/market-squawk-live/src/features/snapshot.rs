@@ -5,7 +5,7 @@ use std::mem::size_of;
 use market_squawk_analytics::{FeatureScalar, REQUIRED_LIVE_FEATURE_COUNT, RequiredLiveFeature};
 use market_squawk_domain::{
     ConnectionGeneration, DigestAlgorithm, EvidenceDigest, InstrumentId, ProviderChannel,
-    ProviderProduct, SourceId, Timestamp, VenueId,
+    ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use sha2::{Digest, Sha256};
 
@@ -18,6 +18,46 @@ use crate::snapshot::{
 const LIVE_FEATURE_SET_DIGEST_DOMAIN: &[u8] = b"MSQKLIVEFEATURESET\x01";
 
 impl RouteFeatureState {
+    /// Additional heap ownership while one route constructs its feature snapshot.
+    ///
+    /// Accepted sets belong to the enclosing shard publication's retained-byte budget. Outside
+    /// that budget, construction may own a complete candidate before checking its fit, unused
+    /// reserved set slots, sorting references, and Vec-to-box normalization overlap. An actor
+    /// builds one route at a time; readers retain publications, never this workspace.
+    pub(crate) fn snapshot_construction_scratch_bytes(maximum_sets: usize) -> Option<usize> {
+        if maximum_sets == 0 {
+            return Some(0);
+        }
+        let values =
+            REQUIRED_LIVE_FEATURE_COUNT.checked_mul(size_of::<LiveFeatureValueSnapshot>())?;
+        let names = RequiredLiveFeature::ALL
+            .iter()
+            .try_fold(0_usize, |bytes, feature| {
+                bytes.checked_add(feature.name().len())
+            })?;
+        let identities = SourceId::MAX_LENGTH
+            .checked_add(VenueId::MAX_LENGTH)?
+            .checked_add(2_usize.checked_mul(SourceIdentifier::MAX_LENGTH)?)?;
+        // Four identity strings and one owned name per value, with allocator/header slack.
+        let text_slack = REQUIRED_LIVE_FEATURE_COUNT
+            .checked_add(4)?
+            .checked_mul(64)?;
+        let candidate = size_of::<LiveFeatureSetSnapshot>()
+            .checked_add(identities)?
+            .checked_add(values)?
+            .checked_add(names)?
+            .checked_add(text_slack)?;
+        let set_slots = maximum_sets.checked_mul(size_of::<LiveFeatureSetSnapshot>())?;
+        // Collect growth and stable-sort workspace coexist with the original reference vector.
+        let ordering =
+            maximum_sets.checked_mul(4_usize.checked_mul(size_of::<&FeatureSetState>())?)?;
+        candidate
+            .checked_add(values)?
+            .checked_add(2_usize.checked_mul(set_slots)?)?
+            .checked_add(ordering)?
+            .checked_add(3 * 64)
+    }
+
     pub(crate) fn build_snapshot(
         &self,
         maximum_bytes: usize,

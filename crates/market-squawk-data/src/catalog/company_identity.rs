@@ -132,6 +132,7 @@ pub struct CompanyIdentityExactRecord {
     manifest_content_digest: EvidenceDigest,
     completed_at: Timestamp,
     provider_binding_digest: Option<EvidenceDigest>,
+    provider_logical_binding_digest: Option<EvidenceDigest>,
 }
 
 impl CompanyIdentityExactRecord {
@@ -178,6 +179,10 @@ impl CompanyIdentityExactRecord {
     /// Returns the direct provider-capture binding retained by the owning run, when present.
     pub const fn provider_binding_digest(&self) -> Option<EvidenceDigest> {
         self.provider_binding_digest
+    }
+    /// Returns the streamed logical publication binding retained by the owning run, when present.
+    pub const fn provider_logical_binding_digest(&self) -> Option<EvidenceDigest> {
+        self.provider_logical_binding_digest
     }
 }
 
@@ -234,6 +239,8 @@ impl Catalog {
                         row.get::<_, Option<Vec<u8>>>(17)?,
                         row.get::<_, i64>(18)?,
                         row.get::<_, i64>(19)?,
+                        row.get::<_, Option<Vec<u8>>>(20)?,
+                        row.get::<_, i64>(21)?,
                     ))
                 })
                 .optional()?;
@@ -258,6 +265,8 @@ impl Catalog {
                 binding_digest,
                 binding_count,
                 completed_at,
+                logical_binding_digest,
+                publication_count,
             )) = row
             else {
                 return Ok(None);
@@ -275,6 +284,7 @@ impl Catalog {
                 artifact_digest.len(),
                 manifest_digest.len(),
                 binding_digest.as_ref().map_or(0, Vec::len),
+                logical_binding_digest.as_ref().map_or(0, Vec::len),
             ])?;
             let observation: CompanyIdentityObservation =
                 super::records::deserialize_verified(&json, &record_digest, &mut budget)?;
@@ -290,6 +300,24 @@ impl Catalog {
                 (0, None) => None,
                 (1, Some(value)) => Some(parse_digest(1, &value)?),
                 _ => return Err(CatalogError::ProviderCaptureConflict),
+            };
+            let provider_logical_binding_digest = match (publication_count, logical_binding_digest)
+            {
+                (0, None) => None,
+                (1, Some(value)) if provider_binding_digest.is_none() => {
+                    let digest = parse_digest(1, &value)?;
+                    let binding =
+                        super::provider_logical::load_provider_logical_publication_binding(
+                            &self.connection,
+                            digest,
+                        )?
+                        .ok_or(CatalogError::ProviderLogicalMismatch)?;
+                    if binding.terminal().source_id().as_str() != source_id {
+                        return Err(CatalogError::ProviderLogicalMismatch);
+                    }
+                    Some(digest)
+                }
+                _ => return Err(CatalogError::ProviderLogicalConflict),
             };
             if observation_digest != digest
                 || observation.source_id().as_str() != source_id
@@ -318,6 +346,7 @@ impl Catalog {
                 manifest_content_digest: parse_digest(manifest_algorithm, &manifest_digest)?,
                 completed_at: Timestamp::from_unix_nanos(completed_at),
                 provider_binding_digest,
+                provider_logical_binding_digest,
             }))
         })();
         self.connection.progress_handler::<fn() -> bool>(0, None)?;
@@ -526,6 +555,9 @@ pub(super) fn persist_company_identity(
     transaction: &Transaction<'_>,
     reservation: &IngestReservation,
     observation: &CompanyIdentityObservation,
+    logical_authorization: Option<
+        &crate::ingest::provider_logical_stream::LogicalCompanyIdentityAuthorization,
+    >,
     catalog_now: Timestamp,
 ) -> Result<(), CatalogError> {
     let (source_id, payload_algorithm, payload_digest, state): (String, i64, Vec<u8>, String) =
@@ -536,11 +568,49 @@ pub(super) fn persist_company_identity(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
     let retained_payload = parse_digest(payload_algorithm, &payload_digest)?;
+    let parent_digest = observation
+        .parent_ingest_payload_evidence()
+        .content_digest();
+    let authorized_logical_parent = if let Some(authorization) = logical_authorization {
+        let observation_digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            sha256(serde_json::to_string(observation)?.as_bytes()),
+        );
+        if state != "reserved"
+            || authorization.source_id().as_str() != source_id
+            || authorization.binding_digest() != retained_payload
+            || authorization.parent_digest() != parent_digest
+            || authorization.observation_digest() != observation_digest
+        {
+            return Err(CatalogError::EvidenceConflict);
+        }
+        transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM ingest_run_provider_publication_bindings AS input
+                 JOIN provider_logical_publication_bindings AS binding
+                   ON binding.binding_digest=input.logical_binding_digest
+                 WHERE input.run_id=?1 AND input.input_ordinal=0
+                   AND input.publication_kind='provider_logical'
+                   AND input.publication_digest=?2 AND input.logical_binding_digest=?2
+                   AND input.source_id=?3 AND binding.source_id=?3
+                   AND (SELECT COUNT(*) FROM ingest_run_provider_publication_bindings
+                        WHERE run_id=?1)=1
+                   AND NOT EXISTS(SELECT 1 FROM ingest_run_provider_capture_bindings
+                                  WHERE run_id=?1)
+             )",
+            params![
+                reservation.run_id.to_string(),
+                retained_payload.bytes(),
+                source_id
+            ],
+            |row| row.get::<_, bool>(0),
+        )?
+    } else {
+        false
+    };
     if source_id != observation.source_id().as_str()
-        || retained_payload
-            != observation
-                .parent_ingest_payload_evidence()
-                .content_digest()
+        || (retained_payload != parent_digest && !authorized_logical_parent)
+        || (logical_authorization.is_some() && !authorized_logical_parent)
         || !matches!(state.as_str(), "reserved" | "succeeded")
     {
         return Err(CatalogError::EvidenceConflict);
@@ -853,7 +923,21 @@ SELECT observations.record_json, observations.record_digest, observations.run_id
            FROM ingest_run_provider_capture_bindings AS binding
            WHERE binding.run_id=observations.run_id
        ),
-       runs.completed_at_ns
+       runs.completed_at_ns,
+       (
+           SELECT binding.logical_binding_digest
+           FROM ingest_run_provider_publication_bindings AS binding
+           WHERE binding.run_id=observations.run_id
+             AND binding.publication_kind='provider_logical'
+             AND binding.source_id=observations.source_id
+           ORDER BY binding.input_ordinal
+           LIMIT 1
+       ),
+       (
+           SELECT COUNT(*)
+           FROM ingest_run_provider_publication_bindings AS binding
+           WHERE binding.run_id=observations.run_id
+       )
 FROM company_identity_observations AS observations
 JOIN ingest_runs AS runs ON runs.run_id=observations.run_id
 JOIN artifacts ON artifacts.run_id=observations.run_id

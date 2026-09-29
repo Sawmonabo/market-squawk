@@ -15,10 +15,10 @@ mod strategy;
 
 pub use clock::EventTimeClock;
 pub use dataset::{
-    AVAILABLE_AT_COMPONENT, BacktestDataset, BacktestExecutionBasis, BacktestLimits,
-    BacktestLimitsInput, BacktestObservation, BacktestStudyQualification, DEPTH_COMPONENT,
-    EVENT_AT_COMPONENT, HistoricalUniverseStatus, MID_PRICE_COMPONENT, ResearchFeatureValue,
-    SPREAD_COMPONENT, STALE_AT_COMPONENT, UNIVERSE_COMPONENT,
+    AVAILABLE_AT_COMPONENT, BacktestDailyHistoryAdmission, BacktestDataset, BacktestExecutionBasis,
+    BacktestLimits, BacktestLimitsInput, BacktestObservation, BacktestStudyQualification,
+    DEPTH_COMPONENT, EVENT_AT_COMPONENT, HistoricalUniverseStatus, MID_PRICE_COMPONENT,
+    ResearchFeatureValue, SPREAD_COMPONENT, STALE_AT_COMPONENT, UNIVERSE_COMPONENT,
 };
 pub use engine::{
     AccountingReconciliation, BacktestContext, BacktestEngine, BacktestError, BacktestRequest,
@@ -43,9 +43,8 @@ pub use fills::{
 };
 pub use model_strategy::{BacktestModelDecisionMapper, BacktestModelStrategy};
 pub use recommendation::{
-    AllOriginRoundTripDispositionV1, AllOriginRoundTripEvaluationV1,
-    AllOriginRoundTripEvaluatorV1, AllOriginRoundTripPolicyV1, AllOriginRoundTripResultV1,
-    AllOriginRoundTripUnavailableV1,
+    AllOriginRoundTripDispositionV1, AllOriginRoundTripEvaluationV1, AllOriginRoundTripEvaluatorV1,
+    AllOriginRoundTripPolicyV1, AllOriginRoundTripResultV1, AllOriginRoundTripUnavailableV1,
     COST_ADJUSTED_TOTAL_RETURN_METRIC, MAXIMUM_DRAWDOWN_METRIC,
     MaterializedRecommendationSignalPlanV1, POSITIVE_FOLD_STABILITY_METRIC,
     RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1, RECOMMENDATION_OOS_FOLD_COUNT_V1,

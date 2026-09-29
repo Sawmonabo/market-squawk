@@ -63,6 +63,7 @@ pub struct OnnxModelPolicy {
     output_shape: Box<[usize]>,
     output_semantics: ModelOutputSemantics,
     output_semantics_bound: bool,
+    forecast_horizons: Option<Box<[u32]>>,
     inference_deadline: Duration,
     fallback: OnnxFallbackPolicy,
     policy_digest: [u8; 32],
@@ -90,6 +91,7 @@ impl OnnxModelPolicy {
             output_shape,
             ModelOutputSemantics::Regression,
             false,
+            None,
             inference_deadline,
             fallback,
         )
@@ -120,9 +122,87 @@ impl OnnxModelPolicy {
             output_shape,
             output_semantics,
             true,
+            None,
             inference_deadline,
             fallback,
         )
+    }
+
+    /// Derives scalar versus research tensor meaning from the admitted training trial.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact graph authorities remain explicit"
+    )]
+    pub fn try_new_for_bundle(
+        bundle: &crate::ModelBundle,
+        opset: u32,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        inference_deadline: Duration,
+        fallback: OnnxFallbackPolicy,
+    ) -> Result<Self, OnnxPolicyError> {
+        match bundle.research_forecast_layout() {
+            Some((_, horizons, _)) => Self::try_new_forecast(
+                bundle.metadata().artifact_hash(),
+                opset,
+                input_shape,
+                output_shape,
+                horizons,
+                inference_deadline,
+                fallback,
+            ),
+            None => Self::try_new_with_output_semantics(
+                bundle.metadata().artifact_hash(),
+                opset,
+                input_shape,
+                output_shape,
+                bundle.metadata().output_semantics(),
+                inference_deadline,
+                fallback,
+            ),
+        }
+    }
+
+    /// Constructs a regression forecast policy with an exact output-column horizon mapping.
+    /// Scalar trading and binary-event policies retain their single-output contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact graph and horizon authorities are explicit"
+    )]
+    pub fn try_new_forecast(
+        model_digest: Sha256Digest,
+        opset: u32,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        horizon_offsets: &[u32],
+        inference_deadline: Duration,
+        fallback: OnnxFallbackPolicy,
+    ) -> Result<Self, OnnxPolicyError> {
+        if horizon_offsets.is_empty()
+            || horizon_offsets.len() > crate::MAX_FORECAST_POINTS
+            || horizon_offsets.contains(&0)
+            || horizon_offsets.windows(2).any(|pair| pair[0] >= pair[1])
+            || output_shape != [1, horizon_offsets.len()]
+        {
+            return Err(OnnxPolicyError::InvalidPolicy);
+        }
+        Self::try_new_internal(
+            model_digest,
+            opset,
+            input_shape,
+            output_shape,
+            ModelOutputSemantics::Regression,
+            true,
+            Some(horizon_offsets),
+            inference_deadline,
+            fallback,
+        )
+    }
+
+    /// Returns the graph-bound research output-column mapping, if this is a forecast policy.
+    #[must_use]
+    pub fn forecast_horizons(&self) -> Option<&[u32]> {
+        self.forecast_horizons.as_deref()
     }
 
     #[allow(
@@ -136,6 +216,7 @@ impl OnnxModelPolicy {
         output_shape: &[usize],
         output_semantics: ModelOutputSemantics,
         output_semantics_bound: bool,
+        forecast_horizons: Option<&[u32]>,
         inference_deadline: Duration,
         fallback: OnnxFallbackPolicy,
     ) -> Result<Self, OnnxPolicyError> {
@@ -147,7 +228,7 @@ impl OnnxModelPolicy {
         }
         let input_elements = shape_elements(input_shape)?;
         let output_elements = shape_elements(output_shape)?;
-        if output_elements != 1
+        if (forecast_horizons.is_none() && output_elements != 1)
             || input_elements
                 .checked_add(output_elements)
                 .is_none_or(|elements| elements > MAX_ONNX_REQUEST_ELEMENTS)
@@ -162,6 +243,7 @@ impl OnnxModelPolicy {
             input_shape,
             output_shape,
             output_semantics_bound.then_some(output_semantics),
+            forecast_horizons,
             inference_deadline,
             fallback,
         );
@@ -172,6 +254,7 @@ impl OnnxModelPolicy {
             output_shape: output_shape.into(),
             output_semantics,
             output_semantics_bound,
+            forecast_horizons: forecast_horizons.map(Into::into),
             inference_deadline,
             fallback,
             policy_digest,
@@ -195,6 +278,35 @@ impl OnnxModelPolicy {
             .proto_model_for_read(&mut Cursor::new(bytes))
             .map_err(|_| OnnxPolicyError::InvalidProtobuf)?;
         validate_proto(self, &proto)
+    }
+
+    pub(crate) fn validate_research_layout(
+        &self,
+        bytes: &[u8],
+        lags: &[u32],
+        strategy: &str,
+    ) -> Result<(), OnnxPolicyError> {
+        let proto = tract_onnx::onnx()
+            .proto_model_for_read(&mut Cursor::new(bytes))
+            .map_err(|_| OnnxPolicyError::InvalidProtobuf)?;
+        for (key, expected) in [
+            (
+                "market_squawk.forecast.lags",
+                lags.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            ("market_squawk.forecast.strategy", strategy.to_owned()),
+        ] {
+            let mut entries = proto.metadata_props.iter().filter(|entry| entry.key == key);
+            if entries.next().is_none_or(|entry| entry.value != expected)
+                || entries.next().is_some()
+            {
+                return Err(OnnxPolicyError::OutputSemanticsMismatch);
+            }
+        }
+        Ok(())
     }
 
     /// Returns the exact admitted model digest.
@@ -276,6 +388,10 @@ impl ValidatedOnnxModel {
         self.tensor_count
     }
 
+    pub(crate) const fn output_elements(&self) -> usize {
+        self.output_elements
+    }
+
     pub(crate) const fn input_elements(&self) -> usize {
         self.input_elements
     }
@@ -324,6 +440,22 @@ fn validate_proto(
     policy: &OnnxModelPolicy,
     proto: &ModelProto,
 ) -> Result<ValidatedOnnxModel, OnnxPolicyError> {
+    let mapping = proto
+        .metadata_props
+        .iter()
+        .filter(|entry| entry.key == "market_squawk.forecast.horizons")
+        .collect::<Vec<_>>();
+    match (policy.forecast_horizons(), mapping.as_slice()) {
+        (None, []) => {}
+        (Some(horizons), [entry])
+            if entry.value
+                == horizons
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",") => {}
+        _ => return Err(OnnxPolicyError::OutputSemanticsMismatch),
+    }
     if !proto.training_info.is_empty() || !proto.functions.is_empty() {
         return Err(OnnxPolicyError::UnsupportedGraphState);
     }
@@ -557,12 +689,17 @@ fn shape_elements(shape: &[usize]) -> Result<usize, OnnxPolicyError> {
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all policy identity fields remain explicit"
+)]
 fn digest_policy(
     model_digest: Sha256Digest,
     opset: u32,
     input_shape: &[usize],
     output_shape: &[usize],
     output_semantics: Option<ModelOutputSemantics>,
+    forecast_horizons: Option<&[u32]>,
     deadline: Duration,
     fallback: OnnxFallbackPolicy,
 ) -> [u8; 32] {
@@ -620,6 +757,17 @@ fn digest_policy(
                 ModelOutputSemantics::BinaryProbability => 2_u8,
             }),
         );
+    }
+    if let Some(horizons) = forecast_horizons {
+        bind_bytes(
+            &mut digest,
+            b"forecast-contract",
+            b"ordered-origin-offsets/v1",
+        );
+        bind_usize(&mut digest, b"forecast-output-count", horizons.len());
+        for offset in horizons {
+            bind_u128(&mut digest, b"forecast-horizon", u128::from(*offset));
+        }
     }
     bind_u128(&mut digest, b"deadline-nanoseconds", deadline.as_nanos());
     bind_u128(

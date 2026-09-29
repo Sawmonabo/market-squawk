@@ -309,6 +309,30 @@ pub(super) struct TrainingRunWire {
     pub(super) probability_calibration: Option<super::probability::ProbabilityCalibrationRefWire>,
 }
 
+#[derive(Debug)]
+pub(super) struct ForecastTensorLayout {
+    pub(super) lags: Box<[u32]>,
+    pub(super) horizons: Box<[u32]>,
+    pub(super) strategy: Box<str>,
+}
+
+impl TrainingRunWire {
+    pub(super) fn forecast_tensor_layout(&self) -> Option<ForecastTensorLayout> {
+        self.trial
+            .forecast
+            .as_ref()
+            .map(|forecast| ForecastTensorLayout {
+                lags: forecast.lags.clone().into_boxed_slice(),
+                horizons: if forecast.strategy == "recursive" {
+                    vec![1].into_boxed_slice()
+                } else {
+                    forecast.horizons.clone().into_boxed_slice()
+                },
+                strategy: forecast.strategy.clone().into_boxed_str(),
+            })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ForecastPolicyWire {
@@ -815,6 +839,7 @@ pub(super) fn validate_training_run(
             "direct" | "recursive" | "multi_output" | "chained"
         ) || !ordered_positive(&forecast.horizons, 512)
             || !ordered_positive(&forecast.lags, 1_024)
+            || (forecast.strategy == "recursive" && forecast.horizons.first() != Some(&1))
             || forecast.observed_cutoff_unix_nanos
                 > metadata.training_dataset.selection_as_of_unix_nanos
             || !(2..=32).contains(&forecast.rolling_splits)

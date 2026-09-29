@@ -6,6 +6,7 @@ use crate::provider_activation::tiingo::{
 use market_squawk_adapter_tiingo::{TiingoDecoder, TiingoEodReceipt, TiingoRequestSpec};
 use market_squawk_data::ProviderCaptureOriginalReceipt;
 use market_squawk_sources::{ProviderCaptureMaterial, ProviderWholeCaptureToken};
+use std::io::Write as _;
 
 impl ProductionResearchIngestCoordinator {
     pub(crate) async fn recover_tiingo_history_metadata(
@@ -174,7 +175,13 @@ impl ProductionResearchIngestCoordinator {
         lease: Arc<market_squawk_data::ProviderCaptureOriginalLease>,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<ProviderWholeCaptureToken, TiingoHistoryApplicationError> {
+    ) -> Result<
+        (
+            ProviderWholeCaptureToken,
+            market_squawk_platform::VerifiedResearchObject,
+        ),
+        TiingoHistoryApplicationError,
+    > {
         let data = self.research.analytical_service();
         let store = self.research.provider_capture_store();
         self.research
@@ -182,6 +189,7 @@ impl ProductionResearchIngestCoordinator {
                 let _lease = lease;
                 let read =
                     data.reopen_provider_capture_original(&original, &store, deadline, &worker)?;
+                let body = seal_original_body(&read, &store, deadline, &worker)?;
                 let (saved, material) = read.into_material()?;
                 let (expectation, request) = material.into_whole_seal_parts();
                 let token = expectation
@@ -198,49 +206,121 @@ impl ProductionResearchIngestCoordinator {
                 {
                     return Err(TiingoHistoryApplicationError::Admission);
                 }
-                Ok(token)
+                Ok((token, body))
             })
             .await?
     }
-    pub(super) async fn decode_tiingo_original_page(
+    /// Decodes and reseals one original page in the same supervised physical read. Only the
+    /// bounded page and its live token leave the worker; durable custody remains the replay source.
+    pub(super) async fn reopen_tiingo_original_page(
         &self,
-        original: &ProviderCaptureOriginalReceipt,
+        original: ProviderCaptureOriginalReceipt,
         request: TiingoRequestSpec,
         context: &TiingoHistoryOriginalContext,
+        lease: Arc<market_squawk_data::ProviderCaptureOriginalLease>,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<TiingoEodReceipt, TiingoHistoryApplicationError> {
+    ) -> Result<
+        (
+            TiingoEodReceipt,
+            ProviderWholeCaptureToken,
+            market_squawk_platform::VerifiedResearchObject,
+        ),
+        TiingoHistoryApplicationError,
+    > {
         let data = self.research.analytical_service();
         let store = self.research.provider_capture_store();
-        let saved = original.clone();
         let native = context.native_contract_revision.clone();
         let entitlement = context.entitlement_generation.clone();
         self.research
             .run_owned_research_io(deadline, cancellation, move |worker| {
+                let _lease = lease;
                 let read =
-                    data.reopen_provider_capture_original(&saved, &store, deadline, &worker)?;
-                let page = saved
+                    data.reopen_provider_capture_original(&original, &store, deadline, &worker)?;
+                let page = original
                     .capture()
                     .pages()
                     .first()
                     .ok_or(TiingoHistoryApplicationError::Admission)?;
-                if saved.capture().request_set_identity() != request.request_identity() {
+                if original.capture().request_set_identity() != request.request_identity() {
                     return Err(TiingoHistoryApplicationError::Admission);
                 }
                 let record = read
                     .records()
                     .first()
                     .ok_or(TiingoHistoryApplicationError::Admission)?;
-                TiingoDecoder::new(native, entitlement)
+                let decoded = TiingoDecoder::new(native, entitlement)
                     .decode_eod(
                         request,
                         page.http_status(),
                         record.payload(),
                         page.received_at(),
-                        saved.decoded_at(),
+                        original.decoded_at(),
                     )
-                    .map_err(|_| TiingoHistoryApplicationError::Admission)
+                    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+                let body = seal_original_body(&read, &store, deadline, &worker)?;
+                let (saved, material) = read.into_material()?;
+                let (expectation, request) = material.into_whole_seal_parts();
+                let token = expectation
+                    .try_rejoin(
+                        request
+                            .seal(&store)
+                            .map_err(|_| TiingoHistoryApplicationError::Admission)?,
+                    )?
+                    .try_into_whole()?;
+                if token.persisted_receipt().receipt_digest()
+                    != saved.physical().sealed_capture_receipt_digest()
+                    || token.persisted_receipt().segment().claim() != saved.physical().claim()
+                    || token.persisted_receipt().capture() != saved.capture()
+                {
+                    return Err(TiingoHistoryApplicationError::Admission);
+                }
+                Ok((decoded, token, body))
             })
             .await?
     }
+}
+
+/// Makes one immutable logical payload from the same verified original frame used by decoding.
+fn seal_original_body(
+    read: &market_squawk_data::ProviderCaptureOriginalRead,
+    store: &market_squawk_platform::SealedResearchJournalStore,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<market_squawk_platform::VerifiedResearchObject, TiingoHistoryApplicationError> {
+    let [record] = read.records() else {
+        return Err(TiingoHistoryApplicationError::Admission);
+    };
+    let admission = market_squawk_platform::ResearchObjectAdmission::try_new(
+        (record.payload().len() as u64).max(1),
+        4095,
+    )
+    .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+    let control = HistoryStreamControl {
+        deadline,
+        cancellation: cancellation.clone(),
+    };
+    let mut pending = store
+        .begin_logical_object(admission)
+        .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+    let written = (|| {
+        for bytes in record.payload().chunks(64 * 1024) {
+            market_squawk_platform::ResearchObjectControl::checkpoint(
+                &control,
+                market_squawk_platform::ResearchObjectControlPoint::BeforeVerification,
+            )
+            .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+            pending
+                .write_all(bytes)
+                .map_err(|_| TiingoHistoryApplicationError::Admission)?;
+        }
+        Ok::<_, TiingoHistoryApplicationError>(())
+    })();
+    if let Err(error) = written {
+        let _ = store.abort_logical_object(pending);
+        return Err(error);
+    }
+    store
+        .finish_logical_object(pending, &control)
+        .map_err(|_| TiingoHistoryApplicationError::Admission)
 }

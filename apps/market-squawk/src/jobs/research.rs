@@ -1033,6 +1033,36 @@ fn map_artifact_error(error: ArtifactError) -> JobRunError {
 
 fn map_phase_one_derived_generation_error(error: ResearchServiceError) -> JobRunError {
     match error {
+        ResearchServiceError::Dataset(DatasetBuildError::IndexedPointInTime(error)) => {
+            use market_squawk_data::PointInTimeError;
+            match error {
+                PointInTimeError::Cancelled => JobRunError::Cancelled,
+                PointInTimeError::DeadlineExceeded => {
+                    failed("phase-one-derived-generation-deadline-exceeded", true)
+                }
+                PointInTimeError::ScratchDiskExhausted
+                | PointInTimeError::AllocationFailure
+                | PointInTimeError::AccountingOverflow
+                | PointInTimeError::CandidateLimitExceeded { .. }
+                | PointInTimeError::FamilyLimitExceeded { .. }
+                | PointInTimeError::ConflictLimitExceeded { .. }
+                | PointInTimeError::ResultRowLimitExceeded { .. }
+                | PointInTimeError::RetainedBytesExceeded { .. } => {
+                    failed("phase-one-derived-generation-resource-exhausted", true)
+                }
+                PointInTimeError::ScratchStorage => {
+                    failed("phase-one-derived-generation-authority-unavailable", true)
+                }
+                PointInTimeError::UnsupportedPolicyVersion { .. }
+                | PointInTimeError::InvalidLimits
+                | PointInTimeError::InvalidLabelWindow
+                | PointInTimeError::CanonicalEncoding
+                | PointInTimeError::DiskRevisionConflicts { .. }
+                | PointInTimeError::RevisionConflicts { .. } => {
+                    failed("phase-one-derived-generation-input-rejected", false)
+                }
+            }
+        }
         ResearchServiceError::Dataset(DatasetBuildError::CurrentPopulation(error)) => {
             map_service_error(crate::application::map_current_population_error(error))
         }

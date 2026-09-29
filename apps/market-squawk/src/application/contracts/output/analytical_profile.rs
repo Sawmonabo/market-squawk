@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use super::{
     boolean, bounded_array, bounded_integer_range, bounded_text, bounded_unsigned,
     bounded_unsigned_range, closed_complete, constant, constant_bool, enumeration, fixed_array,
-    one_of, positive_integer_text, sha256, unsigned_integer_text, uuid,
+    nullable, one_of, positive_integer_text, sha256, unsigned_integer_text, uuid,
 };
 
 pub(crate) fn configuration() -> Value {
@@ -74,17 +74,21 @@ pub(crate) fn resolution() -> Value {
 }
 
 pub(super) fn benchmark_choices() -> Value {
-    bounded_array(closed_complete(vec![
-        ("instrumentId", uuid()),
-        ("displayName", bounded_text(512)),
-        ("symbol", bounded_text(32)),
-        ("comparisonDescription", bounded_text(521)),
-        ("isDefault", boolean()),
-    ]), 3)
+    bounded_array(
+        closed_complete(vec![
+            ("instrumentId", uuid()),
+            ("displayName", bounded_text(512)),
+            ("symbol", bounded_text(32)),
+            ("comparisonDescription", bounded_text(521)),
+            ("isDefault", boolean()),
+        ]),
+        3,
+    )
 }
 
 pub(super) fn catalog() -> Value {
     closed_complete(vec![
+        ("nextCursor", nullable(bounded_text(512))),
         ("benchmarkChoices", benchmark_choices()),
         ("defaultConfiguration", configuration()),
         ("defaultResolution", resolution()),
@@ -132,7 +136,7 @@ pub(super) fn catalog() -> Value {
                         ]),
                     ),
                 ]),
-                4096,
+                100,
             ),
         ),
         (

@@ -1,6 +1,12 @@
 //! Bounded source selection, observed comparable valuation, and durable calculation publication.
 
 mod financial;
+pub(crate) use financial::{
+    FundamentalShareProjectionSources, FundamentalShareRequirements,
+    MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES, finish_common_share_sources,
+    fundamental_share_recipe_artifacts, replay_fundamental_share_sources,
+    validate_fundamental_share_sources,
+};
 mod investment;
 pub(crate) use investment::{
     AutomaticInvestmentValuationEvaluation, AutomaticInvestmentValuationRequest,
@@ -118,6 +124,12 @@ pub(crate) fn automatic_valuation_model_cases(
     use market_squawk_valuation::{
         AutomaticValuationIntermediateKind as Step, AutomaticValuationMethod,
     };
+    if matches!(
+        receipt.method(),
+        AutomaticValuationMethod::DiscountedCashFlow | AutomaticValuationMethod::ResidualIncome
+    ) {
+        return financial::native_model_cases(receipt);
+    }
     if receipt.method() != AutomaticValuationMethod::ComparableCompanies
         || receipt.range().central().basis() != ValuationAmountBasis::PerInstrumentUnit
     {
@@ -326,8 +338,14 @@ impl FairValueDomainService {
             )
             .await?;
         let cohort_evidence = if request.peers.is_empty() {
-            let (peers, evidence) =
-                discover_peers(&research, &subject.fundamentals, &request, context).await?;
+            let (peers, evidence) = discover_peers(
+                &research,
+                &subject.fundamentals,
+                request.subject,
+                request.knowledge_at,
+                context,
+            )
+            .await?;
             request.peers = peers;
             Some(evidence)
         } else {
@@ -796,9 +814,14 @@ impl FairValueDomainService {
         request: &ObservedComparableValuationRequest,
         context: &RequestContext,
     ) -> Result<SelectedComparable<'a>, ServiceError> {
-        let mut fundamentals = self
-            .select_comparable_fundamentals(research, instrument_id, request, context)
-            .await?;
+        let mut fundamentals = Self::select_comparable_fundamentals(
+            research,
+            instrument_id,
+            request.knowledge_at,
+            request.effective_date,
+            context,
+        )
+        .await?;
         if market_selection.receipt().reference().instrument_id() != instrument_id {
             return Err(ServiceError::InvalidRequest);
         }
@@ -825,10 +848,10 @@ impl FairValueDomainService {
     }
 
     async fn select_comparable_fundamentals(
-        &self,
         research: &ResearchService,
         instrument_id: InstrumentId,
-        request: &ObservedComparableValuationRequest,
+        knowledge_at: Timestamp,
+        effective_date: CalendarDate,
         context: &RequestContext,
     ) -> Result<SelectedComparableFundamentals, ServiceError> {
         let reader = research.analytical().sec_research_reader();
@@ -845,8 +868,8 @@ impl FairValueDomainService {
             SecResearchIdentityReadRequest::try_new(
                 instrument_id,
                 family,
-                request.knowledge_at,
-                ResearchTemporalCoordinate::calendar_date(request.effective_date),
+                knowledge_at,
+                ResearchTemporalCoordinate::calendar_date(effective_date),
                 PointInTimeRevisionMode::LatestKnown,
                 pit,
                 SOURCE_READ_BYTES,
@@ -867,7 +890,7 @@ impl FairValueDomainService {
         };
         let (row, observation) = select_annual_eps(selected)?;
         let period = observation.fact_context().period();
-        let fact = observation.clone();
+        let fact = observation;
         let metric =
             ValuationInput::from_selected_fundamental(&facts, row, InputSignificance::Significant)
                 .map_err(map_fair_value_error)?;
@@ -923,7 +946,8 @@ impl FairValueDomainService {
 async fn discover_peers(
     research: &ResearchService,
     subject: &SelectedComparableFundamentals,
-    request: &ObservedComparableValuationRequest,
+    subject_id: InstrumentId,
+    knowledge_at: Timestamp,
     context: &RequestContext,
 ) -> Result<(Vec<InstrumentId>, EvidenceDigest), ServiceError> {
     let reader = research
@@ -934,8 +958,6 @@ async fn discover_peers(
     let industry_surface = subject.industry_surface;
     let industry = subject.industry.clone();
     let industry_evidence = subject.industry_evidence;
-    let knowledge_at = request.knowledge_at;
-    let subject_id = request.subject;
     let deadline = context.deadline();
     research
         .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
@@ -1015,13 +1037,16 @@ async fn discover_peers(
 
 fn select_annual_eps(
     selected: &market_squawk_data::SecResearchSelection,
-) -> Result<(u32, &FundamentalObservation), ServiceError> {
-    let mut latest: Option<(u32, &FundamentalObservation)> = None;
+) -> Result<(u32, FundamentalObservation), ServiceError> {
+    let mut latest: Option<(u32, FundamentalObservation)> = None;
     for row in selected.selected() {
         let ordinal = row.row().row_ordinal();
-        let Some(ResearchObservation::Fundamental(value)) =
-            selected.decoded_rows().get(ordinal as usize)
-        else {
+        let observation = selected
+            .decoded_rows()
+            .get(ordinal as usize)
+            .map_err(map_sec_research_error)?
+            .ok_or(ServiceError::InvalidResult)?;
+        let ResearchObservation::Fundamental(value) = observation else {
             continue;
         };
         if value.concept().as_str() != "us-gaap:EarningsPerShareDiluted"
@@ -1032,7 +1057,7 @@ fn select_annual_eps(
         {
             continue;
         }
-        match latest {
+        match latest.as_ref() {
             Some((_, previous))
                 if previous.fact_context().period().end() > value.fact_context().period().end() => {
             }
@@ -1041,7 +1066,7 @@ fn select_annual_eps(
                     == value.fact_context().period().end() =>
             {
                 // No row-order preference can hide differing filing, dimension or value evidence.
-                if previous != value {
+                if previous != &value {
                     return Err(ServiceError::Unavailable);
                 }
             }
@@ -1133,7 +1158,8 @@ fn map_sec_research_error(error: market_squawk_data::SecResearchReadError) -> Se
         E::Cancelled => ServiceError::Cancelled,
         E::DeadlineExceeded => ServiceError::DeadlineExceeded,
         E::AuthorityUnavailable => ServiceError::Unavailable,
-        E::ObjectBudgetExceeded => ServiceError::ResourceExhausted,
+        E::Index(_) => ServiceError::Internal,
+        E::ObjectBudgetExceeded | E::SpillBudgetExceeded => ServiceError::ResourceExhausted,
         E::OriginMismatch
         | E::ProviderBindingMismatch
         | E::PointInTimeSelection
@@ -1142,9 +1168,9 @@ fn map_sec_research_error(error: market_squawk_data::SecResearchReadError) -> Se
         E::CompanySecurity(error) => map_company_identity_error(error),
         E::Manifest(error) => map_research_error(crate::ResearchServiceError::Manifest(error)),
         E::Catalog(error) => map_research_error(crate::ResearchServiceError::Catalog(error)),
-        E::Parquet(error) => {
-            map_research_error(crate::ResearchServiceError::Ingest(IngestError::Parquet(error)))
-        }
+        E::Parquet(error) => map_research_error(crate::ResearchServiceError::Ingest(
+            IngestError::Parquet(error),
+        )),
         E::RawStore(error) => {
             map_research_error(crate::ResearchServiceError::ProviderCaptureStore(error))
         }

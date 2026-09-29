@@ -1,6 +1,6 @@
 //! Atomic replay materialization, valuation, identity, and retained-size checks.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 
 use market_squawk_data::{AdjustmentStep, CorporateActionPlan};
@@ -17,9 +17,11 @@ use crate::evidence::{
     BasisMeasurement, CashBalance, CorporateActionBinding, FeatureBinding, PortfolioRevision,
     PortfolioRevisionId, Position, RevisionEvidence, ValuationSet,
 };
+use crate::ledger::snapshot::{LedgerSnapshot, check_cancelled};
 use crate::lots::{Lot, LotDirection, LotSelection};
 use crate::transaction::{LedgerEntry, LedgerEntryKind};
 use crate::{PortfolioError, PortfolioLimits, checked_decimal_add, checked_decimal_sub};
+use tokio_util::sync::CancellationToken;
 
 #[allow(
     clippy::too_many_arguments,
@@ -29,26 +31,15 @@ pub(crate) fn build_revision(
     account_id: AccountId,
     base_currency: Currency,
     limits: PortfolioLimits,
-    active_entries: &BTreeMap<SourceIdentifier, LedgerEntry>,
-    seen_revisions: &BTreeSet<(SourceIdentifier, u32)>,
+    snapshot: &LedgerSnapshot,
     plan: Option<&CorporateActionPlan>,
     previous_revision: Option<&PortfolioRevision>,
     valuation: ValuationSet,
     evidence: RevisionEvidence,
+    cancellation: &CancellationToken,
 ) -> Result<PortfolioRevision, PortfolioError> {
+    snapshot.verify(cancellation)?;
     let previous_revision_id = previous_revision.map(PortfolioRevision::id);
-    let mut ordered = active_entries.values().cloned().collect::<Vec<_>>();
-    ordered.sort_unstable_by(|left, right| {
-        left.account_id
-            .cmp(&right.account_id)
-            .then_with(|| left.occurred_at.cmp(&right.occurred_at))
-            .then_with(|| left.source.cmp(&right.source))
-            .then_with(|| {
-                left.transaction
-                    .transaction_id
-                    .cmp(&right.transaction.transaction_id)
-            })
-    });
     let mut state = ReplayState::default();
     let action_count = plan.map_or(0, |value| value.steps().len());
     if action_count > limits.max_results {
@@ -60,7 +51,6 @@ pub(crate) fn build_revision(
     }
     let operation_count = action_count
         .checked_mul(2)
-        .and_then(|count| count.checked_add(ordered.len()))
         .ok_or(PortfolioError::Arithmetic)?;
     let replay_bytes = operation_count
         .checked_mul(size_of::<ReplayOperation<'_>>())
@@ -73,7 +63,6 @@ pub(crate) fn build_revision(
     operations
         .try_reserve_exact(operation_count)
         .map_err(|_| PortfolioError::AllocationFailed)?;
-    operations.extend(ordered.iter().map(ReplayOperation::Entry));
     if let Some(plan) = plan {
         ReplayState::validate_plan(plan)?;
         for step in plan.steps() {
@@ -111,27 +100,30 @@ pub(crate) fn build_revision(
         }
     }
     operations.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
+    let corporate_actions = plan
+        .into_iter()
+        .map(CorporateActionBinding::from_plan)
+        .collect::<Vec<_>>();
+    let mut identity =
+        revision_identity_prefix(account_id, base_currency, previous_revision_id, &evidence);
+    let mut operations = operations.into_iter().peekable();
+    snapshot.visit_ordered(cancellation, |entry| {
+        let entry_key = ReplayOperation::Entry(entry);
+        while operations
+            .peek()
+            .is_some_and(|operation| operation.key() < entry_key.key())
+        {
+            if let Some(operation) = operations.next() {
+                apply_operation(&mut state, operation, limits, cancellation)?;
+            }
+        }
+        hash_entry(&mut identity, entry);
+        apply_operation(&mut state, entry_key, limits, cancellation)
+    })?;
     for operation in operations {
-        match operation {
-            ReplayOperation::Entry(entry) => state.apply_entry(entry)?,
-            ReplayOperation::Action { plan, step, .. } => state.apply_step(plan, step)?,
-            ReplayOperation::CashSettlement { index, .. } => state.settle_cash(index)?,
-        }
-        if state.cash_entitlements.len() > limits.max_results {
-            return Err(PortfolioError::LimitExceeded {
-                resource: "cash entitlements",
-                observed: state.cash_entitlements.len(),
-                limit: limits.max_results,
-            });
-        }
-        if state.lots.len() > limits.max_lots {
-            return Err(PortfolioError::LimitExceeded {
-                resource: "lots",
-                observed: state.lots.len(),
-                limit: limits.max_lots,
-            });
-        }
+        apply_operation(&mut state, operation, limits, cancellation)?;
     }
+    let id = finish_revision_identity(identity, &corporate_actions, &valuation);
     let positions = build_positions(&state.lots, &valuation, limits)?;
     let cash = state.cash.total(&valuation)?;
     let receivable_value = state.receivable_value(&valuation)?;
@@ -212,25 +204,11 @@ pub(crate) fn build_revision(
     let unrealized_gain = aggregate_basis_measurement(&positions, base_currency, |position| {
         position.unrealized_gain
     })?;
-    let corporate_actions = plan
-        .into_iter()
-        .map(CorporateActionBinding::from_plan)
-        .collect::<Vec<_>>();
-    let id = revision_id(
-        account_id,
-        base_currency,
-        previous_revision_id,
-        &ordered,
-        &corporate_actions,
-        &valuation,
-        &evidence,
-    );
     let retained_bytes = estimate_retained(
         &positions,
         &cash_balances,
         &cash_entitlements,
-        active_entries,
-        seen_revisions,
+        snapshot,
         plan,
         &evidence,
     )?;
@@ -270,11 +248,39 @@ pub(crate) fn build_revision(
         evidence,
         corporate_actions,
         retained_bytes,
-        active_entries: active_entries.clone(),
-        seen_revisions: seen_revisions.clone(),
+        snapshot: snapshot.clone(),
         plan: plan.cloned(),
         limits,
     })
+}
+
+fn apply_operation(
+    state: &mut ReplayState,
+    operation: ReplayOperation<'_>,
+    limits: PortfolioLimits,
+    cancellation: &CancellationToken,
+) -> Result<(), PortfolioError> {
+    check_cancelled(cancellation)?;
+    match operation {
+        ReplayOperation::Entry(entry) => state.apply_entry(entry)?,
+        ReplayOperation::Action { plan, step, .. } => state.apply_step(plan, step)?,
+        ReplayOperation::CashSettlement { index, .. } => state.settle_cash(index)?,
+    }
+    if state.cash_entitlements.len() > limits.max_results {
+        return Err(PortfolioError::LimitExceeded {
+            resource: "cash entitlements",
+            observed: state.cash_entitlements.len(),
+            limit: limits.max_results,
+        });
+    }
+    if state.lots.len() > limits.max_lots {
+        return Err(PortfolioError::LimitExceeded {
+            resource: "lots",
+            observed: state.lots.len(),
+            limit: limits.max_lots,
+        });
+    }
+    Ok(())
 }
 
 enum ReplayOperation<'a> {
@@ -424,15 +430,12 @@ fn aggregate_basis_measurement(
     )
 }
 
-fn revision_id(
+fn revision_identity_prefix(
     account_id: AccountId,
     base_currency: Currency,
     previous: Option<PortfolioRevisionId>,
-    entries: &[LedgerEntry],
-    actions: &[CorporateActionBinding],
-    valuation: &ValuationSet,
     evidence: &RevisionEvidence,
-) -> PortfolioRevisionId {
+) -> Sha256 {
     let mut digest = Sha256::new();
     digest.update(b"market-squawk-portfolio-revision-v3\0action-before-entry\0");
     digest.update(account_id.as_uuid().as_bytes());
@@ -456,59 +459,65 @@ fn revision_id(
         digest.update(feature.key.version().get().to_be_bytes());
         digest.update(feature.semantic_digest.as_bytes());
     }
-    for entry in entries {
-        hash_bytes(
-            &mut digest,
-            entry.transaction.transaction_id.as_str().as_bytes(),
-        );
-        digest.update(entry.transaction.revision.get().to_be_bytes());
-        digest.update(
-            entry
-                .transaction
-                .supersedes
-                .map_or(0_u32, RevisionNumber::get)
-                .to_be_bytes(),
-        );
-        digest.update(entry.occurred_at.unix_nanos().to_be_bytes());
-        hash_bytes(&mut digest, entry.source.as_str().as_bytes());
-        if let Some(normalized) = &entry.normalized_evidence {
-            hash_normalized_transaction_evidence(&mut digest, normalized);
-        } else {
-            digest.update([0]);
-        }
-        match &entry.kind {
-            LedgerEntryKind::Trade(trade) => {
-                digest.update([trade.side as u8]);
-                digest.update(trade.instrument_id.as_uuid().as_bytes());
-                hash_decimal(&mut digest, trade.quantity);
-                hash_money(&mut digest, trade.price);
-                hash_money(&mut digest, trade.fee);
-                digest.update([u8::from(trade.executed_notional.is_some())]);
-                if let Some(value) = trade.executed_notional {
-                    hash_money(&mut digest, value);
-                }
-                match &trade.lot_selection {
-                    LotSelection::Fifo => digest.update([0]),
-                    LotSelection::Lifo => digest.update([1]),
-                    LotSelection::AverageCost => digest.update([2]),
-                    LotSelection::SpecificIdentification(ids) => {
-                        digest.update([3]);
-                        for id in ids {
-                            hash_bytes(&mut digest, id.as_str().as_bytes());
-                        }
+    digest
+}
+
+fn hash_entry(digest: &mut Sha256, entry: &LedgerEntry) {
+    hash_bytes(digest, entry.transaction.transaction_id.as_str().as_bytes());
+    digest.update(entry.transaction.revision.get().to_be_bytes());
+    digest.update(
+        entry
+            .transaction
+            .supersedes
+            .map_or(0_u32, RevisionNumber::get)
+            .to_be_bytes(),
+    );
+    digest.update(entry.occurred_at.unix_nanos().to_be_bytes());
+    hash_bytes(digest, entry.source.as_str().as_bytes());
+    if let Some(normalized) = &entry.normalized_evidence {
+        hash_normalized_transaction_evidence(digest, normalized);
+    } else {
+        digest.update([0]);
+    }
+    match &entry.kind {
+        LedgerEntryKind::Trade(trade) => {
+            digest.update([trade.side as u8]);
+            digest.update(trade.instrument_id.as_uuid().as_bytes());
+            hash_decimal(digest, trade.quantity);
+            hash_money(digest, trade.price);
+            hash_money(digest, trade.fee);
+            digest.update([u8::from(trade.executed_notional.is_some())]);
+            if let Some(value) = trade.executed_notional {
+                hash_money(digest, value);
+            }
+            match &trade.lot_selection {
+                LotSelection::Fifo => digest.update([0]),
+                LotSelection::Lifo => digest.update([1]),
+                LotSelection::AverageCost => digest.update([2]),
+                LotSelection::SpecificIdentification(ids) => {
+                    digest.update([3]);
+                    for id in ids {
+                        hash_bytes(digest, id.as_str().as_bytes());
                     }
                 }
             }
-            LedgerEntryKind::CashFlow(flow) => {
-                digest.update([10_u8.saturating_add(flow.kind as u8)]);
-                hash_money(&mut digest, flow.amount);
-                digest.update(
-                    flow.instrument_id
-                        .map_or([0_u8; 16], |instrument| *instrument.as_uuid().as_bytes()),
-                );
-            }
+        }
+        LedgerEntryKind::CashFlow(flow) => {
+            digest.update([10_u8.saturating_add(flow.kind as u8)]);
+            hash_money(digest, flow.amount);
+            digest.update(
+                flow.instrument_id
+                    .map_or([0_u8; 16], |instrument| *instrument.as_uuid().as_bytes()),
+            );
         }
     }
+}
+
+fn finish_revision_identity(
+    mut digest: Sha256,
+    actions: &[CorporateActionBinding],
+    valuation: &ValuationSet,
+) -> PortfolioRevisionId {
     for action in actions {
         digest.update(action.policy_version.to_be_bytes());
         digest.update(action.content_identity.bytes());
@@ -604,8 +613,7 @@ fn estimate_retained(
     positions: &[Position],
     cash_balances: &[CashBalance],
     cash_entitlements: &[crate::CashEntitlement],
-    active_entries: &BTreeMap<SourceIdentifier, LedgerEntry>,
-    seen_revisions: &BTreeSet<(SourceIdentifier, u32)>,
+    snapshot: &LedgerSnapshot,
     plan: Option<&CorporateActionPlan>,
     evidence: &RevisionEvidence,
 ) -> Result<usize, PortfolioError> {
@@ -631,14 +639,7 @@ fn estimate_retained(
         lot_count
             .checked_mul(size_of::<Lot>())
             .ok_or(PortfolioError::Arithmetic)?,
-        active_entries
-            .len()
-            .checked_mul(size_of::<(SourceIdentifier, LedgerEntry)>())
-            .ok_or(PortfolioError::Arithmetic)?,
-        seen_revisions
-            .len()
-            .checked_mul(size_of::<(SourceIdentifier, u32)>())
-            .ok_or(PortfolioError::Arithmetic)?,
+        snapshot.retained_bytes()?,
         evidence
             .sources
             .capacity()
@@ -657,11 +658,6 @@ fn estimate_retained(
     if let Some(plan) = plan {
         retained = retained
             .checked_add(plan.retained_bytes())
-            .ok_or(PortfolioError::Arithmetic)?;
-    }
-    for id in active_entries.keys() {
-        retained = retained
-            .checked_add(id.retained_bytes())
             .ok_or(PortfolioError::Arithmetic)?;
     }
     Ok(retained)

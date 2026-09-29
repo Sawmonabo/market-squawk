@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     io::{Read as _, Write as _},
-    ops::Bound::{Included, Unbounded},
+    ops::Bound::{Excluded, Included, Unbounded},
     sync::Mutex,
 };
 
@@ -184,6 +184,32 @@ struct LogState {
     index: LogIndex,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LogReadCursor {
+    version: u8,
+    through_sequence: u64,
+    retained_first_sequence: u64,
+    after_sequence: u64,
+    query_digest: [u8; 32],
+}
+
+fn query_digest(query: &StructuredLogQuery) -> Result<[u8; 32], StructuredLogError> {
+    serde_json::to_vec(&(
+        "structured-log-page-v1",
+        query.from,
+        query.through,
+        query.minimum_severity,
+        query.domain,
+        &query.source_id,
+        &query.job_id,
+        &query.correlation_id,
+        &query.search,
+    ))
+    .map(|bytes| Sha256::digest(bytes).into())
+    .map_err(|_| StructuredLogError::Encoding)
+}
+
 /// Exclusive structured-log owner over one retained control-root capability.
 pub struct StructuredLogStore {
     directory: Dir,
@@ -273,7 +299,55 @@ impl StructuredLogStore {
             .state
             .lock()
             .map_err(|_| StructuredLogError::Unavailable)?;
-        let start = query.from.map_or(Unbounded, |value| Included((value, 0)));
+        let query_digest = query_digest(query)?;
+        let retained_first_sequence = state
+            .index
+            .records
+            .first_key_value()
+            .map_or(state.next_sequence, |(sequence, _)| *sequence);
+        let latest_sequence = state.next_sequence.saturating_sub(1);
+        let cursor = query
+            .cursor
+            .as_ref()
+            .map(|encoded| {
+                let cursor: LogReadCursor =
+                    serde_json::from_str(encoded).map_err(|_| StructuredLogError::InvalidQuery)?;
+                if cursor.version != 1
+                    || cursor.query_digest != query_digest
+                    || cursor.through_sequence > latest_sequence
+                    || cursor.after_sequence > cursor.through_sequence
+                {
+                    return Err(StructuredLogError::InvalidQuery);
+                }
+                if cursor.retained_first_sequence != retained_first_sequence {
+                    return Err(StructuredLogError::Unavailable);
+                }
+                Ok(cursor)
+            })
+            .transpose()?;
+        let through_sequence = cursor
+            .as_ref()
+            .map_or(latest_sequence, |cursor| cursor.through_sequence);
+        let after_sequence = cursor.as_ref().map_or(0, |cursor| cursor.after_sequence);
+        let start = if after_sequence != 0 {
+            let previous = state
+                .index
+                .records
+                .get(&after_sequence)
+                .ok_or(StructuredLogError::InvalidQuery)?;
+            if query
+                .from
+                .is_some_and(|from| previous.record.event.observed_at < from)
+                || query
+                    .through
+                    .is_some_and(|through| previous.record.event.observed_at > through)
+            {
+                return Err(StructuredLogError::InvalidQuery);
+            }
+            Excluded((previous.record.event.observed_at, after_sequence))
+        } else {
+            query.from.map_or(Unbounded, |value| Included((value, 0)))
+        };
         let end = query
             .through
             .map_or(Unbounded, |value| Included((value, u64::MAX)));
@@ -282,9 +356,10 @@ impl StructuredLogStore {
             .try_reserve_exact(query.limit.saturating_add(1))
             .map_err(|_| StructuredLogError::Allocation)?;
         for (_, sequence) in state.index.by_time.range((start, end)) {
-            if query.after_sequence.is_some_and(|after| *sequence <= after)
-                || !state.index.matches_dimensions(*sequence, query)
-            {
+            if *sequence > through_sequence {
+                break;
+            }
+            if !state.index.matches_dimensions(*sequence, query) {
                 continue;
             }
             let indexed = state
@@ -301,12 +376,25 @@ impl StructuredLogStore {
         }
         let has_more = records.len() > query.limit;
         records.truncate(query.limit);
-        let next_after_sequence = has_more
-            .then(|| records.last().map(StructuredLogRecord::sequence))
-            .flatten();
+        let next_cursor = has_more
+            .then(|| {
+                let after_sequence = records
+                    .last()
+                    .ok_or(StructuredLogError::CorruptStore)?
+                    .sequence();
+                serde_json::to_string(&LogReadCursor {
+                    version: 1,
+                    through_sequence,
+                    retained_first_sequence,
+                    after_sequence,
+                    query_digest,
+                })
+                .map_err(|_| StructuredLogError::Encoding)
+            })
+            .transpose()?;
         Ok(StructuredLogPage {
             records,
-            next_after_sequence,
+            next_cursor,
         })
     }
 
@@ -319,12 +407,12 @@ impl StructuredLogStore {
         deadline: std::time::Instant,
     ) -> Result<DiagnosticArtifactReceipt, StructuredLogError> {
         query.limit = query.limit.min(MAXIMUM_QUERY_LIMIT);
-        let mut cursor = query.after_sequence;
+        let mut cursor = query.cursor.clone();
         let mut bytes = Vec::new();
         let mut record_count = 0usize;
         loop {
             ensure_export_live(&cancellation, deadline)?;
-            query.after_sequence = cursor;
+            query.cursor = cursor;
             let page = self.query(&query)?;
             for record in &page.records {
                 ensure_export_live(&cancellation, deadline)?;
@@ -338,7 +426,7 @@ impl StructuredLogStore {
                     return Err(StructuredLogError::ExportTooLarge);
                 }
             }
-            match page.next_after_sequence {
+            match page.next_cursor {
                 Some(next) => cursor = Some(next),
                 None => break,
             }

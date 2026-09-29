@@ -934,9 +934,7 @@ mod tests {
         RESULT_AUTHORITY_IDENTITY, TrainingJobRunner, WORKER_IDENTITY, identifier,
         namespace_digest,
     };
-    use crate::application::model::runtime::{
-        ProductionModelRuntime, ProductionModelRuntimeLimits,
-    };
+    use crate::application::model::runtime::ProductionModelRuntime;
     use crate::{
         application::{
             job::{JobApplication, JobReceipt, JobView},
@@ -973,6 +971,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(temporary.path().join("market-squawk"))?;
         let runtime = Arc::new(ProductionModelRuntime::test_fixture(&paths, None)?);
+        let retained_runtime = runtime.snapshot()?;
         let model = ModelDomainService::try_from_runtime_snapshot(
             runtime.snapshot()?,
             std::num::NonZeroUsize::new(8).ok_or("nonzero evaluation capacity")?,
@@ -1048,10 +1047,7 @@ mod tests {
         jobs.shutdown_repository().await?;
         drop(application);
         drop(jobs);
-        assert!(!ProductionModelRuntime::has_durable_admissions(
-            &paths,
-            ProductionModelRuntimeLimits::standard()?,
-        )?);
+        assert!(retained_runtime.is_empty());
         Ok(())
     }
 

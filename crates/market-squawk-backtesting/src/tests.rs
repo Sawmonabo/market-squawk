@@ -205,8 +205,8 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
-    assert_eq!(result.fills().len(), 2);
-    let fill = &result.fills()[0];
+    assert_eq!(result.fills()?.len(), 2);
+    let fill = &result.fills()?[0];
     assert_eq!(fill.signal_at(), Timestamp::from_unix_nanos(10));
     assert_eq!(fill.executed_at(), Timestamp::from_unix_nanos(20));
     assert_eq!(fill.quantity(), QuantityLots::new(2)?);
@@ -221,7 +221,7 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
     assert_eq!(
         result.portfolio().fees().amount(),
         result
-            .fills()
+            .fills()?
             .iter()
             .map(|fill| fill.fee().amount())
             .sum::<Decimal>()
@@ -249,8 +249,8 @@ fn competing_intents_share_one_observation_liquidity_budget() -> TestResult {
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
     let contested_fills = result
-        .fills()
-        .iter()
+        .fills()?
+        .into_iter()
         .filter(|fill| fill.executed_at() == Timestamp::from_unix_nanos(20))
         .collect::<Vec<_>>();
     assert_eq!(contested_fills.len(), 1);
@@ -270,7 +270,7 @@ fn immediate_time_in_force_is_terminal_while_gtc_survives_an_unfilled_attempt() 
     let terms = execution_terms()?;
     assert!(
         run_with_time_in_force(account_id, dataset(terms)?, TimeInForce::FillOrKill)?
-            .fills()
+            .fills()?
             .is_empty()
     );
     let delayed_liquidity = dataset_with_depths(terms, [10, 0, 10])?;
@@ -280,24 +280,24 @@ fn immediate_time_in_force_is_terminal_while_gtc_survives_an_unfilled_attempt() 
             delayed_liquidity.clone(),
             TimeInForce::ImmediateOrCancel,
         )?
-        .fills()
+        .fills()?
         .is_empty()
     );
     let good_til_cancelled_result =
         run_with_time_in_force(account_id, delayed_liquidity, TimeInForce::GoodTilCancelled)?;
-    assert_eq!(good_til_cancelled_result.fills().len(), 1);
+    assert_eq!(good_til_cancelled_result.fills()?.len(), 1);
     assert_eq!(
-        good_til_cancelled_result.fills()[0].executed_at(),
+        good_til_cancelled_result.fills()?[0].executed_at(),
         Timestamp::from_unix_nanos(30)
     );
 
     let partial_liquidity = dataset_with_depths(terms, [10, 2, 2])?;
     for time_in_force in [TimeInForce::Day, TimeInForce::GoodTilCancelled] {
         let result = run_with_time_in_force(account_id, partial_liquidity.clone(), time_in_force)?;
-        assert_eq!(result.fills().len(), 2);
+        assert_eq!(result.fills()?.len(), 2);
         assert_eq!(
             result
-                .fills()
+                .fills()?
                 .iter()
                 .map(|fill| fill.quantity().get())
                 .sum::<i64>(),
@@ -309,11 +309,11 @@ fn immediate_time_in_force_is_terminal_while_gtc_survives_an_unfilled_attempt() 
         partial_liquidity.clone(),
         TimeInForce::ImmediateOrCancel,
     )?;
-    assert_eq!(immediate.fills().len(), 1);
-    assert_eq!(immediate.fills()[0].quantity(), QuantityLots::new(2)?);
+    assert_eq!(immediate.fills()?.len(), 1);
+    assert_eq!(immediate.fills()?[0].quantity(), QuantityLots::new(2)?);
     assert!(
         run_with_time_in_force(account_id, partial_liquidity, TimeInForce::FillOrKill)?
-            .fills()
+            .fills()?
             .is_empty()
     );
     Ok(())
@@ -371,7 +371,7 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
     let TrialStatus::Completed(completion) = result.trial().status() else {
         return Err("expected completed terminal".into());
     };
-    assert_eq!(result.run().fills().len(), 2);
+    assert_eq!(result.run().fills()?.len(), 2);
     assert_eq!(completion.metrics().len(), 8);
     assert_eq!(
         completion
@@ -398,6 +398,25 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
             .path()
             .join(completion.artifact().reference())
             .is_file()
+    );
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        temporary.path().join(completion.artifact().reference()),
+    )?)?;
+    let expected_marks = result
+        .run()
+        .equity_marks()
+        .map(|mark| mark.map(|value| value.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        report["equity_marks"],
+        serde_json::to_value(expected_marks)?
+    );
+    assert_eq!(
+        report["fills"]
+            .as_array()
+            .ok_or("missing complete fills")?
+            .len(),
+        result.run().fill_count()
     );
     Ok(())
 }
@@ -752,9 +771,12 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         observations: dataset
             .observations
             .iter()
-            .filter(|row| row.instrument_id() != accompanying_terms.instrument_id())
-            .cloned()
-            .collect(),
+            .filter(|row| {
+                row.as_ref().map_or(true, |row| {
+                    row.instrument_id() != accompanying_terms.instrument_id()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     })?;
     without_accompanying.study_qualification = Some(qualification);
     let missing = RecommendationBacktestKernelV1::run_study(
@@ -784,6 +806,7 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         .observations
         .iter()
         .map(|observation| -> Result<_, Box<dyn Error>> {
+            let observation = observation?;
             Ok(crate::dataset::BacktestDailyBar {
                 execution_terms: observation.execution_terms,
                 starts_at: observation.decision_at().checked_sub_nanos(5)?,
@@ -820,7 +843,7 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
     daily_bars.sort_unstable_by_key(|bar| (bar.ends_at, bar.execution_terms.instrument_id()));
     daily_dataset.daily_history = Some(crate::dataset::BacktestDailyHistory {
         nominal_sources: Box::new([]),
-        bars: daily_bars.into_boxed_slice(),
+        bars: crate::dataset::history_store::DailyBarStore::from_bars(daily_bars)?,
         digest: Sha256Digest::new([71; 32]),
         available_at: Timestamp::from_unix_nanos(cutoff + 1),
     });
@@ -861,8 +884,11 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         .daily_history
         .as_mut()
         .ok_or("daily fixture")?;
-    let first_bar = history
+    let mut bars = history
         .bars
+        .from(Timestamp::from_unix_nanos(i64::MIN))
+        .collect::<Result<Vec<_>, _>>()?;
+    let first_bar = bars
         .iter_mut()
         .find(|bar| {
             bar.execution_terms.instrument_id() == subject_terms.instrument_id()
@@ -870,6 +896,7 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         })
         .ok_or("first eligible daily fixture")?;
     first_bar.traded_volume = Decimal::new(5, 1);
+    history.bars = crate::dataset::history_store::DailyBarStore::from_bars(bars)?;
     let insufficient = RecommendationBacktestKernelV1::run_study(
         &daily_dataset,
         daily_policy,
@@ -1163,9 +1190,17 @@ fn recommendation_materialization_issues_sequentially_from_coordinate_local_pit_
     );
     let mut retrospective_dataset = dataset.clone();
     retrospective_dataset.study_qualification = Some(retrospective);
-    for observation in retrospective_dataset.observations.iter_mut() {
-        observation.source_selection_as_of = retrospective.snapshot_as_of();
-    }
+    let observations = retrospective_dataset
+        .observations
+        .iter()
+        .map(|value| {
+            let mut value = value?;
+            value.source_selection_as_of = retrospective.snapshot_as_of();
+            Ok::<_, BacktestError>(value)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    retrospective_dataset.observations =
+        crate::dataset::observation_store::ObservationStore::from_observations(observations)?;
     let retrospective_policy =
         RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
             study_qualification: retrospective,
@@ -1919,8 +1954,8 @@ fn corporate_action_state_is_visible_at_event_time_and_independently_reconciled(
         result.accounting_reconciliation(),
         AccountingReconciliation::Independent
     );
-    assert_eq!(result.fills().len(), 1);
-    assert_eq!(result.fills()[0].quantity().get(), 3);
+    assert_eq!(result.fills()?.len(), 1);
+    assert_eq!(result.fills()?[0].quantity().get(), 3);
     // Three units become nine, then exactly three. Dividing 1 by 3 first loses decimal units.
     assert_eq!(strategy.last_position, Decimal::from(3));
     assert_eq!(
@@ -1944,7 +1979,7 @@ fn typed_model_failure_is_audited_no_action() -> TestResult {
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
-    assert!(result.fills().is_empty());
+    assert!(result.fills()?.is_empty());
     assert_eq!(result.no_action_count(), 3);
     assert!(result.portfolio().positions().is_empty());
     Ok(())

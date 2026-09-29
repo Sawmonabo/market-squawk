@@ -38,6 +38,7 @@ use crate::schema::{
 const OBJECTS: &str = "objects/sha256";
 const STAGING: &str = "staging/parquet";
 const QUARANTINE: &str = "quarantine/parquet";
+const OPERATION_SCRATCH: &str = "staging/operations";
 pub(crate) const MAX_SCAN_OBJECTS: usize = 100_000;
 const MAX_BLOCKING_TASKS: usize = 4;
 const QUERY_WRITER_FIXED_RECEIPT: usize = 128 * 1024;
@@ -50,6 +51,12 @@ const MAX_REPLAY_PUBLICATION_OBJECTS: usize = 32;
 // Each retained provider capture is already capped at 100,000 canonical rows. Keep the generic
 // replay primitive independently bounded even if a future caller bypasses that upstream check.
 const MAX_REPLAY_PUBLICATION_ROWS: u64 = 3_200_000;
+#[path = "parquet_store/cursor.rs"]
+mod cursor;
+pub use cursor::PinnedBatchCursor;
+#[path = "parquet_store/streaming.rs"]
+mod streaming;
+pub(crate) use streaming::StreamingParquetWriter;
 #[path = "parquet_store/authority.rs"]
 mod authority;
 #[path = "parquet_store/pinned.rs"]
@@ -69,6 +76,31 @@ pub(crate) use authority::{
 };
 pub(crate) use pinned::VerifiedPinnedObject;
 pub use recovery::OrphanRecoveryReport;
+
+/// Private disposable operation storage, retained until the last active computation releases it.
+/// Root authority outlives the directory so restart cleanup cannot race an active spool.
+#[derive(Debug)]
+pub struct OperationScratchDirectory {
+    directory: tempfile::TempDir,
+    _authority: Option<Arc<RootAuthority>>,
+}
+
+impl OperationScratchDirectory {
+    /// Returns the private directory for operation-local indexes and native spill files.
+    pub fn path(&self) -> &std::path::Path {
+        self.directory.path()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> std::io::Result<Self> {
+        Ok(Self {
+            directory: tempfile::Builder::new()
+                .prefix("market-squawk-query-")
+                .tempdir()?,
+            _authority: None,
+        })
+    }
+}
 
 /// Fixed resource policy for local Parquet publication.
 #[derive(Clone, Copy, Debug)]
@@ -303,6 +335,7 @@ impl ParquetObjectStore {
             sync_directory(&activated.directory, path)?;
         }
         sync_directory(&activated.directory, ".")?;
+        clean_operation_scratch(&activated.directory)?;
         Ok(Self {
             root: activated.root,
             directory: activated.directory,
@@ -360,12 +393,31 @@ impl ParquetObjectStore {
             sync_directory(&directory, path)?;
         }
         sync_directory(&directory, ".")?;
+        clean_operation_scratch(&directory)?;
         Ok(Self {
             root,
             directory,
             config,
             blocking_tasks: Arc::new(Semaphore::new(MAX_BLOCKING_TASKS)),
             authority,
+        })
+    }
+
+    /// Creates an operation-private directory reclaimed on drop and after a crashed process.
+    pub fn operation_scratch(&self) -> Result<OperationScratchDirectory, ParquetStoreError> {
+        // Validate the retained root before using the path API required by DataFusion/tempfile.
+        let directory = self
+            .root
+            .try_clone_directory()
+            .map_err(map_artifact_root_clone_error)?;
+        directory.create_dir_all(OPERATION_SCRATCH)?;
+        let scratch = directory.open_dir(OPERATION_SCRATCH)?;
+        drop(scratch);
+        Ok(OperationScratchDirectory {
+            directory: tempfile::Builder::new()
+                .prefix("operation-")
+                .tempdir_in(self.root.root().join(OPERATION_SCRATCH))?,
+            _authority: Some(Arc::clone(&self.authority)),
         })
     }
 
@@ -404,6 +456,7 @@ impl ParquetObjectStore {
     pub(crate) fn query_artifact_writer_admission(
         &self,
         batch: &RecordBatch,
+        page_bytes: usize,
     ) -> Result<QueryArtifactWriterAdmission, ParquetStoreError> {
         let batch_bytes = batch
             .get_array_memory_size()
@@ -451,18 +504,13 @@ impl ParquetObjectStore {
             .and_then(|value| {
                 batch
                     .num_columns()
-                    .checked_mul(QUERY_WRITER_PAGE_BYTES)
+                    .checked_mul(page_bytes)
                     .and_then(|pages| value.checked_add(pages))
             })
             .ok_or(ParquetStoreError::SizeOverflow)?;
         let total_bytes = active_writer_bytes
             .checked_add(metadata_bytes)
             .ok_or(ParquetStoreError::SizeOverflow)?;
-        if u64::try_from(total_bytes).map_err(|_| ParquetStoreError::SizeOverflow)?
-            > self.config.max_staging_bytes
-        {
-            return Err(ParquetStoreError::StagingLimitExceeded);
-        }
         Ok(QueryArtifactWriterAdmission {
             active_writer_bytes,
             metadata_bytes,
@@ -492,43 +540,6 @@ impl ParquetObjectStore {
     ) -> Result<PublishedObject, ParquetStoreError> {
         self.publish_under_lease_inner(batch.record_batch(), cancellation, lease)
             .await
-    }
-
-    /// Encodes and hashes a registered dataset while retaining it outside the final namespace.
-    pub(crate) async fn stage_dataset_under_lease(
-        &self,
-        batch: &DatasetArrowBatch,
-        cancellation: &CancellationToken,
-        lease: &PublicationLease,
-    ) -> Result<StagedObject, ParquetStoreError> {
-        if !self.authority.publication.owns(lease) {
-            return Err(ParquetStoreError::InvalidPublicationLease);
-        }
-        let store = Self {
-            root: self.root.clone(),
-            directory: self.directory.try_clone()?,
-            config: self.config,
-            blocking_tasks: Arc::clone(&self.blocking_tasks),
-            authority: Arc::clone(&self.authority),
-        };
-        let batch = batch.record_batch().clone();
-        let permit = self.acquire_blocking_permit(cancellation).await?;
-        let operation_cancellation = cancellation.child_token();
-        let worker_cancellation = operation_cancellation.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            store.stage_blocking(&batch, &worker_cancellation, None)
-        });
-        tokio::select! {
-            result = &mut worker => {
-                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
-            }
-            _ = cancellation.cancelled() => {
-                operation_cancellation.cancel();
-                worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
-                Err(ParquetStoreError::Cancelled)
-            }
-        }
     }
 
     /// Streams one checked ordered object group into one immutable replacement object.
@@ -591,60 +602,6 @@ impl ParquetObjectStore {
             return Err(ParquetStoreError::InvalidPublicationLease);
         }
         self.finalize_staged(staged)
-    }
-
-    /// Publishes a query artifact only after a checked uncompressed-writer admission.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "query publication keeps every independently owned capability explicit"
-    )]
-    pub(crate) async fn publish_query_artifact_under_lease(
-        &self,
-        batch: RecordBatch,
-        cancellation: &CancellationToken,
-        lease: &PublicationLease,
-        admission: QueryArtifactWriterAdmission,
-        memory_lease: QueryArtifactMemoryLease,
-        supervisor: &BlockingIoSupervisor,
-        #[cfg(test)] writer_barrier: Option<crate::ingest::QueryArtifactWriterWorkerBarrier>,
-    ) -> Result<PublishedObject, ParquetStoreError> {
-        if !self.authority.publication.owns(lease)
-            || self.query_artifact_writer_admission(&batch)? != admission
-        {
-            return Err(ParquetStoreError::InvalidPublicationLease);
-        }
-        let store = Self {
-            root: self.root.clone(),
-            directory: self.directory.try_clone()?,
-            config: self.config,
-            blocking_tasks: Arc::clone(&self.blocking_tasks),
-            authority: Arc::clone(&self.authority),
-        };
-        let permit = self.acquire_blocking_permit(cancellation).await?;
-        let worker_cancellation = supervisor.cancellation().clone();
-        let mut worker = supervisor
-            .spawn_blocking(move || {
-                let _permit = permit;
-                let _memory_lease = memory_lease;
-                #[cfg(test)]
-                if let Some(barrier) = writer_barrier {
-                    barrier.wait();
-                }
-                store.publish_blocking(&batch, &worker_cancellation, Some(admission))
-            })
-            .map_err(|error| match error {
-                BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
-                BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
-                BlockingIoAdmissionError::ReaperUnavailable => {
-                    ParquetStoreError::BlockingTaskFailed
-                }
-            })?;
-        tokio::select! {
-            result = &mut worker => {
-                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
-            }
-            _ = cancellation.cancelled() => Err(ParquetStoreError::Cancelled),
-        }
     }
 
     async fn publish_under_lease_inner(
@@ -1092,11 +1049,6 @@ impl ParquetObjectStore {
             .checked_add(active_writer_bytes)
             .and_then(|value| value.checked_add(metadata_bytes))
             .ok_or(ParquetStoreError::SizeOverflow)?;
-        if u64::try_from(total_bytes).map_err(|_| ParquetStoreError::SizeOverflow)?
-            > self.config.max_staging_bytes
-        {
-            return Err(ParquetStoreError::StagingLimitExceeded);
-        }
         Ok(ReplayPublicationAdmission {
             max_decoded_batch_bytes,
             active_writer_bytes,
@@ -1560,59 +1512,6 @@ impl ParquetObjectStore {
         }
     }
 
-    /// Reads one immutable generation only after caller-selected row and Arrow-memory admission.
-    pub(crate) async fn read_pinned_bounded_async(
-        &self,
-        dataset: &PinnedDataset,
-        max_rows: usize,
-        max_retained_bytes: usize,
-        cancellation: &CancellationToken,
-    ) -> Result<Vec<RecordBatch>, ParquetStoreError> {
-        if max_rows == 0 || max_retained_bytes == 0 {
-            return Err(ParquetStoreError::ReadLimitExceeded);
-        }
-        let store = Self {
-            root: self.root.clone(),
-            directory: self.directory.try_clone()?,
-            config: self.config,
-            blocking_tasks: Arc::clone(&self.blocking_tasks),
-            authority: Arc::clone(&self.authority),
-        };
-        let dataset = dataset.clone();
-        let permit = self.acquire_blocking_permit(cancellation).await?;
-        let operation_cancellation = cancellation.child_token();
-        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
-        let worker_cancellation = operation_cancellation.clone();
-        let supervisor = BlockingIoSupervisor::new(operation_cancellation);
-        let max_rows = u64::try_from(max_rows).map_err(|_| ParquetStoreError::SizeOverflow)?;
-        let mut worker = supervisor
-            .spawn_blocking(move || {
-                let _permit = permit;
-                store.read_pinned_with_limits(
-                    &dataset,
-                    max_rows,
-                    max_retained_bytes,
-                    &worker_cancellation,
-                )
-            })
-            .map_err(|error| match error {
-                BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
-                BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
-                BlockingIoAdmissionError::ReaperUnavailable => {
-                    ParquetStoreError::BlockingTaskFailed
-                }
-            })?;
-        tokio::select! {
-            result = &mut worker => {
-                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
-            }
-            _ = cancellation.cancelled() => {
-                supervisor.cancel();
-                Err(ParquetStoreError::Cancelled)
-            }
-        }
-    }
-
     /// Reads one exact catalog-pinned object under caller-selected row and Arrow-memory bounds.
     ///
     /// The artifact and ordinal are both required so an inherited or compacted generation cannot
@@ -1960,6 +1859,28 @@ impl Drop for StagingCleanup<'_> {
     }
 }
 
+// Called only after acquiring the exclusive process/root authority, before any query can run.
+// Only disposable query directories are touched; immutable objects and publication staging stay.
+fn clean_operation_scratch(directory: &Dir) -> Result<(), ParquetStoreError> {
+    let entries = match directory.read_dir(OPERATION_SCRATCH) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if entry.file_type()?.is_dir()
+            && name
+                .to_str()
+                .is_some_and(|name| name.starts_with("operation-"))
+        {
+            directory.remove_dir_all(std::path::Path::new(OPERATION_SCRATCH).join(name))?;
+        }
+    }
+    Ok(())
+}
+
 /// Immutable object storage failure.
 #[derive(Debug, Error)]
 pub enum ParquetStoreError {
@@ -1997,6 +1918,9 @@ pub enum ParquetStoreError {
     /// A batch or object exceeds the configured bounded staging area.
     #[error("Parquet staging byte limit exceeded")]
     StagingLimitExceeded,
+    /// A streaming writer exceeded its independent working-memory reservation.
+    #[error("Parquet writer memory limit {limit} exceeded")]
+    WriterMemoryLimitExceeded { limit: u64 },
     /// A bounded reader would exceed its caller-selected row or retained-memory ceiling.
     #[error("Parquet reader resource limit exceeded")]
     ReadLimitExceeded,

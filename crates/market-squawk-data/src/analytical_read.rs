@@ -30,23 +30,28 @@ mod corporate_action_source;
 mod current_ordinary;
 pub use corporate_action_source::{CorporateActionSourceReadError, CorporateActionSourceSnapshot};
 
+mod history_cursor;
 #[path = "analytical_read/history_sessions.rs"]
 mod history_sessions;
-pub use history_sessions::{RetainedHistoryNativeSession, RetainedHistoryNativeSessions};
+pub use history_cursor::CompleteMarketBarHistoryCursor;
+pub use history_sessions::{
+    RetainedHistoryNativeSession, RetainedHistoryNativeSessions, RetainedHistorySessionRows,
+};
 
 #[path = "analytical_read/forecast.rs"]
 mod forecast;
 #[path = "analytical_read/input_epoch.rs"]
 mod input_epoch;
 pub use input_epoch::{
-    FeatureDatasetInputCoordinate, FeatureDatasetInputEpochOutput,
+    FeatureDatasetInputCoordinate, FeatureDatasetInputCoordinateHandle,
+    FeatureDatasetInputEpochCursor, FeatureDatasetInputEpochOutput,
     OwnedFeatureDatasetInputCoordinate,
 };
 
 pub use forecast::{
     ForecastDatasetEvidence, ForecastDatasetEvidenceFence, ForecastDatasetReadLimits,
-    ForecastProbabilityOutcome,
-    ForecastFeatureRow, ForecastFeatureValue,
+    ForecastFeatureRow, ForecastFeatureRows, ForecastFeatureValue, ForecastProbabilityOutcome,
+    ForecastSortedDigests,
 };
 
 use crate::manifest::{
@@ -2312,6 +2317,55 @@ impl AnalyticalReadCapability {
             .map_err(Into::into)
     }
 
+    /// Opens a physical occurrence cursor for paged, read-only observation browsing.
+    /// Each reopened cursor holds only its selected immutable generation and active batch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact generation, physical position and independent read bounds"
+    )]
+    pub fn observation_batch_cursor(
+        &self,
+        manifest: &DatasetManifestRef,
+        start_object: usize,
+        start_row: u64,
+        projection: Option<&[&str]>,
+        batch_rows: usize,
+        max_batch_bytes: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::PinnedBatchCursor, AnalyticalReadError> {
+        AnalyticalObservationReadRequest::try_new(
+            manifest.clone(),
+            AnalyticalObservationTemplate::All,
+            Vec::new(),
+            None,
+        )?;
+        let (pinned, _, _) = self
+            .manifests
+            .read_exact(manifest, deadline, cancellation)?;
+        if let Some(columns) = projection {
+            self.objects.pinned_batch_cursor_from_projection(
+                &pinned,
+                start_object,
+                start_row,
+                columns,
+                batch_rows,
+                max_batch_bytes,
+                cancellation,
+            )
+        } else {
+            self.objects.pinned_batch_cursor_from(
+                &pinned,
+                start_object,
+                start_row,
+                batch_rows,
+                max_batch_bytes,
+                cancellation,
+            )
+        }
+        .map_err(Into::into)
+    }
+
     /// Executes one closed observation template over an exact pinned generation.
     pub async fn read_observations(
         &self,
@@ -2559,7 +2613,10 @@ impl AnalyticalReadCapability {
     }
 
     /// Reopens only the original saved history content hash under the existing canonical policy.
-    #[allow(clippy::too_many_arguments, reason = "exact identity and read controls stay explicit")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact identity and read controls stay explicit"
+    )]
     pub fn exact_canonical_market_bar_history_window(
         &self,
         instrument_id: market_squawk_domain::InstrumentId,
@@ -2569,9 +2626,16 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<CanonicalMarketBarHistoryRequest>, AnalyticalReadError> {
-        self.manifests.exact_canonical_market_bar_history_window(
-            instrument_id, selected_content_hash, policy, cutoff, deadline, cancellation,
-        ).map_err(Into::into)
+        self.manifests
+            .exact_canonical_market_bar_history_window(
+                instrument_id,
+                selected_content_hash,
+                policy,
+                cutoff,
+                deadline,
+                cancellation,
+            )
+            .map_err(Into::into)
     }
 
     /// Selects the latest complete canonical daily history window known at one cutoff.
@@ -2655,113 +2719,9 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<CompleteMarketBarHistoryOutput, AnalyticalReadError> {
-        let receipt = selection.receipt();
-        let (origin, origin_source, _) =
-            self.manifests
-                .read_exact(receipt.origin_manifest(), deadline, &cancellation)?;
-        let origin_ordinal = usize::from(receipt.origin_object_ordinal());
-        let origin_object = origin
-            .objects()
-            .get(origin_ordinal)
-            .filter(|object| object.artifact_id() == receipt.origin_artifact_id())
-            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
-        if origin_source != *receipt.source_id()
-            || origin_object.object().row_count()
-                != u64::try_from(receipt.origin_record_count())
-                    .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?
-        {
-            return Err(AnalyticalReadError::InvalidMarketBarResult);
-        }
-        let origin_artifact_id = origin_object.artifact_id();
-        let object_content_hash = origin_object.object().content_hash();
-        let object_lineage_digest = origin_object.object().lineage_digest();
-        let object_row_count = origin_object.object().row_count();
-        let object_size_bytes = origin_object.object().size_bytes();
-        let operation_cancellation = cancellation.child_token();
-        let read_cancellation = operation_cancellation.clone();
-        let read = self.objects.read_pinned_object_bounded_async(
-            &origin,
-            origin_artifact_id,
-            origin_ordinal,
-            receipt.origin_record_count() as usize,
-            COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES,
-            &read_cancellation,
-        );
-        tokio::pin!(read);
-        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-        tokio::pin!(deadline_wait);
-        let batches = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                operation_cancellation.cancel();
-                let _ignored = read.as_mut().await;
-                return Err(AnalyticalReadError::Parquet(crate::ParquetStoreError::Cancelled));
-            }
-            _ = deadline_wait.as_mut() => {
-                operation_cancellation.cancel();
-                let _ignored = read.as_mut().await;
-                return Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded));
-            }
-            result = read.as_mut() => result?,
-        };
-        let (bars, companion_bars, source_actions) = decode_complete_market_bar_history_object(
-            batches,
-            &selection,
-            knowledge_cutoff,
-            deadline,
-            &cancellation,
-        )
-        .await?;
-        let history_content_digest = complete_market_bar_history_content_digest(
-            &selection,
-            origin_artifact_id,
-            receipt.origin_object_ordinal(),
-            object_content_hash,
-            object_lineage_digest,
-            object_row_count,
-            object_size_bytes,
-            &bars,
-            deadline,
-            &cancellation,
-        )
-        .await?;
-        let result_digest = complete_market_bar_history_read_digest(
-            &selection,
-            origin_artifact_id,
-            receipt.origin_object_ordinal(),
-            object_content_hash,
-            object_lineage_digest,
-            object_row_count,
-            object_size_bytes,
-            &bars,
-            deadline,
-            &cancellation,
-        )
-        .await?;
-        history_read_checkpoint(deadline, &cancellation).await?;
-        let read_receipt = CompleteMarketBarHistoryReadReceipt {
-            knowledge_cutoff,
-            source_result_digest: result_digest,
-            selection_digest: selection.selection_digest(),
-            publication_receipt_digest: receipt.receipt_digest(),
-            origin_manifest: receipt.origin_manifest().clone(),
-            origin_artifact_id,
-            origin_object_ordinal: receipt.origin_object_ordinal(),
-            object_content_hash,
-            object_lineage_digest,
-            object_row_count,
-            object_size_bytes,
-            history_content_digest,
-            result_digest,
-        };
-        Ok(CompleteMarketBarHistoryOutput {
-            companion_bars,
-            source_actions,
-            native_sessions: None,
-            selection,
-            read_receipt,
-            bars,
-        })
+        self.selected_history_cursor(selection, knowledge_cutoff, deadline, cancellation)
+            .await?
+            .materialize()
     }
 
     /// Reads bounded exact daily NAV history for one resolved fund/share class.
@@ -3934,260 +3894,6 @@ async fn history_read_checkpoint(
     } else {
         Ok(())
     }
-}
-
-async fn decode_complete_market_bar_history_object(
-    batches: Vec<RecordBatch>,
-    selection: &CompleteMarketBarHistorySelection,
-    knowledge_cutoff: Timestamp,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<
-    (
-        Box<[MarketBarObservation]>,
-        Box<[MarketBarObservation]>,
-        Box<[CorporateActionObservation]>,
-    ),
-    AnalyticalReadError,
-> {
-    history_read_checkpoint(deadline, cancellation).await?;
-    let invalid = || AnalyticalReadError::InvalidMarketBarResult;
-    let receipt = selection.receipt();
-    let row_count = batches.iter().try_fold(0_usize, |total, batch| {
-        total.checked_add(batch.num_rows()).ok_or_else(invalid)
-    })?;
-    if row_count != receipt.origin_record_count() as usize {
-        return Err(invalid());
-    }
-    let mut bars = Vec::new();
-    let mut companion = Vec::new();
-    let mut actions = Vec::new();
-    bars.try_reserve_exact(receipt.bar_count())
-        .map_err(|_| invalid())?;
-    companion
-        .try_reserve_exact(receipt.bar_count())
-        .map_err(|_| invalid())?;
-    actions
-        .try_reserve_exact(row_count.saturating_sub(receipt.bar_count()))
-        .map_err(|_| invalid())?;
-    let mut action_suffix = false;
-    // Charge output containers as well as the decoder's retained observation estimate.
-    let mut retained_bytes = bars
-        .capacity()
-        .checked_add(companion.capacity())
-        .and_then(|slots| slots.checked_mul(std::mem::size_of::<MarketBarObservation>()))
-        .and_then(|bytes| {
-            actions
-                .capacity()
-                .checked_mul(std::mem::size_of::<CorporateActionObservation>())
-                .and_then(|action_bytes| bytes.checked_add(action_bytes))
-        })
-        .filter(|bytes| *bytes <= COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES)
-        .ok_or_else(invalid)?;
-    for batch in batches {
-        for offset in (0..batch.num_rows()).step_by(256) {
-            history_read_checkpoint(deadline, cancellation).await?;
-            let remaining_bytes = COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES
-                .checked_sub(retained_bytes)
-                .ok_or_else(invalid)?;
-            let (observations, decoded_bytes) = ResearchArrowBatch::decode_record_batch_bounded(
-                batch.slice(offset, (batch.num_rows() - offset).min(256)),
-                remaining_bytes,
-            )
-            .map_err(|_| invalid())?;
-            retained_bytes = retained_bytes
-                .checked_add(decoded_bytes)
-                .ok_or_else(invalid)?;
-            for observation in observations {
-                let provenance = match &observation {
-                    ResearchObservation::MarketBar(bar) => bar.context().provenance(),
-                    ResearchObservation::CorporateAction(action) => action.context().provenance(),
-                    _ => return Err(invalid()),
-                };
-                let available = provenance
-                    .availability()
-                    .conservative_available_at()
-                    .ok_or_else(invalid)?;
-                if available > knowledge_cutoff
-                    || provenance.received_at() > knowledge_cutoff
-                    || provenance.ingested_at() > knowledge_cutoff
-                    || provenance.source_id() != receipt.source_id()
-                    || provenance.instrument_id() != Some(receipt.instrument_id())
-                {
-                    return Err(invalid());
-                }
-                match observation {
-                    ResearchObservation::MarketBar(bar) if !action_suffix => {
-                        if bar.adjustment() == receipt.adjustment() {
-                            bars.push(bar);
-                        } else if receipt.date_windows().is_some()
-                            && matches!(
-                                bar.adjustment(),
-                                MarketBarAdjustment::Raw | MarketBarAdjustment::All
-                            )
-                        {
-                            companion.push(bar);
-                        } else {
-                            return Err(invalid());
-                        }
-                    }
-                    ResearchObservation::CorporateAction(action)
-                        if receipt.date_windows().is_some() =>
-                    {
-                        action_suffix = true;
-                        actions.push(action);
-                    }
-                    _ => return Err(invalid()),
-                }
-            }
-        }
-    }
-    history_read_checkpoint(deadline, cancellation).await?;
-    // Source order is part of the nominal graph. Reordering cannot repair malformed source rows.
-    if receipt.date_windows().is_none() {
-        bars.sort_unstable_by_key(|bar| bar.time_semantics().provider_timestamp());
-    }
-    receipt.validate_selected_bars(&bars)?;
-    if selection.surface_requirement() == crate::MarketHistoryPriceSurfaceRequirement::RawWithAll {
-        receipt.validate_companion_bars(&companion)?;
-    }
-    history_read_checkpoint(deadline, cancellation).await?;
-    Ok((
-        bars.into_boxed_slice(),
-        companion.into_boxed_slice(),
-        actions.into_boxed_slice(),
-    ))
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the read digest binds every independently verified object coordinate"
-)]
-async fn complete_market_bar_history_read_digest(
-    selection: &CompleteMarketBarHistorySelection,
-    origin_artifact_id: uuid::Uuid,
-    origin_object_ordinal: u16,
-    object_content_hash: Sha256Digest,
-    object_lineage_digest: Sha256Digest,
-    object_row_count: u64,
-    object_size_bytes: u64,
-    bars: &[MarketBarObservation],
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<Sha256Digest, AnalyticalReadError> {
-    let receipt = selection.receipt();
-    let mut hash = Sha256::new();
-    hash.update(COMPLETE_MARKET_BAR_HISTORY_READ_DOMAIN);
-    hash.update(selection.selection_digest().bytes());
-    hash_complete_market_bar_history_content(
-        &mut hash,
-        receipt,
-        origin_artifact_id,
-        origin_object_ordinal,
-        object_content_hash,
-        object_lineage_digest,
-        object_row_count,
-        object_size_bytes,
-        bars,
-        deadline,
-        cancellation,
-    )
-    .await?;
-    Ok(Sha256Digest::new(hash.finalize().into()))
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the stable digest binds every independently verified object coordinate"
-)]
-async fn complete_market_bar_history_content_digest(
-    selection: &CompleteMarketBarHistorySelection,
-    origin_artifact_id: uuid::Uuid,
-    origin_object_ordinal: u16,
-    object_content_hash: Sha256Digest,
-    object_lineage_digest: Sha256Digest,
-    object_row_count: u64,
-    object_size_bytes: u64,
-    bars: &[MarketBarObservation],
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<Sha256Digest, AnalyticalReadError> {
-    let mut hash = Sha256::new();
-    hash.update(COMPLETE_MARKET_BAR_HISTORY_CONTENT_DOMAIN);
-    hash_complete_market_bar_history_content(
-        &mut hash,
-        selection.receipt(),
-        origin_artifact_id,
-        origin_object_ordinal,
-        object_content_hash,
-        object_lineage_digest,
-        object_row_count,
-        object_size_bytes,
-        bars,
-        deadline,
-        cancellation,
-    )
-    .await?;
-    Ok(Sha256Digest::new(hash.finalize().into()))
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the shared hash input binds every independently verified object coordinate"
-)]
-async fn hash_complete_market_bar_history_content(
-    hash: &mut Sha256,
-    receipt: &crate::MarketBarHistoryPublicationReceipt,
-    origin_artifact_id: uuid::Uuid,
-    origin_object_ordinal: u16,
-    object_content_hash: Sha256Digest,
-    object_lineage_digest: Sha256Digest,
-    object_row_count: u64,
-    object_size_bytes: u64,
-    bars: &[MarketBarObservation],
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<(), AnalyticalReadError> {
-    let origin_manifest = receipt.origin_manifest();
-    hash.update(receipt.receipt_digest().bytes());
-    hash_str(hash, origin_manifest.dataset_id().as_str());
-    hash.update(origin_manifest.manifest_version().to_be_bytes());
-    hash_str(hash, origin_manifest.schema().name());
-    hash.update(origin_manifest.schema_version().get().to_be_bytes());
-    hash.update(origin_manifest.schema().fingerprint());
-    hash.update(origin_manifest.content_hash().bytes());
-    hash.update(origin_artifact_id.as_bytes());
-    hash.update(origin_object_ordinal.to_be_bytes());
-    hash.update(object_content_hash.bytes());
-    hash.update(object_lineage_digest.bytes());
-    hash.update(object_row_count.to_be_bytes());
-    hash.update(object_size_bytes.to_be_bytes());
-    hash.update(receipt.bar_set_digest().bytes());
-    hash.update(
-        u64::try_from(bars.len())
-            .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?
-            .to_be_bytes(),
-    );
-    for (ordinal, bar) in bars.iter().enumerate() {
-        if ordinal % 256 == 0 {
-            history_read_checkpoint(deadline, cancellation).await?;
-        }
-        let observation = ResearchObservation::MarketBar(bar.clone());
-        let payload = CanonicalObservationPayload::try_from_observation(&observation)
-            .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
-        if let Some(timestamp) = bar.time_semantics().provider_timestamp() {
-            hash.update([1]);
-            hash.update(timestamp.unix_nanos().to_be_bytes());
-        } else if let Some(nominal) = bar.time_semantics().nominal_daily_date() {
-            hash.update([2]);
-            hash.update(nominal.date().year().to_be_bytes());
-            hash.update([nominal.date().month(), nominal.date().day()]);
-        } else {
-            return Err(AnalyticalReadError::InvalidMarketBarResult);
-        }
-        hash_evidence(hash, payload.identity());
-    }
-    Ok(())
 }
 
 async fn decode_market_bars(

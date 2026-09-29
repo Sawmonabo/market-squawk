@@ -2,7 +2,7 @@
 
 use super::super::SourceAppliedCorporateActionPlanReference;
 use super::*;
-use market_squawk_data::CompleteMarketBarHistoryOutput;
+use market_squawk_data::CompleteMarketBarHistoryCursor;
 use market_squawk_domain::MarketBarAdjustment;
 
 /// Actual later seal and original immutable source proof; callers retain both with the outcome.
@@ -24,7 +24,7 @@ impl SourceActionPreparationCapability {
     /// New all-family query acquisition receives its ACTUAL later clock, never the forecast seal.
     pub(crate) async fn prepare_for_forecast_outcome(
         &self,
-        original: &CompleteMarketBarHistoryOutput,
+        original: &CompleteMarketBarHistoryCursor,
         interval: (CalendarDate, CalendarDate),
         target_at: Timestamp,
         context: &RequestContext,
@@ -43,11 +43,13 @@ impl SourceActionPreparationCapability {
             || original.read_receipt().knowledge_cutoff() > started_at
             || dates.0 > interval.0
             || dates.1 < interval.1
-            || !native.sessions().iter().any(|session| {
-                session.native_date() == interval.1
-                    && session.bar_present()
-                    && session.closes_at_exclusive() <= target_at
-            })
+            || !native
+                .sessions()
+                .find_date(interval.1)
+                .map_err(map_analytical_error)?
+                .is_some_and(|session| {
+                    session.bar_present() && session.closes_at_exclusive() <= target_at
+                })
         {
             return Err(ServiceError::InvalidRequest);
         }

@@ -830,34 +830,42 @@ impl<R: Read> JournalReader<R> {
     }
 
     /// Collects under explicit record-count and aggregate framed-byte limits.
+    /// Use the record visitor internally when retained replay bytes are unnecessary.
     pub fn read_all_bounded(
         mut self,
         max_records: usize,
         max_aggregate_bytes: u64,
     ) -> Result<Vec<RawCaptureRecord>, JournalError> {
-        self.read_all_bounded_inner(max_records, max_aggregate_bytes, None)
+        let mut records = Vec::new();
+        self.visit_bounded_with_checkpoint(
+            max_records,
+            max_aggregate_bytes,
+            None,
+            |_, _, _, record| {
+                records.try_reserve(1).map_err(|_| {
+                    JournalError::InvalidRecord("journal collection allocation failed".to_owned())
+                })?;
+                records.push(record);
+                Ok::<_, JournalError>(())
+            },
+        )?;
+        Ok(records)
     }
 
-    /// Replays bounded records while checkpointing CRC and JSON work in fixed-size chunks.
-    pub(super) fn read_all_bounded_with_checkpoint<F>(
-        mut self,
-        max_records: usize,
-        max_aggregate_bytes: u64,
-        checkpoint: F,
-    ) -> Result<Vec<RawCaptureRecord>, JournalError>
-    where
-        F: Fn(u64) -> std::io::Result<()>,
-    {
-        self.read_all_bounded_inner(max_records, max_aggregate_bytes, Some(&checkpoint))
-    }
-
-    fn read_all_bounded_inner(
+    /// Runs the sole bounded replay parser and releases each record after its visitor returns.
+    /// Offsets and frame lengths come from the decoded wire, not reserialized estimates.
+    pub(super) fn visit_bounded_with_checkpoint<E>(
         &mut self,
         max_records: usize,
         max_aggregate_bytes: u64,
         checkpoint: Option<&dyn Fn(u64) -> std::io::Result<()>>,
-    ) -> Result<Vec<RawCaptureRecord>, JournalError> {
-        let mut records = Vec::new();
+        mut visit: impl FnMut(usize, u64, u64, RawCaptureRecord) -> Result<(), E>,
+    ) -> Result<usize, E>
+    where
+        E: From<JournalError>,
+    {
+        self.ensure_format()?;
+        let mut count = 0_usize;
         loop {
             let has_record = !self
                 .reader
@@ -865,19 +873,26 @@ impl<R: Read> JournalReader<R> {
                 .map_err(|source| JournalError::io("failed to inspect journal stream", source))?
                 .is_empty();
             if !has_record {
-                return Ok(records);
+                return Ok(count);
             }
-            if records.len() >= max_records {
-                return Err(JournalError::RecordLimitExceeded { limit: max_records });
+            if count >= max_records {
+                return Err(JournalError::RecordLimitExceeded { limit: max_records }.into());
             }
-            let consumed = self.offset.saturating_sub(4);
+            let offset = self.offset;
+            let consumed = offset.saturating_sub(4);
             let remaining = max_aggregate_bytes.saturating_sub(consumed);
             let record = self
                 .next_record_bounded_inner(remaining, checkpoint)?
                 .ok_or_else(|| {
                     JournalError::InvalidRecord("journal stream changed while reading".to_owned())
                 })?;
-            records.push(record);
+            let framed_bytes = self.offset.checked_sub(offset).ok_or_else(|| {
+                JournalError::InvalidRecord("journal frame offset overflow".to_owned())
+            })?;
+            visit(count, offset, framed_bytes, record)?;
+            count = count
+                .checked_add(1)
+                .ok_or(JournalError::RecordLimitExceeded { limit: max_records })?;
         }
     }
 }

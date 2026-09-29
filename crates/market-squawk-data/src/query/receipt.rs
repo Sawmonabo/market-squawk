@@ -114,6 +114,16 @@ impl PinnedQueryOutput {
         &self.result
     }
 
+    /// Transfers the result while preserving its sealed batch authority.
+    pub fn into_result(self) -> QueryResult {
+        self.result
+    }
+
+    pub(super) fn with_result(mut self, result: QueryResult) -> Self {
+        self.result = result;
+        self
+    }
+
     /// Derives an exact monetary value from one inline Decimal128 mantissa, UInt8 scale, and UTF-8
     /// currency cell. All row and column coordinates are retained in the returned receipt.
     ///

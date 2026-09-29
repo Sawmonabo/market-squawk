@@ -141,6 +141,12 @@ impl Catalog {
         let analytical_records: i64 = self.connection.query_row(
             "SELECT
                  (SELECT COUNT(*) FROM artifacts)
+                 + (SELECT COUNT(*) FROM model_inventory_series)
+                 + (SELECT COUNT(*) FROM model_inventory_records)
+                 + (SELECT COUNT(*) FROM forecast_inventory_vintages)
+                 + (SELECT COUNT(*) FROM forecast_inventory_outcomes)
+                 + (SELECT COUNT(*) FROM chart_projection_headers)
+                 + (SELECT COUNT(*) FROM chart_projection_rows)
                  + (SELECT COUNT(*) FROM dataset_manifests)
                  + (SELECT COUNT(*) FROM analytical_generations)
                  + (SELECT COUNT(*) FROM analytical_generation_objects)

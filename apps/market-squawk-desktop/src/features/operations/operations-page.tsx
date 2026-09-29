@@ -8,7 +8,6 @@ import {
   ShieldAlert,
 } from "lucide-react"
 import {
-  useInfiniteQuery,
   useMutation,
   useQuery,
   useQueryClient,
@@ -27,7 +26,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { humanize } from "@/lib/formatters"
-import { compareLosslessIntegers, type LosslessInteger } from "@/lib/lossless-integer"
+import { type LosslessInteger } from "@/lib/lossless-integer"
 import { formatTimestamp } from "@/lib/time"
 import type { JobControlRequest, SystemTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
@@ -37,10 +36,10 @@ import {
   isActiveJob,
   parseJobPage,
   parseRuntimeStatus,
-  type JobView,
   type PendingJobAction,
 } from "./contracts"
 import { JobCard } from "./job-card"
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 import {
   EmptyJobs,
   LoadingState,
@@ -49,7 +48,6 @@ import {
 } from "./operations-status"
 
 const JOB_PAGE_LIMIT = 50
-const MAXIMUM_JOB_PAGES = 4
 
 export function OperationsPage() {
   const system = useSystem()
@@ -88,25 +86,24 @@ function ReadyOperations({
   const [pendingAction, setPendingAction] =
     React.useState<PendingJobAction | null>(null)
   const [announcement, setAnnouncement] = React.useState("")
+  const navigation = useCursorNavigation()
   const jobsQueryKey = productKeys.operation(scope, "job", "Job.List", {
     limit: JOB_PAGE_LIMIT,
+    afterJobId: navigation.after,
   })
-  const jobsQuery = useInfiniteQuery({
+  const jobsQuery = useQuery({
     queryKey: jobsQueryKey,
-    initialPageParam: undefined as string | undefined,
-    queryFn: async ({ pageParam }) =>
-      parseJobPage(
-        await transport.systemQuery({
-          query: "jobs",
-          afterJobId: pageParam,
-          limit: JOB_PAGE_LIMIT,
-        }),
-      ),
-    getNextPageParam: (lastPage, pages) =>
-      pages.length < MAXIMUM_JOB_PAGES
-        ? (lastPage.next ?? undefined)
-        : undefined,
-    refetchInterval: 5_000,
+    gcTime: 0,
+    queryFn: ({ signal }) => transport.systemQuery({
+      query: "jobs", afterJobId: navigation.after, limit: JOB_PAGE_LIMIT,
+    }, { signal }),
+    select: parseJobPage,
+    refetchInterval: (query) => {
+      if (navigation.after !== undefined || !query.state.data) return false
+      try { return parseJobPage(query.state.data).jobs.some((job) => isActiveJob(job.state)) ? 5_000 : false }
+      catch { return false }
+    },
+    refetchIntervalInBackground: false,
   })
   const runtimeQuery = useQuery({
     queryKey: productKeys.operation(
@@ -115,11 +112,12 @@ function ReadyOperations({
       "Operations.GetRuntimeStatus",
       {},
     ),
-    queryFn: async () =>
+    queryFn: async ({ signal }) =>
       parseRuntimeStatus(
-        await transport.systemQuery({ query: "operationRuntimeStatus" }),
+        await transport.systemQuery({ query: "operationRuntimeStatus" }, { signal }),
       ),
-    refetchInterval: 5_000,
+    refetchInterval: (query) => query.state.data && (query.state.data.runningJobs > 0 || query.state.data.activeSources > 0 || query.state.data.paperExecutionActive || query.state.data.executionReconciliationPending) ? 5_000 : false,
+    refetchIntervalInBackground: false,
   })
   const mutation = useMutation({
     mutationFn: (action: PendingJobAction) =>
@@ -133,17 +131,7 @@ function ReadyOperations({
     },
   })
 
-  const jobs = React.useMemo(() => {
-    const unique = new Map<string, JobView>()
-    for (const page of jobsQuery.data?.pages ?? []) {
-      for (const job of page.jobs) {
-        unique.set(`${job.jobId}:${job.generation}`, job)
-      }
-    }
-    return [...unique.values()].sort((left, right) =>
-      compareLosslessIntegers(right.updatedAt, left.updatedAt),
-    )
-  }, [jobsQuery.data])
+  const jobs = jobsQuery.data?.jobs ?? []
   const active = jobs.filter((job) => isActiveJob(job.state)).length
   const attention = jobs.filter((job) =>
     ["awaiting_confirmation", "failed", "interrupted"].includes(job.state),
@@ -184,8 +172,8 @@ function ReadyOperations({
               Durable jobs
             </h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Up to {JOB_PAGE_LIMIT * MAXIMUM_JOB_PAGES} reconnectable jobs,
-              refreshed from the shared service.
+              Browse reconnectable jobs in pages of {JOB_PAGE_LIMIT}.
+              The current first page follows service updates.
             </p>
           </div>
           <Button
@@ -240,29 +228,12 @@ function ReadyOperations({
           </div>
         )}
 
-        {jobsQuery.hasNextPage && (
-          <div className="mt-4 flex justify-center">
-            <Button
-              variant="outline"
-              onClick={() => void jobsQuery.fetchNextPage()}
-              disabled={jobsQuery.isFetchingNextPage}
-            >
-              {jobsQuery.isFetchingNextPage ? (
-                <LoaderCircle className="animate-spin" aria-hidden="true" />
-              ) : null}
-              Load more jobs
-            </Button>
-          </div>
-        )}
-        {!jobsQuery.hasNextPage &&
-          jobsQuery.data &&
-          jobsQuery.data.pages.length === MAXIMUM_JOB_PAGES &&
-          jobsQuery.data.pages.at(-1)?.next && (
-            <p className="mt-3 text-center text-xs text-muted-foreground">
-              This view reached its {JOB_PAGE_LIMIT * MAXIMUM_JOB_PAGES}-job
-              safety limit. Older jobs remain in the durable service.
-            </p>
-          )}
+        <CursorNavigation
+          navigation={navigation}
+          next={jobsQuery.data?.next}
+          busy={jobsQuery.isFetching} error={jobsQuery.isError}
+          onRestart={() => { if (navigation.after === undefined) void jobsQuery.refetch() }}
+        />
       </section>
 
       <OperationalHealth

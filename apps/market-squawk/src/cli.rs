@@ -521,6 +521,24 @@ pub enum MarketCommand {
     History {
         #[arg(long)]
         history_token: String,
+        /// Inclusive visible timestamp boundary, as exact Unix nanoseconds.
+        #[arg(long, conflicts_with_all = ["start_date", "end_date"])]
+        start_unix_nanos: Option<String>,
+        /// Inclusive visible timestamp boundary, as exact Unix nanoseconds.
+        #[arg(long, conflicts_with_all = ["start_date", "end_date"])]
+        end_unix_nanos: Option<String>,
+        /// Inclusive visible session date in YYYY-MM-DD form.
+        #[arg(long)]
+        start_date: Option<chrono::NaiveDate>,
+        /// Inclusive visible session date in YYYY-MM-DD form.
+        #[arg(long)]
+        end_date: Option<chrono::NaiveDate>,
+        /// Maximum displayed points; underlying historical evidence remains complete.
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u16).range(8..=4096))]
+        point_limit: u16,
+        /// Retain the generation selected by the preceding viewport response.
+        #[arg(long)]
+        generation_token: Option<String>,
     },
 }
 
@@ -693,7 +711,14 @@ pub enum ModelCommand {
     /// List model evidence and its usable analytical limits.
     List,
     /// List current model-training and forecasting activity.
-    Activity,
+    Activity {
+        /// Continue using the cursor returned by the preceding activity page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum activity records returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Admit one verified immutable model bundle through a closed request file.
     Admit {
         /// Confined JSON admission request file.
@@ -726,7 +751,14 @@ pub enum ModelCommand {
 #[derive(Debug, Subcommand)]
 pub enum ForecastCommand {
     /// Show the currently available forecast choices.
-    Options,
+    Options {
+        /// Continue using the cursor returned by the preceding choices page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum model choices returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Preview one forecast and receive its one-use confirmation token.
     Preview {
         /// Opaque model choice returned by `forecast options`.
@@ -752,7 +784,14 @@ pub enum ForecastCommand {
         confirm: bool,
     },
     /// List current forecasts.
-    List,
+    List {
+        /// Continue using the cursor returned by the preceding forecasts page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum forecasts returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Show one forecast.
     Show {
         /// Opaque forecast token returned by `forecast list`.
@@ -779,6 +818,12 @@ pub enum ForecastCommand {
     Outcomes {
         /// Opaque forecast token returned by `forecast list`.
         forecast_token: Uuid,
+        /// Continue using the cursor returned by the preceding outcomes page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum outcome records returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
     },
 }
 
@@ -787,9 +832,12 @@ pub enum ForecastCommand {
 pub enum PortfolioCommand {
     /// List named portfolios and their opaque product tokens.
     Accounts {
-        /// Continue after one opaque portfolio token.
+        /// Continue using the cursor returned by the preceding portfolio page.
         #[arg(long)]
-        after_account_token: Option<String>,
+        cursor: Option<String>,
+        /// Maximum portfolios returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
     },
     /// Import a selected portfolio file through review and approval.
     #[command(name = "import")]
@@ -931,7 +979,14 @@ pub enum BacktestCommand {
         confirm: bool,
     },
     /// List backtest activity and available results.
-    List,
+    List {
+        /// Continue using the cursor returned by the preceding activity page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum activity records returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Inspect one completed backtest result.
     Show {
         /// Opaque backtest result token returned by `backtest list`.
@@ -1164,9 +1219,9 @@ pub enum ServiceCommand {
 pub enum JobCommand {
     /// List one bounded page of jobs in stable identity order.
     List {
-        /// Resume strictly after this job identity.
+        /// Continue using the opaque cursor returned by the preceding job page.
         #[arg(long)]
-        after_job_id: Option<Uuid>,
+        after_job_id: Option<String>,
         /// Maximum jobs returned.
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
         limit: u16,
@@ -1283,7 +1338,7 @@ pub enum OperationsCommand {
 pub enum BackupOperationsCommand {
     /// List one bounded page of retained product backups.
     List {
-        /// Continue strictly after this lowercase backup SHA-256.
+        /// Continue using the opaque cursor returned by the preceding backup page.
         #[arg(long)]
         after_backup_id: Option<String>,
         /// Maximum backup manifests returned.
@@ -1469,9 +1524,9 @@ pub struct LogQueryArguments {
     /// Bounded redacted message search text.
     #[arg(long)]
     pub search: Option<String>,
-    /// Continue strictly after this monotonic local log sequence.
+    /// Continue using the opaque cursor returned by the preceding log page.
     #[arg(long)]
-    pub after_sequence: Option<u64>,
+    pub cursor: Option<String>,
     /// Maximum records returned or exported.
     #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u16).range(1..=1000))]
     pub limit: u16,
@@ -1912,84 +1967,114 @@ pub enum AnalysisCommand {
     /// Analyze an admitted investment using the current investment settings.
     Start {
         /// Exact market selection returned by market lookup.
-        #[arg(long)] selection_token: String,
+        #[arg(long)]
+        selection_token: String,
         /// Canonical comparison instrument from analysis profile options; omit for the current default.
-        #[arg(long)] benchmark_instrument_id: Option<Uuid>,
+        #[arg(long)]
+        benchmark_instrument_id: Option<Uuid>,
         /// Authorize the bounded financial analysis sequence; no order is submitted.
-        #[arg(long)] confirm: bool,
+        #[arg(long)]
+        confirm: bool,
     },
     /// Find opportunities using the current investment settings and admitted population.
     Find {
         /// Canonical comparison instrument from analysis profile options; omit for the current default.
-        #[arg(long)] benchmark_instrument_id: Option<Uuid>,
+        #[arg(long)]
+        benchmark_instrument_id: Option<Uuid>,
         /// Authorize the bounded financial analysis sequence; no order is submitted.
-        #[arg(long)] confirm: bool,
+        #[arg(long)]
+        confirm: bool,
     },
     /// Read saved workflow progress and current investment settings.
     Status,
     /// Resume one paused workflow with its original retained evidence and request identity.
     Resume {
         /// Exact workflow token returned by status.
-        #[arg(long)] workflow_token: String,
+        #[arg(long)]
+        workflow_token: String,
         /// Explicitly authorize continuation.
-        #[arg(long)] confirm: bool,
+        #[arg(long)]
+        confirm: bool,
     },
     /// Cancel one workflow and reconcile its exact child jobs.
     Cancel {
         /// Exact workflow token returned by status.
-        #[arg(long)] workflow_token: String,
+        #[arg(long)]
+        workflow_token: String,
         /// Explicitly authorize cancellation.
-        #[arg(long)] confirm: bool,
+        #[arg(long)]
+        confirm: bool,
     },
     /// Read one bounded page of the original completed opportunity-search coverage.
     Coverage {
         /// Exact completed workflow token.
-        #[arg(long)] workflow_token: String,
+        #[arg(long)]
+        workflow_token: String,
         /// JSON file containing the exact nextAfter cursor from the prior page.
-        #[arg(long)] after: Option<PathBuf>,
+        #[arg(long)]
+        after: Option<PathBuf>,
     },
     /// Use one closed Advanced investment-settings command, such as profileOptions or copyRecommended.
     Profile {
         /// JSON file containing the existing typed profile command and its current tokens.
-        #[arg(long)] request: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
         /// Explicitly confirm commands that change or validate investment settings.
-        #[arg(long)] confirm: bool,
+        #[arg(long)]
+        confirm: bool,
     },
     /// Read, preview, or explicitly confirm recommendation account and allocation setup.
     Setup {
         /// Existing setup authority operation.
-        #[command(subcommand)] command: AnalysisSetupCommand,
+        #[command(subcommand)]
+        command: AnalysisSetupCommand,
     },
     /// List persisted generated, no-action, and unavailable investment analyses.
     Results {
         /// Continue after the exact prior saved-analysis action token.
-        #[arg(long)] after: Option<Uuid>,
+        #[arg(long)]
+        after: Option<Uuid>,
         /// Maximum saved results returned.
-        #[arg(long,default_value_t=100,value_parser=clap::value_parser!(u16).range(1..=1000))] limit: u16,
+        #[arg(long,default_value_t=100,value_parser=clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
     },
     /// Reopen one exact persisted investment analysis.
     Show {
         /// Original saved-analysis action token; also used by explicit paper drafting.
-        #[arg(long)] action_token: Uuid,
+        #[arg(long)]
+        action_token: Uuid,
     },
 }
 /// Explicit recommendation setup; every numeric choice comes from the operator.
 #[derive(Debug, Subcommand)]
 pub enum AnalysisSetupCommand {
+    /// Read one page of current financial settings and available model choices.
+    Catalog {
+        /// Continue using the cursor returned by the preceding model choices page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum model choices returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Read the current setup and genuine available account choices.
     Status,
     /// Preview accountId, expectedRevision, and allocationProfile from a bounded JSON file.
     Preview {
         /// Exact setup request, with an explicitly selected account and numeric allocation profile.
-        #[arg(long)] request: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
     },
     /// Commit only the exact preview that the operator reviewed.
     Commit {
         /// Original preview identifier.
-        #[arg(long)] preview_id: Uuid,
+        #[arg(long)]
+        preview_id: Uuid,
         /// Original preview digest.
-        #[arg(long)] preview_digest: String,
+        #[arg(long)]
+        preview_digest: String,
         /// Explicitly confirm the reviewed setup.
-        #[arg(long)] confirm: bool,
+        #[arg(long)]
+        confirm: bool,
     },
 }

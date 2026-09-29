@@ -5,22 +5,22 @@ use super::{InstalledProductTraining, forecast_preparation::InstalledForecastPre
 use crate::{
     LocalProduct, ResearchService,
     application::{
-        InstrumentContextOutcome, InstrumentContextReadCapability, InstrumentContextRequest,
+        DatasetPreparationAuthority, InstrumentContextOutcome, InstrumentContextReadCapability,
+        InstrumentContextRequest, PreparedFeatureDatasetBuild, PreparedProbabilityDatasetPair,
+        ProbabilityBenchmarkSource, ProbabilityCohortPreparationRequest,
+        ProbabilitySubjectInputRequest, RecommendationBenchmarkSelectionReadCapability,
+        SelectedRecommendationBenchmark, SourceAppliedCorporateActionPlanReference,
+        SourceAppliedCorporateActionReadCapability,
         analysis::ProductionGovernedBacktestInputAuthority,
-        analytical_profile::{AnalyticalProfileResolution, ValidatedAnalyticalProfile, revalidate},
+        analytical_profile::{AnalyticalProfileResolution, ValidatedAnalyticalProfile},
         decision::{DecisionApplication, current_find::member::FindMemberContext},
         market_calendar::CompletedMarketSessionReadCapability,
         model::forecast_preparation::ForecastCurrentFeatureInputSelection,
-        DatasetPreparationAuthority, PreparedFeatureDatasetBuild,
-            PreparedProbabilityDatasetPair, ProbabilityBenchmarkSource,
-            ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
-            RecommendationBenchmarkSelectionReadCapability, SelectedRecommendationBenchmark,
-            SourceAppliedCorporateActionPlanReference, SourceAppliedCorporateActionReadCapability,
     },
     jobs::InstalledJobAuthority,
 };
 use market_squawk_data::{
-    AnalyticalFeatureDataset, ChronologicalSplitPolicy, CompleteMarketBarHistoryOutput,
+    AnalyticalFeatureDataset, ChronologicalSplitPolicy, CompleteMarketBarHistoryCursor,
     DatasetBuildPurpose, DatasetStudyPolicy, DatasetTargetHorizon, FeatureDatasetInputEpochOutput,
     FeatureDatasetProductContract, ProbabilityEventTarget, QueryLimits,
 };
@@ -119,7 +119,7 @@ struct DatasetInput {
 struct OpenPlan {
     reference: ProbabilityPlan,
     profile: ValidatedAnalyticalProfile,
-    histories: Vec<CompleteMarketBarHistoryOutput>,
+    histories: Vec<CompleteMarketBarHistoryCursor>,
     benchmark: Option<SelectedRecommendationBenchmark>,
     cutoff: Timestamp,
 }
@@ -355,7 +355,11 @@ impl InstalledProbabilityPreparation {
                 }
                 let (source, selected_benchmark) = self
                     .decisions
-                    .find_member_source_reference(&admitted, request.benchmark_instrument_id, context)?
+                    .find_member_source_reference(
+                        &admitted,
+                        request.benchmark_instrument_id,
+                        context,
+                    )?
                     .ok_or(ServiceError::Unavailable)?;
                 if source.knowledge_cutoff() != cutoff {
                     return Err(ServiceError::InvalidResult);
@@ -384,9 +388,9 @@ impl InstalledProbabilityPreparation {
         if request.source_action_reference.knowledge_cutoff() != cutoff {
             return Err(ServiceError::InvalidRequest);
         }
-        let catalog = forecasts.financial_profile_catalog(context).await?;
-        let profile =
-            revalidate(&request.financial_profile, catalog.as_ref()).map_err(ServiceError::from)?;
+        let profile = forecasts
+            .revalidate_profile(&request.financial_profile, context)
+            .await?;
         if !profile
             .recommendation_policy()
             .parameters()
@@ -474,13 +478,22 @@ impl InstalledProbabilityPreparation {
         let sessions = histories[0]
             .native_sessions()
             .ok_or(ServiceError::Unavailable)?;
-        let mut closes = sessions
-            .sessions()
-            .iter()
-            .map(|v| v.closes_at_exclusive())
-            .filter(|v| *v <= cutoff);
-        let first = closes.next().ok_or(ServiceError::Unavailable)?;
-        let last = closes.last().ok_or(ServiceError::Unavailable)?;
+        let mut first = None;
+        let mut last = None;
+        for session in sessions.sessions().iter() {
+            let close = session
+                .map_err(crate::application::map_source_analytical_error)?
+                .closes_at_exclusive();
+            if close <= cutoff {
+                if first.is_none() {
+                    first = Some(close);
+                } else {
+                    last = Some(close);
+                }
+            }
+        }
+        let first = first.ok_or(ServiceError::Unavailable)?;
+        let last = last.ok_or(ServiceError::Unavailable)?;
         let span = last
             .unix_nanos()
             .checked_sub(first.unix_nanos())
@@ -501,15 +514,21 @@ impl InstalledProbabilityPreparation {
             .map_err(|_| ServiceError::Unavailable)?;
         let currency = histories[0]
             .bars()
-            .first()
+            .next()
+            .transpose()
+            .map_err(crate::application::map_source_analytical_error)?
             .ok_or(ServiceError::Unavailable)?
             .currency();
-        if histories
-            .iter()
-            .flat_map(|v| v.bars())
-            .any(|bar| bar.currency() != currency)
-        {
-            return Err(ServiceError::Unavailable);
+        for history in &histories {
+            for bar in history.bars() {
+                if bar
+                    .map_err(crate::application::map_source_analytical_error)?
+                    .currency()
+                    != currency
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+            }
         }
         let event = match request.event_kind {
             EventKind::PriceHigher => ProbabilityEventTarget::PriceHigher,

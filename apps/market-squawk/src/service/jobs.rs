@@ -19,9 +19,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    application::job::{
-        JobAdmission, JobApplication, JobApplicationError, JobReceipt, JobView, JobViewPage,
-    },
+    application::job::{JobAdmission, JobApplication, JobApplicationError, JobReceipt, JobView},
     jobs::InstalledJobAuthority,
 };
 
@@ -90,7 +88,13 @@ impl InstalledJobOperations {
         job_id: &str,
         generation: u64,
         context: &RequestContext,
-    ) -> Result<(market_squawk_jobs::JobSnapshot, crate::jobs::ForecastJobResult), ServiceError> {
+    ) -> Result<
+        (
+            market_squawk_jobs::JobSnapshot,
+            crate::jobs::ForecastJobResult,
+        ),
+        ServiceError,
+    > {
         ensure_live(context)?;
         authenticated_origin(context)?;
         let id = parse_id(job_id)?;
@@ -355,14 +359,72 @@ impl InstalledJobOperations {
             .map_err(map_application)
     }
 
-    pub(super) async fn list_page(
+    pub(super) async fn product_activity_page(
         &self,
-        limit: JobListPageLimit,
-    ) -> Result<JobViewPage, ServiceError> {
-        self.application
-            .list(None, limit)
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        model: bool,
+    ) -> Result<(Vec<JobView>, Value), ServiceError> {
+        ensure_live(context)?;
+        let input: ProductActivityRequest =
+            decode(&super::business_arguments(request.arguments()))?;
+        let limit = input.limit.unwrap_or(25);
+        if !(1..=100).contains(&limit)
+            || input
+                .cursor
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 512)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let cursor = input
+            .cursor
+            .map(|value| {
+                SourceIdentifier::try_from(value)
+                    .map(JobListCursor::new)
+                    .map_err(|_| ServiceError::InvalidRequest)
+            })
+            .transpose()?;
+        let limit = JobListPageLimit::try_new(limit.min(context.limits().maximum_result_items()))
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        let page = if model {
+            self.repository
+                .list_model_activity(cursor.as_ref(), limit)
+                .await
+        } else {
+            self.repository
+                .list_backtest_activity(cursor.as_ref(), limit)
+                .await
+        }
+        .map_err(|_| ServiceError::Unavailable)?;
+        let views = page
+            .snapshots()
+            .iter()
+            .map(JobView::from_snapshot)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_application)?;
+        let next = serde_json::to_value(page.next()).map_err(|_| ServiceError::InvalidResult)?;
+        ensure_live(context)?;
+        Ok((views, next))
+    }
+
+    pub(super) async fn product_backtest_view(
+        &self,
+        token: uuid::Uuid,
+        context: &RequestContext,
+    ) -> Result<JobView, ServiceError> {
+        ensure_live(context)?;
+        let snapshot = self
+            .repository
+            .get_product_backtest(token)
             .await
-            .map_err(map_application)
+            .map_err(|error| match error {
+                market_squawk_jobs::JobRepositoryError::NotFound => ServiceError::NotFound,
+                _ => ServiceError::Unavailable,
+            })?;
+        let view = JobView::from_snapshot(&snapshot).map_err(map_application)?;
+        ensure_live(context)?;
+        Ok(view)
     }
 }
 
@@ -373,6 +435,13 @@ impl std::fmt::Debug for InstalledJobOperations {
             .field("application", &"[DURABLE JOB APPLICATION]")
             .finish()
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProductActivityRequest {
+    cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]

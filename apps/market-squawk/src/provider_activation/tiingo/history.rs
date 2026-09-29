@@ -5,11 +5,11 @@
 
 use super::*;
 use crate::application::{
-    InstrumentContextOutcome, TiingoEodHistoryPublicationReceipt,
+    InstrumentContextOutcome, InstrumentContextRead, RecommendationBenchmarkSelection,
+    SelectedRecommendationBenchmark, TiingoEodHistoryPublicationReceipt,
     market_calendar::{
         CompletedMarketSessionReadCapability, TiingoCalendarExpectedSessionAuthority,
     },
-    InstrumentContextRead, RecommendationBenchmarkSelection, SelectedRecommendationBenchmark,
     required_annual_source_dates,
 };
 use market_squawk_adapter_tiingo::{
@@ -17,7 +17,7 @@ use market_squawk_adapter_tiingo::{
     TiingoHistoryCheckpointReceipt, TiingoHistoryPlan, TiingoMetadataReceipt,
     tiingo_eod_native_schema_evidence,
 };
-use market_squawk_data::{CompleteMarketBarHistoryOutput, MarketDataInstrumentRecord};
+use market_squawk_data::{CompleteMarketBarHistoryCursor, MarketDataInstrumentRecord};
 use market_squawk_domain::{
     AssetClass, CalendarDate, DigestAlgorithm, ExactPayloadEvidence, MetadataRevision,
     ProviderInstrumentId, RevisionBoundPayloadEvidence, VenueId,
@@ -171,31 +171,64 @@ impl ProviderAdapterActivation {
         let InstrumentContextOutcome::Exact(subject) = identity.outcome() else {
             return Err(ServiceError::Unavailable);
         };
-        let record = identity.canonical_record().ok_or(ServiceError::Unavailable)?;
+        let record = identity
+            .canonical_record()
+            .ok_or(ServiceError::Unavailable)?;
         let subject_publication;
-        let subject_publication = if subject.instrument_id() == benchmarks.primary().instrument_id() {
+        let subject_publication = if subject.instrument_id() == benchmarks.primary().instrument_id()
+        {
             &prepared.primary
         } else if subject.instrument_id() == benchmarks.accompanying().instrument_id() {
             &prepared.accompanying
         } else {
-            subject_publication = self.prepare_instrument_eod_history(
-                record, subject.listing_venue(), calendars, prepared.dates, context,
-            ).await?;
+            subject_publication = self
+                .prepare_instrument_eod_history(
+                    record,
+                    subject.listing_venue(),
+                    calendars,
+                    prepared.dates,
+                    context,
+                )
+                .await?;
             &subject_publication
         };
         let cutoff = current_time()?;
-        let subject_history = self.research.read_complete_tiingo_eod_publication(
-            subject_publication, record, subject.listing_venue(), prepared.dates,
-            calendars, cutoff, context.deadline(), context.cancellation(),
-        ).await.map_err(|error| history_error(&error, context))?;
-        let primary = self.reopen_benchmark_history(
-            benchmarks, benchmarks.primary(), &prepared.primary, prepared.dates,
-            calendars, cutoff, context,
-        ).await?;
-        let accompanying = self.reopen_benchmark_history(
-            benchmarks, benchmarks.accompanying(), &prepared.accompanying, prepared.dates,
-            calendars, cutoff, context,
-        ).await?;
+        let subject_history = self
+            .research
+            .read_complete_tiingo_eod_publication(
+                subject_publication,
+                record,
+                subject.listing_venue(),
+                prepared.dates,
+                calendars,
+                cutoff,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await
+            .map_err(|error| history_error(&error, context))?;
+        let primary = self
+            .reopen_benchmark_history(
+                benchmarks,
+                benchmarks.primary(),
+                &prepared.primary,
+                prepared.dates,
+                calendars,
+                cutoff,
+                context,
+            )
+            .await?;
+        let accompanying = self
+            .reopen_benchmark_history(
+                benchmarks,
+                benchmarks.accompanying(),
+                &prepared.accompanying,
+                prepared.dates,
+                calendars,
+                cutoff,
+                context,
+            )
+            .await?;
         let histories = [subject_history, primary, accompanying];
         let mut hash = Sha256::new();
         hash.update(b"market-squawk/selected-investment-native-histories/v1\0");
@@ -206,12 +239,16 @@ impl ProviderAdapterActivation {
         }
         check_context(context)?;
         Ok(TiingoSelectedInvestmentHistories {
-            histories, dates: prepared.dates,
+            histories,
+            dates: prepared.dates,
             evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into()),
         })
     }
 
-    #[allow(clippy::too_many_arguments, reason = "exact identity, publication and calendar are independent")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact identity, publication and calendar are independent"
+    )]
     async fn reopen_benchmark_history(
         &self,
         benchmarks: &RecommendationBenchmarkSelection,
@@ -221,16 +258,32 @@ impl ProviderAdapterActivation {
         calendars: &CompletedMarketSessionReadCapability,
         cutoff: Timestamp,
         context: &RequestContext,
-    ) -> Result<CompleteMarketBarHistoryOutput, ServiceError> {
-        let record = benchmarks.source_definition(benchmark).ok_or(ServiceError::Unavailable)?;
-        let mut mappings = record.definition().venue_mappings().iter()
+    ) -> Result<CompleteMarketBarHistoryCursor, ServiceError> {
+        let record = benchmarks
+            .source_definition(benchmark)
+            .ok_or(ServiceError::Unavailable)?;
+        let mut mappings = record
+            .definition()
+            .venue_mappings()
+            .iter()
             .filter(|mapping| mapping.venue_symbol().as_str() == benchmark.display_symbol());
         let mapping = mappings.next().ok_or(ServiceError::Unavailable)?;
-        if mappings.next().is_some() { return Err(ServiceError::Unavailable); }
-        self.research.read_complete_tiingo_eod_publication(
-            publication, record, mapping.venue_id(), dates, calendars, cutoff,
-            context.deadline(), context.cancellation(),
-        ).await.map_err(|error| history_error(&error, context))
+        if mappings.next().is_some() {
+            return Err(ServiceError::Unavailable);
+        }
+        self.research
+            .read_complete_tiingo_eod_publication(
+                publication,
+                record,
+                mapping.venue_id(),
+                dates,
+                calendars,
+                cutoff,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await
+            .map_err(|error| history_error(&error, context))
     }
 
     #[allow(
@@ -250,11 +303,25 @@ impl ProviderAdapterActivation {
         let record = benchmarks
             .source_definition(benchmark)
             .ok_or(ServiceError::Unavailable)?;
-        let mut mappings = record.definition().venue_mappings().iter()
+        let mut mappings = record
+            .definition()
+            .venue_mappings()
+            .iter()
             .filter(|mapping| mapping.venue_symbol().as_str() == benchmark.display_symbol());
         let mapping = mappings.next().ok_or(ServiceError::Unavailable)?;
-        if mappings.next().is_some() { return Err(ServiceError::Unavailable); }
-        self.prepare_instrument_eod_history_with_activation(activation, record, mapping.venue_id(), Some(benchmark), calendars, dates, context).await
+        if mappings.next().is_some() {
+            return Err(ServiceError::Unavailable);
+        }
+        self.prepare_instrument_eod_history_with_activation(
+            activation,
+            record,
+            mapping.venue_id(),
+            Some(benchmark),
+            calendars,
+            dates,
+            context,
+        )
+        .await
     }
 
     /// Acquires the exact retained catalog listing and original civil-date horizon. The caller
@@ -268,12 +335,29 @@ impl ProviderAdapterActivation {
         context: &RequestContext,
     ) -> Result<TiingoEodHistoryPublicationReceipt, ServiceError> {
         check_context(context)?;
-        let activation = self.tiingo.read().map_err(|_| operation_error(context))?
-            .as_ref().cloned().ok_or(ServiceError::Unavailable)?;
-        self.prepare_instrument_eod_history_with_activation(&activation, record, venue, None, calendars, dates, context).await
+        let activation = self
+            .tiingo
+            .read()
+            .map_err(|_| operation_error(context))?
+            .as_ref()
+            .cloned()
+            .ok_or(ServiceError::Unavailable)?;
+        self.prepare_instrument_eod_history_with_activation(
+            &activation,
+            record,
+            venue,
+            None,
+            calendars,
+            dates,
+            context,
+        )
+        .await
     }
 
-    #[allow(clippy::too_many_arguments, reason = "source, actual catalog listing, dates and calendar have independent authority")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source, actual catalog listing, dates and calendar have independent authority"
+    )]
     async fn prepare_instrument_eod_history_with_activation(
         &self,
         activation: &Arc<TiingoProductActivation>,
@@ -296,9 +380,14 @@ impl ProviderAdapterActivation {
             AssetClass::Equity => TiingoEodInstrumentKind::Equity,
             _ => return Err(ServiceError::Unavailable),
         };
-        let mut mappings = definition.venue_mappings().iter().filter(|mapping| mapping.venue_id() == venue);
+        let mut mappings = definition
+            .venue_mappings()
+            .iter()
+            .filter(|mapping| mapping.venue_id() == venue);
         let mapping = mappings.next().ok_or(ServiceError::Unavailable)?;
-        if mappings.next().is_some() { return Err(ServiceError::Unavailable); }
+        if mappings.next().is_some() {
+            return Err(ServiceError::Unavailable);
+        }
         let ticker = TiingoTicker::try_new(mapping.venue_symbol().as_str())
             .map_err(|_| ServiceError::InvalidResult)?;
         let plan = TiingoHistoryPlan::try_new(ticker.clone(), dates.0, dates.1)
@@ -324,12 +413,25 @@ impl ProviderAdapterActivation {
         publication
             .validate_precommit()
             .map_err(|_| operation_error(context))?;
-        if let Some(retained) = self.research.reuse_complete_tiingo_eod_history(
-            record, venue, dates, activation.metadata.source_id(),
-            benchmark.map(|_| reviewed_cash_unit_payload()), calendars,
-            current_time()?, context.deadline(), publication.cancellation(),
-        ).await.map_err(|error| history_error(&error, context))? {
-            publication.validate_precommit().map_err(|_| operation_error(context))?;
+        if let Some(retained) = self
+            .research
+            .reuse_complete_tiingo_eod_history(
+                record,
+                venue,
+                dates,
+                activation.metadata.source_id(),
+                benchmark.map(|_| reviewed_cash_unit_payload()),
+                calendars,
+                current_time()?,
+                context.deadline(),
+                publication.cancellation(),
+            )
+            .await
+            .map_err(|error| history_error(&error, context))?
+        {
+            publication
+                .validate_precommit()
+                .map_err(|_| operation_error(context))?;
             return Ok(retained);
         }
         let mut session_hash = Sha256::new();
@@ -476,11 +578,10 @@ impl ProviderAdapterActivation {
             use chrono::Datelike as _;
             // Retain closed-day coverage through acquisition, even when the last price is from
             // an earlier session. These are calendar query bounds, never Tiingo bar timestamps.
-            let acquisition_date = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(
-                current_time()?.unix_nanos(),
-            )
-            .with_timezone(&chrono_tz::America::New_York)
-            .date_naive();
+            let acquisition_date =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(current_time()?.unix_nanos())
+                    .with_timezone(&chrono_tz::America::New_York)
+                    .date_naive();
             let acquisition_date = CalendarDate::new(
                 u16::try_from(acquisition_date.year()).map_err(|_| ServiceError::InvalidRequest)?,
                 u8::try_from(acquisition_date.month()).map_err(|_| ServiceError::InvalidRequest)?,
@@ -605,10 +706,15 @@ fn operation_error(context: &RequestContext) -> ServiceError {
 
 // Only explicit source absence/availability reaches an unavailable source step. A shared
 // authority, settlement, capture or decoding failure is never an availability substitute.
-pub(super) fn source_error(error: &TiingoHttpSourceError, context: &RequestContext) -> ServiceError {
+pub(super) fn source_error(
+    error: &TiingoHttpSourceError,
+    context: &RequestContext,
+) -> ServiceError {
     use market_squawk_adapter_tiingo::TiingoTransportFailureKind as Transport;
     let classified = match error {
-        TiingoHttpSourceError::Provider(failure) => provider_status_error(failure.provider().status()),
+        TiingoHttpSourceError::Provider(failure) => {
+            provider_status_error(failure.provider().status())
+        }
         TiingoHttpSourceError::Adapter(error) => adapter_error(error),
         TiingoHttpSourceError::Decode(failure) => adapter_error(failure.error()),
         TiingoHttpSourceError::Transport(failure) => match failure.kind() {
@@ -648,8 +754,12 @@ fn adapter_error(error: &TiingoAdapterError) -> ServiceError {
     match error {
         TiingoAdapterError::Provider(failure) => provider_status_error(failure.status()),
         TiingoAdapterError::InvalidToken => ServiceError::Unauthorized,
-        TiingoAdapterError::InvalidTicker | TiingoAdapterError::InvalidDateRange => ServiceError::InvalidRequest,
-        TiingoAdapterError::HistoryTooLarge | TiingoAdapterError::BodyTooLarge => ServiceError::ResourceExhausted,
+        TiingoAdapterError::InvalidTicker | TiingoAdapterError::InvalidDateRange => {
+            ServiceError::InvalidRequest
+        }
+        TiingoAdapterError::HistoryTooLarge | TiingoAdapterError::BodyTooLarge => {
+            ServiceError::ResourceExhausted
+        }
         TiingoAdapterError::RequestBuild => ServiceError::Internal,
         _ => ServiceError::InvalidResult,
     }
@@ -675,12 +785,16 @@ fn history_error(
     error: &crate::application::TiingoHistoryApplicationError,
     context: &RequestContext,
 ) -> ServiceError {
-    use crate::application::{TiingoHistoryApplicationError as History, TiingoLatestApplicationError as Latest};
+    use crate::application::{
+        TiingoHistoryApplicationError as History, TiingoLatestApplicationError as Latest,
+    };
     use market_squawk_adapter_tiingo::{TiingoEodMapError, TiingoHistoryEvidenceError};
     let classified = match error {
         History::Source(error) => source_error(error, context),
         History::Calendar(error) => calendar_error(error, context),
-        History::Research(error) | History::Latest(Latest::Research(error)) => research_error(error),
+        History::Research(error) | History::Latest(Latest::Research(error)) => {
+            research_error(error)
+        }
         History::Ingest(error) | History::Latest(Latest::Ingest(error)) => ingest_error(error),
         History::Latest(Latest::Rights(error)) => match error {
             // A rights denial is not absent market data, even if a lower boundary named it
@@ -689,12 +803,24 @@ fn history_error(
             error => *error,
         },
         History::Eod(TiingoEodMapError::Allocation)
-        | History::Evidence(TiingoHistoryEvidenceError::Allocation) => ServiceError::ResourceExhausted,
+        | History::Evidence(TiingoHistoryEvidenceError::Allocation) => {
+            ServiceError::ResourceExhausted
+        }
         History::Read(error) | History::Latest(Latest::AnalyticalRead(error)) => read_error(error),
-        History::Admission | History::OriginalContinuationRequired
-        | History::Eod(_) | History::Evidence(_) | History::Capture(_)
-        | History::CaptureMaterial(_) | History::Publication(_) | History::Extraction(_)
-        | History::Latest(Latest::FamilyMismatch | Latest::RestartInvalid | Latest::Adapter(_) | Latest::Capture(_)) => ServiceError::InvalidResult,
+        History::Admission
+        | History::OriginalContinuationRequired
+        | History::Eod(_)
+        | History::Evidence(_)
+        | History::Capture(_)
+        | History::CaptureMaterial(_)
+        | History::Publication(_)
+        | History::Extraction(_)
+        | History::Latest(
+            Latest::FamilyMismatch
+            | Latest::RestartInvalid
+            | Latest::Adapter(_)
+            | Latest::Capture(_),
+        ) => ServiceError::InvalidResult,
         History::Latest(Latest::AuthorityInvalid) => ServiceError::Unauthorized,
     };
     check_context(context).err().unwrap_or(classified)
@@ -705,7 +831,8 @@ fn ingest_error(error: &market_squawk_data::IngestError) -> ServiceError {
     match error {
         Ingest::Cancelled => ServiceError::Cancelled,
         Ingest::DeadlineExceeded => ServiceError::DeadlineExceeded,
-        Ingest::PublicationAuthorityRevoked | Ingest::AuthorityTransitionRejected
+        Ingest::PublicationAuthorityRevoked
+        | Ingest::AuthorityTransitionRejected
         | Ingest::PersistRightsRequired => ServiceError::Unauthorized,
         _ => ServiceError::Internal,
     }
@@ -713,11 +840,17 @@ fn ingest_error(error: &market_squawk_data::IngestError) -> ServiceError {
 
 fn research_error(error: &crate::ResearchServiceError) -> ServiceError {
     use crate::ResearchServiceError as Research;
-    use market_squawk_platform::{ResearchObjectControlError as Control, SealedResearchJournalStoreError as Store};
+    use market_squawk_platform::{
+        ResearchObjectControlError as Control, SealedResearchJournalStoreError as Store,
+    };
     match error {
         Research::Ingest(error) => ingest_error(error),
-        Research::ProviderCaptureStore(Store::ObjectControl(Control::Cancelled)) => ServiceError::Cancelled,
-        Research::ProviderCaptureStore(Store::ObjectControl(Control::DeadlineExceeded)) => ServiceError::DeadlineExceeded,
+        Research::ProviderCaptureStore(Store::ObjectControl(Control::Cancelled)) => {
+            ServiceError::Cancelled
+        }
+        Research::ProviderCaptureStore(Store::ObjectControl(Control::DeadlineExceeded)) => {
+            ServiceError::DeadlineExceeded
+        }
         Research::IngestAuthorityMismatch => ServiceError::InvalidResult,
         Research::Rights(_) => ServiceError::Unauthorized,
         _ => ServiceError::Internal,
@@ -725,12 +858,14 @@ fn research_error(error: &crate::ResearchServiceError) -> ServiceError {
 }
 
 fn read_error(error: &market_squawk_data::AnalyticalReadError) -> ServiceError {
-    use market_squawk_data::{AnalyticalReadError as Read, QueryError, ParquetStoreError};
+    use market_squawk_data::{AnalyticalReadError as Read, ParquetStoreError, QueryError};
     use market_squawk_platform::ResearchObjectControlError as Control;
     match error {
-        Read::NativeSessionControl(Control::Cancelled) | Read::Query(QueryError::Cancelled)
+        Read::NativeSessionControl(Control::Cancelled)
+        | Read::Query(QueryError::Cancelled)
         | Read::Parquet(ParquetStoreError::Cancelled) => ServiceError::Cancelled,
-        Read::NativeSessionControl(Control::DeadlineExceeded) | Read::Query(QueryError::DeadlineExceeded)
+        Read::NativeSessionControl(Control::DeadlineExceeded)
+        | Read::Query(QueryError::DeadlineExceeded)
         | Read::Parquet(ParquetStoreError::ReadDeadlineExceeded) => ServiceError::DeadlineExceeded,
         _ => ServiceError::Internal,
     }
@@ -754,13 +889,20 @@ fn wall_deadline(context: &RequestContext) -> Result<Timestamp, ServiceError> {
 
 /// Genuine owning reads from three exact publications, in subject/SPY/VTI order.
 pub(crate) struct TiingoSelectedInvestmentHistories {
-    histories: [CompleteMarketBarHistoryOutput; 3],
+    histories: [CompleteMarketBarHistoryCursor; 3],
     dates: (CalendarDate, CalendarDate),
     evidence_digest: EvidenceDigest,
 }
 impl TiingoSelectedInvestmentHistories {
-    pub(crate) const fn evidence_digest(&self) -> EvidenceDigest { self.evidence_digest }
-    pub(crate) fn into_parts(self) -> ([CompleteMarketBarHistoryOutput; 3], (CalendarDate, CalendarDate)) {
+    pub(crate) const fn evidence_digest(&self) -> EvidenceDigest {
+        self.evidence_digest
+    }
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        [CompleteMarketBarHistoryCursor; 3],
+        (CalendarDate, CalendarDate),
+    ) {
         (self.histories, self.dates)
     }
 }
@@ -773,18 +915,44 @@ async fn completed_source_dates(
     context: &RequestContext,
 ) -> Result<(CalendarDate, CalendarDate), ServiceError> {
     let annual = required_annual_source_dates(started_at).map_err(|_| operation_error(context))?;
-    let upper = started_at.utc_calendar_date().map_err(|_| ServiceError::InvalidRequest)?;
+    let upper = started_at
+        .utc_calendar_date()
+        .map_err(|_| ServiceError::InvalidRequest)?;
     let venue = VenueId::try_from("XNYS").map_err(|_| ServiceError::Internal)?;
-    let reference = calendars.preflight(&venue, annual.0, upper, context.deadline(), context.cancellation().clone())
-        .await.map_err(|error| calendar_error(&error, context))?.ok_or(ServiceError::Unavailable)?;
+    let reference = calendars
+        .preflight(
+            &venue,
+            annual.0,
+            upper,
+            context.deadline(),
+            context.cancellation().clone(),
+        )
+        .await
+        .map_err(|error| calendar_error(&error, context))?
+        .ok_or(ServiceError::Unavailable)?;
     let cutoff = current_time()?;
-    let calendar = calendars.read_reference(&reference, cutoff, context.deadline(), context.cancellation().clone())
-        .await.map_err(|error| calendar_error(&error, context))?.ok_or(ServiceError::Unavailable)?;
-    let completed = calendar.native_session_replay().sessions().iter().rev().find_map(|day| {
-        calendar.date_session_on(day.date(), cutoff, cutoff)
-            .filter(|session| session.closes_at_exclusive() <= cutoff)
-            .map(|session| session.date())
-    }).ok_or(ServiceError::Unavailable)?;
+    let calendar = calendars
+        .read_reference(
+            &reference,
+            cutoff,
+            context.deadline(),
+            context.cancellation().clone(),
+        )
+        .await
+        .map_err(|error| calendar_error(&error, context))?
+        .ok_or(ServiceError::Unavailable)?;
+    let completed = calendar
+        .native_session_replay()
+        .sessions()
+        .iter()
+        .rev()
+        .find_map(|day| {
+            calendar
+                .date_session_on(day.date(), cutoff, cutoff)
+                .filter(|session| session.closes_at_exclusive() <= cutoff)
+                .map(|session| session.date())
+        })
+        .ok_or(ServiceError::Unavailable)?;
     check_context(context)?;
     Ok((annual.0, annual.1.max(completed)))
 }
@@ -792,7 +960,8 @@ async fn completed_source_dates(
 const CASH_UNIT_REVISION: &str = "tiingo-spy-vti-inferred-usd-original-share-v1";
 fn reviewed_cash_unit_payload() -> ExactPayloadEvidence {
     ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-        DigestAlgorithm::Sha256, Sha256::digest(include_bytes!("cash_unit_interpretation.md")).into(),
+        DigestAlgorithm::Sha256,
+        Sha256::digest(include_bytes!("cash_unit_interpretation.md")).into(),
     ))
 }
 fn inferred_cash_unit(
@@ -801,7 +970,9 @@ fn inferred_cash_unit(
     instrument: &TiingoEodInstrumentAuthority,
     contract: &TiingoEodContractEvidence,
 ) -> Result<Option<TiingoEodCashUnitEvidence>, ServiceError> {
-    let Some(benchmark) = benchmark else { return Ok(None); };
+    let Some(benchmark) = benchmark else {
+        return Ok(None);
+    };
     if record.definition().instrument_id() != benchmark.instrument_id()
         || record.revision_digest() != benchmark.reference_revision_digest()
         || record.definition().asset_class() != AssetClass::Fund
@@ -809,13 +980,23 @@ fn inferred_cash_unit(
         || instrument.venue_id().as_str() != "ARCX"
         || instrument.ticker().as_str() != benchmark.display_symbol()
         || !matches!(benchmark.display_symbol(), "SPY" | "VTI")
-    { return Err(ServiceError::Unavailable); }
+    {
+        return Err(ServiceError::Unavailable);
+    }
     let assertion = RevisionBoundPayloadEvidence::new(
-        MetadataRevision::new(SourceIdentifier::try_from(CASH_UNIT_REVISION).map_err(|_| ServiceError::Internal)?),
+        MetadataRevision::new(
+            SourceIdentifier::try_from(CASH_UNIT_REVISION).map_err(|_| ServiceError::Internal)?,
+        ),
         reviewed_cash_unit_payload(),
     );
     TiingoEodCashUnitEvidence::try_new_with_status(
-        instrument.instrument_id(), contract.mapping_identity(), record.definition().quote_currency(),
-        assertion, current_time()?, market_squawk_sources::MarketHistoryCashUnitStatus::ReviewedInference,
-    ).map(Some).map_err(|_| ServiceError::InvalidResult)
+        instrument.instrument_id(),
+        contract.mapping_identity(),
+        record.definition().quote_currency(),
+        assertion,
+        current_time()?,
+        market_squawk_sources::MarketHistoryCashUnitStatus::ReviewedInference,
+    )
+    .map(Some)
+    .map_err(|_| ServiceError::InvalidResult)
 }

@@ -1,19 +1,19 @@
 //! Saved reference zones in the authenticated original chart share frame.
 
 use super::nanos;
-use market_squawk_data::ForecastBasisHistory;
+use crate::application::model::forecast::SavedForecastChart;
 use market_squawk_decisions::{InvestmentProposalDecision, TargetPriceRange};
 use market_squawk_domain::Timestamp;
 use market_squawk_services::ServiceError;
 use serde_json::{Value, json};
 
 /// The decision retains a source-minted conversion (reconstructed by the saved decision reader),
-/// while `history` physically reopens the original chart sources. Neither a persisted scalar nor
+/// while `history` authenticates their persisted chart frame and current source rights. Neither a persisted scalar nor
 /// matching nominal currency alone establishes that these two price frames are comparable.
 /// Expiry bounds historical display; this function never reauthorizes a current action.
 pub(super) fn value(
     decision: &InvestmentProposalDecision,
-    history: Option<&ForecastBasisHistory>,
+    history: Option<&SavedForecastChart>,
 ) -> Result<Value, ServiceError> {
     let unavailable = |reason, summary| unavailable(decision, reason, summary);
     let InvestmentProposalDecision::Generated(proposal) = decision else {

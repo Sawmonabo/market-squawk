@@ -39,6 +39,7 @@ pub(crate) fn catalog(
         "defaultResolution": default.resolution(),
         "components": components,
         "models": available_models,
+        "nextCursor": models.and_then(ForecastPreparationCatalog::next_cursor),
         "historicalCosts": {
             "feesBps": cost.fee_basis_points(),
             "slippageBps": cost.slippage_basis_points(),

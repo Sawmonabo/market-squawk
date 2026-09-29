@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 
 use market_squawk_data::{
     CompleteMarketBarHistoryOutput, DatasetManifestRef, DatasetSchemaRegistry,
-    FeatureDatasetInputEpochOutput, OwnedFeatureDatasetInputCoordinate,
+    FeatureDatasetInputCoordinateHandle, FeatureDatasetInputEpochCursor,
     PinnedInstrumentDefinitions, PinnedQueryOutput, Sha256Digest,
 };
 use market_squawk_domain::{
@@ -19,10 +19,12 @@ use sha2::{Digest as _, Sha256};
 use crate::engine::BacktestError;
 
 mod admission;
+pub(crate) mod history_store;
+pub(crate) mod observation_store;
 
 pub use admission::{
-    AVAILABLE_AT_COMPONENT, DEPTH_COMPONENT, EVENT_AT_COMPONENT, MID_PRICE_COMPONENT,
-    SPREAD_COMPONENT, STALE_AT_COMPONENT, UNIVERSE_COMPONENT,
+    AVAILABLE_AT_COMPONENT, BacktestDailyHistoryAdmission, DEPTH_COMPONENT, EVENT_AT_COMPONENT,
+    MID_PRICE_COMPONENT, SPREAD_COMPONENT, STALE_AT_COMPONENT, UNIVERSE_COMPONENT,
 };
 
 const HARD_MAX_OBSERVATIONS: usize = 1_000_000;
@@ -170,7 +172,7 @@ pub enum BacktestExecutionBasis {
 }
 
 /// One raw realized daily bar admitted only from the durable complete-history reader.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct BacktestDailyBar {
     pub(crate) execution_terms: InstrumentExecutionTerms,
     /// Provider period start or original named regular-session open; never a synthesized candle.
@@ -179,6 +181,7 @@ pub(crate) struct BacktestDailyBar {
     pub(crate) available_at: Timestamp,
     pub(crate) close: Money,
     pub(crate) traded_volume: rust_decimal::Decimal,
+    #[serde(with = "history_store::digest_wire")]
     pub(crate) lineage_digest: Sha256Digest,
 }
 
@@ -192,13 +195,13 @@ pub(crate) struct NominalOutcomeSource {
 #[derive(Clone, Debug)]
 pub(crate) struct BacktestDailyHistory {
     pub(crate) nominal_sources: Box<[NominalOutcomeSource]>,
-    pub(crate) bars: Box<[BacktestDailyBar]>,
+    pub(crate) bars: history_store::DailyBarStore,
     pub(crate) digest: Sha256Digest,
     pub(crate) available_at: Timestamp,
 }
 
 /// Historical eligibility carried by the exact Task 11 universe at an observation cutoff.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum HistoricalUniverseStatus {
     /// The instrument belonged to the historical universe at this cutoff.
     Eligible,
@@ -209,7 +212,7 @@ pub enum HistoricalUniverseStatus {
 }
 
 /// One finite research feature available to a strategy at the current cutoff.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResearchFeatureValue {
     pub(crate) name: SourceIdentifier,
     version: NonZeroU32,
@@ -269,7 +272,7 @@ pub(crate) struct BacktestObservationInput {
 }
 
 /// One manifest-bound observation with conservative availability and freshness semantics.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BacktestObservation {
     pub(crate) execution_terms: InstrumentExecutionTerms,
     event_at: Timestamp,
@@ -281,13 +284,15 @@ pub struct BacktestObservation {
     pub(crate) executable_depth: QuantityLots,
     pub(crate) universe: HistoricalUniverseStatus,
     pub(crate) features: Box<[ResearchFeatureValue]>,
+    #[serde(with = "history_store::digest_wire")]
     pub(crate) lineage_digest: Sha256Digest,
     /// Source-verified financial origin and fixed target, distinct from provider event time.
     /// Only sealed feature-epoch admission can populate this for completed-close studies.
     pub(crate) financial_target: Option<(Timestamp, Timestamp)>,
     pub(crate) source_selection_as_of: Timestamp,
     pub(crate) market_reference: Option<Money>,
-    pub(crate) input_coordinate: Option<Box<OwnedFeatureDatasetInputCoordinate>>,
+    #[serde(skip)]
+    pub(crate) input_coordinate: Option<Box<FeatureDatasetInputCoordinateHandle>>,
 }
 
 impl BacktestObservation {
@@ -389,7 +394,7 @@ pub struct BacktestDataset {
     object_graph_digest: Sha256Digest,
     pub(crate) point_in_time_content: Sha256Digest,
     pub(crate) point_in_time_audit: Sha256Digest,
-    pub(crate) observations: Box<[BacktestObservation]>,
+    pub(crate) observations: observation_store::ObservationStore,
     pub(crate) identity: Sha256Digest,
     pub(crate) retained_bytes: usize,
     pub(crate) daily_history: Option<BacktestDailyHistory>,
@@ -420,7 +425,7 @@ impl BacktestDataset {
         admission::with_complete_daily_history(
             self,
             histories,
-            &instrument_definitions,
+            instrument_definitions,
             admitted_at,
             limits,
         )
@@ -439,16 +444,32 @@ impl BacktestDataset {
         admission::with_complete_daily_history(
             dataset,
             histories,
-            &instrument_definitions,
+            instrument_definitions,
             admitted_at,
             limits,
         )
     }
 
+    /// Starts sealed scoring admission and accepts each realized instrument history separately.
+    pub fn begin_study_input_epochs(
+        output: FeatureDatasetInputEpochCursor,
+        instrument_definitions: PinnedInstrumentDefinitions,
+        admitted_at: Timestamp,
+        limits: BacktestLimits,
+    ) -> Result<BacktestDailyHistoryAdmission, BacktestError> {
+        let dataset = admission::from_study_input_epochs(
+            output,
+            &instrument_definitions,
+            admitted_at,
+            limits,
+        )?;
+        BacktestDailyHistoryAdmission::new(dataset, instrument_definitions, admitted_at, limits)
+    }
+
     /// Admits a complete label-free scoring population and separately authenticated raw outcomes.
     /// Neither caller-authored epoch vectors nor label-selected feature queries can enter here.
     pub fn try_from_study_input_epochs(
-        output: FeatureDatasetInputEpochOutput,
+        output: FeatureDatasetInputEpochCursor,
         instrument_definitions: PinnedInstrumentDefinitions,
         histories: Vec<CompleteMarketBarHistoryOutput>,
         admitted_at: Timestamp,
@@ -463,7 +484,7 @@ impl BacktestDataset {
         admission::with_complete_daily_history(
             dataset,
             histories,
-            &instrument_definitions,
+            instrument_definitions,
             admitted_at,
             limits,
         )
@@ -497,23 +518,33 @@ impl BacktestDataset {
         }) {
             return Err(BacktestError::InvalidDataset);
         }
-        let retained_bytes = input.observations.iter().try_fold(
-            size_of::<Self>()
-                .checked_add(input.manifest.dataset_id().as_str().len())
-                .ok_or(BacktestError::LimitExceeded)?,
-            |total, observation| {
-                total
-                    .checked_add(observation.retained_bytes())
-                    .ok_or(BacktestError::LimitExceeded)
-            },
-        )?;
-        let identity = dataset_identity(&input);
+        let observations = observation_store::ObservationStore::from_observations(std::mem::take(
+            &mut input.observations,
+        ))?;
+        Self::from_store(input, observations)
+    }
+
+    pub(crate) fn from_store(
+        input: BacktestDatasetInput,
+        observations: observation_store::ObservationStore,
+    ) -> Result<Self, BacktestError> {
+        let identity = dataset_identity(&input, &observations)?;
+        // SQLite caches and the bounded decode page, rather than complete historical bytes.
+        let retained_bytes = 64 * 1024
+            + observations
+                .iter()
+                .take(128)
+                .try_fold(0usize, |total, value| {
+                    total
+                        .checked_add(value?.retained_bytes())
+                        .ok_or(BacktestError::LimitExceeded)
+                })?;
         Ok(Self {
             manifest: input.manifest,
             object_graph_digest: input.object_graph_digest,
             point_in_time_content: input.point_in_time_content,
             point_in_time_audit: input.point_in_time_audit,
-            observations: input.observations.into_boxed_slice(),
+            observations,
             identity,
             retained_bytes,
             daily_history: None,
@@ -573,7 +604,10 @@ impl BacktestDataset {
     }
 }
 
-fn dataset_identity(input: &BacktestDatasetInput) -> Sha256Digest {
+fn dataset_identity(
+    input: &BacktestDatasetInput,
+    observations: &observation_store::ObservationStore,
+) -> Result<Sha256Digest, BacktestError> {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/backtest-dataset/v2");
     update_text(&mut hash, input.manifest.dataset_id().as_str());
@@ -584,8 +618,9 @@ fn dataset_identity(input: &BacktestDatasetInput) -> Sha256Digest {
     hash.update(input.point_in_time_audit.bytes());
     hash.update(input.instrument_definition_content.bytes());
     hash.update(input.instrument_definition_audit.bytes());
-    hash.update((input.observations.len() as u64).to_be_bytes());
-    for observation in &input.observations {
+    hash.update((observations.len() as u64).to_be_bytes());
+    for observation in observations.iter() {
+        let observation = observation?;
         update_execution_terms(&mut hash, observation.execution_terms);
         hash.update(observation.event_at.unix_nanos().to_be_bytes());
         hash.update(observation.available_at.unix_nanos().to_be_bytes());
@@ -635,7 +670,7 @@ fn dataset_identity(input: &BacktestDatasetInput) -> Sha256Digest {
             hash.update(feature.value.to_bits().to_be_bytes());
         }
     }
-    Sha256Digest::new(hash.finalize().into())
+    Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
 fn update_execution_terms(hash: &mut Sha256, terms: InstrumentExecutionTerms) {

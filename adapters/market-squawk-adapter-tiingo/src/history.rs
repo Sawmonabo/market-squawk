@@ -435,3 +435,12 @@ pub enum TiingoHistoryEvidenceError {
     #[error("sealed Tiingo history evidence allocation failed")]
     Allocation,
 }
+
+/// HTTP completion authority issued only by the source after checkpoint validation.
+#[derive(Debug)]
+pub struct TiingoVerifiedHistoryTerminal {
+    pub(crate) plan_identity: EvidenceDigest,
+    pub(crate) page_count: usize,
+    pub(crate) last_page_identity: Option<EvidenceDigest>,
+    pub(crate) checkpoint_identity: EvidenceDigest,
+}

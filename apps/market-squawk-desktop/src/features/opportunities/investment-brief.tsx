@@ -2,9 +2,12 @@ import { CircleAlert, RefreshCw } from "lucide-react"
 import { useRef, useState, type ReactNode } from "react"
 import { Link } from "react-router-dom"
 
-import { MarketPriceChart, formatChartTimestamp } from "@/components/charts/market-price-chart"
+import { MarketPriceChart, formatChartTimestamp, type ChartViewport, type ObservedPricePoint } from "@/components/charts/market-price-chart"
 
-import type { ProductScope } from "@/app/query-client"
+import { productKeys, type ProductScope } from "@/app/query-client"
+import { keepPreviousData, useQuery } from "@tanstack/react-query"
+import { DemandPanel } from "../shared/demand-panel"
+import { parseInvestmentChart, parseRecommendationTrackRecord } from "./contracts"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -13,6 +16,7 @@ import type { ProductTransport } from "@/lib/transport"
 
 import type {
   InvestmentAnalysis,
+  InvestmentChart,
   InvestmentAnalysisLocator,
   RecommendationTrackRecord,
   StudyQualification,
@@ -29,18 +33,14 @@ export function InvestmentBrief({
   analysis,
   transport,
   scope,
-  trackRecord,
-  trackRecordPending,
-  trackRecordUnavailable,
+  trackRecordAvailable,
   refreshing,
   onRefresh,
 }: {
   analysis: InvestmentAnalysis
   transport: ProductTransport
   scope: ProductScope
-  trackRecord: RecommendationTrackRecord | null
-  trackRecordPending: boolean
-  trackRecordUnavailable: boolean
+  trackRecordAvailable: boolean
   refreshing: boolean
   onRefresh: () => void
 }) {
@@ -120,7 +120,9 @@ export function InvestmentBrief({
         <Fact label="Reporting currency" value={analysis.currency} />
       </dl>
 
-      <SavedInvestmentChart key={analysis.actionToken} analysis={analysis} />
+      {analysis.chartAvailable ? <DemandPanel title="Open saved charts" className="mt-5">
+        <SavedInvestmentChartRead actionToken={analysis.actionToken} currency={analysis.currency} transport={transport} scope={scope} />
+      </DemandPanel> : <p className="mt-5 text-xs text-muted-foreground">Saved chart evidence is unavailable for this analysis.</p>}
       <SavedProbabilities analysis={analysis} />
       <PriceRanges analysis={analysis} />
       <SignalExplanation key={analysis.actionToken} analysis={analysis} />
@@ -146,11 +148,9 @@ export function InvestmentBrief({
       </Disclosure>
       <SizingSummary analysis={analysis} />
       <RealizedOutcome analysis={analysis} />
-      <TrackRecord
-        record={trackRecord}
-        pending={trackRecordPending}
-        unavailable={trackRecordUnavailable}
-      />
+      <DemandPanel title="Comparable history" className="mt-5 rounded-lg border border-border bg-background/30 p-4">
+        <TrackRecordRead transport={transport} scope={scope} actionToken={analysis.trackRecordActionToken} available={trackRecordAvailable} />
+      </DemandPanel>
     </section>
   )
 }
@@ -165,8 +165,94 @@ const harmonicStatus = {
   no_matching_pattern: "No matching pattern", expired: "Expired at the saved cutoff", invalidated: "Invalidated at the saved cutoff",
 } as const
 
-function SavedInvestmentChart({ analysis }: { analysis: InvestmentAnalysis }) {
-  const chart = analysis.chart
+type OriginalChartSelection = { layer: "history" | "benchmark"; timeUnixNanos: string; originalOrdinal: string }
+
+function SavedInvestmentChartRead({ actionToken, currency, transport, scope }: {
+  actionToken: string
+  currency: string
+  transport: ProductTransport
+  scope: ProductScope
+}) {
+  const [viewport, setViewport] = useState<ChartViewport | null>(null)
+  const [viewReset, setViewReset] = useState(0)
+  const [layer, setLayer] = useState<InvestmentChart["viewport"]["layer"]>("all")
+  const [selectedPoint, setSelectedPoint] = useState<OriginalChartSelection | null>(null)
+  const input = { actionToken, pointLimit: viewport?.pointLimit ?? 512, layer,
+    ...(viewport === null ? {} : { startUnixNanos: viewport.fromUnixNanos, endUnixNanos: viewport.throughUnixNanos }) }
+  const chart = useQuery({
+    queryKey: productKeys.operation(scope, "decision", "Decision.GetInvestmentChart", input),
+    gcTime: 0,
+    placeholderData: keepPreviousData,
+    queryFn: async ({ signal }) => parseInvestmentChart(await transport.query({ query: "decisionInvestmentChart", ...input }, { signal }), input),
+  })
+  const updateViewport = (next: ChartViewport) => {
+    if (viewport === null && next.fromUnixNanos === chart.data?.viewport.fullStartUnixNanos
+      && next.throughUnixNanos === chart.data?.viewport.fullEndUnixNanos) return
+    setViewport((current) => current?.fromUnixNanos === next.fromUnixNanos
+      && current.throughUnixNanos === next.throughUnixNanos && current.pointLimit === next.pointLimit ? current : next)
+    setSelectedPoint(null)
+  }
+  return <div className="space-y-3">
+    <label className="flex items-center gap-2 text-xs">Saved chart evidence
+      <select className="rounded-md border border-input bg-background px-2 py-1.5" value={layer}
+        onChange={(event) => { setLayer(event.target.value as typeof layer); setSelectedPoint(null) }}>
+        <option value="all">All layers</option><option value="history">Observed history</option>
+        <option value="forecast">Original forecast</option><option value="benchmark">Saved comparisons</option>
+        <option value="price_pattern">Price pattern</option><option value="action_ranges">Action references</option>
+      </select>
+    </label>
+    <Button size="sm" variant="outline" onClick={() => { setViewport(null); setSelectedPoint(null); setViewReset((value) => value + 1) }}>Reset saved view</Button>
+    {chart.isError ? <Alert variant="destructive">
+      <CircleAlert aria-hidden="true" /><AlertTitle>Saved charts could not be loaded</AlertTitle>
+      <AlertDescription><Button size="sm" variant="outline" onClick={() => void chart.refetch()}>Try again</Button></AlertDescription>
+    </Alert> : null}
+    {chart.data ? <>
+      {chart.isFetching ? <p role="status" className="text-xs text-muted-foreground">Loading the requested evidence window…</p> : null}
+      <SavedInvestmentChart key={viewReset} chart={chart.data} currency={currency} onViewportChange={updateViewport} onObservationSelect={(point) => {
+        if (point.originalOrdinal !== undefined) setSelectedPoint({ layer: "history", timeUnixNanos: String(point.timeUnixNanos), originalOrdinal: point.originalOrdinal })
+      }} onBenchmarkSelect={(point) => setSelectedPoint({ layer: "benchmark", timeUnixNanos: point.coordinate.sessionCloseUnixNanos, originalOrdinal: point.originalOrdinal })} />
+    </> : chart.isPending ? <Skeleton className="h-80 rounded-lg" /> : null}
+    {selectedPoint !== null ? <OriginalChartObservationRead key={String(selectedPoint.timeUnixNanos)} point={selectedPoint} actionToken={actionToken} currency={currency} transport={transport} scope={scope} /> : null}
+  </div>
+}
+
+function OriginalChartObservationRead({ point, actionToken, currency, transport, scope }: {
+  point: OriginalChartSelection; actionToken: string; currency: string; transport: ProductTransport; scope: ProductScope
+}) {
+  const time = String(point.timeUnixNanos)
+  const input = { actionToken, startUnixNanos: time, endUnixNanos: time, pointLimit: 8, layer: point.layer }
+  const read = useQuery({
+    queryKey: productKeys.operation(scope, "decision", "Decision.GetInvestmentChart", input),
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
+      const chart = parseInvestmentChart(await transport.query({ query: "decisionInvestmentChart", ...input }, { signal }), input)
+      const original = point.layer === "history"
+        ? chart.history.state === "available" ? chart.history.points.find((entry) =>
+          (entry.coordinate.kind === "timestamp" ? entry.coordinate.timeUnixNanos : entry.coordinate.sessionCloseUnixNanos) === time
+          && entry.originalOrdinal === point.originalOrdinal) : undefined
+        : chart.benchmark.state === "available" ? chart.benchmark.points.find((entry) =>
+          entry.coordinate.sessionCloseUnixNanos === time && entry.originalOrdinal === point.originalOrdinal) : undefined
+      if (!original) throw new Error("The original saved observation could not be verified.")
+      return original
+    },
+  })
+  return <div className="rounded-lg border border-border bg-background/25 p-3 text-xs">
+    <p className="font-medium">Original saved observation · {formatChartTimestamp(time)}</p>
+    {read.isPending ? <p role="status" className="mt-2 text-muted-foreground">Checking the exact original evidence…</p>
+      : read.isError ? <p role="alert" className="mt-2 text-destructive">The original observation could not be verified. <Button size="xs" variant="outline" onClick={() => void read.refetch()}>Retry</Button></p>
+        : "observations" in read.data ? <dl className="mt-2 grid gap-2 sm:grid-cols-3">{read.data.observations.map((entry, index) => <div key={index}>
+          <dt className="text-muted-foreground">Comparison {index + 1}</dt><dd className="mt-1 font-mono">{entry === null ? "Observation gap" : `${entry.priceIndex} index · ${entry.close} ${currency}`}</dd>
+        </div>)}</dl>
+          : <p className="mt-2 font-mono">{read.data.value === null ? "No recorded price" : `${read.data.value} ${currency}`} · {read.data.quality ?? "Observation gap"}</p>}
+  </div>
+}
+
+function SavedInvestmentChart({ chart, currency, onViewportChange, onObservationSelect, onBenchmarkSelect }: {
+  chart: InvestmentChart; currency: string
+  onViewportChange: (viewport: ChartViewport) => void
+  onObservationSelect: (point: ObservedPricePoint) => void
+  onBenchmarkSelect: (point: Extract<InvestmentChart["benchmark"], { state: "available" }>["points"][number]) => void
+}) {
   const pattern = chart.pricePattern
   const patternDetails = useRef<HTMLDetailsElement>(null)
   const patternSummary = useRef<HTMLElement>(null)
@@ -184,7 +270,13 @@ function SavedInvestmentChart({ analysis }: { analysis: InvestmentAnalysis }) {
     </div>
     {chart.history.state === "available" || chart.forecast.state === "available" || confirmed ? <MarketPriceChart
       title="Saved split-adjusted history, forecast and price patterns"
-      unit={analysis.currency}
+      viewportBounds={chart.viewport.fullStartUnixNanos !== null && chart.viewport.fullEndUnixNanos !== null
+        ? { fromUnixNanos: chart.viewport.fullStartUnixNanos, throughUnixNanos: chart.viewport.fullEndUnixNanos } : undefined}
+      viewportPointLimit={chart.viewport.pointLimit}
+      onViewportChange={onViewportChange}
+      onObservationSelect={onObservationSelect}
+      displayResolution={chart.history.state === "available" ? chart.history.display : undefined}
+      unit={currency}
       cutoffUnixNanos={chart.forecast.state === "available"
         ? chart.forecast.observedThroughUnixNanos : chart.informationCurrentThroughUnixNanos}
       cutoffLabel={chart.forecast.state === "available" ? "Original forecast cutoff" : "Saved information cutoff"}
@@ -192,7 +284,7 @@ function SavedInvestmentChart({ analysis }: { analysis: InvestmentAnalysis }) {
         timeUnixNanos: point.coordinate.kind === "timestamp"
           ? point.coordinate.timeUnixNanos : point.coordinate.sessionCloseUnixNanos,
         ...(point.coordinate.kind === "session_date" ? { sessionDate: point.coordinate.date } : {}),
-        value: point.value, quality: point.quality,
+        value: point.value, quality: point.quality, originalOrdinal: point.originalOrdinal, breakBefore: point.breakBefore[0],
       })) : forecastOrigin.state === "available" ? [{
         timeUnixNanos: forecastOrigin.coordinate.kind === "timestamp"
           ? forecastOrigin.coordinate.timeUnixNanos : forecastOrigin.coordinate.sessionCloseUnixNanos,
@@ -244,7 +336,7 @@ function SavedInvestmentChart({ analysis }: { analysis: InvestmentAnalysis }) {
       </dl>
       <ul className="mt-4 space-y-3 text-xs leading-5">
         {actionRanges.ranges.map((range) => <li key={range.kind}>
-          <p className="font-medium">{range.label}: <span className="font-mono">{range.lower} – {range.upper} {analysis.currency}</span></p>
+          <p className="font-medium">{range.label}: <span className="font-mono">{range.lower} – {range.upper} {currency}</span></p>
           <p className="mt-1 text-muted-foreground">{range.summary}</p>
         </li>)}
       </ul>
@@ -259,11 +351,11 @@ function SavedInvestmentChart({ analysis }: { analysis: InvestmentAnalysis }) {
         <Fact label="Originally confirmed through" value={formatChartTimestamp(pattern.confirmationCutoffUnixNanos)} />
         <Fact label="Pattern expiry" value={formatChartTimestamp(pattern.expiresAtUnixNanos)} />
         <Fact label="Completion / reversal zone" value={pattern.reversalZone
-          ? `${pattern.reversalZone.lower} – ${pattern.reversalZone.upper} ${analysis.currency}` : "Unavailable"} />
+          ? `${pattern.reversalZone.lower} – ${pattern.reversalZone.upper} ${currency}` : "Unavailable"} />
         <Fact label="Invalidation level" value={pattern.invalidation === null
-          ? "Unavailable" : `${pattern.invalidation} ${analysis.currency}`} />
+          ? "Unavailable" : `${pattern.invalidation} ${currency}`} />
         {pattern.targets.map((value, index) => <Fact key={index} label={`Research target ${index + 1}`}
-          value={`${value} ${analysis.currency}`} />)}
+          value={`${value} ${currency}`} />)}
       </dl>
       {pattern.pivots.length ? <div className="mt-4 overflow-x-auto">
         <table className="w-full min-w-[760px] text-left text-xs">
@@ -271,7 +363,7 @@ function SavedInvestmentChart({ analysis }: { analysis: InvestmentAnalysis }) {
           <thead><tr><th className="p-2 font-medium">Pivot</th><th className="p-2 font-medium">Price</th><th className="p-2 font-medium">Observed</th><th className="p-2 font-medium">Available</th><th className="p-2 font-medium">Confirmed</th></tr></thead>
           <tbody>{pattern.pivots.map((pivot) => <tr key={pivot.name} aria-current={pivot.name === selectedPivot ? "true" : undefined}
             className={`border-t border-border ${pivot.name === selectedPivot ? "bg-primary/10" : ""}`}>
-            <td className="p-2">{pivot.name} · {pivot.kind}</td><td className="p-2 font-mono">{pivot.value} {analysis.currency}</td>
+            <td className="p-2">{pivot.name} · {pivot.kind}</td><td className="p-2 font-mono">{pivot.value} {currency}</td>
             <td className="p-2">{formatChartTimestamp(pivot.observedAtUnixNanos)}</td><td className="p-2">{formatChartTimestamp(pivot.availableAtUnixNanos)}</td>
             <td className="p-2">{formatChartTimestamp(pivot.confirmedAtUnixNanos)}</td>
           </tr>)}</tbody>
@@ -284,7 +376,7 @@ function SavedInvestmentChart({ analysis }: { analysis: InvestmentAnalysis }) {
         {pattern.interpretation.map((text) => <li key={text}>{text}</li>)}
       </ul>
     </details>
-    <SavedBenchmarkChart benchmark={chart.benchmark} currency={analysis.currency} />
+    <SavedBenchmarkChart benchmark={chart.benchmark} currency={currency} onViewportChange={onViewportChange} onObservationSelect={onBenchmarkSelect} />
   </section>
 }
 const signalChoices = [
@@ -740,6 +832,21 @@ function RealizedOutcome({ analysis }: { analysis: InvestmentAnalysis }) {
   )
 }
 
+function TrackRecordRead({ transport, scope, actionToken, available }: {
+  transport: ProductTransport
+  scope: ProductScope
+  actionToken: string | null
+  available: boolean
+}) {
+  const record = useQuery({
+    queryKey: productKeys.operation(scope, "decision", "Decision.GetRecommendationTrackRecord", { actionToken }),
+    enabled: available && actionToken !== null,
+    gcTime: 0,
+    queryFn: async ({ signal }) => parseRecommendationTrackRecord(await transport.query({ query: "decisionRecommendationTrackRecord", actionToken: actionToken! }, { signal }), actionToken!),
+  })
+  return <TrackRecord record={record.data ?? null} pending={available && actionToken !== null && record.isPending} unavailable={!available || actionToken === null || record.isError} />
+}
+
 function TrackRecord({
   record,
   pending,
@@ -754,16 +861,16 @@ function TrackRecord({
   }
   if (unavailable || record === null) {
     return (
-      <Disclosure title="Comparable history">
+      <div>
         <p className="text-xs leading-5 text-muted-foreground">
           Comparable saved outcomes are unavailable right now.
         </p>
-      </Disclosure>
+      </div>
     )
   }
   const represented = record.groups.filter((group) => group.recommendationCount > 0)
   return (
-    <Disclosure title="Comparable history">
+    <div>
       <p className="text-xs leading-5 text-muted-foreground">{record.summary}</p>
       <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Fact label="Evaluated through" value={formatProductTimestamp(record.evaluatedAt)} />
@@ -803,7 +910,7 @@ function TrackRecord({
           No comparable saved outcomes are available yet.
         </p>
       )}
-    </Disclosure>
+    </div>
   )
 }
 

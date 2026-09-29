@@ -1,5 +1,5 @@
 import * as React from "react"
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { AlertCircle, Database, RefreshCw, Rows3, Search } from "lucide-react"
 import { Link } from "react-router-dom"
 
@@ -13,6 +13,8 @@ import { MacroContext } from "@/features/macro"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
+
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 
 import { DatasetBuilder } from "./dataset-builder"
 import { DatasetEvidence } from "./dataset-evidence"
@@ -73,21 +75,20 @@ function ResearchWorkspace({
     ...productKeys.domain(bootstrap.productSessionToken, "research"),
     "collections",
   ] as const
-  const collections = useInfiniteQuery({
-    queryKey: collectionKey,
-    initialPageParam: undefined as string | undefined,
-    queryFn: async ({ pageParam }) =>
+  const navigation = useCursorNavigation()
+  const collections = useQuery({
+    queryKey: [...collectionKey, navigation.after],
+    gcTime: 0,
+    queryFn: async ({ signal }) =>
       parseResearchCollectionPage(
         await transport.query({
           query: "researchCollections",
-          ...(pageParam ? { afterCollection: pageParam } : {}),
-        }),
+          ...(navigation.after ? { afterCollection: navigation.after } : {}),
+        }, { signal }),
       ),
-    getNextPageParam: (page) =>
-      page.hasMore ? (page.nextCollection ?? undefined) : undefined,
   })
 
-  const allCollections = collections.data?.pages.flatMap((page) => page.items) ?? []
+  const allCollections = collections.data?.items ?? []
   const normalizedFilter = filter.trim().toLocaleLowerCase()
   const visibleCollections = normalizedFilter
     ? allCollections.filter((collection) =>
@@ -98,7 +99,6 @@ function ResearchWorkspace({
     visibleCollections.find(
       (collection) => collection.collectionToken === selectedId,
     ) ??
-    visibleCollections[0] ??
     null
   const totalRows = allCollections.reduce(
     (total, collection) => total + collection.rowCount,
@@ -164,12 +164,12 @@ function ResearchWorkspace({
           >
             <ResearchFact
               icon={Database}
-              label="Available collections"
+              label="Collections on this page"
               value={formatCount(allCollections.length)}
             />
             <ResearchFact
               icon={Rows3}
-              label="Research observations"
+              label="Observations on this page"
               value={formatCount(totalRows)}
             />
           </section>
@@ -181,7 +181,7 @@ function ResearchWorkspace({
                   htmlFor="research-dataset-filter"
                   className="text-xs font-semibold"
                 >
-                  Find a collection
+                  Find a collection on this page
                 </label>
                 <div className="relative mt-2">
                   <Search
@@ -232,33 +232,24 @@ function ResearchWorkspace({
                   </p>
                 )}
               </div>
-              {collections.hasNextPage ? (
-                <div className="border-t border-border p-3">
-                  <Button
-                    className="w-full"
-                    variant="outline"
-                    onClick={() => void collections.fetchNextPage()}
-                    disabled={collections.isFetchingNextPage}
-                  >
-                    {collections.isFetchingNextPage ? "Loading…" : "Load more collections"}
-                  </Button>
-                </div>
-              ) : null}
             </section>
 
             <div className="space-y-4">
               {selected ? (
                 <DatasetEvidence
+                  key={selected.collectionToken}
                   collection={selected}
                   bootstrap={bootstrap}
                   transport={transport}
                 />
-              ) : null}
+              ) : <p className="rounded-lg border p-5 text-sm text-muted-foreground">Select a collection to open its evidence.</p>}
               <ResearchOperationsLink />
             </div>
           </div>
         </>
       )}
+      <CursorNavigation navigation={navigation} next={collections.data?.hasMore ? collections.data.nextCollection : null} busy={collections.isFetching} error={collections.isError}
+        onRestart={() => { if (navigation.after === undefined) void collections.refetch() }} />
     </ResearchFrame>
   )
 }

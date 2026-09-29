@@ -6,7 +6,10 @@
 
 mod harmonic;
 mod native_sessions;
+pub(crate) use native_sessions::NativeSessionHistory;
+mod viewport;
 pub(crate) use harmonic::HarmonicHistoryEvaluation;
+pub(crate) use viewport::MarketHistoryViewport;
 
 pub(crate) mod benchmark;
 
@@ -113,7 +116,8 @@ impl MarketHistoryInterval {
             Self::Timestamped { end_exclusive, .. } => end_exclusive <= cutoff,
             Self::NominalDates { end_inclusive, .. } => {
                 // This only bounds a date query; it does not assign an instant to a source day.
-                cutoff.utc_calendar_date()
+                cutoff
+                    .utc_calendar_date()
                     .is_ok_and(|date| end_inclusive <= date)
             }
         }

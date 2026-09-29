@@ -29,7 +29,7 @@ pub use admission::{
     BundleAuthorityDocument, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
     ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, ValidatedModelCandidate,
     has_price_return_macro_context_feature_order_v1, recover_model_candidate,
-    verify_model_candidate,
+    recover_model_selection_metadata, verify_model_candidate,
 };
 #[cfg(feature = "release-evidence")]
 pub use bundle::benchmark_support::{
@@ -42,7 +42,7 @@ pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
     MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_FORECAST_POLICY_BYTES, MAX_FORECAST_RESIDUAL_BYTES,
     MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES, MAX_TRAINING_RUN_BYTES, ModelBundle,
-    ProbabilityCalibrationArtifacts, ProbabilityReliabilityBin,
+    ModelSelectionMetadata, ProbabilityCalibrationArtifacts, ProbabilityReliabilityBin,
 };
 pub use forecast::{
     AuthenticatedForecastServingBinding, CalibrationBand, CalibrationCoverageEvaluation,
@@ -69,7 +69,10 @@ pub use metadata::{
     ModelMetadataError, ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod,
     ValidationMetric, ValidationMetricName,
 };
-pub use native::{InferenceBackend, InferenceError, NativeBackendError, NativeLinearBackend};
+pub use native::{
+    InferenceBackend, InferenceError, NativeBackendError, NativeLinearBackend,
+    ResearchForecastInput, ResearchForecastOutput,
+};
 #[cfg(feature = "onnx-runtime")]
 pub use onnx::{
     ControlledOnnxRuntimeRoot, ExternalOnnxRuntimeAdmission, ExternalOnnxRuntimeBackend,
@@ -184,7 +187,8 @@ impl ModelFailure {
                 | OnnxBackendError::FeatureShapeMismatch
                 | OnnxBackendError::RuntimeLoad
                 | OnnxBackendError::IntermediateLimit
-                | OnnxBackendError::WarmUp,
+                | OnnxBackendError::WarmUp
+                | OnnxBackendError::TerminationUncertain,
             ) => ModelFailurePhase::Load,
             Self::Bundle(_) => ModelFailurePhase::Validation,
             Self::Input(_) | Self::Inference(_) => ModelFailurePhase::Inference,
@@ -276,6 +280,7 @@ const fn onnx_backend_error_code(error: OnnxBackendError) -> u16 {
         OnnxBackendError::RuntimeLoad => 504,
         OnnxBackendError::IntermediateLimit => 505,
         OnnxBackendError::WarmUp => 506,
+        OnnxBackendError::TerminationUncertain => 508,
     }
 }
 

@@ -1,12 +1,9 @@
 //! Reopens original current forecast inputs, RAW history and source-owned Split authority.
 
 use super::{ForecastServingEvidence, SelectedPriceForecast, current_input};
-use crate::application::{
-    market_calendar::CompletedMarketSessionReadCapability,
-    research::corporate_actions::{
-        ApplicableActionPlanError, SourceAppliedCorporateActionPlanReference,
-        SourceAppliedCorporateActionReadCapability,
-    },
+use crate::application::research::corporate_actions::{
+    ApplicableActionPlanError, SourceAppliedCorporateActionPlanReference,
+    SourceAppliedCorporateActionReadCapability,
 };
 use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionPolicy, DatasetBuildError, ForecastBasisHistory,
@@ -19,9 +16,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::num::NonZeroU32;
 
-const MAXIMUM_SESSIONS: usize = 4_096;
+mod projection;
+pub(crate) use projection::{
+    authorize_projection_parents, quality as chart_quality, read_chart_display,
+    read_chart_display_from_catalog, storage_error as chart_storage_error,
+};
 
-/// Inert strict reconstruction record. Only `replay_price_history` produces chart authority.
+/// Original financial authority and immutable display projection retained with the decision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SavedForecastChart {
@@ -43,7 +44,9 @@ pub(crate) struct SavedForecastChart {
     selected_manifest: ForecastArtifactManifestRecord,
     origin_manifest: ForecastArtifactManifestRecord,
     parents: Vec<ForecastArtifactManifestRecord>,
-    maximum_sessions: usize,
+    projection: Option<market_squawk_data::ChartProjectionReference>,
+    origin: serde_json::Value,
+    forecast: serde_json::Value,
     source_action_reference: SourceAppliedCorporateActionPlanReference,
 }
 impl SavedForecastChart {
@@ -73,7 +76,6 @@ impl SavedForecastChart {
     }
     fn validate(&self) -> Result<(), ServiceError> {
         if self.version != 1
-            || self.maximum_sessions != MAXIMUM_SESSIONS
             || self.parents.is_empty()
             || self.parents.len() > 128
             || self.source_cutoff != self.source_action_reference.knowledge_cutoff()
@@ -143,22 +145,6 @@ pub(crate) struct ReplayedForecastPriceHistory {
     pub(crate) original_plan: market_squawk_data::CorporateActionPlan,
     pub(crate) history: ForecastBasisHistory,
     pub(crate) saved: SavedForecastChartEvidence,
-}
-
-/// Read-only chart callers need only history; share projection reuses the same replay below.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn replay_price_history(
-    price: &SelectedPriceForecast,
-    research: &crate::ResearchService,
-    calendar: &CompletedMarketSessionReadCapability,
-    source_actions: &SourceAppliedCorporateActionReadCapability,
-    source_reference: &SourceAppliedCorporateActionPlanReference,
-    saved: Option<&SavedForecastChartEvidence>,
-    context: &RequestContext,
-) -> Result<Option<(ForecastBasisHistory, SavedForecastChartEvidence)>, ServiceError> {
-    let calendar = crate::application::market_calendar::ForecastSessionReadCapability::Retained(calendar.retained_read_capability());
-    Ok(replay_price_history_inputs(price, research, &calendar, source_actions, source_reference,
-        saved, context).await?.map(|value| (value.history, value.saved)))
 }
 
 /// The price was authenticated by the existing exact forecast reader. Every source is reopened
@@ -287,13 +273,7 @@ pub(crate) async fn replay_price_history_inputs(
         )
         .map_err(|_| ServiceError::InvalidResult)?;
     let proof = epoch
-        .replay_price_history(
-            &history,
-            &plan,
-            MAXIMUM_SESSIONS,
-            context.deadline(),
-            context.cancellation(),
-        )
+        .replay_price_history(&history, &plan, context.deadline(), context.cancellation())
         .map_err(build_error)?;
     let (permit, _) = crate::application::MarketHistoryReadCapability::authorize_forecast_history(
         research,
@@ -303,7 +283,9 @@ pub(crate) async fn replay_price_history_inputs(
     )
     .await
     .map_err(history_error)?;
-    let record = SavedForecastChart {
+    let origin = projection::original_origin(&proof)?;
+    let forecast = projection::original_forecast(price, &origin)?;
+    let mut record = SavedForecastChart {
         version: 1,
         instrument: proof.instrument_id(),
         currency: proof.origin_price().currency(),
@@ -326,9 +308,12 @@ pub(crate) async fn replay_price_history_inputs(
             .iter()
             .map(ForecastArtifactManifestRecord::from_manifest)
             .collect(),
-        maximum_sessions: MAXIMUM_SESSIONS,
+        projection: None,
+        origin,
+        forecast,
         source_action_reference: source_reference.clone(),
     };
+    projection::publish_history(&mut record, &proof, research, context)?;
     let evidence = record.evidence()?;
     if saved.is_some_and(|saved| *saved != evidence)
         || retained.is_some_and(|saved| saved != record)
@@ -345,7 +330,12 @@ pub(crate) async fn replay_price_history_inputs(
     if now >= permit.expires_at() {
         return Err(ServiceError::Unauthorized);
     }
-    Ok(Some(ReplayedForecastPriceHistory { epoch: epoch.clone(), original_plan: plan, history: proof, saved: evidence }))
+    Ok(Some(ReplayedForecastPriceHistory {
+        epoch: epoch.clone(),
+        original_plan: plan,
+        history: proof,
+        saved: evidence,
+    }))
 }
 fn check(context: &RequestContext) -> Result<(), ServiceError> {
     if context.cancellation().is_cancelled() {

@@ -300,6 +300,8 @@ impl AllOriginRoundTripEvaluatorV1 {
         cohort.update(subject.as_uuid().as_bytes());
         // This first pass seals the entire input population before inspecting any realized fill.
         for observation in dataset.observations.iter() {
+            let observation =
+                observation.map_err(|_| RecommendationBacktestError::InvalidDataset)?;
             if cancellation.is_cancelled() {
                 return Err(RecommendationBacktestError::Cancelled);
             }
@@ -307,12 +309,12 @@ impl AllOriginRoundTripEvaluatorV1 {
             if observation.instrument_id() != subject {
                 continue;
             }
-            let epoch = original_epoch(observation, qualification, policy)?;
+            let epoch = original_epoch(&observation, qualification, policy)?;
             count = count
                 .checked_add(1)
                 .filter(|n| *n <= limits.max_signals())
                 .ok_or(RecommendationBacktestError::LimitExceeded)?;
-            cohort.update(epoch_digest(epoch)?.bytes());
+            cohort.update(epoch_digest(&epoch)?.bytes());
             cohort.update(observation.lineage_digest.bytes());
         }
         if count == 0 {
@@ -334,6 +336,8 @@ impl AllOriginRoundTripEvaluatorV1 {
             .map_err(|_| RecommendationBacktestError::InvalidPolicy)?;
         let mut total_equity_points = 0_usize;
         for observation in dataset.observations.iter() {
+            let observation =
+                observation.map_err(|_| RecommendationBacktestError::InvalidDataset)?;
             if cancellation.is_cancelled() {
                 return Err(RecommendationBacktestError::Cancelled);
             }
@@ -341,14 +345,14 @@ impl AllOriginRoundTripEvaluatorV1 {
             if observation.instrument_id() != subject {
                 continue;
             }
-            let epoch = original_epoch(observation, qualification, policy)?;
+            let epoch = original_epoch(&observation, qualification, policy)?;
             let origin = epoch
                 .target_origin()
                 .ok_or(RecommendationBacktestError::InvalidDataset)?;
             let target = epoch
                 .target_at()
                 .ok_or(RecommendationBacktestError::InvalidDataset)?;
-            let source_epoch_digest = epoch_digest(epoch)?;
+            let source_epoch_digest = epoch_digest(&epoch)?;
             let origin_basis = epoch
                 .fixed_horizon_origin_basis()
                 .ok_or(RecommendationBacktestError::InvalidDataset)?;
@@ -538,12 +542,14 @@ fn original_epoch(
     observation: &BacktestObservation,
     qualification: BacktestStudyQualification,
     policy: AllOriginRoundTripPolicyV1,
-) -> Result<&FeatureDatasetInputEpoch, RecommendationBacktestError> {
-    let epoch = observation
+) -> Result<FeatureDatasetInputEpoch, RecommendationBacktestError> {
+    let coordinate = observation
         .input_coordinate
         .as_ref()
-        .map(|v| v.epoch())
-        .ok_or(RecommendationBacktestError::InvalidDataset)?;
+        .ok_or(RecommendationBacktestError::InvalidDataset)?
+        .load()
+        .map_err(|_| RecommendationBacktestError::InvalidDataset)?;
+    let epoch = coordinate.epoch();
     let origin = epoch
         .target_origin()
         .ok_or(RecommendationBacktestError::InvalidDataset)?;
@@ -568,7 +574,7 @@ fn original_epoch(
     {
         return Err(RecommendationBacktestError::InvalidDataset);
     }
-    Ok(epoch)
+    Ok(epoch.clone())
 }
 fn epoch_digest(
     epoch: &FeatureDatasetInputEpoch,

@@ -1,7 +1,8 @@
 //! Query-scoped capture of verified, no-follow immutable file handles.
 
+use datafusion::execution::memory_pool::MemoryReservation;
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::SchemaRef;
@@ -22,6 +23,7 @@ pub(crate) struct VerifiedPinnedObject {
     object_meta: ObjectMeta,
     file: Arc<Mutex<File>>,
     reader_metadata: ArrowReaderMetadata,
+    _metadata_memory: MemoryReservation,
 }
 
 impl VerifiedPinnedObject {
@@ -97,6 +99,9 @@ impl ParquetObjectStore {
         &self,
         dataset: &PinnedDataset,
         supervisor: &BlockingIoSupervisor,
+        metadata_memory: MemoryReservation,
+        registration_memory: Arc<MemoryReservation>,
+        memory_limit: u64,
     ) -> Result<Vec<VerifiedPinnedObject>, QueryError> {
         let plan = PinnedCapturePlan::try_new(dataset)?;
         let mut verified = Vec::new();
@@ -116,12 +121,15 @@ impl ParquetObjectStore {
             let mut worker = supervisor
                 .spawn_blocking(move || {
                     let _permit = permit;
+                    let _registration_memory = registration_memory;
                     Self::capture_pinned_files(
                         &directory,
                         config,
                         &plan,
                         verified,
                         &worker_cancellation,
+                        &metadata_memory,
+                        memory_limit,
                     )
                 })
                 .map_err(|error| match error {
@@ -147,10 +155,12 @@ impl ParquetObjectStore {
 
     fn capture_pinned_files(
         directory: &cap_std::fs::Dir,
-        config: super::ObjectStoreConfig,
+        _config: super::ObjectStoreConfig,
         plan: &PinnedCapturePlan,
         mut verified: Vec<VerifiedPinnedObject>,
         cancellation: &CancellationToken,
+        metadata_memory: &MemoryReservation,
+        memory_limit: u64,
     ) -> Result<Vec<VerifiedPinnedObject>, ParquetStoreError> {
         for pinned in &plan.objects {
             if cancellation.is_cancelled() {
@@ -166,14 +176,43 @@ impl ParquetObjectStore {
                 .into_std();
             let metadata = file.metadata()?;
             if metadata.len() != pinned.size_bytes
-                || metadata.len() > config.max_staging_bytes
                 || hash_file(&mut file, Some(cancellation))?.bytes() != pinned.content_hash
             {
                 return Err(ParquetStoreError::ObjectMetadataMismatch);
             }
+            if metadata.len() < 8 {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            file.seek(SeekFrom::End(-8))?;
+            let mut footer = [0_u8; 8];
+            file.read_exact(&mut footer)?;
+            let footer_bytes = u32::from_le_bytes(
+                footer[..4]
+                    .try_into()
+                    .map_err(|_| ParquetStoreError::ObjectMetadataMismatch)?,
+            );
+            if &footer[4..] != b"PAR1" || u64::from(footer_bytes) > metadata.len() - 8 {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            let metadata_receipt = usize::try_from(footer_bytes)
+                .ok()
+                .and_then(|bytes| bytes.checked_mul(16))
+                .and_then(|bytes| bytes.checked_add(64 * 1024))
+                .ok_or(ParquetStoreError::SizeOverflow)?;
+            let file_memory = metadata_memory.new_empty();
+            file_memory.try_grow(metadata_receipt).map_err(|_| {
+                ParquetStoreError::WriterMemoryLimitExceeded {
+                    limit: memory_limit,
+                }
+            })?;
             file.seek(SeekFrom::Start(0))?;
             let reader_metadata =
                 ArrowReaderMetadata::load(&file.try_clone()?, ArrowReaderOptions::default())?;
+            if reader_metadata.metadata().memory_size() > metadata_receipt {
+                return Err(ParquetStoreError::WriterMemoryLimitExceeded {
+                    limit: memory_limit,
+                });
+            }
             let metadata_rows =
                 u64::try_from(reader_metadata.metadata().file_metadata().num_rows())
                     .map_err(|_| ParquetStoreError::ObjectMetadataMismatch)?;
@@ -195,6 +234,7 @@ impl ParquetObjectStore {
                 },
                 file: Arc::new(Mutex::new(file)),
                 reader_metadata,
+                _metadata_memory: file_memory,
             });
         }
         Ok(verified)
@@ -202,10 +242,12 @@ impl ParquetObjectStore {
 }
 
 fn capture_query_error(error: ParquetStoreError) -> QueryError {
-    if matches!(error, ParquetStoreError::Cancelled) {
-        QueryError::Cancelled
-    } else {
-        QueryError::Artifact(error)
+    match error {
+        ParquetStoreError::Cancelled => QueryError::Cancelled,
+        ParquetStoreError::WriterMemoryLimitExceeded { limit } => {
+            QueryError::MemoryLimitExceeded { limit }
+        }
+        error => QueryError::Artifact(error),
     }
 }
 

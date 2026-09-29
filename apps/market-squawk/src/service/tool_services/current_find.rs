@@ -23,7 +23,7 @@ use crate::{
     application::{
         CurrentFindScreenPartition, InstrumentContextReadCapability, PreparedCurrentFindFeatures,
         PreparedFeatureDatasetBuild,
-        analytical_profile::{AnalyticalProfileResolution, ValidatedAnalyticalProfile, revalidate},
+        analytical_profile::{AnalyticalProfileResolution, ValidatedAnalyticalProfile},
         decision::{
             AdmittedScreenJob, DecisionApplication, ScreenWorkflowError,
             current_find::{
@@ -32,7 +32,6 @@ use crate::{
             },
         },
         market_calendar::{CompletedMarketSessionRead, CompletedMarketSessionReadCapability},
-        model::forecast_preparation::ForecastPreparationCatalog,
         prepare_find_population, read_find_population,
     },
 };
@@ -175,7 +174,7 @@ impl InstalledCurrentFind {
         &self,
         authority: &InstalledResearchDatasetPreparation,
         parent: &CurrentFindPreparationRecord,
-        models: Option<&ForecastPreparationCatalog>,
+        models: &super::super::forecast_preparation::InstalledForecastPreparation,
         context: &RequestContext,
     ) -> Result<
         (
@@ -187,7 +186,7 @@ impl InstalledCurrentFind {
     > {
         self.authorize(context)?;
         parent.authorize(context)?;
-        let profile = revalidate(&parent.profile, models).map_err(ServiceError::from)?;
+        let profile = models.revalidate_profile(&parent.profile, context).await?;
         let population = read_find_population(
             &self.research,
             self.identities.clone().ok_or(ServiceError::Unavailable)?,
@@ -262,7 +261,7 @@ impl InstalledCurrentFind {
         training: &super::training_preparation::InstalledProductTraining,
         request: &TypedToolRequest,
         context: &RequestContext,
-        models: Option<&ForecastPreparationCatalog>,
+        models: &super::super::forecast_preparation::InstalledForecastPreparation,
     ) -> Result<TypedToolResult, ServiceError> {
         self.authorize(context)?;
         let content = match request.name() {
@@ -301,8 +300,9 @@ impl InstalledCurrentFind {
                         parent
                     }
                     None => {
-                        let profile = revalidate(&input.financial_profile, models)
-                            .map_err(ServiceError::from)?;
+                        let profile = models
+                            .revalidate_profile(&input.financial_profile, context)
+                            .await?;
                         let provisional_cutoff = super::super::runtime::current_timestamp()
                             .map_err(|_| ServiceError::Internal)?;
                         let provisional = prepare_find_population(
@@ -316,7 +316,12 @@ impl InstalledCurrentFind {
                         )
                         .await?;
                         let (pending, original_cohort) = self
-                            .publish_current_sources(&provisional, &profile, input.benchmark_instrument_id, context)
+                            .publish_current_sources(
+                                &provisional,
+                                &profile,
+                                input.benchmark_instrument_id,
+                                context,
+                            )
                             .await?;
                         // Every source publication precedes this ONE immutable analytical cutoff.
                         let cutoff = super::super::runtime::current_timestamp()
@@ -583,7 +588,7 @@ impl InstalledCurrentFind {
                     .await?;
                 let run_id = execution.run().id().as_str();
                 // Source identity is reopened at its original cutoff; deep analysis has its own later cutoff.
-                let profile = revalidate(&parent.profile, models).map_err(ServiceError::from)?;
+                let profile = models.revalidate_profile(&parent.profile, context).await?;
                 let population = read_find_population(
                     &self.research,
                     self.identities.clone().ok_or(ServiceError::Unavailable)?,
@@ -724,7 +729,7 @@ impl InstalledCurrentFind {
         authority: &InstalledResearchDatasetPreparation,
         request: &TypedToolRequest,
         context: &RequestContext,
-        models: Option<&ForecastPreparationCatalog>,
+        models: &super::super::forecast_preparation::InstalledForecastPreparation,
     ) -> Result<PreparedFeatureDatasetBuild, ServiceError> {
         let _guard = self.lock(context).await?;
         let input: PartitionInput = super::decode(request.arguments())?;
@@ -767,7 +772,7 @@ impl InstalledCurrentFind {
         training: &super::training_preparation::InstalledProductTraining,
         request: &TypedToolRequest,
         context: &RequestContext,
-        models: Option<&ForecastPreparationCatalog>,
+        models: &super::super::forecast_preparation::InstalledForecastPreparation,
         captured_at: Timestamp,
     ) -> Result<AdmittedScreenJob, ServiceError> {
         let _guard = self.lock(context).await?;

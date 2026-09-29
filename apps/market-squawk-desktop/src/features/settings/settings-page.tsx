@@ -35,6 +35,8 @@ import { compareLosslessIntegers, type LosslessInteger } from "@/lib/lossless-in
 import { formatTimestamp } from "@/lib/time"
 import type { OperationSettingValue, SystemTransport } from "@/lib/transport"
 
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+
 import {
   asOperationSettingValue,
   formatBytes,
@@ -146,21 +148,25 @@ function SettingsWorkspace({
   const [announcement, setAnnouncement] = React.useState("")
 
   const settingsKey = productKeys.operation(scope, "settings", "Operations.GetSettings", {})
+  const workspaceNavigation = useCursorNavigation()
   const workspaceKey = productKeys.operation(scope, "workspace", "Operations.ListWorkspaces", {
     limit: WORKSPACE_PAGE_LIMIT,
+    afterWorkspaceId: workspaceNavigation.after,
   })
   const settings = useQuery({
     queryKey: settingsKey,
-    queryFn: async () => parseSettingsSnapshot(await transport.systemQuery({ query: "operationSettings" })),
-    refetchInterval: 15_000,
+    queryFn: async ({ signal }) => parseSettingsSnapshot(await transport.systemQuery({ query: "operationSettings" }, { signal })),
+    refetchInterval: false,
   })
   const workspaces = useQuery({
     queryKey: workspaceKey,
-    queryFn: async () =>
+    gcTime: 0,
+    queryFn: async ({ signal }) =>
       parseWorkspacePage(
-        await transport.systemQuery({ query: "operationWorkspaces", limit: WORKSPACE_PAGE_LIMIT }),
+        await transport.systemQuery({ query: "operationWorkspaces", limit: WORKSPACE_PAGE_LIMIT, afterWorkspaceId: workspaceNavigation.after }, { signal }),
       ),
-    refetchInterval: 15_000,
+    refetchInterval: (query) => switchReceipt && query.state.data?.active.generation === switchReceipt.generation ? 5_000 : false,
+    refetchIntervalInBackground: false,
   })
 
   React.useEffect(() => {
@@ -408,6 +414,8 @@ function SettingsWorkspace({
           switchPreview.mutate(workspaceId)
         }}
       />
+      <CursorNavigation navigation={workspaceNavigation} next={workspaces.data?.nextAfterWorkspaceId} busy={workspaces.isFetching} error={workspaces.isError}
+        onRestart={() => { if (workspaceNavigation.after === undefined) void workspaces.refetch() }} />
       {switchReceipt ? <WorkspaceReceiptCard receipt={switchReceipt} /> : null}
 
       <ConfirmationDialog
@@ -536,7 +544,6 @@ function WorkspaceSection({ page, pending, loading, error, onPreview }: { page?:
       {loading ? <div className="mt-4 grid gap-3 sm:grid-cols-2"><Skeleton className="h-44" /><Skeleton className="h-44" /></div> : error ? <Unavailable detail={error} /> : page ? <>
         <div className="mt-4 rounded-lg border border-border bg-card/35 p-4"><p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Active runtime</p><p className="mt-2 font-semibold">Workspace {page.active.workspaceId}</p><p className="mt-1 text-sm text-muted-foreground">Active generation {page.active.generation}. A completed switch forces connected clients to re-sync to the new workspace and generation.</p></div>
         <div className="mt-4 grid gap-3 xl:grid-cols-2">{page.workspaces.map((workspace) => <WorkspaceCard key={workspace.workspaceId} workspace={workspace} active={workspace.workspaceId === page.active.workspaceId} pending={pending} onPreview={onPreview} />)}</div>
-        {page.nextAfterWorkspaceId ? <p className="mt-3 text-xs text-muted-foreground">This inventory reached the service page limit of {WORKSPACE_PAGE_LIMIT}; additional workspaces remain undisclosed until queried through the bounded service workflow.</p> : null}
       </> : null}
     </section>
   )

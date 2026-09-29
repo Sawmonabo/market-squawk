@@ -93,6 +93,252 @@ fn mutation_replay_requires_the_original_digest_and_reuses_terminal_response() -
     Ok(())
 }
 
+#[tokio::test]
+async fn read_abort_reaches_service_workers_and_never_cancels_mutations() -> TestResult {
+    use market_squawk_services::{RequestContext, ServiceLimits};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct Dispatcher {
+        started: tokio::sync::Notify,
+        stopped: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl ApplicationDispatcher for Dispatcher {
+        fn bootstrap(&self) -> Result<serde_json::Value, DispatchError> {
+            Ok(json!({}))
+        }
+        fn effect(&self, operation: &SourceIdentifier) -> Result<OperationEffect, DispatchError> {
+            Ok(if operation.as_str() == "Test.Mutate" {
+                OperationEffect::Mutation
+            } else {
+                OperationEffect::Read
+            })
+        }
+        async fn dispatch(
+            &self,
+            request: &AppRequestEnvelope,
+            context: RequestContext,
+        ) -> Result<serde_json::Value, DispatchError> {
+            if request.operation().as_str() == "Test.Quick" {
+                return Ok(json!({"done": true}));
+            }
+            let cancellation = context.cancellation().clone();
+            let stopped = Arc::clone(&self.stopped);
+            // This detached worker outlives the HTTP future; only service-context cancellation
+            // can stop it. The cancellation route must work with the sole normal slot occupied.
+            tokio::spawn(async move {
+                cancellation.cancelled().await;
+                stopped.notify_one();
+            });
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        fn mutation_response_committed(&self) -> Result<(), DispatchError> {
+            Ok(())
+        }
+    }
+
+    let directory = TempDir::new()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+    let runtime = runtime_identity(1, 2, 3)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let structure = JsonStructureLimits::try_new(16, 4_096, 64, 64)?;
+    let (credentials, registrations) =
+        CredentialRegistry::provision_set([(client_id(5)?, NamedClient::Desktop)])?;
+    let secret = credentials.credential(&registrations[0])?;
+    let dispatcher = Arc::new(Dispatcher {
+        started: tokio::sync::Notify::new(),
+        stopped: Arc::new(tokio::sync::Notify::new()),
+    });
+    let server = RuntimeRouter::try_new(
+        runtime,
+        endpoint,
+        ApplicationProtocolRange::single(ApplicationProtocolVersion::V1),
+        OriginPolicy::try_new([])?,
+        RuntimeRouterLimits::try_new(
+            4_096,
+            4_096,
+            2_048,
+            1,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            structure,
+            ServiceLimits::try_new(4_096, 64, 4_096, 64, structure)?,
+        )?,
+        Arc::new(credentials),
+        dispatcher.clone(),
+        Arc::new(MutationReplayGuard::try_new(ReplayLimits::try_new(2)?)?),
+        Arc::new(EventHub::try_new(
+            runtime.service_generation(),
+            EventHubLimits::try_new(2, 4_096)?,
+        )?),
+        Arc::new(InputStager::new(
+            paths.artifacts()?.clone(),
+            runtime,
+            InputStagingLimits::try_new(2, 4_096)?,
+        )),
+    )?
+    .start(listener, None)?;
+    let now = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let scope = ApplicationRequestScope::try_new(
+        runtime,
+        client_id(5)?,
+        registrations[0].generation(),
+        CorrelationId::try_from_uuid(Uuid::from_u128(6))?,
+        structure,
+        4_096,
+    )?;
+    let rendezvous = RendezvousRecord::try_new(
+        runtime,
+        endpoint,
+        ApplicationProtocolRange::single(ApplicationProtocolVersion::V1),
+        ProcessIdentity::try_new(7, 9)?,
+        now,
+    )?;
+    let client = Arc::new(LoopbackApplicationClient::try_new(
+        &rendezvous,
+        scope.clone(),
+        SecretValue::new(secret.expose_secret().to_owned())?,
+        None,
+        4_096,
+        structure,
+        Duration::from_secs(5),
+    )?);
+
+    let cancellation = CancellationToken::new();
+    let read_client = Arc::clone(&client);
+    let read_cancel = cancellation.clone();
+    let read = tokio::spawn(async move {
+        read_client
+            .invoke_read_operation(
+                RequestId::Integer(10),
+                "Test.Slow",
+                json!({}),
+                Duration::from_secs(5),
+                read_cancel,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), dispatcher.started.notified()).await?;
+    cancellation.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), read).await??,
+        Err(ApplicationClientError::Interrupted)
+    ));
+    tokio::time::timeout(Duration::from_secs(2), dispatcher.stopped.notified()).await?;
+    // Capacity one is reusable after cancellation and after successful completion.
+    for id in [11, 12] {
+        client
+            .invoke_read_operation(
+                RequestId::Integer(id),
+                "Test.Quick",
+                json!({}),
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await?;
+    }
+    assert!(matches!(
+        client
+            .invoke_read_operation(
+                RequestId::Integer(13),
+                "Test.Mutate",
+                json!({}),
+                Duration::from_secs(5),
+                CancellationToken::new()
+            )
+            .await,
+        Err(ApplicationClientError::Rejected)
+    ));
+
+    // Abort after registration and before execution leaves no executable request or tombstone.
+    let now = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let early = scope.request(
+        RequestId::Integer(14),
+        now.checked_add_nanos(5_000_000_000)?,
+        now,
+        SourceIdentifier::try_from("Test.Slow")?,
+        json!({}),
+    )?;
+    let http = reqwest::Client::builder().no_proxy().build()?;
+    let post = |path: &str| {
+        http.post(format!("http://{endpoint}{path}"))
+            .header(
+                CLIENT_ID_HEADER,
+                client_id(5).expect("fixed client").as_uuid().to_string(),
+            )
+            .header(
+                INSTALLATION_ID_HEADER,
+                runtime.installation_id().as_uuid().to_string(),
+            )
+            .header(
+                WORKSPACE_ID_HEADER,
+                runtime.workspace_id().as_uuid().to_string(),
+            )
+            .header(
+                SERVICE_GENERATION_HEADER,
+                runtime.service_generation().get(),
+            )
+            .header(
+                CREDENTIAL_GENERATION_HEADER,
+                registrations[0].generation().get(),
+            )
+            .bearer_auth(secret.expose_secret())
+    };
+    assert_eq!(
+        post("/app/v1/register-read")
+            .json(&early)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let sha256 = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&early)?));
+    let cancellation = json!({"requestId": early.request_id(), "requestSha256": sha256});
+    assert_eq!(
+        post("/app/v1/cancel-read")
+            .json(&cancellation)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post("/app/v1/invoke-read")
+            .json(&early)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::GONE
+    );
+    assert_eq!(
+        post("/app/v1/cancel-read")
+            .json(&cancellation)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    client
+        .invoke_read_operation(
+            RequestId::Integer(15),
+            "Test.Quick",
+            json!({}),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await?;
+    drop(server);
+    Ok(())
+}
+
 #[test]
 fn event_overflow_requires_snapshot_resynchronization() -> TestResult {
     let generation = ServiceGeneration::try_new(9)?;

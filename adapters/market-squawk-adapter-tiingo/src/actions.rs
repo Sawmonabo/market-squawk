@@ -5,17 +5,14 @@
 //! not payment date. `splitFactor` is new units / old units. No separate corporate-action endpoint
 //! entitlement, dividend currency, payment date, or global all-action coverage is inferred here.
 
-use crate::{
-    TiingoEodContractEvidence, TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority,
-    TiingoEodReceipt, TiingoHistoryPlan, TiingoPendingEodHistoryPublication, TiingoRequestScope,
-};
+use crate::{TiingoEodContractEvidence, TiingoEodInstrumentAuthority};
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, CorporateActionKind, CorporateActionObservation, Currency,
     DataQuality, EvidenceDigest, InstrumentId, Money, PayloadHash, PayloadReference,
     ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate,
     ResearchTime, RevisionBoundPayloadEvidence, RevisionNumber, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::{CompleteMarketBarDateWindowsV1, MarketHistoryCashUnitStatus};
+use market_squawk_sources::MarketHistoryCashUnitStatus;
 use rust_decimal::Decimal;
 use std::num::NonZeroU32;
 
@@ -39,8 +36,14 @@ impl TiingoEodCashUnitEvidence {
         assertion: RevisionBoundPayloadEvidence,
         available_at: Timestamp,
     ) -> Result<Self, TiingoEodActionError> {
-        Self::try_new_with_status(instrument, contract_identity, currency, assertion,
-            available_at, MarketHistoryCashUnitStatus::SourceAttested)
+        Self::try_new_with_status(
+            instrument,
+            contract_identity,
+            currency,
+            assertion,
+            available_at,
+            MarketHistoryCashUnitStatus::SourceAttested,
+        )
     }
 
     /// The caller must supply the original retained status on replay. A reviewed interpretation
@@ -88,7 +91,7 @@ impl TiingoEodCashUnitEvidence {
 }
 
 /// Closed per-field disposition. An explicit zero/one is different from a missing field.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TiingoEodActionFieldDisposition {
     ExplicitNoEvent,
     MissingField,
@@ -98,7 +101,7 @@ pub enum TiingoEodActionFieldDisposition {
 }
 
 /// One original provider row, retained even if its raw and adjusted bar surfaces are null.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TiingoEodDailyActionDisposition {
     pub history_page_index: usize,
     pub provider_row_index: u32,
@@ -112,7 +115,7 @@ pub struct TiingoEodDailyActionDisposition {
 
 /// Canonical candidate with the exact existing history page and native row coordinates. The
 /// shared history publisher must bind it to the same sealed graph as the original daily row.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TiingoEodNormalizedAction {
     pub history_page_index: usize,
     pub provider_row_index: u32,
@@ -120,31 +123,18 @@ pub struct TiingoEodNormalizedAction {
     pub observation: CorporateActionObservation,
 }
 
-/// Pure projection of source-known daily fields. This carries no seal token or canonical/PIT
-/// authority. Its completion identity must be retained by the one existing history publisher.
+/// One bounded native page projection awaiting complete history reconciliation.
 #[derive(Debug)]
-pub struct TiingoEodHistoryActionProjection {
-    completion_identity: EvidenceDigest,
-    request_set_identity: EvidenceDigest,
+pub(crate) struct TiingoEodPageActionProjection {
     rows: Box<[TiingoEodDailyActionDisposition]>,
     observations: Box<[TiingoEodNormalizedAction]>,
-    cash_unit: Option<TiingoEodCashUnitEvidence>,
 }
-impl TiingoEodHistoryActionProjection {
-    pub const fn completion_identity(&self) -> EvidenceDigest {
-        self.completion_identity
-    }
-    pub const fn request_set_identity(&self) -> EvidenceDigest {
-        self.request_set_identity
-    }
+impl TiingoEodPageActionProjection {
     pub fn rows(&self) -> &[TiingoEodDailyActionDisposition] {
         &self.rows
     }
     pub fn observations(&self) -> &[TiingoEodNormalizedAction] {
         &self.observations
-    }
-    pub const fn cash_unit(&self) -> Option<&TiingoEodCashUnitEvidence> {
-        self.cash_unit.as_ref()
     }
     pub fn ordinary_fields_complete(&self) -> bool {
         self.rows.iter().all(|row| {
@@ -157,211 +147,6 @@ impl TiingoEodHistoryActionProjection {
             })
         })
     }
-}
-
-/// Projects every source row only after the existing history producer has reconciled the exact
-/// expected session set. `ordinary_fields_complete` describes these two fields, never all action
-/// families. A nonzero dividend without independently evidenced currency remains unresolved.
-pub fn normalize_eod_history_actions(
-    history: &TiingoPendingEodHistoryPublication,
-    cash_unit: Option<&TiingoEodCashUnitEvidence>,
-) -> Result<TiingoEodHistoryActionProjection, TiingoEodActionError> {
-    if history.financial_coverage() != TiingoEodFinancialCoverageDisposition::Complete
-        || !history.missing_expected_sessions().is_empty()
-    {
-        return Err(TiingoEodActionError::IncompleteFinancialDates);
-    }
-    let count = usize::try_from(history.total_provider_actions())
-        .map_err(|_| TiingoEodActionError::ResourceBound)?;
-    let mut projection = ProjectionBuilder::try_new(count)?;
-    for (history_page_index, page) in history.pages().iter().enumerate() {
-        let context = ProjectionContext {
-            instrument: page.instrument(),
-            contract: page.contract(),
-            received_at: page.received_at(),
-            ingested_at: page.ingested_at(),
-        };
-        context.validate_unit(cash_unit)?;
-        for row in page.provider_actions() {
-            projection.push(
-                history_page_index,
-                &context,
-                ActionRowValues {
-                    provider_row_index: row.provider_row_index(),
-                    date: row.provider_date(),
-                    row_digest: row.row_digest(),
-                    cash_dividend: row.cash_dividend(),
-                    split_factor: row.split_factor(),
-                },
-                cash_unit,
-            )?;
-        }
-    }
-    projection.finish(
-        history.completion_identity(),
-        history.capture().plan().request_set_identity(),
-        cash_unit,
-    )
-}
-
-/// Bounded strict decoder output plus exact retained native membership and the original
-/// normalization clock. The serving owner obtains these from the same immutable generation.
-/// These values are not a publication seal or durable read capability.
-#[derive(Clone, Copy, Debug)]
-pub struct TiingoEodActionReplayPage<'a> {
-    pub response: &'a TiingoEodReceipt,
-    pub ingested_at: Timestamp,
-    pub native_row_digests: &'a [EvidenceDigest],
-}
-
-/// Reprojects already verified original raw windows and checks every native date, count and row
-/// digest against the same complete graph. This pure function does not mint financial coverage or
-/// publication authority: the application must retain the genuine shared history read and native
-/// binding, and compare these observations with that generation's canonical action rows.
-///
-/// `plan` is the source request plan, whose identity is distinct from the graph's admitted study
-/// plan digest. No receipt clock, source unit, payable date or missing field is reconstructed from
-/// the current wall clock or another price series.
-pub fn rejoin_eod_history_actions(
-    graph: &CompleteMarketBarDateWindowsV1,
-    plan: &TiingoHistoryPlan,
-    instrument: &TiingoEodInstrumentAuthority,
-    contract: &TiingoEodContractEvidence,
-    pages: &[TiingoEodActionReplayPage<'_>],
-    cash_unit: Option<&TiingoEodCashUnitEvidence>,
-) -> Result<TiingoEodHistoryActionProjection, TiingoEodActionError> {
-    let normalization = graph.normalization();
-    if normalization.contract_identity != contract.mapping_identity()
-        || &normalization.native_schema_revision != contract.native_schema_revision()
-        || &normalization.entitlement_generation != contract.entitlement_generation_identity()
-        || &normalization.adjusted_surface_evidence != contract.adjusted_surface_evidence()
-        || !match (&normalization.cash_unit, cash_unit) {
-            (None, None) => true,
-            (Some(retained), Some(unit)) => {
-                retained.status == unit.status()
-                    && retained.currency == unit.currency()
-                    && &retained.assertion == unit.assertion()
-                    && retained.available_at == unit.available_at()
-            }
-            _ => false,
-        }
-        || graph.instrument_id() != instrument.instrument_id()
-        || graph.instrument_revision_digest()
-            != instrument
-                .instrument_definition()
-                .payload_evidence()
-                .content_digest()
-        || graph.provider_instrument_id() != instrument.provider_instrument_id()
-        || graph.venue_id() != instrument.venue_id()
-        || graph.interval().as_str() != "tiingo-calendar-day"
-        || graph.graph_purpose().as_str() != "tiingo-eod-complete-date-windows/v1"
-        || graph.requested_dates() != plan.interval()
-        || plan.ticker() != instrument.ticker()
-        || pages.len() != plan.pages().len()
-        || pages.len() != graph.windows().len()
-        || pages.is_empty()
-    {
-        return Err(TiingoEodActionError::InvalidEvidence);
-    }
-    let mut projection = ProjectionBuilder::try_new(graph.sessions().len())?;
-    let mut response_bytes = 0_u64;
-    let mut session_ordinal = 0_usize;
-    for (history_page_index, ((page, request), window)) in pages
-        .iter()
-        .zip(plan.pages())
-        .zip(graph.windows())
-        .enumerate()
-    {
-        let response = page.response;
-        let evidence = response.evidence();
-        let TiingoRequestScope::History {
-            start_date,
-            end_date,
-            ..
-        } = request.scope()
-        else {
-            return Err(TiingoEodActionError::InvalidEvidence);
-        };
-        if evidence.request() != request
-            || window.request_identity != request.request_identity()
-            || usize::from(window.component_ordinal) != history_page_index + 1
-            || (window.start_date, window.end_date) != (*start_date, *end_date)
-            || usize::try_from(window.first_session_ordinal).ok() != Some(session_ordinal)
-            || usize::try_from(window.returned_session_count).ok() != Some(response.rows().len())
-            || page.native_row_digests.len() != response.rows().len()
-            || response.rows().len() > request.max_rows()
-            || evidence.native_contract_revision() != contract.native_schema_revision()
-            || evidence.entitlement_generation() != contract.entitlement_generation_identity()
-            || !(200..300).contains(&evidence.status())
-            || evidence.response_bytes() == 0
-            || evidence.response_bytes() > request.max_response_bytes() as u64
-            || evidence.body_digest().bytes() == [0; 32]
-            || evidence.received_at() > evidence.decoded_at()
-            || evidence.decoded_at() > page.ingested_at
-            || evidence.decoded_at() != window.decoded_at
-            || page.ingested_at != window.ingested_at
-            || normalization.metadata_decoded_at > evidence.received_at()
-            || instrument.resolved_at() > evidence.received_at()
-            || response.disposition().response_bytes() != evidence.response_bytes()
-            || usize::try_from(response.disposition().returned_rows()).ok()
-                != Some(response.rows().len())
-        {
-            return Err(TiingoEodActionError::InvalidEvidence);
-        }
-        response_bytes = response_bytes
-            .checked_add(evidence.response_bytes())
-            .filter(|bytes| *bytes <= plan.maximum_response_bytes())
-            .ok_or(TiingoEodActionError::ResourceBound)?;
-        let context = ProjectionContext {
-            instrument,
-            contract,
-            received_at: evidence.received_at(),
-            ingested_at: page.ingested_at,
-        };
-        context.validate_unit(cash_unit)?;
-        for (provider_row_index, (row, expected_digest)) in response
-            .rows()
-            .iter()
-            .zip(page.native_row_digests)
-            .enumerate()
-        {
-            let session = graph
-                .sessions()
-                .get(session_ordinal)
-                .ok_or(TiingoEodActionError::InvalidEvidence)?;
-            if row.date() != session.date
-                || row.row_digest() != *expected_digest
-                || row.date() < *start_date
-                || row.date() > *end_date
-                || session.time.nominal_daily_date().is_none_or(|date| date.date() != row.date())
-                || session.row_digest != row.row_digest()
-            {
-                return Err(TiingoEodActionError::InvalidEvidence);
-            }
-            projection.push(
-                history_page_index,
-                &context,
-                ActionRowValues {
-                    provider_row_index: u32::try_from(provider_row_index)
-                        .map_err(|_| TiingoEodActionError::ResourceBound)?,
-                    date: row.date(),
-                    row_digest: row.row_digest(),
-                    cash_dividend: row.cash_dividend(),
-                    split_factor: row.split_factor(),
-                },
-                cash_unit,
-            )?;
-            session_ordinal += 1;
-        }
-    }
-    if session_ordinal != graph.sessions().len() {
-        return Err(TiingoEodActionError::InvalidEvidence);
-    }
-    projection.finish(
-        graph.completeness_evidence(),
-        plan.request_set_identity(),
-        cash_unit,
-    )
 }
 
 struct ProjectionContext<'a> {
@@ -401,9 +186,6 @@ struct ProjectionBuilder {
 }
 impl ProjectionBuilder {
     fn try_new(count: usize) -> Result<Self, TiingoEodActionError> {
-        if count > 64_000 {
-            return Err(TiingoEodActionError::ResourceBound);
-        }
         let mut rows = Vec::new();
         rows.try_reserve_exact(count)
             .map_err(|_| TiingoEodActionError::ResourceBound)?;
@@ -488,21 +270,13 @@ impl ProjectionBuilder {
         });
         Ok(())
     }
-    fn finish(
-        self,
-        completion_identity: EvidenceDigest,
-        request_set_identity: EvidenceDigest,
-        cash_unit: Option<&TiingoEodCashUnitEvidence>,
-    ) -> Result<TiingoEodHistoryActionProjection, TiingoEodActionError> {
+    fn finish(self) -> Result<TiingoEodPageActionProjection, TiingoEodActionError> {
         if self.rows.len() != self.count {
             return Err(TiingoEodActionError::InvalidEvidence);
         }
-        Ok(TiingoEodHistoryActionProjection {
-            completion_identity,
-            request_set_identity,
+        Ok(TiingoEodPageActionProjection {
             rows: self.rows.into_boxed_slice(),
             observations: self.observations.into_boxed_slice(),
-            cash_unit: cash_unit.cloned(),
         })
     }
 }
@@ -581,4 +355,39 @@ pub enum TiingoEodActionError {
     InvalidEvidence,
     #[error("Tiingo daily action projection exceeds its bounded capacity")]
     ResourceBound,
+}
+
+/// Projects one bounded native page for private staging; only the complete validated history
+/// owner may publish these candidates after full calendar reconciliation.
+pub(crate) fn project_eod_page_actions(
+    page: &crate::TiingoEodPageCandidate,
+    history_page_index: usize,
+    cash_unit: Option<&TiingoEodCashUnitEvidence>,
+) -> Result<TiingoEodPageActionProjection, TiingoEodActionError> {
+    let context = ProjectionContext {
+        instrument: page.instrument(),
+        contract: page.contract(),
+        received_at: page.received_at(),
+        ingested_at: page.ingested_at(),
+    };
+    context.validate_unit(cash_unit)?;
+    if page.provider_actions().len() > page.request().max_rows() {
+        return Err(TiingoEodActionError::ResourceBound);
+    }
+    let mut projection = ProjectionBuilder::try_new(page.provider_actions().len())?;
+    for row in page.provider_actions() {
+        projection.push(
+            history_page_index,
+            &context,
+            ActionRowValues {
+                provider_row_index: row.provider_row_index(),
+                date: row.provider_date(),
+                row_digest: row.row_digest(),
+                cash_dividend: row.cash_dividend(),
+                split_factor: row.split_factor(),
+            },
+            cash_unit,
+        )?;
+    }
+    projection.finish()
 }

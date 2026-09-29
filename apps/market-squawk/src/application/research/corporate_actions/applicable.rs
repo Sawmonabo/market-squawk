@@ -3,9 +3,9 @@
 mod anchor;
 mod backup;
 mod continuity;
-mod ordinary;
 mod current_ordinary;
 mod forecast_outcome;
+mod ordinary;
 pub(crate) use forecast_outcome::SourceForecastOutcomeEvidence;
 mod schema;
 pub(crate) use continuity::{
@@ -17,6 +17,10 @@ pub(crate) use ordinary::{
     ReconciledOrdinaryAction,
 };
 
+use super::source_errors::{
+    map_analytical_error, map_calendar_error, map_ingest_error, map_query_identity_error,
+    map_research_error,
+};
 use crate::application::market_calendar::{
     CompletedMarketSessionDateReceipt, CompletedMarketSessionRead,
     RetainedMarketSessionDateReceipt, RetainedMarketSessionRead,
@@ -29,9 +33,8 @@ use market_squawk_domain::{
     CalendarDate, CorporateActionSourcePayload, EvidenceDigest, InstrumentId, SourceIdentifier,
     Timestamp,
 };
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use market_squawk_services::ServiceError;
-use super::source_errors::{map_analytical_error, map_calendar_error, map_ingest_error, map_query_identity_error, map_research_error};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use market_squawk_data::ApplicableActionGap;
@@ -351,10 +354,21 @@ impl TryFrom<ApplicablePlanReferenceWire> for SourceAppliedCorporateActionPlanRe
                 .anchor
                 .as_ref()
                 .is_some_and(|anchor| !anchor.bounded_page_clocks())
-            || (wire.current_ordinary.is_some() && (!wire.ordinary.is_empty() || wire.anchor.is_some()))
+            || (wire.current_ordinary.is_some()
+                && (wire.anchor.is_some()
+                    || wire
+                        .ordinary
+                        .iter()
+                        .any(|reference| reference.timestamped.is_some())))
             || (wire.current_ordinary.is_none() != wire.current_ordinary_digest.is_none())
-            || wire.current_ordinary.as_ref().is_some_and(|reference| !reference.valid())
-            || wire.current_ordinary_digest.is_some_and(|digest| digest.algorithm() != market_squawk_domain::DigestAlgorithm::Sha256 || digest.bytes() == [0;32])
+            || wire
+                .current_ordinary
+                .as_ref()
+                .is_some_and(|reference| !reference.valid())
+            || wire.current_ordinary_digest.is_some_and(|digest| {
+                digest.algorithm() != market_squawk_domain::DigestAlgorithm::Sha256
+                    || digest.bytes() == [0; 32]
+            })
             || wire.ordinary.len() > 32
             || (wire.ordinary.is_empty() != wire.ordinary_coverage_digest.is_none())
             || wire.ordinary_coverage_digest.is_some_and(|digest| {
@@ -392,8 +406,14 @@ impl TryFrom<ApplicablePlanReferenceWire> for SourceAppliedCorporateActionPlanRe
 }
 impl SourceAppliedCorporateActionPlanReference {
     /// Exact controlled source-recipe dependency for existing backup/restore traversal.
-    pub(crate) fn current_recipe_artifact(&self) -> Result<Option<market_squawk_services::ArtifactReference>, ApplicableActionPlanError> {
-        self.0.current_ordinary.as_ref().map(current_ordinary::CurrentOrdinaryRecipeReference::artifact).transpose()
+    pub(crate) fn current_recipe_artifact(
+        &self,
+    ) -> Result<Option<market_squawk_services::ArtifactReference>, ApplicableActionPlanError> {
+        self.0
+            .current_ordinary
+            .as_ref()
+            .map(current_ordinary::CurrentOrdinaryRecipeReference::artifact)
+            .transpose()
     }
     /// Original source snapshot cutoff. This inert coordinate grants no read authority.
     pub const fn knowledge_cutoff(&self) -> Timestamp {
@@ -446,7 +466,11 @@ impl SourceAppliedCorporateActionPlan {
         &self,
     ) -> Result<SourceAppliedCorporateActionPlanReference, ApplicableActionPlanError> {
         let plan = &self.plan;
-        if self.current_ordinary.as_ref().is_some_and(|coverage| coverage.recipe.is_none()) {
+        if self
+            .current_ordinary
+            .as_ref()
+            .is_some_and(|coverage| coverage.recipe.is_none())
+        {
             return Err(ApplicableActionPlanError::InvalidEvidence);
         }
         use market_squawk_data::CorporateActionAdjustment;
@@ -473,8 +497,14 @@ impl SourceAppliedCorporateActionPlan {
             content_hash: digest(plan.content_hash().bytes()),
             audit_hash: digest(plan.audit_hash().bytes()),
             ordinary: self.ordinary_references(),
-            current_ordinary: self.current_ordinary.as_ref().and_then(|coverage| coverage.recipe.clone()),
-            current_ordinary_digest: self.current_ordinary.as_ref().map(|coverage| coverage.digest),
+            current_ordinary: self
+                .current_ordinary
+                .as_ref()
+                .and_then(|coverage| coverage.recipe.clone()),
+            current_ordinary_digest: self
+                .current_ordinary
+                .as_ref()
+                .map(|coverage| coverage.digest),
             ordinary_coverage_digest: self.ordinary.as_ref().map(OrdinaryActionCoverage::digest),
             anchor: self
                 .anchor
@@ -580,7 +610,9 @@ impl SourceAppliedCorporateActionReadCapability {
             .research
             .market_data_instruments()
             .reopen_corporate_action_query_identities(&source, deadline, &cancellation)
-            .map_err(|error| ApplicableActionPlanError::SourceRead(map_query_identity_error(error)))?;
+            .map_err(|error| {
+                ApplicableActionPlanError::SourceRead(map_query_identity_error(error))
+            })?;
         let Some(calendar) = self
             .calendars
             .read_reference_with_job_context(
@@ -609,10 +641,19 @@ impl SourceAppliedCorporateActionReadCapability {
                 .ok_or(ApplicableActionPlanError::InvalidEvidence)?,
         )
         .map_err(|_| ApplicableActionPlanError::InvalidEvidence)?;
-        let initial_valuation = if wire.ordinary.iter().any(|reference| reference.timestamped.is_some()) {
-            calendar.source_action_calendar().native_session_bounds(wire.interval)
-                .ok_or(ApplicableActionPlanError::InvalidEvidence)?.1
-        } else { wire.valuation_cutoff };
+        let initial_valuation = if wire
+            .ordinary
+            .iter()
+            .any(|reference| reference.timestamped.is_some())
+        {
+            calendar
+                .source_action_calendar()
+                .native_session_bounds(wire.interval)
+                .ok_or(ApplicableActionPlanError::InvalidEvidence)?
+                .1
+        } else {
+            wire.valuation_cutoff
+        };
         let plan = SourceAppliedCorporateActionPlan::try_from_read(
             Arc::new(source),
             query_identity,
@@ -631,11 +672,52 @@ impl SourceAppliedCorporateActionReadCapability {
             deadline,
             &cancellation,
         )?;
-        let plan = if wire.ordinary.is_empty() {
+        let ordinary_reads = if wire.ordinary.is_empty() {
+            Vec::new()
+        } else {
+            self.reopen_ordinary(
+                &wire.ordinary,
+                wire.knowledge_cutoff,
+                deadline,
+                &cancellation,
+                job,
+            )
+            .await?
+        };
+        let plan = if let Some(recipe) = &wire.current_ordinary {
+            let reads = self
+                .reopen_current_recipe(recipe, wire, deadline, &cancellation, job)
+                .await?;
+            let mut plan = if ordinary_reads.is_empty() {
+                plan.with_current_ordinary_reads(reads, limits, deadline, &cancellation)?
+            } else {
+                plan.with_hybrid_ordinary_reads(
+                    ordinary_reads,
+                    reads,
+                    limits,
+                    deadline,
+                    &cancellation,
+                )?
+            };
+            let coverage = plan
+                .current_ordinary
+                .as_mut()
+                .ok_or(ApplicableActionPlanError::InvalidEvidence)?;
+            coverage.recipe = Some(recipe.clone());
+            coverage.references = Vec::new();
+            plan
+        } else if ordinary_reads.is_empty() {
             plan
         } else {
-            let reads = self
-                .reopen_ordinary(
+            plan.with_complete_ordinary_history(ordinary_reads, limits, deadline, &cancellation)?
+        };
+        let plan = if wire
+            .ordinary
+            .iter()
+            .any(|reference| reference.timestamped.is_some())
+        {
+            let proofs = self
+                .reopen_timestamp_price_proofs(
                     &wire.ordinary,
                     wire.knowledge_cutoff,
                     deadline,
@@ -643,20 +725,10 @@ impl SourceAppliedCorporateActionReadCapability {
                     job,
                 )
                 .await?;
-            plan.with_complete_ordinary_history(reads, limits, deadline, &cancellation)?
-        };
-        let plan = if wire.ordinary.iter().any(|reference| reference.timestamped.is_some()) {
-            let proofs = self.reopen_timestamp_price_proofs(&wire.ordinary, wire.knowledge_cutoff, deadline, &cancellation, job).await?;
             plan.with_timestamp_price_proofs(proofs, limits, deadline, &cancellation)?
-        } else { plan };
-        let plan = if let Some(recipe) = &wire.current_ordinary {
-            let reads = self.reopen_current_recipe(recipe, wire, deadline, &cancellation, job).await?;
-            let mut plan = plan.with_current_ordinary_reads(reads, limits, deadline, &cancellation)?;
-            let coverage = plan.current_ordinary.as_mut().ok_or(ApplicableActionPlanError::InvalidEvidence)?;
-            coverage.recipe = Some(recipe.clone());
-            coverage.references = Vec::new();
+        } else {
             plan
-        } else { plan };
+        };
         let plan = if let Some(anchor) = &wire.anchor {
             let (raw, split) = self
                 .reopen_anchor(anchor, wire.knowledge_cutoff, deadline, &cancellation, job)
@@ -686,9 +758,13 @@ fn check(
     cancellation: &CancellationToken,
 ) -> Result<(), ApplicableActionPlanError> {
     if cancellation.is_cancelled() {
-        Err(ApplicableActionPlanError::SourceRead(ServiceError::Cancelled))
+        Err(ApplicableActionPlanError::SourceRead(
+            ServiceError::Cancelled,
+        ))
     } else if Instant::now() >= deadline {
-        Err(ApplicableActionPlanError::SourceRead(ServiceError::DeadlineExceeded))
+        Err(ApplicableActionPlanError::SourceRead(
+            ServiceError::DeadlineExceeded,
+        ))
     } else {
         Ok(())
     }
@@ -709,10 +785,19 @@ fn map_source_plan_error(
 ) -> ApplicableActionPlanError {
     use market_squawk_data::CorporateActionError as E;
     match error {
-        E::SourceReadInterrupted => check(deadline, cancellation).err()
-            .unwrap_or(ApplicableActionPlanError::SourceRead(ServiceError::Internal)),
-        E::InvalidLimits | E::ActionLimitExceeded { .. } | E::RetainedByteLimitExceeded { .. }
-        | E::RetainedSizeOverflow | E::AllocationFailed | E::CanonicalEncodingOverflow => {
+        E::SourceReadInterrupted => {
+            check(deadline, cancellation)
+                .err()
+                .unwrap_or(ApplicableActionPlanError::SourceRead(
+                    ServiceError::Internal,
+                ))
+        }
+        E::InvalidLimits
+        | E::ActionLimitExceeded { .. }
+        | E::RetainedByteLimitExceeded { .. }
+        | E::RetainedSizeOverflow
+        | E::AllocationFailed
+        | E::CanonicalEncodingOverflow => {
             ApplicableActionPlanError::SourceRead(ServiceError::ResourceExhausted)
         }
         E::InvalidApplication | E::RecoveryCodec | E::MissingInstrument => {
@@ -728,8 +813,11 @@ fn map_source_read_error(
 ) -> ApplicableActionPlanError {
     use market_squawk_data::{CorporateActionSourceReadError as E, IngestError};
     let error = match error {
-        E::Interrupted => return check(deadline, cancellation).err()
-            .unwrap_or(ApplicableActionPlanError::SourceRead(ServiceError::Internal)),
+        E::Interrupted => {
+            return check(deadline, cancellation).err().unwrap_or(
+                ApplicableActionPlanError::SourceRead(ServiceError::Internal),
+            );
+        }
         E::InvalidEvidence | E::Arrow(_) => ServiceError::InvalidResult,
         E::FutureEvidence => ServiceError::Unavailable,
         E::ResourceBound => ServiceError::ResourceExhausted,

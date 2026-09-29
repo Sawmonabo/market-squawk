@@ -1,7 +1,9 @@
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::{JobDatabaseFileGuard, JobDatabaseLocation, JobDatabaseWriterGuard};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use super::backup::{capture, verify_database};
 use super::codec::{decode_snapshot, encode_event, encode_snapshot, state_code};
@@ -77,6 +79,111 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), JobReposi
             )
             .map_err(map_sql)?;
     } else if application_id != JOB_DATABASE_APPLICATION_ID || version != SCHEMA_VERSION {
+        return Err(JobRepositoryError::InvalidState);
+    }
+    // This derived read fence changes in the same SQLite transaction as each authoritative
+    // job snapshot. Continuations never combine versions from separate read transactions.
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS job_list_revision (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0)
+         );
+         INSERT OR IGNORE INTO job_list_revision(singleton, revision) VALUES(1, 1);
+         CREATE INDEX IF NOT EXISTS jobs_kind_identity ON jobs(
+            json_extract(CAST(snapshot_json AS TEXT), '$.kind'), job_id, generation);
+         CREATE TABLE IF NOT EXISTS job_backtest_tokens (
+            token BLOB PRIMARY KEY CHECK(length(token) = 16),
+            job_id BLOB NOT NULL,
+            generation INTEGER NOT NULL,
+            UNIQUE(job_id, generation),
+            FOREIGN KEY(job_id, generation) REFERENCES jobs(job_id, generation) ON DELETE CASCADE
+         ) WITHOUT ROWID;
+         CREATE TRIGGER IF NOT EXISTS jobs_list_revision_insert AFTER INSERT ON jobs
+         BEGIN UPDATE job_list_revision SET revision = revision + 1 WHERE singleton = 1; END;
+         CREATE TRIGGER IF NOT EXISTS jobs_list_revision_update AFTER UPDATE ON jobs
+         BEGIN UPDATE job_list_revision SET revision = revision + 1 WHERE singleton = 1; END;
+         CREATE TRIGGER IF NOT EXISTS jobs_list_revision_delete AFTER DELETE ON jobs
+         BEGIN UPDATE job_list_revision SET revision = revision + 1 WHERE singleton = 1; END;
+         COMMIT;",
+        )
+        .map_err(map_sql)?;
+    let transaction = connection.unchecked_transaction().map_err(map_sql)?;
+    {
+        let mut statement = transaction.prepare(
+            "SELECT job_id, generation FROM jobs WHERE json_extract(CAST(snapshot_json AS TEXT), '$.kind') = 'analysis.backtest.v1'
+             AND NOT EXISTS (SELECT 1 FROM job_backtest_tokens AS token WHERE token.job_id=jobs.job_id AND token.generation=jobs.generation)
+             ORDER BY job_id, generation"
+        ).map_err(map_sql)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(map_sql)?;
+        for row in rows {
+            let (id, generation) = row.map_err(map_sql)?;
+            let id = JobId::try_from_uuid(
+                Uuid::from_slice(&id).map_err(|_| JobRepositoryError::InvalidState)?,
+            )
+            .map_err(|_| JobRepositoryError::InvalidState)?;
+            let generation = JobGeneration::try_new(
+                u64::try_from(generation).map_err(|_| JobRepositoryError::InvalidState)?,
+            )
+            .map_err(|_| JobRepositoryError::InvalidState)?;
+            register_backtest_token(&transaction, id, generation, "analysis.backtest.v1")?;
+        }
+    }
+    transaction.commit().map_err(map_sql)?;
+    Ok(())
+}
+
+/// Canonical opaque identity shared by the persisted index and product projection.
+pub(super) fn backtest_product_token(id: JobId, generation: JobGeneration) -> Uuid {
+    let id = id.as_uuid();
+    let generation = generation.get().to_be_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/product-backtest/v1\0");
+    for component in [id.as_bytes().as_slice(), generation.as_slice()] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component);
+    }
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+pub(super) fn register_backtest_token(
+    connection: &Connection,
+    id: JobId,
+    generation: JobGeneration,
+    kind: &str,
+) -> Result<(), JobRepositoryError> {
+    if kind != "analysis.backtest.v1" {
+        return Ok(());
+    }
+    let token = backtest_product_token(id, generation);
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO job_backtest_tokens(token,job_id,generation) VALUES(?1,?2,?3)",
+            params![
+                token.as_bytes().as_slice(),
+                id.as_uuid().as_bytes().as_slice(),
+                sql_u64(generation.get())?
+            ],
+        )
+        .map_err(map_sql)?;
+    let matched = connection
+        .query_row(
+            "SELECT job_id,generation FROM job_backtest_tokens WHERE token=?1",
+            params![token.as_bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(map_sql)?;
+    if matched.0 != id.as_uuid().as_bytes().as_slice() || matched.1 != sql_u64(generation.get())? {
         return Err(JobRepositoryError::InvalidState);
     }
     Ok(())
@@ -271,6 +378,12 @@ fn create_snapshot(
         )
         .map_err(map_sql)?;
     if changed == 1 {
+        register_backtest_token(
+            &transaction,
+            spec.id(),
+            spec.generation(),
+            spec.kind().as_str(),
+        )?;
         transaction.commit().map_err(map_sql)?;
         Ok(snapshot)
     } else {
@@ -371,6 +484,12 @@ fn begin_recovery(
             ],
         )
         .map_err(map_sql)?;
+    register_backtest_token(
+        &transaction,
+        spec.id(),
+        spec.generation(),
+        spec.kind().as_str(),
+    )?;
     transaction.commit().map_err(map_sql)?;
     Ok(recovering)
 }
@@ -420,6 +539,12 @@ fn begin_retry(
             ],
         )
         .map_err(map_sql)?;
+    register_backtest_token(
+        &transaction,
+        spec.id(),
+        spec.generation(),
+        spec.kind().as_str(),
+    )?;
     transaction.commit().map_err(map_sql)?;
     Ok(retrying)
 }

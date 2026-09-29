@@ -1122,15 +1122,16 @@ impl ValuationInput {
         let source = selected
             .decoded_rows()
             .get(usize::try_from(row).map_err(|_| FairValueError::Arithmetic)?)
+            .map_err(|_| FairValueError::InvalidProducerEvidence)?
             .ok_or(FairValueError::InvalidProducerEvidence)?;
-        let ResearchObservation::Fundamental(observation) = source else {
+        let ResearchObservation::Fundamental(observation) = &source else {
             return Err(FairValueError::InvalidProducerEvidence);
         };
         let provenance = observation.context().provenance();
         if provenance.instrument_id() != Some(selection.request().instrument_id()) {
             return Err(FairValueError::InvalidInstrumentRelationship);
         }
-        let canonical_observation = encode_source_record(source)?;
+        let canonical_observation = encode_source_record(&source)?;
         let payload_digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
             Sha256::digest(canonical_observation.as_bytes()).into(),

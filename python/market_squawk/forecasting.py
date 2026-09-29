@@ -21,6 +21,7 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.multioutput import MultiOutputRegressor, RegressorChain
 from skl2onnx import to_onnx
+from skl2onnx.common.data_types import FloatTensorType
 
 
 MAX_FORECAST_OBSERVATIONS = 100_000
@@ -139,6 +140,9 @@ class ForecastFit:
     package_versions: Mapping[str, str]
     onnx_bytes: bytes
     onnx_sha256: str
+    input_lags: tuple[int, ...]
+    exogenous_feature_count: int
+    output_horizons: tuple[int, ...]
 
 
 def fit_forecast(
@@ -199,7 +203,7 @@ def fit_forecast(
         estimator, calibrators, resampling = _fit_mapie_estimators(
             estimator, x[train], y[train], spec, ConformalMethod(conformal_method)
         )
-    onnx = _export_onnx(estimator, x[train])
+    onnx = _export_onnx(estimator, x[train], spec)
     predictor = _SerializedPredictor(onnx)
     central = _future_path(predictor, values, external, future, spec)
     _finite_vector(central, "central forecast")
@@ -276,6 +280,9 @@ def fit_forecast(
         package_versions=versions,
         onnx_bytes=onnx,
         onnx_sha256=hashlib.sha256(onnx).hexdigest(),
+        input_lags=spec.lags,
+        exogenous_feature_count=external.shape[1],
+        output_horizons=(1,) if spec.strategy is ForecastStrategy.RECURSIVE else spec.horizons,
     )
 
 
@@ -610,7 +617,7 @@ def _linear_estimator(coefficients, intercepts, *, scalar=False):
     estimator = Ridge(solver="svd")
     estimator.n_features_in_ = coefficients.shape[1]
     estimator.coef_ = coefficients[0].copy() if scalar else coefficients.copy()
-    estimator.intercept_ = float(intercepts[0]) if scalar else intercepts.copy()
+    estimator.intercept_ = intercepts[0] if scalar else intercepts.copy()
     return estimator
 
 
@@ -767,11 +774,31 @@ def _interval_evidence(kind, method, start, end, evaluation_start, evaluation_en
     )
 
 
-def _export_onnx(estimator, x: np.ndarray) -> bytes:
+def _export_onnx(estimator, x: np.ndarray, spec: ForecastSpecification) -> bytes:
+    # Collapse fitted chains before conversion; recursive models remain the exact
+    # one-step affine predictor used by _future_path at each recursive step.
+    if isinstance(estimator, (MultiOutputRegressor, RegressorChain)):
+        coefficients, intercepts = _linear_parameters(estimator, spec, x.shape[1])
+        estimator = _linear_estimator(coefficients, intercepts)
+    offsets = (1,) if spec.strategy is ForecastStrategy.RECURSIVE else spec.horizons
     try:
-        model = to_onnx(estimator, x[:1].astype(np.float32), target_opset=13)
+        import onnx
+        model = to_onnx(
+            estimator,
+            name="market-squawk-research-affine",
+            initial_types=[("X", FloatTensorType([1, x.shape[1]]))],
+            final_types=[("Y", FloatTensorType([1, len(offsets)]))],
+            target_opset=13,
+            black_op={"LinearRegressor"},
+        )
+        onnx.helper.set_model_props(model, {
+            "market_squawk.forecast.horizons": ",".join(map(str, offsets)),
+            "market_squawk.forecast.lags": ",".join(map(str, spec.lags)),
+            "market_squawk.forecast.strategy": spec.strategy.value,
+        })
+        onnx.checker.check_model(model)
         encoded = model.SerializeToString(deterministic=True)
-    except Exception as error:  # sklearn-onnx exposes multiple converter exception classes
+    except Exception as error:  # converter/checker expose multiple exception classes
         raise ForecastValidationError("central forecast cannot be exported to admitted ONNX") from error
     if not encoded:
         raise ForecastValidationError("central ONNX artifact is empty")

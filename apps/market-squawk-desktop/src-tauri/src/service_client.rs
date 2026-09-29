@@ -4,14 +4,17 @@ use serde_json::{Map, Value, json};
 use tauri::State;
 
 use crate::{
-    bridge::{DesktopState, InvocationAuthority, invoke_application, invoke_private_application},
+    bridge::{
+        DesktopState, InvocationAuthority, invoke_application, invoke_private_application,
+        invoke_read_application,
+    },
     contracts::{
         AnalysisControlCommand, ApplicationInvocation, BacktestProductCommand,
         DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
         FairValueControlCommand, GovernanceControlCommand, GovernanceQueryCommand,
         JobControlCommand, ModelControlCommand, ModelProductCommand, OperationLogDomain,
         OperationLogSeverity, OperationSettingValue, OperationsControlCommand, PaperControlCommand,
-        ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
+        ProductSessionToken, ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
     },
 };
 
@@ -31,9 +34,30 @@ enum DashboardProjection {
 #[tauri::command]
 pub(crate) async fn dashboard_query(
     request: DashboardQueryCommand,
+    request_id: Option<uuid::Uuid>,
+    product_session_token: Option<ProductSessionToken>,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
+    let read = if matches!(&request, DashboardQueryCommand::MarketSessionContext { .. }) {
+        if request_id.is_some() || product_session_token.is_some() {
+            return Err(DesktopCommandError::invalid_request(
+                "A connection change cannot use screen-read cancellation.",
+            ));
+        }
+        None
+    } else {
+        Some(generation.begin_read(
+            request_id.ok_or_else(|| {
+                DesktopCommandError::invalid_request("The screen read requires a request identity.")
+            })?,
+            product_session_token.ok_or_else(|| {
+                DesktopCommandError::invalid_request(
+                    "The screen read requires its current session.",
+                )
+            })?,
+        )?)
+    };
     let mut projection = DashboardProjection::None;
     let (operation, arguments) = match request {
         DashboardQueryCommand::MacroContext {
@@ -72,9 +96,23 @@ pub(crate) async fn dashboard_query(
             arguments.insert("selectionToken".to_owned(), json!(selection_token));
             ("Market.GetInstrument", arguments)
         }
-        DashboardQueryCommand::MarketHistory { history_token } => {
+        DashboardQueryCommand::MarketHistory {
+            history_token,
+            start_unix_nanos,
+            end_unix_nanos,
+            start_date,
+            end_date,
+            point_limit,
+            generation_token,
+        } => {
             let mut arguments = Map::new();
             arguments.insert("historyToken".to_owned(), json!(history_token));
+            insert_optional(&mut arguments, "startUnixNanos", start_unix_nanos);
+            insert_optional(&mut arguments, "endUnixNanos", end_unix_nanos);
+            insert_optional(&mut arguments, "startDate", start_date);
+            insert_optional(&mut arguments, "endDate", end_date);
+            insert_optional(&mut arguments, "pointLimit", point_limit);
+            insert_optional(&mut arguments, "generationToken", generation_token);
             ("Market.GetHistory", arguments)
         }
         DashboardQueryCommand::MarketSessionContext {
@@ -123,15 +161,29 @@ pub(crate) async fn dashboard_query(
             let dataset = generation.resolve_research_collection(collection)?;
             ("Research.GetManifest", dataset_arguments(dataset))
         }
-        DashboardQueryCommand::ResearchCollectionHistory { collection } => {
+        DashboardQueryCommand::ResearchCollectionHistory {
+            collection,
+            cursor,
+            limit,
+        } => {
             projection = DashboardProjection::ResearchObservations;
             let dataset = generation.resolve_research_collection(collection)?;
-            ("Research.GetHistory", dataset_arguments(dataset))
+            (
+                "Research.GetHistory",
+                research_page_arguments(dataset, cursor, limit),
+            )
         }
-        DashboardQueryCommand::ResearchCollectionAlternativeData { collection } => {
+        DashboardQueryCommand::ResearchCollectionAlternativeData {
+            collection,
+            cursor,
+            limit,
+        } => {
             projection = DashboardProjection::ResearchObservations;
             let dataset = generation.resolve_research_collection(collection)?;
-            ("Research.GetAlternativeData", dataset_arguments(dataset))
+            (
+                "Research.GetAlternativeData",
+                research_page_arguments(dataset, cursor, limit),
+            )
         }
         DashboardQueryCommand::ResearchActivities => {
             projection = DashboardProjection::ResearchActivities;
@@ -147,23 +199,30 @@ pub(crate) async fn dashboard_query(
         DashboardQueryCommand::ResearchManifest { dataset } => {
             ("Research.GetManifest", dataset_arguments(dataset))
         }
-        DashboardQueryCommand::ResearchHistory { dataset } => {
-            ("Research.GetHistory", dataset_arguments(dataset))
-        }
-        DashboardQueryCommand::ResearchAlternativeData { dataset } => {
-            ("Research.GetAlternativeData", dataset_arguments(dataset))
-        }
+        DashboardQueryCommand::ResearchHistory {
+            dataset,
+            cursor,
+            limit,
+        } => (
+            "Research.GetHistory",
+            research_page_arguments(dataset, cursor, limit),
+        ),
+        DashboardQueryCommand::ResearchAlternativeData {
+            dataset,
+            cursor,
+            limit,
+        } => (
+            "Research.GetAlternativeData",
+            research_page_arguments(dataset, cursor, limit),
+        ),
         DashboardQueryCommand::ResearchSourceObjects { provider, dataset } => (
             "Source.ListObjects",
             source_discovery_arguments(provider, dataset),
         ),
-        DashboardQueryCommand::PortfolioAccounts {
-            after_account_token,
-        } => {
-            let mut arguments = Map::new();
-            insert_optional(&mut arguments, "afterAccountToken", after_account_token);
-            ("Portfolio.ListAccounts", arguments)
-        }
+        DashboardQueryCommand::PortfolioAccounts { cursor, limit } => (
+            "Portfolio.ListAccounts",
+            product_page_arguments(cursor, limit, 512)?,
+        ),
         DashboardQueryCommand::PortfolioHoldings { account_id } => {
             ("Portfolio.GetHoldings", account_arguments(account_id))
         }
@@ -235,7 +294,10 @@ pub(crate) async fn dashboard_query(
             arguments.insert("scenarioShock".to_owned(), json!(scenario_shock));
             ("Portfolio.EvaluateCandidateImpact", arguments)
         }
-        DashboardQueryCommand::Forecasts => ("Model.ListForecasts", Map::new()),
+        DashboardQueryCommand::Forecasts { cursor, limit } => (
+            "Model.ListForecasts",
+            product_page_arguments(cursor, limit, 256)?,
+        ),
         DashboardQueryCommand::LatestValidForecast {
             instrument_id,
             as_of,
@@ -248,10 +310,31 @@ pub(crate) async fn dashboard_query(
         DashboardQueryCommand::Forecast { forecast_token } => {
             ("Model.GetForecast", forecast_arguments(forecast_token))
         }
-        DashboardQueryCommand::ForecastOutcomes { forecast_token } => (
-            "Model.GetForecastOutcomes",
-            forecast_arguments(forecast_token),
-        ),
+        DashboardQueryCommand::ForecastChart {
+            forecast_token,
+            start_unix_nanos,
+            end_unix_nanos,
+            start_fiscal_ordinal,
+            end_fiscal_ordinal,
+            point_limit,
+        } => {
+            let mut arguments = forecast_arguments(forecast_token);
+            insert_optional(&mut arguments, "startUnixNanos", start_unix_nanos);
+            insert_optional(&mut arguments, "endUnixNanos", end_unix_nanos);
+            insert_optional(&mut arguments, "startFiscalOrdinal", start_fiscal_ordinal);
+            insert_optional(&mut arguments, "endFiscalOrdinal", end_fiscal_ordinal);
+            insert_optional(&mut arguments, "pointLimit", point_limit);
+            ("Model.GetForecastChart", arguments)
+        }
+        DashboardQueryCommand::ForecastOutcomes {
+            forecast_token,
+            cursor,
+            limit,
+        } => {
+            let mut arguments = product_page_arguments(cursor, limit, 256)?;
+            arguments.insert("forecastToken".to_owned(), json!(forecast_token));
+            ("Model.GetForecastOutcomes", arguments)
+        }
         DashboardQueryCommand::DecisionScreens { limit } => {
             let mut arguments = Map::new();
             arguments.insert("limit".to_owned(), json!(limit));
@@ -299,6 +382,21 @@ pub(crate) async fn dashboard_query(
             let mut arguments = Map::new();
             arguments.insert("actionToken".to_owned(), json!(action_token));
             ("Decision.GetInvestmentAnalysis", arguments)
+        }
+        DashboardQueryCommand::DecisionInvestmentChart {
+            action_token,
+            start_unix_nanos,
+            end_unix_nanos,
+            point_limit,
+            layer,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("actionToken".to_owned(), json!(action_token));
+            insert_optional(&mut arguments, "startUnixNanos", start_unix_nanos);
+            insert_optional(&mut arguments, "endUnixNanos", end_unix_nanos);
+            insert_optional(&mut arguments, "pointLimit", point_limit);
+            insert_optional(&mut arguments, "layer", layer);
+            ("Decision.GetInvestmentChart", arguments)
         }
         DashboardQueryCommand::DecisionInvestmentAnalyses {
             after_action_token,
@@ -392,7 +490,13 @@ pub(crate) async fn dashboard_query(
             limit,
         } => {
             let mut arguments = Map::new();
-            insert_optional(&mut arguments, "afterJobId", after_job_id);
+            insert_optional(
+                &mut arguments,
+                "afterJobId",
+                after_job_id
+                    .map(|cursor| opaque_page_cursor(cursor, 256))
+                    .transpose()?,
+            );
             arguments.insert("limit".to_owned(), json!(limit));
             ("Job.List", arguments)
         }
@@ -404,7 +508,13 @@ pub(crate) async fn dashboard_query(
             limit,
         } => {
             let mut arguments = Map::new();
-            insert_optional(&mut arguments, "afterBackupId", after_backup_id);
+            insert_optional(
+                &mut arguments,
+                "afterBackupId",
+                after_backup_id
+                    .map(|cursor| opaque_page_cursor(cursor, 256))
+                    .transpose()?,
+            );
             arguments.insert("limit".to_owned(), json!(limit));
             ("Operations.ListBackups", arguments)
         }
@@ -447,7 +557,7 @@ pub(crate) async fn dashboard_query(
             job_id,
             correlation_id,
             search,
-            after_sequence,
+            cursor,
             limit,
         } => (
             "Operations.QueryLogs",
@@ -460,7 +570,7 @@ pub(crate) async fn dashboard_query(
                 job_id,
                 correlation_id,
                 search,
-                after_sequence,
+                cursor,
                 limit,
             })?,
         ),
@@ -502,14 +612,11 @@ pub(crate) async fn dashboard_query(
             ("Operations.PreviewSettingsRollback", arguments)
         }
     };
-    let mut result = invoke_application(
-        ApplicationInvocation {
-            operation: operation.to_owned(),
-            arguments,
-        },
+    let mut result = invoke_read_application(
+        operation,
+        arguments,
         &state,
-        &generation,
-        InvocationAuthority::ReadOnly,
+        read.as_ref().ok_or_else(DesktopCommandError::internal)?,
     )
     .await?;
     if operation == "Job.List" {
@@ -625,31 +732,23 @@ fn project_research_observations(result: &mut Value) -> Result<(), DesktopComman
         return project_product_metadata(result);
     }
     let observations = data.as_object().ok_or_else(DesktopCommandError::internal)?;
-    let projected = if let Some(rows) = observations.get("rows").and_then(Value::as_array) {
-        let mut projected_rows = Vec::new();
-        projected_rows
-            .try_reserve_exact(rows.len())
-            .map_err(|_error| DesktopCommandError::internal())?;
-        for row in rows {
-            projected_rows.push(project_research_observation_row(row)?);
-        }
-        json!({
-            "kind": "inline",
-            "rows": projected_rows,
-        })
-    } else {
-        let row_count = observations
-            .get("artifact")
-            .and_then(Value::as_object)
-            .and_then(|artifact| artifact.get("rowCount"))
-            .and_then(Value::as_u64)
-            .ok_or_else(DesktopCommandError::internal)?;
-        json!({
-            "kind": "artifact",
-            "rowCount": safe_web_count(row_count)?,
-        })
-    };
-    *application_result_data_mut(result)? = projected;
+    let rows = observations
+        .get("rows")
+        .and_then(Value::as_array)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let mut projected_rows = Vec::new();
+    projected_rows
+        .try_reserve_exact(rows.len())
+        .map_err(|_error| DesktopCommandError::internal())?;
+    for row in rows {
+        projected_rows.push(project_research_observation_row(row)?);
+    }
+    *application_result_data_mut(result)? = json!({
+        "kind": "inline",
+        "rows": projected_rows,
+        "nextCursor": observations.get("nextCursor").filter(|value| value.is_null() || value.is_string()).ok_or_else(DesktopCommandError::internal)?,
+        "hasMore": observations.get("hasMore").and_then(Value::as_bool).ok_or_else(DesktopCommandError::internal)?,
+    });
     project_product_metadata(result)
 }
 
@@ -1099,7 +1198,7 @@ pub(crate) async fn operations_control(
             job_id,
             correlation_id,
             search,
-            after_sequence,
+            cursor,
             limit,
         } => (
             "Operations.ExportLogs",
@@ -1112,7 +1211,7 @@ pub(crate) async fn operations_control(
                 job_id,
                 correlation_id,
                 search,
-                after_sequence,
+                cursor,
                 limit,
             })?,
         ),
@@ -1290,7 +1389,10 @@ pub(crate) async fn decision_control(
                 "calendarReference".to_owned(),
                 Value::Object(calendar_reference),
             );
-            arguments.insert("financialProfile".to_owned(), Value::Object(financial_profile));
+            arguments.insert(
+                "financialProfile".to_owned(),
+                Value::Object(financial_profile),
+            );
             invoke_private_application(
                 "Decision.RunScreen",
                 arguments,
@@ -1513,18 +1615,30 @@ pub(crate) async fn paper_control(
             Map::new(),
             InvocationAuthority::ReadOnly,
         ),
-        PaperControlCommand::PrepareAccount { cash_choice, cost_choice, currency_choice } => {
+        PaperControlCommand::PrepareAccount {
+            cash_choice,
+            cost_choice,
+            currency_choice,
+        } => {
             let mut arguments = Map::new();
             arguments.insert("cashChoice".to_owned(), json!(cash_choice));
             arguments.insert("costChoice".to_owned(), json!(cost_choice));
             arguments.insert("currencyChoice".to_owned(), json!(currency_choice));
-            ("Bot.PrepareAccount", arguments, InvocationAuthority::ReadOnly)
+            (
+                "Bot.PrepareAccount",
+                arguments,
+                InvocationAuthority::ReadOnly,
+            )
         }
         PaperControlCommand::CreateAccount { confirmation_token } => {
             require_confirmation(confirmed)?;
             let mut arguments = Map::new();
             arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
-            ("Bot.CreateAccount", arguments, InvocationAuthority::ExactConfirmed("Bot.CreateAccount"))
+            (
+                "Bot.CreateAccount",
+                arguments,
+                InvocationAuthority::ExactConfirmed("Bot.CreateAccount"),
+            )
         }
         PaperControlCommand::StartPreparation => (
             "Bot.GetStartPreparation",
@@ -1767,13 +1881,17 @@ pub(crate) async fn analysis_control(
 #[tauri::command]
 pub(crate) async fn backtest_products(
     request: BacktestProductCommand,
+    request_id: uuid::Uuid,
+    product_session_token: ProductSessionToken,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
+    let read = generation.begin_read(request_id, product_session_token)?;
     let (operation, arguments) = match request {
-        BacktestProductCommand::List => {
-            ("Analysis.ListProductBacktests", Map::new())
-        }
+        BacktestProductCommand::List { cursor, limit } => (
+            "Analysis.ListProductBacktests",
+            product_page_arguments(cursor, limit, 512)?,
+        ),
         BacktestProductCommand::Get { backtest_token } => {
             let mut arguments = Map::new();
             arguments.insert("backtestToken".to_owned(), json!(backtest_token));
@@ -1785,16 +1903,43 @@ pub(crate) async fn backtest_products(
             ("Analysis.GetRecommendationBacktest", arguments)
         }
     };
-    invoke_narrow(operation, arguments, false, false, &state, &generation).await
+    invoke_read_application(operation, arguments, &state, &read).await
 }
 
 #[tauri::command]
 pub(crate) async fn model_control(
     request: ModelControlCommand,
     confirmed: bool,
+    request_id: Option<uuid::Uuid>,
+    product_session_token: Option<ProductSessionToken>,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
+    let read = if matches!(
+        &request,
+        ModelControlCommand::ForecastPreparationOptions { .. }
+            | ModelControlCommand::PrepareForecast { .. }
+    ) {
+        Some(generation.begin_read(
+            request_id.ok_or_else(|| {
+                DesktopCommandError::invalid_request(
+                    "The forecast read requires a request identity.",
+                )
+            })?,
+            product_session_token.ok_or_else(|| {
+                DesktopCommandError::invalid_request(
+                    "The forecast read requires its current session.",
+                )
+            })?,
+        )?)
+    } else {
+        if request_id.is_some() || product_session_token.is_some() {
+            return Err(DesktopCommandError::invalid_request(
+                "A durable forecast action cannot use screen-read cancellation.",
+            ));
+        }
+        None
+    };
     let (operation, arguments, mutation) = match request {
         ModelControlCommand::StartTraining {
             config_ticket_id,
@@ -1805,9 +1950,11 @@ pub(crate) async fn model_control(
             arguments.insert("authorityTicketId".to_owned(), json!(authority_ticket_id));
             ("Model.StartTraining", arguments, true)
         }
-        ModelControlCommand::ForecastPreparationOptions => {
-            ("Model.GetForecastPreparation", Map::new(), false)
-        }
+        ModelControlCommand::ForecastPreparationOptions { cursor, limit } => (
+            "Model.GetForecastPreparation",
+            product_page_arguments(cursor, limit, 512)?,
+            false,
+        ),
         ModelControlCommand::PrepareForecast { selection } => {
             let mut arguments = Map::new();
             arguments.insert("selection".to_owned(), Value::Object(selection));
@@ -1826,30 +1973,48 @@ pub(crate) async fn model_control(
             .await;
         }
     };
-    invoke_narrow(
-        operation,
-        arguments,
-        mutation,
-        confirmed,
-        &state,
-        &generation,
-    )
-    .await
+    if let Some(read) = read {
+        invoke_read_application(operation, arguments, &state, &read).await
+    } else {
+        invoke_narrow(
+            operation,
+            arguments,
+            mutation,
+            confirmed,
+            &state,
+            &generation,
+        )
+        .await
+    }
 }
 
 #[tauri::command]
 pub(crate) async fn model_products(
     request: ModelProductCommand,
+    request_id: uuid::Uuid,
+    product_session_token: ProductSessionToken,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
-    let operation = match request {
-        ModelProductCommand::List => "Model.ListBundles",
-        ModelProductCommand::Activity => {
-            "Model.ListProductActivity"
+    let read = generation.begin_read(request_id, product_session_token)?;
+    let (operation, arguments) = match request {
+        ModelProductCommand::List { cursor, limit } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "cursor", cursor);
+            insert_optional(&mut arguments, "limit", limit);
+            ("Model.ListBundles", arguments)
         }
+        ModelProductCommand::Get { model_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("modelToken".to_owned(), json!(model_token));
+            ("Model.GetBundle", arguments)
+        }
+        ModelProductCommand::Activity { cursor, limit } => (
+            "Model.ListProductActivity",
+            product_page_arguments(cursor, limit, 512)?,
+        ),
     };
-    invoke_narrow(operation, Map::new(), false, false, &state, &generation).await
+    invoke_read_application(operation, arguments, &state, &read).await
 }
 
 #[tauri::command]
@@ -1918,7 +2083,10 @@ pub(crate) async fn job_control(
         } => {
             let mut arguments = Map::new();
             if let Some(after_job_id) = after_job_id {
-                arguments.insert("afterJobId".to_owned(), json!(after_job_id));
+                arguments.insert(
+                    "afterJobId".to_owned(),
+                    json!(opaque_page_cursor(after_job_id, 256)?),
+                );
             }
             arguments.insert("limit".to_owned(), json!(limit));
             ("Job.List", arguments, false)
@@ -2127,6 +2295,18 @@ fn dataset_arguments(dataset: String) -> Map<String, Value> {
     arguments
 }
 
+fn research_page_arguments(
+    dataset: String,
+    cursor: Option<String>,
+    limit: Option<u16>,
+) -> Map<String, Value> {
+    let mut arguments = dataset_arguments(dataset);
+    insert_optional(&mut arguments, "cursor", cursor);
+    insert_optional(&mut arguments, "limit", limit);
+    arguments.insert("projection".to_owned(), json!("summary"));
+    arguments
+}
+
 fn target_arguments(target_id: String, revision: u32) -> Map<String, Value> {
     let mut arguments = Map::new();
     arguments.insert("targetId".to_owned(), json!(target_id));
@@ -2168,7 +2348,7 @@ struct OperationLogArguments {
     job_id: Option<String>,
     correlation_id: Option<String>,
     search: Option<String>,
-    after_sequence: Option<String>,
+    cursor: Option<String>,
     limit: u16,
 }
 
@@ -2188,16 +2368,39 @@ fn operation_log_arguments(
     insert_optional(&mut arguments, "jobId", input.job_id);
     insert_optional(&mut arguments, "correlationId", input.correlation_id);
     insert_optional(&mut arguments, "search", input.search);
-    if let Some(value) = input.after_sequence {
+    if let Some(value) = input.cursor {
         arguments.insert(
-            "afterSequence".to_owned(),
-            json!(parse_unsigned_decimal(
-                value,
-                "The log sequence must be an unsigned decimal.",
-            )?),
+            "cursor".to_owned(),
+            json!(opaque_page_cursor(value, 1_024)?),
         );
     }
     arguments.insert("limit".to_owned(), json!(input.limit));
+    Ok(arguments)
+}
+
+fn opaque_page_cursor(value: String, maximum_bytes: usize) -> Result<String, DesktopCommandError> {
+    if value.is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control) {
+        return Err(DesktopCommandError::invalid_request(
+            "The page cursor is invalid. Restart this list.",
+        ));
+    }
+    Ok(value)
+}
+
+fn product_page_arguments(
+    cursor: Option<String>,
+    limit: Option<u16>,
+    maximum_cursor_bytes: usize,
+) -> Result<Map<String, Value>, DesktopCommandError> {
+    let mut arguments = Map::new();
+    insert_optional(
+        &mut arguments,
+        "cursor",
+        cursor
+            .map(|value| opaque_page_cursor(value, maximum_cursor_bytes))
+            .transpose()?,
+    );
+    insert_optional(&mut arguments, "limit", limit);
     Ok(arguments)
 }
 

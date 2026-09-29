@@ -20,9 +20,15 @@ pub(crate) struct ForecastOutcomePreparationOrigin {
     serving_manifest: DatasetManifestRef,
 }
 impl ForecastOutcomePreparationOrigin {
-    pub(crate) const fn event_target(&self) -> Option<market_squawk_data::ProbabilityEventTarget> { self.event }
-    pub(crate) const fn analysis_evidence(&self) -> &super::super::ForecastAnalysisEvidence { &self.analysis_evidence }
-    pub(crate) const fn serving_manifest(&self) -> &DatasetManifestRef { &self.serving_manifest }
+    pub(crate) const fn event_target(&self) -> Option<market_squawk_data::ProbabilityEventTarget> {
+        self.event
+    }
+    pub(crate) const fn analysis_evidence(&self) -> &super::super::ForecastAnalysisEvidence {
+        &self.analysis_evidence
+    }
+    pub(crate) const fn serving_manifest(&self) -> &DatasetManifestRef {
+        &self.serving_manifest
+    }
     pub(crate) const fn forecast_token(&self) -> Uuid {
         self.token
     }
@@ -63,10 +69,9 @@ pub(in crate::application::model::forecast) async fn read_origin(
         .forecasts
         .as_ref()
         .ok_or(ForecastApplicationError::Unavailable)?;
-    let record = {
-        let index = forecasts.index.lock().await;
-        product_vintage(&index, token)?.clone()
-    };
+    let index = forecasts.selected_index(token, &context.artifact).await?;
+    let record = product_vintage(&index, token)?.clone();
+    drop(index);
     let image = service.read_image.load();
     let (model_id, bundle_id, bundle_version) = record.typed_model_coordinate()?;
     let bundle = image
@@ -136,9 +141,19 @@ pub(in crate::application::model::forecast) async fn read_origin(
     if terminal.target_at() != Some(target_at)
         || vintage.created_at() > wall_now()?
         || vintage.path().instrument_id() != epoch.instrument_id()
-        || !matches!((vintage.path().output_binding().measurement(), vintage.path().output_binding().target()),
-            (ForecastMeasurement::Return, market_squawk_modeling::ForecastTargetMeaning::FixedHorizonTerminal { .. })
-            | (ForecastMeasurement::Probability, market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }))
+        || !matches!(
+            (
+                vintage.path().output_binding().measurement(),
+                vintage.path().output_binding().target()
+            ),
+            (
+                ForecastMeasurement::Return,
+                market_squawk_modeling::ForecastTargetMeaning::FixedHorizonTerminal { .. }
+            ) | (
+                ForecastMeasurement::Probability,
+                market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }
+            )
+        )
     {
         return Err(ForecastApplicationError::CorruptIndex);
     }
@@ -160,7 +175,9 @@ pub(in crate::application::model::forecast) async fn read_origin(
         venue,
         instrument: epoch.instrument_id(),
         event: match vintage.path().output_binding().target() {
-            market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { event, .. } => Some(event),
+            market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { event, .. } => {
+                Some(event)
+            }
             _ => None,
         },
         analysis_evidence: record.analysis_evidence()?,

@@ -1,12 +1,20 @@
 //! Exact-origin SEC research reads and generation-completion-aware point-in-time selection.
 
+mod filing_xbrl;
+mod indexed;
+mod logical;
+pub use filing_xbrl::{
+    SecFilingXbrlContext, SecFilingXbrlFootnote, SecFilingXbrlNonnumericOccurrence,
+    SecVerifiedFilingXbrl,
+};
+pub use indexed::SecResearchRows;
+
 use std::fmt;
 use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     CommonEquitySuitability, CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest, InstrumentId,
     ResearchContext, ResearchObservation, ResearchTemporalCoordinate, SourceId, Timestamp,
@@ -28,9 +36,9 @@ use crate::catalog::{
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, CatalogAuthority, CatalogError,
     DatasetManifestRef, ManifestCatalogError, ParquetObjectStore, ParquetStoreError,
-    PointInTimeCandidate, PointInTimeError, PointInTimeExclusionReason,
-    PointInTimeExclusionReasons, PointInTimeLimits, PointInTimePolicy, PointInTimeRequest,
-    PointInTimeRevisionMode, PointInTimeRevisionState, PointInTimeService, Sha256Digest,
+    PointInTimeError, PointInTimeExclusionReason, PointInTimeExclusionReasons, PointInTimeLimits,
+    PointInTimePolicy, PointInTimeRequest, PointInTimeRevisionMode, PointInTimeRevisionState,
+    Sha256Digest,
 };
 
 const SEC_SOURCE_ID: &str = "sec-edgar";
@@ -95,6 +103,7 @@ pub struct SecResearchReadRequest {
     revision_mode: PointInTimeRevisionMode,
     point_in_time_limits: PointInTimeLimits,
     maximum_object_bytes: usize,
+    maximum_spill_bytes: u64,
     request_digest: EvidenceDigest,
 }
 
@@ -111,6 +120,7 @@ pub struct SecResearchIdentityReadRequest {
     revision_mode: PointInTimeRevisionMode,
     point_in_time_limits: PointInTimeLimits,
     maximum_object_bytes: usize,
+    maximum_spill_bytes: u64,
 }
 
 impl SecResearchIdentityReadRequest {
@@ -135,7 +145,20 @@ impl SecResearchIdentityReadRequest {
             revision_mode,
             point_in_time_limits,
             maximum_object_bytes,
+            maximum_spill_bytes: 16 * 1024 * 1024 * 1024,
         })
+    }
+
+    /// Sets the independent operation spill allowance; saved filing size is not a RAM limit.
+    pub fn with_spill_bytes(mut self, bytes: u64) -> Result<Self, SecResearchReadError> {
+        if bytes < 4096 || bytes > i64::MAX as u64 {
+            return Err(SecResearchReadError::InvalidRequest);
+        }
+        self.maximum_spill_bytes = bytes;
+        Ok(self)
+    }
+    pub const fn maximum_spill_bytes(&self) -> u64 {
+        self.maximum_spill_bytes
     }
 
     pub const fn instrument_id(&self) -> InstrumentId {
@@ -230,10 +253,24 @@ impl SecResearchReadRequest {
             revision_mode,
             point_in_time_limits,
             maximum_object_bytes,
+            maximum_spill_bytes: 16 * 1024 * 1024 * 1024,
             request_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
         };
         request.request_digest = request_digest(&request)?;
         Ok(request)
+    }
+
+    /// Sets the independent operation spill allowance and rebinds the complete request identity.
+    pub fn with_spill_bytes(mut self, bytes: u64) -> Result<Self, SecResearchReadError> {
+        if bytes < 4096 || bytes > i64::MAX as u64 {
+            return Err(SecResearchReadError::InvalidRequest);
+        }
+        self.maximum_spill_bytes = bytes;
+        self.request_digest = request_digest(&self)?;
+        Ok(self)
+    }
+    pub const fn maximum_spill_bytes(&self) -> u64 {
+        self.maximum_spill_bytes
     }
 
     /// Returns the exact immutable analytical generation.
@@ -543,7 +580,8 @@ pub struct SecResearchSelection {
     request: SecResearchReadRequest,
     origin: SecResearchOrigin,
     company_identity: CompanyIdentityExactRecord,
-    decoded_rows: Box<[ResearchObservation]>,
+    decoded_rows: SecResearchRows<ResearchObservation>,
+    filing_xbrl: Option<SecVerifiedFilingXbrl>,
     disposition: SecResearchDisposition,
     selected: Box<[SecResearchSelectedRow]>,
     exclusions: Box<[SecResearchExcludedRow]>,
@@ -561,8 +599,13 @@ impl SecResearchSelection {
     pub const fn company_identity(&self) -> &CompanyIdentityExactRecord {
         &self.company_identity
     }
-    pub fn decoded_rows(&self) -> &[ResearchObservation] {
+    pub fn decoded_rows(&self) -> &SecResearchRows<ResearchObservation> {
         &self.decoded_rows
+    }
+    /// Returns complete verified nil/nonnumeric filing source facts. Numeric occurrences remain
+    /// in `decoded_rows`, including exclusions; PIT admission still uses the selection receipt.
+    pub const fn filing_xbrl(&self) -> Option<&SecVerifiedFilingXbrl> {
+        self.filing_xbrl.as_ref()
     }
     pub const fn disposition(&self) -> SecResearchDisposition {
         self.disposition
@@ -709,9 +752,13 @@ impl SecResearchReadCapability {
         {
             return Err(SecResearchReadError::OriginMismatch);
         }
-        let provider_binding_digest = company
-            .provider_binding_digest()
-            .ok_or(SecResearchReadError::ProviderBindingMismatch)?;
+        let provider_binding_digest = match request.family() {
+            SecResearchFamily::FilingXbrl => company.provider_logical_binding_digest(),
+            SecResearchFamily::CompanyFacts | SecResearchFamily::Submissions => {
+                company.provider_binding_digest()
+            }
+        }
+        .ok_or(SecResearchReadError::ProviderBindingMismatch)?;
         let pinned = self
             .manifests
             .for_run(company.run_id())?
@@ -736,7 +783,8 @@ impl SecResearchReadCapability {
             request.revision_mode(),
             request.point_in_time_limits(),
             request.maximum_object_bytes(),
-        )?;
+        )?
+        .with_spill_bytes(request.maximum_spill_bytes())?;
         let selected = self
             .select(exact_request, raw_store, deadline, cancellation)
             .await?;
@@ -810,10 +858,27 @@ impl SecResearchReadCapability {
                     .provider_company_id()
                     .as_str(),
             )
-            || company_identity.provider_binding_digest() != Some(request.provider_binding_digest())
+            || match request.family() {
+                SecResearchFamily::FilingXbrl => company_identity.provider_logical_binding_digest(),
+                _ => company_identity.provider_binding_digest(),
+            } != Some(request.provider_binding_digest())
             || company_identity.manifest_content_digest() != pinned.plan().content_hash().evidence()
         {
             return Err(SecResearchReadError::OriginMismatch);
+        }
+
+        if request.family() == SecResearchFamily::FilingXbrl {
+            return self
+                .select_logical(
+                    request,
+                    raw_store,
+                    pinned,
+                    source_id,
+                    company_identity,
+                    deadline,
+                    cancellation,
+                )
+                .await;
         }
 
         let retained_bindings = self
@@ -843,16 +908,10 @@ impl SecResearchReadCapability {
         };
         for physical in binding.physical_claims() {
             check_operation(deadline, &cancellation)?;
-            if usize::try_from(physical.claim().size_bytes())
-                .ok()
-                .is_none_or(|bytes| bytes > request.maximum_object_bytes())
-            {
-                return Err(SecResearchReadError::ObjectBudgetExceeded);
-            }
             let verified = raw_store
-                .open_verified_claim_with_control(physical.claim(), &operation_control)
+                .verify_claim_with_control(physical.claim(), &operation_control)
                 .map_err(map_raw_store_error)?;
-            if verified.receipt().claim() != physical.claim() {
+            if verified.claim() != physical.claim() {
                 return Err(SecResearchReadError::ProviderBindingMismatch);
             }
             drop(verified);
@@ -869,28 +928,30 @@ impl SecResearchReadCapability {
         {
             return Err(SecResearchReadError::OriginMismatch);
         }
-        let batches = read_pinned_object_before_deadline(
-            &self.objects,
+        let scratch = Arc::new(indexed::IndexScratch::new(
+            self.objects.operation_scratch()?,
+            request.maximum_spill_bytes(),
+        ));
+        let cursor = self.objects.pinned_object_batch_cursor(
             &pinned,
             company_identity.artifact_id(),
             object_ordinal,
-            request.point_in_time_limits().max_candidates(),
+            256,
             request.maximum_object_bytes(),
-            deadline,
             &cancellation,
-        )
-        .await?;
-        check_operation(deadline, &cancellation)?;
+        )?;
         let (observations, coordinates, decoded_retained_bytes, observation_dynamic_bytes, lineage) =
             decode_exact_object_batches(
-                batches,
+                cursor,
+                Arc::clone(&scratch),
                 binding.record_count(),
                 pinned.manifest().schema(),
                 request.maximum_object_bytes(),
                 deadline,
                 &cancellation,
                 &operation_control,
-            )?;
+            )
+            .await?;
         if lineage.bytes() != pinned_object.object().lineage_digest().bytes() {
             return Err(SecResearchReadError::OriginMismatch);
         }
@@ -903,6 +964,8 @@ impl SecResearchReadCapability {
             deadline,
             &cancellation,
         )?;
+
+        let filing_xbrl = None;
 
         let mut origin = SecResearchOrigin {
             manifest: request.manifest().clone(),
@@ -931,9 +994,11 @@ impl SecResearchReadCapability {
             binding.capture().observation_digest(),
             binding.row_mapping_digest(),
             observations,
+            filing_xbrl,
             coordinates,
             decoded_retained_bytes,
             observation_dynamic_bytes,
+            self.objects.operation_scratch()?,
             deadline,
             &cancellation,
         )
@@ -963,63 +1028,18 @@ impl SecResearchReadCapability {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the exact pinned object coordinates, bounds, and operation controls remain explicit"
-)]
-async fn read_pinned_object_before_deadline(
-    objects: &ParquetObjectStore,
-    pinned: &crate::PinnedDataset,
-    artifact_id: Uuid,
-    object_ordinal: usize,
-    maximum_rows: usize,
-    maximum_bytes: usize,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<Vec<RecordBatch>, SecResearchReadError> {
-    check_operation(deadline, cancellation)?;
-    let operation_cancellation = cancellation.child_token();
-    let read_cancellation = operation_cancellation.clone();
-    let read = objects.read_pinned_object_bounded_async(
-        pinned,
-        artifact_id,
-        object_ordinal,
-        maximum_rows,
-        maximum_bytes,
-        &read_cancellation,
-    );
-    tokio::pin!(read);
-    let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-    tokio::pin!(deadline_wait);
-    let result = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            operation_cancellation.cancel();
-            let _drained = read.as_mut().await;
-            return Err(SecResearchReadError::Cancelled);
-        }
-        _ = deadline_wait.as_mut() => {
-            operation_cancellation.cancel();
-            let _drained = read.as_mut().await;
-            return Err(SecResearchReadError::DeadlineExceeded);
-        }
-        result = read.as_mut() => result,
-    };
-    check_operation(deadline, cancellation)?;
-    Ok(result?)
-}
-
-fn decode_exact_object_batches(
-    batches: Vec<RecordBatch>,
+async fn decode_exact_object_batches(
+    mut cursor: crate::parquet_store::PinnedBatchCursor,
+    scratch: Arc<indexed::IndexScratch>,
     expected_rows: usize,
     expected_schema: &crate::DatasetSchemaRef,
     maximum_bytes: usize,
     deadline: Instant,
     cancellation: &CancellationToken,
-    control: &dyn ResearchObjectControl,
+    control: &SecResearchOperationControl<'_>,
 ) -> Result<
     (
-        Vec<ResearchObservation>,
+        SecResearchRows<ResearchObservation>,
         Vec<ProviderCaptureRowCoordinate>,
         usize,
         usize,
@@ -1027,58 +1047,33 @@ fn decode_exact_object_batches(
     ),
     SecResearchReadError,
 > {
-    let mut observed_rows = 0_usize;
-    let mut remaining_arrow_bytes = 0_usize;
-    for batch in &batches {
-        check_operation(deadline, cancellation)?;
-        observed_rows = observed_rows
-            .checked_add(batch.num_rows())
-            .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
-        remaining_arrow_bytes = remaining_arrow_bytes
-            .checked_add(batch.get_array_memory_size())
-            .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
-    }
-    if batches.is_empty() || observed_rows != expected_rows {
-        return Err(SecResearchReadError::OriginMismatch);
-    }
-    let batch_slots = batches
-        .capacity()
-        .checked_mul(size_of::<RecordBatch>())
-        .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
-    ensure_object_budget(maximum_bytes, remaining_arrow_bytes, batch_slots)?;
-
-    let mut observations = Vec::new();
-    observations
-        .try_reserve_exact(expected_rows)
-        .map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?;
+    let mut observations = indexed::RowsBuilder::<ResearchObservation>::new(scratch)?;
+    let mut observed_rows = 0usize;
     let mut coordinates = Vec::new();
     coordinates
         .try_reserve_exact(expected_rows)
         .map_err(|_| SecResearchReadError::ObjectBudgetExceeded)?;
-    let aggregate_slots = observations
+    let aggregate_slots = coordinates
         .capacity()
-        .checked_mul(size_of::<ResearchObservation>())
-        .and_then(|bytes| {
-            bytes.checked_add(
-                coordinates
-                    .capacity()
-                    .checked_mul(size_of::<ProviderCaptureRowCoordinate>())?,
-            )
-        })
+        .checked_mul(size_of::<ProviderCaptureRowCoordinate>())
+        .and_then(|bytes| bytes.checked_add(1024 * 1024))
         .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
-    ensure_object_budget(
-        maximum_bytes,
-        remaining_arrow_bytes,
-        checked_object_bytes(batch_slots, aggregate_slots)?,
-    )?;
-
     let mut observation_dynamic_bytes = 0_usize;
     let mut lineage = ResearchLineageDigestAccumulator::new();
-    for batch in batches {
+    loop {
         check_operation(deadline, cancellation)?;
+        let batch = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(SecResearchReadError::Cancelled),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(SecResearchReadError::DeadlineExceeded),
+            batch = cursor.next_batch() => batch?,
+        };
+        let Some(batch) = batch else {
+            break;
+        };
         let batch_bytes = batch.get_array_memory_size();
         let base_bytes = checked_object_bytes(
-            checked_object_bytes(remaining_arrow_bytes, batch_slots)?,
+            batch_bytes,
             checked_object_bytes(aggregate_slots, observation_dynamic_bytes)?,
         )?;
         let available = maximum_bytes
@@ -1107,22 +1102,22 @@ fn decode_exact_object_batches(
                 )
             })
             .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
-        observation_dynamic_bytes = observation_dynamic_bytes
-            .checked_add(
-                decoded
-                    .retained_bytes
-                    .checked_sub(decoded_slots)
-                    .ok_or(SecResearchReadError::ObjectBudgetExceeded)?,
-            )
-            .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
-        observations.extend(decoded.observations);
+        observation_dynamic_bytes = observation_dynamic_bytes.max(
+            decoded
+                .retained_bytes
+                .checked_sub(decoded_slots)
+                .ok_or(SecResearchReadError::ObjectBudgetExceeded)?,
+        );
+        for observation in decoded.observations {
+            observations.push(&observation)?;
+            observed_rows = observed_rows
+                .checked_add(1)
+                .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
+        }
         coordinates.extend(decoded.coordinates);
-        remaining_arrow_bytes = remaining_arrow_bytes
-            .checked_sub(batch_bytes)
-            .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
         check_operation(deadline, cancellation)?;
     }
-    if observations.len() != expected_rows || coordinates.len() != expected_rows {
+    if observed_rows != expected_rows || coordinates.len() != expected_rows {
         return Err(SecResearchReadError::OriginMismatch);
     }
     let decoded_retained_bytes = aggregate_slots
@@ -1132,7 +1127,7 @@ fn decode_exact_object_batches(
         return Err(SecResearchReadError::ObjectBudgetExceeded);
     }
     Ok((
-        observations,
+        observations.finish()?,
         coordinates,
         decoded_retained_bytes,
         observation_dynamic_bytes,
@@ -1221,18 +1216,6 @@ fn bounded_point_in_time_limits(
     .map_err(|_| SecResearchReadError::ObjectBudgetExceeded)
 }
 
-fn ensure_object_budget(
-    maximum: usize,
-    left: usize,
-    right: usize,
-) -> Result<(), SecResearchReadError> {
-    if checked_object_bytes(left, right)? > maximum {
-        Err(SecResearchReadError::ObjectBudgetExceeded)
-    } else {
-        Ok(())
-    }
-}
-
 fn map_raw_store_error(error: SealedResearchJournalStoreError) -> SecResearchReadError {
     match error {
         SealedResearchJournalStoreError::ObjectControl(ResearchObjectControlError::Cancelled) => {
@@ -1265,6 +1248,8 @@ fn map_arrow_error(error: ArrowConversionError) -> SecResearchReadError {
 
 #[derive(Debug, Error)]
 pub enum SecResearchReadError {
+    #[error(transparent)]
+    Index(rusqlite::Error),
     #[error("SEC research request is invalid")]
     InvalidRequest,
     #[error("SEC research read was cancelled")]
@@ -1279,6 +1264,8 @@ pub enum SecResearchReadError {
     ProviderBindingMismatch,
     #[error("SEC research object exceeded the aggregate retained-memory/work ceiling")]
     ObjectBudgetExceeded,
+    #[error("SEC research operation exceeded its spill disk allowance")]
+    SpillBudgetExceeded,
     #[error("SEC point-in-time selection exceeded a bound or failed canonical validation")]
     PointInTimeSelection,
     #[error("SEC restart did not reproduce the exact typed result")]
@@ -1297,6 +1284,17 @@ pub enum SecResearchReadError {
     Arrow(#[from] ArrowConversionError),
     #[error(transparent)]
     RawStore(#[from] SealedResearchJournalStoreError),
+}
+
+impl From<rusqlite::Error> for SecResearchReadError {
+    fn from(error: rusqlite::Error) -> Self {
+        if matches!(error, rusqlite::Error::SqliteFailure(ref failure, _) if failure.code == rusqlite::ErrorCode::DiskFull)
+        {
+            Self::SpillBudgetExceeded
+        } else {
+            Self::Index(error)
+        }
+    }
 }
 
 fn exact_origin_object_ordinal(
@@ -1320,7 +1318,7 @@ fn validate_rows(
     family: SecResearchFamily,
     source_id: &SourceId,
     coordinates: &[ProviderCaptureRowCoordinate],
-    observations: &[ResearchObservation],
+    observations: &SecResearchRows<ResearchObservation>,
     binding: &crate::PersistedProviderCaptureBindingEvidence,
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -1330,17 +1328,18 @@ fn validate_rows(
     }
     for (ordinal, ((coordinate, observation), retained)) in coordinates
         .iter()
-        .zip(observations)
+        .zip(observations.iter())
         .zip(binding.rows())
         .enumerate()
     {
         if ordinal % 64 == 0 {
             check_operation(deadline, cancellation)?;
         }
+        let observation = observation?;
         let expected_ordinal =
             u32::try_from(ordinal).map_err(|_| SecResearchReadError::OriginMismatch)?;
-        if !family.accepts(observation)
-            || observation_context(observation).provenance().source_id() != source_id
+        if !family.accepts(&observation)
+            || observation_context(&observation).provenance().source_id() != source_id
             || coordinate.binding_digest != binding.binding_digest()
             || coordinate.capture_observation_digest != binding.capture().observation_digest()
             || coordinate.canonical_row_ordinal != expected_ordinal
@@ -1368,10 +1367,12 @@ async fn materialize_selection(
     company_identity: CompanyIdentityExactRecord,
     capture_observation_digest: EvidenceDigest,
     row_mapping_digest: EvidenceDigest,
-    observations: Vec<ResearchObservation>,
+    observations: SecResearchRows<ResearchObservation>,
+    filing_xbrl: Option<SecVerifiedFilingXbrl>,
     coordinates: Vec<ProviderCaptureRowCoordinate>,
     decoded_retained_bytes: usize,
     observation_dynamic_bytes: usize,
+    pit_scratch: crate::OperationScratchDirectory,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<SecResearchSelection, SecResearchReadError> {
@@ -1391,24 +1392,17 @@ async fn materialize_selection(
         .ok_or(SecResearchReadError::ObjectBudgetExceeded)?;
     let mut aggregate =
         SecResearchAggregateBudget::new(request.maximum_object_bytes(), decoded_retained_bytes)?;
-    // Candidates clone the decoded observation payloads. Charge the complete dynamic estimate
-    // before cloning so the operation cannot transiently exceed the request's aggregate ceiling.
-    aggregate.charge(observation_dynamic_bytes)?;
-    aggregate.reserve_work(
-        request
-            .manifest()
-            .dataset_id()
-            .as_str()
-            .len()
-            .checked_add(request.manifest().schema().name().len())
-            .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(observations.len()))
-            .ok_or(SecResearchReadError::ObjectBudgetExceeded)?,
-    )?;
-
+    let _ = observation_dynamic_bytes;
+    let mut candidates = crate::pit::disk::CandidateStore::new(
+        pit_scratch,
+        request.maximum_object_bytes(),
+        observations.remaining_spill_bytes()?,
+        cancellation,
+        deadline,
+    )
+    .map_err(map_disk_pit_error)?;
     let mut row_identities =
         aggregate.reserve_exact::<SecResearchRowIdentity>(observations.len())?;
-    let mut candidates = aggregate.reserve_exact::<PointInTimeCandidate>(observations.len())?;
     let mut candidate_ordinals = aggregate.reserve_exact::<usize>(observations.len())?;
     let mut exclusions = aggregate.reserve_exact::<SecResearchExcludedRow>(observations.len())?;
 
@@ -1422,7 +1416,8 @@ async fn materialize_selection(
             observation_digest: coordinate.observation_digest,
         };
         row_identities.push(row);
-        let provenance = observation_context(observation).provenance();
+        let observation = observation?;
+        let provenance = observation_context(&observation).provenance();
         let knowledge = SecResearchKnowledgeExclusions {
             available_after_cutoff: provenance
                 .availability()
@@ -1435,10 +1430,9 @@ async fn materialize_selection(
             company_identity_not_knowable: !company_knowable,
         };
         if knowledge.is_empty() {
-            candidates.push(PointInTimeCandidate::new(
-                observation.clone(),
-                request.manifest().clone(),
-            ));
+            candidates
+                .append(vec![observation], request.manifest())
+                .map_err(map_disk_pit_error)?;
             candidate_ordinals.push(ordinal);
         } else {
             exclusions.push(SecResearchExcludedRow {
@@ -1482,91 +1476,79 @@ async fn materialize_selection(
         bounded_point_in_time_limits(&request, &aggregate)?,
     )
     .map_err(|_| SecResearchReadError::PointInTimeSelection)?;
-    let outcome = PointInTimeService::new()
-        .select(&pit_request, &candidates, cancellation, deadline)
-        .await;
-
+    let outcome = candidates.select(&pit_request, |_| false);
     let (disposition, point_in_time_content_identity, point_in_time_audit_identity) = match outcome
     {
-        Ok(selection) => {
-            for record in selection.records() {
-                check_operation(deadline, cancellation)?;
-                let original =
-                    original_row_ordinal(record.candidate(), &candidates, &candidate_ordinals)?;
-                selected.push(SecResearchSelectedRow {
-                    row: *row_identities
-                        .get(original)
-                        .ok_or(SecResearchReadError::PointInTimeSelection)?,
-                    point_in_time: point_in_time_identities(record),
-                });
-            }
-            for exclusion in selection.exclusions() {
-                check_operation(deadline, cancellation)?;
-                append_pit_exclusion(
-                    &mut exclusions,
-                    exclusion.record(),
-                    exclusion.reasons(),
-                    &candidates,
-                    &candidate_ordinals,
-                    &row_identities,
-                )?;
-            }
-            (
-                if selected.is_empty() {
-                    SecResearchDisposition::Unavailable
-                } else {
-                    SecResearchDisposition::Selected
-                },
-                Some(selection.content_identity()),
-                selection.audit_identity(),
-            )
+        Ok(selection) => (
+            SecResearchDisposition::Selected,
+            Some(selection.content_identity()),
+            selection.audit_identity(),
+        ),
+        Err(PointInTimeError::DiskRevisionConflicts { audit_identity, .. }) => {
+            (SecResearchDisposition::Conflict, None, audit_identity)
         }
-        Err(PointInTimeError::RevisionConflicts { report }) => {
-            for exclusion in report.exclusions() {
-                check_operation(deadline, cancellation)?;
-                append_pit_exclusion(
-                    &mut exclusions,
-                    exclusion.record(),
-                    exclusion.reasons(),
-                    &candidates,
-                    &candidate_ordinals,
-                    &row_identities,
-                )?;
-            }
-            for conflict in report.conflicts() {
-                let mut rows = Vec::new();
-                rows.try_reserve_exact(conflict.records().len())
-                    .map_err(|_| SecResearchReadError::PointInTimeSelection)?;
-                for record in conflict.records() {
-                    check_operation(deadline, cancellation)?;
-                    let original =
-                        original_row_ordinal(record.candidate(), &candidates, &candidate_ordinals)?;
-                    rows.push((
-                        *row_identities
-                            .get(original)
-                            .ok_or(SecResearchReadError::PointInTimeSelection)?,
-                        point_in_time_identities(record),
-                    ));
-                }
-                conflicts.push(SecResearchConflict {
-                    family_identity: conflict.family_identity(),
-                    revision: conflict.revision(),
-                    rows: rows.into_boxed_slice(),
-                });
-            }
-            (
-                SecResearchDisposition::Conflict,
-                None,
-                report.audit_identity(),
-            )
-        }
-        Err(PointInTimeError::Cancelled) => return Err(SecResearchReadError::Cancelled),
-        Err(PointInTimeError::DeadlineExceeded) => {
-            return Err(SecResearchReadError::DeadlineExceeded);
-        }
-        Err(_) => return Err(SecResearchReadError::PointInTimeSelection),
+        Err(error) => return Err(map_disk_pit_error(error)),
     };
-
+    let mut conflict_groups = std::collections::BTreeMap::<
+        ([u8; 32], u32),
+        (
+            Sha256Digest,
+            market_squawk_domain::RevisionNumber,
+            Vec<(SecResearchRowIdentity, SecResearchPointInTimeIdentities)>,
+        ),
+    >::new();
+    candidates
+        .visit_decisions(|ordinal, record, decision| {
+            let original = *candidate_ordinals
+                .get(ordinal)
+                .ok_or(PointInTimeError::CanonicalEncoding)?;
+            let row = *row_identities
+                .get(original)
+                .ok_or(PointInTimeError::CanonicalEncoding)?;
+            let identities = point_in_time_identities(&record);
+            match decision {
+                crate::pit::disk::DecisionDisposition::Selected => {
+                    if disposition == SecResearchDisposition::Selected {
+                        selected.push(SecResearchSelectedRow {
+                            row,
+                            point_in_time: identities,
+                        });
+                    }
+                }
+                crate::pit::disk::DecisionDisposition::Excluded(reasons) => {
+                    exclusions.push(SecResearchExcludedRow {
+                        row,
+                        knowledge: SecResearchKnowledgeExclusions::default(),
+                        point_in_time_reasons: Some(reasons),
+                        point_in_time: Some(identities),
+                    })
+                }
+                crate::pit::disk::DecisionDisposition::Conflict => {
+                    let revision = observation_context(record.candidate().observation())
+                        .time()
+                        .revision();
+                    conflict_groups
+                        .entry((record.family_identity().bytes(), revision.get()))
+                        .or_insert_with(|| (record.family_identity(), revision, Vec::new()))
+                        .2
+                        .push((row, identities));
+                }
+            }
+            Ok(())
+        })
+        .map_err(map_disk_pit_error)?;
+    for (_, (family_identity, revision, rows)) in conflict_groups {
+        conflicts.push(SecResearchConflict {
+            family_identity,
+            revision,
+            rows: rows.into_boxed_slice(),
+        });
+    }
+    let disposition = if disposition == SecResearchDisposition::Selected && selected.is_empty() {
+        SecResearchDisposition::Unavailable
+    } else {
+        disposition
+    };
     selected.sort_by_key(|row| row.row.row_ordinal);
     exclusions.sort_by_key(|row| row.row.row_ordinal);
     conflicts.sort_by(|left, right| {
@@ -1586,16 +1568,9 @@ async fn materialize_selection(
         cancellation,
     )?;
     aggregate.reserve_work(
-        observations
+        selected
             .len()
-            .checked_mul(size_of::<ResearchObservation>())
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    selected
-                        .len()
-                        .checked_mul(size_of::<SecResearchSelectedRow>())?,
-                )
-            })
+            .checked_mul(size_of::<SecResearchSelectedRow>())
             .and_then(|bytes| {
                 bytes.checked_add(
                     exclusions
@@ -1637,7 +1612,8 @@ async fn materialize_selection(
         request,
         origin,
         company_identity,
-        decoded_rows: observations.into_boxed_slice(),
+        decoded_rows: observations,
+        filing_xbrl,
         disposition,
         selected: selected.into_boxed_slice(),
         exclusions: exclusions.into_boxed_slice(),
@@ -1646,36 +1622,13 @@ async fn materialize_selection(
     })
 }
 
-fn original_row_ordinal(
-    candidate: &PointInTimeCandidate,
-    candidates: &[PointInTimeCandidate],
-    ordinals: &[usize],
-) -> Result<usize, SecResearchReadError> {
-    candidates
-        .iter()
-        .position(|retained| std::ptr::eq(retained, candidate))
-        .and_then(|position| ordinals.get(position).copied())
-        .ok_or(SecResearchReadError::PointInTimeSelection)
-}
-
-fn append_pit_exclusion(
-    exclusions: &mut Vec<SecResearchExcludedRow>,
-    record: crate::PointInTimeRecord<'_>,
-    reasons: PointInTimeExclusionReasons,
-    candidates: &[PointInTimeCandidate],
-    candidate_ordinals: &[usize],
-    row_identities: &[SecResearchRowIdentity],
-) -> Result<(), SecResearchReadError> {
-    let original = original_row_ordinal(record.candidate(), candidates, candidate_ordinals)?;
-    exclusions.push(SecResearchExcludedRow {
-        row: *row_identities
-            .get(original)
-            .ok_or(SecResearchReadError::PointInTimeSelection)?,
-        knowledge: SecResearchKnowledgeExclusions::default(),
-        point_in_time_reasons: Some(reasons),
-        point_in_time: Some(point_in_time_identities(&record)),
-    });
-    Ok(())
+fn map_disk_pit_error(error: PointInTimeError<'_>) -> SecResearchReadError {
+    match error {
+        PointInTimeError::ScratchDiskExhausted => SecResearchReadError::SpillBudgetExceeded,
+        PointInTimeError::Cancelled => SecResearchReadError::Cancelled,
+        PointInTimeError::DeadlineExceeded => SecResearchReadError::DeadlineExceeded,
+        _ => SecResearchReadError::PointInTimeSelection,
+    }
 }
 
 fn point_in_time_identities(
@@ -1726,6 +1679,7 @@ fn request_digest(
                 .to_be_bytes(),
         );
     }
+    hash.update(request.maximum_spill_bytes.to_be_bytes());
     Ok(evidence_digest(hash.finalize().into()))
 }
 

@@ -3,8 +3,8 @@
 use super::super::{ForecastServingEvidence, current_input, persistence::VintageRecord};
 use super::*;
 use crate::application::research::corporate_actions::{
-    SourceAppliedCorporateActionPlanReference, SourceAppliedCorporateActionReadCapability,
-    SourceForecastOutcomeEvidence, ApplicableActionPlanError,
+    ApplicableActionPlanError, SourceAppliedCorporateActionPlanReference,
+    SourceAppliedCorporateActionReadCapability, SourceForecastOutcomeEvidence,
 };
 use market_squawk_modeling::ForecastVintage;
 
@@ -73,7 +73,7 @@ pub(super) async fn measure(
         .as_ref()
         .ok_or(ForecastApplicationError::Unavailable)?;
     let existing = {
-        let index = forecasts.index.lock().await;
+        let index = forecasts.index_for_vintage(record.clone())?;
         index
             .outcomes
             .iter()
@@ -95,7 +95,11 @@ pub(super) async fn measure(
                 context.artifact.clone(),
             )
             .await?;
-        existing.verify_measurement_artifact(&artifact, vintage, MeasurementSourceKind::CurrentInputSourceActions)?;
+        existing.verify_measurement_artifact(
+            &artifact,
+            vintage,
+            MeasurementSourceKind::CurrentInputSourceActions,
+        )?;
         let proof: Value = serde_json::from_slice(artifact.content())
             .map_err(|_| ForecastApplicationError::CorruptIndex)?;
         let retained: SourceForecastOutcomeEvidence = serde_json::from_value(
@@ -192,9 +196,9 @@ pub(super) async fn measure(
     .map_err(|_| ForecastApplicationError::InvalidRecord)?;
     context.ensure_live()?;
     forecasts
-        .append_outcome(&outcome, &published, recorded_at)
+        .append_outcome(&outcome, record, &published, recorded_at)
         .await?;
-    let index = forecasts.index.lock().await;
+    let index = forecasts.index_for_vintage(record.clone())?;
     let retained = index
         .outcomes
         .iter()
@@ -212,7 +216,11 @@ pub(in crate::application::model::forecast) fn rounded_measurement(
 ) -> Result<rust_decimal::Decimal, ForecastApplicationError> {
     let mut value = source
         .measured_return()
-        .map_err(|_| ForecastApplicationError::CurrentInputRead(market_squawk_services::ServiceError::InvalidResult))?
+        .map_err(|_| {
+            ForecastApplicationError::CurrentInputRead(
+                market_squawk_services::ServiceError::InvalidResult,
+            )
+        })?
         .round_dp_with_strategy(u32::from(scale), RoundingStrategy::MidpointNearestEven);
     value.rescale(u32::from(scale));
     if value.scale() != u32::from(scale) {
@@ -229,15 +237,19 @@ fn map_source_error(
         return control.into();
     }
     match error {
-        ApplicableActionPlanError::SourceRead(error) => ForecastApplicationError::CurrentInputRead(error),
+        ApplicableActionPlanError::SourceRead(error) => {
+            ForecastApplicationError::CurrentInputRead(error)
+        }
         ApplicableActionPlanError::IncompleteOrdinaryCoverage
-        | ApplicableActionPlanError::UnresolvedApplicableActions => ForecastApplicationError::Unavailable,
-        ApplicableActionPlanError::InvalidEvidence => {
-            ForecastApplicationError::CurrentInputRead(market_squawk_services::ServiceError::InvalidResult)
+        | ApplicableActionPlanError::UnresolvedApplicableActions => {
+            ForecastApplicationError::Unavailable
         }
+        ApplicableActionPlanError::InvalidEvidence => ForecastApplicationError::CurrentInputRead(
+            market_squawk_services::ServiceError::InvalidResult,
+        ),
         // Interrupted without an expired/cancelled request is a source control failure, not absence.
-        ApplicableActionPlanError::Interrupted => {
-            ForecastApplicationError::CurrentInputRead(market_squawk_services::ServiceError::Internal)
-        }
+        ApplicableActionPlanError::Interrupted => ForecastApplicationError::CurrentInputRead(
+            market_squawk_services::ServiceError::Internal,
+        ),
     }
 }

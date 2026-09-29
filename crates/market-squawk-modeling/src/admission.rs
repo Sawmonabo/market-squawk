@@ -319,6 +319,36 @@ pub fn recover_model_candidate(
     })
 }
 
+/// Reopens the exact durable selection evidence without allocating the model weight artifact.
+/// Initial admission and active inference still require full candidate and backend validation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "independent persisted dataset and filesystem authorities remain explicit"
+)]
+pub fn recover_model_selection_metadata(
+    root: &ControlledModelRoot,
+    metadata: &BundleMetadataRef,
+    authority_bytes: &[u8],
+    authority_sha256: Sha256Digest,
+    dataset_root: &Path,
+    dataset: PythonDatasetAdmissionAuthority,
+    feature_registry: &ProductionFeatureRegistry,
+    dataset_limits: PythonDatasetVerificationLimits,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<crate::bundle::ModelSelectionMetadata, ModelAdmissionError> {
+    let selection = dataset.verify(dataset_root, dataset_limits, deadline, cancellation)?;
+    let (_, expectations) = authority(authority_bytes, authority_sha256, &selection, None)?;
+    let metadata = ModelBundle::load_selection_metadata(
+        root,
+        metadata,
+        &expectations,
+        feature_registry.feature_registry(),
+    )?;
+    verify_feature_order(metadata.metadata())?;
+    Ok(metadata)
+}
+
 /// Returns whether model metadata names the single admitted V1 coefficient vector exactly.
 #[must_use]
 pub fn has_price_return_macro_context_feature_order_v1(metadata: &crate::ModelMetadata) -> bool {

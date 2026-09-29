@@ -6,6 +6,7 @@ use crate::{
     QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine,
 };
 use arrow::array::FixedSizeBinaryArray;
+use sha2::Digest as _;
 use std::{sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -407,6 +408,399 @@ impl AnalyticalReadCapability {
             rows: rows.into_boxed_slice(),
             maximum_bytes,
             retained_bytes,
+        })
+    }
+}
+
+/// A sealed coordinate reference. Only the complete data reader can mint it; serialized
+/// caller data cannot acquire source authority. Loading retains one coordinate at a time.
+#[derive(Clone, Debug)]
+pub struct FeatureDatasetInputCoordinateHandle {
+    store: Arc<CoordinateStore>,
+    ordinal: usize,
+}
+
+#[derive(Debug)]
+struct CoordinateStore {
+    dataset: Arc<AnalyticalFeatureDataset>,
+    connection: std::sync::Mutex<rusqlite::Connection>,
+    _directory: Arc<crate::OperationScratchDirectory>,
+    count: usize,
+    identities: Box<[(usize, [u8; 32])]>,
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+impl FeatureDatasetInputCoordinateHandle {
+    pub fn load(&self) -> Result<OwnedFeatureDatasetInputCoordinate, AnalyticalReadError> {
+        if self.store.cancellation.is_cancelled() {
+            return Err(QueryError::Cancelled.into());
+        }
+        if Instant::now() >= self.store.deadline {
+            return Err(QueryError::DeadlineExceeded.into());
+        }
+        let connection = self
+            .store
+            .connection
+            .lock()
+            .map_err(|_| AnalyticalReadError::InvalidInputEpoch)?;
+        let (expected_bytes, expected_digest) = *self
+            .store
+            .identities
+            .get(self.ordinal)
+            .ok_or(AnalyticalReadError::InvalidInputEpoch)?;
+        let bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT substr(payload,1,?2) FROM coordinates WHERE ordinal=?1",
+                rusqlite::params![
+                    self.ordinal as i64,
+                    i64::try_from(expected_bytes.saturating_add(1))
+                        .map_err(|_| AnalyticalReadError::InvalidLimit)?
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| AnalyticalReadError::InvalidInputEpoch)?;
+        if bytes.len() != expected_bytes
+            || <[u8; 32]>::from(sha2::Sha256::digest(&bytes)) != expected_digest
+        {
+            return Err(AnalyticalReadError::InvalidInputEpoch);
+        }
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .map_err(|_| AnalyticalReadError::InvalidInputEpoch)?;
+        let mut rows = Vec::new();
+        let mut epoch = None;
+        for batch in reader {
+            let batch = batch.map_err(|_| AnalyticalReadError::InvalidInputEpoch)?;
+            for index in 0..batch.num_rows() {
+                let (_, row) = super::forecast::decode_row(&batch, index)?;
+                let current = FeatureDatasetInputEpoch::decode(
+                    crate::python_dataset::input_epoch_bytes(&batch, index)?
+                        .ok_or(AnalyticalReadError::InvalidInputEpoch)?,
+                )
+                .map_err(|_| AnalyticalReadError::InvalidInputEpoch)?;
+                if epoch.as_ref().is_some_and(|prior| prior != &current) {
+                    return Err(AnalyticalReadError::InvalidInputEpoch);
+                }
+                epoch = Some(current);
+                rows.push(row);
+            }
+        }
+        Ok(OwnedFeatureDatasetInputCoordinate {
+            dataset: Arc::clone(&self.store.dataset),
+            epoch: epoch.ok_or(AnalyticalReadError::InvalidInputEpoch)?,
+            rows: rows.into_boxed_slice(),
+        })
+    }
+    pub const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+    /// Resolves another coordinate only within the same complete authenticated query.
+    pub fn at(&self, ordinal: usize) -> Option<Self> {
+        (ordinal < self.store.count).then(|| Self {
+            store: Arc::clone(&self.store),
+            ordinal,
+        })
+    }
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Complete authenticated query receipt with a consumable disk-backed coordinate sequence.
+#[derive(Debug)]
+pub struct FeatureDatasetInputEpochCursor {
+    store: Arc<CoordinateStore>,
+    query_output: PinnedQueryOutput,
+    count: usize,
+    next: usize,
+}
+impl FeatureDatasetInputEpochCursor {
+    pub fn dataset(&self) -> &AnalyticalFeatureDataset {
+        &self.store.dataset
+    }
+    pub fn query_output(&self) -> &PinnedQueryOutput {
+        &self.query_output
+    }
+    /// Shares the operation lease for downstream private staging and restart cleanup.
+    pub fn operation_scratch(&self) -> Arc<crate::OperationScratchDirectory> {
+        Arc::clone(&self.store._directory)
+    }
+    pub const fn len(&self) -> usize {
+        self.count
+    }
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    /// Reopens one original authenticated coordinate without retaining the rest of the query.
+    pub fn coordinate(
+        &self,
+        ordinal: usize,
+    ) -> Result<Option<OwnedFeatureDatasetInputCoordinate>, AnalyticalReadError> {
+        if ordinal >= self.count {
+            return Ok(None);
+        }
+        FeatureDatasetInputCoordinateHandle {
+            store: Arc::clone(&self.store),
+            ordinal,
+        }
+        .load()
+        .map(Some)
+    }
+    /// Repeatable complete traversal with one native coordinate resident at a time.
+    pub fn coordinates(
+        &self,
+    ) -> impl Iterator<Item = Result<OwnedFeatureDatasetInputCoordinate, AnalyticalReadError>> + '_
+    {
+        (0..self.count).map(|ordinal| {
+            self.coordinate(ordinal)?
+                .ok_or(AnalyticalReadError::InvalidInputEpoch)
+        })
+    }
+    pub fn next_coordinate(
+        &mut self,
+    ) -> Result<
+        Option<(
+            FeatureDatasetInputCoordinateHandle,
+            OwnedFeatureDatasetInputCoordinate,
+        )>,
+        AnalyticalReadError,
+    > {
+        if self.next == self.count {
+            return Ok(None);
+        }
+        let handle = FeatureDatasetInputCoordinateHandle {
+            store: Arc::clone(&self.store),
+            ordinal: self.next,
+        };
+        let coordinate = handle.load()?;
+        self.next += 1;
+        Ok(Some((handle, coordinate)))
+    }
+}
+
+impl AnalyticalReadCapability {
+    /// Validates every source-bound epoch and component before exposing an ordered cursor.
+    /// SQL sorting uses the query engine's operation-local spill; decoded historical rows are
+    /// never retained as a full Arrow/native pair.
+    pub async fn feature_dataset_input_epoch_cursor(
+        &self,
+        expected_contract: FeatureDatasetProductContract,
+        manifest: &DatasetManifestRef,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<FeatureDatasetInputEpochCursor, AnalyticalReadError> {
+        let retained = self
+            .manifests
+            .read_feature_dataset_snapshot(
+                expected_contract,
+                crate::manifest::CatalogFeatureDatasetSelection::ExactManifest(manifest),
+                &[],
+                1,
+                deadline,
+                &cancellation,
+            )?
+            .datasets
+            .into_iter()
+            .next()
+            .ok_or(AnalyticalReadError::ForecastDatasetUnavailable)?;
+        let pinned = retained.pinned.clone();
+        let dataset = Arc::new(AnalyticalFeatureDataset::from_catalog(
+            retained,
+            expected_contract,
+        )?);
+        if dataset.generation().manifest() != manifest {
+            return Err(AnalyticalReadError::InvalidInputEpoch);
+        }
+        let directory = self
+            .objects
+            .operation_scratch()
+            .map_err(|_| AnalyticalReadError::InvalidLimit)?;
+        let connection = rusqlite::Connection::open(directory.path().join("coordinates.sqlite"))
+            .map_err(|_| AnalyticalReadError::InvalidLimit)?;
+        connection.execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; CREATE TABLE coordinates(ordinal INTEGER PRIMARY KEY,payload BLOB NOT NULL); BEGIN IMMEDIATE;")
+            .map_err(|_| AnalyticalReadError::InvalidLimit)?;
+        let connection = std::sync::Mutex::new(connection);
+        let child = cancellation.child_token();
+        let _guard = child.clone().drop_guard();
+        let engine = ResearchQueryEngine::from_pinned_dataset(
+            pinned,
+            "observations",
+            Arc::clone(&self.objects),
+            child.clone(),
+        )
+        .await?;
+        let request = QueryRequest::try_new(
+            manifest.clone(),
+            "SELECT * FROM observations WHERE component_kind = 1 ORDER BY decision_on, decision_at, instrument_id, example_id, component_name, component_version",
+        )?;
+        let expected_names: std::collections::BTreeSet<&str> =
+            std::iter::once(expected_contract.feature_component_name())
+                .chain(
+                    expected_contract
+                        .macro_components()
+                        .iter()
+                        .map(|value| value.component_name()),
+                )
+                .collect();
+        let width = expected_names.len();
+        let mut names = std::collections::BTreeSet::new();
+        let mut current_epoch: Option<FeatureDatasetInputEpoch> = None;
+        let mut previous_epoch: Option<FeatureDatasetInputEpoch> = None;
+        let mut fragments = Vec::new();
+        let mut count = 0usize;
+        let mut identities = Vec::new();
+        let mut consume = |batch: arrow::record_batch::RecordBatch| -> Result<(), QueryError> {
+            for index in 0..batch.num_rows() {
+                if child.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(QueryError::DeadlineExceeded);
+                }
+                let epoch_bytes = crate::python_dataset::input_epoch_bytes(&batch, index)
+                    .map_err(|_| QueryError::InvalidSource)?
+                    .ok_or(QueryError::InvalidSource)?;
+                if (epoch_bytes.len() as u64)
+                    .checked_mul(16)
+                    .is_none_or(|bytes| bytes > limits.max_memory_bytes())
+                {
+                    return Err(QueryError::InvalidSource);
+                }
+                let (_, row) = super::forecast::decode_row(&batch, index)
+                    .map_err(|_| QueryError::InvalidSource)?;
+                if row.component_kind() != 1 || !matches!(row.target_coordinate_kind(), 3 | 4 | 5) {
+                    return Err(QueryError::InvalidSource);
+                }
+                let epoch = FeatureDatasetInputEpoch::decode(
+                    crate::python_dataset::input_epoch_bytes(&batch, index)
+                        .map_err(|_| QueryError::InvalidSource)?
+                        .ok_or(QueryError::InvalidSource)?,
+                )
+                .map_err(|_| QueryError::InvalidSource)?;
+                let policy = dataset.study_policy().ok_or(QueryError::InvalidSource)?;
+                if epoch
+                    .study_policy()
+                    .map_err(|_| QueryError::InvalidSource)?
+                    != *policy
+                    || epoch.basis() != policy.basis()
+                    || epoch.population_basis() != dataset.population_basis()
+                    || epoch.purpose() != policy.purpose()
+                    || epoch.snapshot_as_of() != policy.snapshot_as_of()
+                    || Some(epoch.source_snapshot_digest()) != dataset.source_snapshot_digest()
+                    || epoch.limitations() != policy.limitations()
+                    || epoch.calculated_at() > dataset.production_receipt().admitted_at()
+                    || !dataset
+                        .generation()
+                        .parents()
+                        .iter()
+                        .any(|parent| parent.manifest() == epoch.source_manifest())
+                {
+                    return Err(QueryError::InvalidSource);
+                }
+                if let Some(previous) = &current_epoch {
+                    if previous.example_id() != epoch.example_id()
+                        || previous.instrument_id() != epoch.instrument_id()
+                        || previous.decision_coordinate() != epoch.decision_coordinate()
+                        || previous != &epoch
+                    {
+                        return Err(QueryError::InvalidSource);
+                    }
+                } else {
+                    if previous_epoch.as_ref().is_some_and(|prior| {
+                        prior.example_id() == epoch.example_id()
+                            && prior.instrument_id() == epoch.instrument_id()
+                            && prior.decision_coordinate() == epoch.decision_coordinate()
+                    }) {
+                        return Err(QueryError::InvalidSource);
+                    }
+                    current_epoch = Some(epoch);
+                }
+                if !names.insert(row.component_name().to_owned()) {
+                    return Err(QueryError::InvalidSource);
+                }
+                fragments.push(batch.slice(index, 1));
+                if fragments.len() == width {
+                    if names
+                        .iter()
+                        .map(String::as_str)
+                        .ne(expected_names.iter().copied())
+                    {
+                        return Err(QueryError::InvalidSource);
+                    }
+                    let combined = arrow::compute::concat_batches(&batch.schema(), &fragments)
+                        .map_err(|_| QueryError::InvalidSource)?;
+                    let mut bytes = Vec::new();
+                    {
+                        let mut writer = arrow::ipc::writer::StreamWriter::try_new(
+                            &mut bytes,
+                            &combined.schema(),
+                        )
+                        .map_err(|_| QueryError::InvalidSource)?;
+                        writer
+                            .write(&combined)
+                            .map_err(|_| QueryError::InvalidSource)?;
+                        writer.finish().map_err(|_| QueryError::InvalidSource)?;
+                    }
+                    if bytes.len() as u64 > limits.max_memory_bytes() {
+                        return Err(QueryError::InvalidSource);
+                    }
+                    identities.push((bytes.len(), <[u8; 32]>::from(sha2::Sha256::digest(&bytes))));
+                    connection
+                        .lock()
+                        .map_err(|_| QueryError::InvalidSource)?
+                        .execute(
+                            "INSERT INTO coordinates VALUES (?1,?2)",
+                            rusqlite::params![count as i64, bytes],
+                        )
+                        .map_err(|_| QueryError::InvalidSource)?;
+                    count = count.checked_add(1).ok_or(QueryError::InvalidSource)?;
+                    fragments.clear();
+                    names.clear();
+                    previous_epoch = current_epoch.take();
+                }
+            }
+            Ok(())
+        };
+        let output = {
+            let execution =
+                engine.query_pinned_consume(request, limits, child.clone(), &mut consume);
+            tokio::pin!(execution);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => { child.cancel(); let _ = execution.as_mut().await; return Err(QueryError::Cancelled.into()); }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => { child.cancel(); let _ = execution.as_mut().await; return Err(QueryError::DeadlineExceeded.into()); }
+                result = execution.as_mut() => result?,
+            }
+        };
+        drop(consume);
+        let counts = dataset.split_counts();
+        let expected_count = counts
+            .train_examples()
+            .checked_add(counts.validation_examples())
+            .and_then(|n| n.checked_add(counts.test_examples()))
+            .ok_or(AnalyticalReadError::InvalidLimit)?;
+        if count == 0 || count != expected_count || !fragments.is_empty() {
+            return Err(AnalyticalReadError::InvalidInputEpoch);
+        }
+        connection
+            .lock()
+            .map_err(|_| AnalyticalReadError::InvalidInputEpoch)?
+            .execute_batch("COMMIT; PRAGMA query_only=ON;")
+            .map_err(|_| AnalyticalReadError::InvalidLimit)?;
+        Ok(FeatureDatasetInputEpochCursor {
+            store: Arc::new(CoordinateStore {
+                dataset,
+                connection,
+                _directory: Arc::new(directory),
+                count,
+                identities: identities.into_boxed_slice(),
+                deadline,
+                cancellation,
+            }),
+            query_output: output,
+            count,
+            next: 0,
         })
     }
 }

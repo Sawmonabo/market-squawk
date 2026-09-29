@@ -55,11 +55,25 @@ pub(crate) enum PublicationSourceEvidence<'a> {
         &'a SealedProviderLogicalPublicationBinding,
         &'a [ProviderArtifactInputCoordinate],
     ),
+    /// A streamed logical publication whose original company capture was validated during staging.
+    ProviderLogicalWithCompanyIdentity(
+        &'a SealedProviderLogicalPublicationBinding,
+        &'a [ProviderArtifactInputCoordinate],
+        &'a crate::ingest::provider_logical_stream::LogicalCompanyIdentityAuthorization,
+    ),
     /// A retained original, its complete binding, and ordered canonical partition placements
     /// publish in this same controlled transaction.
     ProviderLogicalOriginal(
         &'a SealedProviderLogicalPublicationBinding,
         &'a [ProviderArtifactInputCoordinate],
+        std::time::Instant,
+        &'a tokio_util::sync::CancellationToken,
+    ),
+    /// A logical original also consumes the exact independently retained capture session.
+    ProviderLogicalOriginalCaptures(
+        &'a SealedProviderLogicalPublicationBinding,
+        &'a [ProviderArtifactInputCoordinate],
+        &'a market_squawk_sources::ProviderCapturePackSeal,
         std::time::Instant,
         &'a tokio_util::sync::CancellationToken,
     ),
@@ -450,7 +464,8 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
                 &manifest.dataset_name,
             )?;
         }
-        PublicationSourceEvidence::ProviderLogical(binding, coordinates) => {
+        PublicationSourceEvidence::ProviderLogical(binding, coordinates)
+        | PublicationSourceEvidence::ProviderLogicalWithCompanyIdentity(binding, coordinates, _) => {
             retain_sealed_provider_logical_publication_binding(
                 transaction,
                 reservation.run_id,
@@ -462,6 +477,13 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
         PublicationSourceEvidence::ProviderLogicalOriginal(
             binding,
             coordinates,
+            deadline,
+            cancellation,
+        )
+        | PublicationSourceEvidence::ProviderLogicalOriginalCaptures(
+            binding,
+            coordinates,
+            _,
             deadline,
             cancellation,
         ) => {
@@ -497,6 +519,25 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
     )?;
     if inserted != 1 {
         return Err(CatalogError::EvidenceConflict);
+    }
+    if let PublicationSourceEvidence::ProviderLogicalOriginalCaptures(
+        binding,
+        _,
+        pack,
+        deadline,
+        cancellation,
+    ) = source_evidence
+    {
+        let dataset = crate::DatasetId::try_from(manifest.dataset_name.as_str())
+            .map_err(|_| CatalogError::InvalidRecord)?;
+        super::provider_capture::original::consume_for_logical_publication(
+            transaction,
+            &dataset,
+            binding,
+            pack,
+            deadline,
+            cancellation,
+        )?;
     }
     append_audit(
         transaction,
@@ -595,31 +636,55 @@ fn publication_source_evidence_matches(
                 binding.source_id().as_str(),
                 coordinate,
             )?),
-        PublicationSourceEvidence::ProviderLogical(binding, coordinates) => Ok(capture_count == 0
-            && publication_count == 1
-            && retained_publication_input_matches(
-                transaction,
-                run_id,
-                binding.binding_digest(),
-                "provider_logical",
-                binding.terminal().source_id().as_str(),
-                ProviderArtifactInputCoordinate::try_new(0, 0)?,
-            )?
-            && super::provider_logical::partition_inputs_match(
-                transaction,
-                run_id,
-                binding,
-                coordinates,
-            )?),
+        PublicationSourceEvidence::ProviderLogical(binding, coordinates)
+        | PublicationSourceEvidence::ProviderLogicalWithCompanyIdentity(binding, coordinates, _) => {
+            Ok(capture_count == 0
+                && publication_count == 1
+                && retained_publication_input_matches(
+                    transaction,
+                    run_id,
+                    binding.binding_digest(),
+                    "provider_logical",
+                    binding.terminal().source_id().as_str(),
+                    ProviderArtifactInputCoordinate::try_new(0, 0)?,
+                )?
+                && super::provider_logical::partition_inputs_match(
+                    transaction,
+                    run_id,
+                    binding,
+                    coordinates,
+                )?)
+        }
         PublicationSourceEvidence::ProviderLogicalOriginal(
             binding,
             coordinates,
             deadline,
             cancellation,
+        )
+        | PublicationSourceEvidence::ProviderLogicalOriginalCaptures(
+            binding,
+            coordinates,
+            _,
+            deadline,
+            cancellation,
         ) => {
             let dataset = crate::DatasetId::try_from(dataset_name.as_str())
                 .map_err(|_| CatalogError::InvalidRecord)?;
-            Ok(capture_count == 0
+            let originals_match = match source_evidence {
+                PublicationSourceEvidence::ProviderLogicalOriginalCaptures(_, _, pack, _, _) => {
+                    super::provider_capture::original::logical_publication_matches(
+                        transaction,
+                        &dataset,
+                        binding,
+                        pack,
+                        deadline,
+                        cancellation,
+                    )?
+                }
+                _ => true,
+            };
+            Ok(originals_match
+                && capture_count == 0
                 && publication_count == 1
                 && retained_publication_input_matches(
                     transaction,

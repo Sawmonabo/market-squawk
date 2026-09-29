@@ -51,9 +51,9 @@ export function ResearchIngestion({
   const sources = useQuery({
     queryKey: sourceKey,
     enabled: connectedSourceIngestionAvailable,
-    queryFn: async () =>
+    queryFn: async ({ signal }) =>
       parseResearchSourceInputs(
-        await transport.systemQuery({ query: "sourceStatus" }),
+        await transport.systemQuery({ query: "sourceStatus" }, { signal }),
       ),
   })
   const [sourceIdentity, setSourceIdentity] = React.useState("")
@@ -67,14 +67,14 @@ export function ResearchIngestion({
   const objects = useQuery({
     queryKey: objectKey,
     enabled: connectedSourceIngestionAvailable && source !== null,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const selected = requiredSource(source)
       return parseResearchSourceObjects(
         await transport.systemQuery({
           query: "researchSourceObjects",
           provider: selected.provider,
           dataset: selected.dataset,
-        }),
+        }, { signal }),
         selected,
       )
     },

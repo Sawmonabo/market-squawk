@@ -13,8 +13,9 @@ use market_squawk_data::{
     AnalyticalReadCapability, AnalyticalReadLimit, ComponentAdjustmentEvidence, ComponentKind,
     ComponentScope, ComponentValue, CorporateActionSensitivity, DatasetId, DatasetManifestRef,
     DatasetSplit, FeatureDatasetProductContract, ForecastDatasetEvidence,
-    ForecastDatasetReadLimits, ForecastFeatureRow, ForecastFeatureValue, GenerationParentRelation,
-    MarketBarEffectiveRange, ObservationFamilyKey, QueryLimits, Sha256Digest,
+    ForecastDatasetReadLimits, ForecastFeatureRow, ForecastFeatureRows, ForecastFeatureValue,
+    GenerationParentRelation, MarketBarEffectiveRange, ObservationFamilyKey, QueryLimits,
+    Sha256Digest,
 };
 use market_squawk_domain::{
     CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketBarAdjustment,
@@ -41,7 +42,6 @@ use super::macro_features::{MacroFeatureVector, MacroRateRegime, read_macro_feat
 
 const DATASET_PAGE: usize = 64;
 const MAX_DATASETS: usize = 4_096;
-const MAX_ROWS: usize = 100_000;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_VALIDITY_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 const MINIMUM_HISTORY: usize = 3;
@@ -598,7 +598,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
 }
 
 fn evidence_limits() -> Result<ForecastDatasetReadLimits, ForecastEvidenceReadError> {
-    ForecastDatasetReadLimits::try_new(MAX_ROWS, MAX_BYTES)
+    ForecastDatasetReadLimits::try_new(usize::MAX, MAX_BYTES)
         .map_err(|_| ForecastEvidenceReadError::Capacity)
 }
 
@@ -774,12 +774,10 @@ fn shared_compatibility_digest(
     let dataset = evidence.dataset();
     let split_counts = dataset.split_counts();
     let parent_graph = parent_graph_digest(dataset.generation().parents())?;
-    let mut rows = evidence
-        .rows()
-        .iter()
-        .map(shared_row_digest)
-        .collect::<Result<Vec<_>, _>>()?;
-    rows.sort_unstable_by_key(|digest| digest.bytes());
+    let rows = evidence.rows().sorted_row_digests(
+        |row| shared_row_digest(row).map(Sha256Digest::bytes),
+        map_read_error,
+    )?;
 
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/forecast-training-analysis-compatibility/v1\0");
@@ -816,12 +814,12 @@ fn shared_compatibility_digest(
     digest.update(evidence.fence().as_of().unix_nanos().to_be_bytes());
     digest.update(evidence.fence().selected_rows().get().to_be_bytes());
     digest.update(
-        u64::try_from(rows.len())
+        u64::try_from(evidence.rows().len())
             .map_err(|_| ForecastEvidenceReadError::Capacity)?
             .to_be_bytes(),
     );
-    for row in rows {
-        digest.update(row.bytes());
+    for row in rows.iter() {
+        digest.update(row.map_err(map_read_error)?);
     }
     Ok(Sha256Digest::new(digest.finalize().into()))
 }
@@ -926,61 +924,39 @@ fn parent_graph_digest(
 
 fn instrument_inventory(
     metadata: &ModelMetadata,
-    rows: &[ForecastFeatureRow],
+    rows: &ForecastFeatureRows,
     available_at: Timestamp,
     horizon: NonZeroU64,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Vec<ForecastInstrumentAvailability>, ForecastEvidenceReadError> {
-    let mut instruments = Vec::new();
-    instruments
-        .try_reserve_exact(rows.len())
-        .map_err(|_| ForecastEvidenceReadError::Capacity)?;
-    for row in rows.iter().filter(|row| model_label(row, metadata)) {
-        check_control(deadline, cancellation)?;
-        instruments.push(row.instrument_id());
-    }
-    instruments.sort_unstable();
-    instruments.dedup();
     let mut inventory = Vec::new();
-    inventory
-        .try_reserve_exact(instruments.len())
-        .map_err(|_| ForecastEvidenceReadError::Capacity)?;
-    for instrument in instruments {
+    let mut previous_instrument = None;
+    for row in rows.iter_component(
+        None,
+        2,
+        metadata.label().name(),
+        metadata.label().version().get(),
+    ) {
         check_control(deadline, cancellation)?;
+        let row = row.map_err(map_read_error)?;
+        let instrument = row.instrument_id();
+        if previous_instrument == Some(instrument) {
+            continue;
+        }
+        previous_instrument = Some(instrument);
         let Some(origin_label) = latest_oos_origin(metadata, rows, instrument, horizon)? else {
             continue;
         };
-        let (origin, target) = exact_terminal_coordinates(origin_label, horizon)?;
-        let history = historical_labels(metadata, rows, instrument, target, horizon)?;
-        if history.len() < MINIMUM_HISTORY {
+        let (origin, target) = exact_terminal_coordinates(&origin_label, horizon)?;
+        let Some((history_count, observed_from, observed_through, scale)) =
+            historical_label_summary(metadata, rows, instrument, target, horizon)?
+        else {
+            continue;
+        };
+        if history_count < MINIMUM_HISTORY {
             continue;
         }
-        let scale = observed_value(
-            history
-                .first()
-                .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
-        )?
-        .scale();
-        for row in &history {
-            if observed_value(row)?.scale() != scale {
-                return Err(ForecastEvidenceReadError::InvalidEvidence);
-            }
-        }
-        let observed_from = exact_terminal_coordinates(
-            history
-                .first()
-                .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
-            horizon,
-        )?
-        .1;
-        let observed_through = exact_terminal_coordinates(
-            history
-                .last()
-                .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
-            horizon,
-        )?
-        .1;
         if observed_through != target || available_at < target {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
         }
@@ -993,12 +969,15 @@ fn instrument_inventory(
             origin_label.source_selection_as_of(),
             origin_label.split(),
         )?;
+        inventory
+            .try_reserve(1)
+            .map_err(|_| ForecastEvidenceReadError::Capacity)?;
         inventory.push(ForecastInstrumentAvailability::try_new(
             instrument,
             observed_from,
             observed_through,
             available_at,
-            NonZeroUsize::new(history.len()).ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
+            NonZeroUsize::new(history_count).ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
             scale,
         )?);
     }
@@ -1036,7 +1015,7 @@ async fn materialize(
     let historical_oos = latest_oos_origin(metadata, evidence.rows(), instrument, horizon)?
         .ok_or(ForecastEvidenceReadError::Unavailable)?;
     let (historical_origin, historical_target) =
-        exact_terminal_coordinates(historical_oos, horizon)?;
+        exact_terminal_coordinates(&historical_oos, horizon)?;
     if evidence.fence().as_of() < historical_target {
         return Err(ForecastEvidenceReadError::InvalidEvidence);
     }
@@ -1070,7 +1049,9 @@ async fn materialize(
         if coordinate.epoch().instrument_id() != instrument {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
         }
-        let calendar = calendar.cloned().map(crate::application::market_calendar::ForecastSessionReadCapability::Current);
+        let calendar = calendar
+            .cloned()
+            .map(crate::application::market_calendar::ForecastSessionReadCapability::Current);
         crate::application::model::forecast::current_price_session_origin(
             calendar.as_ref(),
             input.session_cohort(),
@@ -1784,12 +1765,6 @@ fn sha256_evidence(value: EvidenceDigest) -> Result<Sha256Digest, ForecastEviden
     Ok(Sha256Digest::new(value.bytes()))
 }
 
-fn model_label(row: &ForecastFeatureRow, metadata: &ModelMetadata) -> bool {
-    row.component_kind() == 2
-        && row.component_name() == metadata.label().name()
-        && row.component_version() == metadata.label().version().get()
-}
-
 fn exact_terminal_coordinates(
     row: &ForecastFeatureRow,
     horizon: NonZeroU64,
@@ -1812,27 +1787,32 @@ fn exact_terminal_coordinates(
     }
 }
 
-fn latest_oos_origin<'row>(
+fn latest_oos_origin(
     metadata: &ModelMetadata,
-    rows: &'row [ForecastFeatureRow],
+    rows: &ForecastFeatureRows,
     instrument: InstrumentId,
     horizon: NonZeroU64,
-) -> Result<Option<&'row ForecastFeatureRow>, ForecastEvidenceReadError> {
+) -> Result<Option<ForecastFeatureRow>, ForecastEvidenceReadError> {
     let training_end = metadata
         .training_period()
         .end()
         .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
-    let mut selected: Option<&ForecastFeatureRow> = None;
-    for row in rows.iter().filter(|row| {
-        row.instrument_id() == instrument
-            && model_label(row, metadata)
-            && !matches!(row.value(), ForecastFeatureValue::Missing)
-    }) {
-        let (origin, _) = exact_terminal_coordinates(row, horizon)?;
+    let mut selected: Option<ForecastFeatureRow> = None;
+    for row in rows.iter_component(
+        Some(instrument),
+        2,
+        metadata.label().name(),
+        metadata.label().version().get(),
+    ) {
+        let row = row.map_err(map_read_error)?;
+        if matches!(row.value(), ForecastFeatureValue::Missing) {
+            continue;
+        }
+        let (origin, _) = exact_terminal_coordinates(&row, horizon)?;
         if row.split() == DatasetSplit::Train || origin < training_end {
             continue;
         }
-        match selected {
+        match selected.as_ref() {
             Some(current) => {
                 let (current_origin, _) = exact_terminal_coordinates(current, horizon)?;
                 if origin == current_origin {
@@ -1848,37 +1828,47 @@ fn latest_oos_origin<'row>(
     Ok(selected)
 }
 
-fn historical_labels<'row>(
+fn historical_label_summary(
     metadata: &ModelMetadata,
-    rows: &'row [ForecastFeatureRow],
+    rows: &ForecastFeatureRows,
     instrument: InstrumentId,
     through: Timestamp,
     horizon: NonZeroU64,
-) -> Result<Vec<&'row ForecastFeatureRow>, ForecastEvidenceReadError> {
-    let mut labels = Vec::new();
-    labels
-        .try_reserve_exact(rows.len())
-        .map_err(|_| ForecastEvidenceReadError::Capacity)?;
-    for row in rows.iter().filter(|row| {
-        row.instrument_id() == instrument
-            && model_label(row, metadata)
-            && !matches!(row.value(), ForecastFeatureValue::Missing)
-    }) {
-        let (_, target) = exact_terminal_coordinates(row, horizon)?;
-        if target <= through {
-            observed_value(row)?;
-            labels.push(row);
+) -> Result<Option<(usize, Timestamp, Timestamp, u8)>, ForecastEvidenceReadError> {
+    let mut summary: Option<(usize, Timestamp, Timestamp, u8)> = None;
+    for row in rows.iter_component(
+        Some(instrument),
+        2,
+        metadata.label().name(),
+        metadata.label().version().get(),
+    ) {
+        let row = row.map_err(map_read_error)?;
+        if matches!(row.value(), ForecastFeatureValue::Missing) {
+            continue;
         }
-    }
-    labels.sort_unstable_by_key(|row| row.label_effective_at());
-    for pair in labels.windows(2) {
-        if exact_terminal_coordinates(pair[0], horizon)?.1
-            >= exact_terminal_coordinates(pair[1], horizon)?.1
-        {
-            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        let (_, target) = exact_terminal_coordinates(&row, horizon)?;
+        if target > through {
+            continue;
         }
+        let scale = observed_value(&row)?.scale();
+        summary = Some(match summary {
+            None => (1, target, target, scale),
+            Some((count, first, previous, expected_scale)) => {
+                if previous >= target || scale != expected_scale {
+                    return Err(ForecastEvidenceReadError::InvalidEvidence);
+                }
+                (
+                    count
+                        .checked_add(1)
+                        .ok_or(ForecastEvidenceReadError::Capacity)?,
+                    first,
+                    target,
+                    scale,
+                )
+            }
+        });
     }
-    Ok(labels)
+    Ok(summary)
 }
 
 fn observed_value(row: &ForecastFeatureRow) -> Result<ForecastValue, ForecastEvidenceReadError> {
@@ -1905,7 +1895,7 @@ fn observed_value(row: &ForecastFeatureRow) -> Result<ForecastValue, ForecastEvi
 
 fn coefficient_row(
     metadata: &ModelMetadata,
-    rows: &[ForecastFeatureRow],
+    rows: &ForecastFeatureRows,
     instrument: InstrumentId,
     origin: Timestamp,
     target: Timestamp,
@@ -1916,24 +1906,27 @@ fn coefficient_row(
         .features()
         .iter()
         .map(|binding| {
-            let mut candidates = rows.iter().filter(|row| {
-                row.instrument_id() == instrument
-                    && row.source_selection_as_of() == cutoff
+            let mut selected = None;
+            for row in rows.iter_component(
+                Some(instrument),
+                1,
+                binding.key().name(),
+                binding.key().version().get(),
+            ) {
+                let row = row.map_err(map_read_error)?;
+                if row.source_selection_as_of() == cutoff
                     && row.observed_effective_at() == Some(origin)
                     && row.label_effective_at() == Some(target)
                     && matches!(row.target_coordinate_kind(), 3 | 5)
                     && row.split() == split
-                    && row.component_kind() == 1
-                    && row.component_name() == binding.key().name()
-                    && row.component_version() == binding.key().version().get()
-            });
-            let selected = candidates
-                .next()
-                .ok_or(ForecastEvidenceReadError::Unavailable)?;
-            if candidates.next().is_some() {
-                return Err(ForecastEvidenceReadError::InvalidEvidence);
+                {
+                    if selected.is_some() {
+                        return Err(ForecastEvidenceReadError::InvalidEvidence);
+                    }
+                    selected = Some(row);
+                }
             }
-            finite_value(selected)
+            finite_value(&selected.ok_or(ForecastEvidenceReadError::Unavailable)?)
         })
         .collect()
 }
@@ -1993,6 +1986,10 @@ fn map_read_error(error: market_squawk_data::AnalyticalReadError) -> ForecastEvi
         market_squawk_data::AnalyticalReadError::InvalidLimit => {
             ForecastEvidenceReadError::Capacity
         }
+        market_squawk_data::AnalyticalReadError::Query(
+            market_squawk_data::QueryError::SpillStorageExhausted
+            | market_squawk_data::QueryError::MemoryLimitExceeded { .. },
+        ) => ForecastEvidenceReadError::Capacity,
         market_squawk_data::AnalyticalReadError::Query(
             market_squawk_data::QueryError::Cancelled,
         ) => ForecastEvidenceReadError::Cancelled,

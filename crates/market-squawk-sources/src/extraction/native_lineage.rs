@@ -1,11 +1,12 @@
 //! Bounded provider-native evidence aligned exactly to canonical extraction rows.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::mem::size_of;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -23,6 +24,187 @@ pub const MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES: usize = 64 * 1024;
 pub const MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum checked deep bytes retained by one provider-native lineage batch.
 pub const MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Physical chunk size; total evidence size is independent of this working buffer.
+pub const PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Compact commitment to a complete ordered immutable sidecar stream.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderNativeSidecarDescriptor {
+    version: u16,
+    chunk_bytes: usize,
+    chunk_count: u64,
+    total_bytes: u64,
+    content_digest: EvidenceDigest,
+    ordered_chunk_digest: EvidenceDigest,
+}
+
+impl ProviderNativeSidecarDescriptor {
+    /// Verifies every bounded chunk and the exact end of the complete immutable stream.
+    pub fn verify_reader(&self, reader: &mut impl Read) -> Result<(), ProviderNativeLineageError> {
+        if &ProviderNativeSidecarChunks::describe(reader)? != self {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+        Ok(())
+    }
+    pub const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+    pub const fn content_digest(&self) -> EvidenceDigest {
+        self.content_digest
+    }
+}
+
+/// Operation-owned, disk-backed complete sidecar. Clones share the same immutable spool.
+#[derive(Clone, Debug)]
+pub struct ProviderNativeSidecarChunks {
+    file: Arc<tempfile::NamedTempFile>,
+    descriptor: ProviderNativeSidecarDescriptor,
+}
+impl PartialEq for ProviderNativeSidecarChunks {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor
+    }
+}
+impl Eq for ProviderNativeSidecarChunks {}
+impl ProviderNativeSidecarChunks {
+    /// Serializes directly to an owned temporary file; no whole-document buffer is allocated.
+    pub fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Self, ProviderNativeLineageError> {
+        Self::serialize_in(value, &std::env::temp_dir())
+    }
+    /// Serializes within the caller's supervised, restart-reclaimable scratch directory.
+    pub fn serialize_in<T: Serialize + ?Sized>(
+        value: &T,
+        parent: &std::path::Path,
+    ) -> Result<Self, ProviderNativeLineageError> {
+        let mut file = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+        {
+            let mut writer = io::BufWriter::with_capacity(
+                PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES,
+                file.as_file_mut(),
+            );
+            serde_json::to_writer(&mut writer, value)
+                .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+            writer
+                .flush()
+                .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+        }
+        file.as_file_mut()
+            .rewind()
+            .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+        let descriptor = Self::describe(file.as_file_mut())?;
+        Ok(Self {
+            file: Arc::new(file),
+            descriptor,
+        })
+    }
+    fn describe(
+        reader: &mut impl Read,
+    ) -> Result<ProviderNativeSidecarDescriptor, ProviderNativeLineageError> {
+        let mut content = Sha256::new();
+        let mut ordered = Sha256::new();
+        ordered.update(b"market-squawk/native-sidecar-chunks/v1");
+        let mut chunk_count = 0u64;
+        let mut total_bytes = 0u64;
+        let mut buffer = [0u8; PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES];
+        loop {
+            let mut used = 0;
+            while used < buffer.len() {
+                let count = reader
+                    .read(&mut buffer[used..])
+                    .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+                if count == 0 {
+                    break;
+                }
+                used += count;
+            }
+            if used == 0 {
+                break;
+            }
+            content.update(&buffer[..used]);
+            ordered.update(chunk_count.to_be_bytes());
+            ordered.update((used as u64).to_be_bytes());
+            ordered.update(Sha256::digest(&buffer[..used]));
+            chunk_count = chunk_count
+                .checked_add(1)
+                .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+            total_bytes = total_bytes
+                .checked_add(used as u64)
+                .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+        }
+        if total_bytes == 0 {
+            return Err(ProviderNativeLineageError::EmptySidecarPayload);
+        }
+        Ok(ProviderNativeSidecarDescriptor {
+            version: 1,
+            chunk_bytes: PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES,
+            chunk_count,
+            total_bytes,
+            content_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, content.finalize().into()),
+            ordered_chunk_digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                ordered.finalize().into(),
+            ),
+        })
+    }
+    /// Restores bounded chunks and checks the complete stream commitment before returning it.
+    pub fn restore<E>(
+        descriptor: &[u8],
+        chunks: impl IntoIterator<Item = Result<Vec<u8>, E>>,
+    ) -> Result<Self, ProviderNativeLineageError> {
+        let expected: ProviderNativeSidecarDescriptor = serde_json::from_slice(descriptor)
+            .map_err(|_| ProviderNativeLineageError::AlignmentMismatch)?;
+        let mut file = tempfile::NamedTempFile::new()
+            .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+        let mut count = 0u64;
+        for chunk in chunks {
+            let chunk = chunk.map_err(|_| ProviderNativeLineageError::AlignmentMismatch)?;
+            count = count
+                .checked_add(1)
+                .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+            if chunk.is_empty()
+                || chunk.len() > PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES
+                || count > expected.chunk_count
+                || (count < expected.chunk_count
+                    && chunk.len() != PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES)
+            {
+                return Err(ProviderNativeLineageError::AlignmentMismatch);
+            }
+            file.write_all(&chunk)
+                .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+        }
+        file.rewind()
+            .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+        let observed = Self::describe(file.as_file_mut())?;
+        if expected != observed {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+        Ok(Self {
+            file: Arc::new(file),
+            descriptor: expected,
+        })
+    }
+    /// Opens a fresh cursor over the complete evidence; the owner keeps scratch alive.
+    pub fn reader(&self) -> Result<std::fs::File, ProviderNativeLineageError> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(self.file.path())
+            .map_err(|_| ProviderNativeLineageError::SerializationFailure)
+    }
+    /// Compact exact descriptor retained in the catalog's native sidecar column.
+    pub const fn descriptor(&self) -> &ProviderNativeSidecarDescriptor {
+        &self.descriptor
+    }
+    /// Checks the complete stream without allocating its total size.
+    pub fn verify(&self) -> Result<(), ProviderNativeLineageError> {
+        if Self::describe(&mut self.reader()?)? != self.descriptor {
+            return Err(ProviderNativeLineageError::AlignmentMismatch);
+        }
+        Ok(())
+    }
+}
 
 /// Closed adapter encoder implementations admitted by the current native-lineage schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,7 +352,8 @@ pub struct ProviderNativeLineageSchema {
 }
 
 impl ProviderNativeLineageSchema {
-    pub(crate) fn for_implementation(implementation: ProviderNativeLineageImplementation) -> Self {
+    /// Returns the immutable schema identity for one code-owned adapter implementation.
+    pub fn for_implementation(implementation: ProviderNativeLineageImplementation) -> Self {
         let version = PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION;
         let mut digest = Sha256::new();
         hash_field(&mut digest, SCHEMA_FINGERPRINT_DOMAIN);
@@ -220,11 +403,16 @@ pub struct ProviderNativeLineageRow {
 /// and physical-receipt semantics that cannot truthfully be repeated on every canonical row.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ProviderNativeLineageBatchSidecar {
+    chunks: Option<ProviderNativeSidecarChunks>,
     semantic_payload: Bytes,
     semantic_payload_digest: EvidenceDigest,
 }
 
 impl ProviderNativeLineageBatchSidecar {
+    /// Complete disk-backed evidence when the semantic payload is a chunk descriptor.
+    pub const fn chunks(&self) -> Option<&ProviderNativeSidecarChunks> {
+        self.chunks.as_ref()
+    }
     /// Returns the exact adapter-encoded batch-level semantic payload.
     pub fn semantic_payload(&self) -> &Bytes {
         &self.semantic_payload
@@ -444,6 +632,16 @@ impl ProviderNativeLineageBatch {
             }
         }
         if let Some(sidecar) = self.batch_sidecar.as_ref() {
+            if let Some(chunks) = sidecar.chunks() {
+                // The private spool was completely hashed at construction and exposes only
+                // read-only handles. Publication verifies the copied immutable object once;
+                // validating each bounded canonical batch must not rescan the whole filing.
+                let descriptor = serde_json::to_vec(chunks.descriptor())
+                    .map_err(|_| ProviderNativeLineageError::SerializationFailure)?;
+                if descriptor.as_slice() != sidecar.semantic_payload.as_ref() {
+                    return Err(ProviderNativeLineageError::AlignmentMismatch);
+                }
+            }
             retained_bytes = retained_bytes
                 .checked_add(size_of::<ProviderNativeLineageBatchSidecar>())
                 .and_then(|bytes| bytes.checked_add(sidecar.semantic_payload.len()))
@@ -701,10 +899,42 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
         let semantic_payload = Bytes::from(payload);
         let semantic_payload_digest = sha256(&semantic_payload);
         self.batch_sidecar = Some(ProviderNativeLineageBatchSidecar {
+            chunks: None,
             semantic_payload,
             semantic_payload_digest,
         });
         self.retained_bytes = retained_bytes;
+        Ok(())
+    }
+
+    /// Serializes complete evidence to disk and binds only its compact descriptor in memory.
+    pub fn try_set_chunked_batch_sidecar<T: Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), ProviderNativeLineageError> {
+        if self
+            .maximum_retained_bytes
+            .saturating_sub(self.retained_bytes)
+            < 2 * PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES
+        {
+            return Err(ProviderNativeLineageError::BatchByteLimitExceeded {
+                max: self.maximum_retained_bytes,
+            });
+        }
+        let chunks = ProviderNativeSidecarChunks::serialize(value)?;
+        self.try_set_sidecar_chunks(chunks)
+    }
+
+    /// Reuses an immutable complete sidecar across bounded canonical ranges.
+    pub fn try_set_sidecar_chunks(
+        &mut self,
+        chunks: ProviderNativeSidecarChunks,
+    ) -> Result<(), ProviderNativeLineageError> {
+        self.try_set_batch_sidecar(chunks.descriptor())?;
+        self.batch_sidecar
+            .as_mut()
+            .ok_or(ProviderNativeLineageError::AlignmentMismatch)?
+            .chunks = Some(chunks);
         Ok(())
     }
 
@@ -1103,4 +1333,54 @@ fn hash_evidence(digest: &mut Sha256, evidence: EvidenceDigest) {
 fn hash_field(digest: &mut Sha256, value: &[u8]) {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value);
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn complete_sidecar_above_inline_limit_rejects_missing_or_corrupt_final_chunk() {
+        // This is complete evidence exceeding the former whole-sidecar admission, not a larger
+        // admission. Serialization and replay retain a single physical chunk at a time.
+        let value = "x".repeat(MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES + 17);
+        let retained = ProviderNativeSidecarChunks::serialize(&value).unwrap();
+        let descriptor = serde_json::to_vec(retained.descriptor()).unwrap();
+        let read_chunks = || {
+            let mut reader = retained.reader().unwrap();
+            let mut chunks = Vec::new();
+            loop {
+                let mut chunk = vec![0; PROVIDER_NATIVE_SIDECAR_CHUNK_BYTES];
+                let count = reader.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                chunk.truncate(count);
+                chunks.push(chunk);
+            }
+            chunks
+        };
+        let restored = ProviderNativeSidecarChunks::restore(
+            &descriptor,
+            read_chunks().into_iter().map(Ok::<_, ()>),
+        )
+        .unwrap();
+        assert_eq!(retained, restored);
+        assert_eq!(
+            serde_json::from_reader::<_, String>(restored.reader().unwrap()).unwrap(),
+            value
+        );
+        let mut missing = read_chunks();
+        missing.pop();
+        assert!(
+            ProviderNativeSidecarChunks::restore(&descriptor, missing.into_iter().map(Ok::<_, ()>))
+                .is_err()
+        );
+        let mut corrupt = read_chunks();
+        corrupt.last_mut().unwrap()[0] ^= 1;
+        assert!(
+            ProviderNativeSidecarChunks::restore(&descriptor, corrupt.into_iter().map(Ok::<_, ()>))
+                .is_err()
+        );
+    }
 }

@@ -460,7 +460,12 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             self.policy.settings_lifecycle.clone(),
             &configuration,
         )
-        .inspect_err(|_| tracing::warn!(component = "configuration", "workspace component restore failed"))
+        .inspect_err(|_| {
+            tracing::warn!(
+                component = "configuration",
+                "workspace component restore failed"
+            )
+        })
         .map_err(|_| ProductBackupError::RestoreComponents)?;
         drop(configuration);
 
@@ -471,7 +476,12 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             &self.paths,
             &provider_metadata,
         )
-        .inspect_err(|_| tracing::warn!(component = "provider_metadata", "workspace component restore failed"))
+        .inspect_err(|_| {
+            tracing::warn!(
+                component = "provider_metadata",
+                "workspace component restore failed"
+            )
+        })
         .map_err(|_| ProductBackupError::RestoreComponents)?;
         drop(provider_metadata);
 
@@ -485,11 +495,12 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
         )
         .map_err(|_| ProductBackupError::RestoreComponents)?;
         let artifacts: Arc<dyn ArtifactRepository> = controlled;
-        let research = Arc::new(crate::ResearchService::from_analytical(
-            &self.paths,
-            Arc::clone(&analytical),
-        ).map_err(|_| ProductBackupError::RestoreComponents)?);
-        let source_data = self.components
+        let research = Arc::new(
+            crate::ResearchService::from_analytical(&self.paths, Arc::clone(&analytical))
+                .map_err(|_| ProductBackupError::RestoreComponents)?,
+        );
+        let source_data = self
+            .components
             .get_mut(&ProductBackupComponentKind::SourceData)
             .ok_or(ProductBackupError::IncompleteComponents)?;
         source_data.verify_and_rewind(cancellation)?;
@@ -503,7 +514,8 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
                 .ok_or(ProductBackupError::InvalidRestoreTarget)?,
             self.policy.maximum_controlled_artifact_bytes,
             cancellation,
-        ).await;
+        )
+        .await;
         research.begin_owned_io_shutdown();
         let shutdown_deadline = std::time::Instant::now()
             .checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
@@ -513,7 +525,12 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
         // owner's Drop joins unavoidable native completion if its bounded drain timed out.
         drop(research);
         shutdown.map_err(|_| ProductBackupError::RestoreWorker)?;
-        source_result.inspect_err(|_| tracing::warn!(component = "source_data", "workspace component restore failed"))?;
+        source_result.inspect_err(|_| {
+            tracing::warn!(
+                component = "source_data",
+                "workspace component restore failed"
+            )
+        })?;
 
         ensure_live(cancellation)?;
         let portfolios =
@@ -533,7 +550,12 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             &portfolios,
             &transactions,
         )
-        .inspect_err(|_| tracing::warn!(component = "portfolios", "workspace component restore failed"))
+        .inspect_err(|_| {
+            tracing::warn!(
+                component = "portfolios",
+                "workspace component restore failed"
+            )
+        })
         .map_err(|_| ProductBackupError::RestoreComponents)?;
         drop((portfolios, transactions));
 
@@ -551,11 +573,16 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
                 self.paths.clone(),
                 Arc::clone(&artifacts),
                 analytical.analytical_reader(),
+                analytical.model_inventory(),
+                analytical.forecast_inventory(),
+                analytical.chart_projections(),
                 self.policy.model_evaluation_records,
                 cancellation,
             )
             .await
-            .inspect_err(|_| tracing::warn!(component = "models", "workspace component restore failed"))
+            .inspect_err(|_| {
+                tracing::warn!(component = "models", "workspace component restore failed")
+            })
             .map_err(|_| ProductBackupError::RestoreComponents)?;
 
         ensure_live(cancellation)?;
@@ -580,7 +607,9 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             cancellation,
         )
         .await
-        .inspect_err(|_| tracing::warn!(component = "jobs", "workspace component restore failed"))?;
+        .inspect_err(|_| {
+            tracing::warn!(component = "jobs", "workspace component restore failed")
+        })?;
 
         ensure_live(cancellation)?;
         let fair_value =
@@ -588,11 +617,16 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
         let attestation = FairValueBackupAttestation::decode(&fair_value)
             .map_err(|_| ProductBackupError::RestoreComponents)?;
         drop(fair_value);
-        let decision_research = Arc::new(crate::ResearchService::from_analytical(
-            &self.paths, Arc::clone(&analytical),
-        ).map_err(|_| ProductBackupError::RestoreComponents)?);
-        let retained_calendar = crate::application::market_calendar::RetainedMarketSessionReadCapability::new(Arc::clone(&decision_research));
-        restored_models.bind_retained_forecast_calendar(retained_calendar.clone())
+        let decision_research = Arc::new(
+            crate::ResearchService::from_analytical(&self.paths, Arc::clone(&analytical))
+                .map_err(|_| ProductBackupError::RestoreComponents)?,
+        );
+        let retained_calendar =
+            crate::application::market_calendar::RetainedMarketSessionReadCapability::new(
+                Arc::clone(&decision_research),
+            );
+        restored_models
+            .bind_retained_forecast_calendar(retained_calendar.clone())
             .map_err(|_| ProductBackupError::RestoreComponents)?;
         let restored_model = restored_models.model_domain();
         let recovery_deadline = std::time::Instant::now()
@@ -652,7 +686,9 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             Ok::<(), ProductBackupError>(())
         }.await;
         decision_research.begin_owned_io_shutdown();
-        let shutdown = decision_research.finish_owned_io_shutdown(recovery_deadline).await;
+        let shutdown = decision_research
+            .finish_owned_io_shutdown(recovery_deadline)
+            .await;
         drop(decision_research);
         shutdown.map_err(|_| ProductBackupError::RestoreWorker)?;
         restore_decisions?;

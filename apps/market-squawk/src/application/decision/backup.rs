@@ -50,22 +50,75 @@ impl DecisionApplication {
     pub(crate) fn source_recipe_artifacts(
         &self,
     ) -> Result<Vec<market_squawk_services::ArtifactReference>, DecisionApplicationError> {
-        let state = self.state.lock().map_err(|_| DecisionApplicationError::Unavailable)?;
-        if state.poisoned || state.source_replay_deferred { return Err(DecisionApplicationError::Unavailable); }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DecisionApplicationError::Unavailable)?;
+        if state.poisoned || state.source_replay_deferred {
+            return Err(DecisionApplicationError::Unavailable);
+        }
         let repository = state.authority.repository();
         let mut references = Vec::new();
         for decision in repository.investment_proposals() {
-            let Some(bundle) = repository.prepared_published_investment_analysis(decision.analysis_id()) else { continue; };
-            let Some(provenance) = bundle.request_provenance() else { continue; };
-            let request: super::investment_request::GenerateRequest = serde_json::from_slice(provenance.canonical_request())
-                .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
-            for source in [request.source_action_reference, request.current_share_action_reference].into_iter().flatten() {
-                if let Some(reference) = source.current_recipe_artifact().map_err(|_| DecisionApplicationError::InvalidPersistentState)? {
-                    match references.binary_search_by(|entry: &market_squawk_services::ArtifactReference| entry.id().cmp(reference.id())) {
-                        Ok(index) if references[index] != reference => return Err(DecisionApplicationError::InvalidPersistentState),
-                        Ok(_) => {},
+            let Some(bundle) =
+                repository.prepared_published_investment_analysis(decision.analysis_id())
+            else {
+                continue;
+            };
+            let Some(provenance) = bundle.request_provenance() else {
+                continue;
+            };
+            let request: super::investment_request::GenerateRequest =
+                serde_json::from_slice(provenance.canonical_request())
+                    .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+            let mut artifacts = Vec::new();
+            if let Some(reference) = request.fundamental_share_sources.as_deref() {
+                artifacts.extend(
+                    crate::application::fair_value::fundamental_share_recipe_artifacts(
+                        reference.as_bytes(),
+                    )
+                    .map_err(|_| DecisionApplicationError::InvalidPersistentState)?,
+                );
+            }
+            for source in [
+                request.source_action_reference,
+                request.current_share_action_reference,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(reference) = source
+                    .current_recipe_artifact()
+                    .map_err(|_| DecisionApplicationError::InvalidPersistentState)?
+                {
+                    artifacts.push(reference);
+                }
+            }
+            if let Some(reference) = decision
+                .evidence()
+                .current_share_projection()
+                .and_then(|proof| proof.valuation_projection().fundamental_source_reference())
+            {
+                artifacts.extend(
+                    crate::application::fair_value::fundamental_share_recipe_artifacts(reference)
+                        .map_err(|_| DecisionApplicationError::InvalidPersistentState)?,
+                );
+            }
+            for reference in artifacts {
+                {
+                    match references.binary_search_by(
+                        |entry: &market_squawk_services::ArtifactReference| {
+                            entry.id().cmp(reference.id())
+                        },
+                    ) {
+                        Ok(index) if references[index] != reference => {
+                            return Err(DecisionApplicationError::InvalidPersistentState);
+                        }
+                        Ok(_) => {}
                         Err(index) => {
-                            references.try_reserve(1).map_err(|_| DecisionApplicationError::Allocation)?;
+                            references
+                                .try_reserve(1)
+                                .map_err(|_| DecisionApplicationError::Allocation)?;
                             references.insert(index, reference);
                         }
                     }
@@ -90,8 +143,10 @@ impl DecisionApplication {
         {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
-        let restored_semantic = DecisionJournal::restore_fresh(&location, limits, bytes, replay, context).await?;
-        let application = Self::open_with_current_share_replay(location, limits, replay, context).await?;
+        let restored_semantic =
+            DecisionJournal::restore_fresh(&location, limits, bytes, replay, context).await?;
+        let application =
+            Self::open_with_current_share_replay(location, limits, replay, context).await?;
         let state = application
             .state
             .lock()
@@ -184,5 +239,7 @@ fn semantic_revision(state: &DecisionState) -> Result<[u8; 32], DecisionApplicat
     let repository = DecisionRepository::try_new(state.limits)?;
     let mut authority = DecisionAuthority::new(repository);
     let mut recovery = RecoveryContext::try_new(state.limits.maximum_screen_runs())?;
-    state.journal.recover_with_retained(&mut authority, &mut recovery, &state.authority)
+    state
+        .journal
+        .recover_with_retained(&mut authority, &mut recovery, &state.authority)
 }

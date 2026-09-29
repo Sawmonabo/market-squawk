@@ -108,8 +108,8 @@ use crate::application::model::runtime::{
     ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
 };
 use crate::application::model::{
-    ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
-    ModelDomainService, ModelDomainServiceError,
+    ForecastApplicationError, ForecastApplicationService, ModelDomainService,
+    ModelDomainServiceError,
 };
 use crate::application::settings::SettingsSeed;
 use crate::application::{
@@ -163,10 +163,6 @@ const MAXIMUM_STAGING_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_ROW_GROUP_ROWS: usize = 65_536;
 const ORPHAN_GRACE: Duration = Duration::from_secs(60);
 const MODEL_EVALUATION_RECORDS: usize = 4_096;
-const FORECAST_VINTAGES: usize = 4_096;
-const FORECAST_OUTCOMES: usize = 65_536;
-const FORECAST_INDEX_BYTES: usize = LocalAuthorityStateStore::maximum_payload_bytes();
-const FORECAST_AUTHORITY_DIRECTORY: &str = "model/forecasts";
 const BATCH_FEATURE_REVISION: &str = "market-squawk-batch-features-v1";
 const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS: usize = 101;
@@ -920,26 +916,31 @@ impl LocalProduct {
         let reference_search: Arc<dyn MarketReferenceSearchAuthority> = nasdaq_reference.clone();
         let source_calendars =
             crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
-                Arc::clone(&research), Arc::clone(&market_runtime),
+                Arc::clone(&research),
+                Arc::clone(&market_runtime),
             );
         let source_action_reads =
             crate::application::SourceAppliedCorporateActionReadCapability::new(
-                Arc::clone(&research), source_calendars.clone(),
-            ).with_artifact_repository(Arc::clone(&artifact_repository));
-        let source_action_preparation =
-            crate::application::SourceActionPreparationCapability::new(
-                Arc::clone(&research), Arc::clone(&market_runtime), Arc::clone(&research_ingest),
+                Arc::clone(&research),
+                source_calendars.clone(),
             )
-            .with_outcome_history_acquisition(Arc::clone(&provider_activation))
-            .with_current_paper_artifacts(Arc::clone(&artifact_repository));
+            .with_artifact_repository(Arc::clone(&artifact_repository));
+        let source_action_preparation = crate::application::SourceActionPreparationCapability::new(
+            Arc::clone(&research),
+            Arc::clone(&market_runtime),
+            Arc::clone(&research_ingest),
+        )
+        .with_outcome_history_acquisition(Arc::clone(&provider_activation))
+        .with_current_paper_artifacts(Arc::clone(&artifact_repository));
         let portfolio = Arc::new(PortfolioApplicationService::try_new(
             &paths,
             PortfolioApplicationLimits::standard(),
         )?);
         let product_policy = market_squawk_decisions::RecommendationPolicy::v1()
             .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
-        let product_mark_age_nanos = u64::try_from(product_policy.parameters().market_max_age_nanos)
-            .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
+        let product_mark_age_nanos =
+            u64::try_from(product_policy.parameters().market_max_age_nanos)
+                .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
         let product_markets =
             crate::application::market_selection::MarketInvestmentReadCapability::try_new(
                 Arc::clone(&research),
@@ -1091,19 +1092,22 @@ impl LocalProduct {
             experiment_limits()?,
             strategies,
         )?);
-        let backtest_inputs = Arc::new(ProductionGovernedBacktestInputAuthority::try_new(
-            &paths,
-            Arc::clone(&research),
-            GovernedBacktestInputAuthorityLimits::standard(),
-        )?.with_source_action_reader(
-            crate::application::SourceAppliedCorporateActionReadCapability::new(
+        let backtest_inputs = Arc::new(
+            ProductionGovernedBacktestInputAuthority::try_new(
+                &paths,
                 Arc::clone(&research),
-                crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
+                GovernedBacktestInputAuthorityLimits::standard(),
+            )?
+            .with_source_action_reader(
+                crate::application::SourceAppliedCorporateActionReadCapability::new(
                     Arc::clone(&research),
-                    Arc::clone(&market_runtime),
+                    crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
+                        Arc::clone(&research),
+                        Arc::clone(&market_runtime),
+                    ),
                 ),
             ),
-        ));
+        );
         let resolver: Arc<dyn GovernedBacktestInputResolver> = backtest_inputs.clone();
         let backtest_repository = Arc::new(ProductionGovernedBacktestRepository::try_new(
             &paths,
@@ -1127,19 +1131,10 @@ impl LocalProduct {
         );
 
         let model_limits = ProductionModelRuntimeLimits::standard()?;
-        let forecast_limits = ForecastApplicationLimits::try_new(
-            NonZeroUsize::new(FORECAST_VINTAGES).ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
-            NonZeroUsize::new(FORECAST_OUTCOMES).ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
-            NonZeroUsize::new(FORECAST_INDEX_BYTES)
-                .ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
-        )?;
         let forecasts = Arc::new(ForecastApplicationService::try_open(
-            paths
-                .control_root()?
-                .root()
-                .join(FORECAST_AUTHORITY_DIRECTORY),
+            research.analytical().forecast_inventory(),
+            research.analytical().chart_projections(),
             Arc::clone(&artifact_repository),
-            forecast_limits,
         )?);
         let (model_runtime, model) = open_model_domain(
             &paths,
@@ -1148,6 +1143,7 @@ impl LocalProduct {
             Arc::clone(&forecasts),
             research.analytical_reader(),
             source_calendars.clone(),
+            research.analytical().model_inventory(),
             source_action_reads.clone(),
             source_action_preparation.clone(),
         )?;
@@ -1205,13 +1201,18 @@ impl LocalProduct {
             ).ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
         };
         let decision_recovery_context =
-            crate::application::decision::current_share::recovery_request_context(&recovery_context)?;
-        let decisions = Arc::new(DecisionApplication::open_with_current_share_replay(
-            paths.control_root()?.decision_database_location(),
-            decision_repository_limits()?,
-            &decision_replay,
-            &decision_recovery_context,
-        ).await?);
+            crate::application::decision::current_share::recovery_request_context(
+                &recovery_context,
+            )?;
+        let decisions = Arc::new(
+            DecisionApplication::open_with_current_share_replay(
+                paths.control_root()?.decision_database_location(),
+                decision_repository_limits()?,
+                &decision_replay,
+                &decision_recovery_context,
+            )
+            .await?,
+        );
         let paper = PaperApplicationServices::new(
             config.clone(),
             Arc::clone(&decisions),
@@ -1564,7 +1565,9 @@ impl LocalProduct {
         Arc::clone(&self.analysis_domain)
     }
 
-    pub(crate) fn source_action_preparation(&self) -> crate::application::SourceActionPreparationCapability {
+    pub(crate) fn source_action_preparation(
+        &self,
+    ) -> crate::application::SourceActionPreparationCapability {
         self.source_action_preparation.clone()
     }
 
@@ -1876,13 +1879,14 @@ fn open_model_domain(
     forecasts: Arc<ForecastApplicationService>,
     analytical: market_squawk_data::AnalyticalReadCapability,
     calendar: crate::application::market_calendar::CompletedMarketSessionReadCapability,
+    inventory: market_squawk_data::ModelInventoryCatalogCapability,
     source_actions: crate::application::SourceAppliedCorporateActionReadCapability,
     outcome_preparation: crate::application::SourceActionPreparationCapability,
 ) -> Result<(Option<Arc<ProductionModelRuntime>>, Arc<ModelDomainService>), LocalProductError> {
-    let durable = ProductionModelRuntime::has_durable_admissions(paths, limits)?;
+    let durable = ProductionModelRuntime::has_durable_admissions(inventory.clone())?;
     let (runtime, snapshot) = match config.training_release_root() {
         None if durable => return Err(LocalProductError::TrainingReleaseRequired),
-        None => (None, ProductionModelRuntime::empty_snapshot(limits)?),
+        None => (None, ProductionModelRuntime::empty_snapshot()?),
         Some(root) => {
             #[cfg(debug_assertions)]
             let (application, onnx_worker_path) = development_training_release_programs(root)?;
@@ -1899,6 +1903,7 @@ fn open_model_domain(
             let onnx_worker = Some(admit_installed_onnx_worker(training.onnx_worker_sha256())?);
             let runtime = Arc::new(ProductionModelRuntime::try_open(
                 paths,
+                inventory,
                 training,
                 onnx_worker,
                 limits,
@@ -1906,7 +1911,7 @@ fn open_model_domain(
             let snapshot = match runtime.snapshot() {
                 Ok(snapshot) => snapshot,
                 Err(ProductionModelRuntimeError::EmptyRuntime) => {
-                    ProductionModelRuntime::empty_snapshot(limits)?
+                    ProductionModelRuntime::empty_snapshot()?
                 }
                 Err(error) => return Err(error.into()),
             };

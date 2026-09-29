@@ -49,12 +49,12 @@ export function MacroContext({ bootstrap, transport }: MacroContextProps) {
       requestVersion,
     }),
     enabled: operationAvailable,
-    queryFn: async () =>
+    queryFn: async ({ signal }) =>
       parseMacroContext(
         await transport.query({
           query: "macroContext",
           ...(cutoffs ?? {}),
-        }),
+        }, { signal }),
         cutoffs ?? undefined,
       ),
   })

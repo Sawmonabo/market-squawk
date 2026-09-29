@@ -381,47 +381,86 @@ fn cumulative_corporate_action_plan_replaces_prior_snapshot_without_replaying_st
     };
     let first_plan = plan(ex_close)?;
     let mut ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
-    let first = ledger.try_apply(
-        vec![
-            entry(
-                "capital",
-                1,
+    let first_entries = vec![
+        entry(
+            "capital",
+            1,
+            None,
+            ex_open - 3,
+            1,
+            LedgerEntryKind::CashFlow(CashFlow::try_new(
+                CashFlowKind::Deposit,
+                money(100, usd),
                 None,
-                ex_open - 3,
-                1,
-                LedgerEntryKind::CashFlow(CashFlow::try_new(
-                    CashFlowKind::Deposit,
-                    money(100, usd),
-                    None,
-                )?),
-            )?,
-            trade(
-                "long-before-ex",
-                ex_open - 2,
-                subject,
-                TradeSide::Buy,
-                3_i64,
-            )?,
-            trade(
-                "short-before-ex",
-                ex_open - 1,
-                short,
-                TradeSide::SellShort,
-                1_i64,
-            )?,
-            trade("buy-at-ex", ex_open, subject, TradeSide::Buy, 1_i64)?,
-            trade(
-                "sell-after-ex",
-                ex_open + 1,
-                subject,
-                TradeSide::Sell,
-                1_i64,
-            )?,
-        ],
+            )?),
+        )?,
+        trade(
+            "long-before-ex",
+            ex_open - 2,
+            subject,
+            TradeSide::Buy,
+            3_i64,
+        )?,
+        trade(
+            "short-before-ex",
+            ex_open - 1,
+            short,
+            TradeSide::SellShort,
+            1_i64,
+        )?,
+        trade("buy-at-ex", ex_open, subject, TradeSide::Buy, 1_i64)?,
+        trade(
+            "sell-after-ex",
+            ex_open + 1,
+            subject,
+            TradeSide::Sell,
+            1_i64,
+        )?,
+    ];
+    let first = ledger.try_apply(
+        first_entries.clone(),
         Some(&first_plan),
         valuation(40, ex_close, &[(1, 10), (2, 10)])?,
         evidence(40, ex_close, &first_plan)?,
     )?;
+    // Replay the same unsorted source through a real operation-owned SQLite snapshot. This
+    // covers action-before-entry ties, long/short entitlements, settlement, and indexed restore.
+    let directory = tempfile::tempdir()?;
+    let paths =
+        market_squawk_platform::LocalPaths::prepare(directory.path().join("streamed-ledger"))?;
+    let catalog_config = market_squawk_data::CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        std::time::Duration::from_millis(250),
+        market_squawk_data::CatalogLimit::new(16)?,
+        market_squawk_data::CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let service = market_squawk_data::AnalyticalDataService::initialize(
+        market_squawk_data::CatalogAuthority::open(catalog_config)?,
+        market_squawk_data::AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+        paths.artifacts()?.clone(),
+        market_squawk_data::ObjectStoreConfig::try_new(
+            8 * 1024 * 1024,
+            1024,
+            std::time::Duration::from_secs(60),
+        )?,
+    )?;
+    let scratch = std::sync::Arc::new(service.object_store().operation_scratch()?);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let mut streamed = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    let indexed_first = streamed.try_apply_stream(
+        first_entries.into_iter().rev().map(Ok),
+        Some(&first_plan),
+        valuation(40, ex_close, &[(1, 10), (2, 10)])?,
+        evidence(40, ex_close, &first_plan)?,
+        scratch.clone(),
+        8 * 1024 * 1024,
+        &cancellation,
+    )?;
+    assert_eq!(indexed_first.token(), first.token());
+    assert_eq!(indexed_first.positions(), first.positions());
+    assert_eq!(indexed_first.cash_entitlements(), first.cash_entitlements());
+    assert_eq!(indexed_first.cash(), first.cash());
+    let mut indexed_restored = indexed_first.clone().into_ledger()?;
     assert_eq!(first.cash(), money(80, usd));
     assert_eq!(first.receivable_value(), money(4, usd));
     assert_eq!(
@@ -459,6 +498,18 @@ fn cumulative_corporate_action_plan_replaces_prior_snapshot_without_replaying_st
         valuation(41, before_payable, &[(1, 3), (2, 10)])?,
         evidence(41, before_payable, &cumulative_plan)?,
     )?;
+    let indexed_cumulative = indexed_restored.try_apply(
+        Vec::new(),
+        Some(&cumulative_plan),
+        valuation(41, before_payable, &[(1, 3), (2, 10)])?,
+        evidence(41, before_payable, &cumulative_plan)?,
+    )?;
+    assert_eq!(indexed_cumulative.token(), cumulative.token());
+    assert_eq!(indexed_cumulative.positions(), cumulative.positions());
+    assert_eq!(
+        indexed_cumulative.cash_entitlements(),
+        cumulative.cash_entitlements()
+    );
     assert_eq!(replayed.token(), cumulative.token());
     assert_eq!(replayed.cash_entitlements(), cumulative.cash_entitlements());
     assert_eq!(
@@ -496,6 +547,80 @@ fn cumulative_corporate_action_plan_replaces_prior_snapshot_without_replaying_st
         valuation(42, payable_close, &[(1, 3), (2, 10)])?,
         evidence(42, payable_close, &settled_plan)?,
     )?;
+    let mut indexed_reopened = indexed_cumulative.into_ledger()?;
+    let indexed_settled = indexed_reopened.try_apply(
+        Vec::new(),
+        Some(&settled_plan),
+        valuation(42, payable_close, &[(1, 3), (2, 10)])?,
+        evidence(42, payable_close, &settled_plan)?,
+    )?;
+    assert_eq!(indexed_settled.token(), settled.token());
+    assert_eq!(indexed_settled.cash(), settled.cash());
+    assert_eq!(
+        indexed_settled.cash_entitlements(),
+        settled.cash_entitlements()
+    );
+    let correction = entry(
+        "capital",
+        2,
+        Some(1),
+        ex_open - 3,
+        1,
+        LedgerEntryKind::CashFlow(CashFlow::try_new(
+            CashFlowKind::Deposit,
+            money(101, usd),
+            None,
+        )?),
+    )?;
+    let corrected = ledger.try_apply(
+        vec![correction.clone()],
+        None,
+        valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+        evidence(43, payable_close + 1, &settled_plan)?,
+    )?;
+    let indexed_corrected = indexed_reopened.try_apply(
+        vec![correction.clone()],
+        None,
+        valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+        evidence(43, payable_close + 1, &settled_plan)?,
+    )?;
+    assert_eq!(indexed_corrected.token(), corrected.token());
+    assert_eq!(indexed_corrected.cash(), corrected.cash());
+    assert_eq!(indexed_corrected.positions(), corrected.positions());
+    assert!(matches!(
+        indexed_reopened.try_apply(
+            vec![correction],
+            None,
+            valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+            evidence(43, payable_close + 1, &settled_plan)?
+        ),
+        Err(PortfolioError::DuplicateTransactionRevision)
+    ));
+    let before_failure = indexed_reopened
+        .history()
+        .last()
+        .ok_or("indexed head")?
+        .token();
+    assert!(matches!(
+        indexed_reopened.try_apply_stream(
+            std::iter::once(Err(PortfolioError::Storage)),
+            None,
+            valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+            evidence(43, payable_close + 1, &settled_plan)?,
+            scratch.clone(),
+            8 * 1024 * 1024,
+            &cancellation
+        ),
+        Err(PortfolioError::Storage)
+    ));
+    assert_eq!(
+        indexed_reopened
+            .history()
+            .last()
+            .ok_or("unchanged indexed head")?
+            .token(),
+        before_failure
+    );
     assert_eq!(recovered.token(), settled.token());
     assert_eq!(recovered.cash_entitlements(), settled.cash_entitlements());
     assert_eq!(settled.cash(), money(84, usd));

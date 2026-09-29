@@ -5,8 +5,9 @@
 //! is claimed. Alpaca `asof` controls symbol mapping, not adjustment knowledge time.
 
 use super::*;
+use crate::application::research::market_history::NativeSessionHistory;
 use market_squawk_data::{
-    CompleteMarketBarHistoryOutput, CompleteMarketBarHistoryRequest, Sha256Digest,
+    CompleteMarketBarHistoryCursor, CompleteMarketBarHistoryRequest, Sha256Digest,
 };
 use market_squawk_domain::{
     BarTimestampBasis, MarketBarAdjustment, MarketBarObservation, MarketBarSessionKind,
@@ -14,8 +15,8 @@ use market_squawk_domain::{
 };
 
 pub(super) struct AlpacaOriginAdjustmentAnchor {
-    pub(super) raw: CompleteMarketBarHistoryOutput,
-    pub(super) split: CompleteMarketBarHistoryOutput,
+    pub(super) raw: CompleteMarketBarHistoryCursor,
+    pub(super) split: CompleteMarketBarHistoryCursor,
     pub(super) raw_page_received_at: Box<[Timestamp]>,
     pub(super) split_page_received_at: Box<[Timestamp]>,
 }
@@ -48,7 +49,9 @@ pub(super) struct AlpacaHistoryReference {
     read: EvidenceDigest,
 }
 impl AlpacaHistoryReference {
-    pub(super) const fn instrument_id(&self) -> InstrumentId { self.instrument }
+    pub(super) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument
+    }
 }
 impl AlpacaOriginAdjustmentAnchorReference {
     pub(super) fn bounded_page_clocks(&self) -> bool {
@@ -62,8 +65,8 @@ impl AlpacaOriginAdjustmentAnchorReference {
 }
 impl AlpacaOriginAdjustmentAnchor {
     fn try_from_reads(
-        raw: CompleteMarketBarHistoryOutput,
-        split: CompleteMarketBarHistoryOutput,
+        raw: CompleteMarketBarHistoryCursor,
+        split: CompleteMarketBarHistoryCursor,
         cutoff: Timestamp,
         raw_page_received_at: Box<[Timestamp]>,
         split_page_received_at: Box<[Timestamp]>,
@@ -76,10 +79,10 @@ impl AlpacaOriginAdjustmentAnchor {
         let split_native = split
             .native_sessions()
             .ok_or(ApplicableActionPlanError::InvalidEvidence)?;
-        if raw_native.sessions() != split_native.sessions()
-            || raw.bars().is_empty()
-            || raw.bars().len() > 64
-            || raw.bars().len() != split.bars().len()
+        if !raw_native.sessions().same_rows(split_native.sessions()).map_err(|_| ApplicableActionPlanError::InvalidEvidence)?
+            || raw.bar_count() == 0
+            || raw.bar_count() > 64
+            || raw.bar_count() != split.bar_count()
             || raw.read_receipt().knowledge_cutoff() != cutoff
             || split.read_receipt().knowledge_cutoff() != cutoff
             || raw.selection().pinned().manifest() != a.origin_manifest()
@@ -111,13 +114,15 @@ impl AlpacaOriginAdjustmentAnchor {
             || a.session_ruleset() != b.session_ruleset()
             || a.published_at() > cutoff
             || b.published_at() > cutoff
-            || raw
-                .bars()
-                .iter()
-                .zip(split.bars())
-                .any(|(raw, split)| !same_coordinate(raw, split))
         {
             return Err(ApplicableActionPlanError::InvalidEvidence);
+        }
+        for (raw, split) in raw.bars().zip(split.bars()) {
+            let raw = raw.map_err(|_| ApplicableActionPlanError::InvalidEvidence)?;
+            let split = split.map_err(|_| ApplicableActionPlanError::InvalidEvidence)?;
+            if !same_coordinate(&raw, &split) {
+                return Err(ApplicableActionPlanError::InvalidEvidence);
+            }
         }
         Ok(Self {
             raw,
@@ -141,11 +146,11 @@ impl SourceAppliedCorporateActionReadCapability {
     /// Joins two actual source publications. Acquisition must use the existing plan directory,
     /// Raw/Split request selection, raw sealing and canonical publisher. This method performs no
     /// provider request and cannot turn caller bars or hashes into an anchor.
-    pub(crate) async fn with_fresh_alpaca_split_anchor(
+    pub(crate) async fn with_fresh_alpaca_split_anchor<H: NativeSessionHistory>(
         &self,
         plan: SourceAppliedCorporateActionPlan,
-        raw: CompleteMarketBarHistoryOutput,
-        split: CompleteMarketBarHistoryOutput,
+        raw: H,
+        split: H,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<SourceAppliedCorporateActionPlan, ApplicableActionPlanError> {
@@ -160,11 +165,11 @@ impl SourceAppliedCorporateActionReadCapability {
         .await
     }
 
-    pub(crate) async fn with_fresh_alpaca_split_anchor_with_job_context(
+    pub(crate) async fn with_fresh_alpaca_split_anchor_with_job_context<H: NativeSessionHistory>(
         &self,
         mut plan: SourceAppliedCorporateActionPlan,
-        raw: CompleteMarketBarHistoryOutput,
-        split: CompleteMarketBarHistoryOutput,
+        raw: H,
+        split: H,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
@@ -179,6 +184,12 @@ impl SourceAppliedCorporateActionReadCapability {
         let split_pages = self
             .anchor_page_clocks(&split, deadline, cancellation, job)
             .await?;
+        let raw = raw
+            .into_native_cursor(self.research.analytical(), deadline, cancellation.clone())
+            .map_err(|_| ApplicableActionPlanError::InvalidEvidence)?;
+        let split = split
+            .into_native_cursor(self.research.analytical(), deadline, cancellation.clone())
+            .map_err(|_| ApplicableActionPlanError::InvalidEvidence)?;
         let anchor = AlpacaOriginAdjustmentAnchor::try_from_reads(
             raw,
             split,
@@ -199,9 +210,9 @@ impl SourceAppliedCorporateActionReadCapability {
 
     /// Uses the existing controlled generation worker to reopen every physical source page.
     /// Empty response pages remain part of the source snapshot and its freshness constraint.
-    async fn anchor_page_clocks(
+    async fn anchor_page_clocks<H: NativeSessionHistory>(
         &self,
-        history: &CompleteMarketBarHistoryOutput,
+        history: &H,
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
@@ -268,8 +279,8 @@ impl SourceAppliedCorporateActionReadCapability {
         job: Option<&market_squawk_jobs::JobRunContext>,
     ) -> Result<
         (
-            CompleteMarketBarHistoryOutput,
-            CompleteMarketBarHistoryOutput,
+            CompleteMarketBarHistoryCursor,
+            CompleteMarketBarHistoryCursor,
         ),
         ApplicableActionPlanError,
     > {
@@ -288,7 +299,7 @@ impl SourceAppliedCorporateActionReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
         job: Option<&market_squawk_jobs::JobRunContext>,
-    ) -> Result<CompleteMarketBarHistoryOutput, ApplicableActionPlanError> {
+    ) -> Result<CompleteMarketBarHistoryCursor, ApplicableActionPlanError> {
         check(deadline, cancellation)?;
         if reference.version != 1
             || reference.cutoff != cutoff
@@ -338,7 +349,7 @@ impl SourceAppliedCorporateActionReadCapability {
         let read = self
             .research
             .analytical_reader()
-            .read_complete_market_bar_history(request, deadline, cancellation.clone())
+            .read_complete_market_bar_history_cursor(request, deadline, cancellation.clone())
             .await
             .map_err(|_| ApplicableActionPlanError::InvalidEvidence)?
             .ok_or(ApplicableActionPlanError::InvalidEvidence)?;
@@ -358,8 +369,8 @@ impl SourceAppliedCorporateActionReadCapability {
         Ok(read)
     }
 }
-pub(super) fn timestamped_history_reference(
-    read: &CompleteMarketBarHistoryOutput,
+pub(super) fn timestamped_history_reference<H: NativeSessionHistory>(
+    read: &H,
 ) -> Result<AlpacaHistoryReference, ApplicableActionPlanError> {
     let receipt = read.selection().receipt();
     let digest = |bytes| EvidenceDigest::new(market_squawk_domain::DigestAlgorithm::Sha256, bytes);
@@ -391,8 +402,10 @@ pub(super) fn timestamped_history_reference(
 /// Evidence digests inside independently fetched calendar receipts may differ. Exact native
 /// period boundaries and the same source ruleset/venue remain mandatory; no date is reconstructed.
 pub(super) fn same_coordinate(a: &MarketBarObservation, b: &MarketBarObservation) -> bool {
-    let (Some(a_time), Some(b_time)) = (a.time_semantics().timestamped_period(), b.time_semantics().timestamped_period())
-    else {
+    let (Some(a_time), Some(b_time)) = (
+        a.time_semantics().timestamped_period(),
+        b.time_semantics().timestamped_period(),
+    ) else {
         return false;
     };
     a.context().provenance().instrument_id() == b.context().provenance().instrument_id()

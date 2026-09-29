@@ -1412,9 +1412,10 @@ fn append_company_rows(
         let observation = selection
             .decoded_rows()
             .get(ordinal)
+            .map_err(map_company_data_error)?
             .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
-        let context =
-            observation_context(observation).ok_or(CanonicalResearchReadError::EvidenceConflict)?;
+        let context = observation_context(&observation)
+            .ok_or(CanonicalResearchReadError::EvidenceConflict)?;
         if context.provenance().instrument_id() != Some(request.instrument_id) {
             return Err(CanonicalResearchReadError::EvidenceConflict);
         }
@@ -1767,7 +1768,9 @@ fn map_company_data_error(error: SecResearchReadError) -> CanonicalResearchReadE
         SecResearchReadError::AuthorityUnavailable => {
             CanonicalResearchReadError::AuthorityUnavailable
         }
-        SecResearchReadError::ObjectBudgetExceeded => CanonicalResearchReadError::ResourceExhausted,
+        SecResearchReadError::ObjectBudgetExceeded | SecResearchReadError::SpillBudgetExceeded => {
+            CanonicalResearchReadError::ResourceExhausted
+        }
         SecResearchReadError::RestartMismatch => CanonicalResearchReadError::RestartConflict,
         _ => CanonicalResearchReadError::EvidenceConflict,
     }

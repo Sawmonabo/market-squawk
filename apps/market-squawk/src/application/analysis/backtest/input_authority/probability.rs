@@ -12,7 +12,7 @@ use market_squawk_backtesting::{
     RecommendationBacktestLimits, RecommendationBacktestLimitsInput, ResearchExecutionAssumptions,
 };
 use market_squawk_data::{
-    AnalyticalFeatureDataset, CompleteMarketBarHistoryOutput, CorporateActionAdjustment,
+    AnalyticalFeatureDataset, CompleteMarketBarHistoryCursor, CorporateActionAdjustment,
     CorporateActionLimits, CorporateActionPlan, DatasetBuildPurpose, FeatureDatasetProductContract,
     ProbabilityCostPolicyV1, ProbabilityExecutionBasisV1, ProbabilityLiquidityPriorityV1,
     ProbabilityRoundTripConventionV1,
@@ -35,8 +35,11 @@ impl ProductionGovernedBacktestInputAuthority {
             fee_basis_points: assumptions.fee_basis_points().get(),
             slippage_basis_points: assumptions.slippage_basis_points().get(),
             maximum_random_slippage_basis_points: assumptions
-                .maximum_random_slippage_basis_points().get(),
-            maximum_participation_basis_points: assumptions.maximum_participation_basis_points().get(),
+                .maximum_random_slippage_basis_points()
+                .get(),
+            maximum_participation_basis_points: assumptions
+                .maximum_participation_basis_points()
+                .get(),
             latency_nanos: assumptions.latency_nanos(),
             allow_partial_fills: assumptions.allow_partial_fills(),
             fee_decimal_scale: assumptions.fee_decimal_scale(),
@@ -59,7 +62,7 @@ impl ProductionGovernedBacktestInputAuthority {
     pub(crate) async fn prepare_probability_evaluation(
         &self,
         dataset: AnalyticalFeatureDataset,
-        history: &CompleteMarketBarHistoryOutput,
+        history: &CompleteMarketBarHistoryCursor,
         corporate_actions: CorporateActionPlan,
         source_action_reference: SourceAppliedCorporateActionPlanReference,
         policy: ProbabilityCostPolicyV1,
@@ -82,6 +85,7 @@ impl ProductionGovernedBacktestInputAuthority {
         let starts_at = sessions
             .sessions()
             .first()
+            .map_err(|_| ServiceError::Unavailable)?
             .ok_or(ServiceError::Unavailable)?
             .closes_at_exclusive();
         let ends_at = source_action_reference.valuation_cutoff();
@@ -98,7 +102,12 @@ impl ProductionGovernedBacktestInputAuthority {
             || !corporate_actions.conflicts().is_empty()
             || !corporate_actions.exclusions().is_empty()
             || !history.selection().receipt().realized_outcome_eligible()
-            || history.bars().iter().any(|bar| bar.currency() != currency)
+            || history
+                .bars()
+                .try_fold(false, |mismatch, bar| {
+                    bar.map(|bar| mismatch || bar.currency() != currency)
+                })
+                .map_err(|_| ServiceError::Unavailable)?
         {
             return Err(ServiceError::InvalidRequest);
         }

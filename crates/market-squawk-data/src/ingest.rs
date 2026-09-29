@@ -1,12 +1,15 @@
 //! Rights-bound analytical ingestion, immutable generation commit, and compaction.
 
 mod provider_logical_original;
+pub(crate) use provider_logical_original::LogicalOriginalSourceRevisionKind;
+pub(crate) mod provider_logical_stream;
+pub use provider_logical_stream::ProviderLogicalStreamStaging;
 mod board_full_history;
 pub use board_full_history::{
-    BoardFullHistoryAnnualRead, BoardFullHistoryMacroRead, BoardFullHistoryArrowPartition, BoardFullHistoryAssignedPartition,
-    BoardFullHistoryNativePartition, BoardFullHistoryPublication, BoardFullHistoryPublicationInput,
-    BoardFullHistoryPublicationReference, BoardFullHistoryReservedPublication,
-    BoardFullHistoryStagingLease,
+    BoardFullHistoryAnnualRead, BoardFullHistoryArrowPartition, BoardFullHistoryAssignedPartition,
+    BoardFullHistoryMacroRead, BoardFullHistoryNativePartition, BoardFullHistoryPublication,
+    BoardFullHistoryPublicationInput, BoardFullHistoryPublicationReference,
+    BoardFullHistoryReservedPublication, BoardFullHistoryStagingLease,
 };
 mod provider_capture_metadata;
 pub use provider_capture_metadata::ProviderMacroMetadataCapture;
@@ -68,8 +71,8 @@ use crate::catalog::{
     PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET,
 };
 use crate::manifest::{FundNavPublicationCandidate, MarketBarHistoryPublicationCandidate};
+use crate::parquet_store::ArtifactRootIdentity;
 use crate::parquet_store::MAX_SCAN_OBJECTS;
-use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
 use crate::query::QueryArtifactMemoryLease;
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
@@ -412,9 +415,16 @@ impl ProviderMacroPlanChunkInput {
     }
 
     /// Retains one physically verified original metadata capture without changing canonical rows.
-    pub fn with_metadata_capture(mut self, metadata: ProviderMacroMetadataCapture) -> Result<Self, IngestError> {
-        if self.metadata_capture.is_some() { return Err(IngestError::InvalidProviderMacroPlan); }
-        metadata.evidence.validate_data(self.sealed_capture.capture_evidence())?;
+    pub fn with_metadata_capture(
+        mut self,
+        metadata: ProviderMacroMetadataCapture,
+    ) -> Result<Self, IngestError> {
+        if self.metadata_capture.is_some() {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        metadata
+            .evidence
+            .validate_data(self.sealed_capture.capture_evidence())?;
         self.metadata_capture = Some(metadata);
         Ok(self)
     }
@@ -516,9 +526,12 @@ impl ProviderMacroPlanPublicationInput {
                 .ok_or(IngestError::InvalidProviderMacroPlan)?;
             if let Some(metadata) = &chunk.metadata_capture {
                 metadata.evidence.validate_data(capture)?;
-                total_semantics_bytes = total_semantics_bytes.checked_add(
-                    u64::try_from(metadata.evidence.retained_bytes()?).map_err(|_| IngestError::InvalidProviderMacroPlan)?
-                ).ok_or(IngestError::InvalidProviderMacroPlan)?;
+                total_semantics_bytes = total_semantics_bytes
+                    .checked_add(
+                        u64::try_from(metadata.evidence.retained_bytes()?)
+                            .map_err(|_| IngestError::InvalidProviderMacroPlan)?,
+                    )
+                    .ok_or(IngestError::InvalidProviderMacroPlan)?;
             }
         }
         if total_rows == 0
@@ -1811,13 +1824,19 @@ impl GenerationOwnedProviderCaptureInputEvidence {
     }
 
     /// Returns the original metadata raw claim, physically verified before this input is returned.
-    pub fn metadata_physical_claim(&self) -> Option<&market_squawk_platform::SealedResearchJournalSegmentClaim> {
-        self.metadata.as_ref().map(|metadata| metadata.physical.claim())
+    pub fn metadata_physical_claim(
+        &self,
+    ) -> Option<&market_squawk_platform::SealedResearchJournalSegmentClaim> {
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.physical.claim())
     }
 
     /// Returns the original metadata logical-to-physical seal identity.
     pub fn metadata_sealed_receipt_digest(&self) -> Option<EvidenceDigest> {
-        self.metadata.as_ref().map(|metadata| metadata.physical.sealed_capture_receipt_digest())
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.physical.sealed_capture_receipt_digest())
     }
 
     /// Returns the physically verified direct provider binding.
@@ -2174,16 +2193,15 @@ impl fmt::Debug for QueryArtifactPublication {
     }
 }
 
+pub(crate) struct QueryArtifactStaging {
+    pub(crate) writer: crate::parquet_store::StreamingParquetWriter,
+    lease: crate::publication_coordinator::PublicationLease,
+    _operation: crate::analytical_backup::AnalyticalOperationLease,
+}
+
 impl QueryArtifactPublication {
     pub(crate) fn root_identity(&self) -> &ArtifactRootIdentity {
         &self.root_identity
-    }
-
-    pub(crate) fn writer_admission(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<QueryArtifactWriterAdmission, ParquetStoreError> {
-        self.objects.query_artifact_writer_admission(batch)
     }
 
     /// Reads one exact query object only while its durable ownership receipt remains live.
@@ -2200,7 +2218,8 @@ impl QueryArtifactPublication {
         cancellation: &CancellationToken,
     ) -> Result<Vec<u8>, QueryError> {
         let now = system_timestamp().map_err(|_| QueryError::ArtifactAuthorityRequired)?;
-        if ownership.artifact_id() != artifact.artifact_id()
+        if ownership.catalog_id() != self.catalog_id
+            || ownership.artifact_id() != artifact.artifact_id()
             || ownership.expires_at() <= now
             || artifact.relative_reference() != object.relative_reference()
             || artifact.content_digest().algorithm() != DigestAlgorithm::Sha256
@@ -2218,6 +2237,47 @@ impl QueryArtifactPublication {
         self.objects
             .read_published_bytes_async(object, maximum_bytes, deadline, cancellation)
             .await
+            .map_err(map_query_store_error)
+    }
+
+    /// Reads a sealed query artifact incrementally while its exact durable ownership is live.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent immutable authority and page bounds"
+    )]
+    pub fn verified_batch_cursor(
+        &self,
+        object: &PublishedObject,
+        artifact: &ArtifactRecord,
+        ownership: &crate::QueryArtifactResult,
+        batch_rows: usize,
+        max_batch_bytes: usize,
+        deadline: tokio::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::parquet_store::PinnedBatchCursor, QueryError> {
+        let now = system_timestamp().map_err(|_| QueryError::ArtifactAuthorityRequired)?;
+        if ownership.catalog_id() != self.catalog_id
+            || ownership.artifact_id() != artifact.artifact_id()
+            || ownership.expires_at() <= now
+            || artifact.relative_reference() != object.relative_reference()
+            || artifact.content_digest().algorithm() != DigestAlgorithm::Sha256
+            || artifact.content_digest().bytes() != object.content_hash().bytes()
+            || artifact.size_bytes() != object.size_bytes()
+            || artifact.created_at() < object.created_at()
+        {
+            return Err(QueryError::Artifact(
+                ParquetStoreError::ObjectMetadataMismatch,
+            ));
+        }
+        self.objects
+            .published_batch_cursor(
+                object,
+                batch_rows,
+                max_batch_bytes,
+                ownership.expires_at(),
+                deadline,
+                cancellation,
+            )
             .map_err(map_query_store_error)
     }
 
@@ -2301,30 +2361,21 @@ impl QueryArtifactPublication {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "publication ownership, admission, deadline, and durability capabilities stay explicit"
-    )]
-    pub(crate) async fn publish_and_bind(
+    pub(crate) async fn begin_streaming(
         &self,
-        batch: RecordBatch,
+        schema: arrow::datatypes::SchemaRef,
         cancellation: &CancellationToken,
         reservation: &QueryArtifactReservation,
-        writer_admission: QueryArtifactWriterAdmission,
         memory_lease: QueryArtifactMemoryLease,
-        supervisor: &BlockingIoSupervisor,
-        deadline: tokio::time::Instant,
-        #[cfg(test)] bind_precommit_deadline: Option<tokio::time::Instant>,
-        durable_bound: &AtomicBool,
-    ) -> Result<(PublishedObject, ArtifactRecord, crate::QueryArtifactResult), crate::QueryError>
-    {
-        let _operation = self
+        memory_limit: u64,
+    ) -> Result<QueryArtifactStaging, QueryError> {
+        let operation = self
             .operation_gate
             .acquire(cancellation)
             .await
-            .ok_or(crate::QueryError::Cancelled)?;
+            .ok_or(QueryError::Cancelled)?;
         if reservation.catalog_id() != self.catalog_id {
-            return Err(crate::QueryError::Catalog(
+            return Err(QueryError::Catalog(
                 CatalogError::InvalidReservationCapability,
             ));
         }
@@ -2333,29 +2384,86 @@ impl QueryArtifactPublication {
             .begin_publication(cancellation)
             .await
             .map_err(map_query_store_error)?;
-        let object = self
+        let writer = self
             .objects
-            .publish_query_artifact_under_lease(
-                batch,
+            .begin_streaming_writer(
+                schema,
                 cancellation,
                 &lease,
-                writer_admission,
-                memory_lease,
-                supervisor,
+                Some(memory_lease),
+                memory_limit,
+                reservation.max_bytes(),
                 #[cfg(test)]
                 self.take_test_writer_barrier(),
             )
             .await
             .map_err(map_query_store_error)?;
-        if !self
-            .objects
-            .verify(&object)
-            .map_err(map_query_store_error)?
-        {
-            return Err(crate::QueryError::Artifact(
-                ParquetStoreError::ObjectMetadataMismatch,
-            ));
+        Ok(QueryArtifactStaging {
+            writer,
+            lease,
+            _operation: operation,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "publication and durable bind authorities stay explicit"
+    )]
+    pub(crate) async fn finish_and_bind(
+        &self,
+        staging: QueryArtifactStaging,
+        cancellation: &CancellationToken,
+        reservation: &QueryArtifactReservation,
+        supervisor: &BlockingIoSupervisor,
+        deadline: tokio::time::Instant,
+        #[cfg(test)] bind_precommit_deadline: Option<tokio::time::Instant>,
+        durable_bound: &AtomicBool,
+    ) -> Result<(PublishedObject, ArtifactRecord, crate::QueryArtifactResult), QueryError> {
+        let QueryArtifactStaging {
+            writer,
+            lease,
+            _operation,
+        } = staging;
+        let staged = writer.finish().await.map_err(map_query_store_error)?;
+        if cancellation.is_cancelled() {
+            return Err(QueryError::Cancelled);
         }
+        let objects = Arc::clone(&self.objects);
+        let permit = objects
+            .acquire_blocking_permit(cancellation)
+            .await
+            .map_err(map_query_store_error)?;
+        let worker_cancellation = cancellation.clone();
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                // Recovery exclusion remains with the finalizing worker even when its caller is
+                // cancelled. An unbound final object can only become an orphan after this releases.
+                if worker_cancellation.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+                let object = objects
+                    .finalize_staged_under_lease(staged, &lease)
+                    .map_err(map_query_store_error)?;
+                if !objects.verify(&object).map_err(map_query_store_error)? {
+                    return Err(QueryError::Artifact(
+                        ParquetStoreError::ObjectMetadataMismatch,
+                    ));
+                }
+                Ok((lease, _operation, object))
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => QueryError::Cancelled,
+                BlockingIoAdmissionError::Saturated
+                | BlockingIoAdmissionError::ReaperUnavailable => {
+                    QueryError::BlockingTaskLimitExceeded
+                }
+            })?;
+        let (_lease, _operation, object) = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(QueryError::Cancelled),
+            result = &mut worker => result.map_err(|_| QueryError::Artifact(ParquetStoreError::BlockingTaskFailed))??,
+        };
         // Content-addressed publication may return an older, already verified immutable object.
         // The catalog timestamp records this reservation's publication, while the object retains
         // its original filesystem creation time.
@@ -2393,6 +2501,9 @@ impl QueryArtifactPublication {
 fn map_query_store_error(error: ParquetStoreError) -> crate::QueryError {
     match error {
         ParquetStoreError::Cancelled => crate::QueryError::Cancelled,
+        ParquetStoreError::WriterMemoryLimitExceeded { limit } => {
+            crate::QueryError::MemoryLimitExceeded { limit }
+        }
         ParquetStoreError::ReadDeadlineExceeded => crate::QueryError::DeadlineExceeded,
         ParquetStoreError::BlockingTaskLimitExceeded => {
             crate::QueryError::BlockingTaskLimitExceeded
@@ -2753,9 +2864,19 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<crate::MarketDataInstrumentRecord, crate::MarketDataInstrumentCatalogError> {
-        self.publish_market_data_reference(deadline, cancellation, move |publisher, cancellation| {
-            publisher.publish_source_reference(input, precommit.as_ref(), deadline, cancellation)
-        }).await
+        self.publish_market_data_reference(
+            deadline,
+            cancellation,
+            move |publisher, cancellation| {
+                publisher.publish_source_reference(
+                    input,
+                    precommit.as_ref(),
+                    deadline,
+                    cancellation,
+                )
+            },
+        )
+        .await
     }
 
     /// Publishes one original Alpaca asset reference through the existing bounded catalog writer.
@@ -2816,9 +2937,20 @@ impl AnalyticalDataService {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<crate::MarketDataInstrumentRecord, crate::MarketDataInstrumentCatalogError> {
-        self.publish_market_data_reference(deadline, cancellation, move |publisher, cancellation| {
-            publisher.publish_issuer_reference(issuer, listing, expected_current, deadline, cancellation)
-        }).await
+        self.publish_market_data_reference(
+            deadline,
+            cancellation,
+            move |publisher, cancellation| {
+                publisher.publish_issuer_reference(
+                    issuer,
+                    listing,
+                    expected_current,
+                    deadline,
+                    cancellation,
+                )
+            },
+        )
+        .await
     }
 
     async fn publish_market_data_reference<F, T>(
@@ -2881,6 +3013,28 @@ impl AnalyticalDataService {
             _ = tokio::time::sleep_until(deadline.into()) => Err(Error::DeadlineExceeded),
             result = &mut worker => result.map_err(|_| Error::BlockingIo(ParquetStoreError::BlockingTaskFailed))?,
         }
+    }
+
+    /// Returns the existing catalog's bounded chart-projection authority.
+    pub fn chart_projections(&self) -> crate::ChartProjectionCatalogCapability {
+        crate::ChartProjectionCatalogCapability::new(Arc::clone(&self.authority))
+    }
+
+    /// Creates private, restart-reclaimable temporary storage for one owned analytical operation.
+    pub fn operation_scratch(
+        &self,
+    ) -> Result<crate::parquet_store::OperationScratchDirectory, ParquetStoreError> {
+        self.objects.operation_scratch()
+    }
+
+    /// Returns the catalog-owned forecast inventory authority.
+    pub fn forecast_inventory(&self) -> crate::ForecastInventoryCatalogCapability {
+        crate::ForecastInventoryCatalogCapability::new(Arc::clone(&self.authority))
+    }
+
+    /// Returns the catalog-owned durable model inventory capability.
+    pub fn model_inventory(&self) -> crate::ModelInventoryCatalogCapability {
+        crate::ModelInventoryCatalogCapability::new(Arc::clone(&self.authority))
     }
 
     /// Returns fair-value persistence authority over this service's sole catalog writer.
@@ -3060,7 +3214,10 @@ impl AnalyticalDataService {
             .lock_authority()?
             .provider_capture_binding_evidence(binding_digest)?
             .ok_or(IngestError::ProviderCaptureRequired)?;
-        let metadata = self.lock_authority()?.catalog().metadata_for_provider_binding(binding_digest)?;
+        let metadata = self
+            .lock_authority()?
+            .catalog()
+            .metadata_for_provider_binding(binding_digest)?;
         verify_persisted_provider_capture_binding(&evidence, store)?;
         if let Some(metadata) = metadata {
             metadata.validate_data(evidence.capture())?;
@@ -3204,18 +3361,31 @@ impl AnalyticalDataService {
                 output.push(GenerationOwnedProviderCaptureInputEvidence {
                     input_ordinal: input.input_ordinal,
                     object_input_ordinal: input.object_input_ordinal,
-                    metadata: input.metadata_dependency_digest.map(|digest| {
-                        let metadata = match control {
-                            Some(control) => authority.catalog().provider_metadata_capture(digest, control.deadline, control.cancellation),
-                            None => authority.catalog().provider_metadata_capture_unbounded(digest),
-                        }.map_err(map_market_recovery_catalog_error)?;
-                        metadata.validate_data(evidence.capture())?;
-                        metadata_retained_bytes = metadata_retained_bytes.checked_add(
-                            u64::try_from(metadata.retained_bytes()?).map_err(|_| IngestError::ProviderCaptureRequired)?
-                        ).filter(|bytes| *bytes <= MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
-                         .ok_or(IngestError::ProviderCaptureRequired)?;
-                        Ok::<_, IngestError>(metadata)
-                    }).transpose()?,
+                    metadata: input
+                        .metadata_dependency_digest
+                        .map(|digest| {
+                            let metadata = match control {
+                                Some(control) => authority.catalog().provider_metadata_capture(
+                                    digest,
+                                    control.deadline,
+                                    control.cancellation,
+                                ),
+                                None => authority
+                                    .catalog()
+                                    .provider_metadata_capture_unbounded(digest),
+                            }
+                            .map_err(map_market_recovery_catalog_error)?;
+                            metadata.validate_data(evidence.capture())?;
+                            metadata_retained_bytes = metadata_retained_bytes
+                                .checked_add(
+                                    u64::try_from(metadata.retained_bytes()?)
+                                        .map_err(|_| IngestError::ProviderCaptureRequired)?,
+                                )
+                                .filter(|bytes| *bytes <= MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
+                                .ok_or(IngestError::ProviderCaptureRequired)?;
+                            Ok::<_, IngestError>(metadata)
+                        })
+                        .transpose()?,
                     binding: evidence,
                 });
             }
@@ -5156,8 +5326,12 @@ impl AnalyticalDataService {
         for chunk in &input.chunks {
             let mut capture = PreparedProviderCaptureBinding::try_from_live(&chunk.sealed_capture)?;
             if let Some(metadata) = &chunk.metadata_capture {
-                if metadata.catalog_id != self.catalog_id { return Err(IngestError::InvalidProviderMacroPlan); }
-                metadata.evidence.validate_data(chunk.sealed_capture.capture_evidence())?;
+                if metadata.catalog_id != self.catalog_id {
+                    return Err(IngestError::InvalidProviderMacroPlan);
+                }
+                metadata
+                    .evidence
+                    .validate_data(chunk.sealed_capture.capture_evidence())?;
                 capture.metadata = Some(metadata.evidence.clone());
             }
             prepared.push(capture);
@@ -6474,6 +6648,13 @@ impl AnalyticalDataService {
                 })?;
             let pinned = match source_evidence {
                 PublicationSourceEvidence::ProviderLogicalOriginal(
+                    _,
+                    _,
+                    deadline,
+                    cancellation,
+                )
+                | PublicationSourceEvidence::ProviderLogicalOriginalCaptures(
+                    _,
                     _,
                     _,
                     deadline,

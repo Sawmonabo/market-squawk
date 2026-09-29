@@ -74,13 +74,21 @@ impl InventoryDocument {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct BackupReadCursor {
+    version: u8,
+    revision: u64,
+    backup_id: [u8; 32],
+}
+
 /// One bounded stable inventory page.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupInventoryPage {
     revision: u64,
     manifests: Vec<ProductBackupManifest>,
-    next_after_backup_id: Option<[u8; 32]>,
+    next_after_backup_id: Option<String>,
     pending_deletions: usize,
 }
 
@@ -198,7 +206,7 @@ impl ProductBackupInventory {
     /// Lists verified backups in descending capture-time order.
     pub fn list(
         &self,
-        after_backup_id: Option<[u8; 32]>,
+        after_backup_id: Option<&str>,
         limit: usize,
     ) -> Result<BackupInventoryPage, ProductBackupError> {
         if limit == 0 || limit > MAXIMUM_PAGE_SIZE {
@@ -209,11 +217,19 @@ impl ProductBackupInventory {
             .lock()
             .map_err(|_| ProductBackupError::InventoryUnavailable)?;
         let start = after_backup_id
-            .map(|cursor| {
+            .map(|encoded| {
+                if encoded.len() > 256 {
+                    return Err(ProductBackupError::InvalidInventoryCursor);
+                }
+                let cursor: BackupReadCursor = serde_json::from_str(encoded)
+                    .map_err(|_| ProductBackupError::InvalidInventoryCursor)?;
+                if cursor.version != 1 || cursor.revision != document.revision {
+                    return Err(ProductBackupError::InvalidInventoryCursor);
+                }
                 document
                     .entries
                     .iter()
-                    .position(|entry| entry.manifest.backup_id() == cursor)
+                    .position(|entry| entry.manifest.backup_id() == cursor.backup_id)
                     .map(|index| index.saturating_add(1))
                     .ok_or(ProductBackupError::InvalidInventoryCursor)
             })
@@ -230,8 +246,19 @@ impl ProductBackupInventory {
         let has_more = manifests.len() > limit;
         manifests.truncate(limit);
         let next_after_backup_id = has_more
-            .then(|| manifests.last().map(ProductBackupManifest::backup_id))
-            .flatten();
+            .then(|| {
+                let backup_id = manifests
+                    .last()
+                    .ok_or(ProductBackupError::InventoryCorrupt)?
+                    .backup_id();
+                serde_json::to_string(&BackupReadCursor {
+                    version: 1,
+                    revision: document.revision,
+                    backup_id,
+                })
+                .map_err(|_| ProductBackupError::InventoryCorrupt)
+            })
+            .transpose()?;
         Ok(BackupInventoryPage {
             revision: document.revision,
             manifests,

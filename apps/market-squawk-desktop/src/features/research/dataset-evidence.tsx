@@ -15,6 +15,9 @@ import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
+import { DemandPanel } from "../shared/demand-panel"
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+
 import {
   parseResearchActionAccepted,
   parseResearchCollection,
@@ -42,33 +45,14 @@ export function DatasetEvidence({
   ] as const
   const detail = useQuery({
     queryKey: [...detailKey, "detail"],
-    queryFn: async () =>
+    gcTime: 0,
+    queryFn: async ({ signal }) =>
       parseResearchCollection(
         await transport.query({
           query: "researchCollection",
           collection: collectionToken,
-        }),
+        }, { signal }),
         collectionToken,
-      ),
-  })
-  const history = useQuery({
-    queryKey: [...detailKey, "history"],
-    queryFn: async () =>
-      parseResearchObservations(
-        await transport.query({
-          query: "researchCollectionHistory",
-          collection: collectionToken,
-        }),
-      ),
-  })
-  const alternative = useQuery({
-    queryKey: [...detailKey, "alternative-data"],
-    queryFn: async () =>
-      parseResearchObservations(
-        await transport.query({
-          query: "researchCollectionAlternativeData",
-          collection: collectionToken,
-        }),
       ),
   })
   const canExport = hasProductCapability(bootstrap, "research_export")
@@ -146,29 +130,47 @@ export function DatasetEvidence({
           title="History and revisions"
           description="When the information applied, when it became public, and whether it later changed."
         >
-          <HistoryEvidence
-            query={{
-              data: history.data,
-              isPending: history.isPending,
-              isError: history.isError,
-              retry: () => void history.refetch(),
-            }}
-          />
-          <AlternativeEvidence
-            result={alternative.data}
-            loading={alternative.isPending}
-            error={alternative.error}
-            retry={() => void alternative.refetch()}
-          />
+          <DemandPanel title="Open history and revisions">
+            <ObservationRead collectionToken={collectionToken} bootstrap={bootstrap} transport={transport} kind="history" />
+          </DemandPanel>
+          <DemandPanel title="Open additional information">
+            <ObservationRead collectionToken={collectionToken} bootstrap={bootstrap} transport={transport} kind="alternative-data" />
+          </DemandPanel>
         </EvidenceBlock>
       </div>
     </article>
   )
 }
 
+function ObservationRead({ collectionToken, bootstrap, transport, kind }: {
+  collectionToken: string
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
+  kind: "history" | "alternative-data"
+}) {
+  const navigation = useCursorNavigation()
+  const query = useQuery({
+    queryKey: [...productKeys.domain(bootstrap.productSessionToken, "research"), "collection", collectionToken, kind, navigation.after],
+    gcTime: 0,
+    queryFn: async ({ signal }) => parseResearchObservations(await transport.query({
+      query: kind === "history" ? "researchCollectionHistory" : "researchCollectionAlternativeData",
+      collection: collectionToken,
+      ...(navigation.after === undefined ? {} : { cursor: navigation.after }),
+      limit: 25,
+    }, { signal })),
+  })
+  return <>
+    <HistoryEvidence label={kind === "history" ? "History" : "Additional information"} query={{ data: query.data, isPending: query.isPending, isError: query.isError, retry: () => void query.refetch() }} />
+    <CursorNavigation navigation={navigation} next={query.data?.nextCursor} busy={query.isFetching} error={query.isError}
+      onRestart={() => { if (navigation.after === undefined) void query.refetch() }} />
+  </>
+}
+
 function HistoryEvidence({
   query,
+  label,
 }: {
+  label: string
   query: {
     data: ResearchObservationResult | undefined
     isPending: boolean
@@ -179,27 +181,14 @@ function HistoryEvidence({
   if (query.isPending) return <Skeleton className="h-48 rounded-lg" />
   if (query.isError) {
     return (
-      <InlineError title="History could not be loaded" retry={query.retry} />
+      <InlineError title={`${label} could not be loaded`} retry={query.retry} />
     )
   }
-  if (!query.data || query.data.kind === "empty") {
+  if (!query.data || query.data.rows.length === 0) {
     return (
       <p className="rounded-md border border-border bg-background/40 p-3 text-xs leading-5 text-muted-foreground">
         This collection contains no matching history.
       </p>
-    )
-  }
-  if (query.data.kind === "artifact") {
-    return (
-      <div className="rounded-md border border-border bg-background/40 p-3">
-        <p className="text-xs font-medium">
-          {formatCount(query.data.rowCount)} observations are available
-        </p>
-        <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          This is more information than the page can show at once. Export the history to review
-          the full collection.
-        </p>
-      </div>
     )
   }
   return (
@@ -208,15 +197,10 @@ function HistoryEvidence({
         {formatCount(query.data.returnedItems)} observations returned
       </p>
       <ul className="max-h-80 space-y-2 overflow-y-auto pr-1">
-        {query.data.rows.slice(0, 8).map((row, index) => (
+        {query.data.rows.map((row, index) => (
           <ObservationEvidence key={index} row={row} />
         ))}
       </ul>
-      {query.data.rows.length > 8 ? (
-        <p className="text-[10px] text-muted-foreground">
-          Showing 8 of {formatCount(query.data.rows.length)} inline rows.
-        </p>
-      ) : null}
     </div>
   )
 }
@@ -243,41 +227,6 @@ function ObservationEvidence({ row }: { row: ResearchObservation }) {
         </div>
       </dl>
     </li>
-  )
-}
-
-function AlternativeEvidence({
-  result,
-  loading,
-  error,
-  retry,
-}: {
-  result: ResearchObservationResult | undefined
-  loading: boolean
-  error: unknown
-  retry: () => void
-}) {
-  if (loading) return <Skeleton className="h-12 rounded-lg" />
-  if (error) {
-    return (
-      <InlineError
-        title="Additional information could not be loaded"
-        retry={retry}
-      />
-    )
-  }
-  const value = !result || result.kind === "empty"
-    ? "No additional information in this collection"
-    : result.kind === "artifact"
-      ? `${formatCount(result.rowCount)} additional observations available`
-      : `${formatCount(result.returnedItems)} additional observations available`
-  return (
-    <div className="rounded-md border border-border bg-background/40 p-3">
-      <p className="text-[9px] uppercase tracking-wider text-muted-foreground">
-        Additional information
-      </p>
-      <p className="mt-1 text-xs text-foreground">{value}</p>
-    </div>
   )
 }
 

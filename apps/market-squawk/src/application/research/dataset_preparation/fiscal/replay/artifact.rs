@@ -109,7 +109,7 @@ pub(crate) struct HistoricalFiscalStudyBinding {
 impl HistoricalFiscalStudyBinding {
     pub(crate) fn from_source(
         plan: &crate::application::analysis::HistoricalStudyPlanV1,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         job: HistoricalFiscalJobReference,
     ) -> Result<Self, ServiceError> {
         let mut result = Self {
@@ -154,7 +154,7 @@ impl HistoricalFiscalStudyBinding {
     }
     fn derive_origins(
         &self,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
     ) -> Result<Vec<HistoricalFiscalOriginDescriptor>, ServiceError> {
         if DatasetReference::from_source(prices.dataset())? != self.price_inputs {
             return Err(ServiceError::InvalidResult);
@@ -162,11 +162,12 @@ impl HistoricalFiscalStudyBinding {
         let mut examples = BTreeSet::new();
         let mut origins = Vec::new();
         let mut source_count = 0usize;
-        for epoch in prices
-            .epochs()
-            .iter()
-            .filter(|e| e.instrument_id() == self.subject)
-        {
+        for coordinate in prices.coordinates() {
+            let coordinate = coordinate.map_err(super::super::super::super::map_read_error)?;
+            let epoch = coordinate.epoch();
+            if epoch.instrument_id() != self.subject {
+                continue;
+            }
             source_count = source_count
                 .checked_add(1)
                 .ok_or(ServiceError::ResourceExhausted)?;
@@ -181,7 +182,7 @@ impl HistoricalFiscalStudyBinding {
                 continue;
             }
             let example = epoch.example_id();
-            if !examples.insert(example)
+            if !examples.insert(example.to_owned())
                 || example.is_empty()
                 || example.len() > 256
                 || !example.is_ascii()
@@ -215,7 +216,7 @@ impl HistoricalFiscalStudyBinding {
     }
     fn checked_origins(
         &self,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
     ) -> Result<Vec<HistoricalFiscalOriginDescriptor>, ServiceError> {
         self.validate()?;
         let origins = self.derive_origins(prices)?;
@@ -227,7 +228,7 @@ impl HistoricalFiscalStudyBinding {
     }
     pub(crate) fn page(
         &self,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         ordinal: usize,
     ) -> Result<HistoricalFiscalPageDescriptor, ServiceError> {
         let origins = self.checked_origins(prices)?;
@@ -246,7 +247,7 @@ impl HistoricalFiscalStudyBinding {
     }
     pub(crate) fn contains(
         &self,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         example: &str,
     ) -> Result<(), ServiceError> {
         if !self
@@ -612,7 +613,7 @@ impl HistoricalFiscalForecastReadCapability {
     pub(crate) async fn read_page_reference(
         &self,
         binding: &HistoricalFiscalStudyBinding,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         ordinal: usize,
         reference: &HistoricalFiscalPageReference,
         context: &RequestContext,
@@ -640,7 +641,7 @@ impl HistoricalFiscalForecastReadCapability {
     pub(crate) async fn publish_selection(
         &self,
         binding: HistoricalFiscalStudyBinding,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         pages: Vec<HistoricalFiscalPageReference>,
         profile: &ValidatedAnalyticalProfile,
         context: &RequestContext,
@@ -722,7 +723,7 @@ impl HistoricalFiscalForecastReadCapability {
     async fn validate_pages(
         &self,
         root: &Root,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         profile: &ValidatedAnalyticalProfile,
         context: &RequestContext,
     ) -> Result<(), ServiceError> {
@@ -808,29 +809,31 @@ impl HistoricalFiscalForecastReadCapability {
     async fn read_origin_recipe(
         &self,
         binding: &HistoricalFiscalStudyBinding,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         origin: &OriginRecipe,
         profile: &ValidatedAnalyticalProfile,
         context: &RequestContext,
     ) -> Result<Vec<HistoricalOriginFinancialForecast>, ServiceError> {
         ensure_request(context)?;
         let identity = origin.identity;
-        let mut matches = prices
-            .epochs()
-            .iter()
-            .enumerate()
-            .filter(|(_, epoch)| epoch.example_id() == origin.example);
-        let (index, epoch) = matches.next().ok_or(ServiceError::Unavailable)?;
-        if matches.next().is_some()
-            || <[u8; 32]>::from(Sha256::digest(
-                epoch.canonical_bytes().map_err(map_fiscal_build_error)?,
-            )) != identity
+        let mut selected = None;
+        for coordinate in prices.coordinates() {
+            let coordinate = coordinate.map_err(super::super::super::super::map_read_error)?;
+            if coordinate.epoch().example_id() == origin.example {
+                if selected.replace(coordinate).is_some() {
+                    return Err(ServiceError::InvalidResult);
+                }
+            }
+        }
+        let selected = selected.ok_or(ServiceError::Unavailable)?;
+        let price = selected.coordinate();
+        let epoch = price.epoch();
+        if <[u8; 32]>::from(Sha256::digest(
+            epoch.canonical_bytes().map_err(map_fiscal_build_error)?,
+        )) != identity
         {
             return Err(ServiceError::InvalidResult);
         }
-        let price = prices
-            .coordinate(index)
-            .ok_or(ServiceError::InvalidResult)?;
         let population = prepare_fixed_current_population(
             &self.research,
             Arc::clone(&self.identities),

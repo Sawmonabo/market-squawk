@@ -142,10 +142,6 @@ impl CompletedMarketSessionRead {
             .sessions()
             .get(first..until)
             .ok_or(CompletedMarketSessionError::InvalidEvidence)?;
-        let mut dates = Vec::new();
-        dates
-            .try_reserve_exact(selected.len())
-            .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?;
         for day in selected {
             check(deadline, &cancellation)?;
             // A listing-market calendar cannot silently become an IEX candle-period source.
@@ -155,7 +151,6 @@ impl CompletedMarketSessionRead {
             {
                 return Err(CompletedMarketSessionError::InvalidEvidence);
             }
-            dates.push(day.date());
         }
         let reference = self.reference();
         let mut hash = Sha256::new();
@@ -177,19 +172,20 @@ impl CompletedMarketSessionRead {
         hash.update(resolved_at.unix_nanos().to_be_bytes());
         hash.update(knowledge_cutoff.unix_nanos().to_be_bytes());
         hash.update(
-            u32::try_from(dates.len())
+            u32::try_from(selected.len())
                 .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?
                 .to_be_bytes(),
         );
-        for date in &dates {
-            hash_date(&mut hash, *date);
+        for day in selected {
+            check(deadline, &cancellation)?;
+            hash_date(&mut hash, day.date());
         }
         // The creating immutable manifest content commitment identifies this durable authority
         // generation. It is independent from a process-local provider activation generation.
         let generation_name = encode_digest(reference.origin_content_digest());
         let authority_generation = SourceIdentifier::try_from(generation_name.as_str())
             .map_err(|_| CompletedMarketSessionError::InvalidEvidence)?;
-        let expected = TiingoEodExpectedSessionEvidence::try_new(
+        let expected = TiingoEodExpectedSessionEvidence::try_new_with_sessions(
             &request,
             self.source.calendar_id().clone(),
             self.calendar_revision().clone(),
@@ -197,7 +193,11 @@ impl CompletedMarketSessionRead {
             self.available_at(),
             resolved_at,
             finish(hash),
-            dates,
+            selected.len(),
+            selected.iter().map(|day| {
+                check(deadline, &cancellation).map_err(adapter_error)?;
+                Ok(day.date())
+            }),
             reference.origin_content_digest(),
             reference.capture_binding_digest(),
             relation,
@@ -275,18 +275,24 @@ impl TiingoEodExpectedSessionAuthority for TiingoCalendarExpectedSessionAuthorit
     fn resolve_expected_sessions(
         &self,
         request: &TiingoEodExpectedSessionRequest,
+        emit: &mut dyn FnMut(CalendarDate) -> Result<(), TiingoEodMapError>,
     ) -> Result<TiingoEodExpectedSessionEvidence, TiingoEodMapError> {
         if request.request_identity() != self.expected.request_identity() {
             return Err(TiingoEodMapError::InvalidExpectedSessionEvidence);
         }
         self.require_current().map_err(adapter_error)?;
-        // Admit the one bounded membership copy before passing it into the adapter receipt.
-        let mut dates = Vec::new();
-        dates
-            .try_reserve_exact(self.expected.expected_sessions().len())
-            .map_err(|_| TiingoEodMapError::Allocation)?;
-        dates.extend_from_slice(self.expected.expected_sessions());
-        let result = TiingoEodExpectedSessionEvidence::try_new(
+        let replay = self.calendar.native_session_replay();
+        let first = replay
+            .sessions()
+            .partition_point(|day| day.date() < request.start_date());
+        let until = replay
+            .sessions()
+            .partition_point(|day| day.date() <= request.end_date());
+        let selected = replay
+            .sessions()
+            .get(first..until)
+            .ok_or(TiingoEodMapError::InvalidExpectedSessionEvidence)?;
+        let result = TiingoEodExpectedSessionEvidence::try_new_with_sessions(
             request,
             self.expected.calendar_id().clone(),
             self.expected.calendar_revision().clone(),
@@ -294,7 +300,18 @@ impl TiingoEodExpectedSessionAuthority for TiingoCalendarExpectedSessionAuthorit
             self.expected.calendar_available_at(),
             self.expected.resolved_at(),
             self.expected.resolution_receipt(),
-            dates,
+            selected.len(),
+            selected.iter().map(|day| {
+                check(self.deadline, &self.cancellation).map_err(adapter_error)?;
+                if day.provider_timestamp().is_some()
+                    || day.period_start().is_some()
+                    || day.period_end_exclusive().is_some()
+                {
+                    return Err(TiingoEodMapError::InvalidExpectedSessionEvidence);
+                }
+                emit(day.date())?;
+                Ok(day.date())
+            }),
             self.expected.origin_content_digest(),
             self.expected.capture_binding_digest(),
             self.expected.relationship().clone(),

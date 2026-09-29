@@ -219,7 +219,7 @@ impl SecParserLimits {
     pub const fn production_defaults() -> Self {
         Self {
             max_decoded_bytes: 32 * 1024 * 1024,
-            max_records: 250_000,
+            max_records: market_squawk_domain::MAX_XBRL_OCCURRENCES,
             max_depth: 128,
             max_string_bytes: 256 * 1024,
             max_total_string_bytes: 24 * 1024 * 1024,

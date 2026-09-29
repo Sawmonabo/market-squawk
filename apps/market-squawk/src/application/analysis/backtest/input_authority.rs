@@ -4,10 +4,10 @@ mod index;
 mod issuer;
 mod plan;
 mod preparation;
+mod probability;
 mod recipe;
 mod resolution;
 mod study;
-mod probability;
 
 use std::{
     fmt,
@@ -26,9 +26,7 @@ use market_squawk_backtesting::{
     RecommendationSignalIssuerIdentityV1, RecommendationSignalPlanCompletenessV1,
     RecommendationSignalPlanMaterializationErrorV1, RecommendationSignalPlanMaterializerV1,
 };
-use market_squawk_data::{
-    CompleteMarketBarHistoryOutput, CorporateActionPlan, DatasetManifestRef, Sha256Digest,
-};
+use market_squawk_data::{CorporateActionPlan, DatasetManifestRef, Sha256Digest};
 use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
@@ -658,10 +656,10 @@ impl ProductionGovernedBacktestInputAuthority {
     /// Binds only genuine completed raw histories to the existing immutable recipe store.
     /// The actual read cutoff must be the one used for every sealed selection. Reopening
     /// compares every original receipt and result before anything is registered.
-    pub(crate) async fn register_recommendation_daily(
+    pub(crate) async fn register_recommendation_daily<T: recipe::DailyHistoryInput>(
         &self,
         input: GovernedBacktestInputRegistrationInput,
-        histories: &[CompleteMarketBarHistoryOutput],
+        histories: &[T],
         admitted_at: Timestamp,
         source_action_reference: crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
         cancellation: CancellationToken,
@@ -733,12 +731,7 @@ impl ProductionGovernedBacktestInputAuthority {
             }
         }
         let materialized = self
-            .resolve_materialized(
-                command,
-                None,
-                cancellation.clone(),
-                deadline,
-            )
+            .resolve_materialized(command, None, cancellation.clone(), deadline)
             .await?;
         if !materialized.has_daily_history() {
             return Err(ServiceError::InvalidRequest);

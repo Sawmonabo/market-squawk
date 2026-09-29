@@ -12,8 +12,7 @@ use market_squawk_backtesting::{
     ResearchExecutionAssumptionsInput,
 };
 use market_squawk_data::{
-    CatalogLimit, CompleteMarketBarHistoryOutput, DatasetManifestRef, DatasetSchemaRegistry,
-    QueryLimits, QueryRequest,
+    CatalogLimit, DatasetManifestRef, DatasetSchemaRegistry, QueryLimits, QueryRequest,
 };
 use market_squawk_domain::{InstrumentId, SourceId, SourceIdentifier, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -27,7 +26,7 @@ pub use corporate_actions::GovernedBacktestCorporateActionsInput;
 pub use policy::{GovernedBacktestPortfolioSeedInput, GovernedBacktestQueryLimitsInput};
 
 use corporate_actions::CorporateActionsWire;
-pub(super) use daily_history::DailyHistoryWire;
+pub(super) use daily_history::{DailyHistoryInput, DailyHistoryWire};
 use manifest::ManifestWire;
 pub(in crate::application::analysis::backtest::input_authority) use manifest::{
     ManifestAuthorityWire, sort_manifest_authorities, validate_manifest_authorities,
@@ -227,9 +226,9 @@ impl RegistrationRecipe {
 
     /// Only sealed durable complete-history outputs can add realized daily outcomes. This
     /// internal extension is unavailable through the public registration JSON contract.
-    pub(super) fn with_daily_history(
+    pub(super) fn with_daily_history<T: DailyHistoryInput>(
         mut self,
-        histories: &[CompleteMarketBarHistoryOutput],
+        histories: &[T],
         admitted_at: Timestamp,
         source_action_reference: crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
     ) -> Result<Self, RecipeError> {

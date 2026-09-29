@@ -1,5 +1,5 @@
 import * as React from "react"
-import { useMutation, useQuery } from "@tanstack/react-query"
+import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query"
 
 import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
@@ -13,13 +13,16 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { MarketHistoryChart } from "./market-history-chart"
-import { parseMarketHistoryResult } from "./market-history"
+import { parseMarketHistoryResult, sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryViewportInput } from "./market-history"
 import {
   marketSessionRequestSchema, parseMarketInstrumentResult, parseMarketProductResult,
   parseMarketSessionContext, type MarketProductRow, type MarketSessionContext,
   type MarketSessionReference, type MarketSessionRequest,
 } from "./market-product"
 import { parseInvestmentSearchPage } from "./reference-market"
+
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+import { DemandPanel } from "../shared/demand-panel"
 
 const queryPolicy = { retry: false, refetchOnWindowFocus: false } as const
 
@@ -33,17 +36,21 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
   const [search, setSearch] = React.useState("")
   const [submittedSearch, setSubmittedSearch] = React.useState<string | null>(null)
   const [selectionToken, setSelectionToken] = React.useState<string | null>(null)
-  const [overviewPageToken, setOverviewPageToken] = React.useState<string | null>(null)
-  const [searchPageToken, setSearchPageToken] = React.useState<string | null>(null)
+  const overviewNavigation = useCursorNavigation()
+  const searchNavigation = useCursorNavigation()
+  const overviewPageToken = overviewNavigation.after
+  const searchPageToken = searchNavigation.after
   const overview = useQuery({
-    queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetOverview", { overviewPageToken }),
-    queryFn: () => transport.query({ query: "marketOverview", ...(overviewPageToken ? { pageToken: overviewPageToken } : {}) }),
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetOverview", { query: "marketOverview", ...(overviewPageToken ? { pageToken: overviewPageToken } : {}) }),
+    gcTime: 0,
+    queryFn: ({ signal }) => transport.query({ query: "marketOverview", ...(overviewPageToken ? { pageToken: overviewPageToken } : {}) }, { signal }),
     ...queryPolicy,
   })
   const searchResult = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.SearchUniverse", { query: submittedSearch, searchPageToken }),
     enabled: submittedSearch !== null,
-    queryFn: () => transport.query({ query: "marketUniverse", text: submittedSearch!, ...(searchPageToken ? { pageToken: searchPageToken } : {}) }),
+    gcTime: 0,
+    queryFn: ({ signal }) => transport.query({ query: "marketUniverse", text: submittedSearch!, ...(searchPageToken ? { pageToken: searchPageToken } : {}) }, { signal }),
     ...queryPolicy,
   })
   const rows = overview.data ? parseMarketProductResult(overview.data).data : []
@@ -53,20 +60,15 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
   const detail = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetInstrument", { selectionToken }),
     enabled: selectionToken !== null,
-    queryFn: () => transport.query({ query: "marketInstrument", selectionToken: selectionToken! }),
+    gcTime: 0,
+    queryFn: ({ signal }) => transport.query({ query: "marketInstrument", selectionToken: selectionToken! }, { signal }),
     ...queryPolicy,
   })
   const detailRow = detail.data && selectionToken ? parseMarketInstrumentResult(detail.data, selectionToken) : selected
   const historyToken = detailRow?.historyToken ?? null
-  const history = useQuery({
-    queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetHistory", { historyToken }),
-    enabled: historyToken !== null,
-    queryFn: () => transport.query({ query: "marketHistory", historyToken: historyToken! }),
-    ...queryPolicy,
-  })
 
   return <Page>
-    <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); const value = search.trim(); if (value) { setSearchPageToken(null); setSubmittedSearch(value) } }}>
+    <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); const value = search.trim(); if (value) { searchNavigation.restart(); setSubmittedSearch(value) } }}>
       <Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find an investment" maxLength={64} />
       <Button type="submit">Search</Button>
     </form>
@@ -74,15 +76,76 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
       {rows.map((row) => <MarketCard key={row.selectionToken} row={row} onSelect={() => setSelectionToken(row.selectionToken)} />)}
       {matches.map((row) => <button className="rounded-xl border p-4 text-left" key={row.selectionToken} onClick={() => setSelectionToken(row.selectionToken)}>{row.name ?? row.symbol}</button>)}
     </div>
-    <div className="mt-4 flex gap-2">
-      {overview.data && parseMarketProductResult(overview.data).page.nextPageToken ? <Button variant="outline" onClick={() => setOverviewPageToken(parseMarketProductResult(overview.data!).page.nextPageToken)}>More markets</Button> : null}
-      {searchPage?.page.nextPageToken ? <Button variant="outline" onClick={() => setSearchPageToken(searchPage.page.nextPageToken)}>More results</Button> : null}
-    </div>
+    <CursorNavigation navigation={overviewNavigation} next={overview.data ? parseMarketProductResult(overview.data).page.nextPageToken : null} busy={overview.isFetching}
+      onRestart={() => { if (overviewPageToken === undefined) void overview.refetch() }} />
+    {submittedSearch !== null ? <CursorNavigation navigation={searchNavigation} next={searchPage?.page.nextPageToken} busy={searchResult.isFetching}
+      onRestart={() => { if (searchPageToken === undefined) void searchResult.refetch() }} /> : null}
     {detailRow ? <section className="mt-5 rounded-xl border p-5"><h2 className="text-lg font-semibold">{detailRow.identity.name ?? detailRow.identity.symbol}</h2><p className="mt-2 font-mono">{detailRow.price ? `${detailRow.price.value} ${detailRow.price.currency}` : "Price unavailable"}</p>{detailRow.changePercent ? <p className="text-sm">{detailRow.changePercent}%</p> : null}<p className="mt-2 text-xs text-muted-foreground">{detailRow.asOf ? new Date(detailRow.asOf).toLocaleString() : "Updated time unavailable"}</p></section> : <p className="mt-5 text-sm text-muted-foreground">No investment selected.</p>}
     {detailRow ? <div className="mt-4"><AnalysisLaunch transport={transport} scope={bootstrap.productSessionToken} selectionToken={detailRow.selectionToken} /></div> : null}
-    {historyToken ? <MarketHistoryChart result={history.data ? parseMarketHistoryResult(history.data, historyToken) : null} /> : null}
+    {historyToken ? <DemandPanel key={historyToken} title="Open price history" className="mt-5 rounded-xl border p-5">
+      <MarketHistoryRead historyToken={historyToken} bootstrap={bootstrap} transport={transport} />
+    </DemandPanel> : null}
     <MarketSessionPanel key={bootstrap.productSessionToken} bootstrap={bootstrap} transport={transport} />
   </Page>
+}
+
+function MarketHistoryRead({ historyToken, bootstrap, transport }: {
+  historyToken: string
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
+}) {
+  const generation = React.useRef<string | undefined>(undefined)
+  const [revision, setRevision] = React.useState(0)
+  const [viewport, setViewport] = React.useState<MarketHistoryViewportInput>({ pointLimit: 512 })
+  const [selectedBar, setSelectedBar] = React.useState<MarketHistoryBar | null>(null)
+  const history = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetHistory", { historyToken, ...viewport, revision }),
+    gcTime: 0,
+    placeholderData: keepPreviousData,
+    queryFn: async ({ signal }) => {
+      const pinnedGeneration = generation.current
+      const result = parseMarketHistoryResult(await transport.query({ query: "marketHistory", historyToken, ...viewport,
+        ...(pinnedGeneration === undefined ? {} : { generationToken: pinnedGeneration }) }, { signal }), historyToken, viewport, pinnedGeneration)
+      if (signal.aborted) throw new DOMException("The view was closed.", "AbortError")
+      if (result.data !== null && generation.current === undefined) generation.current = result.data.generationToken
+      return result
+    },
+    ...queryPolicy,
+  })
+  const reset = () => { generation.current = undefined; setViewport({ pointLimit: 512 }); setSelectedBar(null); setRevision((current) => current + 1) }
+  return <>
+    <Button variant="outline" size="sm" onClick={reset}>Refresh saved history</Button>
+    {history.isError ? <p role="alert" className="mt-3 text-sm text-destructive">Price history could not be loaded. Refresh saved history to open a new generation. <Button variant="outline" size="sm" onClick={() => void history.refetch()}>Retry</Button></p> : null}
+    {history.isFetching ? <p role="status" className="mt-3 text-sm text-muted-foreground">Loading the requested price window…</p> : null}
+    {history.data ? <MarketHistoryChart key={history.data.data?.generationToken ?? revision} result={history.data}
+      onViewportChange={(next) => { setViewport(next); setSelectedBar(null) }} onObservationSelect={setSelectedBar} /> : null}
+    {selectedBar !== null && history.data?.data ? <OriginalMarketBarRead key={`${selectedBar.originalOrdinal}:${history.data.data.generationToken}`}
+      bar={selectedBar} historyToken={historyToken} generationToken={history.data.data.generationToken} bootstrap={bootstrap} transport={transport} /> : null}
+  </>
+}
+
+function OriginalMarketBarRead({ bar, historyToken, generationToken, bootstrap, transport }: {
+  bar: MarketHistoryBar; historyToken: string; generationToken: string; bootstrap: DesktopBootstrap; transport: ProductTransport
+}) {
+  const viewport: MarketHistoryViewportInput = bar.time.precision === "nominal_date"
+    ? { startDate: bar.time.date, endDate: bar.time.date, pointLimit: 8 }
+    : { startUnixNanos: sourceInstantUnixNanos(bar.time.startsAt), endUnixNanos: sourceInstantUnixNanos(bar.time.startsAt), pointLimit: 8 }
+  const original = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetHistory", { historyToken, generationToken, ...viewport }),
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
+      const result = parseMarketHistoryResult(await transport.query({ query: "marketHistory", historyToken, generationToken, ...viewport }, { signal }), historyToken, viewport, generationToken)
+      const point = result.data?.bars.find((candidate) => candidate.originalOrdinal === bar.originalOrdinal)
+      if (!point) throw new Error("The original price observation could not be verified.")
+      return point
+    },
+  })
+  return <div className="mt-4 rounded-lg border border-border p-3 text-xs">
+    <p className="font-medium">Exact original price observation</p>
+    {original.isPending ? <p role="status" className="mt-2 text-muted-foreground">Checking saved evidence…</p>
+      : original.isError ? <p role="alert" className="mt-2 text-destructive">The saved observation could not be verified. <Button size="xs" variant="outline" onClick={() => void original.refetch()}>Retry</Button></p>
+        : <dl className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">{([['Open', original.data.open], ['High', original.data.high], ['Low', original.data.low], ['Close', original.data.close], ['Volume', original.data.volume]] as const).map(([label, value]) => <div key={label}><dt className="text-muted-foreground">{label}</dt><dd className="mt-1 font-mono">{value}</dd></div>)}</dl>}
+  </div>
 }
 
 const sessionProducts: { value: MarketSessionRequest["product"]; label: string }[] = [

@@ -35,8 +35,8 @@ use super::{
 };
 
 mod automatic;
-mod backup_read;
 mod automatic_read;
+mod backup_read;
 pub(crate) use automatic_read::FairValueAutomaticReadCapability;
 use backup_read::BackupAutomaticValuationRead;
 pub(crate) use backup_read::FairValueBackupAttestationLease;
@@ -47,10 +47,13 @@ mod serialization;
 pub(crate) use automatic::{
     AutomaticForecastValuationRequest, AutomaticInvestmentValuationEvaluation,
     AutomaticInvestmentValuationRequest, AutomaticInvestmentValuationSources,
-    AutomaticValuationModelCases, AutomaticValuationPublication,
-    HistoricalForecastValuationAssumption, HistoricalForecastValuationReceipt,
-    HistoricalStudyValuationReadCapability, HistoricalValuationMethodEvaluation,
+    AutomaticValuationModelCases, AutomaticValuationPublication, FundamentalShareProjectionSources,
+    FundamentalShareRequirements, HistoricalForecastValuationAssumption,
+    HistoricalForecastValuationReceipt, HistoricalStudyValuationReadCapability,
+    HistoricalValuationMethodEvaluation, MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES,
     ObservedComparableValuationRequest, automatic_valuation_model_cases,
+    finish_common_share_sources, fundamental_share_recipe_artifacts,
+    replay_fundamental_share_sources, validate_fundamental_share_sources,
 };
 
 pub use resolver::{
@@ -2784,7 +2787,7 @@ fn map_resolution_error(error: FairValueInputResolutionError) -> ServiceError {
     }
 }
 
-fn map_fair_value_error(error: FairValueError) -> ServiceError {
+pub(crate) fn map_fair_value_error(error: FairValueError) -> ServiceError {
     match error {
         FairValueError::Cancelled => ServiceError::Cancelled,
         FairValueError::DeadlineExceeded => ServiceError::DeadlineExceeded,

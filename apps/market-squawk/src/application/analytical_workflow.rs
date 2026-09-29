@@ -874,7 +874,7 @@ impl AnalyticalWorkflowController {
             | AnalyticalControllerCommand::WorkflowCoverage { .. } => {
                 Err(WorkflowError::internal())
             }
-            AnalyticalControllerCommand::ProfileOptions => Err(WorkflowError::internal()),
+            AnalyticalControllerCommand::ProfileOptions { .. } => Err(WorkflowError::internal()),
             AnalyticalControllerCommand::CopyRecommended { display_name } => {
                 self.copy_default(display_name)
             }
@@ -1582,7 +1582,10 @@ enum HistoryCompleteness {
 )]
 pub enum AnalyticalControllerCommand {
     Status,
-    ProfileOptions,
+    ProfileOptions {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
     CopyRecommended {
         display_name: String,
     },
@@ -1637,7 +1640,7 @@ impl AnalyticalControllerCommand {
         !matches!(
             self,
             Self::Status
-                | Self::ProfileOptions
+                | Self::ProfileOptions { .. }
                 | Self::CompareWithRecommended { .. }
                 | Self::History { .. }
                 | Self::WorkflowCoverage { .. }
@@ -1722,9 +1725,23 @@ pub(crate) async fn analytical_controller(
             "Confirm this analysis change before continuing.",
         ));
     }
-    let mut response = if let AnalyticalControllerCommand::FindOpportunities { benchmark_instrument_id } = &request {
-        workflow_driver::start(&state, &generation, WorkflowKind::FindOpportunities, None, *benchmark_instrument_id).await?
-    } else if let AnalyticalControllerCommand::AnalyzeInvestment { selection_token, benchmark_instrument_id } = &request {
+    let mut response = if let AnalyticalControllerCommand::FindOpportunities {
+        benchmark_instrument_id,
+    } = &request
+    {
+        workflow_driver::start(
+            &state,
+            &generation,
+            WorkflowKind::FindOpportunities,
+            None,
+            *benchmark_instrument_id,
+        )
+        .await?
+    } else if let AnalyticalControllerCommand::AnalyzeInvestment {
+        selection_token,
+        benchmark_instrument_id,
+    } = &request
+    {
         workflow_driver::start(
             &state,
             &generation,
@@ -1741,8 +1758,8 @@ pub(crate) async fn analytical_controller(
     } = &request
     {
         workflow_driver::read_coverage(&state, &generation, workflow_token, after.as_ref()).await?
-    } else if matches!(&request, AnalyticalControllerCommand::ProfileOptions) {
-        financial_profiles::profile_options(&state, &generation).await?
+    } else if let AnalyticalControllerCommand::ProfileOptions { cursor, limit } = &request {
+        financial_profiles::profile_options(&state, &generation, cursor.as_deref(), *limit).await?
     } else if let AnalyticalControllerCommand::ValidateProfile {
         profile_token,
         profile_state_token,
@@ -2422,6 +2439,8 @@ fn valid_pending_invocation(pending: &PendingCapabilityInvocation) -> bool {
             bytes.len()
                 <= if pending.operation == "Analysis.CompleteHistoricalStudyFiscalPage" {
                     1024 * 1024
+                } else if pending.operation == "Decision.GenerateInvestmentAnalysis" {
+                    market_squawk_decisions::MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES
                 } else {
                     64 * 1024
                 }

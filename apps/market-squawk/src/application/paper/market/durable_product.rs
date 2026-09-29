@@ -43,8 +43,10 @@ impl MarketDomainService {
             let instrument_id = product::resolve_history_token(&identities, token)?;
             return history::build_product_market_history_result(
                 &self.market_history,
+                &self.product_research,
                 instrument_id,
                 token,
+                request,
                 limits,
                 context,
             )

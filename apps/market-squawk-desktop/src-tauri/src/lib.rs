@@ -32,9 +32,9 @@ mod service_client;
 
 use analytical_controller::{analytical_controller, analytical_product};
 use bridge::{
-    DesktopBootstrapState, DesktopCompositionContext, DesktopState, desktop_bootstrap,
+    DesktopBootstrapState, DesktopCompositionContext, DesktopState, cancel_read, desktop_bootstrap,
     desktop_service_bootstrap, desktop_service_reconnect, installation_control,
-    open_official_provider_page, provider_onboarding,
+    open_official_provider_page, provider_onboarding, register_read,
 };
 use contracts::DesktopCommandError;
 use events::{DesktopEventSubscriptions, subscribe_service_events, unsubscribe_service_events};
@@ -268,6 +268,8 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             backtest_products,
             commit_research_file_import,
             dashboard_query,
+            register_read,
+            cancel_read,
             decision_control,
             desktop_bootstrap,
             desktop_service_bootstrap,

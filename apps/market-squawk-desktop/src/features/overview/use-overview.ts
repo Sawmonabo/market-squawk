@@ -42,7 +42,7 @@ function useMarketOverviewQuery(
     transport,
     scope,
     "market",
-    "overview",
+    "Market.GetOverview",
     MARKET_INPUT,
     (result) => parseMarketProductResult(result).data,
   )
@@ -58,7 +58,7 @@ function useParsedProductQuery<Result>(
 ): ReadState<Result> {
   const query = useQuery({
     queryKey: productKeys.operation(scope, domain, operation, input),
-    queryFn: () => transport.query(input),
+    queryFn: ({ signal }) => transport.query(input, { signal }),
   })
 
   if (query.isPending) {

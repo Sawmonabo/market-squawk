@@ -2,8 +2,6 @@ import * as React from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import {
   AlertTriangle,
-  ChevronLeft,
-  ChevronRight,
   ClipboardCheck,
   Download,
   Eye,
@@ -33,13 +31,13 @@ import { formatTimestamp } from "@/lib/time"
 import type { OperationLogFilter, SystemTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+
 import {
-  asUnsignedCursor,
   defaultLogFilterDraft,
   filterFromDraft,
   logDomainOptions,
   logSeverityOptions,
-  MAXIMUM_LOG_PAGES,
   parseDiagnosticArtifactReceipt,
   parseStructuredLogPage,
   type DiagnosticArtifactReceipt,
@@ -82,25 +80,26 @@ function LogsWorkspace({
   const [draft, setDraft] = React.useState<LogFilterDraft>(defaultLogFilterDraft)
   const [filter, setFilter] = React.useState<OperationLogFilter>(() => ({ limit: 100 }))
   const [filterError, setFilterError] = React.useState<string | null>(null)
-  const [afterSequence, setAfterSequence] = React.useState<string | undefined>()
-  const [priorCursors, setPriorCursors] = React.useState<(string | undefined)[]>([])
+  const navigation = useCursorNavigation()
+  const cursor = navigation.after
   const [selected, setSelected] = React.useState<StructuredLogRecord | null>(null)
   const [confirmExport, setConfirmExport] = React.useState(false)
   const [receipt, setReceipt] = React.useState<DiagnosticArtifactReceipt | null>(null)
   const [announcement, setAnnouncement] = React.useState("")
   const request = React.useMemo(
-    () => ({ query: "operationLogs" as const, ...filter, afterSequence }),
-    [afterSequence, filter],
+    () => ({ query: "operationLogs" as const, ...filter, cursor }),
+    [cursor, filter],
   )
   const queryKey = productKeys.operation(scope, "operations", "Operations.QueryLogs", request)
   const logs = useQuery({
     queryKey,
-    queryFn: () => transport.systemQuery(request).then(parseStructuredLogPage),
+    gcTime: 0,
+    queryFn: ({ signal }) => transport.systemQuery(request, { signal }).then(parseStructuredLogPage),
   })
   const exportMutation = useMutation({
     mutationFn: () =>
       transport
-        .operationsControl({ action: "exportLogs", ...filter, afterSequence }, true)
+        .operationsControl({ action: "exportLogs", ...filter, cursor }, true)
         .then(parseDiagnosticArtifactReceipt),
     onSuccess: (next) => {
       setReceipt(next)
@@ -109,10 +108,6 @@ function LogsWorkspace({
     },
   })
 
-  const nextCursor = asUnsignedCursor(logs.data?.nextAfterSequence ?? null)
-  const invalidNextCursor =
-    logs.data?.nextAfterSequence !== null && logs.data !== undefined && nextCursor === null
-  const reachedPageBound = priorCursors.length + 1 >= MAXIMUM_LOG_PAGES
 
   const applyFilters = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -120,8 +115,7 @@ function LogsWorkspace({
     setFilterError(next.error)
     if (next.error) return
     setFilter(next.filter)
-    setAfterSequence(undefined)
-    setPriorCursors([])
+    navigation.restart()
     setSelected(null)
     setReceipt(null)
     exportMutation.reset()
@@ -132,27 +126,11 @@ function LogsWorkspace({
     setDraft(defaultLogFilterDraft)
     setFilter({ limit: 100 })
     setFilterError(null)
-    setAfterSequence(undefined)
-    setPriorCursors([])
+    navigation.restart()
     setSelected(null)
     setReceipt(null)
     exportMutation.reset()
     setAnnouncement("Log filters reset to the bounded default.")
-  }
-
-  const loadNext = () => {
-    if (nextCursor === null || reachedPageBound) return
-    setPriorCursors((current) => [...current, afterSequence])
-    setAfterSequence(nextCursor)
-    setSelected(null)
-  }
-  const loadPrevious = () => {
-    setPriorCursors((current) => {
-      const previous = current.at(-1)
-      setAfterSequence(previous)
-      return current.slice(0, -1)
-    })
-    setSelected(null)
   }
 
   return (
@@ -161,11 +139,11 @@ function LogsWorkspace({
         <Button
           variant="outline"
           size="sm"
-          onClick={() => void logs.refetch()}
+          onClick={() => { navigation.restart(); setSelected(null); if (cursor === undefined) void logs.refetch() }}
           disabled={logs.isFetching}
         >
           <RefreshCw className={cn(logs.isFetching && "animate-spin")} aria-hidden="true" />
-          Refresh query
+          Restart query
         </Button>
       }
     >
@@ -268,18 +246,8 @@ function LogsWorkspace({
         {logs.data && logs.data.records.length === 0 ? <EmptyResults /> : null}
         {logs.data && logs.data.records.length > 0 ? <LogRecords records={logs.data.records} onSelect={setSelected} /> : null}
 
-        {logs.data ? (
-          <Pagination
-            canGoPrevious={priorCursors.length > 0}
-            canGoNext={nextCursor !== null && !reachedPageBound && !invalidNextCursor}
-            isFetching={logs.isFetching}
-            onPrevious={loadPrevious}
-            onNext={loadNext}
-            page={priorCursors.length + 1}
-            reachedPageBound={reachedPageBound && logs.data.nextAfterSequence !== null}
-            invalidNextCursor={invalidNextCursor}
-          />
-        ) : null}
+        <CursorNavigation navigation={navigation} next={logs.data?.nextCursor} busy={logs.isFetching} error={logs.isError}
+          onNavigate={() => setSelected(null)} onRestart={() => { if (cursor === undefined) void logs.refetch() }} />
       </section>
 
       {receipt ? <ArtifactReceipt receipt={receipt} /> : null}
@@ -303,7 +271,7 @@ function LogsWorkspace({
           </DialogHeader>
           <dl className="grid gap-2 rounded-lg border border-border bg-muted/20 p-3 text-sm">
             <ReceiptFact label="Requested records" value={filter.limit.toLocaleString()} />
-            <ReceiptFact label="Current page" value={String(priorCursors.length + 1)} />
+            <ReceiptFact label="Current page" value={String(navigation.page)} />
             <ReceiptFact label="Scope" value={filterSummary(filter)} />
           </dl>
           {exportMutation.isError ? <Alert variant="destructive"><AlertTriangle aria-hidden="true" /><AlertTitle>Export was not published</AlertTitle><AlertDescription>{messageFrom(exportMutation.error)}</AlertDescription></Alert> : null}
@@ -332,10 +300,6 @@ function EmptyResults() { return <div className="mt-4 rounded-xl border border-d
 
 function LogRecords({ records, onSelect }: { records: StructuredLogRecord[]; onSelect: (record: StructuredLogRecord) => void }) {
   return <div className="mt-4 overflow-x-auto rounded-xl border border-border"><table className="w-full min-w-[900px] text-left text-sm" aria-label="Bounded structured log records"><thead className="border-b border-border bg-muted/35 text-[11px] uppercase tracking-wider text-muted-foreground"><tr><th className="px-4 py-3 font-medium">Time</th><th className="px-4 py-3 font-medium">Severity</th><th className="px-4 py-3 font-medium">Domain</th><th className="px-4 py-3 font-medium">Message</th><th className="px-4 py-3 font-medium">Evidence</th><th className="px-4 py-3 font-medium"><span className="sr-only">Details</span></th></tr></thead><tbody>{records.map((record) => <tr key={record.sequence} className="border-b border-border/65 last:border-b-0 hover:bg-accent/25"><td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">{formatTimestamp(record.event.observedAt)}</td><td className="px-4 py-3"><SeverityBadge severity={record.event.severity} /></td><td className="px-4 py-3 font-mono text-xs">{humanize(record.event.domain)}</td><td className="max-w-[420px] px-4 py-3"><p className="line-clamp-2">{record.event.message}</p>{record.event.operation ? <p className="mt-1 font-mono text-[11px] text-muted-foreground">{record.event.operation}</p> : null}</td><td className="px-4 py-3 text-xs text-muted-foreground">{evidenceCount(record)}</td><td className="px-4 py-3"><Button size="sm" variant="ghost" onClick={() => onSelect(record)}>Details</Button></td></tr>)}</tbody></table></div>
-}
-
-function Pagination({ canGoPrevious, canGoNext, isFetching, onPrevious, onNext, page, reachedPageBound, invalidNextCursor }: { canGoPrevious: boolean; canGoNext: boolean; isFetching: boolean; onPrevious: () => void; onNext: () => void; page: number; reachedPageBound: boolean; invalidNextCursor: boolean }) {
-  return <div className="mt-4"><div className="flex flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground"><span aria-live="polite">Bounded page {page} of at most {MAXIMUM_LOG_PAGES}</span><div className="flex gap-2"><Button variant="outline" size="sm" onClick={onPrevious} disabled={!canGoPrevious || isFetching}><ChevronLeft aria-hidden="true" /> Previous</Button><Button variant="outline" size="sm" onClick={onNext} disabled={!canGoNext || isFetching}>Next <ChevronRight aria-hidden="true" /></Button></div></div>{reachedPageBound ? <p className="mt-3 text-xs text-muted-foreground">This view reached its {MAXIMUM_LOG_PAGES}-page safety limit. Narrow the filters to continue examining retained evidence.</p> : null}{invalidNextCursor ? <Alert className="mt-3"><AlertTriangle aria-hidden="true" /><AlertTitle>Pagination cursor was rejected</AlertTitle><AlertDescription>The service returned an invalid cursor, so pagination stopped without substituting or rounding a value.</AlertDescription></Alert> : null}</div>
 }
 
 function ArtifactReceipt({ receipt }: { receipt: DiagnosticArtifactReceipt }) { return <section className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5" aria-labelledby="export-receipt-heading"><div className="flex gap-3"><FileCheck2 className="mt-0.5 size-5 text-primary" aria-hidden="true" /><div className="min-w-0"><h2 id="export-receipt-heading" className="text-sm font-semibold">Controlled export receipt</h2><p className="mt-1 text-sm text-muted-foreground">The service published the bounded, redacted artifact under its controlled artifact authority.</p><dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><ReceiptFact label="Artifact reference" value={receipt.artifactReference} mono /><ReceiptFact label="Size" value={`${groupDecimal(String(receipt.byteLength))} bytes`} /><ReceiptFact label="SHA-256" value={receipt.sha256} mono /></dl></div></div></section> }

@@ -15,6 +15,7 @@ use market_squawk_portfolio::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::{PortfolioApplicationLimits, PortfolioApplicationServiceError};
 
@@ -347,6 +348,8 @@ pub(super) struct AccountHistory {
 pub(super) struct PortfolioReadImage {
     pub(super) accounts: BTreeMap<AccountId, AccountHistory>,
     pub(super) revisions: PortfolioService,
+    pub(super) account_catalog_digest: [u8; 32],
+    pub(super) account_ordinals: Vec<(AccountId, usize)>,
 }
 
 impl PortfolioReadImage {
@@ -370,7 +373,26 @@ impl PortfolioReadImage {
                     .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?,
             )
             .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
-        for history in accounts.values() {
+        let mut catalog_digest = Sha256::new();
+        catalog_digest.update(b"market-squawk/product-account-page/v1\0");
+        catalog_digest.update(
+            u64::try_from(accounts.len())
+                .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?
+                .to_be_bytes(),
+        );
+        let mut account_ordinals = Vec::new();
+        account_ordinals
+            .try_reserve_exact(accounts.len())
+            .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
+        retained_bytes = retained_bytes
+            .checked_add(
+                account_ordinals
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(AccountId, usize)>())
+                    .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?,
+            )
+            .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
+        for (index, (account_id, history)) in accounts.iter().enumerate() {
             if history.revisions.len() > limits.max_history_per_account {
                 return Err(PortfolioApplicationServiceError::ResourceExhausted);
             }
@@ -409,6 +431,27 @@ impl PortfolioReadImage {
                 .revisions
                 .split_last()
                 .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+            if head.account.account_id() != *account_id {
+                return Err(PortfolioApplicationServiceError::CorruptPublication);
+            }
+            let ordinal = index
+                .checked_add(1)
+                .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
+            account_ordinals.push((*account_id, ordinal));
+            catalog_digest.update(account_id.as_uuid().as_bytes());
+            catalog_digest.update(head.token().bytes());
+            catalog_digest.update(head.artifact_sha256);
+            catalog_digest.update(head.account.currency().as_str().as_bytes());
+            catalog_digest.update(
+                u64::try_from(head.holdings.len())
+                    .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?
+                    .to_be_bytes(),
+            );
+            catalog_digest.update(
+                u64::try_from(head.discrepancies.len())
+                    .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?
+                    .to_be_bytes(),
+            );
             current.push(head.core.clone());
             revoked
                 .try_reserve(prior.len())
@@ -427,6 +470,8 @@ impl PortfolioReadImage {
         Ok(Self {
             accounts,
             revisions,
+            account_catalog_digest: catalog_digest.finalize().into(),
+            account_ordinals,
         })
     }
 }

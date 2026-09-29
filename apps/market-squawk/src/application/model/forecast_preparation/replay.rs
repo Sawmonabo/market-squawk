@@ -243,7 +243,6 @@ impl ForecastPreparationAuthority {
                 .await;
         }
         let retained = self.runtime.retain_forecast_runtime()?;
-        let backup = self.runtime.retain_backup()?;
         let current_selector =
             if let Some(current) = coordinates.serving_evidence.current_price_input() {
                 let mut selector = ForecastCurrentFeatureInputSelection::try_new(
@@ -260,23 +259,27 @@ impl ForecastPreparationAuthority {
             } else {
                 None
             };
-        let catalog_request = catalog_request(
-            &retained,
-            &backup,
-            coordinates.serving_evidence.knowledge_cutoff(),
-            current_selector.clone(),
-        )?;
-        let model = catalog_request
-            .models
-            .iter()
-            .find(|model| {
-                let metadata = model.metadata();
-                metadata.model_id() == coordinates.model_id
-                    && metadata.bundle_id() == &coordinates.bundle_id
-                    && metadata.bundle_version() == coordinates.bundle_version
-            })
-            .cloned()
+        let bundle = retained
+            .image
+            .registry
+            .selection(
+                &coordinates.bundle_id,
+                coordinates.bundle_version,
+                deadline,
+                &cancellation,
+            )?
             .ok_or(ForecastPreparationError::ModelUnavailable)?;
+        let model = model_requirement(&retained, &bundle)?;
+        drop(bundle);
+        if model.metadata().model_id() != coordinates.model_id {
+            return Err(ForecastPreparationError::ModelUnavailable);
+        }
+        let catalog_request = ForecastEvidenceCatalogRequest {
+            runtime_generation_sha256: retained.generation_sha256,
+            models: vec![model.clone()].into_boxed_slice(),
+            knowledge_cutoff: coordinates.serving_evidence.knowledge_cutoff(),
+            current_feature_input: current_selector.clone(),
+        };
         let mut selection = ForecastPreparationSelection::try_new(
             coordinates.model_id,
             coordinates.bundle_id,

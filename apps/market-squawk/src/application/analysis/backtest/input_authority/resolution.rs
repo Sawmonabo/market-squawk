@@ -4,9 +4,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use market_squawk_backtesting::{BacktestDataset, BacktestRequest, ResearchExecutionAssumptions};
 use market_squawk_data::{
-    AnalyticalReadCapability, CompleteMarketBarHistoryOutput, CorporateActionPlan,
-    DatasetManifestRef, FeatureDatasetInputEpochOutput, FeatureDatasetProductContract,
-    PinnedDataset, PinnedInstrumentDefinitions, ResearchQueryEngine, Sha256Digest,
+    AnalyticalReadCapability, CorporateActionPlan, DatasetManifestRef,
+    FeatureDatasetProductContract, PinnedDataset, ResearchQueryEngine, Sha256Digest,
 };
 use market_squawk_domain::Timestamp;
 use market_squawk_services::ServiceError;
@@ -37,12 +36,10 @@ pub(super) struct MaterializedInput {
 enum MaterializedBody {
     Generic(PinnedBacktestInput),
     Study {
-        epochs: FeatureDatasetInputEpochOutput,
-        definitions: PinnedInstrumentDefinitions,
+        dataset: BacktestDataset,
         actions: CorporateActionPlan,
         assumptions: ResearchExecutionAssumptions,
-        limits: market_squawk_backtesting::BacktestLimits,
-        histories: Vec<CompleteMarketBarHistoryOutput>,
+
         admitted_at: Timestamp,
     },
 }
@@ -112,25 +109,15 @@ impl MaterializedInput {
     > {
         match self.body {
             MaterializedBody::Study {
-                epochs,
-                definitions,
+                dataset,
                 actions,
                 assumptions,
-                limits,
-                histories,
+
                 admitted_at,
             } => {
                 if actions.knowledge_cutoff() > admitted_at {
                     return Err(ServiceError::InvalidResult);
                 }
-                let dataset = BacktestDataset::try_from_study_input_epochs(
-                    epochs,
-                    definitions,
-                    histories,
-                    admitted_at,
-                    limits,
-                )
-                .map_err(|_| ServiceError::InvalidResult)?;
                 Ok((dataset, actions, assumptions))
             }
             MaterializedBody::Generic(input) => {
@@ -380,7 +367,7 @@ impl BacktestInputMaterializer {
         let study_epochs = if core.daily_history().is_some() {
             let reader = self.research.analytical_reader();
             Some(reader
-                .feature_dataset_input_epochs(
+                .feature_dataset_input_epoch_cursor(
                     FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonStudyInputsV1,
                     &manifest,
                     core.query_limits()
@@ -430,17 +417,24 @@ impl BacktestInputMaterializer {
                 &instrument_definitions,
                 manifests,
             );
-            let mut histories = Vec::new();
-            histories
-                .try_reserve_exact(history.selections().len())
-                .map_err(|_| ServiceError::ResourceExhausted)?;
+            let mut admission = BacktestDataset::begin_study_input_epochs(
+                epochs,
+                instrument_definitions,
+                history.admitted_at(),
+                core.limits().map_err(|_| ServiceError::InvalidResult)?,
+            )
+            .map_err(|_| ServiceError::InvalidResult)?;
             for selection in history.selections() {
                 ensure_live(&cancellation, deadline)?;
                 let request = selection
                     .exact_request()
                     .map_err(|_| ServiceError::InvalidResult)?;
                 let output = reader
-                    .read_complete_market_bar_history(request, deadline, cancellation.clone())
+                    .read_complete_market_bar_history_cursor(
+                        request,
+                        deadline,
+                        cancellation.clone(),
+                    )
                     .await
                     .map_err(|_| lifecycle_error(&cancellation, deadline))?
                     .ok_or(ServiceError::Unavailable)?;
@@ -477,13 +471,18 @@ impl BacktestInputMaterializer {
                 {
                     return Err(ServiceError::InvalidResult);
                 }
-                histories.push(output);
+                source
+                    .validate_accounting_histories(&[&output], deadline, &cancellation)
+                    .map_err(|_| lifecycle_error(&cancellation, deadline))?;
+                admission
+                    .push_cursor(output)
+                    .map_err(|_| ServiceError::InvalidResult)?;
             }
-            let references = histories.iter().collect::<Vec<_>>();
+            let dataset = admission
+                .finish()
+                .map_err(|_| ServiceError::InvalidResult)?;
             let replayed = original_actions.ok_or(ServiceError::Unavailable)?;
-            replayed
-                .validate_accounting_histories(&references, deadline, &cancellation)
-                .map_err(|_| lifecycle_error(&cancellation, deadline))?;
+
             let actions = replayed
                 .into_covered_accounting_plan()
                 .map_err(|_| ServiceError::Unavailable)?;
@@ -505,15 +504,12 @@ impl BacktestInputMaterializer {
             return Ok(MaterializedInput {
                 evidence,
                 body: MaterializedBody::Study {
-                    epochs,
-                    definitions: instrument_definitions,
-                    histories,
+                    dataset,
                     admitted_at: history.admitted_at(),
                     actions,
                     assumptions: core
                         .execution_assumptions()
                         .map_err(|_| ServiceError::InvalidResult)?,
-                    limits: core.limits().map_err(|_| ServiceError::InvalidResult)?,
                 },
             });
         }
@@ -577,7 +573,7 @@ impl BacktestInputMaterializer {
         let limits = core
             .query_limits()
             .map_err(|_| ServiceError::InvalidResult)?;
-        let execution = engine.query_pinned(request, limits, cancellation.clone());
+        let execution = engine.query_pinned_spooled(request, limits, cancellation.clone());
         tokio::pin!(execution);
         let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
         tokio::pin!(deadline_wait);

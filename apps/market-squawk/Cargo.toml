@@ -19,7 +19,6 @@ bls-installed-fixture = [
 ]
 release-evidence = [
     "dep:memory-stats",
-    "dep:tempfile",
     "market-squawk-adapter-kraken/loopback-fixture",
     "market-squawk-backtesting/release-evidence",
     "market-squawk-data/release-evidence",
@@ -136,7 +135,7 @@ tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tempfile = { workspace = true, optional = true }
+tempfile = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 zeroize = { workspace = true }
@@ -157,7 +156,6 @@ windows-permissions = { workspace = true }
 
 [dev-dependencies]
 market-squawk-adapter-kraken = { workspace = true, features = ["loopback-fixture"] }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

@@ -1012,6 +1012,15 @@ impl SealedResearchJournalStore {
             .operation
             .lock()
             .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
+        self.abort_logical_object_inner(pending)
+    }
+
+    // The caller holds the store operation lock. Reuse the same exact owner, identity, and
+    // single-link checks for explicit abort and a consumed finish that never published.
+    fn abort_logical_object_inner(
+        &self,
+        pending: PendingResearchObject,
+    ) -> Result<(), SealedResearchJournalStoreError> {
         self.validate_owner()?;
         self.validate_pending_owner(&pending)?;
         pending.validate_identity()?;
@@ -1044,6 +1053,7 @@ impl SealedResearchJournalStore {
     /// Finishes, fully re-verifies, and publishes a content-addressed `.mro` without replacement.
     ///
     /// Control is checked throughout verification and immediately before the final-link attempt.
+    /// Prepublication failures remove the consumed stage only after the same checks as abort.
     /// Once that link exists, synchronization, stage retirement, and exact reopen proceed without
     /// another cancellation check so a committed object is never reported as pre-commit state.
     pub fn finish_logical_object(
@@ -1055,96 +1065,116 @@ impl SealedResearchJournalStore {
             .operation
             .lock()
             .map_err(|_| SealedResearchJournalStoreError::OperationLockPoisoned)?;
-        self.validate_owner()?;
-        self.validate_pending_owner(&pending)?;
-        pending.file.flush().map_err(|source| {
-            SealedResearchJournalStoreError::io(
-                "failed to flush logical research-object stage",
-                source,
-            )
-        })?;
-        pending.file.sync_all().map_err(|source| {
-            SealedResearchJournalStoreError::io(
-                "failed to synchronize logical research-object stage",
-                source,
-            )
-        })?;
-        pending.validate_identity()?;
-        sync_directory(&pending.staging)?;
-
-        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
-        let rehashed = rehash_prefix(
-            &mut pending.file,
-            pending.size_bytes,
-            pending.admission.integrity_chunk_bytes,
-            pending.admission.maximum_chunks,
-            Some(control),
-        )?;
-        let incremental_digest = EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            pending.whole_hasher.clone().finalize().into(),
-        );
-        if rehashed.prefix_digest != incremental_digest
-            || rehashed.completed_chunks != pending.completed_chunks
-            || rehashed.partial_chunk_bytes != pending.partial_chunk_bytes
-            || rehashed.partial_chunk_digest
-                != (pending.partial_chunk_bytes > 0).then(|| {
-                    EvidenceDigest::new(
-                        DigestAlgorithm::Sha256,
-                        pending.partial_hasher.clone().finalize().into(),
-                    )
-                })
-        {
-            return Err(SealedResearchJournalStoreError::ObjectReceiptMismatch);
-        }
-        let chunks = rehashed.into_all_chunks()?.into_boxed_slice();
-        let content_digest = incremental_digest;
-        let hex = digest_hex(content_digest);
-        let shard_name = &hex[..2];
-        let filename = format!("{hex}{LOGICAL_OBJECT_SUFFIX}");
-        let relative_reference = format!("objects/sha256/{shard_name}/{filename}");
-        let physical_receipt_digest = object_receipt_digest(
-            &relative_reference,
-            content_digest,
-            pending.size_bytes,
-            pending.admission.integrity_chunk_bytes,
-            &chunks,
-        );
-        let claim = ResearchObjectClaim {
-            relative_reference: relative_reference.into_boxed_str(),
-            content_digest,
-            size_bytes: pending.size_bytes,
-            integrity_chunk_bytes: pending.admission.integrity_chunk_bytes,
-            chunks,
-            physical_receipt_digest,
-        };
-        validate_object_claim(&claim)?;
-        let receipt = ResearchObjectReceipt {
-            claim: clone_object_claim(&claim)?,
-        };
-
-        pending.validate_identity()?;
-        let shard = ensure_directory(&self.objects, shard_name)?;
-        let stage_name = pending.stage_name.clone();
-        let published_identity = pending.identity;
-        pending.validate_identity()?;
-        control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
-        let published_new = match self.staging.hard_link(&*stage_name, &shard, &filename) {
-            Ok(()) => true,
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = open_verified_object_from_shard(&shard, &filename, &claim)?;
-                if existing.receipt != receipt {
-                    return Err(SealedResearchJournalStoreError::StateConflict);
-                }
-                false
-            }
-            Err(source) => {
-                return Err(SealedResearchJournalStoreError::io(
-                    "failed to publish logical research object without replacement",
+        let prepared = (|| {
+            self.validate_owner()?;
+            self.validate_pending_owner(&pending)?;
+            pending.file.flush().map_err(|source| {
+                SealedResearchJournalStoreError::io(
+                    "failed to flush logical research-object stage",
                     source,
-                ));
+                )
+            })?;
+            pending.file.sync_all().map_err(|source| {
+                SealedResearchJournalStoreError::io(
+                    "failed to synchronize logical research-object stage",
+                    source,
+                )
+            })?;
+            pending.validate_identity()?;
+            sync_directory(&pending.staging)?;
+
+            control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+            let rehashed = rehash_prefix(
+                &mut pending.file,
+                pending.size_bytes,
+                pending.admission.integrity_chunk_bytes,
+                pending.admission.maximum_chunks,
+                Some(control),
+            )?;
+            let incremental_digest = EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                pending.whole_hasher.clone().finalize().into(),
+            );
+            if rehashed.prefix_digest != incremental_digest
+                || rehashed.completed_chunks != pending.completed_chunks
+                || rehashed.partial_chunk_bytes != pending.partial_chunk_bytes
+                || rehashed.partial_chunk_digest
+                    != (pending.partial_chunk_bytes > 0).then(|| {
+                        EvidenceDigest::new(
+                            DigestAlgorithm::Sha256,
+                            pending.partial_hasher.clone().finalize().into(),
+                        )
+                    })
+            {
+                return Err(SealedResearchJournalStoreError::ObjectReceiptMismatch);
             }
-        };
+            let chunks = rehashed.into_all_chunks()?.into_boxed_slice();
+            let content_digest = incremental_digest;
+            let hex = digest_hex(content_digest);
+            let shard_name = &hex[..2];
+            let filename = format!("{hex}{LOGICAL_OBJECT_SUFFIX}");
+            let relative_reference = format!("objects/sha256/{shard_name}/{filename}");
+            let physical_receipt_digest = object_receipt_digest(
+                &relative_reference,
+                content_digest,
+                pending.size_bytes,
+                pending.admission.integrity_chunk_bytes,
+                &chunks,
+            );
+            let claim = ResearchObjectClaim {
+                relative_reference: relative_reference.into_boxed_str(),
+                content_digest,
+                size_bytes: pending.size_bytes,
+                integrity_chunk_bytes: pending.admission.integrity_chunk_bytes,
+                chunks,
+                physical_receipt_digest,
+            };
+            validate_object_claim(&claim)?;
+            let receipt = ResearchObjectReceipt {
+                claim: clone_object_claim(&claim)?,
+            };
+
+            pending.validate_identity()?;
+            let shard = ensure_directory(&self.objects, shard_name)?;
+            let stage_name = pending.stage_name.clone();
+            let published_identity = pending.identity;
+            pending.validate_identity()?;
+            control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
+            let published_new = match self.staging.hard_link(&*stage_name, &shard, &filename) {
+                Ok(()) => true,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = open_verified_object_from_shard(&shard, &filename, &claim)?;
+                    if existing.receipt != receipt {
+                        return Err(SealedResearchJournalStoreError::StateConflict);
+                    }
+                    false
+                }
+                Err(source) => {
+                    return Err(SealedResearchJournalStoreError::io(
+                        "failed to publish logical research object without replacement",
+                        source,
+                    ));
+                }
+            };
+
+            Ok((
+                claim,
+                receipt,
+                shard,
+                filename,
+                stage_name,
+                published_identity,
+                published_new,
+            ))
+        })();
+        let (claim, receipt, shard, filename, stage_name, published_identity, published_new) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.abort_logical_object_inner(pending)?;
+                    return Err(error);
+                }
+            };
 
         if published_new {
             let completed = (|| {
@@ -3065,6 +3095,45 @@ mod tests {
                 .reverify_for_commit(&Allow)?,
             receipt
         );
+
+        // Finish consumes its stage: cancellation must retire it without leaving an orphan
+        // for restart recovery, both during verification and at the final pre-link boundary.
+        for control in [
+            &CancelVerificationAt(4) as &dyn ResearchObjectControl,
+            &CancelBeforeCommit,
+        ] {
+            let mut cancelled = store.begin_logical_object(admission)?;
+            cancelled.write_all(b"cancelled-before-publication")?;
+            let checkpoint = store.checkpoint_logical_object(&mut cancelled)?;
+            let stage = temporary
+                .path()
+                .join("research-segments/staging")
+                .join(checkpoint.staging_reference());
+            assert!(matches!(
+                store.finish_logical_object(cancelled, control),
+                Err(SealedResearchJournalStoreError::ObjectControl(
+                    ResearchObjectControlError::Cancelled
+                ))
+            ));
+            assert!(!stage.exists());
+        }
+        // A changed payload with the same owned inode and length is still safely abortable.
+        let mut changed = store.begin_logical_object(admission)?;
+        changed.write_all(b"changed-before-publication")?;
+        let checkpoint = store.checkpoint_logical_object(&mut changed)?;
+        let stage = temporary
+            .path()
+            .join("research-segments/staging")
+            .join(checkpoint.staging_reference());
+        let mut tampered = OpenOptions::new().write(true).open(&stage)?;
+        tampered.write_all(b"X")?;
+        tampered.sync_all()?;
+        drop(tampered);
+        assert!(matches!(
+            store.finish_logical_object(changed, &Allow),
+            Err(SealedResearchJournalStoreError::ObjectReceiptMismatch)
+        ));
+        assert!(!stage.exists());
 
         let interrupted_bytes = b"post-link-crash";
         let mut interrupted = store.begin_logical_object(admission)?;

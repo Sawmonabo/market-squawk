@@ -1,3 +1,4 @@
+import { chartDisplaySchema, chartOriginalPointFields } from "../shared/chart-projection"
 import { z } from "zod"
 
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
@@ -163,9 +164,11 @@ const modelEvidenceSchema = z
   })
   .strict()
 
-const modelEvidencePageSchema = z
-  .object({ models: z.array(modelEvidenceSchema).max(4_096) })
-  .strict()
+const modelSummarySchema = modelEvidenceSchema.pick({ modelToken: true, label: true, evidenceState: true })
+const modelSummaryPageSchema = z.object({
+  models: z.array(modelSummarySchema).max(100),
+  nextCursor: z.string().min(1).nullable(),
+}).strict()
 
 const modelActivitySchema = z
   .object({
@@ -178,7 +181,7 @@ const modelActivitySchema = z
   .strict()
 
 const modelActivityPageSchema = z
-  .object({ activities: z.array(modelActivitySchema).max(1_024) })
+  .object({ activities: z.array(modelActivitySchema).max(100), nextCursor: z.string().min(1).max(512).nullable() })
   .strict()
 
 export const forecastSummarySchema = z
@@ -191,16 +194,15 @@ export const forecastSummarySchema = z
     createdAtUnixNanos: losslessIntegerSchema,
     expiresAtUnixNanos: losslessIntegerSchema,
     horizon: productForecastHorizonSchema,
-    historicalObservationCount: z.number().int().nonnegative().max(4_096),
+    historicalObservationCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     limitations: z.array(z.string().min(1).max(4_096)).max(256),
   })
   .strict()
 
 const forecastPageSchema = z
   .object({
-    forecasts: z.array(forecastSummarySchema).max(4_096),
-    available: z.number().int().nonnegative(),
-    truncated: z.boolean(),
+    forecasts: z.array(forecastSummarySchema).max(100),
+    nextCursor: z.string().min(1).nullable(),
   })
   .strict()
 
@@ -307,6 +309,57 @@ const probabilityCalibrationSchema = z.object({
   "A reliability group must distinguish missing outcomes from zero probability.")).length(10),
 }).strict()
 
+export type ForecastChartViewportInput = {
+  startUnixNanos?: string; endUnixNanos?: string; startFiscalOrdinal?: number; endFiscalOrdinal?: number; pointLimit: number
+}
+const fiscalOrdinalSchema = z.number().int().positive().max(4_294_967_295)
+const forecastChartSchema = z.strictObject({
+  forecastToken: z.string().uuid(), target: forecastTargetSchema,
+  coordinateKind: z.enum(["timestamp", "fiscal_period"]),
+  observedThroughUnixNanos: losslessIntegerSchema.nullable(),
+  observedHistory: z.array(observedHistoryPointSchema.extend(chartOriginalPointFields)).max(4_096),
+  estimates: z.array(forecastPointSchema.extend({ originalOrdinal: chartOriginalPointFields.originalOrdinal })).max(512),
+  display: chartDisplaySchema,
+  viewport: z.strictObject({
+    startUnixNanos: losslessIntegerSchema.nullable(), endUnixNanos: losslessIntegerSchema.nullable(),
+    startFiscalOrdinal: fiscalOrdinalSchema.nullable(), endFiscalOrdinal: fiscalOrdinalSchema.nullable(),
+    pointLimit: z.number().int().min(8).max(4_096),
+    fullStartUnixNanos: losslessIntegerSchema.nullable(), fullEndUnixNanos: losslessIntegerSchema.nullable(),
+    fullStartFiscalOrdinal: fiscalOrdinalSchema.nullable(), fullEndFiscalOrdinal: fiscalOrdinalSchema.nullable(),
+  }),
+}).superRefine((chart, context) => {
+  const financial = chart.target.valueKind === "financial_amount"
+  const probability = chart.target.valueKind === "probability"
+  if (financial !== (chart.coordinateKind === "fiscal_period")
+    || financial !== (chart.observedThroughUnixNanos === null)
+    || (financial || probability) && chart.observedHistory.length > 0
+    || chart.display.returnedPointCount !== chart.observedHistory.length
+    || chart.observedHistory.length > chart.viewport.pointLimit
+    || chart.observedHistory.some((point, index) => point.breakBefore.length !== 1
+      || index > 0 && (BigInt(point.originalOrdinal) <= BigInt(chart.observedHistory[index - 1]!.originalOrdinal)
+        || BigInt(point.observedAtUnixNanos) <= BigInt(chart.observedHistory[index - 1]!.observedAtUnixNanos)))
+    || chart.estimates.some((point) => financial
+      ? point.targetAtUnixNanos !== null || point.financialTarget === null
+      : point.targetAtUnixNanos === null || point.financialTarget !== null)
+    || probability && chart.estimates.some((point) => point.ranges !== null || !/^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(point.central.exact))) {
+    context.addIssue({ code: "custom", message: "The forecast projection contradicts its original target, coordinates or display bounds." })
+  }
+})
+export type ForecastChart = z.infer<typeof forecastChartSchema>
+
+export function parseForecastChart(result: ApplicationResult, forecastToken: string, expected: ForecastChartViewportInput): ForecastChart {
+  const chart = forecastChartSchema.parse(result.data)
+  if (chart.forecastToken !== forecastToken || result.metadata.returnedItems !== 1 || result.metadata.availableItems !== 1 || result.metadata.completeness !== "complete"
+    || chart.viewport.pointLimit !== expected.pointLimit
+    || chart.viewport.startUnixNanos !== (expected.startUnixNanos ?? null)
+    || chart.viewport.endUnixNanos !== (expected.endUnixNanos ?? null)
+    || chart.viewport.startFiscalOrdinal !== (expected.startFiscalOrdinal ?? null)
+    || chart.viewport.endFiscalOrdinal !== (expected.endFiscalOrdinal ?? null)) {
+    throw new Error("The selected forecast window could not be verified.")
+  }
+  return chart
+}
+
 export const forecastVintageSchema = z
   .object({
     forecastToken: z.string().uuid(),
@@ -318,8 +371,6 @@ export const forecastVintageSchema = z
     createdAtUnixNanos: losslessIntegerSchema,
     expiresAtUnixNanos: losslessIntegerSchema,
     horizon: productForecastHorizonSchema,
-    observedHistory: z.array(observedHistoryPointSchema).max(4_096),
-    estimates: z.array(forecastPointSchema).min(1).max(512),
     calibration: calibrationSchema.nullable(),
     probabilityCalibration: probabilityCalibrationSchema.nullable(),
     limitations: z.array(z.string().min(1).max(4_096)).max(256),
@@ -331,16 +382,10 @@ export const forecastVintageSchema = z
   .superRefine((vintage, context) => {
     const financial = vintage.target.valueKind === "financial_amount"
     const probability = vintage.target.valueKind === "probability"
-    if (probability ? vintage.calibration !== null || vintage.observedHistory.length !== 0
-      || vintage.estimates.some((point) => point.ranges !== null || !/^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(point.central.exact))
-      : vintage.probabilityCalibration !== null) {
-      context.addIssue({ code: "custom", message: "Event probabilities cannot reuse price history or interval evidence." })
+    if (probability ? vintage.calibration !== null : vintage.probabilityCalibration !== null) {
+      context.addIssue({ code: "custom", message: "Event probabilities cannot reuse price interval evidence." })
     }
-    if (financial !== (vintage.observedThroughUnixNanos === null)
-      || financial && vintage.observedHistory.length !== 0
-      || vintage.estimates.some((point) => financial
-        ? point.targetAtUnixNanos !== null || point.financialTarget === null
-        : point.targetAtUnixNanos === null || point.financialTarget !== null)) {
+    if (financial !== (vintage.observedThroughUnixNanos === null)) {
       context.addIssue({ code: "custom", message: "The forecast mixes fiscal periods and exact timestamps." })
     }
   })
@@ -360,39 +405,45 @@ const forecastOutcomeSchema = z
 const forecastOutcomesSchema = z
   .object({
     forecastToken: z.string().uuid(),
-    outcomes: z.array(forecastOutcomeSchema).max(4_096),
-    available: z.number().int().nonnegative(),
-    truncated: z.boolean(),
+    outcomes: z.array(forecastOutcomeSchema).max(100),
+    nextCursor: z.string().min(1).nullable(),
   })
   .strict()
 
+export type ModelSummary = z.infer<typeof modelSummarySchema>
 export type ModelEvidence = z.infer<typeof modelEvidenceSchema>
 export type ModelActivity = z.infer<typeof modelActivitySchema>
 export type ForecastSummary = z.infer<typeof forecastSummarySchema>
 export type ForecastVintage = z.infer<typeof forecastVintageSchema>
 export type ForecastOutcome = z.infer<typeof forecastOutcomeSchema>
 
-export function parseModelEvidence(result: ApplicationResult): ModelEvidence[] {
-  const parsed = modelEvidencePageSchema.safeParse(result.data)
-  if (!parsed.success) throw new Error("Model evidence is unavailable right now.")
-  return parsed.data.models
+export function parseModelSummaryPage(result: ApplicationResult) {
+  const parsed = modelSummaryPageSchema.safeParse(result.data)
+  if (!parsed.success || result.metadata.returnedItems !== parsed.data.models.length) throw new Error("Model summaries are unavailable right now.")
+  return parsed.data
 }
 
-export function parseModelActivities(result: ApplicationResult): ModelActivity[] {
+export function parseModelEvidence(result: ApplicationResult, expectedModelToken: string): ModelEvidence {
+  const parsed = modelEvidenceSchema.safeParse(result.data)
+  if (!parsed.success || parsed.data.modelToken !== expectedModelToken || result.metadata.returnedItems !== 1) throw new Error("The selected model evidence could not be verified.")
+  return parsed.data
+}
+
+export function parseModelActivities(result: ApplicationResult): { activities: ModelActivity[]; nextCursor: string | null } {
   const parsed = modelActivityPageSchema.safeParse(result.data)
   if (!parsed.success) throw new Error("Research activity is unavailable right now.")
-  return parsed.data.activities
+  if (result.metadata.returnedItems !== parsed.data.activities.length) throw new Error("Research activity counts are inconsistent.")
+  return parsed.data
 }
 
 export interface ForecastPage {
   forecasts: ForecastSummary[]
-  available: number
-  truncated: boolean
+  nextCursor: string | null
 }
 
 export function parseForecasts(result: ApplicationResult): ForecastPage {
   const parsed = forecastPageSchema.safeParse(result.data)
-  if (!parsed.success) throw new Error("Forecasts are unavailable right now.")
+  if (!parsed.success || result.metadata.returnedItems !== parsed.data.forecasts.length) throw new Error("Forecasts are unavailable right now.")
   return parsed.data
 }
 
@@ -405,13 +456,12 @@ export function parseForecastVintage(result: ApplicationResult): ForecastVintage
 export interface ForecastOutcomes {
   forecastToken: string
   outcomes: ForecastOutcome[]
-  available: number
-  truncated: boolean
+  nextCursor: string | null
 }
 
-export function parseForecastOutcomes(result: ApplicationResult): ForecastOutcomes {
+export function parseForecastOutcomes(result: ApplicationResult, expectedForecastToken: string): ForecastOutcomes {
   const parsed = forecastOutcomesSchema.safeParse(result.data)
-  if (!parsed.success) throw new Error("Forecast outcomes are unavailable right now.")
+  if (!parsed.success || parsed.data.forecastToken !== expectedForecastToken || result.metadata.returnedItems !== parsed.data.outcomes.length) throw new Error("Forecast outcomes are unavailable right now.")
   return parsed.data
 }
 

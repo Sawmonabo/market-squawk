@@ -390,12 +390,14 @@ impl PreparedProductTraining {
         let trial = &run["trial"];
         if trial["features"] != self.features
             || trial["seed"] != json!(0)
-            || trial["missing_policy"] != if self.probability {
+            || trial["missing_policy"]
+                != if self.probability {
                     "drop_row"
                 } else {
                     "reject"
                 }
-            || trial["model_kind"] != if self.probability {
+            || trial["model_kind"]
+                != if self.probability {
                     "logistic"
                 } else {
                     "linear"

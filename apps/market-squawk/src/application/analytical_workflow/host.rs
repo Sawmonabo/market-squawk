@@ -311,7 +311,7 @@ pub(super) async fn invoke_analytical_operation(
         return Err(ServiceError::Unauthorized.into());
     }
     let arguments = prepare_analytical_arguments(generation, operation, arguments, authority)?;
-    let structure = JsonStructureLimits::try_new(64, 64 * 1024, 10_000, 2_000)
+    let structure = JsonStructureLimits::try_new(64, 128 * 1024, 10_000, 2_000)
         .map_err(|_| WorkflowError::internal())?;
     market_squawk_services::validate_json_contract(
         &Value::Object(arguments.clone()),
@@ -324,7 +324,7 @@ pub(super) async fn invoke_analytical_operation(
     let request = descriptor
         .admit(arguments)
         .map_err(|_| WorkflowError::from(ServiceError::InvalidRequest))?;
-    let limits = ServiceLimits::try_new(64 * 1024, 1000, 1024 * 1024, 1000, structure)
+    let limits = ServiceLimits::try_new(256 * 1024, 1000, 1024 * 1024, 1000, structure)
         .map_err(|_| WorkflowError::internal())?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let request_cancel = generation.cancellation();

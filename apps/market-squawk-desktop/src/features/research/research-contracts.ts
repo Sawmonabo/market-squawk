@@ -38,35 +38,17 @@ export const researchObservationSchema = z.strictObject({
 
 const inlineObservationResultSchema = z.strictObject({
   kind: z.literal("inline"),
-  rows: z.array(researchObservationSchema),
-})
-
-const artifactObservationResultSchema = z.strictObject({
-  kind: z.literal("artifact"),
-  rowCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  rows: z.array(researchObservationSchema).max(100),
+  nextCursor: z.string().min(1).nullable(),
+  hasMore: z.boolean(),
 })
 
 export type ResearchCollection = z.infer<typeof researchCollectionSchema>
 export type ResearchObservation = z.infer<typeof researchObservationSchema>
-
-export type ResearchObservationResult =
-  | {
-      kind: "empty"
-      returnedItems: number
-      completeness: ResultCompleteness
-    }
-  | {
-      kind: "inline"
-      rows: ResearchObservation[]
-      returnedItems: number
-      completeness: ResultCompleteness
-    }
-  | {
-      kind: "artifact"
-      rowCount: number
-      returnedItems: number
-      completeness: ResultCompleteness
-    }
+export type ResearchObservationResult = z.infer<typeof inlineObservationResultSchema> & {
+  returnedItems: number
+  completeness: ResultCompleteness
+}
 
 export interface ResearchCollectionPage {
   items: ResearchCollection[]
@@ -127,21 +109,10 @@ export function parseResearchObservations(
     returnedItems: result.metadata.returnedItems,
     completeness: resultCompletenessSchema.parse(result.metadata.completeness),
   }
-  if (result.data === null) {
-    validateReturnedItems(result, 0, "research history")
-    return { kind: "empty", ...common }
-  }
-
   const inline = inlineObservationResultSchema.safeParse(result.data)
-  if (inline.success && inline.data.rows.length === result.metadata.returnedItems) {
+  if (inline.success && inline.data.hasMore === (inline.data.nextCursor !== null)) {
     validateReturnedItems(result, inline.data.rows.length, "research history")
     return { ...inline.data, ...common }
-  }
-
-  const artifact = artifactObservationResultSchema.safeParse(result.data)
-  if (artifact.success && artifact.data.rowCount === result.metadata.returnedItems) {
-    validateReturnedItems(result, artifact.data.rowCount, "research history")
-    return { ...artifact.data, ...common }
   }
 
   throw new Error(

@@ -145,12 +145,54 @@ pub struct ModelBundle {
     probability_policy_bytes: Option<Box<[u8]>>,
     forecast_residual_distribution: Option<crate::ForecastResidualDistribution>,
     retained_bytes: usize,
+    forecast_tensor_layout: Option<validation::ForecastTensorLayout>,
 }
 
 #[derive(Debug)]
 enum BundleArtifact {
     Native(NativeArtifact),
     Onnx,
+}
+
+/// Exact immutable selection evidence; deliberately contains no weight bytes or execution authority.
+#[derive(Clone, Debug)]
+pub struct ModelSelectionMetadata {
+    metadata: ModelMetadata,
+    training_run_bytes: Box<[u8]>,
+    residual_distribution_available: bool,
+}
+impl ModelSelectionMetadata {
+    /// Admitted model, dataset, and output contract.
+    #[must_use]
+    pub const fn metadata(&self) -> &ModelMetadata {
+        &self.metadata
+    }
+    /// Exact independently hashed training provenance.
+    #[must_use]
+    pub fn training_run_bytes(&self) -> &[u8] {
+        &self.training_run_bytes
+    }
+    /// Whether initial evidence includes the native admitted residual distribution.
+    #[must_use]
+    pub const fn residual_distribution_available(&self) -> bool {
+        self.residual_distribution_available
+    }
+}
+
+struct LoadedModelMetadata {
+    metadata: ModelMetadata,
+    metadata_bytes: Vec<u8>,
+    training_run_bytes: Vec<u8>,
+    artifact_reference: BundleMetadataRef,
+    training_run_reference: BundleMetadataRef,
+    expected_artifact_size: usize,
+    artifact_byte_limit: usize,
+    forecast_residuals_bytes: Option<Box<[u8]>>,
+    forecast_policy_bytes: Option<Box<[u8]>>,
+    probability_outcomes_bytes: Option<Box<[u8]>>,
+    probability_policy_bytes: Option<Box<[u8]>>,
+    forecast_residual_distribution: Option<crate::ForecastResidualDistribution>,
+    forecast_tensor_layout: Option<validation::ForecastTensorLayout>,
 }
 
 impl ModelBundle {
@@ -169,6 +211,147 @@ impl ModelBundle {
         expectations: &BundleExpectations,
         feature_registry: &FeatureRegistry,
     ) -> Result<Self, BundleError> {
+        let LoadedModelMetadata {
+            metadata,
+            metadata_bytes,
+            training_run_bytes,
+            artifact_reference,
+            training_run_reference,
+            expected_artifact_size,
+            artifact_byte_limit,
+            forecast_residuals_bytes,
+            forecast_policy_bytes,
+            probability_outcomes_bytes,
+            probability_policy_bytes,
+            forecast_residual_distribution,
+            forecast_tensor_layout,
+        } = Self::read_metadata(root, reference, expectations, feature_registry)?;
+        let format = metadata.format();
+        let artifact_hash = metadata.artifact_hash();
+        let artifact_bytes = read_exact_bounded(
+            &root.directory,
+            artifact_reference.relative_path(),
+            artifact_byte_limit,
+            BundleError::ArtifactTooLarge,
+        )?;
+        if artifact_bytes.len() != expected_artifact_size {
+            return Err(BundleError::ArtifactSizeMismatch);
+        }
+        if sha256_digest(&artifact_bytes) != artifact_hash {
+            return Err(BundleError::ArtifactHashMismatch);
+        }
+        let artifact = if format == crate::ModelFormat::Onnx {
+            BundleArtifact::Onnx
+        } else {
+            validate_json_structure(&artifact_bytes)
+                .map_err(|_| BundleError::ArtifactStructureLimit)?;
+            let artifact_wire: NativeArtifactWire =
+                serde_json::from_slice(&artifact_bytes).map_err(|_| BundleError::ArtifactSyntax)?;
+            BundleArtifact::Native(validate_artifact(
+                artifact_wire,
+                format,
+                metadata.features(),
+            )?)
+        };
+
+        let layout_bytes = forecast_tensor_layout.as_ref().map_or(0, |layout| {
+            (layout.lags.len() + layout.horizons.len()) * size_of::<u32>() + layout.strategy.len()
+        });
+        let retained_bytes = size_of::<Self>()
+            .checked_add(layout_bytes)
+            .ok_or(BundleError::RetainedSizeOverflow)?
+            .checked_add(
+                metadata
+                    .retained_bytes()
+                    .ok_or(BundleError::RetainedSizeOverflow)?,
+            )
+            .and_then(|bytes| match &artifact {
+                BundleArtifact::Native(artifact) => bytes.checked_add(artifact.retained_bytes()?),
+                BundleArtifact::Onnx => Some(bytes),
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    probability_outcomes_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    probability_policy_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
+            .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
+            .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
+            .and_then(|bytes| bytes.checked_add(reference.relative_path().len()))
+            .and_then(|bytes| bytes.checked_add(artifact_reference.relative_path().len()))
+            .and_then(|bytes| bytes.checked_add(training_run_reference.relative_path().len()))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    forecast_residuals_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    forecast_policy_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    forecast_residual_distribution
+                        .as_ref()
+                        .map_or(0, crate::ForecastResidualDistribution::retained_bytes),
+                )
+            })
+            .ok_or(BundleError::RetainedSizeOverflow)?;
+        Ok(Self {
+            metadata,
+            artifact,
+            metadata_path: reference.relative_path().into(),
+            artifact_path: artifact_reference.relative_path().into(),
+            training_run_path: training_run_reference.relative_path().into(),
+            metadata_bytes: metadata_bytes.into_boxed_slice(),
+            artifact_bytes: artifact_bytes.into_boxed_slice(),
+            training_run_bytes: training_run_bytes.into_boxed_slice(),
+            forecast_residuals_bytes,
+            forecast_policy_bytes,
+            probability_outcomes_bytes,
+            probability_policy_bytes,
+            forecast_residual_distribution,
+            forecast_tensor_layout,
+            retained_bytes,
+        })
+    }
+
+    /// Reopens admitted selection evidence without reading or compiling the model weight artifact.
+    /// The returned value cannot be used as an inference backend or a newly admitted bundle.
+    pub(crate) fn load_selection_metadata(
+        root: &ControlledModelRoot,
+        reference: &BundleMetadataRef,
+        expectations: &BundleExpectations,
+        feature_registry: &FeatureRegistry,
+    ) -> Result<ModelSelectionMetadata, BundleError> {
+        let loaded = Self::read_metadata(root, reference, expectations, feature_registry)?;
+        Ok(ModelSelectionMetadata {
+            metadata: loaded.metadata,
+            training_run_bytes: loaded.training_run_bytes.into_boxed_slice(),
+            residual_distribution_available: loaded.forecast_residual_distribution.is_some(),
+        })
+    }
+
+    fn read_metadata(
+        root: &ControlledModelRoot,
+        reference: &BundleMetadataRef,
+        expectations: &BundleExpectations,
+        feature_registry: &FeatureRegistry,
+    ) -> Result<LoadedModelMetadata, BundleError> {
         let metadata_bytes = read_exact_bounded(
             &root.directory,
             reference.relative_path(),
@@ -288,6 +471,7 @@ impl ModelBundle {
         let run: TrainingRunWire = serde_json::from_slice(&training_run_bytes)
             .map_err(|_| BundleError::TrainingRunSyntax)?;
         validate_training_run(&run, &wire, expectations, format, output_semantics)?;
+        let forecast_tensor_layout = run.forecast_tensor_layout();
 
         let (
             forecast_calibration,
@@ -382,28 +566,6 @@ impl ModelBundle {
                 None => return Err(BundleError::InvalidProbabilityCalibration),
             };
 
-        let artifact_bytes = read_exact_bounded(
-            &root.directory,
-            artifact_reference.relative_path(),
-            artifact_byte_limit,
-            BundleError::ArtifactTooLarge,
-        )?;
-        if artifact_bytes.len() != expected_artifact_size {
-            return Err(BundleError::ArtifactSizeMismatch);
-        }
-        if sha256_digest(&artifact_bytes) != artifact_hash {
-            return Err(BundleError::ArtifactHashMismatch);
-        }
-        let artifact = if format == crate::ModelFormat::Onnx {
-            BundleArtifact::Onnx
-        } else {
-            validate_json_structure(&artifact_bytes)
-                .map_err(|_| BundleError::ArtifactStructureLimit)?;
-            let artifact_wire: NativeArtifactWire =
-                serde_json::from_slice(&artifact_bytes).map_err(|_| BundleError::ArtifactSyntax)?;
-            BundleArtifact::Native(validate_artifact(artifact_wire, format, &features)?)
-        };
-
         let metadata = ModelMetadata::new(
             expectations,
             metadata_hash,
@@ -419,73 +581,43 @@ impl ModelBundle {
         )
         .with_forecast_calibration(forecast_calibration)
         .with_probability_calibration(probability_calibration);
-        let retained_bytes = size_of::<Self>()
-            .checked_add(
-                metadata
-                    .retained_bytes()
-                    .ok_or(BundleError::RetainedSizeOverflow)?,
-            )
-            .and_then(|bytes| match &artifact {
-                BundleArtifact::Native(artifact) => bytes.checked_add(artifact.retained_bytes()?),
-                BundleArtifact::Onnx => Some(bytes),
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    probability_outcomes_bytes
-                        .as_ref()
-                        .map_or(0, |value| value.len()),
-                )
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    probability_policy_bytes
-                        .as_ref()
-                        .map_or(0, |value| value.len()),
-                )
-            })
-            .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
-            .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
-            .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
-            .and_then(|bytes| bytes.checked_add(reference.relative_path().len()))
-            .and_then(|bytes| bytes.checked_add(artifact_reference.relative_path().len()))
-            .and_then(|bytes| bytes.checked_add(training_run_reference.relative_path().len()))
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    forecast_residuals_bytes
-                        .as_ref()
-                        .map_or(0, |value| value.len()),
-                )
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    forecast_policy_bytes
-                        .as_ref()
-                        .map_or(0, |value| value.len()),
-                )
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    forecast_residual_distribution
-                        .as_ref()
-                        .map_or(0, crate::ForecastResidualDistribution::retained_bytes),
-                )
-            })
-            .ok_or(BundleError::RetainedSizeOverflow)?;
-        Ok(Self {
+        Ok(LoadedModelMetadata {
             metadata,
-            artifact,
-            metadata_path: reference.relative_path().into(),
-            artifact_path: artifact_reference.relative_path().into(),
-            training_run_path: training_run_reference.relative_path().into(),
-            metadata_bytes: metadata_bytes.into_boxed_slice(),
-            artifact_bytes: artifact_bytes.into_boxed_slice(),
-            training_run_bytes: training_run_bytes.into_boxed_slice(),
+            metadata_bytes,
+            training_run_bytes,
+            artifact_reference,
+            training_run_reference,
+            expected_artifact_size,
+            artifact_byte_limit,
             forecast_residuals_bytes,
             forecast_policy_bytes,
             probability_outcomes_bytes,
             probability_policy_bytes,
             forecast_residual_distribution,
-            retained_bytes,
+            forecast_tensor_layout,
+        })
+    }
+
+    /// Copies the already admitted compact selection evidence without retaining weights.
+    #[must_use]
+    pub fn selection_metadata(&self) -> ModelSelectionMetadata {
+        ModelSelectionMetadata {
+            metadata: self.metadata.clone(),
+            training_run_bytes: self.training_run_bytes.clone(),
+            residual_distribution_available: self.forecast_residual_distribution.is_some(),
+        }
+    }
+
+    /// Exact research tensor layout admitted from the hashed training trial:
+    /// raw lag columns, output observation offsets, and fitted strategy.
+    #[must_use]
+    pub fn research_forecast_layout(&self) -> Option<(&[u32], &[u32], &str)> {
+        self.forecast_tensor_layout.as_ref().map(|layout| {
+            (
+                layout.lags.as_ref(),
+                layout.horizons.as_ref(),
+                layout.strategy.as_ref(),
+            )
         })
     }
 

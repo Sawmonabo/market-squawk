@@ -505,3 +505,460 @@ impl FairValueDomainService {
             .await
     }
 }
+
+pub(crate) const MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES: usize = 128 * 1024;
+
+/// Exact filing and action locators. Decoding these coordinates grants no source authority.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FundamentalShareSourceReference {
+    instrument_id: InstrumentId,
+    knowledge_at: Timestamp,
+    filing_result: EvidenceDigest,
+    company_identity: EvidenceDigest,
+    action: crate::application::SourceAppliedCorporateActionPlanReference,
+}
+#[derive(Clone)]
+pub(crate) struct FundamentalShareProjectionSources {
+    pub(crate) bases: Vec<market_squawk_valuation::CommonShareValuationBasis>,
+    pub(crate) reference: Box<[u8]>,
+}
+
+async fn selected_share_filing(
+    research: &ResearchService,
+    instrument: InstrumentId,
+    knowledge_at: Timestamp,
+    context: &RequestContext,
+) -> Result<market_squawk_data::SecResearchIdentitySelection, ServiceError> {
+    let pit = PointInTimeLimits::try_new(
+        SOURCE_READ_ROWS,
+        SOURCE_READ_ROWS,
+        1024,
+        SOURCE_READ_ROWS,
+        SOURCE_READ_BYTES,
+    )
+    .map_err(|_| ServiceError::Internal)?;
+    let request = SecResearchIdentityReadRequest::try_new(
+        instrument,
+        SecResearchFamily::FilingXbrl,
+        knowledge_at,
+        ResearchTemporalCoordinate::calendar_date(
+            knowledge_at
+                .utc_calendar_date()
+                .map_err(|_| ServiceError::InvalidRequest)?,
+        ),
+        PointInTimeRevisionMode::LatestKnown,
+        pit,
+        SOURCE_READ_BYTES,
+    )
+    .map_err(|_| ServiceError::InvalidRequest)?;
+    let selection = research
+        .analytical()
+        .sec_research_reader()
+        .select_by_identity(
+            request,
+            &research.provider_capture_store(),
+            context.deadline(),
+            context.cancellation().clone(),
+        )
+        .await
+        .map_err(map_sec_research_error)?;
+    let SecResearchIdentityOutcome::Exact(selected) = selection.outcome() else {
+        return Err(ServiceError::Unavailable);
+    };
+    let limits = ResearchUseLimits::try_new(
+        64,
+        4096,
+        8192,
+        4096,
+        4 * 1024 * 1024,
+        context
+            .deadline()
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(5)),
+        Duration::from_secs(300),
+    )
+    .map_err(|_| ServiceError::InvalidRequest)?;
+    // Retained local source use still needs actual current LocalAnalysis rights.
+    let authorization = research
+        .authorize_research_use(
+            ResearchUseRequest::try_new(
+                vec![selected.origin().manifest().clone()],
+                ResearchUse::LocalAnalysis,
+                limits,
+            )
+            .map_err(|_| ServiceError::InvalidRequest)?,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .await
+        .map_err(|e| map_research_use_worker_error(e, context))?
+        .map_err(|e| map_research_use_error(e, context))?;
+    let _permit = authorization.into_permit();
+    Ok(selection)
+}
+
+/// Compact source-derived preparation across acquisition; no complete filing payload is retained.
+pub(crate) struct FundamentalShareRequirements {
+    filings: Vec<(
+        market_squawk_valuation::CommonShareFilingEvidence,
+        EvidenceDigest,
+        EvidenceDigest,
+    )>,
+    required: Vec<(InstrumentId, CalendarDate)>,
+}
+impl FundamentalShareRequirements {
+    pub(crate) fn requirements(&self) -> &[(InstrumentId, CalendarDate)] {
+        &self.required
+    }
+}
+
+impl FairValueDomainService {
+    /// Resolve genuine filing and cohort facts before any final valuation quote is sampled.
+    pub(crate) async fn prepare_common_share_requirements(
+        research: &ResearchService,
+        subject: InstrumentId,
+        knowledge_at: Timestamp,
+        context: &RequestContext,
+    ) -> Result<FundamentalShareRequirements, ServiceError> {
+        let filing = compact_share_filing(research, subject, knowledge_at, context).await?;
+        let mut result = FundamentalShareRequirements {
+            required: vec![(subject, filing.0.reported_on())],
+            filings: vec![filing],
+        };
+        // Missing comparable sources do not discard a genuine native-method denominator.
+        let comparable = async {
+            let date = knowledge_at
+                .utc_calendar_date()
+                .map_err(|_| ServiceError::InvalidRequest)?;
+            let subject_facts = Self::select_comparable_fundamentals(
+                research,
+                subject,
+                knowledge_at,
+                date,
+                context,
+            )
+            .await?;
+            let (peers, _) =
+                discover_peers(research, &subject_facts, subject, knowledge_at, context).await?;
+            let FundamentalPeriod::Duration { start, .. } = subject_facts.period else {
+                return Err(ServiceError::Unavailable);
+            };
+            let mut peer_filings = Vec::with_capacity(peers.len());
+            let mut requirements = vec![(subject, start.min(result.filings[0].0.reported_on()))];
+            for peer in peers {
+                let facts = Self::select_comparable_fundamentals(
+                    research,
+                    peer,
+                    knowledge_at,
+                    date,
+                    context,
+                )
+                .await?;
+                if facts.period != subject_facts.period
+                    || facts.industry != subject_facts.industry
+                    || facts.metric.amount().money().currency()
+                        != subject_facts.metric.amount().money().currency()
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                let filing = compact_share_filing(research, peer, knowledge_at, context).await?;
+                requirements.push((peer, start.min(filing.0.reported_on())));
+                peer_filings.push(filing);
+            }
+            Ok::<_, ServiceError>((peer_filings, requirements))
+        }
+        .await;
+        match comparable {
+            Ok((peers, required)) => {
+                result.filings.extend(peers);
+                result.required = required;
+            }
+            Err(
+                ServiceError::Unavailable | ServiceError::NotFound | ServiceError::Unauthorized,
+            ) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(result)
+    }
+}
+
+async fn compact_share_filing(
+    research: &ResearchService,
+    instrument: InstrumentId,
+    knowledge_at: Timestamp,
+    context: &RequestContext,
+) -> Result<
+    (
+        market_squawk_valuation::CommonShareFilingEvidence,
+        EvidenceDigest,
+        EvidenceDigest,
+    ),
+    ServiceError,
+> {
+    let selection = selected_share_filing(research, instrument, knowledge_at, context).await?;
+    let filing = market_squawk_valuation::CommonShareFilingEvidence::try_from_filing(&selection)
+        .map_err(|_| ServiceError::Unavailable)?;
+    let SecResearchIdentityOutcome::Exact(selected) = selection.outcome() else {
+        return Err(ServiceError::Unavailable);
+    };
+    Ok((
+        filing,
+        selected.receipt().result_digest(),
+        selection.identity().receipt().receipt_digest(),
+    ))
+}
+
+/// Bind prepared filing identities to the exact ordered plans finished after final quote sampling.
+/// The serialized result is inert; generation must physically reopen it before using a denominator.
+pub(crate) fn finish_common_share_sources(
+    requirements: FundamentalShareRequirements,
+    actions: Vec<crate::application::SourceAppliedCorporateActionPlanReference>,
+) -> Result<String, ServiceError> {
+    let subject = requirements
+        .filings
+        .first()
+        .ok_or(ServiceError::InvalidResult)?
+        .0
+        .instrument_id();
+    if actions.is_empty()
+        || actions.len() > requirements.filings.len()
+        || actions
+            .first()
+            .is_none_or(|action| action.requested_instruments() != [subject])
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    // Missing peer sources leave the subject usable by native equity models. The
+    // comparable receipt still requires its complete original cohort at admission.
+    let mut actions = actions.into_iter().peekable();
+    let mut sources = Vec::with_capacity(actions.len());
+    for (filing, filing_result, company_identity) in requirements.filings {
+        if actions
+            .peek()
+            .is_some_and(|action| action.requested_instruments() == [filing.instrument_id()])
+        {
+            sources.push(FundamentalShareSourceReference {
+                instrument_id: filing.instrument_id(),
+                knowledge_at: filing.knowledge_at(),
+                filing_result,
+                company_identity,
+                action: actions.next().ok_or(ServiceError::InvalidResult)?,
+            });
+        }
+    }
+    // Unknown, duplicated, or reordered references cannot be rebound to another filing.
+    if actions.next().is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let reference = serde_json::to_string(&sources).map_err(|_| ServiceError::InvalidResult)?;
+    validate_fundamental_share_sources(reference.as_bytes())?;
+    Ok(reference)
+}
+
+/// Select only the original method's exact source set from the bounded final preparation carrier.
+pub(super) async fn select_prepared_fundamental_share_sources(
+    receipt: &AutomaticValuationMethodReceipt,
+    prepared: Option<&str>,
+    research: &ResearchService,
+    actions: &crate::application::SourceAppliedCorporateActionReadCapability,
+    context: &RequestContext,
+) -> Result<FundamentalShareProjectionSources, ServiceError> {
+    let sources =
+        decode_fundamental_share_sources(prepared.ok_or(ServiceError::Unavailable)?.as_bytes())?;
+    let instruments = receipt
+        .common_share_instruments()
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let selected = instruments
+        .iter()
+        .map(|instrument| {
+            sources
+                .iter()
+                .find(|source| source.instrument_id == *instrument)
+                .cloned()
+                .ok_or(ServiceError::Unavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let reference = serde_json::to_vec(&selected).map_err(|_| ServiceError::InvalidResult)?;
+    replay_fundamental_share_sources(receipt, &reference, research, actions, context).await
+}
+
+pub(crate) fn validate_fundamental_share_sources(reference: &[u8]) -> Result<(), ServiceError> {
+    decode_fundamental_share_sources(reference).map(|_| ())
+}
+fn decode_fundamental_share_sources(
+    reference: &[u8],
+) -> Result<Vec<FundamentalShareSourceReference>, ServiceError> {
+    if reference.is_empty() || reference.len() > MAX_FUNDAMENTAL_SHARE_SOURCE_BYTES {
+        return Err(ServiceError::InvalidResult);
+    }
+    let sources: Vec<FundamentalShareSourceReference> =
+        serde_json::from_slice(reference).map_err(|_| ServiceError::InvalidResult)?;
+    if sources.is_empty()
+        || sources.len() > 17
+        || serde_json::to_vec(&sources).map_err(|_| ServiceError::InvalidResult)? != reference
+        || sources.iter().enumerate().any(|(index, source)| {
+            sources[..index]
+                .iter()
+                .any(|prior| prior.instrument_id == source.instrument_id)
+                || source.action.requested_instruments() != [source.instrument_id]
+                || source.action.knowledge_cutoff() < source.knowledge_at
+                || [source.filing_result, source.company_identity]
+                    .iter()
+                    .any(|digest| {
+                        digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
+                    })
+        })
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(sources)
+}
+
+pub(crate) async fn replay_fundamental_share_sources(
+    receipt: &AutomaticValuationMethodReceipt,
+    reference: &[u8],
+    research: &ResearchService,
+    actions: &crate::application::SourceAppliedCorporateActionReadCapability,
+    context: &RequestContext,
+) -> Result<FundamentalShareProjectionSources, ServiceError> {
+    let sources = decode_fundamental_share_sources(reference)?;
+    let instruments = receipt
+        .common_share_instruments()
+        .map_err(|_| ServiceError::InvalidResult)?;
+    if sources.len() != instruments.len() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let mut bases = Vec::with_capacity(sources.len());
+    for (source, instrument) in sources.iter().zip(instruments) {
+        if source.instrument_id != instrument || source.knowledge_at != receipt.measurement_at() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let selection =
+            selected_share_filing(research, instrument, source.knowledge_at, context).await?;
+        let SecResearchIdentityOutcome::Exact(selected) = selection.outcome() else {
+            return Err(ServiceError::Unavailable);
+        };
+        if selected.receipt().result_digest() != source.filing_result
+            || selection.identity().receipt().receipt_digest() != source.company_identity
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        let filing =
+            market_squawk_valuation::CommonShareFilingEvidence::try_from_filing(&selection)
+                .map_err(|_| ServiceError::Unavailable)?;
+        let requirement = receipt
+            .common_share_source_requirement(filing)
+            .map_err(|_| ServiceError::InvalidResult)?;
+        let plan = actions
+            .read_reference(
+                &source.action,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map_err(crate::application::decision::current_share::source_error)?
+            .ok_or(ServiceError::Unavailable)?;
+        bases.push(
+            market_squawk_valuation::CommonShareValuationBasis::try_from_source_plan(
+                filing,
+                plan.share_plan()
+                    .map_err(crate::application::decision::current_share::source_error)?,
+                requirement.1,
+                requirement.2,
+            )
+            .map_err(|_| ServiceError::Unavailable)?,
+        );
+    }
+    Ok(FundamentalShareProjectionSources {
+        bases,
+        reference: reference.into(),
+    })
+}
+
+pub(super) fn native_model_cases(
+    receipt: &AutomaticValuationMethodReceipt,
+) -> Result<AutomaticValuationModelCases, ServiceError> {
+    let mut sources = Vec::<Arc<ForecastValuationSource>>::new();
+    for input in receipt.inputs() {
+        if let EvidenceOrigin::ForecastDistribution { evidence } = input.input().evidence().origin()
+            && !sources
+                .iter()
+                .any(|source| source.reference() == evidence.source().reference())
+        {
+            sources.push(Arc::new(evidence.source().clone()));
+        }
+    }
+    let native = NativeMethodInputs::select(
+        &sources,
+        receipt.method(),
+        receipt.instrument_id(),
+        receipt.measurement_at(),
+    )?;
+    let assumptions = receipt
+        .macro_assumptions()
+        .ok_or(ServiceError::InvalidResult)?;
+    let cap = if receipt.method() == AutomaticValuationMethod::DiscountedCashFlow {
+        Some(
+            assumptions
+                .reference()
+                .annual_yield_percent()
+                .checked_div(Decimal::from(100))
+                .ok_or(ServiceError::InvalidResult)?,
+        )
+    } else {
+        None
+    };
+    let (lower, upper, identity) = native.range(assumptions.assumption().value(), cap)?;
+    let lower = lower.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToNegativeInfinity);
+    let upper = upper.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity);
+    if lower != receipt.range().lower().money().amount()
+        || upper != receipt.range().upper().money().amount()
+        || !receipt
+            .assumptions()
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.kind(),
+                    AutomaticValuationAssumptionKind::UncertaintyLower
+                        | AutomaticValuationAssumptionKind::UncertaintyUpper
+                )
+            })
+            .all(|a| a.evidence() == identity)
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    let identity = market_squawk_decisions::DecisionContentDigest::try_new(identity)
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let (sensitivity_lower, sensitivity_upper) = receipt
+        .original_share_projection_sensitivity()
+        .map_err(|_| ServiceError::InvalidResult)?;
+    Ok(AutomaticValuationModelCases {
+        calculation_identity: receipt.id(),
+        scenarios: market_squawk_decisions::TargetPriceCases::try_new(
+            receipt.range().lower().money(),
+            receipt.range().central().money(),
+            receipt.range().upper().money(),
+        )
+        .map_err(|_| ServiceError::Unavailable)?,
+        scenario_identity: identity,
+        sensitivity_range: market_squawk_decisions::TargetPriceRange::try_new(
+            sensitivity_lower,
+            sensitivity_upper,
+        )
+        .map_err(|_| ServiceError::Unavailable)?,
+        sensitivity_identity: identity,
+    })
+}
+
+/// Controlled artifact dependencies of the same immutable source recipe used by replay.
+pub(crate) fn fundamental_share_recipe_artifacts(
+    reference: &[u8],
+) -> Result<Vec<market_squawk_services::ArtifactReference>, ServiceError> {
+    let sources = decode_fundamental_share_sources(reference)?;
+    sources
+        .iter()
+        .filter_map(|source| source.action.current_recipe_artifact().transpose())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ServiceError::InvalidResult)
+}

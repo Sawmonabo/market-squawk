@@ -3,9 +3,8 @@
 mod round_trip;
 
 pub use round_trip::{
-    AllOriginRoundTripDispositionV1, AllOriginRoundTripEvaluationV1,
-    AllOriginRoundTripEvaluatorV1, AllOriginRoundTripPolicyV1, AllOriginRoundTripResultV1,
-    AllOriginRoundTripUnavailableV1,
+    AllOriginRoundTripDispositionV1, AllOriginRoundTripEvaluationV1, AllOriginRoundTripEvaluatorV1,
+    AllOriginRoundTripPolicyV1, AllOriginRoundTripResultV1, AllOriginRoundTripUnavailableV1,
 };
 
 use std::collections::BTreeSet;
@@ -757,6 +756,7 @@ struct BoundRecommendationSignalV1 {
 /// Immutable observation in a coordinate-fenced PIT information set.
 #[derive(Clone, Copy, Debug)]
 pub struct RecommendationSignalObservationV1<'dataset> {
+    coordinate: Option<&'dataset market_squawk_data::OwnedFeatureDatasetInputCoordinate>,
     observation: &'dataset BacktestObservation,
 }
 
@@ -800,26 +800,17 @@ impl<'dataset> RecommendationSignalObservationV1<'dataset> {
     }
     /// Original sealed source epoch for this coordinate only; no outcome or future panel is exposed.
     pub fn input_epoch(self) -> Option<&'dataset market_squawk_data::FeatureDatasetInputEpoch> {
-        self.observation
-            .input_coordinate
-            .as_ref()
-            .map(|coordinate| coordinate.epoch())
+        self.coordinate.map(|coordinate| coordinate.epoch())
     }
     /// Sealed data-owned epoch and native model rows for this coordinate only.
     pub fn input_coordinate(
         self,
     ) -> Option<market_squawk_data::FeatureDatasetInputCoordinate<'dataset>> {
-        self.observation
-            .input_coordinate
-            .as_ref()
-            .map(|coordinate| coordinate.coordinate())
+        self.coordinate.map(|coordinate| coordinate.coordinate())
     }
     /// Canonically admitted native model rows for this coordinate, never a future panel.
     pub fn input_rows(self) -> &'dataset [market_squawk_data::ForecastFeatureRow] {
-        self.observation
-            .input_coordinate
-            .as_ref()
-            .map_or(&[], |coordinate| coordinate.rows())
+        self.coordinate.map_or(&[], |coordinate| coordinate.rows())
     }
     pub const fn source_selection_as_of(self) -> Timestamp {
         self.observation.source_selection_as_of
@@ -1379,19 +1370,13 @@ impl MaterializedRecommendationSignalPlanV1 {
                 policy.subject_instrument_id(),
                 policy.benchmark().instrument_id(),
             ] {
-                let index = dataset
+                let observation = dataset
                     .observations
-                    .binary_search_by(|observation| {
-                        observation
-                            .decision_at()
-                            .cmp(&signal.signal_at())
-                            .then_with(|| observation.instrument_id().cmp(&instrument))
-                    })
+                    .find(signal.signal_at(), instrument)
                     .map_err(|_| {
                         RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift
                     })?;
-                let observation = &dataset.observations[index];
-                if materialization_target(observation, policy.execution_basis)?
+                if materialization_target(&observation, policy.execution_basis)?
                     != (signal.target_origin(), signal.target_at())
                 {
                     return Err(
@@ -1592,15 +1577,23 @@ impl RecommendationSignalPlanMaterializerV1 {
         let evaluation_ends_at = evaluation_starts_at
             .checked_add_nanos(RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1)
             .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?;
-        let paired_capacity = dataset
-            .observations
-            .iter()
-            .filter(|observation| {
-                observation.instrument_id() == policy.subject_instrument_id()
-                    && observation.decision_at() >= evaluation_starts_at
-                    && observation.decision_at() < evaluation_ends_at
-            })
-            .count();
+        let paired_capacity =
+            dataset
+                .observations
+                .iter()
+                .try_fold(0usize, |count, observation| {
+                    let observation = observation.map_err(|_| {
+                        RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift
+                    })?;
+                    Ok::<_, RecommendationSignalPlanMaterializationErrorV1>(
+                        count
+                            + usize::from(
+                                observation.instrument_id() == policy.subject_instrument_id()
+                                    && observation.decision_at() >= evaluation_starts_at
+                                    && observation.decision_at() < evaluation_ends_at,
+                            ),
+                    )
+                })?;
         if dataset.observations.len() > limits.max_observation_visits
             || paired_capacity > limits.max_signals
         {
@@ -1626,10 +1619,10 @@ impl RecommendationSignalPlanMaterializerV1 {
         let mut previous_decision_at = None;
         let mut subject_terms = None;
         let mut benchmark_terms = None;
-        for coordinate in dataset
-            .observations
-            .chunk_by(|left, right| left.decision_at() == right.decision_at())
-        {
+        for coordinate in dataset.observations.panels() {
+            let coordinate = coordinate.map_err(|_| {
+                RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift
+            })?;
             if coordinate.first().is_none_or(|observation| {
                 observation.decision_at() < evaluation_starts_at
                     || observation.decision_at() >= evaluation_ends_at
@@ -1639,7 +1632,7 @@ impl RecommendationSignalPlanMaterializerV1 {
             let mut subject = None;
             let mut benchmark = None;
             let mut accompanying = None;
-            for observation in coordinate {
+            for observation in &coordinate {
                 let slot = if observation.instrument_id() == policy.subject_instrument_id() {
                     &mut subject
                 } else if observation.instrument_id() == policy.benchmark().instrument_id() {
@@ -1701,13 +1694,31 @@ impl RecommendationSignalPlanMaterializerV1 {
             fold_last[fold_index] = Some(decision_at);
             let (target_origin, target_at) =
                 materialization_target(subject, policy.execution_basis)?;
+            let subject_coordinate = subject
+                .input_coordinate
+                .as_ref()
+                .map(|handle| handle.load())
+                .transpose()
+                .map_err(|_| {
+                    RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift
+                })?;
+            let benchmark_coordinate = benchmark
+                .input_coordinate
+                .as_ref()
+                .map(|handle| handle.load())
+                .transpose()
+                .map_err(|_| {
+                    RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift
+                })?;
             let coordinate = RecommendationSignalInformationCoordinateV1 {
                 study_qualification: policy.study_qualification,
                 subject: RecommendationSignalObservationV1 {
                     observation: subject,
+                    coordinate: subject_coordinate.as_ref(),
                 },
                 benchmark: RecommendationSignalObservationV1 {
                     observation: benchmark,
+                    coordinate: benchmark_coordinate.as_ref(),
                 },
                 target_origin,
                 target_at,
@@ -2003,7 +2014,7 @@ fn validate_materialization_observation(
     policy: RecommendationBacktestPolicyV1,
 ) -> Result<(), RecommendationSignalPlanMaterializationErrorV1> {
     let reporting_currency = policy.reporting_currency();
-    let (origin, _) = materialization_target(observation, policy.execution_basis)?;
+    let (origin, _) = materialization_target(&observation, policy.execution_basis)?;
     if observation.execution_terms.quote_currency() != reporting_currency
         || observation.execution_terms.settlement_denomination()
             != Denomination::Currency(reporting_currency)
@@ -2821,9 +2832,11 @@ impl RecommendationBacktestKernelV1 {
                                 || !coverage
                                     .history_input_manifests()
                                     .contains(&source.manifest)
-                                || coverage.application_starts_at(source.instrument).is_none_or(
-                                    |starts_at| starts_at > policy.corporate_action_coverage_starts_at,
-                                )
+                                || coverage
+                                    .application_starts_at(source.instrument)
+                                    .is_none_or(|starts_at| {
+                                        starts_at > policy.corporate_action_coverage_starts_at
+                                    })
                         })
                     })
             })
@@ -2933,7 +2946,11 @@ impl RecommendationBacktestKernelV1 {
                                 cancellation,
                                 policy.benchmark.instrument_id,
                                 policy.benchmark_quantity,
-                                RoundTripExecutionOrigin::recommendation(policy, signal, b"benchmark"),
+                                RoundTripExecutionOrigin::recommendation(
+                                    policy,
+                                    signal,
+                                    b"benchmark",
+                                ),
                                 target_at,
                                 publication.simulation_cutoff,
                                 limits,
@@ -3193,52 +3210,55 @@ impl ExecutionObservation {
 fn execution_observations_from(
     dataset: &BacktestDataset,
     starts_at: Timestamp,
-) -> impl Iterator<Item = ExecutionObservation> + '_ {
-    let quotes: &[BacktestObservation] = if dataset.daily_history.is_none() {
-        &dataset.observations
-    } else {
-        &[]
-    };
-    let quote_start = quotes.partition_point(|observation| observation.decision_at < starts_at);
-    let quotes = quotes
-        .iter()
-        .skip(quote_start)
-        .map(|observation| ExecutionObservation {
-            execution_terms: observation.execution_terms,
-            decision_at: observation.decision_at(),
-            available_at: observation.available_at(),
-            reference_price: observation
-                .mid_price
-                .and_then(|price| {
-                    price
-                        .checked_to_decimal(observation.execution_terms.price_tick())
-                        .ok()
-                })
-                .map(|amount| Money::new(amount, observation.execution_terms.quote_currency())),
-            spread_basis_points: observation.spread_basis_points,
-            liquidity: ExecutionLiquidity::QuoteDepth(observation.executable_depth),
-            bar_starts_at: None,
-            universe: observation.universe,
-            lineage_digest: observation.lineage_digest,
+) -> impl Iterator<Item = Result<ExecutionObservation, RecommendationBacktestError>> + '_ {
+    let quotes = dataset
+        .observations
+        .from(starts_at)
+        .take(if dataset.daily_history.is_none() {
+            usize::MAX
+        } else {
+            0
+        })
+        .map(|observation| {
+            let observation =
+                observation.map_err(|_| RecommendationBacktestError::InvalidDataset)?;
+            Ok(ExecutionObservation {
+                execution_terms: observation.execution_terms,
+                decision_at: observation.decision_at(),
+                available_at: observation.available_at(),
+                reference_price: observation
+                    .mid_price
+                    .and_then(|price| {
+                        price
+                            .checked_to_decimal(observation.execution_terms.price_tick())
+                            .ok()
+                    })
+                    .map(|amount| Money::new(amount, observation.execution_terms.quote_currency())),
+                spread_basis_points: observation.spread_basis_points,
+                liquidity: ExecutionLiquidity::QuoteDepth(observation.executable_depth),
+                bar_starts_at: None,
+                universe: observation.universe,
+                lineage_digest: observation.lineage_digest,
+            })
         });
     let bars = dataset
         .daily_history
         .as_ref()
-        .map_or(&[][..], |history| &history.bars[..]);
-    let bar_start = bars.partition_point(|bar| bar.ends_at < starts_at);
-    let bars = bars
-        .iter()
-        .skip(bar_start)
-        .map(move |bar| ExecutionObservation {
-            execution_terms: bar.execution_terms,
-            decision_at: bar.ends_at,
-            available_at: bar.available_at,
-            reference_price: Some(bar.close),
-            spread_basis_points: BasisPoints::new(DAILY_BAR_ASSUMED_FULL_SPREAD_BASIS_POINTS),
-            liquidity: ExecutionLiquidity::DailyTradedVolume(bar.traded_volume),
-            bar_starts_at: Some(bar.starts_at),
-            universe: HistoricalUniverseStatus::Eligible,
-            lineage_digest: bar.lineage_digest,
+        .into_iter()
+        .flat_map(move |history| history.bars.from(starts_at))
+        .map(|bar| {
+            let bar = bar.map_err(|_| RecommendationBacktestError::InvalidDataset)?;
+            Ok(ExecutionObservation {
+                execution_terms: bar.execution_terms,
+                decision_at: bar.ends_at,
+                available_at: bar.available_at,
+                reference_price: Some(bar.close),
+                spread_basis_points: BasisPoints::new(DAILY_BAR_ASSUMED_FULL_SPREAD_BASIS_POINTS),
+                liquidity: ExecutionLiquidity::DailyTradedVolume(bar.traded_volume),
+                bar_starts_at: Some(bar.starts_at),
+                universe: HistoricalUniverseStatus::Eligible,
+                lineage_digest: bar.lineage_digest,
+            })
         });
     quotes.chain(bars)
 }
@@ -3462,6 +3482,7 @@ fn first_eligible_observation(
         return Ok(None);
     }
     for observation in execution_observations_from(dataset, starts_at) {
+        let observation = observation?;
         if cancellation.is_cancelled() {
             return Err(RecommendationBacktestError::Cancelled);
         }
@@ -3654,6 +3675,7 @@ fn build_round_trip_outcome(
         *total_equity_points,
     )?;
     for observation in execution_observations_from(dataset, entry_fill.executed_at()) {
+        let observation = observation?;
         if cancellation.is_cancelled() {
             return Err(RecommendationBacktestError::Cancelled);
         }

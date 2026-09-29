@@ -78,7 +78,7 @@ const restoreEvidenceSchema = z.object({
 export const backupInventorySchema = z.object({
   revision: losslessIntegerSchema,
   manifests: z.array(backupManifestSchema).max(64),
-  nextAfterBackupId: sha256Hex.nullable(),
+  nextAfterBackupId: z.string().min(1).max(256).nullable(),
   pendingDeletions: z.number().int().nonnegative(),
 })
 

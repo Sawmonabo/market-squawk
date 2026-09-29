@@ -54,8 +54,8 @@ pub(crate) use corporate_actions::{
 mod dataset_preparation;
 mod equity_premium;
 pub(crate) use equity_premium::{
-    HistoricalOriginEquityPremiumRead, EquityPremiumReadError, EquityPremiumUnavailable,
-    HistoricalEquityPremiumRead, HistoricalEquityPremiumReference,
+    EquityPremiumReadError, EquityPremiumUnavailable, HistoricalEquityPremiumRead,
+    HistoricalEquityPremiumReference, HistoricalOriginEquityPremiumRead,
     MAXIMUM_EQUITY_PREMIUM_REFERENCE_BYTES, required_annual_source_dates,
 };
 pub(crate) mod financial_targets;
@@ -63,17 +63,18 @@ pub(crate) mod fiscal_projection;
 mod forecast_evidence;
 mod fred;
 mod fund_product;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+mod h15_installed_acceptance;
 mod ingest;
 mod instrument_context;
 mod macro_context;
 mod macro_features;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-mod h15_installed_acceptance;
-#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 pub use h15_installed_acceptance::{
     H15InstalledAcceptance, H15InstalledAcceptanceError, H15InstalledAcceptanceRead,
 };
 mod market_history;
+mod observation_page;
 mod options_context;
 mod sec_fund_job;
 mod sec_fund_product;
@@ -88,8 +89,9 @@ pub(crate) use source_errors::{
 };
 
 pub(crate) use benchmark_selection::{
-    RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
-    RecommendationBenchmarkSelectionReference, SelectedRecommendationBenchmark, BenchmarkComparisonChoice,
+    BenchmarkComparisonChoice, RecommendationBenchmarkSelection,
+    RecommendationBenchmarkSelectionReadCapability, RecommendationBenchmarkSelectionReference,
+    SelectedRecommendationBenchmark,
 };
 pub(crate) use company_product::CompanyProductResult;
 pub(crate) use company_research::{
@@ -97,24 +99,23 @@ pub(crate) use company_research::{
     ResearchProductReadCapability, ResearchProductReadError,
 };
 pub(crate) use dataset_preparation::{
-    HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGES,
-    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs, HistoricalFiscalJobReference,
-    HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference, HistoricalFiscalStudyBinding,
-    RecommendationCohortPreparationRequest,
-    ProbabilityBenchmarkSource, ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
-    ProbabilityCohortCoverage, PreparedProbabilityDatasetPair,
-    DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
-    DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
-    DatasetPreparationSelection, DatasetPreparationUse, FeatureDatasetProductionFinalizer,
-    PreparedFeatureDatasetBuild,
     CurrentFindPartitionEvidenceReference, CurrentFindPartitionPreparationEvidence,
-    CurrentFindScreenPartition, PreparedCurrentFindFeaturePartition, PreparedCurrentFindFeatures,
-    FiscalDatasetPreparationRequest, PreparedFiscalDatasetPair,
+    CurrentFindScreenPartition, DatasetPreparationAuthority, DatasetPreparationError,
+    DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
+    DatasetPreparationReceipt, DatasetPreparationSelection, DatasetPreparationUse,
+    FeatureDatasetProductionFinalizer, FiscalDatasetPreparationRequest,
+    HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES,
+    HISTORICAL_FISCAL_MAXIMUM_PAGES, HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs,
     HistoricalFiscalDatasetExpectation, HistoricalFiscalForecastReadCapability,
-    HistoricalFiscalForecastReference, HistoricalFiscalRecipeReference,
-    HistoricalFiscalSourceSelection, HistoricalFiscalTrainingAuthority,
-    HistoricalFiscalUnavailableReference, HistoricalOriginFinancialForecast,
-    PreparedHistoricalFiscalDatasets,
+    HistoricalFiscalForecastReference, HistoricalFiscalJobReference,
+    HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference, HistoricalFiscalRecipeReference,
+    HistoricalFiscalSourceSelection, HistoricalFiscalStudyBinding,
+    HistoricalFiscalTrainingAuthority, HistoricalFiscalUnavailableReference,
+    HistoricalOriginFinancialForecast, PreparedCurrentFindFeaturePartition,
+    PreparedCurrentFindFeatures, PreparedFeatureDatasetBuild, PreparedFiscalDatasetPair,
+    PreparedHistoricalFiscalDatasets, PreparedProbabilityDatasetPair, ProbabilityBenchmarkSource,
+    ProbabilityCohortCoverage, ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
+    RecommendationCohortPreparationRequest,
 };
 pub(crate) use forecast_evidence::{
     AnalyticalForecastEvidenceReader, reopen_forecast_serving_output,
@@ -125,10 +126,12 @@ pub(crate) use fred::{
 pub(crate) use fund_product::FundProductResult;
 pub(crate) use ingest::BoardFullHistoryApplicationError;
 pub(crate) use ingest::{
-    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError, AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
-    AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector, AlpacaOptionMarketPointInTimeSelector,
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
+    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError,
+    AlpacaOptionMarketPointInTimeSelector, AlpacaOptionMarketPublicationReceipt,
+    AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector,
+    AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
     BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BLS_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION,
     BeaDoctorActivationState, BeaMacroApplicationClosure, BeaMacroApplicationError,
     BeaMacroCapabilityState, BeaMacroPlanPublication, BeaProviderPeriodLatestKnownDto,
@@ -136,20 +139,20 @@ pub(crate) use ingest::{
     BeaUnavailableDto, BeaUnavailableReason, BlsMacroApplicationClosure, BlsMacroApplicationError,
     BlsMacroCapabilityState, BlsMacroPlanPublication, BlsMacroUnavailableReason,
     BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto, BlsProviderPeriodLatestKnownRequest,
-    BlsSealFirstExtractionLimits, BlsWholePlanApplicationHandoff, CoinbaseMarketApplicationOutcome,
-    CryptoCommittedRowIngress, CryptoMarketPublicationAuthority, CryptoMarketPublicationClosure,
-    CryptoMarketPublicationError, CryptoMarketSurface, CryptoPendingFrameIngress,
-    CryptoPublicationRendezvousLimits, CensusLiveComposition, CensusMacroApplicationClosure,
-    CensusMacroApplicationError, CensusPublicationReceipt, CensusQuarterlyPointInTimeRequest,
-    CensusQuarterlyRestartReceipt, CensusRestartSelector, CensusSealFirstExtractionLimits,
-    EiaApplicationAcquisitionLimits, EiaLiveComposition,
-    EiaMacroApplicationClosure, EiaMacroApplicationError, EiaMacroEffectiveCutoff,
-    EiaMacroPointInTimeRequest, EiaMacroPublicationReceipt, EiaMacroRestartReceipt,
-    EiaMacroRestartSelector, FredPublishedGenerationHandoff, IexHistApplicationError,
-    IexHistApplicationLane, IexHistCaptureSealHandoff, IexHistCaptureSealRequirements,
-    IexHistCatalogSealHandoff, IexHistClockStatus, IexHistExactJobPreview,
-    IexHistExplicitJobRequest, IexHistInstrumentIdentityBlocker, IexHistInstrumentIdentityStatus,
-    IexHistJobAuthority, IexHistJobStatus, IexHistPhysicalArtifact, IexHistPhysicalSealRequirement,
+    BlsSealFirstExtractionLimits, BlsWholePlanApplicationHandoff, CensusLiveComposition,
+    CensusMacroApplicationClosure, CensusMacroApplicationError, CensusPublicationReceipt,
+    CensusQuarterlyPointInTimeRequest, CensusQuarterlyRestartReceipt, CensusRestartSelector,
+    CensusSealFirstExtractionLimits, CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress,
+    CryptoMarketPublicationAuthority, CryptoMarketPublicationClosure, CryptoMarketPublicationError,
+    CryptoMarketSurface, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+    EiaApplicationAcquisitionLimits, EiaLiveComposition, EiaMacroApplicationClosure,
+    EiaMacroApplicationError, EiaMacroEffectiveCutoff, EiaMacroPointInTimeRequest,
+    EiaMacroPublicationReceipt, EiaMacroRestartReceipt, EiaMacroRestartSelector,
+    FredPublishedGenerationHandoff, IexHistApplicationError, IexHistApplicationLane,
+    IexHistCaptureSealHandoff, IexHistCaptureSealRequirements, IexHistCatalogSealHandoff,
+    IexHistClockStatus, IexHistExactJobPreview, IexHistExplicitJobRequest,
+    IexHistInstrumentIdentityBlocker, IexHistInstrumentIdentityStatus, IexHistJobAuthority,
+    IexHistJobStatus, IexHistPhysicalArtifact, IexHistPhysicalSealRequirement,
     IexHistPublicationAvailability, IexHistPublicationBlocker, IexHistPublicationBlockers,
     IexHistResearchJobLeaf, IexHistSelectionStatus, KrakenMarketApplicationOutcome,
     KrakenSealedRawCanonicalUnavailable, MarketEventDurableRead, MarketEventDurableReadWriter,
@@ -160,11 +163,12 @@ pub(crate) use ingest::{
     SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
     SchwabRestQuotePostSealFailure, SchwabRestQuotePublicationPackage,
     SchwabRestQuoteSourceHealthOutcome, SchwabStreamerApplicationOutcome,
-    SchwabStreamerGenerationAuthority, SchwabStreamerPublicationPackage, SecFundPublicationReceipt, SecLiveFundApplicationError,
-    SecLiveFundRequest, SecLiveFundSource, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
-    TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION, TiingoCompletedEodActionRead,
-    TiingoCompletedEodHistoryReference, TiingoEodHistoryPublicationReceipt,
-    TiingoHistoryApplicationError, TiingoLatestApplicationError, TreasuryApplicationClosure, TreasuryMacroPublicationReceipt,
+    SchwabStreamerGenerationAuthority, SchwabStreamerPublicationPackage, SecFundPublicationReceipt,
+    SecLiveFundApplicationError, SecLiveFundRequest, SecLiveFundSource,
+    TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+    TiingoCompletedEodActionRead, TiingoCompletedEodHistoryReference,
+    TiingoEodHistoryPublicationReceipt, TiingoHistoryApplicationError,
+    TiingoLatestApplicationError, TreasuryApplicationClosure, TreasuryMacroPublicationReceipt,
     TreasurySelectedObjectRequest,
 };
 pub(crate) use ingest::{
@@ -179,30 +183,30 @@ pub use ingest::{
 };
 pub(crate) use instrument_context::{
     FindPopulationCoverage, FindPopulationExclusion, FindPopulationExclusionReason,
-    FindPopulationReference, PreparedFindCandidate, PreparedFindPopulation,
-    prepare_find_population, prepare_fixed_current_population, read_find_population,
-    InstrumentContext, InstrumentContextOutcome, InstrumentContextRead, InstrumentContextReadCapability,
-    InstrumentContextReadError, InstrumentContextRequest, InstrumentIdentityReadCapability,
-    InstrumentIdentityResolutionOutcome, InstrumentIdentityResolutionRead,
-    InstrumentIdentityResolutionRequest, InstrumentOfficialLifecycleEvidence,
-    InstrumentSearchCandidate, InstrumentSearchListing, InstrumentSearchMatchReason,
-    InstrumentSearchRead, InstrumentSearchRequest,
+    FindPopulationReference, InstrumentContext, InstrumentContextOutcome, InstrumentContextRead,
+    InstrumentContextReadCapability, InstrumentContextReadError, InstrumentContextRequest,
+    InstrumentIdentityReadCapability, InstrumentIdentityResolutionOutcome,
+    InstrumentIdentityResolutionRead, InstrumentIdentityResolutionRequest,
+    InstrumentOfficialLifecycleEvidence, InstrumentSearchCandidate, InstrumentSearchListing,
+    InstrumentSearchMatchReason, InstrumentSearchRead, InstrumentSearchRequest,
+    PreparedFindCandidate, PreparedFindPopulation, prepare_find_population,
+    prepare_fixed_current_population, read_find_population,
 };
 pub(crate) use macro_context::{
-    MACRO_CONTEXT_INDICATOR_COUNT, MACRO_GET_CONTEXT, MACRO_GET_LATEST_SERIES_OBSERVATION, MACRO_GET_SERIES_HISTORY, MacroContextOperation, MacroContextReadCapability,
+    MACRO_CONTEXT_INDICATOR_COUNT, MACRO_GET_CONTEXT, MACRO_GET_LATEST_SERIES_OBSERVATION,
+    MACRO_GET_SERIES_HISTORY, MacroContextOperation, MacroContextReadCapability,
     RESIDENTIAL_ELECTRICITY_PRICE_DATASET,
 };
 pub(crate) use macro_features::{
     MacroFeatureVector, MacroInvestmentContext, read_macro_feature_vector,
 };
 pub(crate) use market_history::{
-    HarmonicHistoryEvaluation,
-    MarketHistoryInterval,
-    LatestMarketHistoryReadRequest, MAX_MARKET_HISTORY_BARS, MarketHistoryAdjustmentPolicy,
-    MarketHistoryBar, MarketHistoryCoverage, MarketHistoryMissingReason,
-    MarketHistoryPartialReason, MarketHistoryQuality, MarketHistoryReadCapability,
-    MarketHistoryReadLimit, MarketHistoryReadOutcome, MarketHistorySeries,
-    MarketHistorySessionPolicy, MarketHistoryTimeframe, MarketHistoryUnavailableReason,
+    HarmonicHistoryEvaluation, LatestMarketHistoryReadRequest, MAX_MARKET_HISTORY_BARS,
+    MarketHistoryAdjustmentPolicy, MarketHistoryBar, MarketHistoryCoverage, MarketHistoryInterval,
+    MarketHistoryMissingReason, MarketHistoryPartialReason, MarketHistoryQuality,
+    MarketHistoryReadCapability, MarketHistoryReadLimit, MarketHistoryReadOutcome,
+    MarketHistorySeries, MarketHistorySessionPolicy, MarketHistoryTimeframe,
+    MarketHistoryUnavailableReason, MarketHistoryViewport,
 };
 pub(crate) use options_context::{
     OptionsContextAvailability, OptionsContextError, OptionsContextReadCapability,
@@ -786,19 +790,26 @@ impl ApplicationDomainService for MacroDomainService {
             }
             MACRO_LIST_SERIES => {
                 let limits = effective_service_limits(&request, &context)?;
-                self.controller.macro_context.list_saved_series(&request, &context, limits).await
+                self.controller
+                    .macro_context
+                    .list_saved_series(&request, &context, limits)
+                    .await
             }
             MACRO_GET_LATEST_SERIES_OBSERVATION => {
                 let limits = effective_service_limits(&request, &context)?;
-                self.controller.macro_context.get_latest_saved_series_observation(&request, &context, limits).await
+                self.controller
+                    .macro_context
+                    .get_latest_saved_series_observation(&request, &context, limits)
+                    .await
             }
             MACRO_GET_SERIES_HISTORY => {
                 let limits = effective_service_limits(&request, &context)?;
-                self.controller.macro_context.get_saved_series_history(&request, &context, limits).await
+                self.controller
+                    .macro_context
+                    .get_saved_series_history(&request, &context, limits)
+                    .await
             }
-            MACRO_GET_OBSERVATIONS
-            | MACRO_GET_VINTAGES
-            | MACRO_GET_REVISIONS => {
+            MACRO_GET_OBSERVATIONS | MACRO_GET_VINTAGES | MACRO_GET_REVISIONS => {
                 let limits = effective_service_limits(&request, &context)?;
                 self.controller
                     .observations(
@@ -919,6 +930,14 @@ impl ResearchController {
         limits: ServiceLimits,
         template: AnalyticalObservationTemplate,
     ) -> Result<TypedToolResult, ServiceError> {
+        if matches!(
+            request.name(),
+            RESEARCH_GET_HISTORY | RESEARCH_GET_ALTERNATIVE_DATA
+        ) {
+            return self
+                .observation_page(request, context, limits, template)
+                .await;
+        }
         let dataset = required_dataset(request)?;
         let generation = self
             .reader
@@ -1172,6 +1191,9 @@ async fn observation_result(
                 "rows": rows,
             });
             TypedToolResult::try_new(content, returned, metadata, limits).map_err(Into::into)
+        }
+        QueryResult::Consumed { .. } | QueryResult::Spooled { .. } => {
+            Err(ServiceError::InvalidResult)
         }
         QueryResult::Artifact {
             object,
@@ -1925,6 +1947,7 @@ fn map_query_error(error: QueryError) -> ServiceError {
         | QueryError::RowLimitExceeded { .. }
         | QueryError::ByteLimitExceeded { .. }
         | QueryError::MemoryLimitExceeded { .. }
+        | QueryError::SpillStorageExhausted
         | QueryError::SizeOverflow
         | QueryError::DependencyAllocationContract
         | QueryError::BlockingTaskLimitExceeded

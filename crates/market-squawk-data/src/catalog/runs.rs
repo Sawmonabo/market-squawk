@@ -379,6 +379,7 @@ impl Catalog {
             reservation,
             completion,
             company_identity,
+            None,
             completed_at,
         )?;
         transaction.commit()?;
@@ -395,7 +396,13 @@ impl Catalog {
         }
         let transaction = self.connection.unchecked_transaction()?;
         let reconciled_at = trusted_catalog_now(&transaction)?;
-        persist_company_identity(&transaction, reservation, company_identity, reconciled_at)?;
+        persist_company_identity(
+            &transaction,
+            reservation,
+            company_identity,
+            None,
+            reconciled_at,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -577,9 +584,14 @@ pub(crate) fn complete_ingest_in_transaction(
     reservation: &IngestReservation,
     completion: ContractCompletion,
     company_identity: Option<&CompanyIdentityObservation>,
+    logical_authorization: Option<
+        &crate::ingest::provider_logical_stream::LogicalCompanyIdentityAuthorization,
+    >,
     completed_at: Timestamp,
 ) -> Result<(), CatalogError> {
-    if company_identity.is_some() && completion != ContractCompletion::Succeeded {
+    if (company_identity.is_some() && completion != ContractCompletion::Succeeded)
+        || (logical_authorization.is_some() && company_identity.is_none())
+    {
         return Err(CatalogError::RunStateConflict);
     }
     let operation: Option<String> = transaction
@@ -623,7 +635,13 @@ pub(crate) fn complete_ingest_in_transaction(
         }
     }
     if let Some(company_identity) = company_identity {
-        persist_company_identity(transaction, reservation, company_identity, completed_at)?;
+        persist_company_identity(
+            transaction,
+            reservation,
+            company_identity,
+            logical_authorization,
+            completed_at,
+        )?;
     }
     let changed = transaction.execute(
         "UPDATE ingest_runs SET state=?1, completed_at_ns=?2

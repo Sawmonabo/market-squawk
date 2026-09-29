@@ -37,14 +37,13 @@ use crate::canonical::{
 };
 use crate::{
     TiingoAdapterError, TiingoCaptureMaterialError, TiingoCapturedPage, TiingoCoverage,
-    TiingoEndpointFamily, TiingoEodBarCandidate,
-    TiingoEodContractEvidence, TiingoEodInstrumentAuthority, TiingoEodMapError,
-    TiingoEodMappingInput, TiingoEodProviderActionEvidence, TiingoEodReceipt, TiingoEodSurface,
-    TiingoEodSurfaceGap, TiingoEodSurfaceGapReason, TiingoFundContext,
-    TiingoFundNavContractEvidence, TiingoFundNavMapError, TiingoFundNavMappingInput,
-    TiingoMetadataReceipt, TiingoNavValueState, TiingoPaginationEvidence, TiingoRequestDisposition,
-    TiingoRequestScope, TiingoRequestSpec, map_eod_page_candidate, map_fund_nav_candidate,
-    normalize_mutual_fund_row,
+    TiingoEndpointFamily, TiingoEodBarCandidate, TiingoEodContractEvidence,
+    TiingoEodInstrumentAuthority, TiingoEodMapError, TiingoEodMappingInput,
+    TiingoEodProviderActionEvidence, TiingoEodReceipt, TiingoEodSurface, TiingoEodSurfaceGap,
+    TiingoEodSurfaceGapReason, TiingoFundContext, TiingoFundNavContractEvidence,
+    TiingoFundNavMapError, TiingoFundNavMappingInput, TiingoMetadataReceipt, TiingoNavValueState,
+    TiingoPaginationEvidence, TiingoRequestDisposition, TiingoRequestScope, TiingoRequestSpec,
+    map_eod_page_candidate, map_fund_nav_candidate, normalize_mutual_fund_row,
 };
 
 const TIINGO_CANONICAL_MEDIA_TYPE: &str = "application-json";
@@ -669,11 +668,11 @@ fn eod_observation(
     .map_err(Into::into)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TiingoNativeDailyRowV1 {
     provider_date: Box<str>,
-    selected_surface: &'static str,
+    selected_surface: String,
     open: Option<String>,
     high: Option<String>,
     low: Option<String>,
@@ -694,7 +693,7 @@ impl TiingoNativeDailyRowV1 {
         let (adjusted_open, adjusted_high, adjusted_low, adjusted_close) = row.adjusted_ohlc();
         Self {
             provider_date: row.provider_date().into(),
-            selected_surface,
+            selected_surface: selected_surface.into(),
             open: decimal_string(open),
             high: decimal_string(high),
             low: decimal_string(low),

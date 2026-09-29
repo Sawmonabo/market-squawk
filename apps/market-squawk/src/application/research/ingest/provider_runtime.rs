@@ -698,7 +698,9 @@ impl ResearchProviderAdmission {
 
     pub(super) fn revoke_if_idle(&self) -> bool {
         self.begin_revocation();
-        let Ok(_publication) = self.state.publication_barrier.try_write() else { return false; };
+        let Ok(_publication) = self.state.publication_barrier.try_write() else {
+            return false;
+        };
         self.state.phase.store(ADMISSION_DRAINED, Ordering::Release);
         true
     }
@@ -1085,6 +1087,7 @@ impl CommittedResearchProviderReplacement {
             pending_replacements,
             selections: _,
             alpaca_historical: _,
+            filing_taxonomy_sources: _,
         } = &mut *authority;
         let current = sources
             .get_mut(&self.profile)
@@ -1363,6 +1366,7 @@ impl CommittedResearchProviderPublicationReplacement {
             pending_replacements,
             selections: _,
             alpaca_historical: _,
+            filing_taxonomy_sources: _,
         } = &mut *authority;
         let current = publication_sources
             .get_mut(&self.profile)
@@ -1502,6 +1506,51 @@ impl ResearchProviderRuntimeMutationAuthority {
         }
         if authority.sources.contains_key(generation.profile()) {
             return Err(ResearchIngestCompositionError::DuplicateProfile.into());
+        }
+        // Complete filings retain the independent publishers of their taxonomy components.
+        // Admit those descriptor-bound revisions before SEC can publish the mixed-source graph.
+        // Repeated SEC activation reuses the exact handles and preserves source revocation.
+        {
+            let super::CoordinatorAuthority {
+                registry,
+                filing_taxonomy_sources,
+                ..
+            } = &mut *authority;
+            let registry = registry
+                .as_mut()
+                .ok_or(ResearchIngestCompositionError::ShuttingDown)?;
+            let dependency_count = market_squawk_sources::FILING_TAXONOMY_SOURCE_AUTHORITIES
+                .len()
+                .saturating_sub(1);
+            filing_taxonomy_sources
+                .try_reserve_exact(dependency_count.saturating_sub(filing_taxonomy_sources.len()))
+                .map_err(|_| ResearchIngestCompositionError::AuthorityUnavailable)?;
+            for publisher in market_squawk_sources::FILING_TAXONOMY_SOURCE_AUTHORITIES {
+                if publisher.source_id() == SEC_EDGAR_SOURCE_ID {
+                    continue;
+                }
+                let dependency = publisher
+                    .dependency_source_metadata()
+                    .map_err(|_| ResearchIngestCompositionError::InvalidRuntimeGeneration)?;
+                if let Some(existing) = filing_taxonomy_sources
+                    .iter()
+                    .find(|registered| registered.source_id() == dependency.source_id())
+                {
+                    if registry
+                        .validate_registered(existing, registered_at)
+                        .map_err(ResearchIngestCompositionError::from)?
+                        != &dependency
+                    {
+                        return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration.into());
+                    }
+                } else {
+                    filing_taxonomy_sources.push(
+                        registry
+                            .register_or_resume_exact(dependency, registered_at)
+                            .map_err(ResearchIngestCompositionError::from)?,
+                    );
+                }
+            }
         }
         let (registration, operation) = {
             let registry = authority
@@ -1755,6 +1804,7 @@ impl ResearchProviderRuntimeMutationAuthority {
             pending_replacements: _,
             selections: _,
             alpaca_historical: _,
+            filing_taxonomy_sources: _,
         } = &mut *authority;
         if let Some(current) = publication_sources.get_mut(&profile) {
             if current.generation == generation {
@@ -2444,6 +2494,7 @@ impl ResearchProviderRuntimeMutationAuthority {
             pending_replacements: _,
             selections: _,
             alpaca_historical: _,
+            filing_taxonomy_sources: _,
         } = &mut *authority;
         let current = sources
             .get(expected.profile())
@@ -2591,9 +2642,8 @@ mod tests {
         SchwabRestQuoteSourceEvidence,
     };
     use crate::live_source::{
-        SchwabQualifiedCurrent, SchwabRestQuoteCurrentBridge,
-        SchwabRestQuoteCurrentPublication, SchwabRestQuoteCurrentRequest,
-        SchwabRestQuoteCurrentUnavailable,
+        SchwabQualifiedCurrent, SchwabRestQuoteCurrentBridge, SchwabRestQuoteCurrentPublication,
+        SchwabRestQuoteCurrentRequest, SchwabRestQuoteCurrentUnavailable,
     };
     use crate::provider_activation::{
         MarketInstrumentReferenceBinding, MarketSubscriptionPriority,
@@ -2627,8 +2677,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schwab_quote_attempt_rejects_revoked_epoch_before_current_qualification()
-    -> TestResult {
+    async fn schwab_quote_attempt_rejects_revoked_epoch_before_current_qualification() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
         let session_id = Uuid::new_v4();
         let (oauth, wire, secret_reference) =

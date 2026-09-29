@@ -10,6 +10,8 @@ import {
   ShieldCheck,
 } from "lucide-react"
 
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -60,28 +62,37 @@ export function ForecastPreparation({
   const [preview, setPreview] =
     React.useState<ForecastPreparationPreview | null>(null)
   const [started, setStarted] = React.useState(false)
+  const navigation = useCursorNavigation()
+  const previewAbort = React.useRef<AbortController | null>(null)
+  React.useEffect(() => () => previewAbort.current?.abort(), [])
   const optionsQuery = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
       "Model",
       "Model.GetForecastPreparation",
-      {},
+      { cursor: navigation.after, limit: 25 },
     ),
     enabled: capabilitiesAvailable,
+    gcTime: 0,
     staleTime: 30_000,
-    queryFn: async () =>
+    queryFn: async ({ signal }) =>
       parseForecastPreparationOptions(
-        await transport.forecastPreparation({ action: "options" }),
+        await transport.forecastPreparation({ action: "options", limit: 25, ...(navigation.after === undefined ? {} : { cursor: navigation.after }) }, false, { signal }),
       ),
   })
   const previewMutation = useMutation({
-    mutationFn: async (selection: ForecastPreparationSelection) =>
-      parseForecastPreparationPreview(
-        await transport.forecastPreparation({
-          action: "preview",
-          selection,
-        }),
-      ),
+    mutationFn: async (selection: ForecastPreparationSelection) => {
+      previewAbort.current?.abort()
+      const controller = new AbortController()
+      previewAbort.current = controller
+      try {
+        const result = await transport.forecastPreparation({ action: "preview", selection }, false, { signal: controller.signal })
+        if (controller.signal.aborted) throw new DOMException("The forecast review was closed.", "AbortError")
+        return parseForecastPreparationPreview(result)
+      } finally {
+        if (previewAbort.current === controller) previewAbort.current = null
+      }
+    },
     onSuccess: setPreview,
   })
   const startMutation = useMutation({
@@ -195,6 +206,11 @@ export function ForecastPreparation({
           ) : null}
         </div>
       ) : null}
+
+      {capabilitiesAvailable ? <CursorNavigation navigation={navigation} next={optionsQuery.data?.nextCursor}
+        busy={optionsQuery.isFetching || previewMutation.isPending || startMutation.isPending} error={optionsQuery.isError}
+        onNavigate={() => { setDraft(null); setPreview(null); setStarted(false) }}
+        onRestart={() => { if (navigation.after === undefined) void optionsQuery.refetch() }} /> : null}
 
       <Dialog
         open={preview !== null}

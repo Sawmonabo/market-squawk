@@ -9,7 +9,7 @@ use crate::application::{
 };
 use market_squawk_data::{
     AnalyticalFeatureDataset, DatasetBuildSpecDigest, FeatureDatasetInputCoordinate,
-    FeatureDatasetInputEpochOutput, QueryLimits,
+    FeatureDatasetInputEpochCursor, QueryLimits,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -43,7 +43,7 @@ impl DatasetReference {
         research: &crate::ResearchService,
         contract: FeatureDatasetProductContract,
         context: &RequestContext,
-    ) -> Result<FeatureDatasetInputEpochOutput, ServiceError> {
+    ) -> Result<FeatureDatasetInputEpochCursor, ServiceError> {
         ensure_request(context)?;
         let dataset_id = DatasetId::try_from(self.dataset_id.as_str())
             .map_err(|_| ServiceError::InvalidRequest)?;
@@ -78,7 +78,7 @@ impl DatasetReference {
         )
         .map_err(|_| ServiceError::InvalidRequest)?;
         reader
-            .feature_dataset_input_epochs(
+            .feature_dataset_input_epoch_cursor(
                 contract,
                 manifest,
                 limits,
@@ -106,7 +106,7 @@ impl HistoricalFiscalForecastReference {
     pub(super) fn from_source(
         target_id: String,
         price: FeatureDatasetInputCoordinate<'_>,
-        financial: &FeatureDatasetInputEpochOutput,
+        financial: &FeatureDatasetInputEpochCursor,
         runtime: &SelectedForecastRuntime,
         distribution: Sha256Digest,
         origin: Sha256Digest,
@@ -200,10 +200,9 @@ impl HistoricalFiscalForecastReference {
 
 mod artifact;
 pub(crate) use artifact::{
-    HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGES,
-    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES,
-    HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs, HistoricalFiscalJobReference,
-    HistoricalFiscalOriginDescriptor, HistoricalFiscalPageDescriptor,
+    HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES,
+    HISTORICAL_FISCAL_MAXIMUM_PAGES, HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs,
+    HistoricalFiscalJobReference, HistoricalFiscalOriginDescriptor, HistoricalFiscalPageDescriptor,
     HistoricalFiscalPageReference, HistoricalFiscalRecipeReference,
     HistoricalFiscalSourceSelection, HistoricalFiscalStudyBinding,
 };

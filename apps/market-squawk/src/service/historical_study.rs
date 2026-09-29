@@ -18,7 +18,7 @@ use crate::{
             HistoricalStudyPlanV1, PreparedRecommendationStudyV1,
             ProductionGovernedBacktestInputAuthority, RecommendationStudyPreparationInputV1,
         },
-        analytical_profile::{AnalyticalProfileResolution, ValidatedAnalyticalProfile, revalidate},
+        analytical_profile::{AnalyticalProfileResolution, ValidatedAnalyticalProfile},
         fair_value::{FairValueDomainService, HistoricalStudyValuationReadCapability},
         fiscal_projection_targets,
         market_calendar::CompletedMarketSessionReadCapability,
@@ -28,9 +28,8 @@ use crate::{
     jobs::{InstalledJobAuthority, PreparedProductTraining, TrainingJobRunner},
 };
 use market_squawk_data::{
-    AnalyticalFeatureDataset, FeatureDatasetInputCoordinate,
-    FeatureDatasetInputEpoch, FeatureDatasetInputEpochOutput, FeatureDatasetProductContract,
-    QueryLimits, Sha256Digest,
+    AnalyticalFeatureDataset, FeatureDatasetInputEpoch, FeatureDatasetInputEpochCursor,
+    FeatureDatasetProductContract, OwnedFeatureDatasetInputCoordinate, QueryLimits, Sha256Digest,
 };
 use market_squawk_domain::{AccountId, InstrumentId, Timestamp};
 use market_squawk_services::{
@@ -62,7 +61,9 @@ pub(super) struct InstalledHistoricalStudy {
     inputs: Arc<ProductionGovernedBacktestInputAuthority>,
 }
 impl InstalledHistoricalStudy {
-    pub(super) fn fiscal_reader(&self) -> Option<Arc<crate::application::HistoricalFiscalForecastReadCapability>> {
+    pub(super) fn fiscal_reader(
+        &self,
+    ) -> Option<Arc<crate::application::HistoricalFiscalForecastReadCapability>> {
         self.fiscal_reader.as_ref().map(Arc::clone)
     }
 
@@ -123,9 +124,9 @@ impl InstalledHistoricalStudy {
         context: &RequestContext,
     ) -> Result<HistoricalStudyPlanV1, ServiceError> {
         context.origin().ok_or(ServiceError::Unauthorized)?;
-        let catalog = forecasts.financial_profile_catalog(context).await?;
-        let profile = revalidate(reference.financial_profile(), catalog.as_ref())
-            .map_err(ServiceError::from)?;
+        let profile = forecasts
+            .revalidate_profile(reference.financial_profile(), context)
+            .await?;
         let cutoff = reference.source_cutoff()?;
         let identities = self.identities.as_ref().ok_or(ServiceError::Unavailable)?;
         let identity = identities
@@ -174,9 +175,9 @@ impl InstalledHistoricalStudy {
         if cutoff.to_string() != input.source_cutoff_unix_nanos {
             return Err(ServiceError::InvalidRequest);
         }
-        let catalog = forecasts.financial_profile_catalog(context).await?;
-        let profile =
-            revalidate(&input.financial_profile, catalog.as_ref()).map_err(ServiceError::from)?;
+        let profile = forecasts
+            .revalidate_profile(&input.financial_profile, context)
+            .await?;
         let identities = self.identities.as_ref().ok_or(ServiceError::Unavailable)?;
         let identity = identities
             .read(
@@ -551,7 +552,7 @@ impl InstalledHistoricalStudy {
         plan: &HistoricalStudyPlanV1,
         job: &JobReference,
         context: &RequestContext,
-    ) -> Result<(AnalyticalFeatureDataset, FeatureDatasetInputEpochOutput), ServiceError> {
+    ) -> Result<(AnalyticalFeatureDataset, FeatureDatasetInputEpochCursor), ServiceError> {
         let study_job = self
             .training
             .snapshot(&job.job_id, job.generation, context)
@@ -602,7 +603,7 @@ impl InstalledHistoricalStudy {
         &self,
         dataset: &AnalyticalFeatureDataset,
         context: &RequestContext,
-    ) -> Result<FeatureDatasetInputEpochOutput, ServiceError> {
+    ) -> Result<FeatureDatasetInputEpochCursor, ServiceError> {
         let limits = QueryLimits::try_new_with_inline_bytes(
             32768,
             32 * 1024 * 1024,
@@ -616,7 +617,7 @@ impl InstalledHistoricalStudy {
         .map_err(|_| ServiceError::InvalidRequest)?;
         self.research
             .analytical_reader()
-            .feature_dataset_input_epochs(
+            .feature_dataset_input_epoch_cursor(
                 dataset.product_contract(),
                 dataset.generation().manifest(),
                 limits,
@@ -673,7 +674,7 @@ impl InstalledHistoricalStudy {
         &self,
         runner: &TrainingJobRunner,
         plan: &HistoricalStudyPlanV1,
-        prices: &FeatureDatasetInputEpochOutput,
+        prices: &FeatureDatasetInputEpochCursor,
         page: &HistoricalFiscalPageDescriptor,
         jobs: Vec<CompletedFiscalTarget>,
         context: &RequestContext,
@@ -732,7 +733,7 @@ impl InstalledHistoricalStudy {
                         }
                         unavailable.push(HistoricalFiscalUnavailableReference::from_source(
                             &target.target_id,
-                            price,
+                            price.coordinate(),
                             error,
                         )?);
                         continue;
@@ -812,8 +813,13 @@ impl InstalledHistoricalStudy {
                     .as_ref()
                     .ok_or(ServiceError::Unavailable)?
                     .select_completed_historical_runtimes(&[model])?;
-                let forecast =
-                    expectation.forecast(&self.research, &runtime, &output, price, context)?;
+                let forecast = expectation.forecast(
+                    &self.research,
+                    &runtime,
+                    &output,
+                    price.coordinate(),
+                    context,
+                )?;
                 completed.push((
                     forecast.reference().clone(),
                     HistoricalFiscalCompletedJobs {
@@ -913,20 +919,23 @@ fn fiscal_target(id: &str) -> Result<FiscalProjectionTarget, ServiceError> {
         .find(|target| target.target_id == id)
         .ok_or(ServiceError::InvalidRequest)
 }
-fn price_coordinate<'a>(
-    prices: &'a FeatureDatasetInputEpochOutput,
+fn price_coordinate(
+    prices: &FeatureDatasetInputEpochCursor,
     example: &str,
     instrument: InstrumentId,
-) -> Result<FeatureDatasetInputCoordinate<'a>, ServiceError> {
-    let mut matches =
-        prices.epochs().iter().enumerate().filter(|(_, epoch)| {
-            epoch.example_id() == example && epoch.instrument_id() == instrument
-        });
-    let (index, _) = matches.next().ok_or(ServiceError::InvalidRequest)?;
-    if matches.next().is_some() {
-        return Err(ServiceError::InvalidResult);
+) -> Result<OwnedFeatureDatasetInputCoordinate, ServiceError> {
+    let mut selected = None;
+    for coordinate in prices.coordinates() {
+        let coordinate = coordinate.map_err(crate::application::map_source_analytical_error)?;
+        if coordinate.epoch().example_id() == example
+            && coordinate.epoch().instrument_id() == instrument
+        {
+            if selected.replace(coordinate).is_some() {
+                return Err(ServiceError::InvalidResult);
+            }
+        }
     }
-    prices.coordinate(index).ok_or(ServiceError::InvalidResult)
+    selected.ok_or(ServiceError::InvalidRequest)
 }
 
 #[derive(Deserialize)]

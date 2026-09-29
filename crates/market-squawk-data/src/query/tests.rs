@@ -53,6 +53,23 @@ fn query_artifact_identity_binds_exact_row_schema() -> TestResult {
         Duration::from_secs(1),
     )?;
 
+    let independent = QueryLimits::try_new(
+        2,
+        128 * 1024 * 1024,
+        8 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(1),
+    )?
+    .with_spill_bytes(512 * 1024 * 1024)?;
+    assert!(independent.max_bytes() > independent.max_memory_bytes());
+    assert_ne!(
+        QueryRequest::try_new(first.clone(), "SELECT 1")?.artifact_identity(&limits),
+        QueryRequest::try_new(first.clone(), "SELECT 1")?
+            .artifact_identity(&limits.with_spill_bytes(1024)?)
+    );
+
     assert_ne!(
         QueryRequest::try_new(first, "SELECT 1")?.artifact_identity(&limits),
         QueryRequest::try_new(second, "SELECT 1")?.artifact_identity(&limits)

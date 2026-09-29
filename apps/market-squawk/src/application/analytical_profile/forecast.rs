@@ -23,6 +23,24 @@ impl ValidatedAnalyticalProfile {
         source_cutoff: Timestamp,
         cohort: Option<&crate::application::market_calendar::ForecastSessionCohort>,
     ) -> Result<ForecastPreparationSelection, AnalyticalProfileError> {
+        self.select_forecast_ranked(catalog, instrument_id, source_cutoff, cohort)
+            .map(|(selection, _)| selection)
+    }
+
+    /// Applies the same total ordering within and across immutable inventory pages.
+    pub(crate) fn select_forecast_ranked(
+        &self,
+        catalog: &ForecastPreparationCatalog,
+        instrument_id: InstrumentId,
+        source_cutoff: Timestamp,
+        cohort: Option<&crate::application::market_calendar::ForecastSessionCohort>,
+    ) -> Result<
+        (
+            ForecastPreparationSelection,
+            (Timestamp, Timestamp, u64, [u8; 32], [u8; 32], u64),
+        ),
+        AnalyticalProfileError,
+    > {
         let horizon = self.horizon();
         let mut selected: Option<(
             &ForecastModelSummary,
@@ -77,7 +95,8 @@ impl ValidatedAnalyticalProfile {
                 .forecast_max_age_nanos,
         )
         .map_err(|_| AnalyticalProfileError::InvalidPolicy)?;
-        ForecastPreparationSelection::try_new(
+        let rank = selection_key(model, dataset, policy);
+        let selection = ForecastPreparationSelection::try_new(
             model.model_id(),
             model.bundle_id().clone(),
             model.bundle_version(),
@@ -87,7 +106,8 @@ impl ValidatedAnalyticalProfile {
             horizon,
             policy.maximum_validity_nanos().get().min(maximum_age),
         )
-        .map_err(|_| AnalyticalProfileError::InvalidPolicy)
+        .map_err(|_| AnalyticalProfileError::InvalidPolicy)?;
+        Ok((selection, rank))
     }
 
     fn selects_model(&self, model: &ForecastModelSummary) -> bool {

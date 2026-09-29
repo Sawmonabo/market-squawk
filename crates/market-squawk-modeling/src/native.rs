@@ -70,6 +70,107 @@ pub trait InferenceBackend: Send + Sync {
     ///
     /// Returns a typed contract or finite-arithmetic failure and never substitutes a score.
     fn infer(&self, input: &ModelInput<'_>) -> Result<ModelOutput, InferenceError>;
+
+    /// Evaluates the distinct lagged research tensor contract without creating trading signals.
+    fn infer_research(
+        &self,
+        _input: &ResearchForecastInput<'_>,
+    ) -> Result<ResearchForecastOutput, InferenceError> {
+        Err(InferenceError::FeatureShapeMismatch)
+    }
+
+    /// Releases active runtime resources after the last application lease ends.
+    fn retire(&self) -> Result<(), InferenceError> {
+        Ok(())
+    }
+}
+
+/// One research origin with explicit lag-column order and exact exogenous feature identities.
+#[derive(Clone, Copy, Debug)]
+pub struct ResearchForecastInput<'a> {
+    exogenous: ModelInput<'a>,
+    lag_offsets: &'a [u32],
+    lag_values: &'a [f64],
+}
+
+impl<'a> ResearchForecastInput<'a> {
+    /// Binds finite raw lag values to their increasing positive observation offsets.
+    pub fn try_new(
+        exogenous: ModelInput<'a>,
+        lag_offsets: &'a [u32],
+        lag_values: &'a [f64],
+    ) -> Result<Self, InferenceError> {
+        if lag_offsets.is_empty()
+            || lag_offsets.len() != lag_values.len()
+            || lag_offsets.contains(&0)
+            || lag_offsets.windows(2).any(|pair| pair[0] >= pair[1])
+            || lag_values.iter().any(|value| !value.is_finite())
+        {
+            return Err(InferenceError::FeatureShapeMismatch);
+        }
+        Ok(Self {
+            exogenous,
+            lag_offsets,
+            lag_values,
+        })
+    }
+
+    pub(crate) fn exogenous(&self) -> &ModelInput<'a> {
+        &self.exogenous
+    }
+    pub(crate) fn lag_offsets(&self) -> &[u32] {
+        self.lag_offsets
+    }
+    pub(crate) fn lag_values(&self) -> &[f64] {
+        self.lag_values
+    }
+}
+
+/// Finite research values indexed by observation offsets, never economic timestamps or probabilities.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResearchForecastOutput {
+    metadata_hash: market_squawk_data::Sha256Digest,
+    artifact_hash: market_squawk_data::Sha256Digest,
+    horizon_offsets: Box<[u32]>,
+    values: Box<[f64]>,
+}
+
+impl ResearchForecastOutput {
+    pub(crate) fn new(
+        metadata_hash: market_squawk_data::Sha256Digest,
+        artifact_hash: market_squawk_data::Sha256Digest,
+        horizon_offsets: &[u32],
+        values: Vec<f64>,
+    ) -> Self {
+        Self {
+            metadata_hash,
+            artifact_hash,
+            horizon_offsets: horizon_offsets.into(),
+            values: values.into_boxed_slice(),
+        }
+    }
+
+    /// Exact admitted metadata identity binding this output to model, dataset, and training evidence.
+    #[must_use]
+    pub const fn metadata_hash(&self) -> market_squawk_data::Sha256Digest {
+        self.metadata_hash
+    }
+
+    /// Exact graph identity which binds lag order, strategy, and output-column mapping.
+    #[must_use]
+    pub const fn artifact_hash(&self) -> market_squawk_data::Sha256Digest {
+        self.artifact_hash
+    }
+    /// Increasing positive observation offsets; recursive models return their fitted one-step offset.
+    #[must_use]
+    pub fn horizon_offsets(&self) -> &[u32] {
+        &self.horizon_offsets
+    }
+    /// Finite values in the same order as the explicit horizon offsets.
+    #[must_use]
+    pub fn values(&self) -> &[f64] {
+        &self.values
+    }
 }
 
 /// Native affine backend supporting the closed linear and logistic link families.

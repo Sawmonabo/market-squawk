@@ -89,16 +89,16 @@ pub fn run_release_evidence_backtest()
         emitted: false,
     };
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
-    let filled_lots = result.fills().iter().try_fold(0_i64, |total, fill| {
+    let filled_lots = result.fills()?.iter().try_fold(0_i64, |total, fill| {
         total.checked_add(fill.quantity().get())
     });
-    let partial_fill_count = result.fills().iter().filter(|fill| fill.partial()).count();
+    let partial_fill_count = result.fills()?.iter().filter(|fill| fill.partial()).count();
     let fees = result
-        .fills()
+        .fills()?
         .iter()
         .map(|fill| fill.fee().amount())
         .sum::<Decimal>();
-    if result.fills().len() != 2
+    if result.fills()?.len() != 2
         || filled_lots != Some(4)
         || partial_fill_count != 2
         || result.accounting_reconciliation() != AccountingReconciliation::Independent
@@ -109,7 +109,7 @@ pub fn run_release_evidence_backtest()
         dataset_identity_sha256: dataset_identity.bytes(),
         object_graph_sha256: object_graph.bytes(),
         result_sha256: result.result_digest().bytes(),
-        fill_count: result.fills().len(),
+        fill_count: result.fills()?.len(),
         filled_lots: filled_lots.ok_or(ReleaseEvidenceBacktestError::InvalidFixture)?,
         partial_fill_count,
         execution_policy_version: RESEARCH_EXECUTION_POLICY_VERSION,

@@ -17,6 +17,7 @@ import type {
   ProfileOptions,
 } from "./analytical-profile-contracts"
 import { useAnalyticalControllerStatus } from "./use-analytical-profile"
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 import { FinancialPreferenceControls, RequiredAnalysisSettings, preferenceInput } from "./financial-preference-controls"
 
 type ControllerTransport = Pick<ProductTransport, "analyticalController">
@@ -29,27 +30,17 @@ export function ProfileControls({ transport, scope }: {
   const [name, setName] = useState("")
   const [confirmation, setConfirmation] = useState<AnalyticalControllerRequest | null>(null)
   const [historyVisible, setHistoryVisible] = useState(false)
-  const [historyCursor, setHistoryCursor] = useState<string | undefined>()
   const key = productKeys.operation(scope, "analysis", "Desktop.AnalyticalProfiles", {})
   const profiles = useAnalyticalControllerStatus(transport, scope)
+  const optionsNavigation = useCursorNavigation()
   const options = useQuery({
-    queryKey: [...key, "options"],
-    queryFn: async () => {
-      const response = await transport.analyticalController({ action: "profileOptions" })
+    queryKey: [...key, "options", { cursor: optionsNavigation.after, limit: 25 }],
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
+      const response = await transport.analyticalController({ action: "profileOptions", cursor: optionsNavigation.after, limit: 25 }, false, { signal })
       if (response.kind !== "profile_options") throw new Error("Analysis choices could not be opened.")
       return response.options
     },
-  })
-  const history = useQuery({
-    queryKey: [...key, "history", historyCursor],
-    queryFn: async () => {
-      const response = await transport.analyticalController({
-        action: "history", afterToken: historyCursor, limit: 20,
-      })
-      if (response.kind !== "history") throw new Error("Profile history could not be opened.")
-      return response
-    },
-    enabled: historyVisible,
   })
   const change = useMutation({
     mutationFn: (request: AnalyticalControllerRequest) =>
@@ -121,6 +112,9 @@ export function ProfileControls({ transport, scope }: {
               Available models and required settings could not be refreshed.
               <Button variant="link" size="sm" onClick={() => void options.refetch()}>Retry available choices</Button>
             </p> : null}
+            <p className="mt-4 text-xs text-muted-foreground">Browse available forecast models. Each profile keeps its selected model when the choice page changes.</p>
+            <CursorNavigation navigation={optionsNavigation} next={options.data?.nextCursor} busy={options.isFetching || change.isPending} error={options.isError}
+              onRestart={() => { if (optionsNavigation.after === undefined) void options.refetch() }} />
             <RequiredAnalysisSettings options={options.data} />
           </>}
       {change.isError ? <ProfileError /> : null}
@@ -144,26 +138,35 @@ export function ProfileControls({ transport, scope }: {
         aria-expanded={historyVisible}>
         <History aria-hidden="true" /> {historyVisible ? "Hide profile history" : "View profile history"}
       </Button>
-      {historyVisible ? history.isPending ? <Skeleton className="mt-3 h-24 w-full" />
-        : history.isError ? <ProfileError /> : (
-          <div className="mt-3 rounded-lg border border-border p-4">
-            <ol className="space-y-3">
-              {history.data.entries.map((entry) => (
-                <li key={entry.historyToken} className="flex flex-wrap justify-between gap-2 text-xs">
-                  <span><strong>{entry.profileName}</strong> · {historyLabel(entry.action)}</span>
-                  <span className="text-muted-foreground">{formatUnixNanos(entry.recordedAt)}</span>
-                </li>
-              ))}
-            </ol>
-            <div className="mt-4 flex gap-2">
-              {historyCursor ? <Button size="sm" variant="outline" onClick={() => setHistoryCursor(undefined)}>Start of history</Button> : null}
-              {history.data.nextAfterToken ? <Button size="sm" variant="outline"
-                onClick={() => setHistoryCursor(history.data.nextAfterToken ?? undefined)}>Next entries</Button> : null}
-            </div>
-          </div>
-        ) : null}
+      {historyVisible ? <ProfileHistoryRead transport={transport} scope={scope} /> : null}
     </section>
   )
+}
+
+function ProfileHistoryRead({ transport, scope }: {
+  transport: ControllerTransport
+  scope: ProductScope
+}) {
+  const navigation = useCursorNavigation()
+  const history = useQuery({
+    queryKey: [...productKeys.operation(scope, "analysis", "Desktop.AnalyticalProfiles", {}), "history", navigation.after],
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
+      const response = await transport.analyticalController({ action: "history", afterToken: navigation.after, limit: 20 }, false, { signal })
+      if (response.kind !== "history") throw new Error("Profile history could not be opened.")
+      return response
+    },
+  })
+  return <div className="mt-3 rounded-lg border border-border p-4">
+    {history.isPending ? <Skeleton className="h-24 w-full" /> : history.isError ? <ProfileError /> : <ol className="space-y-3">
+      {history.data.entries.map((entry) => <li key={entry.historyToken} className="flex flex-wrap justify-between gap-2 text-xs">
+        <span><strong>{entry.profileName}</strong> · {historyLabel(entry.action)}</span>
+        <span className="text-muted-foreground">{formatUnixNanos(entry.recordedAt)}</span>
+      </li>)}
+    </ol>}
+    <CursorNavigation navigation={navigation} next={history.data?.nextAfterToken} busy={history.isFetching}
+      onRestart={() => { if (navigation.after === undefined) void history.refetch() }} />
+  </div>
 }
 
 function ProfileEditor({ profile, busy, options, activationToken, onChange, onConfirm }: {

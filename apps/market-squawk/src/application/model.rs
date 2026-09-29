@@ -24,7 +24,7 @@ use market_squawk_services::{
     ArtifactError, ArtifactReadContext, ArtifactReference, RequestContext, ServiceDomain,
     ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
-use rust_decimal::{Decimal, prelude::FromPrimitive as _};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -47,9 +47,7 @@ mod outcome_preparation;
 mod read_image;
 pub mod runtime;
 
-pub use forecast::{
-    ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
-};
+pub use forecast::{ForecastApplicationError, ForecastApplicationService};
 pub(crate) use forecast::{
     ForecastJobExecutor, ForecastJobOutput, ForecastPrecommitAuthority,
     ForecastRecoveryCoordinates, ForecastStudyRuntimeReference, HistoricalPriceForecast,
@@ -63,6 +61,7 @@ use read_image::{ModelReadImage, ModelReadImageState};
 
 const GET_METADATA: &str = "Model.GetMetadata";
 const LIST_BUNDLES: &str = "Model.ListBundles";
+const GET_BUNDLE: &str = "Model.GetBundle";
 pub(crate) const LIST_PRODUCT_ACTIVITY: &str = "Model.ListProductActivity";
 const EVALUATE: &str = "Model.Evaluate";
 const PREDICT: &str = "Model.Predict";
@@ -73,10 +72,11 @@ pub struct ModelDomainService {
     read_image: Arc<ModelReadImageState>,
     forecasts: Option<Arc<ForecastApplicationService>>,
     forecast_analytical: Option<AnalyticalReadCapability>,
-    forecast_source_actions: Option<super::research::corporate_actions::SourceAppliedCorporateActionReadCapability>,
-    forecast_outcome_preparation: Option<super::research::corporate_actions::SourceActionPreparationCapability>,
-    forecast_calendar:
-        Option<crate::application::market_calendar::ForecastSessionReadCapability>,
+    forecast_source_actions:
+        Option<super::research::corporate_actions::SourceAppliedCorporateActionReadCapability>,
+    forecast_outcome_preparation:
+        Option<super::research::corporate_actions::SourceActionPreparationCapability>,
+    forecast_calendar: Option<crate::application::market_calendar::ForecastSessionReadCapability>,
     evaluations: Mutex<EvaluationStore>,
     lifecycle: Arc<DomainLifecycle>,
 }
@@ -105,7 +105,9 @@ impl ModelDomainService {
         mut self,
         calendar: crate::application::market_calendar::CompletedMarketSessionReadCapability,
     ) -> Self {
-        self.forecast_calendar = Some(crate::application::market_calendar::ForecastSessionReadCapability::Current(calendar));
+        self.forecast_calendar = Some(
+            crate::application::market_calendar::ForecastSessionReadCapability::Current(calendar),
+        );
         self
     }
 
@@ -194,25 +196,16 @@ impl ModelDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let model_id = admitted_model_id(request.arguments())?;
         let image = self.read_image.load();
-        let bundle = image
-            .backends
-            .iter()
-            .filter(|backend| backend.metadata().model_id() == model_id)
-            .max_by_key(|backend| backend.metadata().bundle_version())
-            .ok_or(ServiceError::NotFound)?;
         let retained = image
             .registry
-            .get(
-                bundle.metadata().bundle_id(),
-                bundle.metadata().bundle_version(),
-            )
-            .map_err(|_| ServiceError::Unavailable)?
-            .ok_or(ServiceError::Unavailable)?;
+            .latest(model_id)
+            .map_err(runtime_service_error)?
+            .ok_or(ServiceError::NotFound)?;
         one_result(
             model_metadata_value(
                 &retained,
                 runtime_health_value(
-                    image.backends.len(),
+                    image.len(),
                     image
                         .registry
                         .len()
@@ -230,32 +223,128 @@ impl ModelDomainService {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         let limits = admitted_result_limits(request, context)?;
-        let image = self.read_image.load();
-        let available = image.backends.len();
-        let bundles = image
-            .backends
-            .iter()
-            .take(limits.maximum_result_items())
-            .map(|backend| {
-                image
-                    .registry
-                    .get(
-                        backend.metadata().bundle_id(),
-                        backend.metadata().bundle_version(),
-                    )
-                    .map_err(|_| ServiceError::Unavailable)?
-                    .ok_or(ServiceError::Unavailable)
-                    .and_then(|bundle| product_model_evidence(&bundle))
+        let limit = request
+            .arguments()
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(ServiceError::InvalidRequest)
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let metadata = if bundles.len() < available {
-            ToolResultMetadata::try_truncated_not_applicable(available)?
-        } else {
-            ToolResultMetadata::complete_not_applicable()
+            .transpose()?
+            .unwrap_or(25);
+        if limit == 0 || limit > 100 || limit > limits.maximum_result_items() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let cursor = match request.arguments().get("cursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.as_str()),
+            Some(_) => return Err(ServiceError::InvalidRequest),
         };
-        let item_count = bundles.len();
-        TypedToolResult::try_new(json!({"models": bundles}), item_count, metadata, limits)
-            .map_err(Into::into)
+        let image = self.read_image.load();
+        let (models, next_cursor) = match &image.registry {
+            read_image::ModelBundleInventory::Disk(inventory) => {
+                let (page, next, _) = inventory
+                    .page_window(cursor, limit)
+                    .map_err(runtime_service_error)?;
+                (
+                    page.into_iter()
+                        .map(|entry| entry.product_summary)
+                        .collect::<Vec<_>>(),
+                    next,
+                )
+            }
+            read_image::ModelBundleInventory::Memory(_) => {
+                let after = cursor
+                    .map(str::parse::<usize>)
+                    .transpose()
+                    .map_err(|_| ServiceError::InvalidRequest)?
+                    .unwrap_or(0);
+                if after > image.backends.len() {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let mut models = Vec::new();
+                for backend in image.backends.iter().skip(after).take(limit) {
+                    ensure_request_live(context, &self.lifecycle)?;
+                    let metadata = backend.metadata();
+                    let bundle = image
+                        .registry
+                        .get(metadata.bundle_id(), metadata.bundle_version())
+                        .map_err(runtime_service_error)?
+                        .ok_or(ServiceError::Unavailable)?;
+                    models.push(product_model_summary(&bundle)?);
+                }
+                let next = after + models.len();
+                (
+                    models,
+                    (next < image.backends.len()).then(|| next.to_string()),
+                )
+            }
+        };
+        let count = models.len();
+        TypedToolResult::try_new(
+            json!({"models":models,"nextCursor":next_cursor}),
+            count,
+            ToolResultMetadata::complete_not_applicable(),
+            limits,
+        )
+        .map_err(Into::into)
+    }
+
+    fn bundle_detail(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let token = request
+            .arguments()
+            .get("modelToken")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            .ok_or(ServiceError::InvalidRequest)?;
+        let image = self.read_image.load();
+        let bundle = match &image.registry {
+            read_image::ModelBundleInventory::Disk(inventory) => {
+                let entry = inventory
+                    .catalog
+                    .by_token(inventory.head, token)
+                    .map_err(|_| ServiceError::Unavailable)?
+                    .ok_or(ServiceError::NotFound)?;
+                let admission = runtime::inventory::RuntimeInventory::decode(entry)
+                    .map_err(runtime_service_error)?;
+                inventory
+                    .selection_controlled(&admission, context.deadline(), context.cancellation())
+                    .map_err(runtime_service_error)?
+            }
+            read_image::ModelBundleInventory::Memory(_) => {
+                let mut selected = None;
+                for backend in &image.backends {
+                    ensure_request_live(context, &self.lifecycle)?;
+                    let metadata = backend.metadata();
+                    let candidate = image
+                        .registry
+                        .get(metadata.bundle_id(), metadata.bundle_version())
+                        .map_err(runtime_service_error)?
+                        .ok_or(ServiceError::Unavailable)?;
+                    if forecast_model_evidence_projection(&candidate)?.model_token() == token {
+                        selected = Some(candidate.selection_metadata());
+                        break;
+                    }
+                }
+                selected.ok_or(ServiceError::NotFound)?
+            }
+        };
+        let content = product_model_evidence(&bundle)?;
+        if content
+            .get("modelToken")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            != Some(token)
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        one_result(content, request, context)
     }
 
     fn infer(
@@ -272,17 +361,19 @@ impl ModelDomainService {
             .ok_or(ServiceError::InvalidRequest)?;
         let parsed = ParsedModelInput::try_from(input_value)?;
         let image = self.read_image.load();
-        let backend = image
-            .backends
-            .iter()
-            .find(|backend| {
-                let metadata = backend.metadata();
-                metadata.model_id() == model_id
-                    && metadata.bundle_id() == &parsed.bundle_id
-                    && metadata.bundle_version() == parsed.bundle_version
-            })
-            .ok_or(ServiceError::NotFound)?;
+        let active = image
+            .activate(
+                &parsed.bundle_id,
+                parsed.bundle_version,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .map_err(runtime_service_error)?;
+        let backend = active.backend();
         let metadata = backend.metadata();
+        if metadata.model_id() != model_id {
+            return Err(ServiceError::NotFound);
+        }
         if parsed.feature_values.len() != metadata.features().len() {
             return Err(ServiceError::InvalidRequest);
         }
@@ -357,7 +448,7 @@ impl fmt::Debug for ModelDomainService {
         let image = self.read_image.load();
         formatter
             .debug_struct("ModelDomainService")
-            .field("backend_count", &image.backends.len())
+            .field("model_count", &image.len())
             .field("registry", &"[IMMUTABLE MODEL REGISTRY]")
             .field("forecasts_configured", &self.forecasts.is_some())
             .field("evaluations", &"[BOUNDED EVALUATION EVIDENCE]")
@@ -388,6 +479,7 @@ impl ApplicationDomainService for ModelDomainService {
         let result = match request.name() {
             GET_METADATA => self.metadata(&request, &context),
             LIST_BUNDLES => self.bundles(&request, &context),
+            GET_BUNDLE => self.bundle_detail(&request, &context),
             EVALUATE => self.infer(&request, &context, true),
             PREDICT => self.infer(&request, &context, false),
             outcome_preparation::PREPARE_FORECAST_OUTCOME => {
@@ -398,6 +490,7 @@ impl ApplicationDomainService for ModelDomainService {
             }
             forecast::GENERATE_FORECAST => self.generate_forecast(&request, &context).await,
             forecast::GET_FORECAST => self.get_forecast(&request, &context).await,
+            "Model.GetForecastChart" => self.get_forecast_chart(&request, &context).await,
             forecast::SELECT_LATEST_VALID_FORECAST => {
                 self.select_latest_valid_forecast(&request, &context).await
             }
@@ -416,7 +509,14 @@ impl ApplicationDomainService for ModelDomainService {
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
-        self.lifecycle.finish_shutdown(deadline).await
+        self.lifecycle.finish_shutdown(deadline).await?;
+        if let read_image::ModelBundleInventory::Disk(inventory) = &self.read_image.load().registry
+        {
+            inventory
+                .shutdown(deadline)
+                .map_err(runtime_service_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -879,7 +979,12 @@ fn forecast_output_binding_value(
         "originBasis": origin_basis,
         "fiscalHorizon": fiscal_horizon,
     });
-    if let ForecastTargetMeaning::FixedHorizonEvent { horizon_nanos, origin_basis, event } = binding.target() {
+    if let ForecastTargetMeaning::FixedHorizonEvent {
+        horizon_nanos,
+        origin_basis,
+        event,
+    } = binding.target()
+    {
         value["event"] = forecast::event_product_value(horizon_nanos, origin_basis, event);
     }
     value
@@ -1055,14 +1160,14 @@ fn calibration_coverage_evaluation_value(
 
 fn forecast_selection_receipt_value(receipt: &forecast::ForecastSelectionReceipt) -> Value {
     json!({
-        "schema": "market-squawk/forecast-selection-receipt/v2",
+        "schema": "market-squawk/forecast-selection-receipt/v5",
         "policyRevision": receipt.policy_revision(),
         "selectionOrder": receipt.selection_order().as_str(),
         "qualification": forecast_selection_qualification_value(receipt.qualification()),
         "instrumentId": receipt.instrument_id().to_string(),
         "asOfUnixNanos": receipt.as_of_unix_nanos().to_string(),
         "consideredVintageCount": receipt.considered_vintage_count(),
-        "retainedVintageHardCeiling": receipt.retained_vintage_hard_ceiling(),
+        "inventoryVintageCount": receipt.inventory_vintage_count(),
         "eligibleVintageCount": receipt.eligible_vintage_count(),
         "competingEligibleVintageCount": receipt.competing_eligible_vintage_count(),
         "selectionComplete": receipt.selection_complete(),
@@ -1140,12 +1245,9 @@ pub(crate) fn map_forecast_selection_error(error: ForecastApplicationError) -> S
             ServiceError::InvalidResult
         }
         ForecastApplicationError::Artifact(ArtifactError::Unavailable)
-        | ForecastApplicationError::State(_)
-        | ForecastApplicationError::Unavailable
-        | ForecastApplicationError::RestoreTargetNotFresh => ServiceError::Unavailable,
-        ForecastApplicationError::Conflict | ForecastApplicationError::CorruptIndex => {
-            ServiceError::Internal
-        }
+        | ForecastApplicationError::Inventory(_)
+        | ForecastApplicationError::Unavailable => ServiceError::Unavailable,
+        ForecastApplicationError::CorruptIndex => ServiceError::Internal,
     }
 }
 
@@ -1354,8 +1456,21 @@ fn forecast_model_evidence_projection_inner(
     bundle: &ModelBundle,
     selected_horizon: Option<ForecastHorizon>,
 ) -> Result<ForecastModelEvidenceProjection, ServiceError> {
-    let metadata = bundle.metadata();
-    let training = serde_json::from_slice::<TrainingRunEvidenceWire>(bundle.training_run_bytes())
+    forecast_model_evidence_projection_parts(
+        bundle.metadata(),
+        bundle.training_run_bytes(),
+        bundle.forecast_residual_distribution().is_some(),
+        selected_horizon,
+    )
+}
+
+fn forecast_model_evidence_projection_parts(
+    metadata: &ModelMetadata,
+    training_run_bytes: &[u8],
+    residual_distribution_available: bool,
+    selected_horizon: Option<ForecastHorizon>,
+) -> Result<ForecastModelEvidenceProjection, ServiceError> {
+    let training = serde_json::from_slice::<TrainingRunEvidenceWire>(training_run_bytes)
         .map_err(|_error| ServiceError::InvalidResult)?;
     let split_counts = &training.trial.split_counts;
     let forecast = training.trial.forecast.as_ref();
@@ -1372,7 +1487,8 @@ fn forecast_model_evidence_projection_inner(
             } => selected.fiscal_periods() == Some((cadence, periods_ahead)),
             ForecastTargetMeaning::Unsupported => false,
         });
-    let direct_terminal = direct_terminal_evidence(bundle, forecast);
+    let direct_terminal =
+        direct_terminal_evidence_parts(metadata, residual_distribution_available, forecast);
     let event_evidence = matches!(
         metadata.output_binding().target(),
         ForecastTargetMeaning::FixedHorizonEvent { .. }
@@ -1480,7 +1596,18 @@ fn direct_terminal_evidence(
     bundle: &ModelBundle,
     forecast: Option<&ForecastScheduleEvidenceWire>,
 ) -> bool {
-    let metadata = bundle.metadata();
+    direct_terminal_evidence_parts(
+        bundle.metadata(),
+        bundle.forecast_residual_distribution().is_some(),
+        forecast,
+    )
+}
+
+fn direct_terminal_evidence_parts(
+    metadata: &ModelMetadata,
+    residual_distribution_available: bool,
+    forecast: Option<&ForecastScheduleEvidenceWire>,
+) -> bool {
     let binding = metadata.output_binding();
     let native_financial = matches!(
         binding.measurement(),
@@ -1490,7 +1617,7 @@ fn direct_terminal_evidence(
         ForecastTargetMeaning::FinancialPeriod { .. }
     ) && binding.central_statistic()
         == ForecastCentralStatistic::ModelEstimatedConditionalMean
-        && bundle.forecast_residual_distribution().is_some();
+        && residual_distribution_available;
     forecast.is_none()
         && (binding.expected_arithmetic_return_horizon_nanos().is_some() || native_financial)
         && binding.estimator()
@@ -1525,23 +1652,56 @@ const fn model_evidence_interpretation(
     }
 }
 
-fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
+fn product_model_summary(bundle: &ModelBundle) -> Result<Value, ServiceError> {
+    let evidence = forecast_model_evidence_projection(bundle)?;
+    Ok(
+        json!({"modelToken": evidence.model_token(), "label": bundle.metadata().label().name(), "evidenceState": evidence.overall().as_str()}),
+    )
+}
+
+fn runtime_service_error(error: runtime::ProductionModelRuntimeError) -> ServiceError {
+    match error {
+        runtime::ProductionModelRuntimeError::InvalidAdmission => ServiceError::InvalidRequest,
+        runtime::ProductionModelRuntimeError::ValidationDeadline => ServiceError::DeadlineExceeded,
+        runtime::ProductionModelRuntimeError::Admission(
+            market_squawk_modeling::ModelAdmissionError::Dataset(
+                market_squawk_data::PythonDatasetCatalogError::Cancelled,
+            ),
+        ) => ServiceError::Cancelled,
+        runtime::ProductionModelRuntimeError::ResourceExhausted => ServiceError::ResourceExhausted,
+        _ => ServiceError::Unavailable,
+    }
+}
+
+fn product_model_evidence(
+    bundle: &market_squawk_modeling::ModelSelectionMetadata,
+) -> Result<Value, ServiceError> {
     let metadata = bundle.metadata();
-    let product_evidence = forecast_model_evidence_projection(bundle)?;
+    let product_evidence = forecast_model_evidence_projection_parts(
+        metadata,
+        bundle.training_run_bytes(),
+        bundle.residual_distribution_available(),
+        None,
+    )?;
     let training = serde_json::from_slice::<TrainingRunEvidenceWire>(bundle.training_run_bytes())
         .map_err(|_error| ServiceError::InvalidResult)?;
     let split_counts = &training.trial.split_counts;
     let forecast = training.trial.forecast.as_ref();
-    let direct_terminal = direct_terminal_evidence(bundle, forecast);
+    let direct_terminal = direct_terminal_evidence_parts(
+        metadata,
+        bundle.residual_distribution_available(),
+        forecast,
+    );
     let event_evidence = matches!(
         metadata.output_binding().target(),
         ForecastTargetMeaning::FixedHorizonEvent { .. }
     ) && metadata.probability_calibration().is_some();
     let out_of_sample_observations = split_counts.test;
     let rolling_out_of_sample_folds = forecast.map_or(0, |evidence| evidence.rolling_splits);
-    let evaluated_horizons = forecast.map_or(usize::from(direct_terminal || event_evidence), |evidence| {
-        evidence.horizons.len()
-    });
+    let evaluated_horizons = forecast
+        .map_or(usize::from(direct_terminal || event_evidence), |evidence| {
+            evidence.horizons.len()
+        });
     let point_in_time_bound = metadata
         .training_period()
         .ends_by(metadata.dataset().selection_as_of());

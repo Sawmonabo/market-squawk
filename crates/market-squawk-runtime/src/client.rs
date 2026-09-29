@@ -14,6 +14,7 @@ use market_squawk_services::{JsonStructureLimits, RequestId, validate_json_contr
 use reqwest::{Client, Method, Response, redirect::Policy};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     sync::mpsc,
@@ -82,6 +83,9 @@ impl LoopbackApplicationClient {
             return Err(ApplicationClientError::Rejected);
         }
         let host = rendezvous.endpoint().to_string();
+        // Reqwest initializes its TLS backend even for this HTTP-only loopback transport.
+        market_squawk_platform::install_ring_tls_provider()
+            .map_err(|_| ApplicationClientError::Unavailable)?;
         let http = Client::builder()
             .redirect(Policy::none())
             .no_proxy()
@@ -205,6 +209,81 @@ impl LoopbackApplicationClient {
         lifetime: Duration,
         cancellation: CancellationToken,
     ) -> Result<AppResponseEnvelope, ApplicationClientError> {
+        let request = self.operation_request(request_id, operation, arguments, lifetime)?;
+        self.invoke(request, cancellation).await
+    }
+
+    /// Invokes a request-scoped read with explicit authenticated service cancellation.
+    /// Registration is acknowledged before execution, so an early abort cannot miss the request.
+    /// The router rejects mutations on every read route.
+    pub async fn invoke_read_operation(
+        &self,
+        request_id: RequestId,
+        operation: &str,
+        arguments: Value,
+        lifetime: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<AppResponseEnvelope, ApplicationClientError> {
+        if cancellation.is_cancelled() {
+            return Err(ApplicationClientError::Interrupted);
+        }
+        let request = self.operation_request(request_id, operation, arguments, lifetime)?;
+        // Do not drop registration on abort: its acknowledgement closes the register/cancel race.
+        let registration = self
+            .request(Method::POST, "/app/v1/register-read")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&request)
+            .send()
+            .await;
+        match registration {
+            Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => {}
+            Ok(_) => return Err(ApplicationClientError::Rejected),
+            Err(_) => {
+                // A lost acknowledgement may still have registered the exact request.
+                let _cleanup = self.cancel_registered_read(&request).await;
+                return Err(ApplicationClientError::Unavailable);
+            }
+        }
+        let result = self
+            .invoke_at_path(&request, cancellation, "/app/v1/invoke-read")
+            .await;
+        // Successful completion removes the service entry before sending the response.
+        // Explicit cleanup owns pre-execution aborts and transport failures.
+        if result.is_err() {
+            let _cleanup = self.cancel_registered_read(&request).await;
+        }
+        result
+    }
+
+    async fn cancel_registered_read(
+        &self,
+        request: &AppRequestEnvelope,
+    ) -> Result<(), ApplicationClientError> {
+        let encoded = serde_json::to_vec(request).map_err(|_| ApplicationClientError::Rejected)?;
+        let response = self
+            .request(Method::POST, "/app/v1/cancel-read")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&serde_json::json!({
+                "requestId": request.request_id(),
+                "requestSha256": encode_hex(Sha256::digest(encoded).into()),
+            }))
+            .send()
+            .await
+            .map_err(|_| ApplicationClientError::Unavailable)?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            Err(ApplicationClientError::Rejected)
+        }
+    }
+
+    fn operation_request(
+        &self,
+        request_id: RequestId,
+        operation: &str,
+        arguments: Value,
+        lifetime: Duration,
+    ) -> Result<AppRequestEnvelope, ApplicationClientError> {
         if lifetime.is_zero() || lifetime > self.transport_timeout {
             return Err(ApplicationClientError::Rejected);
         }
@@ -216,11 +295,51 @@ impl LoopbackApplicationClient {
             .map_err(|_error| ApplicationClientError::Rejected)?;
         let operation = SourceIdentifier::try_from(operation)
             .map_err(|_error| ApplicationClientError::Rejected)?;
-        let request = self
-            .scope
+        self.scope
             .request(request_id, deadline, now, operation, arguments)
-            .map_err(|_error| ApplicationClientError::Rejected)?;
-        self.invoke(request, cancellation).await
+            .map_err(|_error| ApplicationClientError::Rejected)
+    }
+
+    async fn invoke_at_path(
+        &self,
+        request: &AppRequestEnvelope,
+        cancellation: CancellationToken,
+        path: &str,
+    ) -> Result<AppResponseEnvelope, ApplicationClientError> {
+        if cancellation.is_cancelled() {
+            return Err(ApplicationClientError::Interrupted);
+        }
+        let expected_request = request.request_id().clone();
+        let expected_generation = request.service_generation();
+        let request_timeout = request
+            .remaining_lifetime(client_wall_now()?)
+            .map_err(|_| ApplicationClientError::Interrupted)?
+            .min(self.transport_timeout);
+        let exchange = async {
+            let response = self
+                .request(Method::POST, path)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(request)
+                .send()
+                .await
+                .map_err(|_| ApplicationClientError::Unavailable)?;
+            let bytes = self.response_bytes(response, &cancellation).await?;
+            AppResponseEnvelope::decode_expected(
+                &bytes,
+                &expected_request,
+                expected_generation,
+                self.response_structure,
+                self.maximum_response_bytes,
+            )
+            .map_err(|_| ApplicationClientError::InvalidResponse)
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ApplicationClientError::Interrupted),
+            result = tokio::time::timeout(request_timeout, exchange) => {
+                result.map_err(|_| ApplicationClientError::Interrupted)?
+            }
+        }
     }
 
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
@@ -294,36 +413,8 @@ impl ApplicationClient for LoopbackApplicationClient {
         request: AppRequestEnvelope,
         cancellation: CancellationToken,
     ) -> Result<AppResponseEnvelope, ApplicationClientError> {
-        let expected_request = request.request_id().clone();
-        let expected_generation = request.service_generation();
-        let request_timeout = request
-            .remaining_lifetime(client_wall_now()?)
-            .map_err(|_| ApplicationClientError::Interrupted)?
-            .min(self.transport_timeout);
-        let exchange = async {
-            let response = self
-                .request(Method::POST, "/app/v1/invoke")
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .json(&request)
-                .send()
-                .await
-                .map_err(|_| ApplicationClientError::Unavailable)?;
-            let bytes = self.response_bytes(response, &cancellation).await?;
-            AppResponseEnvelope::decode_expected(
-                &bytes,
-                &expected_request,
-                expected_generation,
-                self.response_structure,
-                self.maximum_response_bytes,
-            )
-            .map_err(|_| ApplicationClientError::InvalidResponse)
-        };
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err(ApplicationClientError::Interrupted),
-            result = tokio::time::timeout(request_timeout, exchange) => {
-                result.map_err(|_| ApplicationClientError::Interrupted)?
-            }
-        }
+        self.invoke_at_path(&request, cancellation, "/app/v1/invoke")
+            .await
     }
 
     async fn stage_input(

@@ -1,7 +1,7 @@
 import { z } from "zod"
 
 import type { ApplicationResult } from "@/lib/schemas"
-import { losslessIntegerSchema, type LosslessInteger } from "@/lib/lossless-integer"
+import { losslessIntegerSchema } from "@/lib/lossless-integer"
 import type {
   OperationLogDomain,
   OperationLogFilter,
@@ -10,7 +10,6 @@ import type {
 
 export const LOG_PAGE_LIMIT = 100
 export const MAXIMUM_LOG_PAGE_LIMIT = 1_000
-export const MAXIMUM_LOG_PAGES = 10
 
 export const logSeverityOptions: readonly OperationLogSeverity[] = [
   "trace",
@@ -52,7 +51,7 @@ const structuredLogRecordSchema = z.object({
 
 const structuredLogPageSchema = z.object({
   records: z.array(structuredLogRecordSchema).max(MAXIMUM_LOG_PAGE_LIMIT),
-  nextAfterSequence: losslessIntegerSchema.nullable(),
+  nextCursor: z.string().min(1).max(1_024).nullable(),
 })
 
 const diagnosticArtifactReceiptSchema = z.object({
@@ -217,14 +216,6 @@ export function filterFromDraft(
     },
     error: null,
   }
-}
-
-/** Preserves a service pagination cursor as an exact unsigned decimal string. */
-export function asUnsignedCursor(value: LosslessInteger | null): string | null {
-  if (value === null) return null
-  const parsed = BigInt(value)
-  if (parsed < 0n) return null
-  return parsed.toString()
 }
 
 function optionalTrimmed(value: string) {

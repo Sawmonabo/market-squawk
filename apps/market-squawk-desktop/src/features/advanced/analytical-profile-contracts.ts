@@ -63,7 +63,8 @@ const benchmarkChoiceSchema = z.object({
 
 const profileOptionsSchema = z.object({
   benchmarkChoices: z.array(benchmarkChoiceSchema).max(3),
-  modelChoices: z.array(z.object({ token: z.string().min(1).max(64), label: z.string().min(1).max(256) }).strict()).min(1).max(1_001),
+  modelChoices: z.array(z.object({ token: z.string().min(1).max(64), label: z.string().min(1).max(256) }).strict()).min(1).max(101),
+  nextCursor: z.string().min(1).max(512).nullable(),
   fixedSettings: z.array(z.object({ label: z.string().min(1).max(64), value: z.string().min(1).max(256), explanation: z.string().min(1).max(1_024) }).strict()).max(8),
 }).strict()
 
@@ -258,7 +259,7 @@ export type FinancialPreferencesInput = Pick<FinancialPreferences, "coverage" | 
 
 export type AnalyticalControllerRequest =
   | { action: "status" }
-  | { action: "profileOptions" }
+  | { action: "profileOptions"; cursor?: string; limit?: number }
   | { action: "copyRecommended"; displayName: string }
   | {
       action: "updateProfile"

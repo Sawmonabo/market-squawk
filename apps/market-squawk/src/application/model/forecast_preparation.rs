@@ -17,8 +17,8 @@ use market_squawk_domain::{
 };
 use market_squawk_modeling::{
     BundleId, ForecastHorizon, ForecastObservedPoint, ForecastOutputBinding, ForecastRequest,
-    ModelBundle, ModelFeatureValue, ModelFormat, ModelInput, ModelMetadata, ModelOutputSemantics,
-    TrainingDatasetIdentity,
+    ModelFeatureValue, ModelFormat, ModelInput, ModelMetadata, ModelOutputSemantics,
+    ModelSelectionMetadata, TrainingDatasetIdentity,
 };
 use market_squawk_services::{RequestOrigin, ServiceDomain, ToolDescriptor, TypedToolRequest};
 use serde_json::{Map, Value, json};
@@ -30,11 +30,7 @@ use uuid::Uuid;
 use super::{
     ForecastModelCalibrationState, ForecastModelEvidenceProjection, ForecastModelEvidenceState,
     forecast::{ForecastProductIdentity, ForecastProductTarget, GENERATE_FORECAST},
-    forecast_model_evidence_projection, forecast_model_evidence_projection_for_horizon,
-    runtime::{
-        ProductionModelRuntime, ProductionModelRuntimeError, RetainedForecastRuntime,
-        RetainedRuntimeBackup,
-    },
+    runtime::{ProductionModelRuntime, ProductionModelRuntimeError, RetainedForecastRuntime},
 };
 use crate::application::lifecycle::WorkspaceRuntimeIdentity;
 
@@ -94,7 +90,9 @@ impl ForecastPreparationLimits {
 #[derive(Clone, Debug)]
 pub(crate) struct ForecastModelRequirement {
     runtime_generation_sha256: Sha256Digest,
-    bundle: Arc<ModelBundle>,
+    metadata: ModelMetadata,
+    training_run: Arc<[u8]>,
+    residual_distribution_available: bool,
     product_evidence: ForecastModelEvidenceProjection,
 }
 
@@ -106,7 +104,7 @@ impl ForecastModelRequirement {
 
     /// Returns the complete admitted model, feature, label, and dataset contract.
     pub(crate) fn metadata(&self) -> &ModelMetadata {
-        self.bundle.metadata()
+        &self.metadata
     }
 
     pub(crate) const fn product_evidence(&self) -> &ForecastModelEvidenceProjection {
@@ -119,9 +117,16 @@ impl ForecastModelRequirement {
     ) -> Result<Self, ForecastPreparationError> {
         Ok(Self {
             runtime_generation_sha256: self.runtime_generation_sha256,
-            bundle: Arc::clone(&self.bundle),
-            product_evidence: forecast_model_evidence_projection_for_horizon(&self.bundle, horizon)
-                .map_err(|_| ForecastPreparationError::InvalidEvidence)?,
+            metadata: self.metadata.clone(),
+            training_run: Arc::clone(&self.training_run),
+            residual_distribution_available: self.residual_distribution_available,
+            product_evidence: super::forecast_model_evidence_projection_parts(
+                &self.metadata,
+                &self.training_run,
+                self.residual_distribution_available,
+                Some(horizon),
+            )
+            .map_err(|_| ForecastPreparationError::InvalidEvidence)?,
         })
     }
 
@@ -156,7 +161,6 @@ impl ForecastInstrumentAvailability {
     ) -> Result<Self, ForecastEvidenceReadError> {
         if observed_from > observed_through
             || available_at < observed_through
-            || observed_points.get() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
             || decimal_scale > market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
         {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
@@ -1172,9 +1176,16 @@ pub struct ForecastPreparationCatalog {
     runtime_generation_sha256: Sha256Digest,
     models: Box<[ForecastModelSummary]>,
     evidence: ForecastEvidenceCatalogSnapshot,
+    next_cursor: Option<String>,
 }
 
 impl ForecastPreparationCatalog {
+    /// Continues this immutable model-inventory prefix without materializing its history.
+    #[must_use]
+    pub fn next_cursor(&self) -> Option<&str> {
+        self.next_cursor.as_deref()
+    }
+
     #[must_use]
     pub const fn runtime_generation_sha256(&self) -> Sha256Digest {
         self.runtime_generation_sha256
@@ -1643,18 +1654,22 @@ impl ForecastPreparationAuthority {
         workspace: WorkspaceRuntimeIdentity,
         knowledge_cutoff: Timestamp,
         current_feature_input: Option<&ForecastCurrentFeatureInputSelection>,
+        cursor: Option<String>,
+        limit: usize,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<ForecastPreparationCatalog, ForecastPreparationError> {
         validate_origin(origin, workspace)?;
         check_control(deadline, &cancellation)?;
         let retained = self.runtime.retain_forecast_runtime()?;
-        let backup = self.runtime.retain_backup()?;
-        let request = catalog_request(
+        let (request, next_cursor) = catalog_request(
             &retained,
-            &backup,
             knowledge_cutoff,
             current_feature_input.cloned(),
+            cursor.as_deref(),
+            limit,
+            deadline,
+            &cancellation,
         )?;
         let models = request
             .models
@@ -1668,9 +1683,126 @@ impl ForecastPreparationAuthority {
             .await?;
         validate_catalog(&request, &evidence)?;
         Ok(ForecastPreparationCatalog {
-            runtime_generation_sha256: retained.generation_sha256,
+            runtime_generation_sha256: request.runtime_generation_sha256,
             models,
             evidence,
+            next_cursor,
+        })
+    }
+
+    /// Resolves the exact opaque product token through the immutable inventory index.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "selection authority carries owner and source cutoff"
+    )]
+    pub(crate) async fn catalog_for_model_token(
+        &self,
+        origin: RequestOrigin,
+        workspace: WorkspaceRuntimeIdentity,
+        knowledge_cutoff: Timestamp,
+        current_feature_input: Option<&ForecastCurrentFeatureInputSelection>,
+        model_token: Uuid,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<ForecastPreparationCatalog, ForecastPreparationError> {
+        validate_origin(origin, workspace)?;
+        check_control(deadline, &cancellation)?;
+        let retained = self.runtime.retain_forecast_runtime()?;
+        let (id, version) = match &retained.image.registry {
+            super::read_image::ModelBundleInventory::Disk(inventory) => {
+                let entry = inventory
+                    .catalog
+                    .by_token(inventory.head, model_token)
+                    .map_err(ProductionModelRuntimeError::from)?
+                    .ok_or(ForecastPreparationError::ModelUnavailable)?;
+                let admission = super::runtime::inventory::RuntimeInventory::decode(entry)?;
+                (admission.bundle_id, admission.bundle_version)
+            }
+            super::read_image::ModelBundleInventory::Memory(_) => {
+                let mut coordinate = None;
+                for backend in &retained.image.backends {
+                    let metadata = backend.metadata();
+                    let selected = retained
+                        .image
+                        .registry
+                        .selection(
+                            metadata.bundle_id(),
+                            metadata.bundle_version(),
+                            deadline,
+                            &cancellation,
+                        )?
+                        .ok_or(ForecastPreparationError::ModelUnavailable)?;
+                    if model_requirement(&retained, &selected)?
+                        .product_evidence
+                        .model_token()
+                        == model_token
+                    {
+                        coordinate =
+                            Some((metadata.bundle_id().clone(), metadata.bundle_version()));
+                        break;
+                    }
+                }
+                coordinate.ok_or(ForecastPreparationError::ModelUnavailable)?
+            }
+        };
+        self.catalog_for_model(
+            origin,
+            workspace,
+            knowledge_cutoff,
+            current_feature_input,
+            &id,
+            version,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Reads evidence for one exact selected model independently of catalog pagination.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact model authority includes owner, cutoff and cancellation"
+    )]
+    pub(crate) async fn catalog_for_model(
+        &self,
+        origin: RequestOrigin,
+        workspace: WorkspaceRuntimeIdentity,
+        knowledge_cutoff: Timestamp,
+        current_feature_input: Option<&ForecastCurrentFeatureInputSelection>,
+        bundle_id: &BundleId,
+        bundle_version: NonZeroU64,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<ForecastPreparationCatalog, ForecastPreparationError> {
+        validate_origin(origin, workspace)?;
+        check_control(deadline, &cancellation)?;
+        if knowledge_cutoff > wall_now()? {
+            return Err(ForecastPreparationError::InvalidSelection);
+        }
+        let retained = self.runtime.retain_forecast_runtime()?;
+        let selection = retained
+            .image
+            .registry
+            .selection(bundle_id, bundle_version, deadline, &cancellation)?
+            .ok_or(ForecastPreparationError::ModelUnavailable)?;
+        let model = model_requirement(&retained, &selection)?;
+        let models = vec![ForecastModelSummary::from_requirement(&model)].into_boxed_slice();
+        let request = ForecastEvidenceCatalogRequest {
+            runtime_generation_sha256: retained.generation_sha256,
+            models: vec![model].into_boxed_slice(),
+            knowledge_cutoff,
+            current_feature_input: current_feature_input.cloned(),
+        };
+        let evidence = self
+            .evidence
+            .catalog(request.clone(), deadline, cancellation)
+            .await?;
+        validate_catalog(&request, &evidence)?;
+        Ok(ForecastPreparationCatalog {
+            runtime_generation_sha256: request.runtime_generation_sha256,
+            models,
+            evidence,
+            next_cursor: None,
         })
     }
 
@@ -1704,19 +1836,27 @@ impl ForecastPreparationAuthority {
             return Err(ForecastPreparationError::InvalidSelection);
         }
         let retained = self.runtime.retain_forecast_runtime()?;
-        let backup = self.runtime.retain_backup()?;
-        let catalog_request = catalog_request(
-            &retained,
-            &backup,
-            knowledge_cutoff,
-            selection.current_feature_input.clone(),
-        )?;
-        let model = catalog_request
-            .models
-            .iter()
-            .find(|candidate| candidate.matches_coordinate(&selection))
-            .cloned()
+        let bundle = retained
+            .image
+            .registry
+            .selection(
+                &selection.bundle_id,
+                selection.bundle_version,
+                deadline,
+                &cancellation,
+            )?
             .ok_or(ForecastPreparationError::ModelUnavailable)?;
+        let model = model_requirement(&retained, &bundle)?;
+        if !model.matches_coordinate(&selection) {
+            return Err(ForecastPreparationError::ModelUnavailable);
+        }
+        drop(bundle);
+        let catalog_request = ForecastEvidenceCatalogRequest {
+            runtime_generation_sha256: retained.generation_sha256,
+            models: vec![model.clone()].into_boxed_slice(),
+            knowledge_cutoff,
+            current_feature_input: selection.current_feature_input.clone(),
+        };
         let catalog = self
             .evidence
             .catalog(
@@ -1935,53 +2075,87 @@ impl fmt::Debug for ForecastPreparationAuthority {
     }
 }
 
+fn model_requirement(
+    retained: &RetainedForecastRuntime,
+    bundle: &ModelSelectionMetadata,
+) -> Result<ForecastModelRequirement, ForecastPreparationError> {
+    Ok(ForecastModelRequirement {
+        runtime_generation_sha256: retained.generation_sha256,
+        metadata: bundle.metadata().clone(),
+        training_run: Arc::from(bundle.training_run_bytes()),
+        residual_distribution_available: bundle.residual_distribution_available(),
+        product_evidence: super::forecast_model_evidence_projection_parts(
+            bundle.metadata(),
+            bundle.training_run_bytes(),
+            bundle.residual_distribution_available(),
+            None,
+        )
+        .map_err(|_| ForecastPreparationError::InvalidEvidence)?,
+    })
+}
+
 fn catalog_request(
     retained: &RetainedForecastRuntime,
-    backup: &RetainedRuntimeBackup,
     knowledge_cutoff: Timestamp,
     current_feature_input: Option<ForecastCurrentFeatureInputSelection>,
-) -> Result<ForecastEvidenceCatalogRequest, ForecastPreparationError> {
-    if knowledge_cutoff > wall_now()?
-        || Sha256Digest::new(Sha256::digest(backup.canonical_index.as_ref()).into())
-            != retained.generation_sha256
-        || backup.models.len() != retained.image.backends.len()
-    {
-        return Err(ForecastPreparationError::ModelUnavailable);
+    cursor: Option<&str>,
+    limit: usize,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(ForecastEvidenceCatalogRequest, Option<String>), ForecastPreparationError> {
+    if knowledge_cutoff > wall_now()? || limit == 0 || limit > 100 {
+        return Err(ForecastPreparationError::InvalidSelection);
     }
     let mut models = Vec::new();
-    models
-        .try_reserve_exact(retained.image.backends.len())
-        .map_err(|_| ForecastPreparationError::Capacity)?;
-    for backend in &retained.image.backends {
-        let metadata = backend.metadata();
-        let mut matching = backup.models.iter().filter(|(_, bundle)| {
-            let candidate = bundle.metadata();
-            candidate.model_id() == metadata.model_id()
-                && candidate.bundle_id() == metadata.bundle_id()
-                && candidate.bundle_version() == metadata.bundle_version()
-                && candidate.metadata_hash() == metadata.metadata_hash()
-                && candidate.training_run_hash() == metadata.training_run_hash()
-                && candidate.output_binding().identity() == metadata.output_binding().identity()
-        });
-        let (_, bundle) = matching
-            .next()
-            .ok_or(ForecastPreparationError::InvalidEvidence)?;
-        if matching.next().is_some() {
-            return Err(ForecastPreparationError::InvalidEvidence);
+    let (next_cursor, generation) = match &retained.image.registry {
+        super::read_image::ModelBundleInventory::Disk(inventory) => {
+            let (admissions, next, fence) = inventory.page_window(cursor, limit)?;
+            for admission in admissions {
+                check_control(deadline, cancellation)?;
+                let bundle = inventory.selection_controlled(&admission, deadline, cancellation)?;
+                let mut model = model_requirement(retained, &bundle)?;
+                model.runtime_generation_sha256 = Sha256Digest::new(fence.sha256);
+                models.push(model);
+            }
+            (next, Sha256Digest::new(fence.sha256))
         }
-        models.push(ForecastModelRequirement {
-            runtime_generation_sha256: retained.generation_sha256,
-            bundle: Arc::clone(bundle),
-            product_evidence: forecast_model_evidence_projection(bundle)
-                .map_err(|_| ForecastPreparationError::InvalidEvidence)?,
-        });
-    }
-    Ok(ForecastEvidenceCatalogRequest {
-        runtime_generation_sha256: retained.generation_sha256,
-        models: models.into_boxed_slice(),
-        knowledge_cutoff,
-        current_feature_input,
-    })
+        super::read_image::ModelBundleInventory::Memory(_) => {
+            let after = cursor
+                .map(str::parse::<usize>)
+                .transpose()
+                .map_err(|_| ForecastPreparationError::InvalidSelection)?
+                .unwrap_or(0);
+            for backend in retained.image.backends.iter().skip(after).take(limit) {
+                check_control(deadline, cancellation)?;
+                let metadata = backend.metadata();
+                let bundle = retained
+                    .image
+                    .registry
+                    .selection(
+                        metadata.bundle_id(),
+                        metadata.bundle_version(),
+                        deadline,
+                        cancellation,
+                    )?
+                    .ok_or(ForecastPreparationError::ModelUnavailable)?;
+                models.push(model_requirement(retained, &bundle)?);
+            }
+            let next = after + models.len();
+            (
+                (next < retained.image.backends.len()).then(|| next.to_string()),
+                retained.generation_sha256,
+            )
+        }
+    };
+    Ok((
+        ForecastEvidenceCatalogRequest {
+            runtime_generation_sha256: generation,
+            models: models.into_boxed_slice(),
+            knowledge_cutoff,
+            current_feature_input,
+        },
+        next_cursor,
+    ))
 }
 
 fn validate_catalog(

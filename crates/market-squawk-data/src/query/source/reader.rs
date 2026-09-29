@@ -450,11 +450,8 @@ pub(super) fn active_file_receipt(
         largest_row_group =
             largest_row_group.max(decoded.checked_mul(2).ok_or(QueryError::SizeOverflow)?);
     }
-    let compressed_file =
-        usize::try_from(file.object_meta().size).map_err(|_| QueryError::SizeOverflow)?;
     let receipt = DECODER_FIXED_SCRATCH
-        .checked_add(compressed_file)
-        .and_then(|value| value.checked_add(largest_row_group))
+        .checked_add(largest_row_group)
         .ok_or(QueryError::SizeOverflow)?;
     if receipt > MAX_ACTIVE_FILE_RECEIPT {
         return Err(QueryError::ReaderMemoryBoundExceeded);

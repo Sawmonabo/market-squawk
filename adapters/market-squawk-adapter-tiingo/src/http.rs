@@ -697,6 +697,29 @@ impl TiingoHttpSource {
         Ok(next)
     }
 
+    /// Closes the original ordered checkpoint without retaining decoded page projections.
+    pub fn validate_history_terminal(
+        &self,
+        plan: &TiingoHistoryPlan,
+        checkpoint: &TiingoHistoryCheckpointReceipt,
+        last_page_identity: Option<EvidenceDigest>,
+    ) -> Result<crate::TiingoVerifiedHistoryTerminal, TiingoHttpSourceError> {
+        let count = u32::try_from(plan.pages().len())
+            .map_err(|_| TiingoHttpSourceError::InvalidConfiguration)?;
+        checkpoint.validate_for(
+            plan,
+            &self.authority_installation,
+            count,
+            last_page_identity,
+        )?;
+        Ok(crate::TiingoVerifiedHistoryTerminal {
+            plan_identity: plan.request_set_identity(),
+            page_count: plan.pages().len(),
+            last_page_identity,
+            checkpoint_identity: checkpoint.receipt_identity(),
+        })
+    }
+
     /// Closes the exact request graph after every page has been externally sealed/checkpointed.
     pub fn complete_history_capture(
         &self,

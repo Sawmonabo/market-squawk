@@ -404,7 +404,7 @@ impl ToolDescriptor {
     /// arguments.
     pub fn admit(&self, arguments: Map<String, Value>) -> Result<TypedToolRequest, ServiceError> {
         let bounded_arguments = Value::Object(arguments);
-        let argument_limits = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
+        let argument_limits = JsonStructureLimits::try_new(32, 128 * 1024, 10_000, 2_000)
             .map_err(|_| ServiceError::Internal)?;
         validate_json_contract(
             &bounded_arguments,

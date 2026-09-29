@@ -12,7 +12,7 @@ use market_squawk_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-// Matches the existing BacktestDataset complete-history admission ceiling.
+// Bounds the requested instrument panel; individual complete histories use disk-backed admission.
 const MAXIMUM_DAILY_HISTORY_INSTRUMENTS: usize = 4_096;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -61,9 +61,23 @@ pub(in crate::application::analysis::backtest::input_authority) struct DailyHist
     result_digest: String,
     bar_count: usize,
 }
+// Both implementations borrow existing sealed data authority. The interface mints no history.
+pub(in crate::application::analysis::backtest::input_authority) trait DailyHistoryInput {
+    fn selection_wire(&self) -> Result<DailyHistorySelectionWire, RecipeError>;
+}
+impl DailyHistoryInput for CompleteMarketBarHistoryOutput {
+    fn selection_wire(&self) -> Result<DailyHistorySelectionWire, RecipeError> {
+        DailyHistorySelectionWire::from_output(self)
+    }
+}
+impl DailyHistoryInput for market_squawk_data::CompleteMarketBarHistoryCursor {
+    fn selection_wire(&self) -> Result<DailyHistorySelectionWire, RecipeError> {
+        DailyHistorySelectionWire::from_cursor(self)
+    }
+}
 impl DailyHistoryWire {
-    pub(super) fn from_outputs(
-        outputs: &[CompleteMarketBarHistoryOutput],
+    pub(super) fn from_outputs<T: DailyHistoryInput>(
+        outputs: &[T],
         admitted_at: Timestamp,
         source_action_reference: SourceAppliedCorporateActionPlanReference,
     ) -> Result<Self, RecipeError> {
@@ -72,7 +86,7 @@ impl DailyHistoryWire {
         }
         let mut selections = outputs
             .iter()
-            .map(DailyHistorySelectionWire::from_output)
+            .map(DailyHistoryInput::selection_wire)
             .collect::<Result<Vec<_>, _>>()?;
         selections.sort_unstable_by_key(|selection| selection.instrument_id);
         if selections.iter().any(|selection| {
@@ -115,17 +129,6 @@ impl DailyHistoryWire {
         for selection in &self.selections {
             selection.validate()?;
         }
-        let total = self
-            .selections
-            .iter()
-            .try_fold(0_usize, |total, selection| {
-                total
-                    .checked_add(selection.bar_count)
-                    .ok_or(RecipeError::ResourceExhausted)
-            })?;
-        if total > core.limits.into_input()?.max_observations {
-            return Err(RecipeError::ResourceExhausted);
-        }
         let actions = core.corporate_actions()?.ok_or(RecipeError::Invalid)?;
         if actions.valuation_cutoff().unix_nanos() != core.ends_at_unix_nanos
             || actions.knowledge_cutoff() != self.source_action_reference.knowledge_cutoff()
@@ -166,10 +169,33 @@ impl DailyHistoryWire {
 }
 impl DailyHistorySelectionWire {
     fn from_output(output: &CompleteMarketBarHistoryOutput) -> Result<Self, RecipeError> {
-        let receipt = output.selection().receipt();
+        Self::from_parts(
+            output.selection(),
+            output.read_receipt(),
+            output.native_sessions(),
+            output.bars().len(),
+        )
+    }
+    fn from_cursor(
+        output: &market_squawk_data::CompleteMarketBarHistoryCursor,
+    ) -> Result<Self, RecipeError> {
+        Self::from_parts(
+            output.selection(),
+            output.read_receipt(),
+            output.native_sessions(),
+            output.bar_count(),
+        )
+    }
+    fn from_parts(
+        selection: &market_squawk_data::CompleteMarketBarHistorySelection,
+        read_receipt: &market_squawk_data::CompleteMarketBarHistoryReadReceipt,
+        native_sessions: Option<&market_squawk_data::RetainedHistoryNativeSessions>,
+        bar_count: usize,
+    ) -> Result<Self, RecipeError> {
+        let receipt = selection.receipt();
         if !receipt.realized_outcome_eligible()
             || receipt.adjustment() != MarketBarAdjustment::Raw
-            || output.bars().is_empty()
+            || bar_count == 0
         {
             return Err(RecipeError::Invalid);
         }
@@ -181,18 +207,20 @@ impl DailyHistorySelectionWire {
                 session_kind: receipt.session_kind().ok_or(RecipeError::Invalid)?,
             },
             (None, Some((start, end_inclusive))) => {
-                let native = output.native_sessions().ok_or(RecipeError::Invalid)?;
+                let native = native_sessions.ok_or(RecipeError::Invalid)?;
                 DailyHistoryCoordinate::NominalDailyDate {
                     start,
                     end_inclusive,
                     first_session_close: native
                         .sessions()
                         .first()
+                        .map_err(|_| RecipeError::Invalid)?
                         .ok_or(RecipeError::Invalid)?
                         .closes_at_exclusive(),
                     last_session_close: native
                         .sessions()
                         .last()
+                        .map_err(|_| RecipeError::Invalid)?
                         .ok_or(RecipeError::Invalid)?
                         .closes_at_exclusive(),
                 }
@@ -207,14 +235,14 @@ impl DailyHistorySelectionWire {
             feed: receipt.feed().clone(),
             interval: receipt.interval().clone(),
             ruleset: receipt.session_ruleset().clone(),
-            surface_requirement: output.selection().surface_requirement(),
-            knowledge_cutoff: output.read_receipt().knowledge_cutoff(),
-            selected_manifest: ManifestWire::from_manifest(output.selection().pinned().manifest()),
-            origin_manifest: ManifestWire::from_manifest(output.read_receipt().origin_manifest()),
-            selection_digest: encode_digest(output.selection().selection_digest().bytes()),
+            surface_requirement: selection.surface_requirement(),
+            knowledge_cutoff: read_receipt.knowledge_cutoff(),
+            selected_manifest: ManifestWire::from_manifest(selection.pinned().manifest()),
+            origin_manifest: ManifestWire::from_manifest(read_receipt.origin_manifest()),
+            selection_digest: encode_digest(selection.selection_digest().bytes()),
             publication_receipt_digest: encode_digest(receipt.receipt_digest().bytes()),
-            result_digest: encode_digest(output.read_receipt().result_digest().bytes()),
-            bar_count: output.bars().len(),
+            result_digest: encode_digest(read_receipt.result_digest().bytes()),
+            bar_count,
         };
         result.validate()?;
         Ok(result)
@@ -315,10 +343,12 @@ impl DailyHistorySelectionWire {
                 .map_err(|_| RecipeError::Invalid)
         }
     }
-    pub(in crate::application::analysis::backtest::input_authority) fn matches(
+    pub(in crate::application::analysis::backtest::input_authority) fn matches<
+        T: DailyHistoryInput,
+    >(
         &self,
-        output: &CompleteMarketBarHistoryOutput,
+        output: &T,
     ) -> Result<bool, RecipeError> {
-        Ok(&Self::from_output(output)? == self)
+        Ok(&output.selection_wire()? == self)
     }
 }

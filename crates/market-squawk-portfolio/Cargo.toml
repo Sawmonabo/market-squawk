@@ -14,10 +14,16 @@ market-squawk-analytics = { workspace = true }
 market-squawk-data = { workspace = true }
 market-squawk-domain = { workspace = true }
 rust_decimal.workspace = true
+rusqlite.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+market-squawk-platform.workspace = true
 proptest.workspace = true
 
 [[test]]

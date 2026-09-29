@@ -1,9 +1,11 @@
 //! One installed tool surface shared by native and MCP transports.
 
-use super::probability::{InstalledProbabilityPreparation, PREPARE_PROBABILITY_EVENT, START_PROBABILITY_DATASET};
-pub(super) mod training_preparation;
+use super::probability::{
+    InstalledProbabilityPreparation, PREPARE_PROBABILITY_EVENT, START_PROBABILITY_DATASET,
+};
 mod current_find;
 mod find_results;
+pub(super) mod training_preparation;
 use current_find::InstalledCurrentFind;
 use training_preparation::{
     GET_DATASET_RESULT, GET_TRAINING_RESULT, InstalledProductTraining, START_INVESTMENT_DATASET,
@@ -15,8 +17,8 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_jobs::{
-    JobAuthority, JobAuthorityError, JobGeneration, JobId, JobListPageLimit, JobOrigin,
-    JobRepository, JobRepositoryError, JobSnapshot, JobState, SqliteJobRepository,
+    JobAuthority, JobAuthorityError, JobGeneration, JobId, JobOrigin, JobRepository,
+    JobRepositoryError, JobSnapshot, JobState, SqliteJobRepository,
 };
 use market_squawk_runtime::{ClientId, InputStager, InputTicketId, RuntimeIdentity};
 use market_squawk_services::{
@@ -31,10 +33,11 @@ use crate::{
     LocalProduct,
     application::{
         Application, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
-        DatasetPreparationSelection,
+        DatasetPreparationSelection, MarketRuntimeRegistry,
         lifecycle::WorkspaceRuntimeIdentity,
-        market_calendar::{CompletedMarketSessionReadCapability, context::MarketSessionContextReadCapability},
-        MarketRuntimeRegistry,
+        market_calendar::{
+            CompletedMarketSessionReadCapability, context::MarketSessionContextReadCapability,
+        },
         model::{LIST_PRODUCT_ACTIVITY, product_model_activity},
         operations::OperationsApplicationServices,
         recommendation::RecommendationSetupAuthority,
@@ -52,9 +55,9 @@ use super::{
     },
     forecast_preparation::{InstalledForecastPreparation, START_PREPARED_FORECAST},
     historical_study::{
-        COMPLETE_HISTORICAL_STUDY_FISCAL_PAGE, GET_HISTORICAL_STUDY_PLAN,
-        InstalledHistoricalStudy, START_HISTORICAL_STUDY_DATASET,
-        START_HISTORICAL_STUDY_TRAINING, START_RECOMMENDATION_BACKTEST,
+        COMPLETE_HISTORICAL_STUDY_FISCAL_PAGE, GET_HISTORICAL_STUDY_PLAN, InstalledHistoricalStudy,
+        START_HISTORICAL_STUDY_DATASET, START_HISTORICAL_STUDY_TRAINING,
+        START_RECOMMENDATION_BACKTEST,
     },
     jobs::{InstalledJobOperations, JobStartAdmission},
     market_evidence::InstalledMarketEvidence,
@@ -90,7 +93,8 @@ const RESEARCH_INGEST_RESULT_AUTHORITY: &str = "research.dataset-publication.v1"
 pub(super) struct InstalledToolServices {
     application: Arc<Application>,
     product_capabilities: ServiceCapabilities,
-    pub(super) analytical_workflow: Arc<crate::application::analytical_workflow::host::WorkflowHost>,
+    pub(super) analytical_workflow:
+        Arc<crate::application::analytical_workflow::host::WorkflowHost>,
     jobs: InstalledJobOperations,
     runners: Arc<InstalledJobRunners>,
     inputs: Arc<InputStager>,
@@ -98,7 +102,9 @@ pub(super) struct InstalledToolServices {
     dataset_preparation: InstalledResearchDatasetPreparation,
     historical_study: InstalledHistoricalStudy,
     probability_preparation: InstalledProbabilityPreparation,
-    historical_reader: Option<Arc<crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability>>,
+    historical_reader: Option<
+        Arc<crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability>,
+    >,
     backtest_preparation: InstalledBacktestPreparation,
     forecast_preparation: InstalledForecastPreparation,
     profile_benchmarks: crate::application::RecommendationBenchmarkSelectionReadCapability,
@@ -210,12 +216,13 @@ impl InstalledToolServices {
             .map_err(|_| ServiceError::Internal)?;
         let maximum_mark_age_nanos = u64::try_from(policy.parameters().market_max_age_nanos)
             .map_err(|_| ServiceError::Internal)?;
-        let markets = crate::application::market_selection::MarketInvestmentReadCapability::try_new(
-            product.research(),
-            product.research().instrument_definitions(),
-            product.research().market_data_instruments(),
-            maximum_mark_age_nanos,
-        )?;
+        let markets =
+            crate::application::market_selection::MarketInvestmentReadCapability::try_new(
+                product.research(),
+                product.research().instrument_definitions(),
+                product.research().market_data_instruments(),
+                maximum_mark_age_nanos,
+            )?;
         let dataset_preparation = InstalledResearchDatasetPreparation::new(
             product.research(),
             product.macro_context_read_capability(),
@@ -224,9 +231,14 @@ impl InstalledToolServices {
         );
         let historical_study =
             InstalledHistoricalStudy::new(product, jobs, dataset_preparation.authority());
-        let probability_preparation = InstalledProbabilityPreparation::new(product, jobs, dataset_preparation.authority())
-            .with_outcome_publication(product.source_action_preparation(),product.model_domain(),
-                Arc::clone(runners.analysis_phase_one_feature_derived_generation()),jobs);
+        let probability_preparation =
+            InstalledProbabilityPreparation::new(product, jobs, dataset_preparation.authority())
+                .with_outcome_publication(
+                    product.source_action_preparation(),
+                    product.model_domain(),
+                    Arc::clone(runners.analysis_phase_one_feature_derived_generation()),
+                    jobs,
+                );
         let historical_reader = match (
             product.model_runtime(), runners.forecast().preparation_authority(),
             historical_study.fiscal_reader(),
@@ -255,18 +267,24 @@ impl InstalledToolServices {
             product.model_domain(),
             product.fair_value_service(),
             crate::application::fair_value::ForecastValuationSourceFactory::new(
-                product.model_domain(), product.research(),
+                product.model_domain(),
+                product.research(),
             ),
             product.backtest_inputs(),
             product.backtest_repository(),
             historical_reader.clone(),
             std::num::NonZeroUsize::new(
                 crate::application::model::forecast::MAXIMUM_FORECAST_ARTIFACT_BYTES,
-            ).ok_or(ServiceError::Internal)?,
+            )
+            .ok_or(ServiceError::Internal)?,
             crate::application::SourceAppliedCorporateActionReadCapability::new(
                 product.research(),
-                CompletedMarketSessionReadCapability::new(product.research(), product.market_runtime()),
-            ).with_artifact_repository(product.artifacts()),
+                CompletedMarketSessionReadCapability::new(
+                    product.research(),
+                    product.market_runtime(),
+                ),
+            )
+            .with_artifact_repository(product.artifacts()),
         );
         let market_evidence = product.instrument_context_read_capability().map(|identities| {
             let selections = crate::application::market_selection::product::MarketProductSelectionReadCapability::new(
@@ -298,7 +316,11 @@ impl InstalledToolServices {
         let product_capabilities = application
             .product_capabilities()
             .map_err(|_error| ServiceError::Internal)?;
-        let analytical_workflow = crate::application::analytical_workflow::host::WorkflowHost::open(product.paths(), runtime.workspace_id().as_uuid())
+        let analytical_workflow =
+            crate::application::analytical_workflow::host::WorkflowHost::open(
+                product.paths(),
+                runtime.workspace_id().as_uuid(),
+            )
             .map_err(|_| ServiceError::Unavailable)?;
         Ok(Self {
             analytical_workflow,
@@ -318,15 +340,17 @@ impl InstalledToolServices {
                 runtime,
             )?,
             forecast_preparation,
-            profile_benchmarks: crate::application::RecommendationBenchmarkSelectionReadCapability::new(
-                product.research().market_data_instruments(),
-            ),
+            profile_benchmarks:
+                crate::application::RecommendationBenchmarkSelectionReadCapability::new(
+                    product.research().market_data_instruments(),
+                ),
             training_preparation: InstalledProductTraining::new(product, jobs),
             current_find: InstalledCurrentFind::new(product, runtime),
             market_evidence,
             market_session_runtime: product.market_runtime(),
             market_session_reader: MarketSessionContextReadCapability::new(
-                product.research(), product.market_runtime(),
+                product.research(),
+                product.market_runtime(),
             ),
             recommendation_backtest: InstalledRecommendationBacktestReadOperations::new(
                 product.backtest_inputs(),
@@ -559,32 +583,66 @@ impl InstalledToolServices {
             START_RECOMMENDATION_BACKTEST => {
                 let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
                 let (setup, catalog) = self.recommendation_setup.resolve_for_analysis(context)?;
-                let prepared = self.historical_study.prepare_study(
-                    runner, &self.forecast_preparation, request,
-                    setup.selected_account().account_id(),
-                    market_squawk_valuation::ActorId::try_from("installed-investment-analysis")
-                        .map_err(|_| ServiceError::Internal)?,
-                    context,
-                ).await?;
-                self.recommendation_setup.recheck_for_analysis(&setup, &catalog, context)?;
+                let prepared = self
+                    .historical_study
+                    .prepare_study(
+                        runner,
+                        &self.forecast_preparation,
+                        request,
+                        setup.selected_account().account_id(),
+                        market_squawk_valuation::ActorId::try_from("installed-investment-analysis")
+                            .map_err(|_| ServiceError::Internal)?,
+                        context,
+                    )
+                    .await?;
+                self.recommendation_setup
+                    .recheck_for_analysis(&setup, &catalog, context)?;
                 let (study, issuer) = prepared.into_parts();
-                let admission = self.runners.backtest().admit_recommendation(
-                    study, issuer, captured_at, context.limits(),
-                    self.historical_study.fiscal_reader().ok_or(ServiceError::Unavailable)?,
-                ).map_err(map_backtest_admission)?;
+                let admission = self
+                    .runners
+                    .backtest()
+                    .admit_recommendation(
+                        study,
+                        issuer,
+                        captured_at,
+                        context.limits(),
+                        self.historical_study
+                            .fiscal_reader()
+                            .ok_or(ServiceError::Unavailable)?,
+                    )
+                    .map_err(map_backtest_admission)?;
                 (admission, JobAdmissionOwner::Backtest)
             }
             START_PROBABILITY_DATASET => {
                 let setup = match self.recommendation_setup.resolve_for_analysis(context) {
-                    Ok(value)=>Some(value), Err(ServiceError::Unavailable|ServiceError::NotFound)=>None,
-                    Err(error)=>return Err(error),
+                    Ok(value) => Some(value),
+                    Err(ServiceError::Unavailable | ServiceError::NotFound) => None,
+                    Err(error) => return Err(error),
                 };
-                let prepared=self.probability_preparation.prepare_dataset(&self.forecast_preparation,request,
-                    setup.as_ref().map(|(setup,_)|setup.selected_account().account_id()),context).await?;
-                if let Some((setup,catalog))=&setup {self.recommendation_setup.recheck_for_analysis(setup,catalog,context)?;}
-                let admission=self.runners.analysis_phase_one_feature_derived_generation().admit_prepared(prepared,captured_at)
+                let prepared = self
+                    .probability_preparation
+                    .prepare_dataset(
+                        &self.forecast_preparation,
+                        request,
+                        setup
+                            .as_ref()
+                            .map(|(setup, _)| setup.selected_account().account_id()),
+                        context,
+                    )
+                    .await?;
+                if let Some((setup, catalog)) = &setup {
+                    self.recommendation_setup
+                        .recheck_for_analysis(setup, catalog, context)?;
+                }
+                let admission = self
+                    .runners
+                    .analysis_phase_one_feature_derived_generation()
+                    .admit_prepared(prepared, captured_at)
                     .map_err(map_research_admission)?;
-                (admission,JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration)
+                (
+                    admission,
+                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                )
             }
             START_HISTORICAL_STUDY_DATASET => {
                 let prepared = self
@@ -596,7 +654,10 @@ impl InstalledToolServices {
                     .analysis_phase_one_feature_derived_generation()
                     .admit_prepared(prepared, captured_at)
                     .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration)
+                (
+                    admission,
+                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                )
             }
             START_HISTORICAL_STUDY_TRAINING => {
                 let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
@@ -625,22 +686,40 @@ impl InstalledToolServices {
                 )
             }
             current_find::START_DATASET => {
-                let models = self.forecast_preparation.financial_profile_catalog(context).await?;
-                let prepared = self.current_find.prepare_dataset(
-                    &self.dataset_preparation, request, context, models.as_ref(),
-                ).await?;
-                let admission = self.runners.analysis_phase_one_feature_derived_generation()
+                let prepared = self
+                    .current_find
+                    .prepare_dataset(
+                        &self.dataset_preparation,
+                        request,
+                        context,
+                        &self.forecast_preparation,
+                    )
+                    .await?;
+                let admission = self
+                    .runners
+                    .analysis_phase_one_feature_derived_generation()
                     .admit_prepared(prepared, captured_at)
                     .map_err(map_research_admission)?;
-                (admission, JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration)
+                (
+                    admission,
+                    JobAdmissionOwner::AnalysisPhaseOneFeatureGeneration,
+                )
             }
             current_find::START_SCREEN => {
-                let models = self.forecast_preparation.financial_profile_catalog(context).await?;
-                let prepared = self.current_find.prepare_screen(
-                    &self.dataset_preparation, &self.training_preparation,
-                    request, context, models.as_ref(), captured_at,
-                ).await?;
-                let admission = self.runners.screen()
+                let prepared = self
+                    .current_find
+                    .prepare_screen(
+                        &self.dataset_preparation,
+                        &self.training_preparation,
+                        request,
+                        context,
+                        &self.forecast_preparation,
+                        captured_at,
+                    )
+                    .await?;
+                let admission = self
+                    .runners
+                    .screen()
                     .admit(crate::jobs::ScreenJobCommand::new(prepared), captured_at)
                     .map_err(map_screen_admission)?;
                 (admission, JobAdmissionOwner::Screen)
@@ -1119,10 +1198,23 @@ impl InstalledToolServices {
     ) -> Pin<Box<dyn Future<Output = Result<TypedToolResult, ServiceError>> + Send + '_>> {
         if super::analytical_workflow::owns(request.name()) {
             return Box::pin(async move {
-                let descriptor = self.application.capabilities().find(request.name()).cloned().ok_or(ServiceError::NotFound)?;
-                if descriptor.version()!=request.version() || descriptor.contract()!=request.contract(){return Err(ServiceError::InvalidRequest)}
-                let result=super::analytical_workflow::call(&self.analytical_workflow,&request,&context).await?;
-                result.validate_for(&descriptor).map_err(ServiceError::from)?;
+                let descriptor = self
+                    .application
+                    .capabilities()
+                    .find(request.name())
+                    .cloned()
+                    .ok_or(ServiceError::NotFound)?;
+                if descriptor.version() != request.version()
+                    || descriptor.contract() != request.contract()
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let result =
+                    super::analytical_workflow::call(&self.analytical_workflow, &request, &context)
+                        .await?;
+                result
+                    .validate_for(&descriptor)
+                    .map_err(ServiceError::from)?;
                 Ok(result)
             });
         }
@@ -1205,30 +1297,55 @@ impl InstalledToolServices {
                 return Ok(result);
             });
         }
-        if matches!(request.name(), GET_HISTORICAL_STUDY_PLAN | COMPLETE_HISTORICAL_STUDY_FISCAL_PAGE | super::jobs::GET_RECOMMENDATION_BACKTEST_JOB_RESULT) {
+        if matches!(
+            request.name(),
+            GET_HISTORICAL_STUDY_PLAN
+                | COMPLETE_HISTORICAL_STUDY_FISCAL_PAGE
+                | super::jobs::GET_RECOMMENDATION_BACKTEST_JOB_RESULT
+        ) {
             return Box::pin(async move {
-                let descriptor = self.application.capabilities().find(request.name())
-                    .cloned().ok_or(ServiceError::NotFound)?;
-                if descriptor.version() != request.version() || descriptor.contract() != request.contract() {
+                let descriptor = self
+                    .application
+                    .capabilities()
+                    .find(request.name())
+                    .cloned()
+                    .ok_or(ServiceError::NotFound)?;
+                if descriptor.version() != request.version()
+                    || descriptor.contract() != request.contract()
+                {
                     return Err(ServiceError::InvalidRequest);
                 }
                 ensure_live(&context)?;
                 let result = if request.name() == GET_HISTORICAL_STUDY_PLAN {
-                    self.historical_study.plan(&self.forecast_preparation, &request, &context).await?
+                    self.historical_study
+                        .plan(&self.forecast_preparation, &request, &context)
+                        .await?
                 } else if request.name() == super::jobs::GET_RECOMMENDATION_BACKTEST_JOB_RESULT {
-                    self.jobs.read_recommendation_backtest_result(
-                        self.runners.backtest(),
-                        self.historical_reader.as_deref().ok_or(ServiceError::Unavailable)?,
-                        &request, &context,
-                    ).await?
+                    self.jobs
+                        .read_recommendation_backtest_result(
+                            self.runners.backtest(),
+                            self.historical_reader
+                                .as_deref()
+                                .ok_or(ServiceError::Unavailable)?,
+                            &request,
+                            &context,
+                        )
+                        .await?
                 } else {
                     let runner = self.runners.training().ok_or(ServiceError::Unavailable)?;
-                    self.historical_study.complete_fiscal_page(
-                        runner, &self.forecast_preparation, &request, &context,
-                    ).await?
+                    self.historical_study
+                        .complete_fiscal_page(
+                            runner,
+                            &self.forecast_preparation,
+                            &request,
+                            &context,
+                        )
+                        .await?
                 };
                 ensure_live(&context)?;
-                result.validate_for(&descriptor).map_err(ServiceError::from)?;
+                result
+                    .validate_for(&descriptor)
+                    .map_err(ServiceError::from)?;
                 return Ok(result);
             });
         }
@@ -1246,17 +1363,16 @@ impl InstalledToolServices {
                     return Err(ServiceError::InvalidRequest);
                 }
                 ensure_live(&context)?;
-                let maximum = context.limits().maximum_result_items().min(1_024);
-                let limit = JobListPageLimit::try_new(maximum)
-                    .map_err(|_error| ServiceError::InvalidRequest)?;
-                let page = self.jobs.list_page(limit).await?;
-                let activities = page
-                    .jobs()
+                let (views, next_cursor) = self
+                    .jobs
+                    .product_activity_page(&request, &context, true)
+                    .await?;
+                let activities = views
                     .iter()
-                    .filter_map(product_model_activity)
-                    .collect::<Vec<_>>();
+                    .map(|view| product_model_activity(view).ok_or(ServiceError::InvalidResult))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let result = TypedToolResult::try_new(
-                    serde_json::json!({"activities": activities}),
+                    serde_json::json!({"activities": activities,"nextCursor":next_cursor}),
                     activities.len(),
                     ToolResultMetadata::complete_not_applicable(),
                     context.limits(),
@@ -1353,28 +1469,56 @@ impl InstalledToolServices {
                 {
                     return Err(ServiceError::InvalidRequest);
                 }
-                let models = self
-                    .forecast_preparation
-                    .financial_profile_catalog(&context)
-                    .await?;
-                let result = super::analytical_profile::call(&request, &context, models.as_ref(), &self.profile_benchmarks)?;
+                let result = super::analytical_profile::call(
+                    &request,
+                    &context,
+                    &self.forecast_preparation,
+                    &self.profile_benchmarks,
+                )
+                .await?;
                 result
                     .validate_for(&descriptor)
                     .map_err(ServiceError::from)?;
                 return Ok(result);
             });
         }
-        if request.name()==PREPARE_PROBABILITY_EVENT {
+        if request.name() == PREPARE_PROBABILITY_EVENT {
             return Box::pin(async move {
-                let descriptor=self.application.capabilities().find(request.name()).cloned().ok_or(ServiceError::NotFound)?;
-                if descriptor.version()!=request.version() || descriptor.contract()!=request.contract() {return Err(ServiceError::InvalidRequest)}
-                let setup=match self.recommendation_setup.resolve_for_analysis(&context) {
-                    Ok(value)=>Some(value),Err(ServiceError::Unavailable|ServiceError::NotFound)=>None,Err(error)=>return Err(error),
+                let descriptor = self
+                    .application
+                    .capabilities()
+                    .find(request.name())
+                    .cloned()
+                    .ok_or(ServiceError::NotFound)?;
+                if descriptor.version() != request.version()
+                    || descriptor.contract() != request.contract()
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let setup = match self.recommendation_setup.resolve_for_analysis(&context) {
+                    Ok(value) => Some(value),
+                    Err(ServiceError::Unavailable | ServiceError::NotFound) => None,
+                    Err(error) => return Err(error),
                 };
-                let result=self.probability_preparation.prepare(&self.forecast_preparation,&request,
-                    setup.as_ref().map(|(setup,_)|setup.selected_account().account_id()),&context).await?;
-                if let Some((setup,catalog))=&setup {self.recommendation_setup.recheck_for_analysis(setup,catalog,&context)?;}
-                result.validate_for(&descriptor).map_err(ServiceError::from)?;Ok(result)
+                let result = self
+                    .probability_preparation
+                    .prepare(
+                        &self.forecast_preparation,
+                        &request,
+                        setup
+                            .as_ref()
+                            .map(|(setup, _)| setup.selected_account().account_id()),
+                        &context,
+                    )
+                    .await?;
+                if let Some((setup, catalog)) = &setup {
+                    self.recommendation_setup
+                        .recheck_for_analysis(setup, catalog, &context)?;
+                }
+                result
+                    .validate_for(&descriptor)
+                    .map_err(ServiceError::from)?;
+                Ok(result)
             });
         }
         if matches!(request.name(), GET_DATASET_RESULT | GET_TRAINING_RESULT) {
@@ -1474,15 +1618,27 @@ impl InstalledToolServices {
         }
         if super::market_session_context::owns(request.name()) {
             return Box::pin(async move {
-                let descriptor = self.application.capabilities().find(request.name()).cloned()
+                let descriptor = self
+                    .application
+                    .capabilities()
+                    .find(request.name())
+                    .cloned()
                     .ok_or(ServiceError::NotFound)?;
-                if descriptor.version() != request.version() || descriptor.contract() != request.contract() {
+                if descriptor.version() != request.version()
+                    || descriptor.contract() != request.contract()
+                {
                     return Err(ServiceError::InvalidRequest);
                 }
                 let result = super::market_session_context::call(
-                    &request, &context, &self.market_session_runtime, &self.market_session_reader,
-                ).await?;
-                result.validate_for(&descriptor).map_err(ServiceError::from)?;
+                    &request,
+                    &context,
+                    &self.market_session_runtime,
+                    &self.market_session_reader,
+                )
+                .await?;
+                result
+                    .validate_for(&descriptor)
+                    .map_err(ServiceError::from)?;
                 return Ok(result);
             });
         }
@@ -1501,7 +1657,7 @@ impl InstalledToolServices {
                 }
                 let models = self
                     .forecast_preparation
-                    .financial_profile_catalog(&context)
+                    .financial_profile_catalog_for_request(&request, &context)
                     .await?;
                 let result = self
                     .market_evidence
@@ -1542,23 +1698,36 @@ impl InstalledToolServices {
             || matches!(request.name(), find_results::PUBLISH | find_results::GET)
         {
             return Box::pin(async move {
-                let descriptor = self.application.capabilities().find(request.name()).cloned()
+                let descriptor = self
+                    .application
+                    .capabilities()
+                    .find(request.name())
+                    .cloned()
                     .ok_or(ServiceError::NotFound)?;
-                if descriptor.version() != request.version() || descriptor.contract() != request.contract() {
+                if descriptor.version() != request.version()
+                    || descriptor.contract() != request.contract()
+                {
                     return Err(ServiceError::InvalidRequest);
                 }
-                let result = if matches!(request.name(), find_results::PUBLISH | find_results::GET) {
-                    self.current_find.call_find_results(
-                        &request, &context, &self.training_preparation,
-                    ).await?
+                let result = if matches!(request.name(), find_results::PUBLISH | find_results::GET)
+                {
+                    self.current_find
+                        .call_find_results(&request, &context, &self.training_preparation)
+                        .await?
                 } else {
-                    let models = self.forecast_preparation.financial_profile_catalog(&context).await?;
-                    self.current_find.call(
-                        &self.dataset_preparation, &self.training_preparation,
-                        &request, &context, models.as_ref(),
-                    ).await?
+                    self.current_find
+                        .call(
+                            &self.dataset_preparation,
+                            &self.training_preparation,
+                            &request,
+                            &context,
+                            &self.forecast_preparation,
+                        )
+                        .await?
                 };
-                result.validate_for(&descriptor).map_err(ServiceError::from)?;
+                result
+                    .validate_for(&descriptor)
+                    .map_err(ServiceError::from)?;
                 return Ok(result);
             });
         }
@@ -1576,14 +1745,16 @@ impl InstalledToolServices {
                     return Err(ServiceError::InvalidRequest);
                 }
                 let result = if request.name() == GENERATE_INVESTMENT_ANALYSIS {
-                    self.decisions.generate_investment_analysis(
-                        &request,
-                        &context,
-                        &self.jobs,
-                        self.runners.forecast(),
-                        &self.portfolio_analysis,
-                        &self.forecast_preparation,
-                    ).await?
+                    self.decisions
+                        .generate_investment_analysis(
+                            &request,
+                            &context,
+                            &self.jobs,
+                            self.runners.forecast(),
+                            &self.portfolio_analysis,
+                            &self.forecast_preparation,
+                        )
+                        .await?
                 } else {
                     self.decisions.call(&request, &context).await?
                 };
@@ -1608,7 +1779,7 @@ impl InstalledToolServices {
                 }
                 let models = self
                     .forecast_preparation
-                    .financial_profile_catalog(&context)
+                    .financial_profile_catalog_for_request(&request, &context)
                     .await?;
                 let result = self
                     .portfolio_analysis
@@ -1743,25 +1914,55 @@ impl InstalledToolServices {
                 return Ok(result);
             });
         }
-        if request.name()=="Model.PrepareForecastOutcome" {
+        if request.name() == "Model.PrepareForecastOutcome" {
             return Box::pin(async move {
                 // The original model owner first validates the saved token, maturity, authority,
                 // and existing canonical label. Only a genuine mature catalog miss can acquire.
-                let original=self.application.call(request.clone(),context.clone()).await?;
-                let value=original.structured_content();
-                if value.get("state").and_then(Value::as_str)!=Some("unavailable")
-                    || value.get("reason").and_then(Value::as_str)!=Some("source_unavailable") {return Ok(original)}
-                let token=request.arguments().get("forecastToken").and_then(Value::as_str)
-                    .and_then(|value|Uuid::parse_str(value).ok()).ok_or(ServiceError::InvalidRequest)?;
-                let setup=match self.recommendation_setup.resolve_for_analysis(&context){
-                    Ok(value)=>Some(value),Err(ServiceError::Unavailable|ServiceError::NotFound)=>None,Err(error)=>return Err(error),
+                let original = self
+                    .application
+                    .call(request.clone(), context.clone())
+                    .await?;
+                let value = original.structured_content();
+                if value.get("state").and_then(Value::as_str) != Some("unavailable")
+                    || value.get("reason").and_then(Value::as_str) != Some("source_unavailable")
+                {
+                    return Ok(original);
+                }
+                let token = request
+                    .arguments()
+                    .get("forecastToken")
+                    .and_then(Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let setup = match self.recommendation_setup.resolve_for_analysis(&context) {
+                    Ok(value) => Some(value),
+                    Err(ServiceError::Unavailable | ServiceError::NotFound) => None,
+                    Err(error) => return Err(error),
                 };
-                let published=match self.probability_preparation.ensure_matured_event_publication(token,
-                    setup.as_ref().map(|(setup,_)|setup.selected_account().account_id()),&context).await {
-                    Ok(value)=>value,Err(ServiceError::Unavailable|ServiceError::NotFound)=>false,Err(error)=>return Err(error),
+                let published = match self
+                    .probability_preparation
+                    .ensure_matured_event_publication(
+                        token,
+                        setup
+                            .as_ref()
+                            .map(|(setup, _)| setup.selected_account().account_id()),
+                        &context,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(ServiceError::Unavailable | ServiceError::NotFound) => false,
+                    Err(error) => return Err(error),
                 };
-                if let Some((setup,catalog))=&setup {self.recommendation_setup.recheck_for_analysis(setup,catalog,&context)?;}
-                if published {self.application.call(request,context).await}else{Ok(original)}
+                if let Some((setup, catalog)) = &setup {
+                    self.recommendation_setup
+                        .recheck_for_analysis(setup, catalog, &context)?;
+                }
+                if published {
+                    self.application.call(request, context).await
+                } else {
+                    Ok(original)
+                }
             });
         }
         self.application.call(request, context)

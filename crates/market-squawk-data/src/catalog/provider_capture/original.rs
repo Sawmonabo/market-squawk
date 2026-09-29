@@ -5,7 +5,6 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const MAX_ORIGINAL_CONTEXT_BYTES: usize = 128 * 1024;
-const MAX_ORIGINAL_RESPONSES: u16 = 64;
 
 /// Constructor-private custody locator. It carries original facts, never live seal authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,7 +72,7 @@ impl Catalog {
         cancellation: &CancellationToken,
     ) -> Result<Option<EvidenceDigest>, CatalogError> {
         self.market_recovery_read(deadline,cancellation,|| {
-            let mut statement=self.connection.prepare("SELECT DISTINCT original.session_digest FROM provider_capture_originals AS original JOIN provider_raw_observations AS observation ON observation.capture_observation_digest=original.capture_observation_digest WHERE original.ordinal=0 AND original.published_binding IS NULL AND original.published_option_binding IS NULL AND observation.source_id=?1 LIMIT 2")?;
+            let mut statement=self.connection.prepare("SELECT DISTINCT original.session_digest FROM provider_capture_originals AS original JOIN provider_raw_observations AS observation ON observation.capture_observation_digest=original.capture_observation_digest WHERE original.ordinal=0 AND original.published_binding IS NULL AND original.published_option_binding IS NULL AND original.published_logical_binding IS NULL AND observation.source_id=?1 LIMIT 2")?;
             let mut rows=statement.query([source.as_str()])?;
             let Some(row)=rows.next()? else{return Ok(None)};
             let session=parse_digest(1,&row.get::<_,Vec<u8>>(0)?)?;
@@ -205,7 +204,6 @@ impl Catalog {
     ) -> Result<ProviderCaptureOriginalReceipt, CatalogError> {
         if session.bytes() == [0; 32]
             || expected_count == 0
-            || expected_count > MAX_ORIGINAL_RESPONSES
             || ordinal >= expected_count
             || context.len() > MAX_ORIGINAL_CONTEXT_BYTES
             || (ordinal == 0) != !context.is_empty()
@@ -343,10 +341,20 @@ pub(in crate::catalog) fn load(
     session: EvidenceDigest,
     ordinal: u16,
 ) -> Result<Option<ProviderCaptureOriginalReceipt>, CatalogError> {
+    load_original(connection, session, ordinal, true)
+}
+
+// Whole-session consumers verify the ordered pack once after reading every original.
+fn load_original(
+    connection: &Connection,
+    session: EvidenceDigest,
+    ordinal: u16,
+    verify_pack: bool,
+) -> Result<Option<ProviderCaptureOriginalReceipt>, CatalogError> {
     let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM provider_capture_originals WHERE session_digest=?1 AND ordinal=?2)",params![session.bytes(),i64::from(ordinal)],|row|row.get(0))?;
     let raw = connection.query_row("SELECT original.expected_count,original.dataset_id,original.context_bytes,original.decoded_at_ns,
         observation.capture_json,object.raw_claim_digest,object.object_capture_content_digest,object.object_capture_observation_digest,
-        object.capture_receipt_digest,raw.raw_claim_json,original.predecessor_digest,original.original_digest,COALESCE(original.published_binding,original.published_option_binding)
+        object.capture_receipt_digest,raw.raw_claim_json,original.predecessor_digest,original.original_digest,COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding)
         FROM provider_capture_originals AS original JOIN provider_raw_observations AS observation
           ON observation.capture_observation_digest=original.capture_observation_digest
         JOIN provider_raw_observation_objects AS object ON object.capture_observation_digest=observation.capture_observation_digest AND object.input_ordinal=0
@@ -379,7 +387,6 @@ pub(in crate::catalog) fn load(
         || capture.len() > MAX_PROVIDER_CLAIM_JSON_BYTES
         || claim.len() > MAX_PROVIDER_CLAIM_JSON_BYTES
         || count == 0
-        || count > MAX_ORIGINAL_RESPONSES
         || ordinal >= count
         || (ordinal == 0) != !context.is_empty()
     {
@@ -444,16 +451,16 @@ pub(in crate::catalog) fn load(
           WHERE previous.session_digest=original.session_digest AND previous.ordinal=original.ordinal-1
            AND previous.original_digest=original.predecessor_digest AND previous.expected_count=original.expected_count
            AND previous.dataset_id=original.dataset_id AND previous.decoded_at_ns<=original.decoded_at_ns
-           AND COALESCE(previous.published_binding,previous.published_option_binding) IS COALESCE(original.published_binding,original.published_option_binding)
+           AND COALESCE(previous.published_binding,previous.published_option_binding,previous.published_logical_binding) IS COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding)
            AND previous_observation.source_id=observation.source_id
            AND previous_observation.metadata_revision=observation.metadata_revision
            AND previous_observation.source_revision_digest=observation.source_revision_digest))
-         AND (COALESCE(original.published_binding,original.published_option_binding) IS NULL OR original.expected_count=(SELECT COUNT(*) FROM provider_capture_originals AS member WHERE member.session_digest=original.session_digest AND COALESCE(member.published_binding,member.published_option_binding)=COALESCE(original.published_binding,original.published_option_binding)))
-         AND (COALESCE(original.published_binding,original.published_option_binding) IS NULL OR EXISTS(
+         AND (COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding) IS NULL OR original.expected_count=(SELECT COUNT(*) FROM provider_capture_originals AS member WHERE member.session_digest=original.session_digest AND COALESCE(member.published_binding,member.published_option_binding,member.published_logical_binding)=COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding)))
+         AND (COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding) IS NULL OR EXISTS(
           SELECT 1 FROM ingest_run_provider_capture_bindings AS binding
           JOIN dataset_manifests AS manifest ON manifest.run_id=binding.run_id
           JOIN provider_capture_binding_objects AS object ON object.binding_digest=binding.binding_digest
-          WHERE binding.binding_digest=COALESCE(original.published_binding,original.published_option_binding) AND manifest.dataset_name=original.dataset_id
+          WHERE binding.binding_digest=COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding) AND manifest.dataset_name=original.dataset_id
            AND object.raw_claim_digest=original.raw_claim_digest AND object.physical_receipt_digest=original.physical_receipt_digest)
           OR EXISTS(
            SELECT 1 FROM provider_option_market_bindings AS option_binding
@@ -462,12 +469,20 @@ pub(in crate::catalog) fn load(
            JOIN json_each(option_binding.reference_dependencies_json) AS reference
            JOIN provider_capture_metadata_dependencies AS dependency
              ON lower(hex(dependency.dependency_digest))=json_extract(reference.value,'$.dependency_digest')
-           WHERE option_binding.option_binding_digest=COALESCE(original.published_binding,original.published_option_binding)
+           WHERE option_binding.option_binding_digest=COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding)
              AND manifest.dataset_name=original.dataset_id
              AND dependency.capture_observation_digest=original.capture_observation_digest
              AND dependency.raw_claim_digest=original.raw_claim_digest
              AND dependency.physical_receipt_digest=original.physical_receipt_digest
              AND option_binding.recorded_at_ns>=original.retained_at_ns)
+          OR EXISTS(
+           SELECT 1 FROM provider_logical_publication_bindings AS logical
+           JOIN ingest_run_provider_publication_bindings AS input ON input.logical_binding_digest=logical.binding_digest
+           JOIN dataset_manifests AS manifest ON manifest.run_id=input.run_id
+           WHERE original.published_logical_binding=logical.binding_digest
+             AND input.publication_kind='provider_logical' AND input.source_id=observation.source_id
+             AND logical.source_id=observation.source_id AND manifest.dataset_name=original.dataset_id
+             AND logical.recorded_at_ns>=original.retained_at_ns)
           OR EXISTS(
            SELECT 1 FROM audit_events AS replay
            JOIN ingest_runs AS run ON run.run_id=replay.subject_id AND run.state='succeeded' AND run.operation='persist'
@@ -475,7 +490,7 @@ pub(in crate::catalog) fn load(
            JOIN dataset_manifests AS manifest ON manifest.run_id=run.run_id
            JOIN provider_capture_bindings AS previous_binding ON previous_binding.binding_digest=input.binding_digest
            JOIN provider_raw_observations AS previous_capture ON previous_capture.capture_observation_digest=previous_binding.capture_observation_digest
-           JOIN provider_capture_bindings AS fresh_binding ON fresh_binding.binding_digest=COALESCE(original.published_binding,original.published_option_binding)
+           JOIN provider_capture_bindings AS fresh_binding ON fresh_binding.binding_digest=COALESCE(original.published_binding,original.published_option_binding,original.published_logical_binding)
            JOIN provider_raw_observations AS fresh_capture ON fresh_capture.capture_observation_digest=fresh_binding.capture_observation_digest
            JOIN provider_capture_binding_objects AS object ON object.binding_digest=fresh_binding.binding_digest
            WHERE replay.event_type='provider-capture-binding.reobserved' AND replay.details_digest=fresh_binding.binding_digest
@@ -494,6 +509,12 @@ pub(in crate::catalog) fn load(
         params![session.bytes(),i64::from(ordinal)],|row|row.get(0))?;
     if !custody {
         return Err(CatalogError::CorruptCatalog);
+    }
+    let logical: Option<Vec<u8>> = connection.query_row(
+        "SELECT published_logical_binding FROM provider_capture_originals WHERE session_digest=?1 AND ordinal=?2",
+        params![session.bytes(), i64::from(ordinal)], |row| row.get(0))?;
+    if let Some(logical) = logical.filter(|_| verify_pack) {
+        validate_persisted_pack_identity(connection, session, count, parse_digest(1, &logical)?)?;
     }
     Ok(Some(value))
 }
@@ -662,15 +683,192 @@ pub(in crate::catalog) fn consume_option_dependencies(
         return Ok(());
     };
     let session: Vec<u8> = connection.query_row("SELECT session_digest FROM provider_capture_originals
-        WHERE raw_claim_digest=?1 AND physical_receipt_digest=?2 AND ordinal=0 AND published_binding IS NULL AND published_option_binding IS NULL",
+        WHERE raw_claim_digest=?1 AND physical_receipt_digest=?2 AND ordinal=0 AND published_binding IS NULL AND published_option_binding IS NULL AND published_logical_binding IS NULL",
         params![first.physical().raw_claim_digest().bytes(),first.physical().claim().physical_receipt_digest().bytes()],|row| row.get(0))?;
     let changed = connection.execute(
         "UPDATE provider_capture_originals SET published_option_binding=?1
-        WHERE session_digest=?2 AND published_binding IS NULL AND published_option_binding IS NULL",
+        WHERE session_digest=?2 AND published_binding IS NULL AND published_option_binding IS NULL AND published_logical_binding IS NULL",
         params![evidence.binding_digest().bytes(), session],
     )?;
     if changed != evidence.reference_dependencies().len() {
         return Err(CatalogError::ProviderCaptureConflict);
+    }
+    Ok(())
+}
+
+/// Consumes the exact independently sealed original session in the logical publication transaction.
+pub(in crate::catalog) fn consume_for_logical_publication(
+    connection: &Connection,
+    dataset: &DatasetId,
+    binding: &market_squawk_sources::SealedProviderLogicalPublicationBinding,
+    pack: &market_squawk_sources::ProviderCapturePackSeal,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), CatalogError> {
+    let session = validate_live_pack_session(
+        connection,
+        dataset,
+        binding,
+        pack,
+        false,
+        deadline,
+        cancellation,
+    )?;
+    let changed = connection.execute(
+        "UPDATE provider_capture_originals SET published_logical_binding=?1 WHERE session_digest=?2
+         AND published_binding IS NULL AND published_option_binding IS NULL AND published_logical_binding IS NULL",
+        params![binding.binding_digest().bytes(), session.bytes()])?;
+    if changed as u64 != pack.capture_count() {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    Ok(())
+}
+
+pub(in crate::catalog) fn logical_publication_matches(
+    connection: &Connection,
+    dataset: &DatasetId,
+    binding: &market_squawk_sources::SealedProviderLogicalPublicationBinding,
+    pack: &market_squawk_sources::ProviderCapturePackSeal,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<bool, CatalogError> {
+    validate_live_pack_session(
+        connection,
+        dataset,
+        binding,
+        pack,
+        true,
+        deadline,
+        cancellation,
+    )
+    .map(|_| true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_live_pack_session(
+    connection: &Connection,
+    dataset: &DatasetId,
+    binding: &market_squawk_sources::SealedProviderLogicalPublicationBinding,
+    pack: &market_squawk_sources::ProviderCapturePackSeal,
+    published: bool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<EvidenceDigest, CatalogError> {
+    let first_capture = pack.first_capture();
+    let mut lookup = connection.prepare(
+        "SELECT session_digest FROM provider_capture_originals WHERE ordinal=0
+         AND capture_observation_digest=?1 AND physical_receipt_digest=?2 LIMIT 2",
+    )?;
+    let mut rows = lookup.query(params![
+        first_capture.capture().observation_digest().bytes(),
+        first_capture.segment().physical_receipt_digest().bytes()
+    ])?;
+    let first = rows.next()?.ok_or(CatalogError::ProviderCaptureConflict)?;
+    let session = parse_digest(1, &first.get::<_, Vec<u8>>(0)?)?;
+    if rows.next()?.is_some() {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    drop(rows);
+    drop(lookup);
+    let expected =
+        u16::try_from(pack.capture_count()).map_err(|_| CatalogError::ProviderCaptureConflict)?;
+    if expected == 0
+        || pack.source_id() != binding.terminal().source_id()
+        || binding
+            .objects()
+            .get(pack.logical_ordinal() as usize)
+            .is_none_or(|object| {
+                object.role() != market_squawk_sources::LogicalObjectRole::ProviderPayload
+                    || object.object() != pack.object()
+                    || object.semantic_identity() != pack.captures_digest()
+            })
+    {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    let mut identity = market_squawk_sources::ProviderCapturePackAccumulator::new();
+    let mut predecessor = None;
+    for ordinal in 0..expected {
+        if cancellation.is_cancelled() {
+            return Err(CatalogError::MarketRecoveryReadCancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(CatalogError::MarketRecoveryReadDeadlineExceeded);
+        }
+        let original = load_original(connection, session, ordinal, false)?
+            .ok_or(CatalogError::ProviderCaptureConflict)?;
+        if original.expected_count != expected
+            || &original.dataset != dataset
+            || original.capture.source_id() != pack.source_id()
+            || original.predecessor != predecessor
+            || original.published != published.then_some(binding.binding_digest())
+        {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        identity
+            .push_evidence(
+                original.physical.sealed_capture_receipt_digest,
+                original.capture.pages().len() as u64,
+                original.capture.total_body_bytes(),
+            )
+            .map_err(|_| CatalogError::ProviderCaptureConflict)?;
+        predecessor = Some(original.digest);
+    }
+    if identity.finish() != pack.captures_digest() {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    Ok(session)
+}
+
+// A direct indexed custody read must also reject a transplanted logical target. Hash only compact
+// scalar receipt fields, never decode or retain the complete session's contexts or response bodies.
+fn validate_persisted_pack_identity(
+    connection: &Connection,
+    session: EvidenceDigest,
+    expected: u16,
+    binding: EvidenceDigest,
+) -> Result<(), CatalogError> {
+    let mut statement = connection.prepare(
+        "SELECT original.ordinal,object.capture_receipt_digest,observation.page_count,observation.total_body_bytes
+         FROM provider_capture_originals AS original
+         JOIN provider_raw_observations AS observation ON observation.capture_observation_digest=original.capture_observation_digest
+         JOIN provider_raw_observation_objects AS object ON object.capture_observation_digest=original.capture_observation_digest
+           AND object.raw_claim_digest=original.raw_claim_digest AND object.physical_receipt_digest=original.physical_receipt_digest
+           AND object.input_ordinal=0
+         WHERE original.session_digest=?1 AND original.published_logical_binding=?2 ORDER BY original.ordinal")?;
+    let mut rows = statement.query(params![session.bytes(), binding.bytes()])?;
+    let mut identity = market_squawk_sources::ProviderCapturePackAccumulator::new();
+    while let Some(row) = rows.next()? {
+        let ordinal =
+            u64::try_from(row.get::<_, i64>(0)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let body_count =
+            u64::try_from(row.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let body_bytes =
+            u64::try_from(row.get::<_, i64>(3)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        if ordinal != identity.capture_count() || identity.capture_count() >= u64::from(expected) {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        identity
+            .push_evidence(
+                parse_digest(1, &row.get::<_, Vec<u8>>(1)?)?,
+                body_count,
+                body_bytes,
+            )
+            .map_err(|_| CatalogError::CorruptCatalog)?;
+    }
+    if identity.capture_count() != u64::from(expected) {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let packed_identity = identity.finish();
+    let retained = super::super::provider_logical::load_provider_logical_publication_binding(
+        connection, binding,
+    )?
+    .ok_or(CatalogError::CorruptCatalog)?;
+    if retained.objects().first().is_none_or(|object| {
+        object.ordinal() != 0
+            || object.role() != market_squawk_sources::LogicalObjectRole::ProviderPayload
+            || object.semantic_identity() != packed_identity
+    }) {
+        return Err(CatalogError::CorruptCatalog);
     }
     Ok(())
 }

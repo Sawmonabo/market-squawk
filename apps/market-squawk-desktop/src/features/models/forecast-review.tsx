@@ -1,7 +1,11 @@
-import { useQuery } from "@tanstack/react-query"
+import { useState } from "react"
+import { Button } from "@/components/ui/button"
+import { DemandPanel } from "../shared/demand-panel"
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+import { keepPreviousData, useQuery } from "@tanstack/react-query"
 import { AlertTriangle, CalendarClock, ChartNoAxesCombined, ShieldCheck } from "lucide-react"
 
-import { MarketPriceChart } from "@/components/charts/market-price-chart"
+import { MarketPriceChart, type ChartViewport, type ObservedPricePoint } from "@/components/charts/market-price-chart"
 
 import { productKeys } from "@/app/query-client"
 import { productCapabilitySet } from "@/lib/product-capabilities"
@@ -10,8 +14,11 @@ import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
+  parseForecastChart,
   parseForecastOutcomes,
   parseForecastVintage,
+  type ForecastChart,
+  type ForecastChartViewportInput,
   type ForecastOutcome,
   type ForecastSummary,
   type ForecastVintage,
@@ -36,45 +43,6 @@ export function ForecastReview({
   error: string | null
   select: (forecastToken: string) => void
 }) {
-  const capabilities = productCapabilitySet(bootstrap)
-  const detailAvailable = capabilities.has("forecast_detail")
-  const outcomesAvailable = capabilities.has("forecast_outcomes")
-  const detail = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.productSessionToken,
-      "Model",
-      "Model.GetForecast",
-      { forecastToken: selected?.forecastToken ?? null },
-    ),
-    queryFn: async () => {
-      if (!selected) throw new Error("No forecast is selected.")
-      return parseForecastVintage(
-        await transport.query({
-          query: "forecast",
-          forecastToken: selected.forecastToken,
-        }),
-      )
-    },
-    enabled: detailAvailable && selected !== null,
-  })
-  const outcomes = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.productSessionToken,
-      "Model",
-      "Model.GetForecastOutcomes",
-      { forecastToken: selected?.forecastToken ?? null },
-    ),
-    queryFn: async () => {
-      if (!selected) throw new Error("No forecast is selected.")
-      return parseForecastOutcomes(
-        await transport.query({
-          query: "forecastOutcomes",
-          forecastToken: selected.forecastToken,
-        }),
-      )
-    },
-    enabled: outcomesAvailable && selected !== null,
-  })
 
   return (
     <section className="rounded-xl border border-border bg-card/45 p-5">
@@ -124,22 +92,130 @@ export function ForecastReview({
             ))}
           </div>
           {selected ? <SummaryEvidence summary={selected} /> : null}
-          <ForecastDetail
-            summary={selected}
-            detail={detail.data ?? null}
-            detailAvailable={detailAvailable}
-            detailLoading={detail.isPending && selected !== null}
-            detailError={detail.isError ? "Forecast details are unavailable right now." : null}
-            outcomes={outcomes.data?.forecastToken === selected?.forecastToken ? outcomes.data?.outcomes ?? [] : []}
-            outcomesAvailable={outcomesAvailable}
-            outcomesLoading={outcomes.isPending && selected !== null}
-            outcomesError={outcomes.isError ? "Forecast outcomes are unavailable right now." : null}
-            outcomesTruncated={outcomes.data?.truncated ?? false}
-          />
+          {selected ? <DemandPanel key={selected.forecastToken} title="Open forecast details and history" className="mt-5 rounded-lg border p-4">
+            <ForecastEvidenceRead summary={selected} bootstrap={bootstrap} transport={transport} />
+          </DemandPanel> : null}
         </>
       )}
     </section>
   )
+}
+
+type OriginalForecastSelection = { kind: "history" | "estimate"; originalOrdinal: string; time?: string; fiscalOrdinal?: number }
+
+function ForecastEvidenceRead({ summary, bootstrap, transport }: {
+  summary: ForecastSummary
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
+}) {
+  const [outcomesOpen, setOutcomesOpen] = useState(false)
+  const [viewport, setViewport] = useState<ForecastChartViewportInput>({ pointLimit: 512 })
+  const [selectedOriginal, setSelectedOriginal] = useState<OriginalForecastSelection | null>(null)
+  const [fiscalError, setFiscalError] = useState<string | null>(null)
+  const [viewReset, setViewReset] = useState(0)
+  const capabilities = productCapabilitySet(bootstrap)
+  const detailAvailable = capabilities.has("forecast_detail")
+  const outcomesAvailable = capabilities.has("forecast_outcomes")
+  const detail = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecast", { forecastToken: summary.forecastToken }),
+    gcTime: 0,
+    queryFn: async ({ signal }) => parseForecastVintage(await transport.query({ query: "forecast", forecastToken: summary.forecastToken }, { signal })),
+    enabled: detailAvailable,
+  })
+  const chart = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecastChart", { forecastToken: summary.forecastToken, ...viewport }),
+    gcTime: 0,
+    placeholderData: keepPreviousData,
+    enabled: detailAvailable,
+    queryFn: async ({ signal }) => parseForecastChart(await transport.query({ query: "forecastChart", forecastToken: summary.forecastToken, ...viewport }, { signal }), summary.forecastToken, viewport),
+  })
+  const onViewportChange = (next: ChartViewport) => {
+    if (viewport.startUnixNanos === undefined && next.fromUnixNanos === chart.data?.viewport.fullStartUnixNanos
+      && next.throughUnixNanos === chart.data?.viewport.fullEndUnixNanos) return
+    setViewport({ startUnixNanos: next.fromUnixNanos, endUnixNanos: next.throughUnixNanos, pointLimit: next.pointLimit })
+    setSelectedOriginal(null)
+  }
+  const onObservationSelect = (point: ObservedPricePoint) => {
+    if (point.originalOrdinal !== undefined) setSelectedOriginal({ kind: "history", time: String(point.timeUnixNanos), originalOrdinal: point.originalOrdinal })
+  }
+  const onEstimateSelect = (point: ForecastChart["estimates"][number]) => setSelectedOriginal({ kind: "estimate", originalOrdinal: point.originalOrdinal,
+    ...(point.targetAtUnixNanos === null ? { fiscalOrdinal: point.financialTarget!.ordinal } : { time: point.targetAtUnixNanos }) })
+  const detailProps = {
+    summary, detail: detail.data ?? null, detailAvailable,
+    chart: chart.data ?? null, chartLoading: chart.isPending, chartError: chart.isError,
+    onViewportChange, onObservationSelect, onEstimateSelect, viewReset,
+    detailLoading: detail.isPending,
+    detailError: detail.isError ? "Forecast details are unavailable right now." : null,
+  }
+  return <>
+    <Button size="sm" variant="outline" onClick={() => { setViewport({ pointLimit: 512 }); setSelectedOriginal(null); setFiscalError(null); setViewReset((current) => current + 1) }}>Reset saved forecast view</Button>
+    {chart.data?.coordinateKind === "fiscal_period" ? <form className="mt-3 flex flex-wrap items-end gap-3 text-xs" onSubmit={(event) => {
+      event.preventDefault()
+      const fields = new FormData(event.currentTarget)
+      const start = Number(fields.get("start")), end = Number(fields.get("end"))
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 4_294_967_295) { setFiscalError("Choose ordered reporting periods."); return }
+      setFiscalError(null); setSelectedOriginal(null); setViewport({ startFiscalOrdinal: start, endFiscalOrdinal: end, pointLimit: 512 })
+    }}>
+      <label className="grid gap-1">First reporting period<input className="rounded border bg-background p-2" name="start" type="number" min={1} defaultValue={chart.data.viewport.fullStartFiscalOrdinal ?? 1} required /></label>
+      <label className="grid gap-1">Last reporting period<input className="rounded border bg-background p-2" name="end" type="number" min={1} defaultValue={chart.data.viewport.fullEndFiscalOrdinal ?? 1} required /></label>
+      <Button size="sm" variant="outline" type="submit">Open period window</Button>
+      {fiscalError ? <p role="alert" className="text-destructive">{fiscalError}</p> : null}
+    </form> : null}
+    {chart.isFetching ? <p role="status" className="mt-3 text-xs text-muted-foreground">Loading the requested forecast window…</p> : null}
+    {chart.isError || detail.isError ? <Button size="sm" variant="outline" onClick={() => { if (chart.isError) void chart.refetch(); if (detail.isError) void detail.refetch() }}>Retry forecast evidence</Button> : null}
+    {outcomesAvailable ? <Button size="sm" variant="outline" onClick={() => setOutcomesOpen((current) => !current)} aria-expanded={outcomesOpen}>
+      {outcomesOpen ? "Close actual outcomes" : "Open actual outcomes"}
+    </Button> : null}
+    {outcomesOpen ? <ForecastOutcomeRead {...detailProps} bootstrap={bootstrap} transport={transport} />
+      : <ForecastDetail {...detailProps} outcomes={[]} outcomesAvailable={outcomesAvailable} outcomesRequested={false} outcomesLoading={false} outcomesError={null} outcomesTruncated={false} />}
+    {selectedOriginal !== null ? <OriginalForecastPointRead key={`${selectedOriginal.kind}:${selectedOriginal.originalOrdinal}`} point={selectedOriginal} forecastToken={summary.forecastToken} bootstrap={bootstrap} transport={transport} /> : null}
+  </>
+}
+
+function OriginalForecastPointRead({ point, forecastToken, bootstrap, transport }: {
+  point: OriginalForecastSelection; forecastToken: string; bootstrap: DesktopBootstrap; transport: ProductTransport
+}) {
+  const viewport: ForecastChartViewportInput = point.time !== undefined ? { startUnixNanos: point.time, endUnixNanos: point.time, pointLimit: 8 }
+    : { startFiscalOrdinal: point.fiscalOrdinal, endFiscalOrdinal: point.fiscalOrdinal, pointLimit: 8 }
+  const original = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecastChart", { forecastToken, ...viewport }),
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
+      const chart = parseForecastChart(await transport.query({ query: "forecastChart", forecastToken, ...viewport }, { signal }), forecastToken, viewport)
+      const row = point.kind === "history" ? chart.observedHistory.find((entry) => entry.originalOrdinal === point.originalOrdinal)
+        : chart.estimates.find((entry) => entry.originalOrdinal === point.originalOrdinal)
+      if (!row) throw new Error("The original forecast evidence could not be verified.")
+      return row
+    },
+  })
+  return <div className="mt-4 rounded-lg border p-3 text-xs"><p className="font-medium">Exact original forecast evidence</p>
+    {original.isPending ? <p role="status" className="mt-2 text-muted-foreground">Checking saved evidence…</p>
+      : original.isError ? <p role="alert" className="mt-2 text-destructive">The saved evidence could not be verified. <Button size="xs" variant="outline" onClick={() => void original.refetch()}>Retry</Button></p>
+        : "value" in original.data ? <p className="mt-2 font-mono">{original.data.value.formatted}</p>
+          : <dl className="mt-2 grid gap-2 sm:grid-cols-4"><Fact label="Central" value={original.data.central.formatted} mono /><Fact label="Likely range" value={formatRange(original.data.ranges?.likely)} mono /><Fact label="Wider range" value={formatRange(original.data.ranges?.wider)} mono /><Fact label="Stress range" value={formatRange(original.data.ranges?.stress)} mono /></dl>}
+  </div>
+}
+
+function ForecastOutcomeRead({ bootstrap, transport, ...detailProps }: {
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
+} & Pick<Parameters<typeof ForecastDetail>[0], "summary" | "detail" | "detailAvailable" | "detailLoading" | "detailError" | "chart" | "chartLoading" | "chartError" | "onViewportChange" | "onObservationSelect" | "onEstimateSelect" | "viewReset">) {
+  const forecastToken = detailProps.summary!.forecastToken
+  const navigation = useCursorNavigation()
+  const outcomes = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecastOutcomes", { forecastToken, cursor: navigation.after, limit: 25 }),
+    gcTime: 0,
+    queryFn: async ({ signal }) => parseForecastOutcomes(await transport.query({ query: "forecastOutcomes", forecastToken, cursor: navigation.after, limit: 25 }, { signal }), forecastToken),
+  })
+  return <>
+    <CursorNavigation navigation={navigation} next={outcomes.data?.nextCursor} busy={outcomes.isFetching} error={outcomes.isError} onRestart={() => { if (navigation.after === undefined) void outcomes.refetch() }} />
+    <ForecastDetail {...detailProps}
+    outcomes={outcomes.data?.forecastToken === forecastToken ? outcomes.data.outcomes : []}
+    outcomesAvailable outcomesRequested
+    outcomesLoading={outcomes.isPending}
+    outcomesError={outcomes.isError ? "Forecast outcomes are unavailable right now." : null}
+    outcomesTruncated={outcomes.data?.nextCursor !== null && outcomes.data?.nextCursor !== undefined} />
+  </>
 }
 
 function SummaryEvidence({ summary }: { summary: ForecastSummary }) {
@@ -178,8 +254,10 @@ function ForecastDetail({
   detailAvailable,
   detailLoading,
   detailError,
+  chart, chartLoading, chartError, onViewportChange, onObservationSelect, onEstimateSelect, viewReset,
   outcomes,
   outcomesAvailable,
+  outcomesRequested,
   outcomesLoading,
   outcomesError,
   outcomesTruncated,
@@ -189,8 +267,16 @@ function ForecastDetail({
   detailAvailable: boolean
   detailLoading: boolean
   detailError: string | null
+  chart: ForecastChart | null
+  chartLoading: boolean
+  chartError: boolean
+  onViewportChange: (viewport: ChartViewport) => void
+  onObservationSelect: (point: ObservedPricePoint) => void
+  onEstimateSelect: (point: ForecastChart["estimates"][number]) => void
+  viewReset: number
   outcomes: ForecastOutcome[]
   outcomesAvailable: boolean
+  outcomesRequested: boolean
   outcomesLoading: boolean
   outcomesError: string | null
   outcomesTruncated: boolean
@@ -209,6 +295,14 @@ function ForecastDetail({
     return <Unavailable text="The selected forecast evidence could not be verified." />
   }
 
+  if (chart !== null && (chart.target.valueKind !== detail.target.valueKind || chart.target.label !== detail.target.label
+    || chart.target.currencyCode !== detail.target.currencyCode || chart.target.unitLabel !== detail.target.unitLabel
+    || chart.observedThroughUnixNanos !== detail.observedThroughUnixNanos)) {
+    return <Unavailable text="The forecast chart target and information cutoff could not be verified." />
+  }
+
+  const estimates = chart?.estimates ?? []
+  const observedHistory = chart?.observedHistory ?? []
   const outcomeByTarget = new Map(
     outcomes.map((outcome) => [outcome.targetAtUnixNanos, outcome]),
   )
@@ -232,36 +326,44 @@ function ForecastDetail({
         </p>
       </div>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <MiniFact icon={ChartNoAxesCombined} label="Forecast points" value={detail.estimates.length.toLocaleString()} />
+        <MiniFact icon={ChartNoAxesCombined} label="Forecast points" value={chartLoading ? "Loading…" : chartError ? "Unavailable" : estimates.length.toLocaleString()} />
         <MiniFact icon={CalendarClock} label="Information through" value={formatObservedThrough(detail.observedThroughUnixNanos)} />
         <MiniFact icon={CalendarClock} label="Valid until" value={formatTimestamp(detail.expiresAtUnixNanos)} />
         <MiniFact
           icon={ShieldCheck}
           label="Outcome evidence"
           value={
-            !outcomesAvailable
+            !outcomesRequested
+              ? "Open actual outcomes to compare"
+              : !outcomesAvailable
               ? "Outcome history unavailable"
               : outcomesLoading
                 ? "Loading…"
                 : outcomesError
                   ? "Unavailable"
-                  : `${outcomes.length}${outcomesTruncated ? "+" : ""} realized`
+                  : `${outcomes.length} on this outcome page${outcomesTruncated ? "; more pages available" : ""}`
           }
         />
       </div>
 
-      {detail.target.valueKind === "probability" ? <ProbabilityEventEvidence vintage={detail} />
+      {chartLoading ? <Unavailable text="Loading the requested forecast chart…" /> : chartError ? <Unavailable text="The saved forecast chart is unavailable." /> : detail.target.valueKind === "probability" ? <ProbabilityEventEvidence vintage={detail} estimates={estimates} />
         : detail.target.valueKind !== "financial_amount" ? <MarketPriceChart
-        key={detail.forecastToken}
+        key={`${detail.forecastToken}:${viewReset}`}
         title={`${detail.target.label}: history and forecast`}
+        viewportBounds={chart?.viewport.fullStartUnixNanos !== null && chart?.viewport.fullStartUnixNanos !== undefined && chart.viewport.fullEndUnixNanos !== null
+          ? { fromUnixNanos: chart.viewport.fullStartUnixNanos, throughUnixNanos: chart.viewport.fullEndUnixNanos } : undefined}
+        onViewportChange={onViewportChange}
+        onObservationSelect={onObservationSelect}
+        displayResolution={chart?.display}
+        viewportPointLimit={512}
         unit={detail.target.currencyCode ?? detail.target.unitLabel}
         cutoffUnixNanos={detail.observedThroughUnixNanos}
-        observed={detail.observedHistory.map((point) => ({
+        observed={observedHistory.map((point) => ({
           timeUnixNanos: point.observedAtUnixNanos,
           value: point.value.exact,
-          quality: "Recorded forecast input",
+          quality: "Recorded forecast input", originalOrdinal: point.originalOrdinal, breakBefore: point.breakBefore[0],
         }))}
-        forecast={detail.estimates.flatMap((point) => {
+        forecast={estimates.flatMap((point) => {
           if (point.targetAtUnixNanos === null) return []
           const outcome = outcomeByTarget.get(point.targetAtUnixNanos)
           return [{
@@ -298,11 +400,11 @@ function ForecastDetail({
             </tr>
           </thead>
           <tbody>
-            {detail.estimates.map((point, index) => {
+            {estimates.map((point, index) => {
               const outcome = point.targetAtUnixNanos === null ? undefined : outcomeByTarget.get(point.targetAtUnixNanos)
               return (
                 <tr key={`${point.targetAtUnixNanos ?? point.financialTarget?.ordinal}:${index}`} className="border-t border-border">
-                  <td className="px-3 py-2 text-muted-foreground">{formatForecastCoordinate(point)}</td>
+                  <td className="px-3 py-2 text-muted-foreground"><button type="button" className="text-left underline" onClick={() => onEstimateSelect(point)}>{formatForecastCoordinate(point)}</button></td>
                   <td className="px-3 py-2 font-mono">{point.central.formatted}</td>
                   {detail.target.valueKind !== "probability" ? <>
                     <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.likely)}</td>
@@ -313,7 +415,7 @@ function ForecastDetail({
                     {outcome ? (
                       outcome.actual.formatted
                     ) : (
-                      <span className="font-sans text-muted-foreground">Not observed</span>
+                      <span className="font-sans text-muted-foreground">{!outcomesRequested ? "Open actual outcomes" : outcomesLoading ? "Loading…" : outcomesError ? "Unavailable" : "Not returned on this outcome page"}</span>
                     )}
                   </td>
                 </tr>
@@ -545,7 +647,7 @@ function formatObservedThrough(value: string | null): string {
 function formatCalendarDate(value: { year: number; month: number; day: number }): string {
   return `${String(value.year).padStart(4, "0")}-${String(value.month).padStart(2, "0")}-${String(value.day).padStart(2, "0")}`
 }
-function formatForecastCoordinate(point: ForecastVintage["estimates"][number]): string {
+function formatForecastCoordinate(point: ForecastChart["estimates"][number]): string {
   if (point.targetAtUnixNanos !== null) return formatTimestamp(point.targetAtUnixNanos)
   const target = point.financialTarget
   if (!target) return "Reporting period unavailable"
@@ -559,7 +661,7 @@ function formatCalibrationWindow(window: NonNullable<ForecastVintage["calibratio
     : `${formatCalendarDate(window.start)} – ${formatCalendarDate(window.end)} (reporting dates)`
 }
 
-function ProbabilityEventEvidence({ vintage }: { vintage: ForecastVintage }) {
+function ProbabilityEventEvidence({ vintage, estimates }: { vintage: ForecastVintage; estimates: ForecastChart["estimates"] }) {
   const event = vintage.target.event
   if (!event) return <Unavailable text="The event definition is unavailable." />
   const definition = event.definition
@@ -570,7 +672,7 @@ function ProbabilityEventEvidence({ vintage }: { vintage: ForecastVintage }) {
     <h3 className="text-sm font-semibold">{title}</h3>
     <p className="mt-2 text-xs leading-5 text-muted-foreground">{vintage.target.meaning}</p>
     <dl className="mt-4 grid gap-3 sm:grid-cols-2">
-      {vintage.estimates.map((point, index) => <Fact key={index} label={formatForecastCoordinate(point)} value={point.central.formatted} mono />)}
+      {estimates.map((point, index) => <Fact key={index} label={formatForecastCoordinate(point)} value={point.central.formatted} mono />)}
     </dl>
     <p className="mt-3 text-xs leading-5 text-muted-foreground">This is the chance of the named event over {vintage.horizon.label.toLowerCase()}. It is separate from expected percentage gain or a future price range.</p>
     <details className="mt-4 rounded-md border border-border bg-background/25 p-3 text-xs">

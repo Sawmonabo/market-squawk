@@ -34,7 +34,7 @@ export function FinancialPreferenceControls({ preferences, values, options, disa
           value={values.modelChoice} disabled={disabled || !options}
           onChange={(event) => onChange({ ...values, modelChoice: event.target.value })}>
           {modelChoices.map((model) => <option key={model.token} value={model.token}>{model.label}</option>)}
-          {!modelListed ? <option value={values.modelChoice}>{options ? "Previously selected model — unavailable" : "Selected model"}</option> : null}
+          {!modelListed ? <option value={values.modelChoice}>{options ? "Selected model outside this choice page" : "Selected model"}</option> : null}
         </select>
       </label>
     </div>

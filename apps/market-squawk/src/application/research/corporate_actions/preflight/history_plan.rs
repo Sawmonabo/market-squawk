@@ -4,19 +4,19 @@ use super::*;
 use crate::application::research::{
     RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
 };
-use market_squawk_data::{CompleteMarketBarHistoryOutput, CompleteMarketBarHistoryRequest};
+use market_squawk_data::{CompleteMarketBarHistoryCursor, CompleteMarketBarHistoryRequest};
 use market_squawk_domain::MarketBarAdjustment;
 use std::collections::BTreeMap;
 
 /// All returned reads use the one actual post-acquisition cutoff. Original publication roots and
 /// native dates remain unchanged; the caller must retain its earlier requested cutoff separately.
 pub(crate) struct PreparedHistorySourceActions {
-    histories: [CompleteMarketBarHistoryOutput; 3],
+    histories: [CompleteMarketBarHistoryCursor; 3],
     actions: SourceAppliedCorporateActionPlan,
     snapshot_as_of: Timestamp,
 }
 impl PreparedHistorySourceActions {
-    pub(crate) fn histories(&self) -> &[CompleteMarketBarHistoryOutput; 3] {
+    pub(crate) fn histories(&self) -> &[CompleteMarketBarHistoryCursor; 3] {
         &self.histories
     }
     pub(crate) fn actions(&self) -> &SourceAppliedCorporateActionPlan {
@@ -28,7 +28,7 @@ impl PreparedHistorySourceActions {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        [CompleteMarketBarHistoryOutput; 3],
+        [CompleteMarketBarHistoryCursor; 3],
         SourceAppliedCorporateActionPlan,
         Timestamp,
     ) {
@@ -42,7 +42,7 @@ impl SourceActionPreparationCapability {
     /// fields only after the existing single overlap selector has reconciled every native row.
     pub(crate) async fn prepare_for_histories(
         &self,
-        histories: [CompleteMarketBarHistoryOutput; 3],
+        histories: [CompleteMarketBarHistoryCursor; 3],
         benchmarks: &RecommendationBenchmarkSelection,
         interval: (CalendarDate, CalendarDate),
         valuation_cutoff: Timestamp,
@@ -69,23 +69,56 @@ impl SourceActionPreparationCapability {
                 context.cancellation(),
             )?
             .ok_or(ServiceError::Unavailable)?;
-        let (histories, actions, snapshot_as_of) = self.prepare_selected_nominal_histories(
-            Vec::from(histories), interval, valuation_cutoff, context).await?;
-        benchmark_reader.read_reference(benchmarks.reference(), context.deadline(), context.cancellation())?
+        let (histories, actions, snapshot_as_of) = self
+            .prepare_selected_nominal_histories(
+                Vec::from(histories),
+                interval,
+                valuation_cutoff,
+                context,
+            )
+            .await?;
+        benchmark_reader
+            .read_reference(
+                benchmarks.reference(),
+                context.deadline(),
+                context.cancellation(),
+            )?
             .ok_or(ServiceError::Unavailable)?;
         // Existing fixed premium contract still requires the complete accounting authority.
-        actions.covered_accounting_plan().map_err(|error| map_plan_error(error, context))?;
-        let histories = histories.try_into().map_err(|_| ServiceError::InvalidResult)?;
-        Ok(PreparedHistorySourceActions { histories, actions, snapshot_as_of })
+        actions
+            .covered_accounting_plan()
+            .map_err(|error| map_plan_error(error, context))?;
+        let histories = histories
+            .try_into()
+            .map_err(|_| ServiceError::InvalidResult)?;
+        Ok(PreparedHistorySourceActions {
+            histories,
+            actions,
+            snapshot_as_of,
+        })
     }
 
     pub(super) async fn prepare_selected_nominal_histories(
-        &self, histories: Vec<CompleteMarketBarHistoryOutput>, interval: (CalendarDate, CalendarDate),
-        valuation_cutoff: Timestamp, context: &RequestContext,
-    ) -> Result<(Vec<CompleteMarketBarHistoryOutput>, SourceAppliedCorporateActionPlan, Timestamp), ServiceError> {
+        &self,
+        histories: Vec<CompleteMarketBarHistoryCursor>,
+        interval: (CalendarDate, CalendarDate),
+        valuation_cutoff: Timestamp,
+        context: &RequestContext,
+    ) -> Result<
+        (
+            Vec<CompleteMarketBarHistoryCursor>,
+            SourceAppliedCorporateActionPlan,
+            Timestamp,
+        ),
+        ServiceError,
+    > {
         check(context)?;
         let started_at = now()?;
-        if histories.is_empty() || histories.len() > 3 || interval.0 > interval.1 || valuation_cutoff > started_at {
+        if histories.is_empty()
+            || histories.len() > 3
+            || interval.0 > interval.1
+            || valuation_cutoff > started_at
+        {
             return Err(ServiceError::InvalidRequest);
         }
         let mut originals = BTreeMap::new();
@@ -212,10 +245,15 @@ impl SourceActionPreparationCapability {
         // dispositions remain unavailable. Neither query termination nor empty rows bypasses it.
         plan.covered_price_plan()
             .map_err(|error| map_plan_error(error, context))?;
-        plan.price_reference().map_err(|error| map_plan_error(error, context))?;
+        plan.price_reference()
+            .map_err(|error| map_plan_error(error, context))?;
         let mut reopened = Vec::with_capacity(histories.len());
         for history in &histories {
-            reopened.push(self.reopen_original_ordinary_history(history, cutoff, context).await?.0);
+            reopened.push(
+                self.reopen_original_ordinary_history(history, cutoff, context)
+                    .await?
+                    .0,
+            );
         }
         check(context)?;
         Ok((reopened, plan, cutoff))
@@ -223,10 +261,10 @@ impl SourceActionPreparationCapability {
 
     pub(super) async fn reopen_original_ordinary_history(
         &self,
-        original: &CompleteMarketBarHistoryOutput,
+        original: &CompleteMarketBarHistoryCursor,
         cutoff: Timestamp,
         context: &RequestContext,
-    ) -> Result<(CompleteMarketBarHistoryOutput, CompletedMarketSessionRead), ServiceError> {
+    ) -> Result<(CompleteMarketBarHistoryCursor, CompletedMarketSessionRead), ServiceError> {
         check(context)?;
         let receipt = original.selection().receipt();
         let graph = receipt.date_windows().ok_or(ServiceError::Unavailable)?;
@@ -251,7 +289,7 @@ impl SourceActionPreparationCapability {
         let reopened = self
             .research
             .analytical_reader()
-            .read_complete_market_bar_history(
+            .read_complete_market_bar_history_cursor(
                 request,
                 context.deadline(),
                 context.cancellation().clone(),
@@ -288,8 +326,14 @@ impl SourceActionPreparationCapability {
             .await
             .map_err(map_research_error)?;
         if reopened.read_receipt().knowledge_cutoff() != cutoff
-            || reopened.native_sessions().map(|native| native.sessions())
-                != original.native_sessions().map(|native| native.sessions())
+            || !match (reopened.native_sessions(), original.native_sessions()) {
+                (Some(reopened), Some(original)) => reopened
+                    .sessions()
+                    .same_rows(original.sessions())
+                    .map_err(map_analytical_error)?,
+                (None, None) => true,
+                _ => false,
+            }
         {
             return Err(ServiceError::InvalidResult);
         }
@@ -299,8 +343,8 @@ impl SourceActionPreparationCapability {
 }
 
 fn same_original(
-    a: &CompleteMarketBarHistoryOutput,
-    b: &CompleteMarketBarHistoryOutput,
+    a: &CompleteMarketBarHistoryCursor,
+    b: &CompleteMarketBarHistoryCursor,
 ) -> Result<(), ServiceError> {
     let a_receipt = a.selection().receipt();
     let b_receipt = b.selection().receipt();
@@ -310,10 +354,32 @@ fn same_original(
         || a_receipt.date_windows() != b_receipt.date_windows()
         || a_receipt.bar_set_digest() != b_receipt.bar_set_digest()
         || a.read_receipt().history_content_digest() != b.read_receipt().history_content_digest()
-        || a.bars() != b.bars()
-        || a.source_actions() != b.source_actions()
     {
         return Err(ServiceError::InvalidResult);
+    }
+    let mut a_bars = a.bars();
+    let mut b_bars = b.bars();
+    loop {
+        match (
+            a_bars.next().transpose().map_err(map_analytical_error)?,
+            b_bars.next().transpose().map_err(map_analytical_error)?,
+        ) {
+            (None, None) => break,
+            (Some(a), Some(b)) if a == b => {}
+            _ => return Err(ServiceError::InvalidResult),
+        }
+    }
+    let mut a_actions = a.source_actions();
+    let mut b_actions = b.source_actions();
+    loop {
+        match (
+            a_actions.next().transpose().map_err(map_analytical_error)?,
+            b_actions.next().transpose().map_err(map_analytical_error)?,
+        ) {
+            (None, None) => break,
+            (Some(a), Some(b)) if a == b => {}
+            _ => return Err(ServiceError::InvalidResult),
+        }
     }
     Ok(())
 }
@@ -326,69 +392,140 @@ pub(crate) struct PreparedSelectedHistorySources {
     cutoff: Timestamp,
 }
 impl PreparedSelectedHistorySources {
-    pub(crate) fn subject_manifest(&self) -> &DatasetManifestRef { &self.subject_manifest }
-    pub(crate) fn plan(&self) -> &SourceAppliedCorporateActionPlan { &self.plan }
-    pub(crate) const fn cutoff(&self) -> Timestamp { self.cutoff }
+    pub(crate) fn subject_manifest(&self) -> &DatasetManifestRef {
+        &self.subject_manifest
+    }
+    pub(crate) fn plan(&self) -> &SourceAppliedCorporateActionPlan {
+        &self.plan
+    }
+    pub(crate) const fn cutoff(&self) -> Timestamp {
+        self.cutoff
+    }
 }
 impl SourceActionPreparationCapability {
     pub(crate) async fn prepare_selected_complete_histories(
-        &self, instruments: &[MarketDataInstrumentRecord], population_start: Timestamp,
-        analysis_at: Timestamp, context: &RequestContext,
+        &self,
+        instruments: &[MarketDataInstrumentRecord],
+        population_start: Timestamp,
+        analysis_at: Timestamp,
+        context: &RequestContext,
     ) -> Result<PreparedSelectedHistorySources, ServiceError> {
-        use market_squawk_adapter_alpaca::{AlpacaHistoricalEquityPreflightPlan, AlpacaHistoricalLookback,
-            AlpacaInstrumentMapping, AlpacaTimeframe, AlpacaAdjustment};
+        use market_squawk_adapter_alpaca::{
+            AlpacaAdjustment, AlpacaHistoricalEquityPreflightPlan, AlpacaHistoricalLookback,
+            AlpacaInstrumentMapping, AlpacaTimeframe,
+        };
         check(context)?;
-        if instruments.is_empty() || instruments.len() > 2 || population_start >= analysis_at || analysis_at > now()? {
+        if instruments.is_empty()
+            || instruments.len() > 2
+            || population_start >= analysis_at
+            || analysis_at > now()?
+        {
             return Err(ServiceError::InvalidRequest);
         }
-        let runtime = self.runtime.current_alpaca_calendar_runtime(context.deadline(), context.cancellation())
-            .await.map_err(|_| controlled(context, ServiceError::Unavailable))?;
-        let nanos = analysis_at.unix_nanos().checked_sub(population_start.unix_nanos()).ok_or(ServiceError::InvalidRequest)?;
-        let days = nanos.checked_add(86_400_000_000_000 - 1).and_then(|n| n.checked_div(86_400_000_000_000))
-            .and_then(|n| n.checked_add(1)).and_then(|n| u16::try_from(n).ok()).ok_or(ServiceError::Unavailable)?;
-        let lookback = AlpacaHistoricalLookback::try_from_days(days).map_err(|_| ServiceError::Unavailable)?;
+        let runtime = self
+            .runtime
+            .current_alpaca_calendar_runtime(context.deadline(), context.cancellation())
+            .await
+            .map_err(|_| controlled(context, ServiceError::Unavailable))?;
+        let nanos = analysis_at
+            .unix_nanos()
+            .checked_sub(population_start.unix_nanos())
+            .ok_or(ServiceError::InvalidRequest)?;
+        let days = nanos
+            .checked_add(86_400_000_000_000 - 1)
+            .and_then(|n| n.checked_div(86_400_000_000_000))
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or(ServiceError::Unavailable)?;
+        let lookback =
+            AlpacaHistoricalLookback::try_from_days(days).map_err(|_| ServiceError::Unavailable)?;
         let mut published = Vec::with_capacity(instruments.len());
         let mut unique = BTreeSet::new();
         for record in instruments {
-            if !unique.insert(record.definition().instrument_id()) { return Err(ServiceError::InvalidRequest); }
-            let mut listings = record.definition().venue_mappings().iter().filter(|mapping| mapping.venue_id().as_str() == "iex");
+            if !unique.insert(record.definition().instrument_id()) {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let mut listings = record
+                .definition()
+                .venue_mappings()
+                .iter()
+                .filter(|mapping| mapping.venue_id().as_str() == "iex");
             let listing = listings.next().ok_or(ServiceError::Unavailable)?;
-            if listings.next().is_some() { return Err(ServiceError::Unavailable); }
-            let mapping = AlpacaInstrumentMapping::try_new(listing.venue_symbol().as_str().to_owned(), record.definition().instrument_id(), record.definition().asset_class())
-                .map_err(|_| ServiceError::Unavailable)?;
-            let plan = AlpacaHistoricalEquityPreflightPlan::try_new(mapping, AlpacaTimeframe::day(), analysis_at, lookback, AlpacaAdjustment::Raw)
-                .map_err(|_| ServiceError::Unavailable)?;
-            published.push(self.publish_canonical_history(&runtime, plan, record, context).await?);
+            if listings.next().is_some() {
+                return Err(ServiceError::Unavailable);
+            }
+            let mapping = AlpacaInstrumentMapping::try_new(
+                listing.venue_symbol().as_str().to_owned(),
+                record.definition().instrument_id(),
+                record.definition().asset_class(),
+            )
+            .map_err(|_| ServiceError::Unavailable)?;
+            let plan = AlpacaHistoricalEquityPreflightPlan::try_new(
+                mapping,
+                AlpacaTimeframe::day(),
+                analysis_at,
+                lookback,
+                AlpacaAdjustment::Raw,
+            )
+            .map_err(|_| ServiceError::Unavailable)?;
+            published.push(
+                self.publish_canonical_history(&runtime, plan, record, context)
+                    .await?,
+            );
         }
         // Inspect original native coordinates, never infer session dates from nominal midnight.
         let inspection_at = now()?;
         let mut interval = None;
         let mut bounds = None;
         for original in &published {
-            let history = self.reopen_published_history_ref(original, inspection_at, context).await?;
-            let sessions = history.native_sessions().ok_or(ServiceError::Unavailable)?.sessions();
-            let first = sessions.first().ok_or(ServiceError::Unavailable)?;
-            let last = sessions.last().ok_or(ServiceError::Unavailable)?;
+            let history = self
+                .reopen_published_history_ref(original, inspection_at, context)
+                .await?;
+            let sessions = history
+                .native_sessions()
+                .ok_or(ServiceError::Unavailable)?
+                .sessions();
+            let first = sessions
+                .first()
+                .map_err(map_analytical_error)?
+                .ok_or(ServiceError::Unavailable)?;
+            let last = sessions
+                .last()
+                .map_err(map_analytical_error)?
+                .ok_or(ServiceError::Unavailable)?;
             let dates = (first.native_date(), last.native_date());
             let times = (first.opens_at(), last.closes_at_exclusive());
-            if interval.is_some_and(|prior| prior != dates) || bounds.is_some_and(|prior| prior != times) {
+            if interval.is_some_and(|prior| prior != dates)
+                || bounds.is_some_and(|prior| prior != times)
+            {
                 return Err(ServiceError::Unavailable);
             }
-            interval = Some(dates); bounds = Some(times);
+            interval = Some(dates);
+            bounds = Some(times);
             drop(history);
         }
         let (_, terminal_close) = bounds.ok_or(ServiceError::Unavailable)?;
         let dates = interval.ok_or(ServiceError::Unavailable)?;
-        let activation = self.outcome_history_activation.as_ref().ok_or(ServiceError::Unavailable)?;
+        let activation = self
+            .outcome_history_activation
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
         let mut nominal = Vec::with_capacity(instruments.len());
         for instrument in instruments {
             // Tiingo's original exchange metadata admits a principal listing, never the IEX
             // feed venue. Its nominal action proof keeps that distinct source identity.
-            let mut listings = instrument.definition().venue_mappings().iter()
+            let mut listings = instrument
+                .definition()
+                .venue_mappings()
+                .iter()
                 .filter(|mapping| matches!(mapping.venue_id().as_str(), "ARCX" | "XNYS" | "XNAS"));
             let venue = listings.next().ok_or(ServiceError::Unavailable)?.venue_id();
-            if listings.next().is_some() { return Err(ServiceError::Unavailable); }
-            let publication = activation.prepare_instrument_eod_history(instrument, venue, &self.calendars, dates, context).await?;
+            if listings.next().is_some() {
+                return Err(ServiceError::Unavailable);
+            }
+            let publication = activation
+                .prepare_instrument_eod_history(instrument, venue, &self.calendars, dates, context)
+                .await?;
             let history = self.ingest.read_complete_tiingo_eod_publication(&publication, instrument, venue, dates,
                 &self.calendars, now()?, context.deadline(), context.cancellation()).await
                 .map_err(|error| match error {
@@ -400,16 +537,40 @@ impl SourceActionPreparationCapability {
                 })?;
             nominal.push(history);
         }
-        let (nominal, plan, cutoff) = self.prepare_selected_nominal_histories(nominal, dates, terminal_close, context).await?;
+        let (nominal, plan, cutoff) = self
+            .prepare_selected_nominal_histories(nominal, dates, terminal_close, context)
+            .await?;
         drop(nominal); // Economic action originals remain in the admitted nominal source pool.
         let mut histories = Vec::with_capacity(published.len());
-        for original in &published { histories.push(self.reopen_published_history_ref(original, cutoff, context).await?); }
-        let plan = plan.with_completed_timestamp_price_histories(&histories.iter().collect::<Vec<_>>(),
-            limits()?, context.deadline(), context.cancellation()).map_err(|error| map_plan_error(error, context))?;
-        plan.covered_price_plan().map_err(|error| map_plan_error(error, context))?;
-        let subject_manifest = histories.first().ok_or(ServiceError::InvalidResult)?.selection().pinned().manifest().clone();
+        for original in &published {
+            histories.push(
+                self.reopen_published_history_ref(original, cutoff, context)
+                    .await?,
+            );
+        }
+        let plan = plan
+            .with_completed_timestamp_price_histories(
+                &histories.iter().collect::<Vec<_>>(),
+                limits()?,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .map_err(|error| map_plan_error(error, context))?;
+        plan.covered_price_plan()
+            .map_err(|error| map_plan_error(error, context))?;
+        let subject_manifest = histories
+            .first()
+            .ok_or(ServiceError::InvalidResult)?
+            .selection()
+            .pinned()
+            .manifest()
+            .clone();
         drop(histories);
         check(context)?;
-        Ok(PreparedSelectedHistorySources { subject_manifest, plan, cutoff })
+        Ok(PreparedSelectedHistorySources {
+            subject_manifest,
+            plan,
+            cutoff,
+        })
     }
 }

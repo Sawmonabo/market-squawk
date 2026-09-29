@@ -22,10 +22,12 @@ market-squawk-platform.workspace = true
 market-squawk-sources.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -34,7 +36,8 @@ uuid.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+market-squawk-data.workspace = true
+market-squawk-valuation.workspace = true
 
 [[test]]
 name = "filings"

@@ -1,12 +1,19 @@
 use std::sync::Arc;
 
+use super::runtime::{
+    ProductionModelRuntimeError,
+    inventory::{ActiveModelLease, RuntimeInventory},
+};
 use arc_swap::ArcSwap;
-use market_squawk_modeling::{InferenceBackend, ModelRegistry};
+use market_squawk_domain::ModelId;
+use market_squawk_modeling::{BundleId, InferenceBackend, ModelBundle, ModelRegistry};
+use std::{num::NonZeroU64, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 use super::{ModelDomainServiceError, bundle_coordinate, model_coordinate};
 
 pub(super) struct ModelReadImage {
-    pub(super) registry: Arc<ModelRegistry>,
+    pub(super) registry: ModelBundleInventory,
     pub(super) backends: Box<[Arc<dyn InferenceBackend>]>,
 }
 
@@ -40,17 +47,102 @@ impl ModelReadImage {
             }
         }
         Ok(Self {
-            registry,
+            registry: ModelBundleInventory::Memory(registry),
             backends: backends.into_boxed_slice(),
         })
     }
 
+    pub(super) fn from_inventory(inventory: Arc<RuntimeInventory>) -> Self {
+        Self {
+            registry: ModelBundleInventory::Disk(inventory),
+            backends: Box::new([]),
+        }
+    }
+
+    pub(super) fn activate(
+        &self,
+        id: &BundleId,
+        version: NonZeroU64,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ActiveModelLease, ProductionModelRuntimeError> {
+        match &self.registry {
+            ModelBundleInventory::Disk(inventory) => {
+                inventory.activate(id, version, deadline, cancellation)
+            }
+            ModelBundleInventory::Memory(registry) => {
+                let bundle = registry
+                    .get(id, version)?
+                    .ok_or(ProductionModelRuntimeError::CorruptRuntime)?;
+                let backend = self
+                    .backends
+                    .iter()
+                    .find(|backend| backend.metadata() == bundle.metadata())
+                    .cloned()
+                    .ok_or(ProductionModelRuntimeError::CorruptRuntime)?;
+                Ok(ActiveModelLease::fixture(bundle, backend))
+            }
+        }
+    }
+
     pub(super) fn len(&self) -> usize {
-        self.backends.len()
+        self.registry.len().unwrap_or(0)
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.backends.is_empty()
+        self.len() == 0
+    }
+}
+
+pub(super) enum ModelBundleInventory {
+    Memory(Arc<ModelRegistry>),
+    Disk(Arc<RuntimeInventory>),
+}
+
+impl ModelBundleInventory {
+    pub(super) fn get(
+        &self,
+        id: &BundleId,
+        version: NonZeroU64,
+    ) -> Result<Option<Arc<ModelBundle>>, ProductionModelRuntimeError> {
+        match self {
+            Self::Memory(registry) => registry.get(id, version).map_err(Into::into),
+            Self::Disk(inventory) => inventory.get(id, version),
+        }
+    }
+    pub(super) fn selection(
+        &self,
+        id: &BundleId,
+        version: NonZeroU64,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<market_squawk_modeling::ModelSelectionMetadata>, ProductionModelRuntimeError>
+    {
+        match self {
+            Self::Memory(registry) => Ok(registry
+                .get(id, version)?
+                .map(|bundle| bundle.selection_metadata())),
+            Self::Disk(inventory) => inventory
+                .admission(id, version)?
+                .map(|admission| inventory.selection_controlled(&admission, deadline, cancellation))
+                .transpose(),
+        }
+    }
+    pub(super) fn latest(
+        &self,
+        id: ModelId,
+    ) -> Result<Option<Arc<ModelBundle>>, ProductionModelRuntimeError> {
+        match self {
+            Self::Memory(registry) => registry.latest(id).map_err(Into::into),
+            Self::Disk(inventory) => inventory.latest(id),
+        }
+    }
+    pub(super) fn len(&self) -> Result<usize, ProductionModelRuntimeError> {
+        match self {
+            Self::Memory(registry) => registry.len().map_err(Into::into),
+            Self::Disk(inventory) => usize::try_from(inventory.head.sequence)
+                .map_err(|_| ProductionModelRuntimeError::ResourceExhausted),
+        }
     }
 }
 

@@ -1,5 +1,4 @@
-import { useMemo } from "react"
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
+import { useQuery } from "@tanstack/react-query"
 import {
   ChevronRight,
   CircleAlert,
@@ -21,7 +20,6 @@ import {
   admittedSavedScreenId,
   parseInvestmentAnalysis,
   parseInvestmentAnalysisPage,
-  parseRecommendationTrackRecord,
   parseSavedScreenProduct,
   type InvestmentAnalysisLocator,
 } from "./contracts"
@@ -35,6 +33,8 @@ import {
 } from "./investment-brief"
 import { AnalysisActivity } from "./analysis-activity"
 import { AnalysisLaunch } from "./analysis-launch"
+
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 
 const ANALYSIS_PAGE_LIMIT = 24
 
@@ -60,13 +60,13 @@ export function OpportunitiesReadExperience({
     queryKey: productKeys.operation(scope, "decision", "Decision.GetScreen", {
       screenId: requestedScreenId,
     }),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const screenId = requestedScreenId
       if (screenId === null) {
         throw new Error("Select a saved screen before opening it.")
       }
       return parseSavedScreenProduct(
-        await transport.query({ query: "decisionScreen", screenId }),
+        await transport.query({ query: "decisionScreen", screenId }, { signal }),
         screenId,
       )
     },
@@ -75,38 +75,32 @@ export function OpportunitiesReadExperience({
       requestedScreenId !== null &&
       screenReadAvailable,
   })
-  const analyses = useInfiniteQuery({
+  const navigation = useCursorNavigation()
+  const analyses = useQuery({
     queryKey: productKeys.operation(
       scope,
       "decision",
       "Decision.ListInvestmentAnalyses",
-      { limit: ANALYSIS_PAGE_LIMIT },
+      { limit: ANALYSIS_PAGE_LIMIT, afterActionToken: navigation.after },
     ),
-    initialPageParam: undefined as string | undefined,
-    queryFn: async ({ pageParam }) => {
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
       const request = {
-        ...(pageParam ? { afterActionToken: pageParam } : {}),
+        ...(navigation.after ? { afterActionToken: navigation.after } : {}),
         limit: ANALYSIS_PAGE_LIMIT,
       }
       return parseInvestmentAnalysisPage(
         await transport.query({
           query: "decisionInvestmentAnalyses",
-          ...(pageParam ? { afterActionToken: pageParam } : {}),
+          ...(navigation.after ? { afterActionToken: navigation.after } : {}),
           limit: request.limit,
-        }),
+        }, { signal }),
         request,
       )
     },
-    getNextPageParam: (page) =>
-      page.completeness === "truncated"
-        ? (page.nextAfterActionToken ?? undefined)
-        : undefined,
     enabled: readAvailable,
   })
-  const history = useMemo(
-    () => analyses.data?.pages.flatMap((page) => page.analyses) ?? [],
-    [analyses.data],
-  )
+  const history = analyses.data?.analyses ?? []
   const repeatedIdentity =
     new Set(history.map((analysis) => analysis.actionToken)).size !== history.length
   const selected = useQuery({
@@ -116,7 +110,7 @@ export function OpportunitiesReadExperience({
       "Decision.GetInvestmentAnalysis",
       { actionToken: selectedActionToken },
     ),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const actionToken = selectedActionToken
       if (actionToken === null) {
         throw new Error("Select a saved analysis before opening its brief.")
@@ -125,40 +119,16 @@ export function OpportunitiesReadExperience({
         await transport.query({
           query: "decisionInvestmentAnalysis",
           actionToken,
-        }),
+        }, { signal }),
         actionToken,
       )
     },
     enabled: readAvailable && selectedActionToken !== null,
+    gcTime: 0,
   })
   const trackRecordAvailable =
     product.status === "ready" &&
     hasProductCapability(product.bootstrap, "decision_recommendation_history")
-  const trackRecordActionToken = selected.data?.trackRecordActionToken ?? null
-  const trackRecord = useQuery({
-    queryKey: productKeys.operation(
-      scope,
-      "decision",
-      "Decision.GetRecommendationTrackRecord",
-      { actionToken: trackRecordActionToken },
-    ),
-    queryFn: async () => {
-      const actionToken = trackRecordActionToken
-      if (actionToken === null) {
-        throw new Error("Comparable history is unavailable for this saved analysis.")
-      }
-      return parseRecommendationTrackRecord(
-        await transport.query({
-          query: "decisionRecommendationTrackRecord",
-          actionToken,
-        }),
-        actionToken,
-      )
-    },
-    enabled:
-      trackRecordAvailable &&
-      trackRecordActionToken !== null,
-  })
 
   return (
     <>
@@ -212,27 +182,13 @@ export function OpportunitiesReadExperience({
             <BriefError onRetry={() => void selected.refetch()} />
           ) : (
             <InvestmentBrief
+              key={selectedActionToken}
               analysis={selected.data}
               transport={transport}
               scope={scope}
-              trackRecord={trackRecord.data ?? null}
-              trackRecordPending={
-                trackRecordAvailable &&
-                trackRecordActionToken !== null &&
-                trackRecord.isPending
-              }
-              trackRecordUnavailable={
-                !trackRecordAvailable ||
-                trackRecordActionToken === null ||
-                trackRecord.isError
-              }
-              refreshing={selected.isFetching || trackRecord.isFetching}
-              onRefresh={() => {
-                void selected.refetch()
-                if (trackRecordActionToken !== null && trackRecordAvailable) {
-                  void trackRecord.refetch()
-                }
-              }}
+              trackRecordAvailable={trackRecordAvailable}
+              refreshing={selected.isFetching}
+              onRefresh={() => void selected.refetch()}
             />
           )}
         </div>
@@ -322,23 +278,8 @@ export function OpportunitiesReadExperience({
                 />
               ) : null}
 
-              {analyses.hasNextPage ? (
-                <div className="mt-5 flex justify-center">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => void analyses.fetchNextPage()}
-                    disabled={analyses.isFetchingNextPage}
-                  >
-                    {analyses.isFetchingNextPage ? (
-                      <RefreshCw className="animate-spin" aria-hidden="true" />
-                    ) : (
-                      <ChevronRight aria-hidden="true" />
-                    )}
-                    Load more analyses
-                  </Button>
-                </div>
-              ) : null}
+              <CursorNavigation navigation={navigation} next={analyses.data?.completeness === "truncated" ? analyses.data.nextAfterActionToken : null} busy={analyses.isFetching}
+                onRestart={() => { if (navigation.after === undefined) void analyses.refetch() }} />
             </>
           )}
         </section>

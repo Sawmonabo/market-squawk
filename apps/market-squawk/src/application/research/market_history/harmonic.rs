@@ -18,7 +18,7 @@ use market_squawk_analytics::{
     MIN_HARMONIC_BARS, classify_harmonic_pattern,
 };
 use market_squawk_data::{
-    CompleteMarketBarHistoryOutput, ForecastBasisHistory, ForecastBasisHistoryRow,
+    CompleteMarketBarHistoryCursor, ForecastBasisHistory, ForecastBasisHistoryRow,
     LatestCanonicalMarketBarHistoryWindowRequest, MarketHistorySelectionPolicy, ResearchUse,
     ResearchUseCatalogError, ResearchUseLimits, ResearchUsePermit, ResearchUseRequest,
 };
@@ -170,7 +170,7 @@ impl MarketHistoryReadCapability {
                 calendar_identity: digest(history.calendar_identity().bytes()),
                 completeness_identity,
                 marketability_identity,
-                materialized_bars: u32::try_from(history.rows().len()).map_err(|_| invalid())?,
+                materialized_bars: u32::try_from(history.row_count()).map_err(|_| invalid())?,
                 start_ordinal: u32::try_from(prepared.start_ordinal).map_err(|_| invalid())?,
             },
             permit,
@@ -322,7 +322,7 @@ impl MarketHistoryReadCapability {
         };
         let Some(output) = self
             .reader
-            .read_canonical_market_bar_history(exact_request, deadline, cancellation.clone())
+            .read_canonical_market_bar_history_cursor(exact_request, deadline, cancellation.clone())
             .await
             .map_err(|error| unavailable_reason(&error))?
         else {
@@ -459,7 +459,7 @@ async fn authorize_history_parents(
     reason = "source receipt, financial identity and causal coordinates are independent"
 )]
 fn evaluate_history(
-    output: &CompleteMarketBarHistoryOutput,
+    output: &CompleteMarketBarHistoryCursor,
     permit: ResearchUsePermit,
     rights_checked_at: Timestamp,
     instrument_id: InstrumentId,
@@ -477,7 +477,7 @@ fn evaluate_history(
         || publication.adjustment() != MarketBarAdjustment::All
         || !publication.current_research_eligible()
         || publication.published_at() > source_cutoff
-        || output.bars().len() != publication.bar_count()
+        || output.bar_count() != publication.bar_count()
     {
         return Err(invalid());
     }
@@ -486,9 +486,14 @@ fn evaluate_history(
     // publication receipt. Do not drop an unavailable interior bar and join its neighbours.
     let mut eligible_count: usize = 0;
     let mut previous_end = None;
+    let mut selected = std::collections::VecDeque::new();
+    selected
+        .try_reserve_exact(MAX_HARMONIC_BARS)
+        .map_err(|_| MarketHistoryUnavailableReason::CapacityExceeded)?;
     for bar in output.bars() {
         check_control(deadline, cancellation)?;
-        let completed = source_completion(output, bar)?;
+        let bar = bar.map_err(|error| unavailable_reason(&error))?;
+        let completed = source_completion(output, &bar)?;
         if previous_end.is_some_and(|prior| prior >= completed) {
             return Err(invalid());
         }
@@ -510,13 +515,16 @@ fn evaluate_history(
         {
             return Err(invalid());
         }
-        eligible_count += 1;
+        eligible_count = eligible_count.checked_add(1).ok_or_else(invalid)?;
+        if selected.len() == MAX_HARMONIC_BARS {
+            selected.pop_front();
+        }
+        selected.push_back(bar);
     }
     if eligible_count == 0 {
         return Ok(None);
     }
     let start_ordinal = eligible_count.saturating_sub(MAX_HARMONIC_BARS);
-    let selected = &output.bars()[start_ordinal..eligible_count];
 
     // Adjusted prices can have sub-market-tick precision. Derive the exact decimal grid from
     // the selected values and retain any genuine execution increment separately. Never round OHLC
@@ -531,7 +539,7 @@ fn evaluate_history(
     let mut bars = Vec::new();
     bars.try_reserve_exact(selected.len())
         .map_err(|_| MarketHistoryUnavailableReason::CapacityExceeded)?;
-    for bar in selected {
+    for bar in &selected {
         check_control(deadline, cancellation)?;
         let provenance = bar.context().provenance();
         let available_at = provenance
@@ -686,7 +694,7 @@ fn evaluate_history(
             calendar_identity,
             completeness_identity,
             marketability_identity,
-            materialized_bars: u32::try_from(output.bars().len()).map_err(|_| invalid())?,
+            materialized_bars: u32::try_from(output.bar_count()).map_err(|_| invalid())?,
             start_ordinal: u32::try_from(start_ordinal).map_err(|_| invalid())?,
         },
         permit,
@@ -707,7 +715,9 @@ struct PreparedBasisBars {
 /// Preserve every source clock and exact price. Only the final uninterrupted native-session run
 /// can describe a currently active pattern; earlier runs remain in the sealed chart history.
 fn prepare_basis_bars(
-    rows: &[ForecastBasisHistoryRow],
+    rows: impl IntoIterator<
+        Item = Result<ForecastBasisHistoryRow, market_squawk_data::DatasetBuildError>,
+    >,
     currency: Currency,
     source_cutoff: Timestamp,
     observed_through: Timestamp,
@@ -716,16 +726,26 @@ fn prepare_basis_bars(
 ) -> Result<PreparedBasisBars, MarketHistoryUnavailableReason> {
     let invalid = || MarketHistoryUnavailableReason::IntegrityUnproven;
     check_control(deadline, cancellation)?;
-    if rows.is_empty() || rows.len() > MAX_HARMONIC_BARS {
-        return Err(invalid());
+    // The detector already evaluates at most MAX_HARMONIC_BARS. Retain the same final
+    // contiguous suffix while the full original history remains in the immutable projection.
+    let mut selected = std::collections::VecDeque::with_capacity(MAX_HARMONIC_BARS);
+    let mut start_ordinal = 0;
+    for (ordinal, row) in rows.into_iter().enumerate() {
+        check_control(deadline, cancellation)?;
+        let row = row.map_err(|_| invalid())?;
+        if row.prices.is_none() {
+            selected.clear();
+            start_ordinal = ordinal.checked_add(1).ok_or_else(invalid)?;
+        } else {
+            if selected.len() == MAX_HARMONIC_BARS {
+                selected.pop_front();
+                start_ordinal = start_ordinal.checked_add(1).ok_or_else(invalid)?;
+            }
+            selected.push_back(row);
+        }
     }
-    let start_ordinal = rows
-        .iter()
-        .rposition(|row| row.prices.is_none())
-        .map_or(0, |index| index + 1);
-    let selected = &rows[start_ordinal..];
     if selected
-        .last()
+        .back()
         .is_none_or(|row| row.observed_at != observed_through)
     {
         return Err(invalid());
@@ -746,7 +766,7 @@ fn prepare_basis_bars(
         .try_reserve_exact(selected.len())
         .map_err(|_| MarketHistoryUnavailableReason::CapacityExceeded)?;
     let mut previous = None;
-    for row in selected {
+    for row in &selected {
         check_control(deadline, cancellation)?;
         let prices = row.prices.as_ref().ok_or_else(invalid)?;
         let available_at = row.available_at.ok_or_else(invalid)?;
@@ -921,7 +941,7 @@ fn finish_evaluation(
 
 /// Keeps native dates intact; only the original attached calendar supplies a regular close.
 fn source_completion(
-    output: &CompleteMarketBarHistoryOutput,
+    output: &CompleteMarketBarHistoryCursor,
     bar: &MarketBarObservation,
 ) -> Result<Timestamp, MarketHistoryUnavailableReason> {
     let invalid = || MarketHistoryUnavailableReason::IntegrityUnproven;
@@ -931,12 +951,16 @@ fn source_completion(
         }
         return Ok(completed);
     }
-    let nominal = bar.time_semantics().nominal_daily_date().ok_or_else(invalid)?;
+    let nominal = bar
+        .time_semantics()
+        .nominal_daily_date()
+        .ok_or_else(invalid)?;
     let native = output.native_sessions().ok_or_else(invalid)?;
-    let index = native.sessions()
-        .binary_search_by_key(&nominal.date(), |session| session.native_date())
-        .map_err(|_| invalid())?;
-    let session = &native.sessions()[index];
+    let session = native
+        .sessions()
+        .find_date(nominal.date())
+        .map_err(|error| unavailable_reason(&error))?
+        .ok_or_else(invalid)?;
     if !session.bar_present()
         || session.provider_timestamp().is_some()
         || session.provider_period().is_some()
@@ -951,10 +975,17 @@ fn source_completion(
 fn calendar_error(error: CompletedMarketSessionError) -> MarketHistoryUnavailableReason {
     match error {
         CompletedMarketSessionError::Cancelled => MarketHistoryUnavailableReason::Cancelled,
-        CompletedMarketSessionError::DeadlineExceeded => MarketHistoryUnavailableReason::DeadlineExceeded,
-        CompletedMarketSessionError::ResourceBoundExceeded => MarketHistoryUnavailableReason::CapacityExceeded,
-        CompletedMarketSessionError::Unavailable => MarketHistoryUnavailableReason::StorageUnavailable,
-        CompletedMarketSessionError::InvalidRequest | CompletedMarketSessionError::InvalidEvidence => {
+        CompletedMarketSessionError::DeadlineExceeded => {
+            MarketHistoryUnavailableReason::DeadlineExceeded
+        }
+        CompletedMarketSessionError::ResourceBoundExceeded => {
+            MarketHistoryUnavailableReason::CapacityExceeded
+        }
+        CompletedMarketSessionError::Unavailable => {
+            MarketHistoryUnavailableReason::StorageUnavailable
+        }
+        CompletedMarketSessionError::InvalidRequest
+        | CompletedMarketSessionError::InvalidEvidence => {
             MarketHistoryUnavailableReason::IntegrityUnproven
         }
     }
@@ -965,7 +996,9 @@ fn source_error(error: ServiceError) -> MarketHistoryUnavailableReason {
         ServiceError::Cancelled => MarketHistoryUnavailableReason::Cancelled,
         ServiceError::DeadlineExceeded => MarketHistoryUnavailableReason::DeadlineExceeded,
         ServiceError::ResourceExhausted => MarketHistoryUnavailableReason::CapacityExceeded,
-        ServiceError::Unavailable | ServiceError::NotFound => MarketHistoryUnavailableReason::StorageUnavailable,
+        ServiceError::Unavailable | ServiceError::NotFound => {
+            MarketHistoryUnavailableReason::StorageUnavailable
+        }
         _ => MarketHistoryUnavailableReason::IntegrityUnproven,
     }
 }
@@ -1113,8 +1146,15 @@ mod tests {
         let cancellation = CancellationToken::new();
         let cutoff = Timestamp::from_unix_nanos(500);
         let origin = Timestamp::from_unix_nanos(400);
-        let prepared = prepare_basis_bars(&rows, currency, cutoff, origin, deadline, &cancellation)
-            .map_err(|_| "valid split-basis suffix rejected")?;
+        let prepared = prepare_basis_bars(
+            rows.iter().cloned().map(Ok),
+            currency,
+            cutoff,
+            origin,
+            deadline,
+            &cancellation,
+        )
+        .map_err(|_| "valid split-basis suffix rejected")?;
         assert_eq!(prepared.start_ordinal, 2);
         assert_eq!(prepared.bars.len(), 2);
         assert_eq!(prepared.analytical_tick.as_decimal(), Decimal::new(1, 3));
@@ -1131,16 +1171,50 @@ mod tests {
             prepared.chart_bars[0].nominal_date,
             Some(rows[2].native_date)
         );
+        // The detector's bounded suffix must not reject the retained full browse history.
+        let original_count = MAX_HARMONIC_BARS + 7;
+        let long_rows = (0..original_count).map(|index| {
+            let mut row = rows[0].clone();
+            row.observed_at = Timestamp::from_unix_nanos(index as i64 + 1);
+            row.available_at = Some(Timestamp::from_unix_nanos(10_000));
+            Ok(row)
+        });
+        let prepared = prepare_basis_bars(
+            long_rows,
+            currency,
+            Timestamp::from_unix_nanos(10_000),
+            Timestamp::from_unix_nanos(original_count as i64),
+            deadline,
+            &cancellation,
+        )
+        .map_err(|_| "complete history incorrectly constrained by detector limit")?;
+        assert_eq!(prepared.start_ordinal, 7);
+        assert_eq!(prepared.bars.len(), MAX_HARMONIC_BARS);
         // A later-known input is rejected, never dropped and joined to its neighbours.
         rows[2].available_at = Some(Timestamp::from_unix_nanos(501));
         assert!(matches!(
-            prepare_basis_bars(&rows, currency, cutoff, origin, deadline, &cancellation),
+            prepare_basis_bars(
+                rows.iter().cloned().map(Ok),
+                currency,
+                cutoff,
+                origin,
+                deadline,
+                &cancellation
+            ),
             Err(MarketHistoryUnavailableReason::IntegrityUnproven)
         ));
         // Missing origin cannot turn an earlier historical shape into current evidence.
         rows[3].prices = None;
         assert!(
-            prepare_basis_bars(&rows, currency, cutoff, origin, deadline, &cancellation).is_err()
+            prepare_basis_bars(
+                rows.iter().cloned().map(Ok),
+                currency,
+                cutoff,
+                origin,
+                deadline,
+                &cancellation
+            )
+            .is_err()
         );
         Ok(())
     }

@@ -1,7 +1,7 @@
 //! Private live admission retained by the existing plan, separate from its recovery values.
 
-mod current_ordinary;
 mod completed_history;
+mod current_ordinary;
 
 use super::*;
 use crate::{
@@ -48,7 +48,9 @@ impl Eq for CorporateActionSourceCoverage {}
 
 impl CorporateActionSourceCoverage {
     /// True only after original US IEX calendar and exact economic-date reads are joined.
-    pub const fn uses_us_equity_dates(&self) -> bool { self.current_us_equity_dates }
+    pub const fn uses_us_equity_dates(&self) -> bool {
+        self.current_us_equity_dates
+    }
     pub const fn interval(&self) -> (CalendarDate, CalendarDate) {
         self.interval
     }
@@ -74,12 +76,24 @@ impl CorporateActionSourceCoverage {
         &self.history_inputs
     }
     /// Genuine timestamp history span, admitted through original receipt and native calendar.
-    pub fn covers_timestamp_history_span(&self, instrument: InstrumentId, manifest: &DatasetManifestRef,
-        knowledge: Timestamp, left: Timestamp, right: Timestamp) -> bool {
-        knowledge == self.knowledge_cutoff && self.completed_histories.iter().any(|history|
-            history.covers_span(instrument, manifest, knowledge, left, right))
+    pub fn covers_timestamp_history_span(
+        &self,
+        instrument: InstrumentId,
+        manifest: &DatasetManifestRef,
+        knowledge: Timestamp,
+        left: Timestamp,
+        right: Timestamp,
+    ) -> bool {
+        knowledge == self.knowledge_cutoff
+            && self
+                .completed_histories
+                .iter()
+                .any(|history| history.covers_span(instrument, manifest, knowledge, left, right))
     }
-    pub(crate) fn admits_completed_history(&self, history: &super::current_ordinary::CompletedOrdinaryHistoryEvidence) -> bool {
+    pub(crate) fn admits_completed_history(
+        &self,
+        history: &super::current_ordinary::CompletedOrdinaryHistoryEvidence,
+    ) -> bool {
         self.completed_histories.contains(history)
     }
     /// Checked shared proof heap, charged once when several projected plans share this marker.
@@ -216,7 +230,8 @@ impl CorporateActionSourceCoverage {
                 calendar.binding_digest(),
                 calendar.evidence_digest(),
             ))?;
-            for row in read.actions().rows() {
+            for row in read.action_rows() {
+                let row = row.map_err(|_| CorporateActionError::InvalidApplication)?;
                 audit.json(&(
                     row.history_page_index,
                     row.provider_row_index,
@@ -238,7 +253,8 @@ impl CorporateActionSourceCoverage {
                 ))?;
             }
             for record in read.records() {
-                audit.record(record)?;
+                let record = record.map_err(|_| CorporateActionError::InvalidApplication)?;
+                audit.record(&record)?;
             }
             for root in [
                 history.selection().pinned().manifest(),
@@ -286,7 +302,11 @@ impl CorporateActionSourceCoverage {
             instruments: instruments.iter().copied().collect(),
             knowledge_cutoff: source.knowledge_cutoff(),
             valuation_bound,
-            source_calendar_identity: (calendar.manifest().content_hash(), calendar.binding_digest(), calendar.evidence_digest()),
+            source_calendar_identity: (
+                calendar.manifest().content_hash(),
+                calendar.binding_digest(),
+                calendar.evidence_digest(),
+            ),
             projection_records,
             application_starts: reads
                 .iter()
@@ -330,7 +350,10 @@ impl CorporateActionSourceCoverage {
             ),
             (self.roots.len(), size_of::<DatasetManifestRef>()),
             (self.history_inputs.len(), size_of::<DatasetManifestRef>()),
-            (self.completed_histories.len(), size_of::<super::current_ordinary::CompletedOrdinaryHistoryEvidence>()),
+            (
+                self.completed_histories.len(),
+                size_of::<super::current_ordinary::CompletedOrdinaryHistoryEvidence>(),
+            ),
             (self.source_audit.len(), 1),
             (self.outside_window.len(), size_of::<SourceIdentifier>()),
             (self.unresolved.len(), size_of::<ApplicableActionGap>()),
@@ -537,8 +560,12 @@ impl CorporateActionPlan {
         valuation_cutoff: Timestamp,
         limits: CorporateActionLimits,
     ) -> Result<Self, CorporateActionError> {
-        let required =
-            self.source_split_projection_limits(policy, instrument, knowledge_cutoff, valuation_cutoff)?;
+        let required = self.source_split_projection_limits(
+            policy,
+            instrument,
+            knowledge_cutoff,
+            valuation_cutoff,
+        )?;
         if required.max_actions().get() > limits.max_actions().get() {
             return Err(CorporateActionError::ActionLimitExceeded {
                 limit: limits.max_actions().get(),

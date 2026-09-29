@@ -121,13 +121,17 @@ impl AnnualEquityCashReturnRead {
             .ok_or(EquityPremiumUnavailable::NativeDateAuthorityMissing)?;
         if native.calendar_origin_content_digest() != graph.calendar().origin_content_digest
             || native.calendar_capture_binding_digest() != graph.calendar().capture_binding_digest
-            || native.sessions().iter().any(|session| {
-                !session.bar_present()
-                    || session.provider_timestamp().is_some()
-                    || session.provider_period().is_some()
-            })
         {
             return Err(EquityPremiumUnavailable::NativeDateAuthorityMissing);
+        }
+        for session in native.sessions().iter() {
+            let session = session.map_err(|_| mismatch)?;
+            if !session.bar_present()
+                || session.provider_timestamp().is_some()
+                || session.provider_period().is_some()
+            {
+                return Err(EquityPremiumUnavailable::NativeDateAuthorityMissing);
+            }
         }
         let (start, end) = graph.requested_dates();
         if start > requested_start || end < requested_end {
@@ -135,6 +139,7 @@ impl AnnualEquityCashReturnRead {
         }
         let mut prices = BTreeMap::new();
         for bar in source.history().bars() {
+            let bar = bar.map_err(|_| mismatch)?;
             let date = bar
                 .time_semantics()
                 .nominal_daily_date()
@@ -148,8 +153,7 @@ impl AnnualEquityCashReturnRead {
                 return Err(mismatch);
             }
         }
-        let rows = source.actions().rows();
-        if rows.is_empty() || rows.windows(2).any(|pair| pair[0].date >= pair[1].date) {
+        if source.source_history().action_row_count() == 0 {
             return Err(EquityPremiumUnavailable::IncompleteTenYearHistory);
         }
         // The complete expected-session graph, not weekday arithmetic, establishes the final
@@ -158,26 +162,40 @@ impl AnnualEquityCashReturnRead {
         let mut closing_prices = Vec::with_capacity(ENDPOINTS);
         for offset in 0..ENDPOINTS {
             let target_year = opening_year + offset as u16;
-            let closing_date = native
-                .sessions()
-                .iter()
-                .rev()
-                .map(|session| session.native_date())
-                .find(|date| date.year() == target_year)
+            let mut closing_date = None;
+            for session in native.sessions().iter() {
+                let date = session.map_err(|_| mismatch)?.native_date();
+                if date.year() == target_year {
+                    closing_date = Some(date);
+                }
+            }
+            let closing_date = closing_date
                 .filter(|date| date.month() == 12 && date.day() >= 24)
                 .ok_or(EquityPremiumUnavailable::IncompleteTenYearHistory)?;
-            let row = rows
-                .binary_search_by_key(&closing_date, |row| row.date)
-                .ok()
-                .and_then(|index| rows.get(index))
-                .ok_or(EquityPremiumUnavailable::MissingAnnualClosingPrice)?;
             let close = prices
-                .get(&row.date)
+                .get(&closing_date)
                 .copied()
                 .filter(|price| price.amount() > Decimal::ZERO)
                 .ok_or(EquityPremiumUnavailable::MissingAnnualClosingPrice)?;
-            closing_dates.push(row.date);
+            closing_dates.push(closing_date);
             closing_prices.push(close);
+        }
+        // Validate the complete indexed action calendar and retain only the fixed annual
+        // endpoint membership. No source action rows accumulate in application memory.
+        let mut closing_present = [false; ENDPOINTS];
+        let mut previous_date = None;
+        for row in source.source_history().action_rows() {
+            let row = row.map_err(|_| mismatch)?;
+            if previous_date.is_some_and(|date| date >= row.date) {
+                return Err(EquityPremiumUnavailable::IncompleteTenYearHistory);
+            }
+            previous_date = Some(row.date);
+            if let Ok(index) = closing_dates.binary_search(&row.date) {
+                closing_present[index] = true;
+            }
+        }
+        if closing_present.contains(&false) {
+            return Err(EquityPremiumUnavailable::MissingAnnualClosingPrice);
         }
         let mut cash = [Money::new(Decimal::ZERO, currency); EQUITY_PREMIUM_SAMPLE_YEARS];
         let first = closing_dates[0];
@@ -200,10 +218,11 @@ impl AnnualEquityCashReturnRead {
             digest.update(b"original-economic-sample-origin\0");
             digest.update(economic_origin.unix_nanos().to_be_bytes());
         }
-        for row in rows
-            .iter()
-            .filter(|row| row.date > first && row.date <= last)
-        {
+        for row in source.source_history().action_rows() {
+            let row = row.map_err(|_| mismatch)?;
+            if row.date <= first || row.date > last {
+                continue;
+            }
             if !prices.contains_key(&row.date) {
                 return Err(EquityPremiumUnavailable::IncompleteTenYearHistory);
             }

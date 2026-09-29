@@ -88,14 +88,61 @@ impl SourceAppliedCorporateActionPlan {
     /// Uses original current economic-date reads. It cannot borrow a historical history proof,
     /// replace source knowledge, or turn an unavailable monetary unit into an empty action list.
     pub(crate) fn with_current_ordinary_reads(
+        self,
+        reads: Vec<CurrentOrdinaryActionSourceRead>,
+        limits: CorporateActionLimits,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, ApplicableActionPlanError> {
+        if self.ordinary.is_some() {
+            return Err(ApplicableActionPlanError::InvalidEvidence);
+        }
+        self.join_current_ordinary_reads(Vec::new(), reads, limits, deadline, cancellation)
+    }
+
+    /// Original completed EOD prefix and current-date tail share one source selector and recipe.
+    pub(crate) fn with_hybrid_ordinary_reads<C: Into<SourcePlanCalendar>>(
+        self,
+        histories: Vec<(
+            crate::application::research::ingest::TiingoCompletedEodActionRead,
+            C,
+        )>,
+        reads: Vec<CurrentOrdinaryActionSourceRead>,
+        limits: CorporateActionLimits,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, ApplicableActionPlanError> {
+        if histories.len() > 32 || self.ordinary.is_some() {
+            return Err(ApplicableActionPlanError::InvalidEvidence);
+        }
+        let mut histories: Vec<_> = histories
+            .into_iter()
+            .map(|(read, calendar)| (read, calendar.into()))
+            .collect();
+        histories.sort_by_key(|(read, _)| read.history().selection().receipt().instrument_id());
+        self.join_current_ordinary_reads(histories, reads, limits, deadline, cancellation)
+    }
+
+    pub(crate) fn share_plan(&self) -> Result<&CorporateActionPlan, ApplicableActionPlanError> {
+        if self.plan.source_split_admission().is_none() {
+            return Err(ApplicableActionPlanError::IncompleteOrdinaryCoverage);
+        }
+        Ok(&self.plan)
+    }
+
+    fn join_current_ordinary_reads(
         mut self,
+        histories: Vec<(
+            crate::application::research::ingest::TiingoCompletedEodActionRead,
+            SourcePlanCalendar,
+        )>,
         mut reads: Vec<CurrentOrdinaryActionSourceRead>,
         limits: CorporateActionLimits,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Self, ApplicableActionPlanError> {
         check(deadline, cancellation)?;
-        if self.ordinary.is_some() || self.current_ordinary.is_some() || self.anchor.is_some() {
+        if self.current_ordinary.is_some() || self.anchor.is_some() {
             return Err(ApplicableActionPlanError::InvalidEvidence);
         }
         reads.sort_by_key(|read| {
@@ -105,10 +152,20 @@ impl SourceAppliedCorporateActionPlan {
                 read.family(),
             )
         });
-        self.plan = CorporateActionPlan::try_from_current_ordinary_source_reads(
+        let source_histories: Vec<_> = histories
+            .iter()
+            .map(|(read, calendar)| {
+                (
+                    read.source_history().as_ref(),
+                    calendar.source_action_calendar().as_ref(),
+                )
+            })
+            .collect();
+        self.plan = CorporateActionPlan::try_from_hybrid_ordinary_source_reads(
             &self.source,
             &self.query_identity,
             self.calendar.source_action_calendar(),
+            &source_histories,
             &reads,
             &self.requested_instruments.iter().copied().collect(),
             self.interval,
@@ -135,7 +192,10 @@ impl SourceAppliedCorporateActionPlan {
             recipe: None,
             digest: coverage.evidence_digest(),
         });
-        // Source bytes are already charged once in the existing plan; drop read owners here.
+        // Only original histories needed by physical replay remain owned by this plan.
+        if !histories.is_empty() {
+            return self.retain_ordinary_history(histories, deadline, cancellation);
+        }
         check(deadline, cancellation)?;
         Ok(self)
     }
@@ -289,7 +349,9 @@ impl SourceAppliedCorporateActionReadCapability {
                     deadline,
                     cancellation,
                 )
-                .map_err(|error| ApplicableActionPlanError::SourceRead(map_analytical_error(error)))?
+                .map_err(|error| {
+                    ApplicableActionPlanError::SourceRead(map_analytical_error(error))
+                })?
                 .ok_or(ApplicableActionPlanError::InvalidEvidence)?;
             let generation = self
                 .research
@@ -301,7 +363,9 @@ impl SourceAppliedCorporateActionReadCapability {
                     |generation, _, _, _, _| Ok(generation.clone()),
                 )
                 .await
-                .map_err(|error| ApplicableActionPlanError::SourceRead(map_research_error(error)))?;
+                .map_err(|error| {
+                    ApplicableActionPlanError::SourceRead(map_research_error(error))
+                })?;
             let read = self
                 .research
                 .analytical_reader()
@@ -325,7 +389,9 @@ impl SourceAppliedCorporateActionReadCapability {
                 )
                 .ok_or(ApplicableActionPlanError::InvalidEvidence)?;
             if total_audit > 64 * 1024 * 1024 {
-                return Err(ApplicableActionPlanError::SourceRead(ServiceError::ResourceExhausted));
+                return Err(ApplicableActionPlanError::SourceRead(
+                    ServiceError::ResourceExhausted,
+                ));
             }
             reads.push(read);
         }
@@ -333,7 +399,9 @@ impl SourceAppliedCorporateActionReadCapability {
     }
 }
 
-fn map_current_recipe_artifact_error(error: market_squawk_services::ArtifactError) -> ApplicableActionPlanError {
+fn map_current_recipe_artifact_error(
+    error: market_squawk_services::ArtifactError,
+) -> ApplicableActionPlanError {
     use market_squawk_services::ArtifactError as E;
     ApplicableActionPlanError::SourceRead(match error {
         E::Cancelled => ServiceError::Cancelled,
@@ -362,8 +430,16 @@ impl SourceAppliedCorporateActionPlan {
         check(deadline, cancellation)?;
         // Live generation always samples physical time; callers cannot supply an earlier clock.
         let admitted_at = current_share_wall_time()?;
-        self.forecast_share_conversion_at_admission(epoch, history, original_plan, market,
-            admitted_at, output_scale, deadline, cancellation)
+        self.forecast_share_conversion_at_admission(
+            epoch,
+            history,
+            original_plan,
+            market,
+            admitted_at,
+            output_scale,
+            deadline,
+            cancellation,
+        )
     }
 
     /// Shared exact source reconstruction. The retained reader below is the only historical
@@ -387,7 +463,10 @@ impl SourceAppliedCorporateActionPlan {
         let mark = observation.mark();
         let quote_at = observation.timestamps().effective_at();
         let now = current_share_wall_time()?;
-        if self.current_ordinary.as_ref().is_none_or(|coverage| coverage.recipe.is_none())
+        if self
+            .current_ordinary
+            .as_ref()
+            .is_none_or(|coverage| coverage.recipe.is_none())
             || self.plan.source_split_admission().is_none()
             || self.plan.valuation_cutoff() != quote_at
             || admitted_at > now
@@ -398,24 +477,58 @@ impl SourceAppliedCorporateActionPlan {
             || mark.currency() != history.origin_price().currency()
             || mark.fresh_until().is_none_or(|expiry| admitted_at > expiry)
             || now >= market.authorization_expires_at()
-        { return Err(invalid()); }
-        let policy = CorporateActionPolicy::new(market_squawk_data::CorporateActionAdjustment::SplitAdjusted,
-            std::num::NonZeroU32::MIN);
-        let limits = self.plan.source_split_projection_limits(policy, epoch.instrument_id(),
-            self.plan.knowledge_cutoff(), quote_at)
+        {
+            return Err(invalid());
+        }
+        let policy = CorporateActionPolicy::new(
+            market_squawk_data::CorporateActionAdjustment::SplitAdjusted,
+            std::num::NonZeroU32::MIN,
+        );
+        let limits = self
+            .plan
+            .source_split_projection_limits(
+                policy,
+                epoch.instrument_id(),
+                self.plan.knowledge_cutoff(),
+                quote_at,
+            )
             .map_err(|error| map_source_plan_error(error, deadline, cancellation))?;
-        let current_plan = self.plan.try_project_source_split_plan(policy, epoch.instrument_id(),
-            self.plan.knowledge_cutoff(), quote_at, limits)
+        let current_plan = self
+            .plan
+            .try_project_source_split_plan(
+                policy,
+                epoch.instrument_id(),
+                self.plan.knowledge_cutoff(),
+                quote_at,
+                limits,
+            )
             .map_err(|error| map_source_plan_error(error, deadline, cancellation))?;
-        let result = history.convert_to_current_share_units(epoch, original_plan, &current_plan,
-            market.publication(), market.market_definitions(), output_scale, deadline, cancellation)
+        let result = history
+            .convert_to_current_share_units(
+                epoch,
+                original_plan,
+                &current_plan,
+                market.publication(),
+                market.market_definitions(),
+                output_scale,
+                deadline,
+                cancellation,
+            )
             .map_err(|error| match error {
-                market_squawk_data::DatasetBuildError::Cancelled => ApplicableActionPlanError::SourceRead(ServiceError::Cancelled),
-                market_squawk_data::DatasetBuildError::DeadlineExceeded => ApplicableActionPlanError::SourceRead(ServiceError::DeadlineExceeded),
-                market_squawk_data::DatasetBuildError::LimitExceeded => ApplicableActionPlanError::SourceRead(ServiceError::ResourceExhausted),
+                market_squawk_data::DatasetBuildError::Cancelled => {
+                    ApplicableActionPlanError::SourceRead(ServiceError::Cancelled)
+                }
+                market_squawk_data::DatasetBuildError::DeadlineExceeded => {
+                    ApplicableActionPlanError::SourceRead(ServiceError::DeadlineExceeded)
+                }
+                market_squawk_data::DatasetBuildError::LimitExceeded => {
+                    ApplicableActionPlanError::SourceRead(ServiceError::ResourceExhausted)
+                }
                 _ => invalid(),
             })?;
-        if result.quote_at() != quote_at { return Err(invalid()); }
+        if result.quote_at() != quote_at {
+            return Err(invalid());
+        }
         check(deadline, cancellation)?;
         Ok(result)
     }
@@ -434,12 +547,25 @@ impl SourceAppliedCorporateActionReadCapability {
         output_scale: u32,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<Option<market_squawk_data::ForecastCurrentShareConversion>, ApplicableActionPlanError> {
-        let Some(source) = self.read_reference(reference, deadline, cancellation.clone()).await? else {
+    ) -> Result<Option<market_squawk_data::ForecastCurrentShareConversion>, ApplicableActionPlanError>
+    {
+        let Some(source) = self
+            .read_reference(reference, deadline, cancellation.clone())
+            .await?
+        else {
             return Ok(None);
         };
-        source.current_forecast_share_conversion(epoch, history, original_plan, market,
-            output_scale, deadline, &cancellation).map(Some)
+        source
+            .current_forecast_share_conversion(
+                epoch,
+                history,
+                original_plan,
+                market,
+                output_scale,
+                deadline,
+                &cancellation,
+            )
+            .map(Some)
     }
 }
 
@@ -466,7 +592,8 @@ impl SourceAppliedCorporateActionReadCapability {
         output_scale: u32,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<Option<market_squawk_data::ForecastCurrentShareConversion>, ApplicableActionPlanError> {
+    ) -> Result<Option<market_squawk_data::ForecastCurrentShareConversion>, ApplicableActionPlanError>
+    {
         check(deadline, &cancellation)?;
         if original_authorized_at.unix_nanos() <= 0
             || original_authorized_at > original_admitted_at
@@ -477,17 +604,30 @@ impl SourceAppliedCorporateActionReadCapability {
         }
         // Physically reopen the original current-action capture, ordinary reads and calendar;
         // reference equality is enforced by the existing source owner, never a latest selector.
-        let Some(source) = self.read_reference(reference, deadline, cancellation.clone()).await? else {
+        let Some(source) = self
+            .read_reference(reference, deadline, cancellation.clone())
+            .await?
+        else {
             return Ok(None);
         };
-        let conversion = source.forecast_share_conversion_at_admission(epoch, history,
-            original_plan, market, original_admitted_at, output_scale, deadline, &cancellation)?;
+        let conversion = source.forecast_share_conversion_at_admission(
+            epoch,
+            history,
+            original_plan,
+            market,
+            original_admitted_at,
+            output_scale,
+            deadline,
+            &cancellation,
+        )?;
         if conversion.identity() != expected_conversion_identity {
             return Err(ApplicableActionPlanError::InvalidEvidence);
         }
         // Historical freshness never waives present rights to read the retained source.
         if current_share_wall_time()? >= market.authorization_expires_at() {
-            return Err(ApplicableActionPlanError::SourceRead(ServiceError::Unauthorized));
+            return Err(ApplicableActionPlanError::SourceRead(
+                ServiceError::Unauthorized,
+            ));
         }
         check(deadline, &cancellation)?;
         Ok(Some(conversion))
@@ -495,8 +635,10 @@ impl SourceAppliedCorporateActionReadCapability {
 }
 
 fn current_share_wall_time() -> Result<Timestamp, ApplicableActionPlanError> {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .ok().and_then(|value| i64::try_from(value.as_nanos()).ok())
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_nanos()).ok())
         .map(Timestamp::from_unix_nanos)
         .ok_or(ApplicableActionPlanError::InvalidEvidence)
 }

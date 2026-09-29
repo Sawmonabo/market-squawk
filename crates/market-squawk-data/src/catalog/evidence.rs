@@ -465,7 +465,71 @@ fn read_provider_relation_rows(
     read_provider_option_evidence(connection, maximum, &mut result)?;
     read_direct_provider_input_evidence(connection, maximum, &mut result)?;
     read_market_event_selection_evidence(connection, maximum, &mut result)?;
+    read_indexed_resource_evidence(connection, maximum, &mut result)?;
     Ok(result)
+}
+
+// Hash one stored record at a time. Model bytes and filing chunks are never accumulated here.
+fn read_indexed_resource_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    use rusqlite::types::ValueRef;
+
+    for (relation, query) in [
+        (
+            "forecast_inventory_vintages",
+            "SELECT printf('%019d',sequence), sequence, vintage_id, request_hash, product_token, artifact_id, instrument_id, created_at, available_at, expires_at, record, record_sha256 FROM forecast_inventory_vintages ORDER BY sequence",
+        ),
+        (
+            "forecast_inventory_outcomes",
+            "SELECT printf('%019d',sequence), sequence, outcome_id, vintage_id, target_at, record, record_sha256 FROM forecast_inventory_outcomes ORDER BY sequence",
+        ),
+        (
+            "model_inventory_series",
+            "SELECT model_id, model_id, bundle_id FROM model_inventory_series ORDER BY model_id",
+        ),
+        (
+            "chart_projection_headers",
+            "SELECT hex(source_sha256), source_sha256, projection_sha256, row_count, series_count, first_time, last_time, metadata FROM chart_projection_headers ORDER BY source_sha256",
+        ),
+        (
+            "chart_projection_rows",
+            "SELECT hex(source_sha256)||'/'||printf('%019d',ordinal), source_sha256, ordinal, time_nanos, payload, payload_sha256 FROM chart_projection_rows ORDER BY source_sha256,ordinal",
+        ),
+        (
+            "model_inventory_records",
+            "SELECT printf('%019d',sequence), sequence, model_id, bundle_id, bundle_version, candidate_directory, product_token, record, record_sha256, chain_sha256 FROM model_inventory_records ORDER BY sequence",
+        ),
+    ] {
+        let mut statement = connection.prepare(query)?;
+        let columns = statement.column_count();
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            require_capacity(result, maximum)?;
+            let key: String = row.get(0)?;
+            let mut digest = ProviderRowDigest::new(relation)?;
+            for index in 1..columns {
+                match row.get_ref(index)? {
+                    ValueRef::Integer(value) => digest.integer(value),
+                    ValueRef::Text(value) => digest.text(
+                        std::str::from_utf8(value).map_err(|_| CatalogError::CorruptCatalog)?,
+                    )?,
+                    ValueRef::Blob(value) => digest.bytes(value)?,
+                    ValueRef::Null => digest.optional_bytes(None)?,
+                    _ => return Err(CatalogError::CorruptCatalog),
+                }
+            }
+            result.push(provider_relation_row(
+                relation,
+                key.into_bytes().into_boxed_slice(),
+                digest.finish(),
+                0,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_direct_provider_input_evidence(
@@ -849,7 +913,8 @@ fn read_provider_logical_original_evidence(
         "SELECT coordinate_digest, dataset_id, source_id, native_schema_digest,
                 source_revision_digest, original_digest, received_at_ns, checkpoint_digest,
                 checkpoint_bytes, object_count, object_set_digest, rights_id, custody_digest,
-                retained_at_ns, publication_digest, published_at_ns
+                retained_at_ns, publication_digest, published_at_ns,
+                registered_source_revision_digest, source_revision_kind
          FROM provider_logical_originals ORDER BY coordinate_digest LIMIT ?1",
     )?;
     let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
@@ -874,7 +939,11 @@ fn read_provider_logical_original_evidence(
         let retained: i64 = row.get(13)?;
         let publication: Option<Vec<u8>> = row.get(14)?;
         let published: Option<i64> = row.get(15)?;
-        if checkpoint.is_empty()
+        let registered_revision = parse_sha256(1, row.get::<_, Vec<u8>>(16)?)?;
+        let revision_kind: String = row.get(17)?;
+        if !matches!(revision_kind.as_str(), "metadata" | "contract_payload")
+            || (revision_kind == "metadata" && revision != registered_revision)
+            || checkpoint.is_empty()
             || checkpoint.len() > super::MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES
             || Sha256Digest::new(Sha256::digest(&checkpoint).into()) != checkpoint_digest
             || !(1..=64).contains(&objects)
@@ -893,6 +962,8 @@ fn read_provider_logical_original_evidence(
         digest.text(&source)?;
         digest.digest(native);
         digest.digest(revision);
+        digest.digest(registered_revision);
+        digest.text(&revision_kind)?;
         digest.digest(original);
         digest.integer(received);
         digest.digest(checkpoint_digest);
@@ -1828,7 +1899,12 @@ fn read_native_reference_evidence(
         digest.digest(physical);
         digest.digest(custody);
         digest.integer(retained_at);
-        result.push(provider_relation_row(RELATION, digest_primary_key(identity), digest.finish(), 0));
+        result.push(provider_relation_row(
+            RELATION,
+            digest_primary_key(identity),
+            digest.finish(),
+            0,
+        ));
     }
     Ok(())
 }

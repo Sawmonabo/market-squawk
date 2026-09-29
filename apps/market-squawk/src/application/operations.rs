@@ -414,14 +414,8 @@ impl ApplicationDomainService for OperationsApplicationServices {
             LIST_BACKUPS => {
                 let input: BackupListInput = decode(request.arguments())?;
                 serde_json::to_value(
-                    self.backups.list(
-                        input
-                            .after_backup_id
-                            .as_deref()
-                            .map(parse_sha256)
-                            .transpose()?,
-                        input.limit,
-                    )?,
+                    self.backups
+                        .list(input.after_backup_id.as_deref(), input.limit)?,
                 )
                 .map_err(|_| ServiceError::Internal)?
             }

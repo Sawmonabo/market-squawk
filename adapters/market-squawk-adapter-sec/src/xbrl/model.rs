@@ -2043,7 +2043,7 @@ impl XbrlDocumentContext {
 }
 
 /// One exact normalized numeric fact plus its full occurrence evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct XbrlNumericFact {
     pub(super) concept: SourceIdentifier,
     pub(super) unit: SourceIdentifier,
@@ -2082,16 +2082,27 @@ impl XbrlNumericFact {
 }
 
 /// Nil or nonnumeric occurrence retained without fabricating a Decimal.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct XbrlNonnumericOccurrence {
     pub(super) occurrence_id: SourceIdentifier,
     pub(super) accession: SourceIdentifier,
     pub(super) concept: XbrlQualifiedName,
     pub(super) context_id: SourceIdentifier,
+    #[serde(with = "occurrence_context_serde")]
+    pub(super) context: Arc<XbrlOccurrenceContext>,
     pub(super) lexical_value: XbrlText,
     pub(super) nil: bool,
     pub(super) source_payload: ExactPayloadEvidence,
     pub(super) occurrence_relationships: XbrlOccurrenceRelationships,
+}
+
+/// One parsed source context shared by every nonnumeric occurrence referencing it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct XbrlOccurrenceContext {
+    pub(super) entity: market_squawk_domain::XbrlEntity,
+    pub(super) period: market_squawk_domain::XbrlPeriod,
+    pub(super) dimensions: Vec<market_squawk_domain::XbrlDimensionEvidence>,
+    pub(super) context_graph: market_squawk_domain::XbrlContextGraph,
 }
 
 impl XbrlNonnumericOccurrence {
@@ -2108,6 +2119,26 @@ impl XbrlNonnumericOccurrence {
     /// Returns the exact XBRL context identity referenced by this occurrence.
     pub const fn context_id(&self) -> &SourceIdentifier {
         &self.context_id
+    }
+
+    /// Returns the source entity referenced by this occurrence.
+    pub fn entity(&self) -> &market_squawk_domain::XbrlEntity {
+        &self.context.entity
+    }
+
+    /// Returns the exact source instant or duration.
+    pub fn period(&self) -> market_squawk_domain::XbrlPeriod {
+        self.context.period
+    }
+
+    /// Returns all source-reported dimensions, including segment/scenario placement.
+    pub fn dimensions(&self) -> &[market_squawk_domain::XbrlDimensionEvidence] {
+        &self.context.dimensions
+    }
+
+    /// Returns the retained source-only XML context graph.
+    pub fn context_graph(&self) -> &market_squawk_domain::XbrlContextGraph {
+        &self.context.context_graph
     }
 
     /// Returns the source lexical and resolved concept QName.
@@ -2135,6 +2166,46 @@ impl XbrlNonnumericOccurrence {
     }
 }
 
+/// One source footnote and its exact explanatory text, independent of numeric fact contexts.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct XbrlFootnoteOccurrence {
+    pub(super) occurrence_id: SourceIdentifier,
+    pub(super) accession: SourceIdentifier,
+    pub(super) language: XbrlText,
+    pub(super) role: SourceIdentifier,
+    pub(super) title: Option<XbrlText>,
+    pub(super) lexical_value: XbrlText,
+    pub(super) source_payload: ExactPayloadEvidence,
+    pub(super) occurrence_relationships: XbrlOccurrenceRelationships,
+}
+
+impl XbrlFootnoteOccurrence {
+    pub const fn occurrence_id(&self) -> &SourceIdentifier {
+        &self.occurrence_id
+    }
+    pub const fn accession(&self) -> &SourceIdentifier {
+        &self.accession
+    }
+    pub const fn language(&self) -> &XbrlText {
+        &self.language
+    }
+    pub const fn role(&self) -> &SourceIdentifier {
+        &self.role
+    }
+    pub const fn title(&self) -> Option<&XbrlText> {
+        self.title.as_ref()
+    }
+    pub const fn lexical_value(&self) -> &XbrlText {
+        &self.lexical_value
+    }
+    pub const fn source_payload(&self) -> &ExactPayloadEvidence {
+        &self.source_payload
+    }
+    pub const fn occurrence_relationships(&self) -> &XbrlOccurrenceRelationships {
+        &self.occurrence_relationships
+    }
+}
+
 /// Parsed XBRL output preserving numeric and nonnumeric occurrence families separately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedXbrlDocument {
@@ -2143,41 +2214,15 @@ pub struct ParsedXbrlDocument {
     pub(super) taxonomy_set: XbrlTaxonomySet,
     pub(super) source_payload: ExactPayloadEvidence,
     pub(super) evaluated_at: Timestamp,
-    pub(super) retained_output_upper_bound: usize,
     pub(super) numeric_facts: Vec<XbrlNumericFact>,
     pub(super) nonnumeric_occurrences: Vec<XbrlNonnumericOccurrence>,
+    pub(super) footnotes: Vec<XbrlFootnoteOccurrence>,
 }
 
 impl ParsedXbrlDocument {
-    pub(crate) const fn retained_output_upper_bound(&self) -> usize {
-        self.retained_output_upper_bound
-    }
-
-    pub(crate) fn matches_document_context(
-        &self,
-        accession: &SourceIdentifier,
-        expected_cik: &SourceIdentifier,
-        taxonomy_set: &SecValidatedXbrlTaxonomySet,
-        source_payload: EvidenceDigest,
-    ) -> bool {
-        &self.accession == accession
-            && self.expected_cik.as_ref() == Some(expected_cik)
-            && self.taxonomy_set == taxonomy_set.domain_set()
-            && self.source_payload.content_digest() == source_payload
-    }
-
-    pub(crate) const fn evaluated_at(&self) -> Timestamp {
-        self.evaluated_at
-    }
-
-    pub(crate) fn into_families(
-        self,
-    ) -> (Vec<XbrlNumericFact>, Vec<XbrlNonnumericOccurrence>, usize) {
-        (
-            self.numeric_facts,
-            self.nonnumeric_occurrences,
-            self.retained_output_upper_bound,
-        )
+    /// Returns complete explanatory footnotes carried by the source filing.
+    pub fn footnotes(&self) -> &[XbrlFootnoteOccurrence] {
+        &self.footnotes
     }
 
     /// Returns normalized numeric facts.
@@ -2246,6 +2291,792 @@ mod tests {
         ))
     }
 
+    // Reuses this module's captured artifacts and the real closed adapter admission. All
+    // physical custody, native binding, publication and reopening use the public owning APIs.
+    async fn exercise_normalized_filing_physical_restart(
+        root: &std::path::Path,
+        store: Arc<RawEvidenceStore>,
+        source_id: SourceId,
+        revision: MetadataRevision,
+        filing: RetrievedSecBytes,
+        artifacts: Vec<RetrievedSecBytes>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use market_squawk_data::{
+            AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
+            CatalogLimit, CatalogResultLimits, DatasetId, IngestIdentity, ObjectStoreConfig,
+            PointInTimeLimits, PointInTimeRevisionMode, RightsBasis, RightsDecisionInput,
+            SecResearchDisposition, SecResearchFamily, SecResearchReadRequest, SourceOperation,
+        };
+        use market_squawk_domain::{
+            AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
+            EffectiveInterval, InstrumentId, ProviderIdentityEvidence, ProviderIdentityRecord,
+            ProviderIdentityRecordInput, ProviderIdentityRegistry, ProviderInstrumentId,
+            ResearchTemporalCoordinate, RevisionBoundPayloadEvidence, SchemaVersion,
+            SequenceCapability,
+        };
+        use market_squawk_sources::{
+            AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
+            EndpointPolicy, FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy,
+            SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+            SourceMetadataProvider, SourceProtocolProfile,
+        };
+        use std::num::{NonZeroU32, NonZeroU64};
+        use std::time::Instant;
+        let cancellation = CancellationToken::new();
+        let registry_path = root.join("normalized-filing-representations");
+        std::fs::create_dir(&registry_path)?;
+        let representations = Arc::new(crate::SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&registry_path, ambient_authority())?,
+            crate::SecRepresentationLimits::production_defaults(),
+        )?);
+        let representation = representations.record_source_success_cancellable(
+            &source_id,
+            filing.locator().ok_or("captured filing locator")?,
+            filing.evidence(),
+            u64::try_from(filing.bytes().len())?,
+            crate::SecHttpValidators::default(),
+            &cancellation,
+        )?;
+        let at = representation.first_observed_at();
+        let filing = captured_artifact(
+            &store,
+            representation.locator(),
+            filing.bytes(),
+            source_id.clone(),
+            revision.clone(),
+            at,
+        )?;
+        let artifacts = artifacts
+            .into_iter()
+            .map(|artifact| {
+                let receipt = artifact
+                    .capture_receipt()
+                    .ok_or("captured taxonomy receipt")?;
+                captured_artifact(
+                    &store,
+                    artifact.locator().ok_or("captured taxonomy locator")?,
+                    artifact.bytes(),
+                    receipt.source_id().clone(),
+                    receipt.metadata_revision().clone(),
+                    at,
+                )
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let instrument: InstrumentId = "0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1".parse()?;
+        let identities = Arc::new(ProviderIdentityRegistry::try_from_records(vec![
+            ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id: instrument,
+                source_id: source_id.clone(),
+                provider_instrument_id: ProviderInstrumentId::try_from("0000320193")?,
+                evidence: ProviderIdentityEvidence::from_content_digest(filing.evidence()),
+                source_timestamp: None,
+                observed_at: at,
+                metadata_revision: revision.clone(),
+                validity,
+                supersedes: None,
+            }),
+        ])?);
+        let metadata = SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            source_id.clone(),
+            RevisionBoundPayloadEvidence::new(
+                revision.clone(),
+                ExactPayloadEvidence::from_content_digest(filing.evidence()),
+            ),
+            SourceClass::RegulatoryFiling,
+            SourceIdentifier::try_from(crate::SEC_PROVIDER_RATE_SCOPE)?,
+            AuthorizationGrant::new(
+                AuthorizationMode::PublicInterface,
+                AuthorizationBasis::new(SourceIdentifier::try_from("sec-public-edgar")?),
+                ExactPayloadEvidence::from_content_digest(filing.evidence()),
+                validity,
+            ),
+            SourceCoverage::try_non_instrument(
+                ExactPayloadEvidence::from_content_digest(filing.evidence()),
+                validity,
+                CoverageDomain::RegulatoryFilings,
+                CoverageDelay::Delayed(1),
+                DeliveryEvidence::Unknown,
+            )?,
+            DataQuality::OfficialDelayed,
+            NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([
+                "https://data.sec.gov/submissions",
+                "https://www.sec.gov/Archives/edgar/data",
+            ])?),
+            FreshnessPolicy::try_new(1, 1, 1, 1, 0)?,
+            Some(crate::sec_application_budget_policy()?),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::RevisionPreserving,
+                false,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))?;
+        struct MetadataOwner(SourceMetadata);
+        impl SourceMetadataProvider for MetadataOwner {
+            fn metadata(&self) -> &SourceMetadata {
+                &self.0
+            }
+        }
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+        let registered = registry.register(metadata.clone(), at)?;
+        let extraction_authority =
+            registry.extraction_authority(&registered, &MetadataOwner(metadata.clone()))?;
+        let paths = LocalPaths::prepare(root.join("normalized-filing-restart"))?;
+        let raw_store = paths.sealed_research_journal_store()?;
+        let submissions_bytes = include_bytes!("../../fixtures/submissions-recent.json");
+        let submissions_raw = captured_artifact(
+            &store,
+            crate::SecObjectLocator::submissions("0000320193")?.url(),
+            submissions_bytes,
+            source_id.clone(),
+            revision.clone(),
+            at,
+        )?;
+        let submissions = crate::RetrievedSubmissions::new(
+            crate::SubmissionsDocument::parse(
+                submissions_bytes,
+                SecParserLimits::production_defaults(),
+            )?,
+            submissions_raw,
+            Vec::new(),
+        );
+        let root_material = filing
+            .capture_material()?
+            .ok_or("captured filing material")?;
+        let (expectation, request) = root_material.into_whole_seal_parts();
+        let root_token = expectation
+            .try_rejoin(request.seal(&raw_store)?)?
+            .try_into_whole()?;
+        let admitted = crate::extraction::admit_filing_xbrl_root_from_sealed_capture(
+            root_token,
+            Arc::clone(&store),
+            representations,
+            source_id.clone(),
+            revision.clone(),
+            SecParserLimits::production_defaults(),
+            &submissions,
+            "0000320193-25-000079",
+            &filing,
+            &cancellation,
+        )?;
+        let handoff = crate::extraction::prepare_filing_xbrl_capture_from_admitted_root(
+            store,
+            identities,
+            source_id.clone(),
+            revision,
+            SecParserLimits::production_defaults(),
+            submissions,
+            admitted,
+            artifacts,
+            &cancellation,
+        )?;
+        let dataset =
+            DatasetId::try_from(handoff.dataset().analytical_dataset_identifier()?.as_str())?;
+        let deadline = crate::client::system_timestamp()?.checked_add_nanos(60_000_000_000)?;
+        let (mut stream, material) = handoff.extract(
+            extraction_authority,
+            NonZeroU32::new(1).ok_or("record ceiling")?,
+            NonZeroU64::new(64 * 1024 * 1024).ok_or("byte ceiling")?,
+            deadline,
+            cancellation.clone(),
+            root,
+        )?;
+        assert_eq!(stream.total_records(), 2);
+        let company = stream.company_identity().clone();
+        let company_json = serde_json::to_vec(&company)?;
+        let company_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(company_json).into());
+        let location = paths.catalog()?.clone();
+        let catalog_config = CatalogConfig::try_new(
+            location.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?;
+        let authority = CatalogAuthority::open(catalog_config.clone())?;
+        authority.register_source(&metadata, at)?;
+        // The complete graph retains distinct publisher source/revision authority. Register
+        // its actual code-owned descriptors; SEC metadata cannot stand in for these parents.
+        for publisher in [
+            FASB_XBRL_TAXONOMY_AUTHORITY,
+            XBRL_INTERNATIONAL_STANDARDS_AUTHORITY,
+            W3C_XML_SCHEMA_STANDARDS_AUTHORITY,
+        ] {
+            let dependency = publisher.dependency_source_metadata()?;
+            authority.register_source(&dependency, at)?;
+        }
+        let store_config =
+            ObjectStoreConfig::try_new(64 * 1024 * 1024, 64, Duration::from_secs(60))?;
+        let service = AnalyticalDataService::initialize(
+            authority,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )?;
+        use market_squawk_sources::{
+            ExtractionContentAccumulator, LogicalObjectRole, LogicalPartitionFamily,
+            LogicalPartitionSetAdmission, PendingLogicalPartitionSet, ProviderLogicalTerminalInput,
+            SealedLogicalObjectInput, SealedProviderLogicalPublicationBinding,
+        };
+        use std::io::{Read, Write};
+        #[derive(Debug)]
+        struct FixtureControl(CancellationToken);
+        impl market_squawk_platform::ResearchObjectControl for FixtureControl {
+            fn checkpoint(
+                &self,
+                _: market_squawk_platform::ResearchObjectControlPoint,
+            ) -> Result<(), market_squawk_platform::ResearchObjectControlError> {
+                if self.0.is_cancelled() {
+                    return Err(market_squawk_platform::ResearchObjectControlError::Cancelled);
+                }
+                Ok(())
+            }
+        }
+        impl market_squawk_data::IngestPrecommitAuthority for FixtureControl {
+            fn validate_precommit(&self) -> Result<(), market_squawk_data::IngestError> {
+                if self.0.is_cancelled() {
+                    return Err(market_squawk_data::IngestError::Cancelled);
+                }
+                Ok(())
+            }
+        }
+        fn object_admission(
+            bytes: u64,
+        ) -> Result<
+            market_squawk_platform::ResearchObjectAdmission,
+            market_squawk_platform::SealedResearchJournalStoreError,
+        > {
+            market_squawk_platform::ResearchObjectAdmission::try_new(bytes.max(1), 4095)
+        }
+        fn digest(bytes: &[u8]) -> EvidenceDigest {
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
+        }
+        let control = FixtureControl(cancellation.clone());
+        let mut raw_objects = Vec::new();
+        for record in material.records() {
+            let mut pending =
+                raw_store.begin_logical_object(object_admission(record.payload().len() as u64)?)?;
+            pending.write_all(record.payload())?;
+            raw_objects.push(raw_store.finish_logical_object(pending, &control)?);
+        }
+        let (expectation, seal_request) = material.into_whole_seal_parts();
+        let token = expectation
+            .try_rejoin(seal_request.seal(&raw_store)?)?
+            .try_into_whole()?;
+        let (mut objects, receipt) =
+            SealedLogicalObjectInput::try_from_whole_capture(token, raw_objects, &control)?;
+        let mut staging = service.begin_provider_logical_stream(
+            dataset.clone(),
+            source_id.clone(),
+            &cancellation,
+        )?;
+        let partition_admission = LogicalPartitionSetAdmission::try_new(
+            object_admission(32 * 1024 * 1024)?,
+            4096,
+            256,
+            128 * 1024,
+        )?;
+        let mut row_partitions = PendingLogicalPartitionSet::begin(
+            LogicalPartitionFamily::CanonicalRowMap,
+            digest(b"market-squawk/sec-filing/logical-row-map/v1"),
+            partition_admission,
+            0,
+        )?;
+        let mut native_partitions = None;
+        let mut content = None;
+        let mut expectations = Vec::new();
+        let mut native_descriptor = None;
+        // The fixture forces two chunks while retaining complete shared filing evidence once.
+        while let Some(chunk) = stream.next_chunk(&cancellation)? {
+            assert_eq!(chunk.batch().records().len(), 1);
+            assert_eq!(chunk.row_capture_page_ordinals(), &[1]);
+            let start = stream.emitted_records() - chunk.batch().records().len();
+            let (batch, _, native, page_ordinals) = chunk.into_parts();
+            let batch = batch.try_bind_provider_capture(receipt.capture())?;
+            if content.is_none() {
+                content = Some(ExtractionContentAccumulator::try_new(
+                    batch.request(),
+                    stream.total_records(),
+                )?);
+            }
+            native.validate(&batch)?;
+            if native_partitions.is_none() {
+                native_partitions = Some(PendingLogicalPartitionSet::begin(
+                    LogicalPartitionFamily::ProviderNative,
+                    native.schema().fingerprint(),
+                    partition_admission,
+                    0,
+                )?);
+                let sidecar = native.batch_sidecar().ok_or("complete source sidecar")?;
+                let chunks = sidecar.chunks().ok_or("chunked source evidence")?;
+                let mut reader = chunks.reader()?;
+                let mut pending =
+                    raw_store.begin_logical_object(object_admission(reader.metadata()?.len())?)?;
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let read = reader.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    pending.write_all(&buffer[..read])?;
+                }
+                objects.push(SealedLogicalObjectInput::try_from_verified(
+                    LogicalObjectRole::ProviderComponent,
+                    objects.len() as u32,
+                    sidecar.semantic_payload_digest(),
+                    raw_store.finish_logical_object(pending, &control)?,
+                    &control,
+                )?);
+                native_descriptor = Some(sidecar.semantic_payload().to_vec());
+            }
+            let native_set = native_partitions.as_mut().ok_or("native partitions")?;
+            for (local, ((record, native_row), page)) in batch
+                .records()
+                .iter()
+                .zip(native.rows())
+                .zip(&page_ordinals)
+                .enumerate()
+            {
+                let ordinal = u64::try_from(start + local)?;
+                content.as_mut().ok_or("whole content")?.push(record)?;
+                native_set.stage_frame(
+                    &raw_store,
+                    &control,
+                    ordinal,
+                    native_row.semantic_payload(),
+                    native_row.semantic_payload_digest(),
+                )?;
+                let frame = receipt.row_frame(u32::try_from(ordinal)?, *page)?;
+                let mapping = serde_json::to_vec(&serde_json::json!({
+                    "canonical_row_ordinal": frame.canonical_row_ordinal(), "capture_page_ordinal": frame.capture_page_ordinal(),
+                    "segment_ordinal": frame.segment_ordinal(), "physical_frame_ordinal": frame.physical_frame_ordinal(),
+                    "page_body_digest": frame.page_body_digest(), "received_at": frame.received_at(), "source_sequence": frame.source_sequence(),
+                    "canonical_record_digest": record.evidence().content_digest(), "native_semantic_digest": native_row.semantic_payload_digest(),
+                }))?;
+                row_partitions.stage_frame(
+                    &raw_store,
+                    &control,
+                    ordinal,
+                    &mapping,
+                    digest(&mapping),
+                )?;
+            }
+            native_set.seal_current_partition(&raw_store, &control)?;
+            row_partitions.seal_current_partition(&raw_store, &control)?;
+            let revisions = market_squawk_sources::ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())?;
+            expectations.push(
+                service
+                    .stage_provider_logical_stream_chunk(
+                        &mut staging,
+                        batch,
+                        native,
+                        revisions,
+                        &receipt,
+                        &page_ordinals,
+                        &cancellation,
+                    )
+                    .await?,
+            );
+        }
+        assert_eq!(stream.emitted_records(), 2);
+        assert_eq!(expectations.len(), 2);
+        let whole_content = content.ok_or("whole content")?.finish()?;
+        let companion = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "family": "sec_filing_capture", "capture": receipt.capture(),
+            "sealed_receipt_digest": receipt.receipt_digest(), "original_segment_claim": receipt.segment().claim(),
+            "company_identity": &company, "native_descriptor": native_descriptor,
+            "extraction_content_identity": whole_content.digest(), "record_count": whole_content.record_count(),
+        }))?;
+        let mut pending =
+            raw_store.begin_logical_object(object_admission(companion.len() as u64)?)?;
+        pending.write_all(&companion)?;
+        objects.push(SealedLogicalObjectInput::try_from_verified(
+            LogicalObjectRole::ProviderComponent,
+            objects.len() as u32,
+            digest(&companion),
+            raw_store.finish_logical_object(pending, &control)?,
+            &control,
+        )?);
+        let mut partitions = native_partitions
+            .ok_or("native partitions")?
+            .finish(&raw_store, &control)?
+            .into_partitions()
+            .into_vec();
+        partitions.extend(
+            row_partitions
+                .finish(&raw_store, &control)?
+                .into_partitions()
+                .into_vec(),
+        );
+        let total_logical_object_bytes = objects
+            .iter()
+            .map(|object| object.object().size_bytes())
+            .sum();
+        let binding = SealedProviderLogicalPublicationBinding::try_new(
+            ProviderLogicalTerminalInput {
+                source_id: source_id.clone(),
+                source_revision_digest: metadata
+                    .revision_evidence()
+                    .payload_evidence()
+                    .content_digest(),
+                execution_attempt_digest: Some(receipt.receipt_digest()),
+                provider_terminal_evidence_digest: whole_content.digest(),
+                total_decoded_events: 0,
+                total_canonical_rows: 2,
+                total_logical_object_bytes,
+            },
+            &[
+                LogicalPartitionFamily::ProviderNative,
+                LogicalPartitionFamily::CanonicalRowMap,
+            ],
+            objects,
+            partitions,
+            expectations,
+        )?;
+        let payload_digest = binding.binding_digest();
+        let identity = IngestIdentity::try_new(
+            source_id.clone(),
+            payload_digest,
+            SourceOperation::Persist,
+            "sec:normalized-filing:restart:v1",
+        )?;
+        let reservation = service
+            .reserve_source_ingest(
+                &metadata,
+                at,
+                RightsDecisionInput {
+                    source_id,
+                    payload_digest,
+                    retrieved_at: at,
+                    basis: RightsBasis::reviewed_terms(
+                        "https://www.sec.gov/os/accessing-edgar-data",
+                        filing.evidence(),
+                    )?,
+                    authorization_evidence: filing.evidence(),
+                    authorization_expires_at: None,
+                    permitted_operations: vec![SourceOperation::Persist],
+                },
+                &identity,
+                &cancellation,
+            )
+            .await?;
+        let (committed, binding_digest) = service
+            .finish_provider_logical_stream(
+                staging,
+                reservation,
+                binding,
+                company.clone(),
+                Arc::new(control),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("normalized SEC filing publication: {error}"))
+            })?;
+        assert_eq!(binding_digest, payload_digest);
+        drop(stream);
+        // The operator explicitly resolves this fixture instrument against the captured filing.
+        // A matching ticker alone is deliberately not relationship authority.
+        use market_squawk_domain::{
+            AssetClass, CommonEquitySuitability, CompanySecurityIdentityLink,
+            CompanySecurityIdentityLinkInput, CompanySecurityKind, CompanySecurityLinkTransition,
+            CompanySecurityRelationshipKind, CompanySecurityResolutionBasis, Currency,
+            IdentifierEntitlement, IdentifierRightsPolicyReference, MarketDataInstrumentDefinition,
+            MarketDataInstrumentDefinitionInput, VenueId, VenueMapping, VenueSymbol,
+        };
+        let reviewed = ExactPayloadEvidence::from_content_digest(filing.evidence());
+        let definition =
+            MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+                instrument_id: instrument,
+                reference_evidence: metadata.revision_evidence().clone(),
+                effective_interval: validity,
+                asset_class: AssetClass::Equity,
+                display_name: None,
+                quote_currency: Currency::try_from("USD")?,
+                quote_currency_evidence: reviewed.clone(),
+                venue_mappings: vec![VenueMapping::new(
+                    VenueId::try_from("XNAS")?,
+                    VenueSymbol::try_from("AAPL")?,
+                )],
+                provider_identities: vec![ProviderIdentityRecord::new(
+                    ProviderIdentityRecordInput {
+                        instrument_id: instrument,
+                        source_id: metadata.source_id().clone(),
+                        provider_instrument_id: ProviderInstrumentId::try_from("0000320193")?,
+                        evidence: ProviderIdentityEvidence::from_content_digest(filing.evidence()),
+                        source_timestamp: None,
+                        observed_at: at,
+                        metadata_revision: metadata.revision().clone(),
+                        validity,
+                        supersedes: None,
+                    },
+                )],
+                identifiers: Vec::new(),
+            })?;
+        service
+            .market_data_instrument_synchronization()
+            .synchronize(
+                market_squawk_data::MarketDataInstrumentSynchronization::try_new(
+                    vec![definition],
+                    1,
+                )?,
+                Instant::now() + Duration::from_secs(30),
+                &cancellation,
+            )?;
+        let market_definition = service
+            .market_data_instruments()
+            .latest(
+                instrument,
+                Instant::now() + Duration::from_secs(30),
+                &cancellation,
+            )?
+            .ok_or("fixture market definition")?;
+        let authorized_at = crate::client::system_timestamp()?;
+        service.company_security_link_publication().publish(
+            CompanySecurityIdentityLink::try_new(CompanySecurityIdentityLinkInput {
+                schema_version: SchemaVersion::CURRENT,
+                company_source_id: company.source_id().clone(),
+                provider_company_id: company.provider_company_id().clone(),
+                company_surface: company.surface(),
+                company_observation_digest: company_digest,
+                instrument_id: instrument,
+                market_instrument_revision_digest: market_definition.revision_digest(),
+                security_kind: CompanySecurityKind::CommonEquity,
+                relationship_kind: CompanySecurityRelationshipKind::Issuer,
+                common_equity_suitability: CommonEquitySuitability::SuitableIssuerCommonEquity,
+                resolution_basis: CompanySecurityResolutionBasis::OperatorAuthorizedResolution {
+                    receipt_id: SourceIdentifier::try_from("fixture-common-equity-resolution")?,
+                    operator_id: SourceIdentifier::try_from("fixture-operator")?,
+                    evidence: reviewed,
+                    authorized_at,
+                },
+                relationship_evidence_rights: IdentifierRightsPolicyReference::new(
+                    SourceIdentifier::try_from("fixture-operator-local-use")?,
+                    IdentifierEntitlement::UserOwned,
+                    SourceIdentifier::try_from("fixture-operator-resolution")?,
+                ),
+                effective_interval: validity,
+                available_at: authorized_at,
+                ingested_at: authorized_at,
+                transition: CompanySecurityLinkTransition::Initial,
+            })?,
+            Instant::now() + Duration::from_secs(30),
+            &cancellation,
+        )?;
+
+        let knowledge_at = crate::client::system_timestamp()?.checked_add_nanos(1_000_000_000)?;
+        let request = SecResearchReadRequest::try_new(
+            committed.manifest().clone(),
+            SecResearchFamily::FilingXbrl,
+            binding_digest,
+            company_digest,
+            knowledge_at,
+            ResearchTemporalCoordinate::calendar_date(market_squawk_domain::CalendarDate::new(
+                2025, 7, 24,
+            )?),
+            PointInTimeRevisionMode::LatestKnown,
+            PointInTimeLimits::try_new(8, 8, 8, 8, 8 * 1024 * 1024)?,
+            64 * 1024 * 1024,
+        )?;
+        let selected = service
+            .sec_research_reader()
+            .select(
+                request,
+                &raw_store,
+                Instant::now() + Duration::from_secs(30),
+                cancellation.clone(),
+            )
+            .await?;
+        assert_eq!(selected.disposition(), SecResearchDisposition::Selected);
+        assert_eq!(selected.decoded_rows().len(), 2);
+        let filing_source = selected
+            .filing_xbrl()
+            .ok_or("verified full filing source")?;
+        assert_eq!(filing_source.numeric_fact_count(), 2);
+        assert_eq!(filing_source.nonnumeric_occurrences().len(), 3);
+        assert_eq!(filing_source.contexts().len(), 1);
+        assert_eq!(filing_source.footnotes().len(), 1);
+        let footnote = filing_source
+            .footnotes()
+            .get(0)?
+            .ok_or("retained footnote")?;
+        assert_eq!(footnote.occurrence_id().as_str(), "shares-footnote");
+        assert_eq!(footnote.language().as_str(), "en-US");
+        assert_eq!(
+            footnote.role().as_str(),
+            "http://www.xbrl.org/2003/role/footnote"
+        );
+        assert_eq!(
+            footnote.title().map(|title| title.as_str()),
+            Some("Reported count")
+        );
+        assert_eq!(
+            footnote.lexical_value().as_str(),
+            "As reported in this filing; no share forecast."
+        );
+        assert_eq!(
+            footnote.occurrence_relationships().continuation_chain()[0].as_str(),
+            "shares-note-cont"
+        );
+        assert_eq!(footnote.occurrence_relationships().relationships().len(), 1);
+        let context = filing_source.contexts().get(0)?.ok_or("retained context")?;
+        assert_eq!(context.entity().value().as_str(), "0000320193");
+        assert_eq!(context.dimensions().len(), 1);
+        assert!(!context.context_graph().events().is_empty());
+        let mut found_nil = false;
+        for occurrence in filing_source.nonnumeric_occurrences().iter() {
+            let occurrence = occurrence?;
+            found_nil |= occurrence.is_nil();
+            assert_eq!(
+                filing_source.context(occurrence.context_id())?.as_ref(),
+                Some(&context)
+            );
+        }
+        assert!(found_nil);
+        let identity_selected = service
+            .sec_research_reader()
+            .select_by_identity(
+                market_squawk_data::SecResearchIdentityReadRequest::try_new(
+                    instrument,
+                    SecResearchFamily::FilingXbrl,
+                    knowledge_at,
+                    selected.request().effective_cutoff().clone(),
+                    PointInTimeRevisionMode::LatestKnown,
+                    selected.request().point_in_time_limits(),
+                    selected.request().maximum_object_bytes(),
+                )?,
+                &raw_store,
+                Instant::now() + Duration::from_secs(30),
+                cancellation.clone(),
+            )
+            .await?;
+        let common_shares = market_squawk_valuation::CommonShareFilingEvidence::try_from_filing(
+            &identity_selected,
+        )?;
+        assert_eq!(common_shares.instrument_id(), instrument);
+        assert_eq!(
+            common_shares.shares(),
+            rust_decimal::Decimal::from(15_000_000_000_u64)
+        );
+        assert_eq!(
+            common_shares.reported_on(),
+            market_squawk_domain::CalendarDate::new(2025, 7, 24)?
+        );
+        assert_eq!(common_shares.knowledge_at(), knowledge_at);
+        let expected_request = selected.request().clone();
+        let expected_receipt = selected.receipt();
+        let identity_request = identity_selected.request().clone();
+        drop(identity_selected);
+        drop(selected);
+        drop(committed);
+        drop(service);
+        drop(raw_store);
+        let reopened = AnalyticalDataService::open(
+            CatalogAuthority::open(catalog_config)?,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )?;
+        let reopened_raw = paths.sealed_research_journal_store()?;
+        let replay = reopened
+            .sec_research_reader()
+            .select(
+                expected_request,
+                &reopened_raw,
+                Instant::now() + Duration::from_secs(30),
+                cancellation.clone(),
+            )
+            .await?;
+        assert_eq!(replay.receipt(), expected_receipt);
+        assert_eq!(
+            replay
+                .filing_xbrl()
+                .ok_or("replayed filing")?
+                .numeric_fact_count(),
+            2
+        );
+        assert_eq!(
+            replay
+                .filing_xbrl()
+                .ok_or("replayed filing")?
+                .nonnumeric_occurrences()
+                .len(),
+            3
+        );
+        let identity_replay = reopened
+            .sec_research_reader()
+            .select_by_identity(
+                identity_request,
+                &reopened_raw,
+                Instant::now() + Duration::from_secs(30),
+                cancellation,
+            )
+            .await?;
+        assert_eq!(
+            market_squawk_valuation::CommonShareFilingEvidence::try_from_filing(&identity_replay)?,
+            common_shares
+        );
+        eprintln!("physical filing and financial identity/restart assertions passed");
+        // Optional original-filing regression; this exercises the production indexed parser,
+        // retaining one decoded occurrence at a time rather than building a diagnostic sidecar.
+        if let Ok(path) = std::env::var("SEC_SOURCE_BUDGET_FILING") {
+            let bytes = std::fs::read(path)?;
+            let parser_cancellation = CancellationToken::new();
+            let parsed = crate::XbrlDocumentParser::parse_indexed_in_with_cancellation(
+                &bytes,
+                crate::SecParserLimits::production_defaults(),
+                crate::XbrlDocumentContext::new(
+                    SourceIdentifier::try_from("0000950170-25-100235")?,
+                    market_squawk_domain::XbrlTaxonomySet::declared(
+                        EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
+                        SourceIdentifier::try_from("original-msft-filing-regression")?,
+                    ),
+                    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                        DigestAlgorithm::Sha256,
+                        Sha256::digest(&bytes).into(),
+                    )),
+                    Timestamp::from_unix_nanos(1),
+                ),
+                &parser_cancellation,
+                root,
+            )?;
+            assert!(parsed.numeric_count > 0);
+            assert!(parsed.nonnumeric_count > 0);
+            assert!(parsed.context_count()? > 0);
+            let mut lowercase_zero = 0usize;
+            let mut capitalized_zero = 0usize;
+            for ordinal in 0..parsed.numeric_count {
+                let fact = parsed
+                    .numeric_at(ordinal)?
+                    .ok_or("missing indexed MSFT fact")?;
+                match fact.evidence().lexical_value().as_str().trim() {
+                    "no" => {
+                        assert_eq!(fact.value(), Decimal::ZERO);
+                        lowercase_zero += 1;
+                    }
+                    "No" => {
+                        assert_eq!(fact.value(), Decimal::ZERO);
+                        capitalized_zero += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(lowercase_zero > 0);
+            assert!(capitalized_zero > 0);
+            parser_cancellation.cancel();
+            assert!(matches!(
+                parsed.numeric_at(0),
+                Err(crate::SecXbrlError::Cancelled)
+            ));
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2254,18 +3085,40 @@ mod tests {
             temporary.path(),
             ambient_authority(),
         )?));
-        let observed_at = Timestamp::from_unix_nanos(100);
+        let observed_at = crate::client::system_timestamp()?;
         let sec_source = SEC_EDGAR_AUTHORITY.canonical_source_id()?;
         let sec_revision = MetadataRevision::new(SourceIdentifier::try_from("sec-test-v1")?);
-        let filing_locator = "https://www.sec.gov/Archives/edgar/data/1/0001/company-20251231.htm";
+        let filing_locator =
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250628.htm";
         let filing = captured_artifact(
             &store,
             filing_locator,
             br#"<html xmlns="http://www.w3.org/1999/xhtml"
                 xmlns:link="http://www.xbrl.org/2003/linkbase"
-                xmlns:xlink="http://www.w3.org/1999/xlink"><head>
+                xmlns:xlink="http://www.w3.org/1999/xlink"
+                xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+                xmlns:xbrli="http://www.xbrl.org/2003/instance"
+                xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns:dei="http://xbrl.sec.gov/dei/2025"
+                xmlns:us-gaap="http://fasb.org/us-gaap/2025"
+                xmlns:iso4217="http://www.xbrl.org/2003/iso4217"><head>
                 <link:schemaRef xlink:type="simple" xlink:href="company-20251231.xsd"/>
-                </head></html>"#,
+                </head><body>
+                <xbrli:context id="shares"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000320193</xbrli:identifier></xbrli:entity><xbrli:period><xbrli:instant>2025-07-24</xbrli:instant></xbrli:period></xbrli:context>
+                <xbrli:context id="annual"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000320193</xbrli:identifier></xbrli:entity><xbrli:period><xbrli:startDate>2024-06-29</xbrli:startDate><xbrli:endDate>2025-06-28</xbrli:endDate></xbrli:period></xbrli:context>
+                <xbrli:context id="listing"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000320193</xbrli:identifier><xbrli:segment><xbrldi:explicitMember dimension="us-gaap:StatementClassOfStockAxis">us-gaap:CommonStockMember</xbrldi:explicitMember></xbrli:segment></xbrli:entity><xbrli:period><xbrli:startDate>2024-06-29</xbrli:startDate><xbrli:endDate>2025-06-28</xbrli:endDate></xbrli:period></xbrli:context>
+                <xbrli:unit id="shares-unit"><xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unit>
+                <xbrli:unit id="eps-unit"><xbrli:divide><xbrli:unitNumerator><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unitNumerator><xbrli:unitDenominator><xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unitDenominator></xbrli:divide></xbrli:unit>
+                <ix:nonFraction id="shares-fact" name="dei:EntityCommonStockSharesOutstanding" contextRef="shares" unitRef="shares-unit" decimals="0">15000000000</ix:nonFraction>
+                <ix:nonFraction id="eps-fact" name="us-gaap:EarningsPerShareDiluted" contextRef="annual" unitRef="eps-unit" decimals="2">6.50</ix:nonFraction>
+                <ix:nonNumeric id="listing-symbol" name="dei:TradingSymbol" contextRef="listing">AAPL</ix:nonNumeric>
+                <ix:nonNumeric id="listing-title" name="dei:Security12bTitle" contextRef="listing">Common Stock</ix:nonNumeric>
+                <ix:nonNumeric id="nil-file-number" name="dei:EntityFileNumber" contextRef="listing" xsi:nil="true"/>
+                <ix:footnote id="shares-footnote" xml:lang="en-US" title="Reported count" continuedAt="shares-note-cont">As reported in this filing;</ix:footnote>
+                <ix:continuation id="shares-note-cont"> no share forecast.</ix:continuation>
+                <ix:relationship arcrole="http://www.xbrl.org/2003/arcrole/fact-footnote" fromRefs="shares-fact" toRefs="shares-footnote"/>
+                </body></html>"#,
             sec_source.clone(),
             sec_revision.clone(),
             observed_at,
@@ -2273,7 +3126,7 @@ mod tests {
         let artifacts = vec![
             captured_artifact(
                 &store,
-                "https://www.sec.gov/Archives/edgar/data/1/0001/company-20251231.xsd",
+                "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/company-20251231.xsd",
                 br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                     xmlns:link="http://www.xbrl.org/2003/linkbase"
                     xmlns:xlink="http://www.w3.org/1999/xlink"
@@ -2292,7 +3145,7 @@ mod tests {
             )?,
             captured_artifact(
                 &store,
-                "https://www.sec.gov/Archives/edgar/data/1/0001/company-20251231_pre.xml",
+                "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/company-20251231_pre.xml",
                 br#"<link:linkbase xmlns:link="http://www.xbrl.org/2003/linkbase"/>"#,
                 sec_source.clone(),
                 sec_revision.clone(),
@@ -2353,7 +3206,8 @@ mod tests {
         ));
 
         let mut captured_by_locator = artifacts
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|artifact| {
                 Ok((
                     artifact
@@ -2392,14 +3246,14 @@ mod tests {
             closure.accept_captured(request, artifact, &acquisition_cancellation)?;
         }
         assert!(captured_by_locator.is_empty());
-        let artifacts = closure.finish(&acquisition_cancellation)?;
+        let closed_artifacts = closure.finish(&acquisition_cancellation)?;
 
         let admitted = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
             Arc::clone(&store),
             &sec_source,
             &sec_revision,
             &filing,
-            artifacts,
+            closed_artifacts,
             SecParserLimits::production_defaults(),
             &CancellationToken::new(),
         )?;
@@ -2430,7 +3284,19 @@ mod tests {
             parser_context(),
             &CancellationToken::new(),
         )?;
-        assert!(parsed.numeric_facts().is_empty());
+        assert_eq!(parsed.numeric_facts().len(), 2);
+        assert_eq!(parsed.nonnumeric_occurrences().len(), 3);
+        assert_eq!(parsed.footnotes().len(), 1);
+        super::super::exercise_nested_continuations(parser_context())?;
+        exercise_normalized_filing_physical_restart(
+            temporary.path(),
+            Arc::clone(&store),
+            sec_source.clone(),
+            sec_revision.clone(),
+            filing.clone(),
+            artifacts,
+        )
+        .await?;
 
         let roles = admitted
             .validated()
@@ -2687,5 +3553,23 @@ mod tests {
             Some(written)
         );
         Ok(())
+    }
+}
+
+mod occurrence_context_serde {
+    use super::XbrlOccurrenceContext;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Arc<XbrlOccurrenceContext>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.as_ref().serialize(serializer)
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<XbrlOccurrenceContext>, D::Error> {
+        XbrlOccurrenceContext::deserialize(deserializer).map(Arc::new)
     }
 }

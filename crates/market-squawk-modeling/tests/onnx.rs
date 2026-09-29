@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use market_squawk_data::Sha256Digest;
 #[cfg(feature = "release-evidence")]
-use market_squawk_modeling::ReleaseEvidenceInferenceFixture;
+use market_squawk_modeling::{
+    InferenceBackend, InferenceError, ModelFeatureValue, ModelInput,
+    ReleaseEvidenceInferenceFixture, ResearchForecastInput,
+};
 use market_squawk_modeling::{
     ModelOutputSemantics, OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError,
 };
@@ -60,6 +63,41 @@ fn onnx_policy_rejects_hostile_graphs_before_runtime_load() -> TestResult {
     );
 
     let proto = ModelProto::decode(model.as_slice())?;
+
+    // A research column mapping is authority, including a one-column recursive model.
+    let mut forecast = proto.clone();
+    forecast.metadata_props.push(StringStringEntryProto {
+        key: "market_squawk.forecast.horizons".to_owned(),
+        value: "1".to_owned(),
+    });
+    let forecast = forecast.encode_to_vec();
+    let forecast_policy = OnnxModelPolicy::try_new_forecast(
+        digest(&forecast),
+        13,
+        &[1, 2],
+        &[1, 1],
+        &[1],
+        Duration::from_millis(250),
+        OnnxFallbackPolicy::NoAction,
+    )?;
+    forecast_policy.preflight(&forecast)?;
+    assert_eq!(
+        policy_for(&forecast)?.preflight(&forecast),
+        Err(OnnxPolicyError::OutputSemanticsMismatch)
+    );
+    let mismapped = OnnxModelPolicy::try_new_forecast(
+        digest(&forecast),
+        13,
+        &[1, 2],
+        &[1, 1],
+        &[2],
+        Duration::from_millis(250),
+        OnnxFallbackPolicy::NoAction,
+    )?;
+    assert_eq!(
+        mismapped.preflight(&forecast),
+        Err(OnnxPolicyError::OutputSemanticsMismatch)
+    );
 
     let mut external_data = proto.clone();
     external_data
@@ -147,6 +185,74 @@ fn admitted_worker_runs_the_exact_fixture_with_bounded_evidence() -> TestResult 
     assert_ne!(identity.onnx_runtime_semantics_digest(), [0; 32]);
     assert_ne!(identity.onnx_warm_up_digest(), [0; 32]);
     assert!(identity.onnx_retained_bytes() > 0);
+    drop(fixture);
+
+    // Extend the same real worker fixture with two independently calculable columns.
+    // X = [raw lag, raw feature 0, raw feature 1]; Y = XW + B.
+    let mut proto = ModelProto::decode(golden_model()?.as_slice())?;
+    let graph = proto.graph.as_mut().ok_or("golden graph missing")?;
+    graph.initializer[0].dims = vec![3, 2];
+    graph.initializer[0].float_data = vec![1.0, -2.0, 2.0, 1.0, -1.0, 0.5];
+    graph.initializer[0].raw_data.clear();
+    graph.initializer[1].dims = vec![2];
+    graph.initializer[1].float_data = vec![0.5, -0.5];
+    graph.initializer[1].raw_data.clear();
+    for (value, width) in [(&mut graph.input[0], 3), (&mut graph.output[0], 2)] {
+        value
+            .r#type
+            .as_mut()
+            .and_then(|value| value.value.as_mut())
+            .and_then(|value| match value {
+                tract_onnx::pb::type_proto::Value::TensorType(tensor) => tensor.shape.as_mut(),
+            })
+            .and_then(|shape| shape.dim.get_mut(1))
+            .ok_or("golden tensor width missing")?
+            .value = Some(tensor_shape_proto::dimension::Value::DimValue(width));
+    }
+    for (key, value) in [
+        ("market_squawk.forecast.horizons", "1,3"),
+        ("market_squawk.forecast.lags", "1"),
+        ("market_squawk.forecast.strategy", "direct"),
+    ] {
+        proto.metadata_props.push(StringStringEntryProto {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        });
+    }
+    let model = proto.encode_to_vec();
+    let backend =
+        ReleaseEvidenceInferenceFixture::try_research_onnx_backend(worker, worker_digest, &model)?;
+    let mut values = backend
+        .metadata()
+        .features()
+        .iter()
+        .map(ModelFeatureValue::from_binding)
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 2);
+    values[0].try_set_value(3.0)?;
+    values[1].try_set_value(14.0)?;
+    let exogenous = ModelInput::try_new(backend.metadata(), &values)?;
+    assert_eq!(
+        backend.infer(&exogenous),
+        Err(InferenceError::OnnxRuntimeFailure)
+    );
+    let wrong_lag = ResearchForecastInput::try_new(exogenous, &[2], &[4.0])?;
+    assert_eq!(
+        backend.infer_research(&wrong_lag),
+        Err(InferenceError::FeatureShapeMismatch)
+    );
+    let input = ResearchForecastInput::try_new(exogenous, &[1], &[4.0])?;
+    let first = backend.infer_research(&input)?;
+    assert_eq!(first.metadata_hash(), backend.metadata().metadata_hash());
+    assert_eq!(first.artifact_hash(), digest(&model));
+    assert_eq!(first.horizon_offsets(), &[1, 3]);
+    assert_eq!(first.values(), &[-3.5, 1.5]);
+    assert_eq!(backend.infer_research(&input)?, first);
+    let next_input = ResearchForecastInput::try_new(exogenous, &[1], &[7.0])?;
+    let next = backend.infer_research(&next_input)?;
+    assert_eq!(next.horizon_offsets(), &[1, 3]);
+    assert_eq!(next.values(), &[-0.5, -4.5]);
+    backend.retire()?;
     Ok(())
 }
 

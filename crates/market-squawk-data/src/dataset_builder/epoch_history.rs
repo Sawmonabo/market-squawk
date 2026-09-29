@@ -2,7 +2,7 @@
 
 use super::{EpochSource, FeatureDatasetInputEpoch};
 use crate::{
-    CompleteMarketBarHistoryOutput, ComponentAdjustmentEvidence, CorporateActionPlan,
+    CompleteMarketBarHistoryCursor, ComponentAdjustmentEvidence, CorporateActionPlan,
     DatasetBuildError, DatasetBuildPurpose, Sha256Digest,
 };
 use market_squawk_domain::{
@@ -10,13 +10,14 @@ use market_squawk_domain::{
     Money, Timestamp,
 };
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{io, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-const MAX_SOURCE_ROWS: usize = 64_000;
-const MAX_CHART_ROWS: usize = 4_096;
+#[path = "epoch_history/rows.rs"]
+mod rows;
+use rows::HistoryRows;
 
 /// Sealed producer result. Serialized bytes are retained evidence, not a reread capability.
 /// There is deliberately no Deserialize or public constructor.
@@ -41,7 +42,7 @@ pub struct ForecastBasisHistory {
     origin_at: Timestamp,
     origin_price: Money,
     first_session_ordinal: usize,
-    rows: Vec<ForecastBasisHistoryRow>,
+    rows: HistoryRows,
 }
 impl ForecastBasisHistory {
     pub const fn instrument_id(&self) -> market_squawk_domain::InstrumentId {
@@ -68,8 +69,16 @@ impl ForecastBasisHistory {
     pub fn history_identity(&self) -> Sha256Digest {
         Sha256Digest::new(self.history_identity)
     }
-    pub fn rows(&self) -> &[ForecastBasisHistoryRow] {
-        &self.rows
+    pub fn rows(
+        &self,
+    ) -> impl Iterator<Item = Result<ForecastBasisHistoryRow, DatasetBuildError>> + '_ {
+        self.rows.iter()
+    }
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn last_row(&self) -> Option<&ForecastBasisHistoryRow> {
+        self.rows.last()
     }
     pub const fn origin_at(&self) -> Timestamp {
         self.origin_at
@@ -84,7 +93,7 @@ impl ForecastBasisHistory {
 
 /// Native session coordinates remain distinct from provider observation/completion timestamps.
 /// An absent original bar stays a real gap; consumers must not join across it for detection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForecastBasisHistoryRow {
     pub native_date: CalendarDate,
@@ -101,7 +110,7 @@ pub struct ForecastBasisHistoryRow {
     pub original_bar_identity: Option<[u8; 32]>,
     pub prices: Option<ForecastBasisOhlc>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForecastBasisOhlc {
     pub open: Money,
@@ -113,20 +122,16 @@ pub struct ForecastBasisOhlc {
 impl FeatureDatasetInputEpoch {
     /// Replays only the original generation and source-admitted split plan at the saved cutoff.
     /// Callers must freshly authorize all original history/action/calendar parents before use.
-    /// `max_sessions` chooses a bounded suffix ending at the genuine forecast origin; it never
-    /// deletes interior gaps or invents a market calendar. No provider call or latest selection.
+    /// Retains every authenticated session through the genuine forecast origin, including gaps.
+    /// Display range and resolution are applied only after immutable projection publication.
     pub fn replay_price_history(
         &self,
-        history: &CompleteMarketBarHistoryOutput,
+        history: &CompleteMarketBarHistoryCursor,
         plan: &CorporateActionPlan,
-        max_sessions: usize,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<ForecastBasisHistory, DatasetBuildError> {
         check(deadline, cancellation)?;
-        if max_sessions == 0 || max_sessions > MAX_CHART_ROWS {
-            return Err(DatasetBuildError::LimitExceeded);
-        }
         let epoch = match &self.source {
             EpochSource::CompletedBarClose(value)
             | EpochSource::NamedSessionCloseForNominalDailyBar(value) => value,
@@ -155,8 +160,6 @@ impl FeatureDatasetInputEpoch {
             || publication.published_at() > self.source_selection_as_of()
             || native.published_at() > self.source_selection_as_of()
             || native.received_at() > native.published_at()
-            || history.bars().len() > MAX_SOURCE_ROWS
-            || native.sessions().len() > MAX_SOURCE_ROWS
             || plan.steps().len() > 1_024
             || plan.policy() != *policy
             || plan.content_hash() != *plan_content
@@ -179,7 +182,7 @@ impl FeatureDatasetInputEpoch {
                 return Err(invalid());
             }
         } else {
-            let actual = crate::CompletedOrdinaryHistoryEvidence::try_from_history(history)
+            let actual = crate::CompletedOrdinaryHistoryEvidence::try_from_cursor(history)
                 .map_err(|_| invalid())?;
             if !coverage.admits_completed_history(&actual) {
                 return Err(invalid());
@@ -214,7 +217,10 @@ impl FeatureDatasetInputEpoch {
         let origin = epoch.target_origin();
         let mut eligible = 0_usize;
         let mut previous = None;
-        for session in native.sessions() {
+        let mut first = None;
+        let mut last = None;
+        for session in native.sessions().iter() {
+            let session = session.map_err(|_| invalid())?;
             check(deadline, cancellation)?;
             let observation = session
                 .provider_period()
@@ -227,12 +233,15 @@ impl FeatureDatasetInputEpoch {
             previous = Some(observation);
             if observation <= origin {
                 eligible += 1;
+                if first.is_none() {
+                    first = Some(session.clone());
+                }
+                last = Some(session);
             }
         }
-        let start = eligible.saturating_sub(max_sessions);
-        let selected = native.sessions().get(start..eligible).ok_or_else(invalid)?;
-        let first = selected.first().ok_or_else(invalid)?;
-        let last = selected.last().ok_or_else(invalid)?;
+        let start = 0;
+        let first = first.ok_or_else(invalid)?;
+        let last = last.ok_or_else(invalid)?;
         if first.native_date() < coverage.interval().0
             || last.native_date() > coverage.interval().1
             || coverage
@@ -241,31 +250,24 @@ impl FeatureDatasetInputEpoch {
         {
             return Err(invalid());
         }
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(selected.len())
-            .map_err(|_| DatasetBuildError::LimitExceeded)?;
+        let mut rows =
+            HistoryRows::new(history.operation_scratch(), deadline, cancellation.clone())?;
+        let mut bars = history.bars();
+        let mut next_bar = bars.next().transpose().map_err(|_| invalid())?;
         let mut origin_matched = false;
-        for session in selected {
+        for session in native.sessions().iter().take(eligible) {
+            let session = session.map_err(|_| invalid())?;
             check(deadline, cancellation)?;
-            let bar = if let Some(timestamp) = session.provider_timestamp() {
-                history
-                    .bars()
-                    .binary_search_by_key(&Some(timestamp), |bar| {
-                        bar.time_semantics().provider_timestamp()
-                    })
-                    .ok()
-                    .map(|index| &history.bars()[index])
-            } else {
-                history
-                    .bars()
-                    .binary_search_by_key(&Some(session.native_date()), |bar| {
-                        bar.time_semantics()
-                            .nominal_daily_date()
-                            .map(|date| date.date())
-                    })
-                    .ok()
-                    .map(|index| &history.bars()[index])
-            };
+            // Canonical originals and native sessions are ordered by their actual source key.
+            // Consume at most one original at a time; no source history binary-search vector.
+            let key = session
+                .provider_timestamp()
+                .map(|at| at.unix_nanos())
+                .unwrap_or_else(|| native_date_key(session.native_date()));
+            while next_bar.as_ref().is_some_and(|bar| original_key(bar) < key) {
+                next_bar = bars.next().transpose().map_err(|_| invalid())?;
+            }
+            let bar = next_bar.as_ref().filter(|bar| original_key(bar) == key);
             if session.bar_present() != bar.is_some() {
                 return Err(invalid());
             }
@@ -328,11 +330,12 @@ impl FeatureDatasetInputEpoch {
                 row.original_bar_identity = Some(hash(b"original-raw-history-bar/v1", bar)?);
                 row.prices = Some(prices);
             }
-            rows.push(row);
+            rows.push(row)?;
         }
         if !origin_matched {
             return Err(invalid());
         }
+        rows.finish()?;
         let epoch_identity = hash(b"forecast-history-input-epoch/v1", &self.canonical_bytes()?)?;
         // Whole original epoch binds currency, raw source origin, both clocks, original action
         // content/audit/implementation and current-unit price. This is an equality authority,
@@ -383,6 +386,21 @@ impl FeatureDatasetInputEpoch {
             rows,
         })
     }
+}
+
+fn native_date_key(date: CalendarDate) -> i64 {
+    i64::from(date.year()) * 10_000 + i64::from(date.month()) * 100 + i64::from(date.day())
+}
+fn original_key(bar: &MarketBarObservation) -> i64 {
+    bar.time_semantics()
+        .provider_timestamp()
+        .map(|at| at.unix_nanos())
+        .or_else(|| {
+            bar.time_semantics()
+                .nominal_daily_date()
+                .map(|date| native_date_key(date.date()))
+        })
+        .unwrap_or(i64::MIN)
 }
 
 fn transform(
@@ -494,8 +512,7 @@ fn hash(domain: &[u8], value: &impl Serialize) -> Result<[u8; 32], DatasetBuildE
             self.bytes = self
                 .bytes
                 .checked_add(bytes.len())
-                .filter(|bytes| *bytes <= 16 * 1024 * 1024)
-                .ok_or_else(|| io::Error::other("forecast history evidence exceeds bound"))?;
+                .ok_or_else(|| io::Error::other("forecast history evidence size overflow"))?;
             self.hash.update(bytes);
             Ok(bytes.len())
         }
@@ -533,14 +550,39 @@ mod tests {
     };
 
     #[test]
-    fn exact_share_conversion_rounds_once_and_preserves_outward_bounds() -> Result<(), Box<dyn std::error::Error>> {
+    fn exact_share_conversion_rounds_once_and_preserves_outward_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
         use ShareConversionRounding::{Central, Lower, Upper};
-        assert_eq!(exact_scaled_ratio(Decimal::from(120), 1, 2, 2, Central)?, Decimal::from(60));
-        assert_eq!(exact_scaled_ratio(Decimal::from(120), 1, 1, 2, Central)?, Decimal::from(120));
-        assert_eq!(exact_scaled_ratio(Decimal::ONE, 1, 3, 2, Lower)?, Decimal::new(33, 2));
-        assert_eq!(exact_scaled_ratio(Decimal::ONE, 1, 3, 2, Upper)?, Decimal::new(34, 2));
-        assert_eq!(exact_scaled_ratio(Decimal::from_str("0.0050000000000000000000000001")?, 1, 1, 2, Central)?, Decimal::new(1, 2));
-        assert_eq!(exact_scaled_ratio(Decimal::new(5, 3), 1, 1, 2, Central)?, Decimal::ZERO);
+        assert_eq!(
+            exact_scaled_ratio(Decimal::from(120), 1, 2, 2, Central)?,
+            Decimal::from(60)
+        );
+        assert_eq!(
+            exact_scaled_ratio(Decimal::from(120), 1, 1, 2, Central)?,
+            Decimal::from(120)
+        );
+        assert_eq!(
+            exact_scaled_ratio(Decimal::ONE, 1, 3, 2, Lower)?,
+            Decimal::new(33, 2)
+        );
+        assert_eq!(
+            exact_scaled_ratio(Decimal::ONE, 1, 3, 2, Upper)?,
+            Decimal::new(34, 2)
+        );
+        assert_eq!(
+            exact_scaled_ratio(
+                Decimal::from_str("0.0050000000000000000000000001")?,
+                1,
+                1,
+                2,
+                Central
+            )?,
+            Decimal::new(1, 2)
+        );
+        assert_eq!(
+            exact_scaled_ratio(Decimal::new(5, 3), 1, 1, 2, Central)?,
+            Decimal::ZERO
+        );
         assert!(exact_scaled_ratio(Decimal::MAX, 2, 1, 2, Central).is_err());
         Ok(())
     }

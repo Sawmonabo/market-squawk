@@ -1,3 +1,4 @@
+import { DemandPanel } from "../shared/demand-panel"
 import { useQuery } from "@tanstack/react-query"
 import {
   Activity,
@@ -150,23 +151,7 @@ function DecisionCard({
   transport: ProductTransport
   scope: ProductScope
 }) {
-  const analysis = useQuery({
-    queryKey: productKeys.operation(
-      scope,
-      "decision",
-      "investment-analysis",
-      { actionToken: locator.actionToken },
-    ),
-    queryFn: async () =>
-      parseInvestmentAnalysis(
-        await transport.query({
-          query: "decisionInvestmentAnalysis",
-          actionToken: locator.actionToken,
-        }),
-        locator.actionToken,
-      ),
-  })
-  const displayed = analysis.data ?? locator
+  const displayed = locator
 
   return (
     <article className="rounded-xl border border-border bg-background/35 p-4">
@@ -190,22 +175,39 @@ function DecisionCard({
         <Fact label="Review by" value={formatProductTimestamp(displayed.horizon.expiresAt)} />
       </dl>
 
-      {analysis.isPending ? (
-        <Skeleton className="mt-4 h-36 rounded-lg" />
-      ) : analysis.isError || !analysis.data ? (
-        <Alert className="mt-4">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Supporting detail is unavailable</AlertTitle>
-          <AlertDescription>
-            Treat this saved action as incomplete until its ranges, reasons, risks,
-            and uncertainty can be reviewed.
-          </AlertDescription>
-        </Alert>
-      ) : (
-        <DecisionEvidence analysis={analysis.data} />
-      )}
+      <DemandPanel title="Open supporting evidence" className="mt-4 rounded-lg border p-3">
+        <DecisionEvidenceRead locator={locator} transport={transport} scope={scope} />
+      </DemandPanel>
     </article>
   )
+}
+
+function DecisionEvidenceRead({ locator, transport, scope }: {
+  locator: InvestmentAnalysisLocator
+  transport: ProductTransport
+  scope: ProductScope
+}) {
+  const analysis = useQuery({
+    queryKey: productKeys.operation(
+      scope,
+      "decision",
+      "Decision.GetInvestmentAnalysis",
+      { actionToken: locator.actionToken },
+    ),
+    gcTime: 0,
+    queryFn: async ({ signal }) =>
+      parseInvestmentAnalysis(
+        await transport.query({
+          query: "decisionInvestmentAnalysis",
+          actionToken: locator.actionToken,
+        }, { signal }),
+        locator.actionToken,
+      ),
+  })
+
+  if (analysis.isPending) return <Skeleton className="mt-4 h-36 rounded-lg" />
+  if (analysis.isError || !analysis.data) return <Alert className="mt-4"><CircleAlert aria-hidden="true" /><AlertTitle>Supporting detail is unavailable</AlertTitle><AlertDescription>Treat this saved action as incomplete until its ranges, reasons, risks, and uncertainty can be reviewed.</AlertDescription></Alert>
+  return <DecisionEvidence analysis={analysis.data} />
 }
 
 function DecisionEvidence({ analysis }: { analysis: InvestmentAnalysis }) {

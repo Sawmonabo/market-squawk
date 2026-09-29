@@ -40,9 +40,10 @@ export function useLookup(
   )
   const query = useQuery({
     queryKey: productKeys.operation(scope, "analysis", "lookup", input),
-    queryFn: () => transport.query(input),
+    queryFn: ({ signal }) => transport.query(input, { signal }),
     enabled: ready,
     staleTime: 30_000,
+    gcTime: 0,
   })
 
   if (!ready) {

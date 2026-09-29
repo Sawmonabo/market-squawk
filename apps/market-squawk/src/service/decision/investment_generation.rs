@@ -7,11 +7,12 @@ use crate::{
     ResearchService,
     application::{
         MacroContextReadCapability, MarketHistoryReadCapability, MarketHistoryUnavailableReason,
+        SourceAppliedCorporateActionReadCapability,
         analysis::{
             GovernedRecommendationBacktestReferenceV1, ProductionGovernedBacktestInputAuthority,
             ProductionGovernedBacktestRepository,
         },
-        analytical_profile::{AnalyticalProfileResolution, revalidate},
+        analytical_profile::AnalyticalProfileResolution,
         decision::{
             DecisionApplication,
             investment_request::{
@@ -25,15 +26,11 @@ use crate::{
             FairValueDomainService, ForecastValuationSourceFactory,
         },
         market_calendar::CompletedMarketSessionReadCapability,
-        market_selection::{
-            MarketInvestmentReadCapability, MarketInvestmentReadReceipt,
-        },
+        market_selection::{MarketInvestmentReadCapability, MarketInvestmentReadReceipt},
         model::forecast::{
-                ExactHorizonPriceForecastEvidence, ForecastEvidenceReadContext,
-                ForecastEvidenceReader, ForecastPriceEvidence, LatestValidForecast,
-                replay_price_history_inputs,
-            },
-        SourceAppliedCorporateActionReadCapability,
+            ExactHorizonPriceForecastEvidence, ForecastEvidenceReadContext, ForecastEvidenceReader,
+            ForecastPriceEvidence, LatestValidForecast, replay_price_history_inputs,
+        },
     },
     jobs::ForecastJobRunner,
     portfolio_application::{
@@ -44,13 +41,12 @@ use crate::{
 };
 use market_squawk_data::Sha256Digest;
 use market_squawk_decisions::{
-    CandidateId, CurrentShareMarketAdmission, InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput,
-    InvestmentAnalysisRequestProvenance, InvestmentProbabilityEvidence, LiquidityEvidence,
-    PortfolioPositionState,
-    PortfolioRiskEvidence, PreparedPublishedInvestmentAnalysis,
-    ProbabilityEventEvidence, ProbabilityEventKind, ProbabilityForecastEvidence,
-    ProbabilityForecastReference, ProbabilityUnavailableReason, ProposalEvidenceWindow,
-    ScreenRunId,
+    CandidateId, CurrentShareMarketAdmission, InvestmentAnalysisEvidence,
+    InvestmentAnalysisEvidenceInput, InvestmentAnalysisRequestProvenance,
+    InvestmentProbabilityEvidence, LiquidityEvidence, PortfolioPositionState,
+    PortfolioRiskEvidence, PreparedPublishedInvestmentAnalysis, ProbabilityEventEvidence,
+    ProbabilityEventKind, ProbabilityForecastEvidence, ProbabilityForecastReference,
+    ProbabilityUnavailableReason, ProposalEvidenceWindow, ScreenRunId,
 };
 use market_squawk_domain::{InstrumentId, Money, Timestamp};
 use market_squawk_services::{
@@ -65,7 +61,8 @@ use std::{
     sync::Arc,
 };
 
-pub(in crate::service) const GENERATE_INVESTMENT_ANALYSIS: &str = "Decision.GenerateInvestmentAnalysis";
+pub(in crate::service) const GENERATE_INVESTMENT_ANALYSIS: &str =
+    "Decision.GenerateInvestmentAnalysis";
 
 /// Reuses existing authorities. It owns no source fetch, model runner, account selector or store.
 pub(in crate::service) struct InvestmentGenerationOperations {
@@ -80,24 +77,21 @@ pub(in crate::service) struct InvestmentGenerationOperations {
     valuation_sources: ForecastValuationSourceFactory,
     study_inputs: Arc<ProductionGovernedBacktestInputAuthority>,
     studies: Arc<ProductionGovernedBacktestRepository>,
-    historical_reader: Option<Arc<crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability>,
+    historical_reader: Option<
+        Arc<crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability>,
     >,
     maximum_forecast_artifact_bytes: NonZeroUsize,
     source_actions: SourceAppliedCorporateActionReadCapability,
 }
 impl InvestmentGenerationOperations {
     /// Shares existing read authorities only; chart reads cannot acquire or publish new inputs.
-    pub(super) fn chart_reader(&self,
+    pub(super) fn chart_reader(
+        &self,
     ) -> super::investment_analysis::chart::SavedInvestmentChartReader {
         super::investment_analysis::chart::SavedInvestmentChartReader {
             research: Arc::clone(&self.research),
-            calendars: self.calendars.clone(),
-            history: self.history.clone(),
-            forecasts: Arc::clone(&self.forecasts),
-            maximum_forecast_artifact_bytes: self.maximum_forecast_artifact_bytes,
         }
     }
-
 
     #[allow(
         clippy::too_many_arguments,
@@ -115,7 +109,8 @@ impl InvestmentGenerationOperations {
         valuation_sources: ForecastValuationSourceFactory,
         study_inputs: Arc<ProductionGovernedBacktestInputAuthority>,
         studies: Arc<ProductionGovernedBacktestRepository>,
-        historical_reader: Option<Arc<crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability>,
+        historical_reader: Option<
+            Arc<crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability>,
         >,
         maximum_forecast_artifact_bytes: NonZeroUsize,
         source_actions: SourceAppliedCorporateActionReadCapability,
@@ -176,9 +171,13 @@ impl InvestmentGenerationOperations {
         {
             return self.result(&bundle, context);
         }
-        let models = preparation.financial_profile_catalog(context).await?;
-        let validated =
-            revalidate(&input.financial_profile, models.as_ref()).map_err(ServiceError::from)?;
+        let models = preparation
+            .financial_profile_catalog(&input.financial_profile.configuration, context)
+            .await?;
+        let validated = crate::application::analytical_profile::revalidate(
+            &input.financial_profile,
+            models.as_ref(),
+        )?;
         let profile = input.analytical_profile.domain()?;
         let source_cutoff = timestamp(&input.source_cutoff_unix_nanos)?;
         let portfolio_cutoff = input
@@ -507,7 +506,9 @@ impl InvestmentGenerationOperations {
                 replay_price_history_inputs(
                     price,
                     &self.research,
-                    &crate::application::market_calendar::ForecastSessionReadCapability::Current(self.calendars.clone()),
+                    &crate::application::market_calendar::ForecastSessionReadCapability::Current(
+                        self.calendars.clone(),
+                    ),
                     &self.source_actions,
                     reference,
                     None,
@@ -637,6 +638,8 @@ impl InvestmentGenerationOperations {
                 &self.market,
                 &market,
                 &self.valuation_sources,
+                input.fundamental_share_sources.as_deref(),
+                &self.source_actions,
                 AutomaticInvestmentValuationSources {
                     price_forecast: price.as_ref(),
                     financial_forecasts: &financial,
@@ -656,6 +659,7 @@ impl InvestmentGenerationOperations {
             )
             .await?;
         let selected_receipt = valuation.selected_receipt().cloned();
+        let selected_share_sources = valuation.selected_share_sources().cloned();
         let (method_set, selected_valuation) = valuation.into_parts();
         let (valuation, financial_model) =
             selected_valuation.map_or((None, None), |(v, f)| (Some(v), Some(f)));
@@ -743,7 +747,12 @@ impl InvestmentGenerationOperations {
             account_id: account,
             as_of: source_cutoff,
             admitted_at,
-            market: Some(crate::application::decision::current_share::market_evidence(&market, market.authorization_expires_at())?),
+            market: Some(
+                crate::application::decision::current_share::market_evidence(
+                    &market,
+                    market.authorization_expires_at(),
+                )?,
+            ),
             price_forecast: forecast_evidence,
             valuation,
             financial_model,
@@ -780,25 +789,69 @@ impl InvestmentGenerationOperations {
                 .map_err(|_| ServiceError::InvalidRequest)?;
         }
         if let (Some(history), Some(receipt), Some(reference)) = (
-            forecast_chart.as_ref(), selected_receipt.as_ref(), input.current_share_action_reference.as_ref(),
+            forecast_chart.as_ref(),
+            selected_receipt.as_ref(),
+            input.current_share_action_reference.as_ref(),
         ) {
-            let conversion = self.source_actions.read_current_forecast_share_conversion(
-                reference, &history.epoch, &history.history, &history.original_plan, &market,
-                u32::from(receipt.range().central().scale()), context.deadline(), context.cancellation().clone(),
-            ).await.map_err(crate::application::decision::current_share::source_error)?;
+            let conversion = self
+                .source_actions
+                .read_current_forecast_share_conversion(
+                    reference,
+                    &history.epoch,
+                    &history.history,
+                    &history.original_plan,
+                    &market,
+                    u32::from(receipt.range().central().scale()),
+                    context.deadline(),
+                    context.cancellation().clone(),
+                )
+                .await
+                .map_err(crate::application::decision::current_share::source_error)?;
             if let Some(conversion) = conversion {
-                let valuation_projection = receipt.project_current_share_units(&history.epoch, &conversion, admitted_at)
-                    .map_err(|_| ServiceError::InvalidResult)?;
+                let valuation_projection = if let Some(sources) = selected_share_sources {
+                    let price_source = self
+                        .valuation_sources
+                        .source_for_selected_forecast(
+                            price.as_ref().ok_or(ServiceError::InvalidResult)?,
+                            &ArtifactReadContext::new(
+                                context.cancellation().clone(),
+                                context.deadline(),
+                            ),
+                        )
+                        .await
+                        .map_err(crate::application::fair_value::map_fair_value_error)?;
+                    receipt.project_fundamental_current_share_units(
+                        &history.epoch,
+                        &price_source,
+                        &conversion,
+                        &sources.bases,
+                        sources.reference,
+                        admitted_at,
+                        horizon_at,
+                    )
+                } else {
+                    receipt.project_current_share_units(&history.epoch, &conversion, admitted_at)
+                }
+                .map_err(|_| ServiceError::InvalidResult)?;
                 let admission = CurrentShareMarketAdmission {
                     market: *evidence.market().ok_or(ServiceError::InvalidResult)?,
                     authorized_at: market.authorized_at(),
                     authorization_expires_at: market.authorization_expires_at(),
-                    authorization_decision_digest: digest(market_squawk_domain::EvidenceDigest::new(
-                        market_squawk_domain::DigestAlgorithm::Sha256, market.authorization_decision_digest(),
-                    ))?,
+                    authorization_decision_digest: digest(
+                        market_squawk_domain::EvidenceDigest::new(
+                            market_squawk_domain::DigestAlgorithm::Sha256,
+                            market.authorization_decision_digest(),
+                        ),
+                    )?,
                 };
-                evidence = evidence.try_project_current_share_units(conversion, valuation_projection,
-                    market.publication(), admission).map_err(|_| ServiceError::InvalidResult)?;
+                evidence = evidence
+                    .try_project_current_share_units(
+                        conversion,
+                        valuation_projection,
+                        market.publication(),
+                        admission,
+                    )
+                    .map_err(|_| ServiceError::InvalidResult)?;
             }
         }
         let bundle = self.decisions.generate_published_investment_analysis(
@@ -1035,7 +1088,6 @@ impl InvestmentGenerationOperations {
         }),1,ToolResultMetadata::complete_not_applicable(),context.limits()).map_err(Into::into)
     }
 }
-
 
 fn current_portfolio_evidence(
     value: &PortfolioRecommendationEvidence,

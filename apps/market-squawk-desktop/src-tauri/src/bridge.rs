@@ -55,6 +55,7 @@ const MAXIMUM_RESEARCH_PREPARATION_RECEIPTS: usize = 256;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
+const MAXIMUM_PENDING_READS: usize = 256;
 const SCHWAB_PROVIDER_ID: &str = "schwab.trader-api-market-data";
 
 #[derive(Clone)]
@@ -363,12 +364,38 @@ pub(crate) struct DesktopGeneration {
     product_session_token: ProductSessionToken,
     data_root: PathBuf,
     cancellation: CancellationToken,
+    reads: Mutex<HashMap<Uuid, Arc<DesktopReadEntry>>>,
     governance_authorizations: Mutex<HashMap<Uuid, NativeGovernanceAuthorization>>,
     research_collections: Mutex<ResearchCollectionTokens>,
     research_preparation_choices: Mutex<StableProductTokens>,
     research_preparation_receipts: Mutex<OneUseProductTokens>,
     research_activities: Mutex<StableProductTokens>,
     mcp_clients: Arc<DesktopMcpClientState>,
+}
+
+struct DesktopReadEntry {
+    cancellation: CancellationToken,
+    registered_until: Instant,
+    started: AtomicBool,
+}
+
+pub(crate) struct DesktopRead {
+    generation: Arc<DesktopGeneration>,
+    request_id: Uuid,
+    entry: Arc<DesktopReadEntry>,
+}
+
+impl Drop for DesktopRead {
+    fn drop(&mut self) {
+        self.entry.cancellation.cancel();
+        if let Ok(mut reads) = self.generation.reads.lock()
+            && reads
+                .get(&self.request_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
+            reads.remove(&self.request_id);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -675,7 +702,6 @@ impl DesktopState {
             }
         };
         generation.begin_shutdown();
-
     }
 }
 
@@ -753,6 +779,7 @@ impl DesktopGeneration {
             product_session_token: ProductSessionToken::random(),
             data_root,
             cancellation: CancellationToken::new(),
+            reads: Mutex::new(HashMap::new()),
             governance_authorizations: Mutex::new(HashMap::new()),
             research_collections: Mutex::new(ResearchCollectionTokens::default()),
             research_preparation_choices: Mutex::new(StableProductTokens::default()),
@@ -787,6 +814,7 @@ impl DesktopGeneration {
             product_session_token: ProductSessionToken::random(),
             data_root,
             cancellation: CancellationToken::new(),
+            reads: Mutex::new(HashMap::new()),
             governance_authorizations: Mutex::new(HashMap::new()),
             research_collections: Mutex::new(ResearchCollectionTokens::default()),
             research_preparation_choices: Mutex::new(StableProductTokens::default()),
@@ -817,6 +845,32 @@ impl DesktopGeneration {
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.child_token()
+    }
+
+    pub(crate) fn begin_read(
+        self: &Arc<Self>,
+        request_id: Uuid,
+        product_session_token: ProductSessionToken,
+    ) -> Result<DesktopRead, DesktopCommandError> {
+        admit_webview_product_session(product_session_token, self.product_session_token)?;
+        let mut reads = self
+            .reads
+            .lock()
+            .map_err(|_| DesktopCommandError::internal())?;
+        prune_pending_reads(&mut reads);
+        let entry = reads
+            .get(&request_id)
+            .ok_or_else(|| map_application_client_error(ApplicationClientError::Interrupted))?;
+        if entry.cancellation.is_cancelled() || entry.started.swap(true, Ordering::AcqRel) {
+            return Err(map_application_client_error(
+                ApplicationClientError::Interrupted,
+            ));
+        }
+        Ok(DesktopRead {
+            generation: Arc::clone(self),
+            request_id,
+            entry: Arc::clone(entry),
+        })
     }
 
     pub(crate) fn register_research_collection(
@@ -1128,10 +1182,123 @@ impl DesktopGeneration {
 
     pub(crate) fn begin_shutdown(&self) {
         self.cancellation.cancel();
+        if let Ok(mut reads) = self.reads.lock() {
+            reads.clear();
+        }
         if let Ok(mut authorizations) = self.governance_authorizations.lock() {
             authorizations.clear();
         }
     }
+}
+
+fn prune_pending_reads(reads: &mut HashMap<Uuid, Arc<DesktopReadEntry>>) {
+    let now = Instant::now();
+    reads.retain(|_, entry| {
+        let retained = entry.started.load(Ordering::Acquire) || entry.registered_until > now;
+        if !retained {
+            entry.cancellation.cancel();
+        }
+        retained
+    });
+}
+
+#[tauri::command]
+pub(crate) fn register_read(
+    request_id: Uuid,
+    product_session_token: ProductSessionToken,
+    state: State<'_, DesktopState>,
+) -> Result<(), DesktopCommandError> {
+    let generation = state.generation()?;
+    admit_webview_product_session(product_session_token, generation.product_session_token)?;
+    if request_id.is_nil() || generation.cancellation.is_cancelled() {
+        return Err(DesktopCommandError::invalid_request(
+            "The read request is unavailable.",
+        ));
+    }
+    let mut reads = generation
+        .reads
+        .lock()
+        .map_err(|_| DesktopCommandError::internal())?;
+    prune_pending_reads(&mut reads);
+    if reads.contains_key(&request_id) {
+        return Err(DesktopCommandError::invalid_request(
+            "The read request is already registered.",
+        ));
+    }
+    if reads.len() >= MAXIMUM_PENDING_READS {
+        return Err(DesktopCommandError::new(
+            "resource_exhausted",
+            "Too many screen reads are pending.",
+        ));
+    }
+    reads
+        .try_reserve(1)
+        .map_err(|_| DesktopCommandError::internal())?;
+    reads.insert(
+        request_id,
+        Arc::new(DesktopReadEntry {
+            cancellation: generation.cancellation(),
+            registered_until: Instant::now()
+                .checked_add(APPLICATION_REQUEST_TIMEOUT)
+                .ok_or_else(DesktopCommandError::internal)?,
+            started: AtomicBool::new(false),
+        }),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn cancel_read(
+    request_id: Uuid,
+    product_session_token: ProductSessionToken,
+    state: State<'_, DesktopState>,
+) -> Result<(), DesktopCommandError> {
+    let generation = state.current_generation()?;
+    admit_webview_product_session(product_session_token, generation.product_session_token)?;
+    let mut reads = generation
+        .reads
+        .lock()
+        .map_err(|_| DesktopCommandError::internal())?;
+    prune_pending_reads(&mut reads);
+    if let Some(entry) = reads.remove(&request_id) {
+        entry.cancellation.cancel();
+    }
+    Ok(())
+}
+
+pub(crate) async fn invoke_read_application(
+    operation: &str,
+    arguments: Map<String, Value>,
+    state: &DesktopState,
+    read: &DesktopRead,
+) -> Result<Value, DesktopCommandError> {
+    state.admit_current(&read.generation)?;
+    let request_id = RequestId::try_string(format!("desktop-read-{}", read.request_id))
+        .map_err(|_| DesktopCommandError::internal())?;
+    let result = invoke_bounded_generation_operation(
+        &read.generation,
+        operation,
+        arguments,
+        InvocationAuthority::ReadOnly,
+        true,
+        true,
+        request_id,
+        read.entry.cancellation.clone(),
+    )
+    .await?;
+    state.admit_current(&read.generation)?;
+    if read.entry.cancellation.is_cancelled() {
+        return Err(map_application_client_error(
+            ApplicationClientError::Interrupted,
+        ));
+    }
+    let result = lossless_webview_value(result);
+    validate_desktop_json(
+        &result,
+        desktop_result_byte_limit(operation) as usize,
+        false,
+    )?;
+    Ok(result)
 }
 
 fn resolve_workspace_data_root(
@@ -1264,9 +1431,14 @@ pub(crate) async fn desktop_service_bootstrap(
                     "The reconnecting desktop service state is no longer available.",
                 )
             })?;
-            if let Err(error) =
-                commit_reconnected_generation(&app, &state, &subscriptions, *expected_runtime, connection)
-                    .await
+            if let Err(error) = commit_reconnected_generation(
+                &app,
+                &state,
+                &subscriptions,
+                *expected_runtime,
+                connection,
+            )
+            .await
             {
                 // Foreground recovery already produced a connection. The old generation remains
                 // current on every preparation failure, so retaining a consumed bootstrap action
@@ -1627,12 +1799,17 @@ async fn invoke_generation_operation(
         arguments,
         authority,
         apply_desktop_result_limits,
+        false,
         request_id,
         generation.cancellation(),
     )
     .await?;
     let result = lossless_webview_value(result);
-    validate_desktop_json(&result, desktop_result_byte_limit(operation) as usize, false)?;
+    validate_desktop_json(
+        &result,
+        desktop_result_byte_limit(operation) as usize,
+        false,
+    )?;
     Ok(result)
 }
 
@@ -1656,9 +1833,16 @@ pub(crate) fn prepare_analytical_arguments(
     ) {
         arguments.insert("confirm".to_owned(), Value::Bool(true));
     }
-    if descriptor.input_schema.pointer("/properties/resultLimits").is_some() {
+    if descriptor
+        .input_schema
+        .pointer("/properties/resultLimits")
+        .is_some()
+    {
         let limits = desktop_result_limits(operation);
-        if arguments.get("resultLimits").is_some_and(|saved| saved != &limits) {
+        if arguments
+            .get("resultLimits")
+            .is_some_and(|saved| saved != &limits)
+        {
             return Err(DesktopCommandError::invalid_request(
                 "The saved operation result limits differ from the desktop limits.",
             ));
@@ -1708,18 +1892,24 @@ pub(crate) async fn invoke_analytical_operation(
             arguments,
             authority,
             false,
+            false,
             request_id,
             request_cancellation,
         ) => result,
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "read cancellation routing remains distinct from business authority and result limits"
+)]
 async fn invoke_bounded_generation_operation(
     generation: &Arc<DesktopGeneration>,
     operation: &str,
     mut arguments: Map<String, Value>,
     authority: InvocationAuthority,
     apply_desktop_result_limits: bool,
+    registered_read: bool,
     request_id: RequestId,
     cancellation: CancellationToken,
 ) -> Result<Value, DesktopCommandError> {
@@ -1756,10 +1946,7 @@ async fn invoke_bounded_generation_operation(
             .pointer("/properties/resultLimits")
             .is_some()
     {
-        arguments.insert(
-            "resultLimits".to_owned(),
-            desktop_result_limits(operation),
-        );
+        arguments.insert("resultLimits".to_owned(), desktop_result_limits(operation));
     }
     let arguments = Value::Object(arguments);
     validate_desktop_json(&arguments, MAXIMUM_APPLICATION_ARGUMENT_BYTES, true)?;
@@ -1776,22 +1963,27 @@ async fn invoke_bounded_generation_operation(
     let application = setup_client
         .as_ref()
         .unwrap_or(generation.application.as_ref());
-    let response = application
-        .invoke_operation(
-            request_id,
-            operation,
-            arguments,
-            if setup_client.is_some() {
-                Duration::from_secs(120)
-            } else {
-                APPLICATION_REQUEST_TIMEOUT
-            },
-            cancellation,
-        )
-        .await
-        .map_err(map_application_client_error)?;
+    let lifetime = if setup_client.is_some() {
+        Duration::from_secs(120)
+    } else {
+        APPLICATION_REQUEST_TIMEOUT
+    };
+    let response = if registered_read {
+        application
+            .invoke_read_operation(request_id, operation, arguments, lifetime, cancellation)
+            .await
+    } else {
+        application
+            .invoke_operation(request_id, operation, arguments, lifetime, cancellation)
+            .await
+    }
+    .map_err(map_application_client_error)?;
     let result = decode_application_result(response.result())?;
-    validate_desktop_json(&result, desktop_result_byte_limit(operation) as usize, false)?;
+    validate_desktop_json(
+        &result,
+        desktop_result_byte_limit(operation) as usize,
+        false,
+    )?;
     Ok(result)
 }
 

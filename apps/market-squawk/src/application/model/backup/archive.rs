@@ -1,30 +1,15 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::{Read, Write},
-};
+//! Sequential archive framing. Only one verified member is resident at a time.
+use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::{ModelBackupError, ModelBackupLimits, RetainedArchiveMember, hex};
+use super::{ModelBackupError, ModelBackupLimits, SEMANTIC_REVISION_DOMAIN};
 
-const MAGIC: &[u8; 16] = b"MSQMODELARCHIVE1";
-const ARCHIVE_VERSION: u16 = 1;
+const MAGIC: &[u8; 16] = b"MSQMODELSTREAM1!";
 const MAXIMUM_ARCHIVE_PATH_BYTES: usize = 1_024;
-const MAXIMUM_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
-
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(super) struct SnapshotManifest {
-    pub(super) schema_version: u16,
-    pub(super) semantic_authority_revision: String,
-    pub(super) runtime_index_path: String,
-    pub(super) forecast_index_path: String,
-    pub(super) models: Vec<ModelManifestRecord>,
-    pub(super) forecast_artifacts: Vec<ForecastArtifactManifestRecord>,
-    pub(super) members: Vec<MemberManifestRecord>,
-}
+const FOOTER_PATH: &str = "authority.sha256";
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -47,154 +32,153 @@ pub(super) struct ModelMemberManifestRecord {
     pub(super) sha256: String,
 }
 
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(super) struct ForecastArtifactManifestRecord {
-    pub(super) artifact_id: String,
-    pub(super) archive_path: String,
-    pub(super) byte_length: u64,
-    pub(super) sha256: String,
-    pub(super) media_type: String,
-}
-
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(super) struct MemberManifestRecord {
-    pub(super) path: String,
-    pub(super) byte_length: u64,
-    pub(super) sha256: String,
-}
-
-pub(super) struct DecodedArchive {
-    pub(super) manifest: SnapshotManifest,
-    pub(super) members: BTreeMap<String, Box<[u8]>>,
-}
-
-impl std::fmt::Debug for DecodedArchive {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DecodedArchive")
-            .field("manifest", &self.manifest)
-            .field("member_count", &self.members.len())
-            .field("members", &"[VERIFIED ARCHIVE BYTES]")
-            .finish()
-    }
-}
-
-pub(super) fn write_archive(
-    writer: &mut (dyn Write + Send),
-    manifest: &SnapshotManifest,
-    members: &[RetainedArchiveMember],
+pub(super) struct ArchiveWriter<'a> {
+    output: DigestingWriter<'a>,
+    semantic: Sha256,
+    members: usize,
     limits: ModelBackupLimits,
-    cancellation: &CancellationToken,
-) -> Result<(u64, [u8; 32]), ModelBackupError> {
-    let manifest_bytes = serde_json::to_vec(manifest).map_err(|_| ModelBackupError::Archive)?;
-    if manifest_bytes.len() > MAXIMUM_MANIFEST_BYTES
-        || serde_json::from_slice::<SnapshotManifest>(&manifest_bytes)
-            .map_err(|_| ModelBackupError::Archive)?
-            != *manifest
-    {
-        return Err(ModelBackupError::Archive);
+    cancellation: &'a CancellationToken,
+}
+
+impl<'a> ArchiveWriter<'a> {
+    pub(super) fn new(
+        writer: &'a mut (dyn Write + Send),
+        limits: ModelBackupLimits,
+        cancellation: &'a CancellationToken,
+    ) -> Result<Self, ModelBackupError> {
+        let mut output = DigestingWriter::new(writer, limits.maximum_archive_bytes());
+        output.write_all(MAGIC)?;
+        Ok(Self {
+            output,
+            semantic: semantic_digest(),
+            members: 0,
+            limits,
+            cancellation,
+        })
     }
-    let member_count = members
-        .len()
-        .checked_add(1)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(ModelBackupError::Capacity)?;
-    if manifest.members.len() != members.len()
-        || !manifest
-            .members
-            .iter()
-            .zip(members)
-            .all(|(expected, member)| {
-                expected.path == member.path
-                    && usize::try_from(expected.byte_length) == Ok(member.bytes.len())
-                    && expected.sha256 == hex(Sha256::digest(&member.bytes).into())
-            })
-        || encoded_length(&manifest_bytes, members)? > limits.maximum_archive_bytes()
-    {
-        return Err(ModelBackupError::Archive);
+
+    pub(super) fn member(&mut self, path: &str, bytes: &[u8]) -> Result<(), ModelBackupError> {
+        if path == FOOTER_PATH
+            || bytes.is_empty()
+            || bytes.len() > self.limits.maximum_member_bytes().get()
+            || self.members >= self.limits.maximum_members().get().saturating_sub(1)
+        {
+            return Err(ModelBackupError::Capacity);
+        }
+        write_member(&mut self.output, path, bytes, self.cancellation)?;
+        update_semantic(&mut self.semantic, path, bytes)?;
+        self.members += 1;
+        Ok(())
     }
-    let mut output = DigestingWriter::new(writer, limits.maximum_archive_bytes());
-    output.write_all(MAGIC)?;
-    output.write_all(&ARCHIVE_VERSION.to_be_bytes())?;
-    output.write_all(&member_count.to_be_bytes())?;
-    write_member(&mut output, "manifest.json", &manifest_bytes, cancellation)?;
-    for member in members {
+
+    pub(super) fn finish(mut self) -> Result<([u8; 32], u64, [u8; 32]), ModelBackupError> {
+        let revision: [u8; 32] = self.semantic.finalize().into();
+        write_member(&mut self.output, FOOTER_PATH, &revision, self.cancellation)?;
+        let (length, digest) = self.output.finish()?;
+        Ok((revision, length, digest))
+    }
+}
+
+pub(super) struct ArchiveReader<'a> {
+    input: BoundedReader<'a>,
+    semantic: Sha256,
+    members: usize,
+    limits: ModelBackupLimits,
+}
+
+impl<'a> ArchiveReader<'a> {
+    pub(super) fn new(
+        reader: &'a mut (dyn Read + Send),
+        limits: ModelBackupLimits,
+        cancellation: &'a CancellationToken,
+    ) -> Result<Self, ModelBackupError> {
+        let mut input = BoundedReader::new(reader, limits.maximum_archive_bytes(), cancellation);
+        let mut magic = [0_u8; MAGIC.len()];
+        let result = input.read_exact(&mut magic);
         if cancellation.is_cancelled() {
             return Err(ModelBackupError::Cancelled);
         }
-        write_member(&mut output, &member.path, &member.bytes, cancellation)?;
+        result?;
+        if &magic != MAGIC {
+            return Err(ModelBackupError::Archive);
+        }
+        Ok(Self {
+            input,
+            semantic: semantic_digest(),
+            members: 0,
+            limits,
+        })
     }
-    output.finish()
+
+    pub(super) fn member(&mut self, expected: &str) -> Result<Box<[u8]>, ModelBackupError> {
+        self.member_bounded(expected, self.limits.maximum_member_bytes().get())
+    }
+
+    pub(super) fn member_bounded(
+        &mut self,
+        expected: &str,
+        maximum_bytes: usize,
+    ) -> Result<Box<[u8]>, ModelBackupError> {
+        if expected == FOOTER_PATH
+            || self.members >= self.limits.maximum_members().get().saturating_sub(1)
+        {
+            return Err(ModelBackupError::Capacity);
+        }
+        let result = read_member(
+            &mut self.input,
+            maximum_bytes.min(self.limits.maximum_member_bytes().get()),
+        );
+        if self.input.cancellation.is_cancelled() {
+            return Err(ModelBackupError::Cancelled);
+        }
+        let (path, bytes) = result?;
+        if path != expected {
+            return Err(ModelBackupError::Archive);
+        }
+        update_semantic(&mut self.semantic, &path, &bytes)?;
+        self.members += 1;
+        Ok(bytes)
+    }
+
+    pub(super) fn finish(mut self) -> Result<[u8; 32], ModelBackupError> {
+        let result = read_member(&mut self.input, 32);
+        if self.input.cancellation.is_cancelled() {
+            return Err(ModelBackupError::Cancelled);
+        }
+        let (path, bytes) = result?;
+        let revision: [u8; 32] = self.semantic.finalize().into();
+        let mut trailing = [0_u8; 1];
+        let result = self.input.read(&mut trailing);
+        if self.input.cancellation.is_cancelled() {
+            return Err(ModelBackupError::Cancelled);
+        }
+        if path != FOOTER_PATH || bytes.as_ref() != revision || result? != 0 {
+            return Err(ModelBackupError::Archive);
+        }
+        Ok(revision)
+    }
 }
 
-pub(super) fn read_archive(
-    reader: &mut (dyn Read + Send),
-    limits: ModelBackupLimits,
-    cancellation: &CancellationToken,
-) -> Result<DecodedArchive, ModelBackupError> {
-    let mut input = BoundedReader::new(reader, limits.maximum_archive_bytes(), cancellation);
-    let mut magic = [0_u8; MAGIC.len()];
-    input.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(ModelBackupError::Archive);
-    }
-    let version = read_u16(&mut input)?;
-    let count = usize::try_from(read_u32(&mut input)?).map_err(|_| ModelBackupError::Capacity)?;
-    if version != ARCHIVE_VERSION || count == 0 || count > limits.maximum_members().get() {
-        return Err(ModelBackupError::Archive);
-    }
-    let (manifest_path, manifest_bytes) = read_member(&mut input, MAXIMUM_MANIFEST_BYTES)?;
-    if manifest_path != "manifest.json" {
-        return Err(ModelBackupError::Archive);
-    }
-    let manifest = serde_json::from_slice::<SnapshotManifest>(&manifest_bytes)
-        .map_err(|_| ModelBackupError::Archive)?;
-    if manifest.schema_version != ARCHIVE_VERSION
-        || serde_json::to_vec(&manifest)
-            .map_err(|_| ModelBackupError::Archive)?
-            .as_slice()
-            != manifest_bytes.as_ref()
-        || manifest.members.len().checked_add(1) != Some(count)
-    {
-        return Err(ModelBackupError::Archive);
-    }
-    let expected = manifest
-        .members
-        .iter()
-        .map(|member| member.path.as_str())
-        .collect::<BTreeSet<_>>();
-    if expected.len() != manifest.members.len()
-        || !expected.iter().all(|path| valid_archive_path(path))
-    {
-        return Err(ModelBackupError::Archive);
-    }
-    let mut members = BTreeMap::new();
-    for expected_member in &manifest.members {
-        let (path, bytes) = read_member(&mut input, limits.maximum_member_bytes().get())?;
-        if path != expected_member.path
-            || !expected.contains(path.as_str())
-            || members.insert(path, bytes).is_some()
-        {
-            return Err(ModelBackupError::Archive);
-        }
-    }
-    let mut trailing = [0_u8; 1];
-    if input.read(&mut trailing)? != 0 || members.len() != manifest.members.len() {
-        return Err(ModelBackupError::Archive);
-    }
-    for expected in &manifest.members {
-        let bytes = members
-            .get(&expected.path)
-            .ok_or(ModelBackupError::Archive)?;
-        if u64::try_from(bytes.len()) != Ok(expected.byte_length)
-            || hex(Sha256::digest(bytes).into()) != expected.sha256
-        {
-            return Err(ModelBackupError::Archive);
-        }
-    }
-    Ok(DecodedArchive { manifest, members })
+fn semantic_digest() -> Sha256 {
+    let mut digest = Sha256::new();
+    digest.update(SEMANTIC_REVISION_DOMAIN);
+    digest
+}
+
+fn update_semantic(digest: &mut Sha256, path: &str, bytes: &[u8]) -> Result<(), ModelBackupError> {
+    digest.update(
+        u64::try_from(path.len())
+            .map_err(|_| ModelBackupError::Capacity)?
+            .to_be_bytes(),
+    );
+    digest.update(path.as_bytes());
+    digest.update(
+        u64::try_from(bytes.len())
+            .map_err(|_| ModelBackupError::Capacity)?
+            .to_be_bytes(),
+    );
+    digest.update(Sha256::digest(bytes));
+    Ok(())
 }
 
 fn write_member(
@@ -272,39 +256,10 @@ fn valid_archive_path(value: &str) -> bool {
         })
 }
 
-fn encoded_length(
-    manifest: &[u8],
-    members: &[RetainedArchiveMember],
-) -> Result<u64, ModelBackupError> {
-    let fixed_header =
-        u64::try_from(MAGIC.len() + 2 + 4).map_err(|_| ModelBackupError::Capacity)?;
-    std::iter::once(("manifest.json", manifest))
-        .chain(
-            members
-                .iter()
-                .map(|member| (member.path.as_str(), member.bytes.as_ref())),
-        )
-        .try_fold(fixed_header, |total, (path, bytes)| {
-            let path = u64::try_from(path.len()).map_err(|_| ModelBackupError::Capacity)?;
-            let bytes = u64::try_from(bytes.len()).map_err(|_| ModelBackupError::Capacity)?;
-            total
-                .checked_add(2 + 8 + 32)
-                .and_then(|value| value.checked_add(path))
-                .and_then(|value| value.checked_add(bytes))
-                .ok_or(ModelBackupError::Capacity)
-        })
-}
-
 fn read_u16(reader: &mut impl Read) -> Result<u16, ModelBackupError> {
     let mut bytes = [0_u8; 2];
     reader.read_exact(&mut bytes)?;
     Ok(u16::from_be_bytes(bytes))
-}
-
-fn read_u32(reader: &mut impl Read) -> Result<u32, ModelBackupError> {
-    let mut bytes = [0_u8; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_be_bytes(bytes))
 }
 
 fn read_u64(reader: &mut impl Read) -> Result<u64, ModelBackupError> {
@@ -382,11 +337,11 @@ impl<'reader> BoundedReader<'reader> {
 
 impl Read for BoundedReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
         if self.cancellation.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "model backup restore was cancelled",
-            ));
+            return Err(std::io::Error::other("model backup restore was cancelled"));
         }
         if self.remaining == 0 {
             let mut trailing = [0_u8; 1];
@@ -399,11 +354,76 @@ impl Read for BoundedReader<'_> {
         }
         let permitted = usize::try_from(self.remaining)
             .unwrap_or(usize::MAX)
-            .min(bytes.len());
+            .min(bytes.len())
+            .min(64 * 1024);
         let read = self.reader.read(&mut bytes[..permitted])?;
         self.remaining = self
             .remaining
             .saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
         Ok(read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read};
+
+    use super::{ArchiveReader, ArchiveWriter, MAGIC};
+    use crate::application::model::backup::{ModelBackupError, ModelBackupLimits};
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn streamed_archive_requires_complete_integrity_and_cancellation_terminates_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = ModelBackupLimits::standard()?;
+        let cancellation = CancellationToken::new();
+        let mut encoded = Vec::new();
+        let mut writer = ArchiveWriter::new(&mut encoded, limits, &cancellation)?;
+        writer.member("first.json", b"first")?;
+        writer.member("last.json", b"last")?;
+        let (revision, length, _) = writer.finish()?;
+        assert_eq!(length, encoded.len() as u64);
+        let read_complete = |bytes: &[u8]| -> Result<[u8; 32], ModelBackupError> {
+            let mut input = Cursor::new(bytes);
+            let mut reader = ArchiveReader::new(&mut input, limits, &cancellation)?;
+            assert_eq!(reader.member("first.json")?.as_ref(), b"first");
+            assert_eq!(reader.member("last.json")?.as_ref(), b"last");
+            reader.finish()
+        };
+        assert_eq!(read_complete(&encoded)?, revision);
+        // The last authority bytes must be present and authentic before restore can succeed.
+        assert!(read_complete(&encoded[..encoded.len() - 1]).is_err());
+        let mut corrupt = encoded.clone();
+        let last = corrupt.last_mut().ok_or("empty archive")?;
+        *last ^= 1;
+        assert!(read_complete(&corrupt).is_err());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(read_complete(&trailing).is_err());
+
+        struct CancelDuringRead<'a> {
+            bytes: Cursor<&'a [u8]>,
+            cancellation: CancellationToken,
+        }
+        impl Read for CancelDuringRead<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.bytes.read(bytes)?;
+                if self.bytes.position() > MAGIC.len() as u64 {
+                    self.cancellation.cancel();
+                }
+                Ok(read)
+            }
+        }
+        let cancelled = CancellationToken::new();
+        let mut input = CancelDuringRead {
+            bytes: Cursor::new(encoded.as_slice()),
+            cancellation: cancelled.clone(),
+        };
+        let mut reader = ArchiveReader::new(&mut input, limits, &cancelled)?;
+        assert!(matches!(
+            reader.member("first.json"),
+            Err(ModelBackupError::Cancelled)
+        ));
+        Ok(())
     }
 }

@@ -198,6 +198,69 @@ impl ReleaseEvidenceInferenceFixture {
         })
     }
 
+    /// Constructs the closed research fixture: one raw lag, two raw exogenous columns,
+    /// and two outputs at observation offsets one and three.
+    ///
+    /// This is synthetic execution evidence, not candidate-admission or financial authority.
+    /// The graph must bind this exact layout in its ONNX metadata before a worker starts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a graph layout mismatch, invalid worker identity, or failed backend warm-up.
+    pub fn try_research_onnx_backend(
+        worker_path: &Path,
+        worker_digest: [u8; 32],
+        artifact_bytes: &[u8],
+    ) -> Result<TractOnnxBackend, ReleaseEvidenceInferenceError> {
+        let features = feature_bindings()?
+            .into_iter()
+            .map(|binding| {
+                ModelFeatureBinding::new(
+                    binding.key().clone(),
+                    binding.input_schema_digest(),
+                    binding.semantic_digest(),
+                    FeatureNormalizer::Identity,
+                )
+            })
+            .collect();
+        let mut bundle = build_bundle(
+            BundleSeed {
+                model_id: "018f3c2a-91ab-7ccd-b3de-123456789abf",
+                bundle_id: "release-evidence-research-onnx",
+                artifact_digest: sha256(artifact_bytes),
+                metadata_digest: sha256(b"release-evidence-research-metadata-v1"),
+                training_run_digest: sha256(b"release-evidence-research-training-run-v1"),
+            },
+            training_dataset()?,
+            ModelFormat::Onnx,
+            artifact_bytes,
+            features,
+            None,
+        )?;
+        bundle.forecast_tensor_layout = Some(super::validation::ForecastTensorLayout {
+            lags: Box::new([1]),
+            horizons: Box::new([1, 3]),
+            strategy: "direct".into(),
+        });
+        bundle.retained_bytes = bundle
+            .retained_bytes
+            .checked_add(3 * size_of::<u32>() + "direct".len())
+            .ok_or(ReleaseEvidenceInferenceError::InvalidFixture)?;
+        let policy = OnnxModelPolicy::try_new_for_bundle(
+            &bundle,
+            13,
+            &[1, 3],
+            &[1, 2],
+            Duration::from_millis(250),
+            OnnxFallbackPolicy::NoAction,
+        )
+        .map_err(ReleaseEvidenceInferenceError::OnnxPolicy)?;
+        let program = OnnxWorkerProgram::admit(worker_path, worker_digest)
+            .map_err(ReleaseEvidenceInferenceError::WorkerAdmission)?;
+        TractOnnxBackend::try_from_bundle(Arc::new(bundle), policy, &program)
+            .map_err(ReleaseEvidenceInferenceError::OnnxBackend)
+    }
+
     /// Runs one production native inference with exact input-identity validation.
     ///
     /// # Errors
@@ -378,6 +441,7 @@ fn build_bundle(
         probability_outcomes_bytes: None,
         probability_policy_bytes: None,
         forecast_residual_distribution: None,
+        forecast_tensor_layout: None,
         retained_bytes,
     })
 }

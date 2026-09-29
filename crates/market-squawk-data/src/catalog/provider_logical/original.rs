@@ -1,5 +1,7 @@
 //! Original-file custody and exact creating-generation locators in the logical catalog.
 
+use crate::ingest::LogicalOriginalSourceRevisionKind;
+
 use std::time::Instant;
 
 use market_squawk_domain::SourceId;
@@ -66,6 +68,8 @@ struct Original {
     source: SourceId,
     native_schema: EvidenceDigest,
     source_revision: EvidenceDigest,
+    registered_source_revision: EvidenceDigest,
+    source_revision_kind: LogicalOriginalSourceRevisionKind,
     received_at: Timestamp,
     retained_at: Timestamp,
     rights_id: [u8; 32],
@@ -80,6 +84,8 @@ impl Catalog {
         source: &SourceId,
         native_schema: EvidenceDigest,
         source_revision: EvidenceDigest,
+        registered_source_revision: EvidenceDigest,
+        source_revision_kind: LogicalOriginalSourceRevisionKind,
         original_digest: EvidenceDigest,
         received_at: Timestamp,
         checkpoint: &[u8],
@@ -147,6 +153,14 @@ impl Catalog {
         if received_at > now {
             return Err(CatalogError::PublicationTimeConflict);
         }
+        validate_source_revision(
+            &transaction,
+            source,
+            source_revision,
+            registered_source_revision,
+            source_revision_kind,
+            now,
+        )?;
         let admitted: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM source_rights AS rights
              JOIN source_revisions AS revision ON revision.source_id=rights.source_id
@@ -156,7 +170,7 @@ impl Catalog {
                AND (rights.authorization_expires_at_ns IS NULL OR rights.authorization_expires_at_ns>?5)
                AND revision.revision_digest=?6 AND revision.registered_at_ns<=?5)",
             params![grant.rights_id(), source.as_str(), original_digest.bytes(),
-                i64::from(SourceOperation::Persist.mask()), now.unix_nanos(), source_revision.bytes()],
+                i64::from(SourceOperation::Persist.mask()), now.unix_nanos(), registered_source_revision.bytes()],
             |row| row.get(0),
         )?;
         if !admitted {
@@ -167,6 +181,8 @@ impl Catalog {
                 || existing.source != *source
                 || existing.native_schema != native_schema
                 || existing.source_revision != source_revision
+                || existing.registered_source_revision != registered_source_revision
+                || existing.source_revision_kind != source_revision_kind
                 || existing.received_at != received_at
                 || existing.receipt.checkpoint_bytes() != checkpoint
                 || existing.objects.as_ref() != claims.as_slice()
@@ -188,6 +204,8 @@ impl Catalog {
             source: source.clone(),
             native_schema,
             source_revision,
+            registered_source_revision,
+            source_revision_kind,
             received_at,
             retained_at: now,
             rights_id: grant.rights_id(),
@@ -199,12 +217,12 @@ impl Catalog {
              (coordinate_digest, dataset_id, source_id, native_schema_digest, source_revision_digest,
               original_digest, received_at_ns, checkpoint_digest, checkpoint_bytes,
               object_count, object_set_digest, rights_id, custody_digest, retained_at_ns,
-              publication_digest, published_at_ns)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL)",
+              publication_digest, published_at_ns, registered_source_revision_digest, source_revision_kind)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,?15,?16)",
             params![coordinate.bytes(), dataset.as_str(), source.as_str(), native_schema.bytes(),
                 source_revision.bytes(), original_digest.bytes(), received_at.unix_nanos(),
                 checkpoint_digest(checkpoint).bytes(), checkpoint, to_i64(value.objects.len())?,
-                object_set_digest(&value.objects).bytes(), grant.rights_id(), receipt_digest.bytes(), now.unix_nanos()],
+                object_set_digest(&value.objects).bytes(), grant.rights_id(), receipt_digest.bytes(), now.unix_nanos(), registered_source_revision.bytes(), source_revision_kind.name()],
         )?;
         for object in &value.objects {
             check_control(deadline, cancellation)?;
@@ -540,13 +558,16 @@ fn load_original(
         i64,
         Option<Vec<u8>>,
         Option<i64>,
+        Vec<u8>,
+        String,
     );
     let header: Option<Header> = connection.query_row(
         "SELECT dataset_id, source_id, native_schema_digest, source_revision_digest, original_digest,
          received_at_ns, checkpoint_digest, checkpoint_bytes, object_count, object_set_digest,
-         rights_id, custody_digest, retained_at_ns, publication_digest, published_at_ns
+         rights_id, custody_digest, retained_at_ns, publication_digest, published_at_ns,
+         registered_source_revision_digest, source_revision_kind
          FROM provider_logical_originals WHERE coordinate_digest=?1", [coordinate.bytes()],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?)),
     ).optional()?;
     let Some(header) = header else {
         return Ok(None);
@@ -623,6 +644,12 @@ fn load_original(
         source: SourceId::try_from(header.1.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
         native_schema: parse_digest(1, &header.2)?,
         source_revision: parse_digest(1, &header.3)?,
+        registered_source_revision: parse_digest(1, &header.15)?,
+        source_revision_kind: match header.16.as_str() {
+            "metadata" => LogicalOriginalSourceRevisionKind::Metadata,
+            "contract_payload" => LogicalOriginalSourceRevisionKind::ContractPayload,
+            _ => return Err(CatalogError::CorruptCatalog),
+        },
         received_at: Timestamp::from_unix_nanos(header.5),
         retained_at: Timestamp::from_unix_nanos(header.12),
         rights_id: header
@@ -643,6 +670,14 @@ fn load_original(
     {
         return Err(CatalogError::CorruptCatalog);
     }
+    validate_source_revision(
+        connection,
+        &original.source,
+        original.source_revision,
+        original.registered_source_revision,
+        original.source_revision_kind,
+        original.retained_at,
+    )?;
     let rights_match: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM source_rights WHERE rights_id=?1 AND source_id=?2
          AND payload_algorithm=1 AND payload_digest=?3 AND (operation_mask & ?4)<>0
@@ -686,6 +721,8 @@ fn custody_digest(original: &Original) -> EvidenceDigest {
     let mut hash = Sha256::new();
     hash.update(ORIGINAL_RECEIPT_DOMAIN);
     hash_digest(&mut hash, original.receipt.coordinate);
+    hash_digest(&mut hash, original.registered_source_revision);
+    hash_field(&mut hash, original.source_revision_kind.name().as_bytes());
     hash_digest(
         &mut hash,
         checkpoint_digest(original.receipt.checkpoint_bytes()),
@@ -709,4 +746,31 @@ fn check_control(deadline: Instant, cancellation: &CancellationToken) -> Result<
     } else {
         Ok(())
     }
+}
+
+fn validate_source_revision(
+    connection: &Connection,
+    source: &SourceId,
+    revision: EvidenceDigest,
+    registered: EvidenceDigest,
+    kind: LogicalOriginalSourceRevisionKind,
+    retained_at: Timestamp,
+) -> Result<(), CatalogError> {
+    let json: String = connection.query_row(
+        "SELECT metadata_json FROM source_revisions WHERE source_id=?1 AND revision_digest=?2 AND registered_at_ns<=?3",
+        params![source.as_str(), registered.bytes(), retained_at.unix_nanos()], |row| row.get(0),
+    ).optional()?.ok_or(CatalogError::CorruptCatalog)?;
+    let metadata: market_squawk_sources::SourceMetadata = serde_json::from_str(&json)?;
+    if json.len() > 1024 * 1024
+        || serde_json::to_string(&metadata)? != json
+        || metadata.source_id() != source
+        || EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(json.as_bytes()).into(),
+        ) != registered
+        || kind.digest(&metadata, registered) != revision
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(())
 }

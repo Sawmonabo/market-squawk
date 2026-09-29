@@ -6,10 +6,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_domain::{
-    CalendarDate, Currency, DigestAlgorithm, EvidenceDigest,
-    ExactPayloadEvidence, FundNavCompleteness, FundNavDisposition, FundNavMissingState,
-    FundNavValue, InstrumentId, MarketBarAdjustment,
-    MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence,
+    CalendarDate, Currency, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
+    FundNavCompleteness, FundNavDisposition, FundNavMissingState, FundNavValue, InstrumentId,
+    MarketBarAdjustment, MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence,
     SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{LocalPaths, RawCaptureRecord, SealedResearchJournalStore};
@@ -21,9 +20,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    TIINGO_APPLICATION_BYTES_PER_MONTH, TiingoAdapterError, TiingoCompletedEodHistoryCandidate,
-    TiingoCompletedFundNavHistoryCandidate, TiingoCompletedHistoryCapture, TiingoDecoder,
-    TiingoEodContractEvidence,
+    TIINGO_APPLICATION_BYTES_PER_MONTH, TiingoAdapterError, TiingoCompletedFundNavHistoryCandidate,
+    TiingoCompletedHistoryCapture, TiingoDecoder, TiingoEodContractEvidence,
     TiingoEodExpectedSessionAuthority, TiingoEodExpectedSessionEvidence,
     TiingoEodExpectedSessionRequest, TiingoEodExpectedSessionValidationReceipt,
     TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority, TiingoEodInstrumentKind,
@@ -129,6 +127,10 @@ fn seal_response(
         crate::TiingoEndpointFamily::Metadata => "tiingo-daily-metadata",
         crate::TiingoEndpointFamily::LatestDailyPrices => "tiingo-daily-latest",
         crate::TiingoEndpointFamily::HistoricalDailyPrices => "tiingo-daily-history-window",
+        crate::TiingoEndpointFamily::CorporateActionDistributions => {
+            "tiingo-corporate-action-distributions"
+        }
+        crate::TiingoEndpointFamily::CorporateActionSplits => "tiingo-corporate-action-splits",
     };
     let receipt = ProviderCaptureSetReceipt::try_new(
         contract.source_id().clone(),
@@ -204,6 +206,7 @@ impl TiingoEodExpectedSessionAuthority for FixedEodExpectedSessionAuthority {
     fn resolve_expected_sessions(
         &self,
         request: &TiingoEodExpectedSessionRequest,
+        emit: &mut dyn FnMut(CalendarDate) -> Result<(), TiingoEodMapError>,
     ) -> Result<TiingoEodExpectedSessionEvidence, TiingoEodMapError> {
         let expected_date = CalendarDate::new(2026, 8, 10)
             .map_err(|_| TiingoEodMapError::InvalidExpectedSessionEvidence)?;
@@ -214,6 +217,7 @@ impl TiingoEodExpectedSessionAuthority for FixedEodExpectedSessionAuthority {
         {
             return Err(TiingoEodMapError::InvalidExpectedSessionEvidence);
         }
+        emit(expected_date)?;
         TiingoEodExpectedSessionEvidence::try_new(
             request,
             SourceIdentifier::try_from("xnas-expected-sessions")
@@ -234,9 +238,12 @@ impl TiingoEodExpectedSessionAuthority for FixedEodExpectedSessionAuthority {
             digest(b"xnas-original-calendar-content"),
             digest(b"xnas-original-calendar-capture"),
             market_squawk_sources::ReviewedMarketCalendarRelationship::try_new(
-                request.venue_id().clone(), request.venue_id().clone(),
-                request.start_date(), request.end_date(),
-            ).map_err(|_| TiingoEodMapError::InvalidExpectedSessionEvidence)?,
+                request.venue_id().clone(),
+                request.venue_id().clone(),
+                request.start_date(),
+                request.end_date(),
+            )
+            .map_err(|_| TiingoEodMapError::InvalidExpectedSessionEvidence)?,
         )
     }
 
@@ -245,9 +252,16 @@ impl TiingoEodExpectedSessionAuthority for FixedEodExpectedSessionAuthority {
         evidence: &TiingoEodExpectedSessionEvidence,
     ) -> Result<TiingoEodExpectedSessionValidationReceipt, TiingoEodMapError> {
         if evidence.calendar_id().as_str() == "xnas-expected-sessions"
-            && evidence.expected_sessions()
-                == [CalendarDate::new(2026, 8, 10)
-                    .map_err(|_| TiingoEodMapError::InvalidExpectedSessionEvidence)?]
+            && evidence.expected_session_count() == 1
+            && evidence.expected_session_digest() == {
+                let mut hash = Sha256::new();
+                crate::eod::append_dates(
+                    &mut hash,
+                    &[CalendarDate::new(2026, 8, 10)
+                        .map_err(|_| TiingoEodMapError::InvalidExpectedSessionEvidence)?],
+                );
+                EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+            }
         {
             TiingoEodExpectedSessionValidationReceipt::try_new(
                 evidence,
@@ -661,7 +675,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         Timestamp::from_unix_nanos(50),
         Timestamp::from_unix_nanos(51),
     )?;
-    let equity_body = br#"[{"date":"2026-08-10T00:00:00.000Z","open":200,"high":201,"low":199,"close":200,"volume":100,"adjOpen":200,"adjHigh":201,"adjLow":199,"adjClose":200,"adjVolume":100,"divCash":0,"splitFactor":1}]"#;
+    let equity_body = br#"[{"date":"2026-08-10T00:00:00.000Z","open":200,"high":201,"low":199,"close":200,"volume":100,"adjOpen":200,"adjHigh":201,"adjLow":199,"adjClose":200,"adjVolume":100,"divCash":0,"splitFactor":2}]"#;
     let equity_history_plan = TiingoHistoryPlan::try_new(
         equity_ticker.clone(),
         date(2026, 8, 10)?,
@@ -815,48 +829,145 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
     assert_ne!(raw.semantic_identity(), adjusted.semantic_identity());
 
     let completed_capture = completed_single_page_history(
-        equity_history_plan,
+        equity_history_plan.clone(),
         &equity_response,
         &equity_sealed,
         &contract,
     )?;
-    let completed_history = TiingoCompletedEodHistoryCandidate::try_new(
-        completed_capture,
-        vec![eod_page],
-        &eod_instrument,
-        &FixedEodExpectedSessionAuthority,
+    let calendar_request =
+        TiingoEodExpectedSessionRequest::new(&equity_history_plan, &eod_instrument);
+    let mut expected_dates = Vec::new();
+    let calendar = FixedEodExpectedSessionAuthority.resolve_expected_sessions(
+        &calendar_request,
+        &mut |date| {
+            expected_dates.push(date);
+            Ok(())
+        },
     )?;
-    let expected_completion_identity = completed_history.completion_identity();
-    let pending_history = completed_history.into_pending_publication();
+    let validation = FixedEodExpectedSessionAuthority.validate_current(&calendar)?;
+    let expected_completion_identity = crate::eod::history_completion_identity(
+        &completed_capture,
+        std::slice::from_ref(&eod_page),
+        &calendar,
+        &expected_dates,
+        &validation,
+        &expected_dates,
+        &[],
+        TiingoEodFinancialCoverageDisposition::Complete,
+        2,
+        0,
+        1,
+    )?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let make_stage = || {
+        crate::TiingoEodHistoryStage::try_new(
+            equity_history_plan.clone(),
+            equity_metadata.clone(),
+            equity_metadata_sealed.clone(),
+            eod_instrument.clone(),
+            eod_contract.clone(),
+            None,
+            digest(b"fixture-admitted-plan"),
+            temporary.path(),
+        )
+    };
+    let mut stage = make_stage()?;
+    let page = stage.push_page(
+        &equity_response,
+        &equity_sealed,
+        Timestamp::from_unix_nanos(54),
+        &cancel,
+    )?;
+    let terminal = crate::TiingoVerifiedHistoryTerminal {
+        plan_identity: equity_history_plan.request_set_identity(),
+        page_count: 1,
+        last_page_identity: Some(page.page_identity()),
+        checkpoint_identity: completed_capture.checkpoint_receipt_identity(),
+    };
+    let mut indexed = stage.finish(terminal, &FixedEodExpectedSessionAuthority, &cancel)?;
+    assert!(indexed.publication_authorized());
+    assert_eq!(indexed.completion_identity(), expected_completion_identity);
     assert_eq!(
         (
-            pending_history.capture().terminal(),
-            pending_history.pages().len(),
-            pending_history.total_bars(),
-            pending_history.total_gaps(),
-            pending_history.total_provider_actions(),
-            pending_history.financial_coverage(),
-            pending_history.returned_sessions(),
-            pending_history.missing_expected_sessions().is_empty(),
-            pending_history
-                .expected_session_validation()
-                .authority_generation()
-                .as_str(),
-            pending_history.completion_identity(),
+            indexed.descriptor().raw_count(),
+            indexed.descriptor().all_count(),
+            indexed.descriptor().source_action_count(),
+            indexed.descriptor().normalized_action_count()
         ),
-        (
-            TiingoHistoryTerminalDisposition::ApplicationDateWindowsExhaustedWithoutProviderCursor,
-            1,
-            2,
-            0,
-            1,
-            TiingoEodFinancialCoverageDisposition::Complete,
-            [date(2026, 8, 10)?].as_slice(),
-            true,
-            "xnas-calendar-authority-generation-7",
-            expected_completion_identity,
-        )
+        (1, 1, 1, 1)
     );
+    assert!(indexed.descriptor().raw_digest().is_some());
+    assert!(indexed.descriptor().all_digest().is_some());
+    assert_eq!(
+        indexed.session_at(0)?.ok_or("missing indexed date")?.date,
+        date(2026, 8, 10)?
+    );
+    let disposition = indexed
+        .action_disposition_at(0)?
+        .ok_or("missing indexed action disposition")?;
+    assert_eq!(
+        disposition.cash,
+        crate::TiingoEodActionFieldDisposition::ExplicitNoEvent
+    );
+    assert_eq!(
+        disposition.shares,
+        crate::TiingoEodActionFieldDisposition::Normalized {
+            observation_index: 0
+        }
+    );
+    let mut observations = Vec::new();
+    while let Some(request) = indexed.extraction_request(
+        Timestamp::from_unix_nanos(1000),
+        std::num::NonZeroU32::MIN,
+        NonZeroU64::new(8 * 1024 * 1024).ok_or("byte budget")?,
+    )? {
+        let chunk = indexed
+            .next_chunk(&request, &cancel)?
+            .ok_or("missing indexed chunk")?;
+        assert_eq!(chunk.batch().records().len(), 1);
+        assert_eq!(chunk.global_start(), observations.len() as u64);
+        let record = &chunk.batch().records()[0];
+        observations.push(serde_json::from_slice::<
+            market_squawk_domain::ResearchObservation,
+        >(record.payload())?);
+    }
+    assert!(indexed.is_exhausted());
+    assert_eq!(indexed.chunk_count(), 3);
+    assert!(matches!(
+        observations.as_slice(),
+        [
+            market_squawk_domain::ResearchObservation::MarketBar(_),
+            market_squawk_domain::ResearchObservation::MarketBar(_),
+            market_squawk_domain::ResearchObservation::CorporateAction(_)
+        ]
+    ));
+    let descriptor = indexed.descriptor().clone();
+    let mut original_indexes = Vec::new();
+    indexed.write_page_index(&mut original_indexes, &cancel)?;
+    indexed.write_session_index(&mut original_indexes, &cancel)?;
+    indexed.write_action_index(&mut original_indexes, &cancel)?;
+    drop(indexed);
+    let mut reopened = make_stage()?;
+    reopened.push_page(
+        &equity_response,
+        &equity_sealed,
+        Timestamp::from_unix_nanos(54),
+        &cancel,
+    )?;
+    let reopened = reopened.finish_replay(&descriptor, &cancel)?;
+    assert!(!reopened.publication_authorized());
+    assert_eq!(reopened.descriptor(), &descriptor);
+    let mut reopened_indexes = Vec::new();
+    reopened.write_page_index(&mut reopened_indexes, &cancel)?;
+    reopened.write_session_index(&mut reopened_indexes, &cancel)?;
+    reopened.write_action_index(&mut reopened_indexes, &cancel)?;
+    assert_eq!(original_indexes, reopened_indexes);
+    let stopped = tokio_util::sync::CancellationToken::new();
+    stopped.cancel();
+    assert!(matches!(
+        reopened.write_page_index(&mut Vec::new(), &stopped),
+        Err(crate::TiingoEodHistoryStageError::Cancelled)
+    ));
 
     let windows = TiingoQuotaWindows::try_new(
         Timestamp::from_unix_nanos(100),

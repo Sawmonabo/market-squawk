@@ -6,13 +6,14 @@
 //! manifest plus source/native/raw/company evidence required for restart. Filing XBRL enters the
 //! same path only through the adapter's opaque accession/document/taxonomy capture graph.
 
+use std::io::{Read, Write};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::Instant;
 
 use market_squawk_adapter_sec::{
     SecClientError, SecEdgarSource, SecExtractionResult, SecFilingXbrlCaptureHandoff,
-    SecResearchDataset, SecResearchDatasetKind,
+    SecFilingXbrlExtractionStream, SecResearchDataset, SecResearchDatasetKind,
 };
 use market_squawk_data::{
     AnalyticalObservationOutput, AnalyticalObservationReadRequest, AnalyticalObservationTemplate,
@@ -250,10 +251,8 @@ impl SecFundamentalsCoordinatorClosure {
                 deadline,
             )
             .await?;
-        let published = self.publish(sealed, precommit, cancellation).await?;
-        if !matches!(published, SecFundamentalsPublicationReceipt::FilingXbrl(_)) {
-            return Err(SecFundamentalsApplicationError::InvalidSelection);
-        }
+        self.publish_filing_stream(sealed, precommit, cancellation, deadline)
+            .await?;
         Ok(true)
     }
 
@@ -287,7 +286,7 @@ impl SecFundamentalsCoordinatorClosure {
         wall_deadline: Timestamp,
         cancellation: CancellationToken,
         deadline: Instant,
-    ) -> Result<SecFundamentalsSealedHandoff, SecFundamentalsApplicationError> {
+    ) -> Result<SecFilingStreamHandoff, SecFundamentalsApplicationError> {
         self.extraction.validate_current()?;
         if cancellation.is_cancelled() {
             return Err(SecFundamentalsApplicationError::Cancelled);
@@ -295,19 +294,39 @@ impl SecFundamentalsCoordinatorClosure {
         if Instant::now() >= deadline {
             return Err(SecFundamentalsApplicationError::DeadlineExceeded);
         }
-        let source = Arc::clone(&self.source);
+        let scratch = Arc::new(self.bridge.research.analytical().operation_scratch()?);
+        let worker_scratch = Arc::clone(&scratch);
+        let raw_store = self.bridge.research.provider_capture_store();
+        let worker_store = Arc::clone(&raw_store);
         let authority = self.extraction.clone();
         let worker_cancellation = cancellation.child_token();
         let worker_token = worker_cancellation.clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            handoff.extract(
-                authority,
-                max_records,
-                max_bytes,
-                wall_deadline,
-                worker_token,
-            )
-        });
+        let worker =
+            tokio::task::spawn_blocking(move || -> Result<_, SecFundamentalsApplicationError> {
+                let (stream, material) = handoff.extract(
+                    authority,
+                    max_records,
+                    max_bytes,
+                    wall_deadline,
+                    worker_token.clone(),
+                    worker_scratch.path(),
+                )?;
+                let control = FilingStreamControl {
+                    cancellation: worker_token,
+                    deadline,
+                };
+                let mut objects = Vec::new();
+                for record in material.records() {
+                    let admission = filing_object_admission(record.payload().len() as u64)?;
+                    let mut pending = worker_store.begin_logical_object(admission)?;
+                    for bytes in record.payload().chunks(64 * 1024) {
+                        control.check()?;
+                        pending.write_all(bytes)?;
+                    }
+                    objects.push(worker_store.finish_logical_object(pending, &control)?);
+                }
+                Ok((stream, material, objects, worker_scratch))
+            });
         tokio::pin!(worker);
         let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
         tokio::pin!(deadline_wait);
@@ -327,16 +346,325 @@ impl SecFundamentalsCoordinatorClosure {
                 result.map_err(|_| SecFundamentalsApplicationError::BlockingWorkerFailed)??
             }
         };
-        let (extracted, capture_material) = extracted;
-        self.bridge
-            .seal_extracted(
-                source.as_ref(),
-                extracted,
-                capture_material,
+        let (stream, material, objects, scratch) = extracted;
+        let (expectation, request) = material.into_whole_seal_parts();
+        let sealed = self
+            .bridge
+            .research
+            .seal_provider_capture(request, &cancellation, deadline)
+            .await?;
+        let token = expectation.try_rejoin(sealed)?.try_into_whole()?;
+        let control = FilingStreamControl {
+            cancellation,
+            deadline,
+        };
+        let (objects, receipt) =
+            market_squawk_sources::SealedLogicalObjectInput::try_from_whole_capture(
+                token, objects, &control,
+            )?;
+        Ok(SecFilingStreamHandoff {
+            stream,
+            objects,
+            receipt,
+            _scratch: scratch,
+        })
+    }
+
+    async fn publish_filing_stream(
+        &self,
+        handoff: SecFilingStreamHandoff,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<CommittedDataset, SecFundamentalsApplicationError> {
+        use market_squawk_data::{IngestIdentity, SourceOperation};
+        use market_squawk_sources::{
+            ExtractionContentAccumulator, LogicalObjectRole, LogicalPartitionFamily,
+            LogicalPartitionSetAdmission, PendingLogicalPartitionSet, ProviderLogicalTerminalInput,
+            SealedLogicalObjectInput, SealedProviderLogicalPublicationBinding,
+        };
+        precommit.validate_precommit()?;
+        let SecFilingStreamHandoff {
+            mut stream,
+            mut objects,
+            receipt,
+            _scratch,
+        } = handoff;
+        let source = self.source.metadata().clone();
+        let selection =
+            SecResearchDataset::try_from_identifier(stream.request().object().dataset())?;
+        let analytical_dataset =
+            DatasetId::try_from(selection.analytical_dataset_identifier()?.as_str())
+                .map_err(|_| SecFundamentalsApplicationError::InvalidSelection)?;
+        let company_identity = stream.company_identity().clone();
+        let total_records = stream.total_records();
+        let mut content = None;
+        let raw_store = self.bridge.research.provider_capture_store();
+        let control = FilingStreamControl {
+            cancellation: cancellation.clone(),
+            deadline,
+        };
+        let mut staging = self
+            .bridge
+            .research
+            .analytical()
+            .begin_provider_logical_stream(
+                analytical_dataset.clone(),
+                source.source_id().clone(),
+                &cancellation,
+            )?;
+        let partition_admission = LogicalPartitionSetAdmission::try_new(
+            filing_object_admission(32 * 1024 * 1024)?,
+            4096,
+            256,
+            128 * 1024,
+        )?;
+        let row_map_schema = filing_digest(b"market-squawk/sec-filing/logical-row-map/v1");
+        let mut native_partitions = None;
+        let mut row_partitions = PendingLogicalPartitionSet::begin(
+            LogicalPartitionFamily::CanonicalRowMap,
+            row_map_schema,
+            partition_admission,
+            0,
+        )?;
+        let mut expectations = Vec::new();
+        let mut native_descriptor = None;
+        loop {
+            control.check()?;
+            let token = cancellation.child_token();
+            let worker_token = token.clone();
+            let mut worker = tokio::task::spawn_blocking(move || {
+                let chunk = stream.next_chunk(&worker_token);
+                (stream, chunk)
+            });
+            let (returned, chunk) = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => { token.cancel(); let _ = worker.await; return Err(SecFundamentalsApplicationError::Cancelled); }
+                _ = tokio::time::sleep_until(deadline.into()) => { token.cancel(); let _ = worker.await; return Err(SecFundamentalsApplicationError::DeadlineExceeded); }
+                result = &mut worker => result.map_err(|_| SecFundamentalsApplicationError::BlockingWorkerFailed)?,
+            };
+            stream = returned;
+            let Some(chunk) = chunk? else {
+                break;
+            };
+            let start = stream
+                .emitted_records()
+                .checked_sub(chunk.batch().records().len())
+                .ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
+            let (batch, _, native, page_ordinals) = chunk.into_parts();
+            let batch = batch.try_bind_provider_capture(receipt.capture())?;
+            if content.is_none() {
+                content = Some(ExtractionContentAccumulator::try_new(
+                    batch.request(),
+                    total_records,
+                )?);
+            }
+            native
+                .validate(&batch)
+                .map_err(|_| SecFundamentalsApplicationError::InvalidNativeLineage)?;
+            if native_partitions.is_none() {
+                native_partitions = Some(PendingLogicalPartitionSet::begin(
+                    LogicalPartitionFamily::ProviderNative,
+                    native.schema().fingerprint(),
+                    partition_admission,
+                    0,
+                )?);
+                let sidecar = native
+                    .batch_sidecar()
+                    .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?;
+                let chunks = sidecar
+                    .chunks()
+                    .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?;
+                let mut reader = chunks
+                    .reader()
+                    .map_err(|_| SecFundamentalsApplicationError::InvalidNativeLineage)?;
+                let size = reader.metadata()?.len();
+                let mut pending = raw_store.begin_logical_object(filing_object_admission(size)?)?;
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    control.check()?;
+                    let read = reader.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    pending.write_all(&buffer[..read])?;
+                }
+                let object = raw_store.finish_logical_object(pending, &control)?;
+                objects.push(SealedLogicalObjectInput::try_from_verified(
+                    LogicalObjectRole::ProviderComponent,
+                    objects.len() as u32,
+                    sidecar.semantic_payload_digest(),
+                    object,
+                    &control,
+                )?);
+                native_descriptor = Some(sidecar.semantic_payload().to_vec());
+            }
+            let native_set = native_partitions
+                .as_mut()
+                .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?;
+            for (local, ((record, native_row), page)) in batch
+                .records()
+                .iter()
+                .zip(native.rows())
+                .zip(&page_ordinals)
+                .enumerate()
+            {
+                control.check()?;
+                let ordinal = u64::try_from(start + local)
+                    .map_err(|_| SecFundamentalsApplicationError::AllocationFailed)?;
+                content
+                    .as_mut()
+                    .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+                    .push(record)?;
+                native_set.stage_frame(
+                    &raw_store,
+                    &control,
+                    ordinal,
+                    native_row.semantic_payload(),
+                    native_row.semantic_payload_digest(),
+                )?;
+                let frame = receipt.row_frame(
+                    u32::try_from(ordinal)
+                        .map_err(|_| SecFundamentalsApplicationError::AllocationFailed)?,
+                    *page,
+                )?;
+                let mapping = serde_json::to_vec(&serde_json::json!({
+                    "canonical_row_ordinal": frame.canonical_row_ordinal(), "capture_page_ordinal": frame.capture_page_ordinal(),
+                    "segment_ordinal": frame.segment_ordinal(), "physical_frame_ordinal": frame.physical_frame_ordinal(),
+                    "page_body_digest": frame.page_body_digest(), "received_at": frame.received_at(), "source_sequence": frame.source_sequence(),
+                    "canonical_record_digest": record.evidence().content_digest(), "native_semantic_digest": native_row.semantic_payload_digest(),
+                }))?;
+                row_partitions.stage_frame(
+                    &raw_store,
+                    &control,
+                    ordinal,
+                    &mapping,
+                    filing_digest(&mapping),
+                )?;
+            }
+            native_set.seal_current_partition(&raw_store, &control)?;
+            row_partitions.seal_current_partition(&raw_store, &control)?;
+            let revisions = self.source.revision_plan(&batch)?;
+            expectations.push(
+                self.bridge
+                    .research
+                    .analytical()
+                    .stage_provider_logical_stream_chunk(
+                        &mut staging,
+                        batch,
+                        native,
+                        revisions,
+                        &receipt,
+                        &page_ordinals,
+                        &cancellation,
+                    )
+                    .await?,
+            );
+        }
+        if stream.emitted_records() != total_records {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+        let whole_content = content
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+            .finish()?;
+        let companion = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "family": "sec_filing_capture", "capture": receipt.capture(), "sealed_receipt_digest": receipt.receipt_digest(), "original_segment_claim": receipt.segment().claim(),
+            "company_identity": &company_identity, "native_descriptor": native_descriptor,
+            "extraction_content_identity": whole_content.digest(), "record_count": whole_content.record_count(),
+        }))?;
+        let mut pending =
+            raw_store.begin_logical_object(filing_object_admission(companion.len() as u64)?)?;
+        pending.write_all(&companion)?;
+        let object = raw_store.finish_logical_object(pending, &control)?;
+        objects.push(SealedLogicalObjectInput::try_from_verified(
+            LogicalObjectRole::ProviderComponent,
+            objects.len() as u32,
+            filing_digest(&companion),
+            object,
+            &control,
+        )?);
+        let mut partitions = native_partitions
+            .ok_or(SecFundamentalsApplicationError::InvalidNativeLineage)?
+            .finish(&raw_store, &control)?
+            .into_partitions()
+            .into_vec();
+        partitions.extend(
+            row_partitions
+                .finish(&raw_store, &control)?
+                .into_partitions()
+                .into_vec(),
+        );
+        let total_logical_object_bytes = objects
+            .iter()
+            .try_fold(0u64, |total, object| {
+                total.checked_add(object.object().size_bytes())
+            })
+            .ok_or(SecFundamentalsApplicationError::AllocationFailed)?;
+        let binding = SealedProviderLogicalPublicationBinding::try_new(
+            ProviderLogicalTerminalInput {
+                source_id: source.source_id().clone(),
+                source_revision_digest: source
+                    .revision_evidence()
+                    .payload_evidence()
+                    .content_digest(),
+                execution_attempt_digest: Some(receipt.receipt_digest()),
+                provider_terminal_evidence_digest: whole_content.digest(),
+                total_decoded_events: 0,
+                total_canonical_rows: total_records as u64,
+                total_logical_object_bytes,
+            },
+            &[
+                LogicalPartitionFamily::ProviderNative,
+                LogicalPartitionFamily::CanonicalRowMap,
+            ],
+            objects,
+            partitions,
+            expectations,
+        )?;
+        let digest = binding.binding_digest();
+        let retrieved_at = receipt
+            .capture()
+            .pages()
+            .iter()
+            .map(|page| page.received_at())
+            .max()
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
+        let rights = self.rights.decision(digest, retrieved_at)?;
+        let identity = IngestIdentity::try_new(
+            source.source_id().clone(),
+            digest,
+            SourceOperation::Persist,
+            format!(
+                "sec-filing-logical:{}:{:x}",
+                analytical_dataset.as_str(),
+                Sha256::digest(digest.bytes())
+            ),
+        )?;
+        let reservation = self
+            .bridge
+            .research
+            .analytical()
+            .reserve_source_ingest(&source, retrieved_at, rights, &identity, &cancellation)
+            .await?;
+        precommit.validate_precommit()?;
+        let (committed, retained_digest) = self
+            .bridge
+            .research
+            .analytical()
+            .finish_provider_logical_stream(
+                staging,
+                reservation,
+                binding,
+                company_identity,
+                precommit,
                 cancellation,
-                deadline,
             )
-            .await
+            .await?;
+        if retained_digest != digest {
+            return Err(SecFundamentalsApplicationError::RestartInvalid);
+        }
+        drop(_scratch);
+        Ok(committed)
     }
 
     pub(crate) async fn publish(
@@ -412,7 +740,7 @@ impl SecFundamentalsApplicationBridge {
 
     /// Seals an already extracted SEC result without exposing the physical store to the adapter.
     ///
-    /// This split also accepts the filing-XBRL result emitted by the adapter's opaque capture graph.
+    /// Filing XBRL uses the complete logical stream publication owner.
     async fn seal_extracted(
         &self,
         source: &SecEdgarSource,
@@ -500,13 +828,13 @@ impl SecFundamentalsApplicationBridge {
             row_capture_page_ordinals,
             token,
         } = handoff;
-        if rights.source_id() != source.source_id()
+        if coordinates.family == SecFundamentalsFamily::FilingXbrl
+            || rights.source_id() != source.source_id()
             || batch.records().is_empty()
             || revisions.len() != batch.records().len()
             || !revisions.native_lineage_required()
             || row_capture_page_ordinals.len() != batch.records().len()
             || revisions.is_locally_observed()
-                != (coordinates.family == SecFundamentalsFamily::FilingXbrl)
         {
             return Err(SecFundamentalsApplicationError::InvalidAuthority);
         }
@@ -577,13 +905,58 @@ impl SecFundamentalsApplicationBridge {
                 })
             }
             SecFundamentalsFamily::FilingXbrl => {
-                SecFundamentalsPublicationReceipt::FilingXbrl(SecFilingXbrlPublicationReceipt {
-                    committed,
-                    restart: SecFilingXbrlRestartSelector { binding: restart },
-                })
+                return Err(SecFundamentalsApplicationError::InvalidAuthority);
             }
         })
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct SecFilingStreamHandoff {
+    stream: SecFilingXbrlExtractionStream,
+    objects: Vec<market_squawk_sources::SealedLogicalObjectInput>,
+    receipt: SealedProviderCaptureSetReceipt,
+    _scratch: Arc<market_squawk_data::OperationScratchDirectory>,
+}
+struct FilingStreamControl {
+    cancellation: CancellationToken,
+    deadline: Instant,
+}
+impl FilingStreamControl {
+    fn check(&self) -> Result<(), std::io::Error> {
+        if self.cancellation.is_cancelled() || Instant::now() >= self.deadline {
+            return Err(std::io::Error::other(
+                "filing operation cancelled or deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+impl market_squawk_platform::ResearchObjectControl for FilingStreamControl {
+    fn checkpoint(
+        &self,
+        _: market_squawk_platform::ResearchObjectControlPoint,
+    ) -> Result<(), market_squawk_platform::ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            return Err(market_squawk_platform::ResearchObjectControlError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(market_squawk_platform::ResearchObjectControlError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+fn filing_object_admission(
+    bytes: u64,
+) -> Result<market_squawk_platform::ResearchObjectAdmission, SecFundamentalsApplicationError> {
+    // Physical chunk metadata follows exact object size. This is a format admission, not RAM.
+    Ok(market_squawk_platform::ResearchObjectAdmission::try_new(
+        bytes.max(1),
+        4095,
+    )?)
+}
+fn filing_digest(bytes: &[u8]) -> EvidenceDigest {
+    EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
 }
 
 #[derive(Debug)]
@@ -755,7 +1128,6 @@ impl SecFundamentalsSealedHandoff {
 pub(crate) enum SecFundamentalsPublicationReceipt {
     Submissions(SecSubmissionsPublicationReceipt),
     CompanyFacts(SecCompanyFactsPublicationReceipt),
-    FilingXbrl(SecFilingXbrlPublicationReceipt),
 }
 
 /// Immutable complete-submissions generation and its exact restart selector.
@@ -812,47 +1184,6 @@ impl SecCompanyFactsPublicationReceipt {
     }
 
     pub(crate) const fn restart_selector(&self) -> &SecCompanyFactsRestartSelector {
-        &self.restart
-    }
-
-    pub(crate) const fn cik(&self) -> &SourceIdentifier {
-        self.restart.binding.cik()
-    }
-
-    pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
-        self.restart.binding.provider_dataset()
-    }
-
-    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
-        self.restart.manifest()
-    }
-
-    pub(crate) const fn provider_binding_digest(&self) -> EvidenceDigest {
-        self.restart.binding_digest()
-    }
-
-    pub(crate) const fn company_observation_digest(&self) -> EvidenceDigest {
-        self.restart.company_observation_digest()
-    }
-
-    pub(crate) fn company_identity(&self) -> &CompanyIdentityObservation {
-        self.restart.binding.company_identity()
-    }
-}
-
-/// Immutable accession/document/taxonomy-bound XBRL generation and exact restart selector.
-#[derive(Debug)]
-pub(crate) struct SecFilingXbrlPublicationReceipt {
-    committed: CommittedDataset,
-    restart: SecFilingXbrlRestartSelector,
-}
-
-impl SecFilingXbrlPublicationReceipt {
-    pub(crate) const fn committed(&self) -> &CommittedDataset {
-        &self.committed
-    }
-
-    pub(crate) const fn restart_selector(&self) -> &SecFilingXbrlRestartSelector {
         &self.restart
     }
 
@@ -1387,70 +1718,6 @@ impl SecCompanyFactsRestartSelector {
     }
 }
 
-/// Exact immutable filing-XBRL selector; Company Facts cannot be substituted.
-#[derive(Clone, Debug)]
-pub(crate) struct SecFilingXbrlRestartSelector {
-    binding: SecFundamentalsRestartBinding,
-}
-
-impl SecFilingXbrlRestartSelector {
-    pub(crate) fn try_from_durable_coordinates(
-        binding: SecFundamentalsRestartBinding,
-    ) -> Result<Self, SecFundamentalsApplicationError> {
-        if binding.family != SecFundamentalsFamily::FilingXbrl {
-            return Err(SecFundamentalsApplicationError::RestartInvalid);
-        }
-        Ok(Self { binding })
-    }
-
-    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
-        self.binding.manifest()
-    }
-
-    pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
-        self.binding.binding_digest()
-    }
-
-    pub(crate) const fn company_observation_digest(&self) -> EvidenceDigest {
-        self.binding.company_observation_digest()
-    }
-
-    pub(crate) const fn cik(&self) -> &SourceIdentifier {
-        self.binding.cik()
-    }
-
-    /// Reopens exact filing-XBRL numeric facts, raw graph, identity, and bounded candidates.
-    pub(crate) async fn reopen(
-        &self,
-        research: &ResearchService,
-        identity_reader: &CompanySecurityIdentityReadCapability,
-        identity_effective_at: Timestamp,
-        knowledge_at: Timestamp,
-        knowledge_range: Option<ObservationKnowledgeRange>,
-        limits: QueryLimits,
-        deadline: Instant,
-        cancellation: CancellationToken,
-    ) -> Result<SecFilingXbrlRestartReceipt, SecFundamentalsApplicationError> {
-        if self.binding.family != SecFundamentalsFamily::FilingXbrl {
-            return Err(SecFundamentalsApplicationError::RestartInvalid);
-        }
-        self.binding
-            .reopen(
-                AnalyticalObservationTemplate::Fundamental,
-                knowledge_range,
-                research,
-                identity_reader,
-                identity_effective_at,
-                knowledge_at,
-                limits,
-                deadline,
-                cancellation,
-            )
-            .await
-            .map(|receipt| SecFilingXbrlRestartReceipt { receipt })
-    }
-}
-
 #[derive(Debug)]
 struct SecFundamentalsRestartReceipt {
     evidence: PersistedProviderCaptureBindingEvidence,
@@ -1523,26 +1790,6 @@ impl SecCompanyFactsRestartReceipt {
     }
 }
 
-/// Exact raw/native/company and filing-XBRL candidates reopened after restart.
-#[derive(Debug)]
-pub(crate) struct SecFilingXbrlRestartReceipt {
-    receipt: SecFundamentalsRestartReceipt,
-}
-
-impl SecFilingXbrlRestartReceipt {
-    pub(crate) const fn provider_evidence(&self) -> &PersistedProviderCaptureBindingEvidence {
-        &self.receipt.evidence
-    }
-
-    pub(crate) const fn company_identity(&self) -> &SecCompanyIdentityRestartEvidence {
-        &self.receipt.company_identity
-    }
-
-    pub(crate) const fn observations(&self) -> &AnalyticalObservationOutput {
-        &self.receipt.observations
-    }
-}
-
 /// Filing-XBRL application capability at this adapter head.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SecFilingXbrlApplicationState {
@@ -1561,6 +1808,17 @@ pub(crate) enum SecFundamentalsPointInTimeState {
 /// Fail-closed SEC fundamentals application-composition failure.
 #[derive(Debug, Error)]
 pub(crate) enum SecFundamentalsApplicationError {
+    #[error(transparent)]
+    DataRights(#[from] market_squawk_data::RightsError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Parquet(#[from] market_squawk_data::ParquetStoreError),
+    #[error(transparent)]
+    Logical(#[from] market_squawk_sources::ProviderLogicalPublicationError),
+    #[error(transparent)]
+    RawStore(#[from] market_squawk_platform::SealedResearchJournalStoreError),
+
     #[error("SEC fundamentals selection does not match the configured source and capture")]
     InvalidSelection,
     #[error("SEC fundamentals publication authority does not match the exact sealed handoff")]

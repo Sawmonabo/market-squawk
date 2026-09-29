@@ -169,6 +169,31 @@ def _signed_prediction_attempt(
 
 
 class TrainingBundleContracts(unittest.TestCase):
+    def test_research_exports_static_affine_horizon_columns(self) -> None:
+        import numpy as np
+        import onnx
+        from market_squawk.forecasting import (
+            ForecastSpecification, ForecastStrategy, _estimator, _export_onnx,
+            _SerializedPredictor, _linear_estimator,
+        )
+
+        spec = ForecastSpecification(ForecastStrategy.CHAINED, (1, 3), (1, 2), 100, 17)
+        features = np.asarray([[float(row), float(row % 3)] for row in range(24)])
+        targets = np.column_stack((features[:, 0] * 2 + 3, features[:, 0] * -4 + features[:, 1]))
+        fitted = _estimator(spec).fit(features, targets)
+        encoded = _export_onnx(fitted, features, spec)
+        model = onnx.load_model_from_string(encoded)
+        self.assertTrue(all(node.domain in ("", "ai.onnx") for node in model.graph.node))
+        self.assertEqual([dim.dim_value for dim in model.graph.input[0].type.tensor_type.shape.dim], [1, 2])
+        self.assertEqual([dim.dim_value for dim in model.graph.output[0].type.tensor_type.shape.dim], [1, 2])
+        self.assertEqual(dict((entry.key, entry.value) for entry in model.metadata_props)["market_squawk.forecast.horizons"], "1,3")
+        np.testing.assert_allclose(_SerializedPredictor(encoded).predict(features[-1:]),
+                                   fitted.predict(features[-1:]), rtol=1e-5, atol=1e-5)
+        recursive = replace(spec, strategy=ForecastStrategy.RECURSIVE)
+        center = _linear_estimator([[2.0, -1.0]], [0.5], scalar=True)
+        recursive_graph = _export_onnx(center, features, recursive)
+        np.testing.assert_allclose(_SerializedPredictor(recursive_graph).predict([[3.0, 2.0]]), [[4.5]])
+
     def test_worker_protocol_is_ordered_bounded_and_terminal_once(self) -> None:
         stream = io.BytesIO()
         worker = WorkerProtocolWriter(

@@ -38,24 +38,25 @@ pub use canonical::{
     TiingoPendingLatestFundNavPublication, map_fund_nav_candidate,
 };
 pub use credentials::{TiingoApiToken, TiingoRequestBuilder};
-pub use decoder::{TiingoCorporateActionReceipt, TiingoCorporateActionRow, TiingoCorporateActionValue, TiingoDecoder, TiingoSchemaCircuitState};
+pub use decoder::{
+    TiingoCorporateActionReceipt, TiingoCorporateActionRow, TiingoCorporateActionValue,
+    TiingoDecoder, TiingoSchemaCircuitState,
+};
 pub use eod::{
-    TiingoCompletedEodHistoryCandidate, TiingoEodBarCandidate,
-    TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
+    TiingoEodBarCandidate, TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
     TiingoEodExpectedSessionEvidence, TiingoEodExpectedSessionRequest,
     TiingoEodExpectedSessionValidationReceipt, TiingoEodFinancialCoverageDisposition,
     TiingoEodInstrumentAuthority, TiingoEodInstrumentKind, TiingoEodMapError,
     TiingoEodMappingInput, TiingoEodPageCandidate, TiingoEodPagePublicationRoute,
     TiingoEodProviderActionEvidence, TiingoEodSurface, TiingoEodSurfaceGap,
-    TiingoEodSurfaceGapReason, TiingoPendingEodHistoryPublication,
-    TiingoPendingLatestEodPublication, map_eod_page_candidate,
+    TiingoEodSurfaceGapReason, TiingoPendingLatestEodPublication, map_eod_page_candidate,
 };
 pub use error::{
     TiingoAdapterError, TiingoProviderFailure, TiingoSchemaChange, TiingoSchemaChangeReason,
 };
 pub use history::{
     TiingoCompletedHistoryCapture, TiingoHistoryEvidenceError, TiingoHistoryTerminalDisposition,
-    TiingoSealedHistoryPage,
+    TiingoSealedHistoryPage, TiingoVerifiedHistoryTerminal,
 };
 pub use http::{
     TiingoCaptureMaterialError, TiingoCapturedPage, TiingoDecodeFailure,
@@ -75,10 +76,12 @@ pub use nav::{
     missing_nav_candidate, normalize_mutual_fund_row,
 };
 pub use publication::{
+    TiingoEodHistoryChunk, TiingoEodHistoryChunkCommitment, TiingoEodHistoryDescriptor,
+    TiingoEodHistoryPageEvidence, TiingoEodHistoryStage, TiingoEodHistoryStageError,
     TiingoLatestEodPublicationOutcome, TiingoLatestFundNavPublicationOutcome,
     TiingoLatestPublicationError, TiingoLatestUnavailableReason, TiingoPendingLatestPublication,
     TiingoSealedEodPublication, TiingoSealedFundNavPublication, TiingoSealedLatestPublication,
-    TiingoSealedLatestUnavailable, prepare_latest_publication,
+    TiingoSealedLatestUnavailable, ValidatedTiingoEodHistory, prepare_latest_publication,
 };
 pub use quota::{
     TIINGO_APPLICATION_BYTES_PER_MONTH, TIINGO_APPLICATION_REQUESTS_PER_DAY,
@@ -96,11 +99,13 @@ pub use request::{
 #[cfg(test)]
 mod tests;
 
-pub use actions::{TiingoEodCashUnitEvidence, TiingoEodActionError, TiingoEodActionFieldDisposition,
-    TiingoEodDailyActionDisposition, TiingoEodNormalizedAction, TiingoEodHistoryActionProjection,
-    TiingoEodActionReplayPage, normalize_eod_history_actions, rejoin_eod_history_actions};
-pub use publication::{TiingoPreparedEodHistoryCapture, TiingoEodHistoryPublicationError,
-    reconstruct_eod_history_mapping, verify_eod_history_native_row, verify_eod_history_native_sidecar,
-    tiingo_eod_native_schema_evidence};
+pub use actions::{
+    TiingoEodActionError, TiingoEodActionFieldDisposition, TiingoEodCashUnitEvidence,
+    TiingoEodDailyActionDisposition, TiingoEodNormalizedAction,
+};
+pub use publication::{
+    TiingoEodHistoryPublicationError, reconstruct_eod_history_descriptor_mapping,
+    tiingo_eod_native_schema_evidence, verify_eod_history_native_row,
+};
 
 pub use market_squawk_sources::ProviderNativeExchangeCode as TiingoExchangeCode;

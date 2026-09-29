@@ -16,6 +16,9 @@ import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
+import { DemandPanel } from "../shared/demand-panel"
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+
 import { BundleEvidence } from "./bundle-evidence"
 import { ForecastPreparation } from "./forecast-preparation"
 import { ForecastReview } from "./forecast-review"
@@ -25,6 +28,7 @@ import {
   parseForecasts,
   parseModelActivities,
   parseModelEvidence,
+  parseModelSummaryPage,
 } from "./models-contracts"
 
 export function ModelsPage() {
@@ -68,46 +72,59 @@ function ModelsWorkspace({
   const modelsAvailable = capabilities.has("model_evidence")
   const modelActivityAvailable = capabilities.has("model_activity")
 
+  const navigation = useCursorNavigation()
   const models = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
       "Model",
-      "Model.ListProductEvidence",
-      {},
+      "Model.ListBundles",
+      { cursor: navigation.after, limit: 25 },
     ),
-    queryFn: async () => {
-      return parseModelEvidence(await transport.modelProducts({ action: "list" }))
+    queryFn: async ({ signal }) => {
+      return parseModelSummaryPage(await transport.modelProducts({ action: "list", cursor: navigation.after, limit: 25 }, { signal }))
     },
     enabled: modelsAvailable,
+    gcTime: 0,
   })
+  const forecastNavigation = useCursorNavigation()
   const forecasts = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
       "Model",
       "Model.ListForecasts",
-      {},
+      { cursor: forecastNavigation.after, limit: 25 },
     ),
-    queryFn: async () =>
-      parseForecasts(await transport.query({ query: "forecasts" })),
+    queryFn: async ({ signal }) =>
+      parseForecasts(await transport.query({ query: "forecasts", cursor: forecastNavigation.after, limit: 25 }, { signal })),
     enabled: forecastsAvailable,
+    gcTime: 0,
   })
+  const activityNavigation = useCursorNavigation()
   const activities = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
       "Model",
       "Model.ListProductActivity",
-      {},
+      { cursor: activityNavigation.after, limit: 25 },
     ),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       return parseModelActivities(
-        await transport.modelProducts({ action: "activity" }),
+        await transport.modelProducts({ action: "activity", cursor: activityNavigation.after, limit: 25 }, { signal }),
       )
     },
     enabled: modelActivityAvailable,
-    refetchInterval: 5_000,
+    gcTime: 0,
+    refetchInterval: (query) => activityNavigation.after === undefined && query.state.data?.activities.some(isActiveModelActivity) ? 5_000 : false,
+    refetchIntervalInBackground: false,
   })
 
-  const modelRows = models.data ?? []
+  const selectedModelEvidence = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetBundle", { modelToken: selectedModelToken }),
+    enabled: modelsAvailable && selectedModelToken !== null,
+    gcTime: 0,
+    queryFn: async ({ signal }) => parseModelEvidence(await transport.modelProducts({ action: "get", modelToken: selectedModelToken! }, { signal }), selectedModelToken!),
+  })
+  const modelRows = models.data?.models ?? []
   const selectedModel =
     modelRows.find((model) => model.modelToken === selectedModelToken) ?? null
   const forecastRows = forecasts.data?.forecasts ?? []
@@ -115,18 +132,19 @@ function ModelsWorkspace({
     forecastRows.find(
       (forecast) => forecast.forecastToken === selectedForecastToken,
     ) ?? null
-  const activityRows = activities.data ?? []
+  const activityRows = activities.data?.activities ?? []
   const activeCount = activityRows.filter(isActiveModelActivity).length
   const calibratedForecasts = forecastRows.filter(
     (forecast) => forecast.modelEvidence.calibration === "calibrated",
   ).length
   const refreshing =
-    models.isFetching || forecasts.isFetching || activities.isFetching
+    models.isFetching || selectedModelEvidence.isFetching || forecasts.isFetching || activities.isFetching
 
   const refresh = () => {
     if (modelsAvailable) {
       void models.refetch()
       void activities.refetch()
+      if (selectedModelToken !== null) void selectedModelEvidence.refetch()
     }
     if (forecastsAvailable) void forecasts.refetch()
   }
@@ -168,7 +186,7 @@ function ModelsWorkspace({
       >
         <SummaryFact
           icon={Boxes}
-          label="Research models"
+          label="Models on this page"
           value={queryCount(
             modelsAvailable,
             models.isPending,
@@ -178,7 +196,7 @@ function ModelsWorkspace({
         />
         <SummaryFact
           icon={ChartNoAxesCombined}
-          label="Forecasts"
+          label="Forecasts on this page"
           value={queryCount(
             forecastsAvailable,
             forecasts.isPending,
@@ -188,7 +206,7 @@ function ModelsWorkspace({
         />
         <SummaryFact
           icon={ShieldAlert}
-          label="Calibrated forecasts"
+          label="Calibrated on this page"
           value={queryCount(
             forecastsAvailable,
             forecasts.isPending,
@@ -198,7 +216,7 @@ function ModelsWorkspace({
         />
         <SummaryFact
           icon={Activity}
-          label="Work in progress"
+          label="Active on this activity page"
           value={queryCount(
             modelsAvailable,
             activities.isPending,
@@ -260,27 +278,32 @@ function ModelsWorkspace({
               })}
             </ul>
           )}
+          <div className="p-3"><CursorNavigation navigation={navigation} next={models.data?.nextCursor} busy={models.isFetching} error={models.isError}
+            onRestart={() => { if (navigation.after === undefined) void models.refetch() }} /></div>
         </section>
 
         <div className="space-y-4">
           <BundleEvidence
-            model={selectedModel}
+            model={selectedModelEvidence.data ?? null}
             available={modelsAvailable}
-            loading={models.isPending}
-            error={models.isError ? "Try refreshing the page." : null}
+            loading={selectedModelToken !== null && selectedModelEvidence.isPending}
+            error={selectedModelEvidence.isError ? "Try refreshing the page." : null}
           />
+          <DemandPanel title="Open forecast preparation" className="rounded-xl border p-4">
           <ForecastPreparation
             bootstrap={bootstrap}
             transport={transport}
             onStarted={async () => {
+              activityNavigation.restart(); forecastNavigation.restart()
               await Promise.all([
-                modelsAvailable
+                modelActivityAvailable && activityNavigation.after === undefined
                   ? activities.refetch()
                   : Promise.resolve(),
-                forecastsAvailable ? forecasts.refetch() : Promise.resolve(),
+                forecastsAvailable && forecastNavigation.after === undefined ? forecasts.refetch() : Promise.resolve(),
               ])
             }}
           />
+          </DemandPanel>
           <ForecastReview
             bootstrap={bootstrap}
             transport={transport}
@@ -293,9 +316,13 @@ function ModelsWorkspace({
             }
             select={setSelectedForecastToken}
           />
+      {forecastsAvailable ? <CursorNavigation navigation={forecastNavigation} next={forecasts.data?.nextCursor} busy={forecasts.isFetching} error={forecasts.isError}
+        onRestart={() => { if (forecastNavigation.after === undefined) void forecasts.refetch() }} /> : null}
+          {modelActivityAvailable ? <CursorNavigation navigation={activityNavigation} next={activities.data?.nextCursor} busy={activities.isFetching} error={activities.isError}
+            onRestart={() => { if (activityNavigation.after === undefined) void activities.refetch() }} /> : null}
           <ModelJobActivity
             activities={activityRows}
-            available={modelsAvailable}
+            available={modelActivityAvailable}
             loading={activities.isPending}
             error={
               activities.isError

@@ -52,13 +52,21 @@ pub(crate) struct AutomaticInvestmentValuationEvaluation {
     completion: AutomaticValuationMethodSetAudit,
     selected: Option<(ValuationEvidence, FinancialModelEvidence)>,
     selected_receipt: Option<market_squawk_valuation::AutomaticValuationMethodReceipt>,
+    selected_share_sources: Option<super::FundamentalShareProjectionSources>,
 }
 impl AutomaticInvestmentValuationEvaluation {
     pub(crate) const fn completion(&self) -> &AutomaticValuationMethodSetAudit {
         &self.completion
     }
-    pub(crate) const fn selected_receipt(&self) -> Option<&market_squawk_valuation::AutomaticValuationMethodReceipt> {
+    pub(crate) const fn selected_receipt(
+        &self,
+    ) -> Option<&market_squawk_valuation::AutomaticValuationMethodReceipt> {
         self.selected_receipt.as_ref()
+    }
+    pub(crate) fn selected_share_sources(
+        &self,
+    ) -> Option<&super::FundamentalShareProjectionSources> {
+        self.selected_share_sources.as_ref()
     }
     pub(crate) fn into_parts(
         self,
@@ -80,6 +88,8 @@ impl FairValueDomainService {
         market_reader: &MarketInvestmentReadCapability,
         market: &MarketInvestmentReadReceipt,
         source_factory: &ForecastValuationSourceFactory,
+        prepared_share_sources: Option<&str>,
+        source_actions: &crate::application::SourceAppliedCorporateActionReadCapability,
         sources: AutomaticInvestmentValuationSources<'_>,
         request: AutomaticInvestmentValuationRequest,
         context: &RequestContext,
@@ -260,6 +270,7 @@ impl FairValueDomainService {
         let mut selected = None;
         let mut selected_id = None;
         let mut selected_receipt = None;
+        let mut selected_share_sources = None;
         let mut recommendation = [None; 4];
         // Every successful calculation gets a separate truthful recommendation-admission outcome.
         for method in [
@@ -283,20 +294,23 @@ impl FairValueDomainService {
                 continue;
             };
             let assessed_at;
-            let outcome = if publication.receipt.range().central().basis()
-                != ValuationAmountBasis::PerInstrumentUnit
-            {
-                assessed_at = calculation_clock()?;
-                AutomaticValuationRecommendationOutcome::NotPerInstrumentUnit
-            } else if method == AutomaticValuationMethod::ComparableCompanies {
-                // Actual reported-EPS arithmetic remains visible as research. A fiscal date or
-                // /shares unit does not prove the EPS restatement frame of each quoted security.
-                assessed_at = calculation_clock()?;
-                AutomaticValuationRecommendationOutcome::ShareUnitBasisUnproven
-            } else if selected_id.is_some() {
+            let outcome = if selected_id.is_some() {
                 assessed_at = calculation_clock()?;
                 AutomaticValuationRecommendationOutcome::NotCheckedAfterSelection
             } else {
+                let share_sources = if method == AutomaticValuationMethod::ForecastDistribution {
+                    Ok(None)
+                } else {
+                    super::financial::select_prepared_fundamental_share_sources(
+                        &publication.receipt,
+                        prepared_share_sources,
+                        &research,
+                        source_actions,
+                        context,
+                    )
+                    .await
+                    .map(Some)
+                };
                 let result = self
                     .read_automatic_investment_evidence(
                         &research,
@@ -313,6 +327,7 @@ impl FairValueDomainService {
                 ensure_request_live(context, &self.lifecycle)?;
                 assessed_at = calculation_clock()?;
                 let result = result.and_then(|evidence| {
+                    share_sources.as_ref().map_err(|error| *error)?;
                     if assessed_at >= evidence.0.window().expires_at()
                         || assessed_at >= evidence.1.window().expires_at()
                     {
@@ -323,6 +338,7 @@ impl FairValueDomainService {
                 });
                 match result {
                     Ok(evidence) => {
+                        selected_share_sources = share_sources?;
                         selected_receipt = Some(publication.receipt.clone());
                         selected = Some(evidence);
                         selected_id = Some(publication.measurement_id);
@@ -387,6 +403,7 @@ impl FairValueDomainService {
             .map_err(|_| ServiceError::InvalidResult)?,
             selected,
             selected_receipt,
+            selected_share_sources,
         })
     }
 }

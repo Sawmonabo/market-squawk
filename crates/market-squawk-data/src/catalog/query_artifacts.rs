@@ -129,6 +129,7 @@ impl fmt::Debug for QueryArtifactReservation {
 /// Durable ownership and lifecycle receipt returned with an authorized query artifact.
 #[derive(Debug, Eq, PartialEq)]
 pub struct QueryArtifactResult {
+    catalog_id: Uuid,
     reservation_id: Uuid,
     owner: SourceIdentifier,
     artifact_id: Uuid,
@@ -136,6 +137,10 @@ pub struct QueryArtifactResult {
 }
 
 impl QueryArtifactResult {
+    pub(crate) const fn catalog_id(&self) -> Uuid {
+        self.catalog_id
+    }
+
     /// Returns the durable reservation that owns this result.
     pub const fn reservation_id(&self) -> Uuid {
         self.reservation_id
@@ -373,6 +378,7 @@ impl Catalog {
         durable_bound.store(true, Ordering::Release);
         checkpoint(QueryArtifactBindCheckpoint::AfterCommit);
         Ok(QueryArtifactResult {
+            catalog_id: self.catalog_id,
             reservation_id: reservation.reservation_id,
             owner: reservation.owner.clone(),
             artifact_id: artifact.artifact_id(),

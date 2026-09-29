@@ -124,13 +124,11 @@ pub(super) fn estimate_peak_bytes(
         config.maximum_retained_snapshot_readers().get(),
     )?;
     total = add(total, snapshot_peak.additional_bytes)?;
-    let feature_publications = multiply(snapshot_peak.publication_count, routes.len() as u64)?;
+    // Feature output is nested in, and charged against, each complete shard publication above.
+    // Only construction ownership outside that retained budget requires an additional charge.
     total = add(
         total,
-        multiply(
-            feature_publications,
-            u64::from(config.maximum_feature_snapshot_bytes().get()),
-        )?,
+        all_shard_feature_snapshot_scratch_bytes(config, routes)?,
     )?;
     // Every shard may construct concurrently. Route-key scratch scales with configured routes;
     // one maximum-sized stream/status ordering workspace may coexist in each actor.
@@ -213,6 +211,31 @@ fn per_actor_snapshot_sort_scratch(
             SNAPSHOT_STREAM_SORT_SCRATCH_BYTES,
             SNAPSHOT_STATUS_SORT_SCRATCH_BYTES,
         )?,
+    )
+}
+
+fn all_shard_feature_snapshot_scratch_bytes(
+    config: &LiveRuntimeConfig,
+    routes: &[LiveRouteConfig],
+) -> Result<u64, LiveRuntimeConfigError> {
+    let per_actor = crate::features::RouteFeatureState::snapshot_construction_scratch_bytes(
+        config.maximum_feature_sets_per_route().get(),
+    )
+    .and_then(|bytes| u64::try_from(bytes).ok())
+    .ok_or(LiveRuntimeConfigError::CapacityOverflow)?;
+    let router = match config.routing_version() {
+        ShardRoutingVersion::V1 => ShardRouter::v1(config.shard_count().get())?,
+    };
+    let mut occupied = vec![false; usize::from(config.shard_count().get())];
+    for route in routes {
+        let shard = router.route(route.route());
+        *occupied
+            .get_mut(usize::from(shard.index()))
+            .ok_or(LiveRuntimeConfigError::RouteOutsideShardSet)? = true;
+    }
+    multiply(
+        occupied.into_iter().filter(|occupied| *occupied).count() as u64,
+        per_actor,
     )
 }
 

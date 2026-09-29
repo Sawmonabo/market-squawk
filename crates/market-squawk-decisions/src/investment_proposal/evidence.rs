@@ -900,7 +900,18 @@ impl ValuationEvidence {
         window: ProposalEvidenceWindow,
     ) -> Result<Self, InvestmentProposalError> {
         ensure_positive(fair_value)?;
-        if basis != ValuationAmountBasis::PerInstrumentUnit {
+        let native_total = basis == ValuationAmountBasis::TotalCommonEquity
+            && matches!(
+                provenance,
+                ValuationEvidenceProvenance::ResearchCalculation {
+                    method: AutomaticValuationMethod::DiscountedCashFlow
+                        | AutomaticValuationMethod::ResidualIncome,
+                    ..
+                }
+            );
+        // Original total-equity research is retained for sealed share projection. It cannot
+        // satisfy actionable per-unit admission until that projection has completed.
+        if basis != ValuationAmountBasis::PerInstrumentUnit && !native_total {
             return Err(InvestmentProposalError::InvalidValuationSelection);
         }
         if horizon_at <= window.available_at() {
@@ -1081,9 +1092,14 @@ impl FinancialModelEvidence {
         let lower = receipt_range.lower();
         let central = receipt_range.central();
         let upper = receipt_range.upper();
+        let expected_basis = match receipt.method() {
+            AutomaticValuationMethod::DiscountedCashFlow
+            | AutomaticValuationMethod::ResidualIncome => ValuationAmountBasis::TotalCommonEquity,
+            _ => ValuationAmountBasis::PerInstrumentUnit,
+        };
         if [lower.basis(), central.basis(), upper.basis()]
             .into_iter()
-            .any(|basis| basis != ValuationAmountBasis::PerInstrumentUnit)
+            .any(|basis| basis != expected_basis)
             || macro_assumptions.as_ref() != receipt.macro_assumptions()
             || receipt.assumptions().is_empty()
             || receipt.intermediates().is_empty()
@@ -2536,7 +2552,7 @@ fn validate_model_assumptions(
     let mut lower_count = 0;
     let mut upper_count = 0;
     for (index, assumption) in assumptions.iter().enumerate() {
-        if assumption.available_at() > window.observed_at()
+        if assumption.available_at() > window.available_at()
             || assumption.expires_at() < window.expires_at()
             || assumptions[..index].iter().any(|prior| {
                 (prior.kind(), prior.identifier()) >= (assumption.kind(), assumption.identifier())

@@ -6,6 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "pit/canonical.rs"]
 mod canonical;
+#[path = "pit/disk.rs"]
+pub(crate) mod disk;
 #[path = "pit/model.rs"]
 mod model;
 #[path = "pit/result.rs"]

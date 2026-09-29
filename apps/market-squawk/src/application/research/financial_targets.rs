@@ -225,17 +225,24 @@ impl FinancialTargetHistory {
     }
 
     /// Reopens the original observation within this retained selection; no projected DTO is proof.
-    pub(crate) fn observation(&self, index: usize) -> Option<&FundamentalObservation> {
-        let fact = self.facts.get(index)?;
+    pub(crate) fn observation(
+        &self,
+        index: usize,
+    ) -> Result<Option<FundamentalObservation>, ServiceError> {
+        let Some(fact) = self.facts.get(index) else {
+            return Ok(None);
+        };
         let SecResearchIdentityOutcome::Exact(source) = self.source.outcome() else {
-            return None;
+            return Err(ServiceError::InvalidResult);
         };
         match source
             .decoded_rows()
-            .get(usize::try_from(fact.row_ordinal).ok()?)?
+            .get(usize::try_from(fact.row_ordinal).map_err(|_| ServiceError::InvalidResult)?)
+            .map_err(map_source_error)?
+            .ok_or(ServiceError::InvalidResult)?
         {
-            ResearchObservation::Fundamental(observation) => Some(observation),
-            _ => None,
+            ResearchObservation::Fundamental(observation) => Ok(Some(observation)),
+            _ => Err(ServiceError::InvalidResult),
         }
     }
 
@@ -527,6 +534,7 @@ fn normalize_selection(
         let Some(ResearchObservation::Fundamental(observation)) = source
             .decoded_rows()
             .get(usize::try_from(ordinal).map_err(|_| ServiceError::InvalidResult)?)
+            .map_err(map_source_error)?
         else {
             return Err(ServiceError::InvalidResult);
         };
@@ -598,7 +606,7 @@ fn normalize_selection(
         digest.update(row.point_in_time().evidence_identity().bytes());
         digest.update(ordinal.to_be_bytes());
         digest.update(
-            canonical_digest(&(role, role.basis(), observation), &mut canonical_bytes)?.bytes(),
+            canonical_digest(&(role, role.basis(), &observation), &mut canonical_bytes)?.bytes(),
         );
         let evidence_identity = finish_digest(digest)?;
         let fact_index = facts.len();
@@ -735,7 +743,9 @@ fn map_source_error(error: SecResearchReadError) -> ServiceError {
     match error {
         SecResearchReadError::Cancelled => ServiceError::Cancelled,
         SecResearchReadError::DeadlineExceeded => ServiceError::DeadlineExceeded,
-        SecResearchReadError::ObjectBudgetExceeded => ServiceError::ResourceExhausted,
+        SecResearchReadError::ObjectBudgetExceeded | SecResearchReadError::SpillBudgetExceeded => {
+            ServiceError::ResourceExhausted
+        }
         SecResearchReadError::InvalidRequest => ServiceError::InvalidRequest,
         SecResearchReadError::AuthorityUnavailable => ServiceError::Unavailable,
         _ => ServiceError::InvalidResult,

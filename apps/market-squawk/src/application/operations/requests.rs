@@ -91,7 +91,7 @@ pub(super) struct LogQueryInput {
     job_id: Option<String>,
     correlation_id: Option<String>,
     search: Option<String>,
-    after_sequence: Option<u64>,
+    cursor: Option<String>,
     limit: usize,
 }
 
@@ -106,7 +106,7 @@ impl LogQueryInput {
             job_id: self.job_id,
             correlation_id: self.correlation_id,
             search: self.search,
-            after_sequence: self.after_sequence,
+            cursor: self.cursor,
             limit: self.limit,
         }
     }

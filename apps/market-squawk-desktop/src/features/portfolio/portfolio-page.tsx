@@ -13,9 +13,10 @@ import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
 import { PortfolioPlanning } from "./portfolio-planning"
 import { PortfolioScenarios } from "./portfolio-scenarios"
 import { RecommendationSetup } from "./recommendation-setup"
-import type { PortfolioAccount } from "./portfolio-contracts"
-import { formatProductTime, portfolioDisplayName } from "./portfolio-format"
-import { DataQualityPanel, PortfolioSummary } from "./portfolio-panels"
+import { CursorNavigation } from "../shared/cursor-navigation"
+import { DemandPanel } from "../shared/demand-panel"
+
+import type { PortfolioAccountSummary } from "./portfolio-contracts"
 import { usePortfolioAccounts } from "./use-portfolio"
 
 export function PortfolioPage() {
@@ -47,7 +48,7 @@ function PortfolioWorkspace({
   transport: ProductTransport
 }) {
   const accounts = usePortfolioAccounts(transport, bootstrap)
-  const rows = accounts.query.data ?? []
+  const rows = accounts.query.data?.accounts ?? []
   const [selectedToken, setSelectedToken] = React.useState<string | null>(null)
   const selected =
     rows.find((account) => account.accountToken === selectedToken) ?? null
@@ -108,30 +109,29 @@ function PortfolioWorkspace({
         </>
       )}
 
-      <details className="group mt-5 rounded-xl border border-border bg-card/30 p-4">
-        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">
-          <span>Import or update portfolio details</span>
-          <ChevronDown
-            className="size-4 text-muted-foreground transition-transform group-open:rotate-180"
-            aria-hidden="true"
-          />
-        </summary>
+      {accounts.available ? <CursorNavigation navigation={accounts.navigation} next={accounts.query.data?.nextCursor} busy={accounts.query.isFetching} error={accounts.query.isError}
+        onNavigate={() => setSelectedToken(null)} onRestart={() => { if (accounts.navigation.after === undefined) void accounts.query.refetch() }} /> : null}
+
+      <DemandPanel title="Import or update portfolio details" className="group mt-5 rounded-xl border border-border bg-card/30 p-4">
         <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
           Review a portfolio file before saving any holdings, cash, transactions, or corrections.
           This page never chooses a portfolio for you.
         </p>
         <PortfolioImportWorkflow
-          selectedPortfolioName={selected ? portfolioDisplayName(selected) : null}
+          selectedPortfolioName={selected?.displayName ?? null}
         />
-      </details>
+      </DemandPanel>
     </PortfolioFrame>
   )
 }
 
-function SelectedPortfolio({ account }: { account: PortfolioAccount }) {
+function SelectedPortfolio({ account }: { account: PortfolioAccountSummary }) {
   return (
     <div className="mt-5 space-y-4">
-      <PortfolioSummary account={account} />
+      <section className="rounded-xl border border-border p-5">
+        <h2 className="text-lg font-semibold">{account.displayName}</h2>
+        <p className="mt-2 text-sm text-muted-foreground">{account.currency} · {account.holdings} recorded holdings · {account.dataIssues} recorded data issues</p>
+      </section>
       <Alert>
         <AlertCircle aria-hidden="true" />
         <AlertTitle>Detailed analysis is unavailable</AlertTitle>
@@ -158,7 +158,7 @@ function SelectedPortfolio({ account }: { account: PortfolioAccount }) {
             <PortfolioScenarios choices={null} />
             <PortfolioPlanning positionChoices={null} rebalanceChoices={null} />
           </div>
-          <DataQualityPanel account={account} />
+
         </div>
       </details>
     </div>
@@ -170,7 +170,7 @@ function AccountDirectory({
   selectedToken,
   select,
 }: {
-  accounts: PortfolioAccount[]
+  accounts: PortfolioAccountSummary[]
   selectedToken: string | null
   select: (accountToken: string) => void
 }) {
@@ -208,23 +208,16 @@ function AccountDirectory({
             >
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold">{account.portfolioName}</p>
-                  {account.accountName !== account.portfolioName ? (
-                    <p className="mt-1 text-xs text-muted-foreground">{account.accountName}</p>
-                  ) : null}
+                  <p className="text-sm font-semibold">{account.displayName}</p>
+
                 </div>
                 <span className="rounded-md border border-border px-2 py-1 font-mono text-[10px]">
-                  {account.reportingCurrency}
+                  {account.currency}
                 </span>
               </div>
               <dl className="mt-4 grid grid-cols-2 gap-3 text-xs">
-                <AccountFact label="Account type" value={account.accountTypeLabel} />
-                <AccountFact label="Updated" value={formatProductTime(account.updatedAt)} />
-                <AccountFact label="Positions" value={account.positionCount.toLocaleString()} />
-                <AccountFact
-                  label="Transactions"
-                  value={account.transactionCount.toLocaleString()}
-                />
+                <AccountFact label="Holdings" value={account.holdings.toLocaleString()} />
+                <AccountFact label="Data issues" value={account.dataIssues.toLocaleString()} />
               </dl>
               <p className="mt-4 text-[11px] font-medium text-primary">
                 {selected ? "Selected" : "View this portfolio"}

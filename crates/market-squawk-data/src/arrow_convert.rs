@@ -208,6 +208,19 @@ fn decode_json<T: DeserializeOwned>(
     Ok(result?)
 }
 
+/// Reuses controlled JSON decoding for already digest-verified native semantics. The source
+/// reader admits its concrete owned shape before calling this helper with an owning type.
+pub(crate) fn decode_provider_native_sidecar<T: DeserializeOwned>(
+    bytes: &[u8],
+    control: &dyn ResearchObjectControl,
+) -> Result<T, ArrowConversionError> {
+    let mut operation = ArrowOperationControl::new(control);
+    operation.checkpoint_now()?;
+    let decoded = decode_json(bytes, Some(&mut operation))?;
+    operation.checkpoint_now()?;
+    Ok(decoded)
+}
+
 fn encode_json<T: Serialize>(
     value: &T,
     control: Option<&mut ArrowOperationControl<'_>>,
@@ -607,6 +620,8 @@ struct ExtractionRowLineage {
     revision_assignment: Option<RevisionAssignmentLineage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_capture: Option<ProviderCaptureRowLineage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_logical: Option<ProviderLogicalRowLineage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -625,6 +640,39 @@ struct ProviderCaptureRowLineage {
     segment_ordinal: u16,
     physical_frame_ordinal: u32,
     page_body_digest: EvidenceDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ProviderLogicalRowLineage {
+    binding_digest: EvidenceDigest,
+    partition_ordinal: u32,
+    canonical_row_ordinal: u64,
+    native_semantic_digest: EvidenceDigest,
+}
+
+/// Validated coordinates into one complete provider logical publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderLogicalRowCoordinate {
+    pub(crate) binding_digest: EvidenceDigest,
+    pub(crate) partition_ordinal: u32,
+    pub(crate) canonical_row_ordinal: u64,
+    pub(crate) canonical_row_digest: EvidenceDigest,
+    pub(crate) observation_digest: EvidenceDigest,
+    pub(crate) native_semantic_digest: EvidenceDigest,
+}
+
+pub(crate) struct DecodedProviderLogicalBatch {
+    pub(crate) schema_ref: DatasetSchemaRef,
+    pub(crate) observations: Vec<ResearchObservation>,
+    pub(crate) coordinates: Vec<ProviderLogicalRowCoordinate>,
+    pub(crate) retained_bytes: usize,
+}
+
+struct LogicalExtractionBinding<'a> {
+    binding: &'a market_squawk_sources::SealedProviderLogicalPublicationBinding,
+    partition: &'a market_squawk_sources::CanonicalPartitionExpectation,
+    native_digests: &'a [EvidenceDigest],
+    dataset: SourceIdentifier,
 }
 
 /// Already-validated durable coordinates tying one canonical Arrow row to provider capture.
@@ -664,6 +712,13 @@ impl ResearchLineageDigestAccumulator {
 
     pub(crate) fn finish(self) -> EvidenceDigest {
         EvidenceDigest::new(DigestAlgorithm::Sha256, self.hash.finalize().into())
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        batch: &ResearchArrowBatch,
+    ) -> Result<(), ArrowConversionError> {
+        self.update(batch, None)
     }
 
     fn update(
@@ -724,6 +779,7 @@ struct ResearchObservationEnvelopeTag {
     observation: String,
 }
 
+const LOGICAL_EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 6;
 const CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 5;
 const EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 4;
 const LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 3;
@@ -733,7 +789,7 @@ impl ResearchArrowBatch {
     pub fn try_from_extraction_batch(
         extraction: &ExtractionBatch,
     ) -> Result<Self, ArrowConversionError> {
-        Self::try_from_extraction_batch_with_revisions(extraction, None, None)
+        Self::try_from_extraction_batch_with_revisions(extraction, None, None, None)
     }
 
     /// Returns source-validated canonical observations before durable revision rebinding.
@@ -768,6 +824,7 @@ impl ResearchArrowBatch {
                 superseded_time: record.superseded_time().cloned(),
                 revision_assignment: None,
                 provider_capture: None,
+                provider_logical: None,
             }));
             validate_row_lineage(
                 &lineage,
@@ -786,7 +843,7 @@ impl ResearchArrowBatch {
         extraction: &ExtractionBatch,
         revisions: &[RevisionNumber],
     ) -> Result<Self, ArrowConversionError> {
-        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), None)
+        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), None, None)
     }
 
     pub(crate) fn try_from_extraction_batch_with_assigned_revisions_and_provider_binding(
@@ -794,13 +851,56 @@ impl ResearchArrowBatch {
         revisions: &[RevisionNumber],
         binding: &PreparedProviderCaptureBinding,
     ) -> Result<Self, ArrowConversionError> {
-        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions), Some(binding))
+        Self::try_from_extraction_batch_with_revisions(
+            extraction,
+            Some(revisions),
+            Some(binding),
+            None,
+        )
+    }
+
+    pub(crate) fn try_from_extraction_batch_with_assigned_revisions_and_logical_binding(
+        extraction: &ExtractionBatch,
+        revisions: &[RevisionNumber],
+        binding: &market_squawk_sources::SealedProviderLogicalPublicationBinding,
+        partition_ordinal: usize,
+        native_digests: &[EvidenceDigest],
+        dataset: SourceIdentifier,
+    ) -> Result<Self, ArrowConversionError> {
+        let partition = binding
+            .canonical_partitions()
+            .get(partition_ordinal)
+            .ok_or(ArrowConversionError::ExtractionBindingMismatch)?;
+        let content = market_squawk_sources::ExtractionContentIdentity::try_from_batch(extraction)
+            .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?;
+        if binding.terminal().source_id() != extraction.request().object().source_id()
+            || partition.semantic_digest() != content.digest()
+            || partition.row_range().item_count().get() as usize != extraction.records().len()
+            || native_digests.len() != extraction.records().len()
+            || native_digests
+                .iter()
+                .any(|digest| digest.algorithm() != DigestAlgorithm::Sha256)
+        {
+            return Err(ArrowConversionError::ExtractionBindingMismatch);
+        }
+        Self::try_from_extraction_batch_with_revisions(
+            extraction,
+            Some(revisions),
+            None,
+            Some(LogicalExtractionBinding {
+                binding,
+                partition,
+                native_digests,
+                dataset,
+            }),
+        )
     }
 
     fn try_from_extraction_batch_with_revisions(
         extraction: &ExtractionBatch,
         revisions: Option<&[RevisionNumber]>,
         binding: Option<&PreparedProviderCaptureBinding>,
+        logical: Option<LogicalExtractionBinding<'_>>,
     ) -> Result<Self, ArrowConversionError> {
         let original_observations = Self::validated_extraction_observations(extraction)?;
         if revisions.is_some_and(|values| values.len() != original_observations.len()) {
@@ -809,7 +909,7 @@ impl ResearchArrowBatch {
         if matches!(
             extraction.request().object().capture_identity(),
             SourceObjectCaptureIdentity::Paged { .. }
-        ) != binding.is_some()
+        ) != (binding.is_some() || logical.is_some())
         {
             return Err(ArrowConversionError::ProviderCaptureRequired);
         }
@@ -845,7 +945,9 @@ impl ResearchArrowBatch {
                 None => original,
             };
             lineages.push(RowLineage::Extraction(Box::new(ExtractionRowLineage {
-                schema_version: if binding.is_some() {
+                schema_version: if logical.is_some() {
+                    LOGICAL_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                } else if binding.is_some() {
                     CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
                 } else if assignment.is_some() {
                     EXTRACTION_LINEAGE_SCHEMA_VERSION
@@ -871,13 +973,25 @@ impl ResearchArrowBatch {
                 provider_capture: binding
                     .map(|binding| provider_capture_lineage(binding, index))
                     .transpose()?,
+                provider_logical: logical.as_ref().map(|logical| ProviderLogicalRowLineage {
+                    binding_digest: logical.binding.binding_digest(),
+                    partition_ordinal: logical.partition.partition_ordinal(),
+                    canonical_row_ordinal: logical.partition.row_range().first_ordinal()
+                        + index as u64,
+                    native_semantic_digest: logical.native_digests[index],
+                }),
             })));
             observations.push(observation);
         }
         let request_digests = vec![request_digest.bytes(); observations.len()];
         Self::try_from_observations_with_requests(
-            extraction.request().object().dataset().clone(),
-            request_digest,
+            logical.as_ref().map_or_else(
+                || extraction.request().object().dataset().clone(),
+                |logical| logical.dataset.clone(),
+            ),
+            logical
+                .as_ref()
+                .map_or(request_digest, |logical| logical.binding.binding_digest()),
             request_digests,
             lineages,
             &observations,
@@ -1478,6 +1592,71 @@ impl ResearchArrowBatch {
             observations,
             coordinates,
             retained_bytes,
+        })
+    }
+
+    pub(crate) fn decode_provider_logical_record_batch_bounded(
+        batch: RecordBatch,
+        max_additional_bytes: usize,
+        lineage: &mut ResearchLineageDigestAccumulator,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<DecodedProviderLogicalBatch, ArrowConversionError> {
+        let coordinate_bytes = batch
+            .num_rows()
+            .checked_mul(size_of::<ProviderLogicalRowCoordinate>())
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        let allowance = max_additional_bytes.checked_sub(coordinate_bytes).ok_or(
+            ArrowConversionError::RetainedLimitExceeded {
+                required_bytes: coordinate_bytes,
+                limit_bytes: max_additional_bytes,
+            },
+        )?;
+        let mut operation = ArrowOperationControl::new(control);
+        let (candidate, observations, observation_bytes, _) =
+            Self::validate_and_decode_record_batch_inner(
+                batch,
+                allowance,
+                false,
+                Some(&mut operation),
+            )?;
+        let row_lineages = candidate.decode_row_lineages(Some(&mut operation))?;
+        let payloads = candidate
+            .batch
+            .column_by_name("payload_sha256")
+            .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        let mut coordinates = Vec::with_capacity(observations.len());
+        for (index, row) in row_lineages.into_iter().enumerate() {
+            let RowLineage::Extraction(row) = row else {
+                return Err(ArrowConversionError::ProviderCaptureRequired);
+            };
+            let logical = row
+                .provider_logical
+                .ok_or(ArrowConversionError::ProviderCaptureRequired)?;
+            coordinates.push(ProviderLogicalRowCoordinate {
+                binding_digest: logical.binding_digest,
+                partition_ordinal: logical.partition_ordinal,
+                canonical_row_ordinal: logical.canonical_row_ordinal,
+                canonical_row_digest: row.record_evidence.content_digest(),
+                observation_digest: EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    payloads
+                        .value(index)
+                        .try_into()
+                        .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?,
+                ),
+                native_semantic_digest: logical.native_semantic_digest,
+            });
+        }
+        lineage.update(&candidate, Some(&mut operation))?;
+        operation.checkpoint_now()?;
+        Ok(DecodedProviderLogicalBatch {
+            schema_ref: candidate.schema_ref.clone(),
+            observations,
+            coordinates,
+            retained_bytes: observation_bytes
+                .checked_add(coordinate_bytes)
+                .ok_or(ArrowConversionError::RetainedSizeOverflow)?,
         })
     }
 
@@ -2173,9 +2352,14 @@ fn validate_row_lineage(
                 LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION
                     | EXTRACTION_LINEAGE_SCHEMA_VERSION
                     | CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                    | LOGICAL_EXTRACTION_LINEAGE_SCHEMA_VERSION
             ) && lineage.source_id == *provenance.source_id()
                 && (lineage.dataset == *dataset
-                    || lineage.schema_version == CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION)
+                    || matches!(
+                        lineage.schema_version,
+                        CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                            | LOGICAL_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                    ))
                 && lineage.request_digest.algorithm() == DigestAlgorithm::Sha256
                 && lineage.request_digest.bytes() == request_digest
                 && lineage.record_schema.as_str() == RESEARCH_RECORD_SCHEMA
@@ -2190,12 +2374,22 @@ fn validate_row_lineage(
                     }
                     None => lineage.schema_version != CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION,
                 }
+                && match &lineage.provider_logical {
+                    Some(logical) => {
+                        lineage.schema_version == LOGICAL_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                            && lineage.provider_capture.is_none()
+                            && logical.binding_digest.algorithm() == DigestAlgorithm::Sha256
+                            && logical.native_semantic_digest.algorithm() == DigestAlgorithm::Sha256
+                    }
+                    None => lineage.schema_version != LOGICAL_EXTRACTION_LINEAGE_SCHEMA_VERSION,
+                }
                 && match &lineage.revision_assignment {
                     Some(assignment) => {
                         matches!(
                             lineage.schema_version,
                             EXTRACTION_LINEAGE_SCHEMA_VERSION
                                 | CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                                | LOGICAL_EXTRACTION_LINEAGE_SCHEMA_VERSION
                         ) && assignment.assigned_revision == time.revision()
                             && CanonicalObservationPayload::try_from_observation(observation)
                                 .is_ok_and(|semantic| {

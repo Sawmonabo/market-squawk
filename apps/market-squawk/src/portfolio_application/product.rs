@@ -32,6 +32,21 @@ impl ProductAccountBinding {
     }
 }
 
+/// Constructs one binding using the same publication ordinal as the complete product catalog.
+pub(super) fn account_binding(
+    account_id: AccountId,
+    ordinal: usize,
+) -> Result<ProductAccountBinding, PortfolioApplicationServiceError> {
+    if ordinal == 0 {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    Ok(ProductAccountBinding {
+        account_id,
+        token: account_token(account_id)?,
+        display_name: format!("Portfolio {ordinal}").into_boxed_str(),
+    })
+}
+
 fn account_token(account_id: AccountId) -> Result<Box<str>, PortfolioApplicationServiceError> {
     let identity = account_id.to_string();
     opaque_product_text_token(
@@ -55,11 +70,7 @@ pub(super) fn account_catalog(
         let ordinal = index
             .checked_add(1)
             .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
-        catalog.push(ProductAccountBinding {
-            account_id,
-            token: account_token(account_id)?,
-            display_name: format!("Portfolio {ordinal}").into_boxed_str(),
-        });
+        catalog.push(account_binding(account_id, ordinal)?);
     }
     catalog.sort_unstable_by(|left, right| left.token.cmp(&right.token));
     if catalog

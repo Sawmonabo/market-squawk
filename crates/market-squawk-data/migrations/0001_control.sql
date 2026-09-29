@@ -4,6 +4,83 @@ CREATE TABLE schema_migrations (
     applied_at_ns INTEGER NOT NULL
 ) STRICT;
 
+-- Durable model history is independent of the models currently active in memory.
+CREATE TABLE model_inventory_series (
+    model_id TEXT PRIMARY KEY,
+    bundle_id TEXT UNIQUE NOT NULL
+) STRICT;
+
+CREATE TABLE model_inventory_records (
+    sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
+    model_id TEXT NOT NULL REFERENCES model_inventory_series(model_id),
+    bundle_id TEXT NOT NULL REFERENCES model_inventory_series(bundle_id),
+    bundle_version BLOB NOT NULL CHECK (length(bundle_version) = 8),
+    candidate_directory TEXT UNIQUE NOT NULL,
+    product_token TEXT UNIQUE NOT NULL,
+    record BLOB NOT NULL,
+    record_sha256 BLOB NOT NULL CHECK (length(record_sha256) = 32),
+    chain_sha256 BLOB NOT NULL CHECK (length(chain_sha256) = 32),
+    UNIQUE (bundle_id, bundle_version)
+) STRICT;
+
+CREATE INDEX model_inventory_by_model_version
+ON model_inventory_records(model_id, bundle_version);
+
+CREATE TRIGGER model_inventory_series_immutable_update
+BEFORE UPDATE ON model_inventory_series BEGIN
+    SELECT RAISE(ABORT, 'model inventory series are immutable');
+END;
+CREATE TRIGGER model_inventory_series_immutable_delete
+BEFORE DELETE ON model_inventory_series BEGIN
+    SELECT RAISE(ABORT, 'model inventory series are immutable');
+END;
+CREATE TRIGGER model_inventory_records_immutable_update
+BEFORE UPDATE ON model_inventory_records BEGIN
+    SELECT RAISE(ABORT, 'model inventory records are immutable');
+END;
+CREATE TRIGGER model_inventory_records_immutable_delete
+BEFORE DELETE ON model_inventory_records BEGIN
+    SELECT RAISE(ABORT, 'model inventory records are immutable');
+END;
+
+CREATE TABLE chart_projection_headers (
+    source_sha256 BLOB PRIMARY KEY CHECK (length(source_sha256) = 32),
+    projection_sha256 BLOB NOT NULL CHECK (length(projection_sha256) = 32),
+    row_count INTEGER NOT NULL CHECK (row_count >= 0),
+    series_count INTEGER NOT NULL CHECK (series_count > 0),
+    first_time INTEGER,
+    last_time INTEGER,
+    metadata BLOB NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE chart_projection_rows (
+    source_sha256 BLOB NOT NULL REFERENCES chart_projection_headers(source_sha256)
+        DEFERRABLE INITIALLY DEFERRED,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    time_nanos INTEGER NOT NULL,
+    payload BLOB NOT NULL,
+    payload_sha256 BLOB NOT NULL CHECK (length(payload_sha256) = 32),
+    PRIMARY KEY (source_sha256, ordinal)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX chart_projection_time ON chart_projection_rows(source_sha256, time_nanos, ordinal);
+
+CREATE TRIGGER chart_projection_headers_immutable_update
+BEFORE UPDATE ON chart_projection_headers BEGIN
+    SELECT RAISE(ABORT, 'chart projections are immutable');
+END;
+CREATE TRIGGER chart_projection_headers_immutable_delete
+BEFORE DELETE ON chart_projection_headers BEGIN
+    SELECT RAISE(ABORT, 'chart projections are immutable');
+END;
+CREATE TRIGGER chart_projection_rows_immutable_update
+BEFORE UPDATE ON chart_projection_rows BEGIN
+    SELECT RAISE(ABORT, 'chart projection rows are immutable');
+END;
+CREATE TRIGGER chart_projection_rows_immutable_delete
+BEFORE DELETE ON chart_projection_rows BEGIN
+    SELECT RAISE(ABORT, 'chart projection rows are immutable');
+END;
+
 CREATE TABLE sources (
     source_id TEXT PRIMARY KEY CHECK (length(CAST(source_id AS BLOB)) BETWEEN 1 AND 128),
     current_revision_digest BLOB NOT NULL CHECK (length(current_revision_digest) = 32),
@@ -331,3 +408,33 @@ CREATE TRIGGER audit_events_immutable_delete
 BEFORE DELETE ON audit_events BEGIN
     SELECT RAISE(ABORT, 'audit events are immutable');
 END;
+
+CREATE TABLE forecast_inventory_vintages (
+    sequence INTEGER PRIMARY KEY,
+    vintage_id TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL UNIQUE,
+    product_token TEXT NOT NULL UNIQUE,
+    artifact_id TEXT NOT NULL UNIQUE,
+    instrument_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    available_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    record BLOB NOT NULL,
+    record_sha256 BLOB NOT NULL CHECK(length(record_sha256)=32)
+) STRICT;
+CREATE INDEX forecast_inventory_instrument_time ON forecast_inventory_vintages(instrument_id,created_at);
+CREATE INDEX forecast_inventory_instrument_sequence ON forecast_inventory_vintages(instrument_id,sequence);
+CREATE TABLE forecast_inventory_outcomes (
+    sequence INTEGER PRIMARY KEY,
+    outcome_id TEXT NOT NULL UNIQUE,
+    vintage_id TEXT NOT NULL REFERENCES forecast_inventory_vintages(vintage_id),
+    target_at INTEGER NOT NULL,
+    record BLOB NOT NULL,
+    record_sha256 BLOB NOT NULL CHECK(length(record_sha256)=32),
+    UNIQUE(vintage_id,target_at)
+) STRICT;
+CREATE INDEX forecast_inventory_outcome_parent ON forecast_inventory_outcomes(vintage_id,sequence);
+CREATE TRIGGER forecast_inventory_vintages_immutable_update BEFORE UPDATE ON forecast_inventory_vintages BEGIN SELECT RAISE(ABORT, 'forecast inventory is immutable'); END;
+CREATE TRIGGER forecast_inventory_vintages_immutable_delete BEFORE DELETE ON forecast_inventory_vintages BEGIN SELECT RAISE(ABORT, 'forecast inventory is immutable'); END;
+CREATE TRIGGER forecast_inventory_outcomes_immutable_update BEFORE UPDATE ON forecast_inventory_outcomes BEGIN SELECT RAISE(ABORT, 'forecast inventory is immutable'); END;
+CREATE TRIGGER forecast_inventory_outcomes_immutable_delete BEFORE DELETE ON forecast_inventory_outcomes BEGIN SELECT RAISE(ABORT, 'forecast inventory is immutable'); END;

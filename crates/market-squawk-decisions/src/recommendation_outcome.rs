@@ -26,7 +26,7 @@ pub const INVESTMENT_ANALYSIS_PUBLICATION_SCHEMA_VERSION: u16 = 1;
 /// Current schema for immutable typed investment-analysis explanations.
 pub const INVESTMENT_ANALYSIS_EXPLANATION_SCHEMA_VERSION: u16 = 1;
 /// Maximum canonical generation-request bytes retained as opaque audit provenance.
-pub const MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES: usize = 65_536;
+pub const MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES: usize = 256 * 1024;
 /// Current schema for realized recommendation-outcome status records.
 pub const RECOMMENDATION_OUTCOME_STATUS_SCHEMA_VERSION: u16 = 1;
 /// Code-owned minimum completed observations before a group performance mean is displayed.

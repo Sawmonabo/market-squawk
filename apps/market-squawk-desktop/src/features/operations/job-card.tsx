@@ -1,3 +1,4 @@
+import { DemandPanel } from "../shared/demand-panel"
 import {
   CheckCircle2,
   FileText,
@@ -220,6 +221,25 @@ function JobArtifactPreview({
   transport: SystemTransport
   scope: ProductScope
 }) {
+  const mediaType = previewableMediaType(artifact)
+  return <section className="rounded-md border border-border/70 bg-background/25 p-3">
+    <p className="flex items-center gap-2 text-xs font-medium"><FileText className="size-3.5" aria-hidden="true" />Controlled artifact</p>
+    <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">{artifact.id} · sha256:{artifact.sha256} · {artifact.byteCount.toLocaleString()} bytes</p>
+    {mediaType ? <DemandPanel title="View controlled preview" className="mt-3">
+      <JobArtifactPreviewRead artifact={artifact} transport={transport} scope={scope} />
+    </DemandPanel> : <p className="mt-2 text-xs text-muted-foreground">Viewing is unavailable: this dashboard can safely render only JSON or NDJSON artifact previews.</p>}
+  </section>
+}
+
+function JobArtifactPreviewRead({
+  artifact,
+  transport,
+  scope,
+}: {
+  artifact: JobArtifact
+  transport: SystemTransport
+  scope: ProductScope
+}) {
   const previewBytes = Math.min(artifact.byteCount, ARTIFACT_PREVIEW_BYTES)
   const mediaType = previewableMediaType(artifact)
   const previewQuery = useQuery({
@@ -230,8 +250,8 @@ function JobArtifactPreview({
       mediaType: artifact.mediaType,
       maximumBytes: previewBytes,
     }),
-    enabled: false,
-    queryFn: async () => {
+    gcTime: 0,
+    queryFn: async ({ signal }) => {
       if (!mediaType) {
         throw new Error("This artifact does not have a previewable media type.")
       }
@@ -245,7 +265,7 @@ function JobArtifactPreview({
           mediaType,
           offset: 0,
           maximumBytes: firstMaximum,
-        }),
+        }, { signal }),
         artifact,
         0,
         firstMaximum,
@@ -273,7 +293,7 @@ function JobArtifactPreview({
           mediaType,
           offset: first.nextOffset,
           maximumBytes: secondMaximum,
-        }),
+        }, { signal }),
         artifact,
         first.nextOffset,
         secondMaximum,
@@ -289,35 +309,10 @@ function JobArtifactPreview({
   const content = preview ? decodeUtf8(preview.chunksBase64) : null
 
   return (
-    <section className="rounded-md border border-border/70 bg-background/25 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0">
-          <p className="flex items-center gap-2 text-xs font-medium">
-            <FileText className="size-3.5" aria-hidden="true" />
-            Controlled artifact
-          </p>
-          <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
-            {artifact.id} · sha256:{artifact.sha256} · {artifact.byteCount.toLocaleString()} bytes
-          </p>
-        </div>
-        {mediaType && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={previewQuery.isFetching}
-            onClick={() => void previewQuery.refetch()}
-          >
-            {previewQuery.isFetching
-              ? "Retrieving preview…"
-              : "View controlled preview"}
-          </Button>
-        )}
-      </div>
-      {!mediaType && (
-        <p className="mt-2 text-xs text-muted-foreground">
-          Viewing is unavailable: this dashboard can safely render only JSON or NDJSON artifact previews.
-        </p>
-      )}
+    <div>
+      <Button size="sm" variant="outline" disabled={previewQuery.isFetching} onClick={() => void previewQuery.refetch()}>
+        {previewQuery.isFetching ? "Retrieving preview…" : "Refresh controlled preview"}
+      </Button>
       {previewQuery.isError && (
         <p className="mt-2 text-xs text-destructive">
           The controlled preview could not be retrieved: {messageFrom(previewQuery.error)}
@@ -335,7 +330,7 @@ function JobArtifactPreview({
           </pre>
         </div>
       )}
-    </section>
+    </div>
   )
 }
 

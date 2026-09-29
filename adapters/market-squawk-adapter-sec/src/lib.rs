@@ -44,7 +44,10 @@ pub use client::{
 };
 pub use composite::SecCompositeBounds;
 pub use evidence_store::{RawEvidenceError, RawEvidenceStore};
-pub use extraction::{SecDiscoveryResult, SecExtractionResult, SecFilingXbrlCaptureHandoff};
+pub use extraction::{
+    SecDiscoveryResult, SecExtractionResult, SecFilingXbrlCaptureHandoff,
+    SecFilingXbrlExtractionStream,
+};
 pub use json::{
     CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument, SecFiling, SecFormerName,
     SecParserError, SecParserLimits, SecSubmissionCompanyMetadata, SecSubmissionsCompanion,
@@ -70,5 +73,5 @@ pub use representation_registry::{
 };
 pub use xbrl::{
     ParsedXbrlDocument, SecXbrlError, XbrlDocumentContext, XbrlDocumentParser,
-    XbrlNonnumericOccurrence, XbrlNumericFact,
+    XbrlFootnoteOccurrence, XbrlNonnumericOccurrence, XbrlNumericFact,
 };

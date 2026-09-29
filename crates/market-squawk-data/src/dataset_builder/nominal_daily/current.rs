@@ -117,6 +117,36 @@ impl NominalDailyCurrentSource {
 }
 
 impl CompleteMarketBarHistoryOutput {
+    /// Retains the original latest pair through the shared current-source validation.
+    pub fn try_current_nominal_daily_source(
+        &self,
+        source_cutoff: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<NominalDailyCurrentSource, DatasetBuildError> {
+        DatasetHistory::Memory(self).try_current_nominal_daily_source(
+            source_cutoff,
+            deadline,
+            cancellation,
+        )
+    }
+}
+impl CompleteMarketBarHistoryCursor {
+    /// Retains the same latest pair directly from the indexed original history.
+    pub fn try_current_nominal_daily_source(
+        &self,
+        source_cutoff: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<NominalDailyCurrentSource, DatasetBuildError> {
+        DatasetHistory::Indexed(self).try_current_nominal_daily_source(
+            source_cutoff,
+            deadline,
+            cancellation,
+        )
+    }
+}
+impl DatasetHistory<'_> {
     /// Retains only the final two completed native bars, not another full source history.
     /// Local availability remains the actual saved cutoff and never becomes historical knowledge.
     pub fn try_current_nominal_daily_source(
@@ -131,6 +161,10 @@ impl CompleteMarketBarHistoryOutput {
             .native_sessions()
             .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?;
         let clocks = receipt.knowledge_clocks();
+        let bar_count = match self {
+            Self::Memory(history) => history.bars().len(),
+            Self::Indexed(history) => history.bar_count(),
+        };
         if self.read_receipt().knowledge_cutoff() != source_cutoff
             || !receipt.current_research_eligible()
             || receipt.adjustment() != MarketBarAdjustment::Raw
@@ -140,15 +174,43 @@ impl CompleteMarketBarHistoryOutput {
             || [clocks.0, clocks.1, clocks.2]
                 .iter()
                 .any(|clock| *clock > source_cutoff)
-            || self.bars().len() != sessions.sessions().len()
+            || bar_count != sessions.sessions().len()
         {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         }
         let mut selected = [None, None];
         let mut count = 0;
-        for (index, bar) in self.bars().iter().enumerate().rev() {
+        let bars: Box<
+            dyn Iterator<Item = Result<(usize, MarketBarObservation), DatasetBuildError>> + '_,
+        > = match self {
+            Self::Memory(history) => Box::new(
+                history
+                    .bars()
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(index, bar)| Ok((index, bar.clone()))),
+            ),
+            Self::Indexed(history) => Box::new((0..bar_count).rev().map(|index| {
+                let session = sessions
+                    .sessions()
+                    .get(index)
+                    .map_err(map_history_read_error)?
+                    .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?;
+                let coordinate = market_squawk_domain::ResearchTemporalCoordinate::calendar_date(
+                    session.native_date(),
+                );
+                let bar = history
+                    .bar_at_coordinate(&coordinate)
+                    .map_err(map_history_read_error)?
+                    .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?;
+                Ok((index, bar))
+            })),
+        };
+        for original in bars {
             check_control(deadline, cancellation)?;
-            let row = self.nominal_session_row(bar)?;
+            let (index, bar) = original?;
+            let row = self.nominal_session_row(&bar)?;
             let known = bar
                 .context()
                 .provenance()
@@ -187,10 +249,10 @@ impl CompleteMarketBarHistoryOutput {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         }
         let source = self.nominal_source(prior_row, current_row, None)?;
-        // Use the existing epoch's conservative eight-times serialization accounting. Charge
-        // before cloning the two bar payloads; the complete history is never cloned here.
+        // Use the existing epoch's conservative eight-times serialization accounting. Only
+        // the selected original pair is retained; the complete history is never cloned here.
         let mut counter = ByteCounter(0);
-        serde_json::to_writer(&mut counter, &(prior, current, &source.origin))
+        serde_json::to_writer(&mut counter, &(&prior, &current, &source.origin))
             .map_err(|_| DatasetBuildError::LimitExceeded)?;
         let retained_bytes = counter
             .0
@@ -202,8 +264,8 @@ impl CompleteMarketBarHistoryOutput {
         check_control(deadline, cancellation)?;
         Ok(NominalDailyCurrentSource {
             source,
-            prior: prior.clone(),
-            current: current.clone(),
+            prior,
+            current,
             source_cutoff,
             retained_bytes,
         })

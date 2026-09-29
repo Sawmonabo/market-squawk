@@ -4,21 +4,23 @@ mod current;
 mod fiscal;
 mod history;
 mod probability;
-pub(crate) use probability::{ProbabilityBenchmarkSource, ProbabilityCohortCoverage,
-    ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest, PreparedProbabilityDatasetPair};
 pub(crate) use current::{
     CurrentFindPartitionEvidenceReference, CurrentFindPartitionPreparationEvidence,
     CurrentFindScreenPartition, PreparedCurrentFindFeaturePartition, PreparedCurrentFindFeatures,
 };
 pub(crate) use fiscal::{
-    FiscalDatasetPreparationRequest, HistoricalFiscalDatasetExpectation,
-    HistoricalFiscalStudyBinding, HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference,
-    HistoricalFiscalJobReference, HistoricalFiscalCompletedJobs, HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGES,
-    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_PAGE_SIZE,
+    FiscalDatasetPreparationRequest, HISTORICAL_FISCAL_MAXIMUM_ORIGINS,
+    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_MAXIMUM_PAGES,
+    HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs, HistoricalFiscalDatasetExpectation,
     HistoricalFiscalForecastReadCapability, HistoricalFiscalForecastReference,
-    HistoricalFiscalRecipeReference, HistoricalFiscalSourceSelection,
+    HistoricalFiscalJobReference, HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference,
+    HistoricalFiscalRecipeReference, HistoricalFiscalSourceSelection, HistoricalFiscalStudyBinding,
     HistoricalFiscalTrainingAuthority, HistoricalFiscalUnavailableReference,
     HistoricalOriginFinancialForecast, PreparedFiscalDatasetPair, PreparedHistoricalFiscalDatasets,
+};
+pub(crate) use probability::{
+    PreparedProbabilityDatasetPair, ProbabilityBenchmarkSource, ProbabilityCohortCoverage,
+    ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
 };
 
 use std::{
@@ -65,11 +67,16 @@ use super::{
     macro_context::MacroContextReadCapability,
     macro_features::{MacroFeatureVector, read_macro_feature_vector},
 };
-use crate::{ResearchService, application::{
-    lifecycle::WorkspaceRuntimeIdentity,
-    market_calendar::{CompletedMarketSessionError, CompletedMarketSessionRead, CompletedMarketSessionReadCapability,
-        CompletedMarketSessionReference},
-}};
+use crate::{
+    ResearchService,
+    application::{
+        lifecycle::WorkspaceRuntimeIdentity,
+        market_calendar::{
+            CompletedMarketSessionError, CompletedMarketSessionRead,
+            CompletedMarketSessionReadCapability, CompletedMarketSessionReference,
+        },
+    },
+};
 
 use history::DatasetRecipeCoordinates;
 pub(crate) use history::RecommendationCohortPreparationRequest;
@@ -494,7 +501,8 @@ pub(crate) struct DatasetPreparationAuthority {
     reader: AnalyticalReadCapability,
     macro_context: MacroContextReadCapability,
     calendar: CompletedMarketSessionReadCapability,
-    source_actions: crate::application::research::corporate_actions::SourceAppliedCorporateActionReadCapability,
+    source_actions:
+        crate::application::research::corporate_actions::SourceAppliedCorporateActionReadCapability,
     receipts: Mutex<ReceiptRegistry>,
 }
 
@@ -522,35 +530,53 @@ impl DatasetPreparationAuthority {
 
     /// Reopens the original calendar named by the source publication and performs the existing
     /// controlled history association. A newer current calendar cannot replace that evidence.
-    pub(crate) async fn rejoin_nominal_history(
+    pub(crate) async fn rejoin_nominal_history<
+        H: crate::application::research::market_history::NativeSessionHistory,
+    >(
         &self,
-        history: market_squawk_data::CompleteMarketBarHistoryOutput,
+        history: H,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(market_squawk_data::CompleteMarketBarHistoryOutput, CompletedMarketSessionRead), DatasetPreparationError> {
+    ) -> Result<(H, CompletedMarketSessionRead), DatasetPreparationError> {
         check_control(deadline, cancellation)?;
-        let graph = history.selection().receipt().date_windows()
+        let graph = history
+            .selection()
+            .receipt()
+            .date_windows()
             .ok_or(DatasetPreparationError::InvalidEvidence)?;
         let original = graph.calendar();
         let reference = CompletedMarketSessionReference::try_from_retained_digests(
-            original.origin_content_digest, original.capture_binding_digest,
-        ).map_err(map_calendar_preparation_error)?;
+            original.origin_content_digest,
+            original.capture_binding_digest,
+        )
+        .map_err(map_calendar_preparation_error)?;
         let cutoff = history.read_receipt().knowledge_cutoff();
-        let calendar = self.calendar.read_reference(
-            &reference, cutoff, deadline, cancellation.child_token(),
-        ).await.map_err(map_calendar_preparation_error)?
+        let calendar = self
+            .calendar
+            .read_reference(&reference, cutoff, deadline, cancellation.child_token())
+            .await
+            .map_err(map_calendar_preparation_error)?
             .ok_or(DatasetPreparationError::Unavailable)?;
-        let history = self.research.rejoin_market_history_native_sessions_with_calendar(
-            history, &calendar, deadline, cancellation,
-        ).await.map_err(|_| check_control(deadline, cancellation).err()
-            .unwrap_or(DatasetPreparationError::InvalidEvidence))?;
+        let history = self
+            .research
+            .rejoin_market_history_native_sessions_with_calendar(
+                history,
+                &calendar,
+                deadline,
+                cancellation,
+            )
+            .await
+            .map_err(|_| {
+                check_control(deadline, cancellation)
+                    .err()
+                    .unwrap_or(DatasetPreparationError::InvalidEvidence)
+            })?;
         if history.native_sessions().is_none() {
             return Err(DatasetPreparationError::InvalidEvidence);
         }
         check_control(deadline, cancellation)?;
         Ok((history, calendar))
     }
-
     /// Lists only builds derivable from complete current source evidence and current rights.
     pub(crate) async fn options(
         &self,
@@ -1162,9 +1188,14 @@ async fn derive_generation_options(
             provider_instrument_id: value.provider_instrument_id().clone(),
             feed: value.feed().clone(),
             interval: value.interval().clone(),
-            timestamp_basis: value.time_semantics().timestamp_basis()
+            timestamp_basis: value
+                .time_semantics()
+                .timestamp_basis()
                 .ok_or(DatasetPreparationError::InvalidEvidence)?,
-            session: value.time_semantics().session().cloned()
+            session: value
+                .time_semantics()
+                .session()
+                .cloned()
                 .ok_or(DatasetPreparationError::InvalidEvidence)?,
             currency: value.currency(),
         };
@@ -1182,8 +1213,11 @@ async fn derive_generation_options(
             available_at,
             observation: value.clone(),
             manifest: generation.manifest().clone(),
-            session_evidence: value.time_semantics().session()
-                .ok_or(DatasetPreparationError::InvalidEvidence)?.evidence(),
+            session_evidence: value
+                .time_semantics()
+                .session()
+                .ok_or(DatasetPreparationError::InvalidEvidence)?
+                .evidence(),
         });
     }
     for (_, mut series) in series {
@@ -1683,7 +1717,10 @@ fn adjustment_evidence(
         DigestAlgorithm::Sha256,
         Sha256::digest(if plan.source_split_admission().is_some() {
             b"market-squawk/source-applied-native-close-split-price-return-kernel/v1".as_slice()
-        } else { SPLIT_RETURN_KERNEL_REVISION.as_bytes() }).into(),
+        } else {
+            SPLIT_RETURN_KERNEL_REVISION.as_bytes()
+        })
+        .into(),
     );
     ComponentAdjustmentEvidence::try_applied(
         plan.policy(),
@@ -1713,8 +1750,12 @@ fn split_adjusted_close(
     plan: &CorporateActionPlan,
 ) -> Result<Decimal, DatasetPreparationError> {
     if plan.source_split_admission().is_some() {
-        return super::corporate_actions::source_split_adjusted_close(plan, &point.observation, point.effective)
-            .map_err(map_source_action_error);
+        return super::corporate_actions::source_split_adjusted_close(
+            plan,
+            &point.observation,
+            point.effective,
+        )
+        .map_err(map_source_action_error);
     }
     let mut adjusted = point.observation.close().amount();
     for step in plan.steps() {
@@ -1734,10 +1775,20 @@ fn split_adjusted_close(
             // Application is issued by the original native calendar; the source date is unchanged.
             application.application_at()
         } else {
-            if point.observation.time_semantics().nominal_daily_date().is_some() {
+            if point
+                .observation
+                .time_semantics()
+                .nominal_daily_date()
+                .is_some()
+            {
                 return Err(DatasetPreparationError::InvalidEvidence);
             }
-            action.observation().context().time().effective().exact_timestamp()
+            action
+                .observation()
+                .context()
+                .time()
+                .effective()
+                .exact_timestamp()
                 .ok_or(DatasetPreparationError::InvalidEvidence)?
         };
         // The bar's aggregation interval is half-open. A split at its exclusive end changes
@@ -2336,55 +2387,90 @@ const fn hex_nibble(value: u8) -> Option<u8> {
 
 fn map_calendar_preparation_error(error: CompletedMarketSessionError) -> DatasetPreparationError {
     match error {
-        CompletedMarketSessionError::Cancelled | CompletedMarketSessionError::DeadlineExceeded =>
-            DatasetPreparationError::Cancelled,
+        CompletedMarketSessionError::Cancelled | CompletedMarketSessionError::DeadlineExceeded => {
+            DatasetPreparationError::Cancelled
+        }
         CompletedMarketSessionError::ResourceBoundExceeded => DatasetPreparationError::Capacity,
         CompletedMarketSessionError::Unavailable => DatasetPreparationError::Unavailable,
-        CompletedMarketSessionError::InvalidRequest | CompletedMarketSessionError::InvalidEvidence =>
-            DatasetPreparationError::InvalidEvidence,
+        CompletedMarketSessionError::InvalidRequest
+        | CompletedMarketSessionError::InvalidEvidence => DatasetPreparationError::InvalidEvidence,
     }
 }
 
 /// Projects only an originally covered price-action pool across the actual native source span.
 /// Snapshot knowledge is fixed; a financial date never becomes a fabricated effective instant.
 fn project_source_price_plan(
-    source: &CorporateActionPlan, instrument: InstrumentId, knowledge: Timestamp,
-    valuation: Timestamp, left: &MarketSeriesPoint, right: &MarketSeriesPoint,
-    deadline: Instant, cancellation: &CancellationToken,
+    source: &CorporateActionPlan,
+    instrument: InstrumentId,
+    knowledge: Timestamp,
+    valuation: Timestamp,
+    left: &MarketSeriesPoint,
+    right: &MarketSeriesPoint,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<CorporateActionPlan, DatasetPreparationError> {
     check_control(deadline, cancellation)?;
-    let coverage = source.source_split_admission().ok_or(DatasetPreparationError::InvalidEvidence)?;
-    if knowledge != coverage.knowledge_cutoff() || left.effective >= right.effective
-        || valuation < right.effective || valuation > knowledge
+    let coverage = source
+        .source_split_admission()
+        .ok_or(DatasetPreparationError::InvalidEvidence)?;
+    if knowledge != coverage.knowledge_cutoff()
+        || left.effective >= right.effective
+        || valuation < right.effective
+        || valuation > knowledge
         || !coverage.history_input_manifests().contains(&left.manifest)
         || !coverage.history_input_manifests().contains(&right.manifest)
-        || coverage.application_starts_at(instrument).is_none_or(|start| start > left.effective) {
+        || coverage
+            .application_starts_at(instrument)
+            .is_none_or(|start| start > left.effective)
+    {
         return Err(DatasetPreparationError::InvalidEvidence);
     }
-    match (left.observation.time_semantics().nominal_daily_date(), right.observation.time_semantics().nominal_daily_date()) {
+    match (
+        left.observation.time_semantics().nominal_daily_date(),
+        right.observation.time_semantics().nominal_daily_date(),
+    ) {
         (Some(left_date), Some(right_date)) => {
-            if coverage.interval().0 > left_date.date() || coverage.interval().1 < right_date.date() {
+            if coverage.interval().0 > left_date.date() || coverage.interval().1 < right_date.date()
+            {
                 return Err(DatasetPreparationError::InvalidEvidence);
             }
         }
-        (None, None) if left.manifest == right.manifest
-            && left.observation.completed_at() == Some(left.effective)
-            && right.observation.completed_at() == Some(right.effective)
-            && coverage.covers_timestamp_history_span(instrument, &left.manifest, knowledge, left.effective, right.effective) => {}
+        (None, None)
+            if left.manifest == right.manifest
+                && left.observation.completed_at() == Some(left.effective)
+                && right.observation.completed_at() == Some(right.effective)
+                && coverage.covers_timestamp_history_span(
+                    instrument,
+                    &left.manifest,
+                    knowledge,
+                    left.effective,
+                    right.effective,
+                ) => {}
         _ => return Err(DatasetPreparationError::InvalidEvidence),
     }
-    let policy = CorporateActionPolicy::new(CorporateActionAdjustment::SplitAdjusted, NonZeroU32::MIN);
-    let limits = source.source_split_projection_limits(policy, instrument, knowledge, valuation)
+    let policy =
+        CorporateActionPolicy::new(CorporateActionAdjustment::SplitAdjusted, NonZeroU32::MIN);
+    let limits = source
+        .source_split_projection_limits(policy, instrument, knowledge, valuation)
         .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-    let plan = source.try_project_source_split_plan(policy, instrument, knowledge, valuation, limits)
+    let plan = source
+        .try_project_source_split_plan(policy, instrument, knowledge, valuation, limits)
         .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
     // Ordinary dividends do not change the split-adjusted PRICE return. Other unit/lifecycle
     // effects inside this span require a different modeled target; never silently ignore them.
     for record in plan.admitted() {
-        let at = record.application().ok_or(DatasetPreparationError::InvalidEvidence)?.application_at();
-        if at >= left.effective && at <= right.effective
-            && !matches!(record.observation().action(), market_squawk_domain::CorporateActionKind::Split { .. }
-                | market_squawk_domain::CorporateActionKind::CashDividend { .. }) {
+        let at = record
+            .application()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?
+            .application_at();
+        if at >= left.effective
+            && at <= right.effective
+            && !matches!(
+                record.observation().action(),
+                market_squawk_domain::CorporateActionKind::Split { .. }
+                    | market_squawk_domain::CorporateActionKind::CashDividend { .. }
+            )
+        {
             return Err(DatasetPreparationError::Unavailable);
         }
     }
@@ -2392,12 +2478,16 @@ fn project_source_price_plan(
     Ok(plan)
 }
 
-fn map_source_action_error(error: crate::application::research::corporate_actions::ApplicableActionPlanError) -> DatasetPreparationError {
+fn map_source_action_error(
+    error: crate::application::research::corporate_actions::ApplicableActionPlanError,
+) -> DatasetPreparationError {
     use crate::application::research::corporate_actions::ApplicableActionPlanError as Error;
     match error {
         Error::SourceRead(error) => DatasetPreparationError::SourceRead(error),
         Error::Interrupted => DatasetPreparationError::Cancelled,
         Error::InvalidEvidence => DatasetPreparationError::InvalidEvidence,
-        Error::IncompleteOrdinaryCoverage | Error::UnresolvedApplicableActions => DatasetPreparationError::Unavailable,
+        Error::IncompleteOrdinaryCoverage | Error::UnresolvedApplicableActions => {
+            DatasetPreparationError::Unavailable
+        }
     }
 }

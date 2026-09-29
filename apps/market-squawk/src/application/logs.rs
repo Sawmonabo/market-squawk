@@ -240,13 +240,17 @@ pub struct StructuredLogQuery {
     pub job_id: Option<String>,
     pub correlation_id: Option<String>,
     pub search: Option<String>,
-    pub after_sequence: Option<u64>,
+    pub cursor: Option<String>,
     pub limit: usize,
 }
 
 impl StructuredLogQuery {
     pub(super) fn validate(&self) -> Result<(), StructuredLogError> {
-        if self.limit == 0
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 1024)
+            || self.limit == 0
             || self.limit > MAXIMUM_QUERY_LIMIT
             || self
                 .from
@@ -283,7 +287,7 @@ impl Default for StructuredLogQuery {
             job_id: None,
             correlation_id: None,
             search: None,
-            after_sequence: None,
+            cursor: None,
             limit: 250,
         }
     }
@@ -294,7 +298,7 @@ impl Default for StructuredLogQuery {
 #[serde(rename_all = "camelCase")]
 pub struct StructuredLogPage {
     pub(super) records: Vec<StructuredLogRecord>,
-    pub(super) next_after_sequence: Option<u64>,
+    pub(super) next_cursor: Option<String>,
 }
 
 impl StructuredLogPage {

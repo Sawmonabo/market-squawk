@@ -5,10 +5,7 @@ use market_squawk_services::{
 };
 use serde::Deserialize;
 
-use crate::application::{
-    analytical_profile::{AnalyticalProfileConfiguration, catalog, resolve},
-    model::forecast_preparation::ForecastPreparationCatalog,
-};
+use crate::application::analytical_profile::{AnalyticalProfileConfiguration, catalog, resolve};
 
 pub(super) const GET_CATALOG: &str = "AnalyticalProfile.GetCatalog";
 pub(super) const RESOLVE: &str = "AnalyticalProfile.Resolve";
@@ -23,33 +20,61 @@ struct ResolveRequest {
     configuration: Option<AnalyticalProfileConfiguration>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelPageRequest {
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
 /// Uses the existing forecast preparation catalogue supplied by installed composition. This
 /// adapter owns no runtime, model registry, profile persistence, or independent financial default.
-pub(super) fn call(
+pub(super) async fn call(
     request: &TypedToolRequest,
     context: &RequestContext,
-    models: Option<&ForecastPreparationCatalog>,
+    forecasts: &super::forecast_preparation::InstalledForecastPreparation,
     benchmarks: &crate::application::RecommendationBenchmarkSelectionReadCapability,
 ) -> Result<TypedToolResult, ServiceError> {
     ensure_live(context)?;
     let arguments = super::business_arguments(request.arguments());
     let (content, count) = match request.name() {
         GET_CATALOG => {
-            if !arguments.is_empty() {
+            let input: ModelPageRequest =
+                serde_json::from_value(serde_json::Value::Object(arguments))
+                    .map_err(|_| ServiceError::InvalidRequest)?;
+            let limit = input.limit.unwrap_or(25);
+            if !(1..=100).contains(&limit)
+                || input
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 512)
+            {
                 return Err(ServiceError::InvalidRequest);
             }
-            let observed_at = super::runtime::current_timestamp()
-                .map_err(|_| ServiceError::Internal)?;
+            let models = forecasts
+                .model_catalog_page(input.cursor, usize::from(limit), context)
+                .await?;
+            let observed_at =
+                super::runtime::current_timestamp().map_err(|_| ServiceError::Internal)?;
             let choices = benchmarks.comparison_choices(
-                observed_at, observed_at, context.deadline(), context.cancellation(),
+                observed_at,
+                observed_at,
+                context.deadline(),
+                context.cancellation(),
             )?;
-            (catalog(models, &choices)?, 10)
+            (catalog(models.as_ref(), &choices)?, 10)
         }
         RESOLVE => {
             let input: ResolveRequest =
                 serde_json::from_value(serde_json::Value::Object(arguments))
                     .map_err(|_| ServiceError::InvalidRequest)?;
-            let resolved = resolve(input.configuration, models)?;
+            let configuration = input
+                .configuration
+                .map_or_else(AnalyticalProfileConfiguration::default_v1, Ok)?;
+            let models = forecasts
+                .financial_profile_catalog(&configuration, context)
+                .await?;
+            let resolved = resolve(Some(configuration), models.as_ref())?;
             (
                 serde_json::to_value(resolved.resolution())
                     .map_err(|_| ServiceError::InvalidResult)?,

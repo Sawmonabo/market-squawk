@@ -32,7 +32,8 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::normalize::{
-    compare_company_facts, compare_filings, normalize_filing_xbrl_with_cancellation,
+    SecFilingXbrlNormalization, compare_company_facts, compare_filings,
+    normalize_filing_xbrl_with_cancellation,
 };
 use crate::product::{SEC_FILING_XBRL_DATASET_PREFIX, SecFilingXbrlCoordinates};
 use crate::xbrl::{
@@ -299,7 +300,8 @@ impl SecFilingXbrlCaptureHandoff {
         max_bytes: NonZeroU64,
         deadline: Timestamp,
         cancellation: CancellationToken,
-    ) -> Result<(SecExtractionResult, ProviderCaptureMaterial), SecClientError> {
+        scratch_parent: &std::path::Path,
+    ) -> Result<(SecFilingXbrlExtractionStream, ProviderCaptureMaterial), SecClientError> {
         extract_filing_xbrl_handoff(
             self.pending,
             self.capture_material,
@@ -308,6 +310,7 @@ impl SecFilingXbrlCaptureHandoff {
             max_bytes,
             deadline,
             &cancellation,
+            scratch_parent,
         )
     }
 }
@@ -766,7 +769,8 @@ fn extract_filing_xbrl_handoff(
     max_bytes: NonZeroU64,
     deadline: Timestamp,
     cancellation: &CancellationToken,
-) -> Result<(SecExtractionResult, ProviderCaptureMaterial), SecClientError> {
+    scratch_parent: &std::path::Path,
+) -> Result<(SecFilingXbrlExtractionStream, ProviderCaptureMaterial), SecClientError> {
     authority.validate_current()?;
     if cancellation.is_cancelled() {
         return Err(SecClientError::Cancelled);
@@ -866,17 +870,21 @@ fn extract_filing_xbrl_handoff(
         .ok_or(SecClientError::ResponseTooLarge)?;
     let parser_limits = pending
         .parser_limits
-        .intersect(request_parser_limits(
+        .intersect(request_parser_limits_with_record_limit(
             &request,
             pending.filing_document.bytes().len(),
             0,
+            // This filing is indexed before bounded extraction chunks are emitted. The chunk
+            // row window is not the complete parser's occurrence/work admission.
+            pending.parser_limits.records(),
         )?)?
         .with_retained_bytes(parser_admission)?;
-    let document = XbrlDocumentParser::parse_with_cancellation(
+    let document = XbrlDocumentParser::parse_indexed_in_with_cancellation(
         pending.filing_document.bytes(),
         parser_limits,
         pending.document_context,
         cancellation,
+        scratch_parent,
     )?;
     let ingested_at = crate::client::system_timestamp()?;
     let company_identity = company_identity_from_submissions(
@@ -886,7 +894,7 @@ fn extract_filing_xbrl_handoff(
         ingested_at,
         cancellation,
     )?;
-    let mut normalized = normalize_filing_xbrl_with_cancellation(
+    let normalized = normalize_filing_xbrl_with_cancellation(
         &pending.source_id,
         &pending.identities,
         pending.dataset,
@@ -896,6 +904,7 @@ fn extract_filing_xbrl_handoff(
         ingested_at,
         parser_admission,
         cancellation,
+        scratch_parent,
     )?;
     let normalization_retained = normalized.working_set_retained_bytes();
     let canonical_admission = parser_admission
@@ -912,63 +921,133 @@ fn extract_filing_xbrl_handoff(
         deadline,
     )
     .map_err(map_extraction_contract_error)?;
-    let mut records =
-        ExtractionBatchAccumulator::try_new(&request).map_err(map_extraction_contract_error)?;
-    while let Some(observation) = normalized.try_next_observation(cancellation)? {
-        authority.validate_current()?;
-        records
-            .push(canonical_record(
-                &request,
-                observation,
-                &authority,
-                cancellation,
-            )?)
-            .map_err(map_extraction_contract_error)?;
-    }
-    let batch = records.finish().map_err(map_extraction_contract_error)?;
-    if batch.records().is_empty() {
+    if normalized.numeric_fact_count() == 0 {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
-    let batch_retained =
-        usize::try_from(batch.total_bytes().map_err(map_extraction_contract_error)?)
-            .map_err(|_| SecClientError::ResponseTooLarge)?;
-    let row_map_retained = batch
-        .records()
-        .len()
-        .checked_mul(size_of::<u16>())
-        .and_then(|n| n.checked_mul(2))
-        .ok_or(SecClientError::ResponseTooLarge)?;
-    let native_admission = canonical_admission
-        .checked_sub(batch_retained)
-        .and_then(|n| n.checked_sub(row_map_retained))
-        .filter(|n| *n > 0)
-        .ok_or(SecClientError::ResponseTooLarge)?;
-    let native_lineage = normalized
-        .into_native_lineage()?
-        .try_into_provider_native_lineage(&batch, native_admission)
-        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
-    let mut row_capture_page_ordinals = Vec::new();
-    row_capture_page_ordinals
-        .try_reserve_exact(batch.records().len())
-        .map_err(|_| SecClientError::AllocationFailed)?;
-    if row_capture_page_ordinals
-        .capacity()
-        .checked_mul(size_of::<u16>())
-        .is_none_or(|bytes| bytes > row_map_retained)
-    {
-        return Err(SecClientError::ResponseTooLarge);
-    }
-    row_capture_page_ordinals.resize(batch.records().len(), 1);
-    authority.validate_current()?;
     Ok((
-        SecExtractionResult {
-            batch,
-            company_identity: Some(company_identity),
-            native_lineage,
-            row_capture_page_ordinals,
+        SecFilingXbrlExtractionStream {
+            authority,
+            request,
+            normalized,
+            company_identity,
+            pending_record: None,
+            emitted: 0,
+            finished: false,
+            maximum_working_bytes: canonical_admission,
         },
         capture_material,
     ))
+}
+
+/// Complete validated filing producer. Each yielded range is bounded; EOF is mandatory before
+/// the common logical-publication owner can seal the entire filing's canonical identity.
+#[derive(Debug)]
+pub struct SecFilingXbrlExtractionStream {
+    authority: ExtractionAuthority,
+    request: ExtractionRequest,
+    normalized: SecFilingXbrlNormalization,
+    company_identity: CompanyIdentityObservation,
+    pending_record: Option<ExtractionRecord>,
+    emitted: usize,
+    finished: bool,
+    maximum_working_bytes: usize,
+}
+impl SecFilingXbrlExtractionStream {
+    pub const fn request(&self) -> &ExtractionRequest {
+        &self.request
+    }
+    pub const fn total_records(&self) -> usize {
+        self.normalized.numeric_fact_count()
+    }
+    pub const fn company_identity(&self) -> &CompanyIdentityObservation {
+        &self.company_identity
+    }
+    pub const fn emitted_records(&self) -> usize {
+        self.emitted
+    }
+    pub fn next_chunk(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SecExtractionResult>, SecClientError> {
+        self.authority.validate_current()?;
+        if cancellation.is_cancelled() {
+            return Err(SecClientError::Cancelled);
+        }
+        if crate::client::system_timestamp()? >= self.request.deadline() {
+            return Err(SecClientError::DeadlineExceeded);
+        }
+        if self.finished {
+            return Ok(None);
+        }
+        let start = self.emitted;
+        let mut count = 0usize;
+        let mut records = ExtractionBatchAccumulator::try_new(&self.request)
+            .map_err(map_extraction_contract_error)?;
+        while count < 256 && count < self.request.max_records() as usize {
+            if crate::client::system_timestamp()? >= self.request.deadline() {
+                return Err(SecClientError::DeadlineExceeded);
+            }
+            let record = if let Some(record) = self.pending_record.take() {
+                record
+            } else {
+                let Some(observation) = self.normalized.try_next_observation(cancellation)? else {
+                    self.finished = true;
+                    break;
+                };
+                canonical_record(&self.request, observation, &self.authority, cancellation)?
+            };
+            if let Some(record) = records
+                .try_push_or_return(record)
+                .map_err(map_extraction_contract_error)?
+            {
+                self.pending_record = Some(record);
+                break;
+            }
+            count += 1;
+        }
+        if count == 0 {
+            if self.finished && self.emitted == self.total_records() {
+                return Ok(None);
+            }
+            return Err(SecClientError::ResponseTooLarge);
+        }
+        let batch = records.finish().map_err(map_extraction_contract_error)?;
+        let batch_bytes =
+            usize::try_from(batch.total_bytes().map_err(map_extraction_contract_error)?)
+                .map_err(|_| SecClientError::ResponseTooLarge)?;
+        let native_admission = self
+            .maximum_working_bytes
+            .checked_sub(batch_bytes)
+            .and_then(|bytes| bytes.checked_sub(count * 2 * size_of::<u16>()))
+            .ok_or(SecClientError::ResponseTooLarge)?;
+        let native_result =
+            self.normalized
+                .native_for_batch(&batch, start, native_admission, cancellation);
+        if cancellation.is_cancelled() {
+            return Err(SecClientError::Cancelled);
+        }
+        if crate::client::system_timestamp()? >= self.request.deadline() {
+            return Err(SecClientError::DeadlineExceeded);
+        }
+        let native_lineage =
+            native_result.map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+        self.emitted = self
+            .emitted
+            .checked_add(count)
+            .ok_or(SecClientError::ResponseTooLarge)?;
+        if self.emitted > self.total_records()
+            || (self.finished && self.emitted != self.total_records())
+        {
+            return Err(SecClientError::InvalidCompositeRepresentation);
+        }
+        self.authority.validate_current()?;
+        Ok(Some(SecExtractionResult {
+            batch,
+            company_identity: Some(self.company_identity.clone()),
+            native_lineage,
+            row_capture_page_ordinals: vec![1; count],
+        }))
+    }
 }
 
 fn extract_blocking(
@@ -1790,6 +1869,21 @@ fn request_parser_limits(
     decoded_bytes: usize,
     decoded_capacity: usize,
 ) -> Result<SecParserLimits, SecClientError> {
+    request_parser_limits_with_record_limit(
+        request,
+        decoded_bytes,
+        decoded_capacity,
+        usize::try_from(request.max_records())
+            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?,
+    )
+}
+
+fn request_parser_limits_with_record_limit(
+    request: &ExtractionRequest,
+    decoded_bytes: usize,
+    decoded_capacity: usize,
+    parser_record_limit: usize,
+) -> Result<SecParserLimits, SecClientError> {
     let working_set_limit = usize::try_from(
         request
             .max_bytes()
@@ -1808,8 +1902,7 @@ fn request_parser_limits(
     let string_limit = decoded_limit.min(256 * 1024).min(total_string_limit).max(1);
     SecParserLimits::try_new(
         decoded_limit,
-        usize::try_from(request.max_records())
-            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?,
+        parser_record_limit,
         128,
         string_limit,
         total_string_limit,

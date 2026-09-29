@@ -76,24 +76,28 @@ impl ModelDomainService {
             return Ok(result);
         }
         let image = self.read_image.load();
-        let backend = image
-            .backends
-            .iter()
-            .find(|backend| {
-                let metadata = backend.metadata();
-                metadata.model_id() == model_id
-                    && metadata.bundle_id() == &parsed.bundle_id
-                    && metadata.bundle_version() == parsed.bundle_version
-            })
-            .ok_or(ServiceError::NotFound)?;
-        let metadata = backend.metadata();
-        let bundle = image
-            .registry
-            .get(metadata.bundle_id(), metadata.bundle_version())
-            .map_err(|_| ServiceError::Unavailable)?
-            .ok_or(ServiceError::Unavailable)?;
+        let active = image
+            .activate(
+                &parsed.bundle_id,
+                parsed.bundle_version,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .map_err(|error| match error {
+                super::super::runtime::ProductionModelRuntimeError::ValidationDeadline => {
+                    ServiceError::DeadlineExceeded
+                }
+                _ if context.cancellation().is_cancelled() => ServiceError::Cancelled,
+                _ => ServiceError::Unavailable,
+            })?;
+        let backend = active.backend();
+        let bundle = active.bundle();
+        let metadata = bundle.metadata();
+        if metadata.model_id() != model_id {
+            return Err(ServiceError::NotFound);
+        }
         let authoritative_evidence =
-            forecast_model_evidence_projection_for_horizon(&bundle, parsed.horizon)?;
+            forecast_model_evidence_projection_for_horizon(bundle, parsed.horizon)?;
         if authoritative_evidence != parsed.model_evidence {
             return Err(ServiceError::InvalidRequest);
         }
@@ -332,7 +336,17 @@ impl ModelDomainService {
     ) -> Result<Option<ForecastJobOutput>, ServiceError> {
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         ensure_request_live(context, &self.lifecycle)?;
-        let Some(existing) = forecasts.vintage_for_request(request_hash).await else {
+        let Some(existing) = forecasts
+            .vintage_for_request(
+                request_hash,
+                &market_squawk_services::ArtifactReadContext::new(
+                    context.cancellation().clone(),
+                    context.deadline(),
+                ),
+            )
+            .await
+            .map_err(map_forecast_error)?
+        else {
             return Ok(None);
         };
         let artifact = forecasts
@@ -345,10 +359,21 @@ impl ModelDomainService {
             )
             .await
             .map_err(map_forecast_error)?;
-        super::outcome::validate_event_for_read(self, existing.product_token().map_err(map_forecast_error)?, context)
-            .await.map_err(map_forecast_error)?;
+        super::outcome::validate_event_for_read(
+            self,
+            existing.product_token().map_err(map_forecast_error)?,
+            context,
+        )
+        .await
+        .map_err(map_forecast_error)?;
         let content = forecasts
-            .get_forecast_by_identity(&existing.vintage_id)
+            .get_forecast_by_identity(
+                &existing.vintage_id,
+                &market_squawk_services::ArtifactReadContext::new(
+                    context.cancellation().clone(),
+                    context.deadline(),
+                ),
+            )
             .await
             .map_err(map_forecast_error)?;
         let result = one_result(content, request, context)?;
@@ -368,10 +393,18 @@ impl ModelDomainService {
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         let vintage = admitted_vintage_id(request.arguments())?;
         let token = Uuid::parse_str(vintage).map_err(|_| ServiceError::InvalidRequest)?;
-        super::outcome::validate_event_for_read(self, token, context).await.map_err(map_forecast_error)?;
+        super::outcome::validate_event_for_read(self, token, context)
+            .await
+            .map_err(map_forecast_error)?;
         one_result(
             forecasts
-                .get_forecast(vintage)
+                .get_forecast(
+                    vintage,
+                    &market_squawk_services::ArtifactReadContext::new(
+                        context.cancellation().clone(),
+                        context.deadline(),
+                    ),
+                )
                 .await
                 .map_err(map_forecast_error)?,
             request,
@@ -386,11 +419,27 @@ impl ModelDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         let limits = admitted_result_limits(request, context)?;
-        let maximum =
-            NonZeroUsize::new(limits.maximum_result_items()).ok_or(ServiceError::InvalidRequest)?;
+        let requested = request
+            .arguments()
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(ServiceError::InvalidRequest)
+            })
+            .transpose()?
+            .unwrap_or(25);
+        if requested > 100 || requested > limits.maximum_result_items() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let maximum = NonZeroUsize::new(requested).ok_or(ServiceError::InvalidRequest)?;
         collection_result(
             forecasts
-                .list_forecasts(maximum)
+                .list_forecasts(
+                    maximum,
+                    request.arguments().get("cursor").and_then(Value::as_str),
+                )
                 .await
                 .map_err(map_forecast_error)?,
             limits,
@@ -405,13 +454,36 @@ impl ModelDomainService {
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         let vintage = admitted_vintage_id(request.arguments())?;
         let token = Uuid::parse_str(vintage).map_err(|_| ServiceError::InvalidRequest)?;
-        super::outcome::validate_event_for_read(self, token, context).await.map_err(map_forecast_error)?;
+        super::outcome::validate_event_for_read(self, token, context)
+            .await
+            .map_err(map_forecast_error)?;
         let limits = admitted_result_limits(request, context)?;
-        let maximum =
-            NonZeroUsize::new(limits.maximum_result_items()).ok_or(ServiceError::InvalidRequest)?;
+        let requested = request
+            .arguments()
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(ServiceError::InvalidRequest)
+            })
+            .transpose()?
+            .unwrap_or(25);
+        if requested > 100 || requested > limits.maximum_result_items() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let maximum = NonZeroUsize::new(requested).ok_or(ServiceError::InvalidRequest)?;
         collection_result(
             forecasts
-                .get_forecast_outcomes(vintage, maximum)
+                .get_forecast_outcomes(
+                    vintage,
+                    maximum,
+                    request.arguments().get("cursor").and_then(Value::as_str),
+                    &market_squawk_services::ArtifactReadContext::new(
+                        context.cancellation().clone(),
+                        context.deadline(),
+                    ),
+                )
                 .await
                 .map_err(map_forecast_error)?,
             limits,
@@ -470,7 +542,13 @@ impl super::ForecastJobExecutor for ModelDomainService {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         let vintage = forecasts
-            .vintage_for_artifact(artifact)
+            .vintage_for_artifact(
+                artifact,
+                &market_squawk_services::ArtifactReadContext::new(
+                    context.cancellation().clone(),
+                    context.deadline(),
+                ),
+            )
             .await
             .map_err(map_forecast_error)?;
         if vintage.request_hash != super::persistence::hex(coordinates.request_hash.bytes()) {
@@ -487,7 +565,13 @@ impl super::ForecastJobExecutor for ModelDomainService {
             .await
             .map_err(map_forecast_error)?;
         let content = forecasts
-            .get_forecast_by_identity(&vintage.vintage_id)
+            .get_forecast_by_identity(
+                &vintage.vintage_id,
+                &market_squawk_services::ArtifactReadContext::new(
+                    context.cancellation().clone(),
+                    context.deadline(),
+                ),
+            )
             .await
             .map_err(map_forecast_error)?;
         ensure_request_live(context, &self.lifecycle)?;
@@ -1235,12 +1319,9 @@ fn map_forecast_error(error: ForecastApplicationError) -> ServiceError {
             ServiceError::InvalidResult
         }
         ForecastApplicationError::Artifact(ArtifactError::Unavailable)
-        | ForecastApplicationError::State(_)
-        | ForecastApplicationError::Unavailable
-        | ForecastApplicationError::RestoreTargetNotFresh => ServiceError::Unavailable,
-        ForecastApplicationError::Conflict | ForecastApplicationError::CorruptIndex => {
-            ServiceError::Internal
-        }
+        | ForecastApplicationError::Inventory(_)
+        | ForecastApplicationError::Unavailable => ServiceError::Unavailable,
+        ForecastApplicationError::CorruptIndex => ServiceError::Internal,
     }
 }
 

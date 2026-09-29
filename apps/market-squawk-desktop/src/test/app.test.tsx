@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import { App } from "@/app/app"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
@@ -22,6 +22,18 @@ import {
   type ProductTransport,
   type SystemTransport,
 } from "@/lib/transport"
+
+// Drawing is outside this read-lifecycle regression; preserve the real React
+// consumers, query cache, demand controls and native transport contract.
+vi.mock("lightweight-charts", () => ({
+  ColorType: { Solid: "solid" }, CandlestickSeries: "candles", LineSeries: "line",
+  createChart: () => ({
+    addSeries: () => ({ setData: () => undefined, applyOptions: () => undefined }),
+    subscribeCrosshairMove: () => undefined,
+    timeScale: () => ({ fitContent: () => undefined, setVisibleRange: () => undefined, subscribeVisibleTimeRangeChange: () => undefined }),
+    remove: () => undefined,
+  }),
+}))
 
 const TEST_WORKSPACE_ID = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
 const TEST_SERVICE_GENERATION = 1
@@ -111,18 +123,18 @@ function transport(
     query,
     systemQuery: async () => systemResult(null),
     modelProducts: async (request) =>
-      productResult(request.action === "list" ? { models: [] } : { activities: [] }),
+      productResult(request.action === "list" ? { models: [], nextCursor: null } : { activities: [], nextCursor: null }),
     backtestProducts: async (request) => {
       if (request.action === "get") {
         throw new Error("No completed backtest is configured for this test.")
       }
-      return productResult({ activities: [] })
+      return productResult({ activities: [], nextCursor: null })
     },
     analyticalController: async (request) => request.action === "profileOptions"
       ? { kind: "profile_options", options: {
           benchmarkChoices: [],
           modelChoices: [{ token: "recommended", label: "Recommended calibrated forecast" }],
-          fixedSettings: [],
+          fixedSettings: [], nextCursor: null,
         } }
       : analyticalControllerStatus(),
     researchControl: async () =>
@@ -401,7 +413,6 @@ function marketResult(row: MarketProductRow): ApplicationResult {
 }
 
 const marketOverviewResult = marketResult(marketOverviewRow)
-const marketInstrumentResult = marketResult(marketOverviewRow)
 
 const macroKnowledgeCutoff = "2026-08-28T14:30:00Z"
 const macroEffectiveDateCutoff = "2026-08-27"
@@ -626,6 +637,24 @@ describe("Market Squawk desktop boundary", () => {
   it("renders one provider-neutral market journey with current price and explicit selection", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
+    const historyToken = "history_0123456789abcdef0123456789abcdef"
+    const generationToken = "a".repeat(64)
+    const historyResult: ApplicationResult = {
+      data: { data: {
+        historyToken, currency: "USD", partial: false, generationToken,
+        bars: [
+          { originalOrdinal: "0", breakBefore: [false, false, false], time: { precision: "nominal_date", date: "2026-06-01" }, open: "65000.123456789", high: "65002", low: "64999", close: "65001.123456789", volume: "12" },
+          { originalOrdinal: "2", breakBefore: [false, false, false], time: { precision: "nominal_date", date: "2026-08-08" }, open: "68000", high: "68002", low: "67999", close: "68001.123456789", volume: "15" },
+        ],
+        display: { method: "first_last_min_max", originalPointCount: "3", visibleOriginalPointCount: "3", returnedPointCount: 2,
+          firstTimeUnixNanos: null, lastTimeUnixNanos: null, projectionDigest: "b".repeat(64), reduced: true },
+        viewport: { startUnixNanos: null, endUnixNanos: null, startDate: null, endDate: null, pointLimit: 512,
+          fullStartUnixNanos: null, fullEndUnixNanos: null, fullStartDate: "2026-06-01", fullEndDate: "2026-08-08" },
+      }, unavailableReason: null },
+      metadata: { completeness: "complete", returnedItems: 2, availableItems: 2 },
+    }
+    let viewportSignal: AbortSignal | undefined
+    let resolveViewport: ((result: ApplicationResult) => void) | undefined
     const readyBootstrap: DesktopSystemBootstrap = {
       ...blockedBootstrap,
       capabilities: ["market_overview", "market_instrument"],
@@ -633,10 +662,17 @@ describe("Market Squawk desktop boundary", () => {
     render(
       <MemoryRouter initialEntries={["/markets"]}>
         <App
-          transport={transport(readyBootstrap, undefined, async (request) => {
+          transport={transport(readyBootstrap, undefined, async (request, options) => {
             issuedQueries.push(request)
             if (request.query === "marketOverview") return marketOverviewResult
-            if (request.query === "marketInstrument") return marketInstrumentResult
+            if (request.query === "marketInstrument") return marketResult({ ...marketOverviewRow, historyToken })
+            if (request.query === "marketHistory") {
+              if (request.startDate !== undefined) {
+                viewportSignal = options?.signal
+                return new Promise<ApplicationResult>((resolve) => { resolveViewport = resolve })
+              }
+              return historyResult
+            }
             throw new Error(`Unexpected market query: ${request.query}`)
           })}
         />
@@ -681,6 +717,33 @@ describe("Market Squawk desktop boundary", () => {
         ].includes(request.query),
       ),
     ).toBe(false)
+
+    expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(0)
+    const historyToggle = screen.getByText("Open price history")
+    await user.click(historyToggle)
+    await screen.findByLabelText("History window")
+    expect(issuedQueries.filter((request) => request.query === "marketHistory")).toEqual([
+      { query: "marketHistory", historyToken, pointLimit: 512 },
+    ])
+    expect(screen.getAllByText("68001.123456789 USD").length).toBeGreaterThan(0)
+    await user.selectOptions(screen.getByLabelText("History window"), "30")
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toEqual([
+      { query: "marketHistory", historyToken, pointLimit: 512 },
+      { query: "marketHistory", historyToken, startDate: "2026-07-09", endDate: "2026-08-08", pointLimit: 512, generationToken },
+    ]))
+    expect(viewportSignal?.aborted).toBe(false)
+    await user.click(historyToggle)
+    await waitFor(() => expect(viewportSignal?.aborted).toBe(true))
+    expect(screen.queryByLabelText("History window")).toBeNull()
+    // A late cancelled response cannot repopulate a closed panel or pin a new
+    // reader to the old window. Reopening starts from unpinned saved history.
+    resolveViewport?.(historyResult)
+    await user.click(historyToggle)
+    await screen.findByLabelText("History window")
+    expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
+    await user.click(screen.getByRole("button", { name: "Refresh saved history" }))
+    await waitFor(() => expect(issuedQueries.filter((request) => request.query === "marketHistory")).toHaveLength(4))
+    expect(issuedQueries.filter((request) => request.query === "marketHistory").at(-1)).toEqual({ query: "marketHistory", historyToken, pointLimit: 512 })
 
     const renderedText = document.body.textContent ?? ""
     expect(renderedText).not.toMatch(/kraken|coinbase|websocket-v2/i)

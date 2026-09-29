@@ -35,6 +35,35 @@ pub(super) struct AcquiredInvestmentSources {
     pub(super) source_action_reference: Option<SourceAppliedCorporateActionPlanReference>,
 }
 
+pub(super) struct CurrentInvestmentSources {
+    pub(super) cutoff: Timestamp,
+    pub(super) source_action_reference: Option<SourceAppliedCorporateActionPlanReference>,
+    pub(super) fundamental_share_sources: Option<String>,
+    pub(super) steps: Vec<SourcePreparationStep>,
+}
+
+async fn quote_clock(
+    markets: &MarketInvestmentReadCapability,
+    instrument: InstrumentId,
+    cutoff: Timestamp,
+    context: &RequestContext,
+) -> Result<Timestamp, ServiceError> {
+    let market = markets
+        .read(
+            instrument,
+            cutoff,
+            context.deadline(),
+            context.cancellation().clone(),
+        )
+        .await?
+        .ok_or(ServiceError::Unavailable)?;
+    Ok(market
+        .observation()
+        .map_err(|_| ServiceError::Unavailable)?
+        .timestamps()
+        .effective_at())
+}
+
 impl InstalledInvestmentSourcePreparation {
     pub(in crate::service) const fn new(
         research: Arc<ResearchService>,
@@ -56,32 +85,214 @@ impl InstalledInvestmentSourcePreparation {
         }
     }
 
-    /// Acquire before sampling a quote, then bind the retained plan to that exact quote clock.
-    pub(super) async fn acquire_current_share_sources(
+    /// Acquire the complete source interval before selecting the prices used by calculation.
+    pub(super) async fn acquire_current_investment_sources(
         &self,
         identity: &InstrumentContextRead,
-        origin: Timestamp,
+        origin: Option<Timestamp>,
+        original_knowledge_at: Option<Timestamp>,
         markets: &MarketInvestmentReadCapability,
         profile: &ValidatedAnalyticalProfile,
         context: &RequestContext,
-    ) -> Result<(Timestamp, SourceAppliedCorporateActionPlanReference), ServiceError> {
-        let record = identity.canonical_record().ok_or(ServiceError::Unavailable)?;
-        let prepared = self.actions.acquire_current_action_sources(
-            std::slice::from_ref(record), origin, clock()?, context,
-        ).await?;
+    ) -> Result<CurrentInvestmentSources, ServiceError> {
+        use crate::application::fair_value::{FairValueDomainService, finish_common_share_sources};
+        let record = identity
+            .canonical_record()
+            .ok_or(ServiceError::Unavailable)?;
+        let instrument = record.definition().instrument_id();
+        let maximum_age = u64::try_from(
+            profile
+                .recommendation_policy()
+                .parameters()
+                .market_max_age_nanos,
+        )
+        .map_err(|_| ServiceError::InvalidRequest)?;
+        let markets = markets.with_maximum_mark_age_nanos(maximum_age)?;
+        let mut steps = Vec::with_capacity(2);
+        let started = clock()?;
+        let financial = if let Some(knowledge_at) = original_knowledge_at {
+            let acquired = async {
+                let requirements = FairValueDomainService::prepare_common_share_requirements(
+                    &self.research,
+                    instrument,
+                    knowledge_at,
+                    context,
+                )
+                .await?;
+                // These marks choose only the native source dates. Final prices are read below.
+                let mut pending = Vec::with_capacity(requirements.requirements().len());
+                for &(id, start) in requirements.requirements() {
+                    let acquired = async {
+                        let quote = quote_clock(&markets, id, clock()?, context).await?;
+                        self.actions
+                            .acquire_financial_share_sources(&[(id, start, quote)], context)
+                            .await
+                    }
+                    .await;
+                    match acquired {
+                        Ok(originals) => pending.push((id, originals)),
+                        // Missing peer evidence only removes the comparable method. Native
+                        // methods still use the independently admitted subject denominator.
+                        Err(
+                            ServiceError::Unavailable
+                            | ServiceError::NotFound
+                            | ServiceError::Unauthorized,
+                        ) if id != instrument => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok::<_, ServiceError>((requirements, pending))
+            }
+            .await;
+            match acquired {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    steps.push(SourcePreparationStep::from_attempt(
+                        "fundamental_share_actions",
+                        started,
+                        Err(error),
+                        context,
+                    )?);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let price_started = clock()?;
+        let price = if let Some(origin) = origin {
+            match self
+                .actions
+                .acquire_current_action_sources(
+                    std::slice::from_ref(record),
+                    origin,
+                    clock()?,
+                    context,
+                )
+                .await
+            {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    steps.push(SourcePreparationStep::from_attempt(
+                        "current_share_actions",
+                        price_started,
+                        Err(error),
+                        context,
+                    )?);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // This single selection cutoff is also returned to FinalEvidence and FinalPortfolio.
+        // Source-plan finishing below performs only retained-original reads, never acquisition.
         let cutoff = clock()?;
-        let maximum_age = u64::try_from(profile.recommendation_policy().parameters().market_max_age_nanos)
-            .map_err(|_| ServiceError::InvalidRequest)?;
-        let market = markets.with_maximum_mark_age_nanos(maximum_age)?
-            .read(record.definition().instrument_id(), cutoff, context.deadline(), context.cancellation().clone())
-            .await?.ok_or(ServiceError::Unavailable)?;
-        let quote_at = market.observation().map_err(|_| ServiceError::Unavailable)?.timestamps().effective_at();
-        let plan = self.actions.finish_current_action_sources(prepared, quote_at, context).await?;
-        let reference = plan.reference().map_err(|_| ServiceError::InvalidResult)?;
-        if reference.knowledge_cutoff() < cutoff || reference.valuation_cutoff() != quote_at {
-            return Err(ServiceError::InvalidResult);
-        }
-        Ok((cutoff, reference))
+        let subject_quote = if price.is_some() || financial.is_some() {
+            quote_clock(&markets, instrument, cutoff, context).await
+        } else {
+            Err(ServiceError::Unavailable)
+        };
+        let source_action_reference = if let Some(pending) = price {
+            let outcome = async {
+                let quote_at = subject_quote?;
+                let plan = self
+                    .actions
+                    .finish_current_action_sources(pending, quote_at, context)
+                    .await?;
+                let reference = plan.reference().map_err(|_| ServiceError::InvalidResult)?;
+                if reference.knowledge_cutoff() < cutoff || reference.valuation_cutoff() != quote_at
+                {
+                    return Err(ServiceError::InvalidResult);
+                }
+                Ok::<_, ServiceError>(reference)
+            }
+            .await;
+            match outcome {
+                Ok(reference) => {
+                    steps.push(SourcePreparationStep::from_attempt(
+                        "current_share_actions",
+                        price_started,
+                        reference_digest(&reference),
+                        context,
+                    )?);
+                    Some(reference)
+                }
+                Err(error) => {
+                    steps.push(SourcePreparationStep::from_attempt(
+                        "current_share_actions",
+                        price_started,
+                        Err(error),
+                        context,
+                    )?);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let fundamental_share_sources = if let Some((requirements, pending)) = financial {
+            let outcome = async {
+                let mut references = Vec::with_capacity(pending.len());
+                for (id, originals) in pending {
+                    let finished = async {
+                        let effective_at = if id == instrument {
+                            subject_quote?
+                        } else {
+                            quote_clock(&markets, id, cutoff, context).await?
+                        };
+                        self.actions
+                            .finish_financial_share_sources(
+                                originals,
+                                &[(id, effective_at, cutoff)],
+                                context,
+                            )
+                            .await
+                    }
+                    .await;
+                    match finished {
+                        Ok(mut original) => references.append(&mut original),
+                        Err(
+                            ServiceError::Unavailable
+                            | ServiceError::NotFound
+                            | ServiceError::Unauthorized,
+                        ) if id != instrument => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                finish_common_share_sources(requirements, references)
+            }
+            .await;
+            match outcome {
+                Ok(reference) => {
+                    steps.push(SourcePreparationStep::from_attempt(
+                        "fundamental_share_actions",
+                        started,
+                        reference_digest(&reference),
+                        context,
+                    )?);
+                    Some(reference)
+                }
+                Err(error) => {
+                    steps.push(SourcePreparationStep::from_attempt(
+                        "fundamental_share_actions",
+                        started,
+                        Err(error),
+                        context,
+                    )?);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        ensure_live(context)?;
+        Ok(CurrentInvestmentSources {
+            cutoff,
+            source_action_reference,
+            fundamental_share_sources,
+            steps,
+        })
     }
 
     /// Explicit current research acquisition; canonical reads and historical selectors stay pure.
@@ -195,7 +406,9 @@ impl InstalledInvestmentSourcePreparation {
                     OptionsContextUnavailableReason::NoDataAtCutoff => {
                         return Err(ServiceError::InvalidResult);
                     }
-                    OptionsContextUnavailableReason::NoContractsInWindow => "no_contracts_in_window",
+                    OptionsContextUnavailableReason::NoContractsInWindow => {
+                        "no_contracts_in_window"
+                    }
                 };
                 Ok(SourcePreparationStep::unavailable(
                     "option_context",
@@ -372,94 +585,170 @@ impl InstalledInvestmentSourcePreparation {
                 }
             }
         }
-        if source_action_reference.as_ref().is_none_or(|reference| benchmark_instrument_id.is_some_and(|id| !reference.requested_instruments().contains(&id))) {
-        // Independent subject acquisition does not require the fixed premium pair.
-        steps.retain(|step| step.source != "selected_history" && step.source != "source_actions");
-        let started = clock()?;
-        let subject_record = identity.canonical_record().ok_or(ServiceError::Unavailable)?.clone();
-        let acquisition_at = clock()?;
-        let population_start = acquisition_at.checked_sub_nanos(i64::from(market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS - 367) * 86_400_000_000_000)
-            .map_err(|_| ServiceError::InvalidRequest)?;
-        let mut records = vec![subject_record.clone()];
-        // Keep the caller's choice unchanged. Absence selects the admitted default; an explicit
-        // unavailable comparison stays unavailable and never becomes the default instrument.
-        let comparison = RecommendationBenchmarkSelectionReadCapability::new(
-            self.research.market_data_instruments(),
-        )
-        .select_comparison(
-            benchmark_instrument_id,
-            acquisition_at,
-            acquisition_at,
-            context.deadline(),
-            context.cancellation(),
-        )?;
-        if let Some(comparison) = comparison.as_ref().filter(|value| value.instrument_id() != instrument) {
-            let benchmark_id = comparison.instrument_id();
-            let query = market_squawk_data::MarketDataInstrumentPopulationQuery::try_new(
-                vec![benchmark_id], acquisition_at, acquisition_at).map_err(|_| ServiceError::InvalidRequest)?;
-            let reader = self.research.market_data_instruments();
-            let selection = reader.pin_population_as_of(query, context.deadline(), context.cancellation())
-                .map_err(crate::application::map_market_definition_read_error)?;
-            if selection.disposition() == market_squawk_data::MarketDataInstrumentPopulationDisposition::Complete
-                && selection.exclusions().is_empty()
-            {
-                let [record] = selection.records() else { return Err(ServiceError::InvalidResult); };
-                if record.definition().instrument_id() != benchmark_id
-                    || record.revision_digest() != comparison.reference_revision_digest()
-                {
-                    return Err(ServiceError::InvalidResult);
-                }
-                records.push(record.clone());
-            }
-        }
-        let mut prepared = self.actions.prepare_selected_complete_histories(&records, population_start, acquisition_at, context).await;
-        if records.len() == 2 && matches!(prepared, Err(ServiceError::Unavailable | ServiceError::NotFound)) {
-            // An unavailable comparison never suppresses genuine subject-only higher/cost events.
-            prepared = self.actions.prepare_selected_complete_histories(&[subject_record], population_start, acquisition_at, context).await;
-        }
-        // Acquisition may cross a canonical revision. The returned source-action cutoff is
-        // also the later probability selector's cutoff, so compare the exact same selection now.
-        let prepared = prepared.and_then(|prepared| {
-            let cutoff = prepared.cutoff();
-            let final_comparison = RecommendationBenchmarkSelectionReadCapability::new(
+        if source_action_reference.as_ref().is_none_or(|reference| {
+            benchmark_instrument_id
+                .is_some_and(|id| !reference.requested_instruments().contains(&id))
+        }) {
+            // Independent subject acquisition does not require the fixed premium pair.
+            steps.retain(|step| {
+                step.source != "selected_history" && step.source != "source_actions"
+            });
+            let started = clock()?;
+            let subject_record = identity
+                .canonical_record()
+                .ok_or(ServiceError::Unavailable)?
+                .clone();
+            let acquisition_at = clock()?;
+            let population_start = acquisition_at
+                .checked_sub_nanos(
+                    i64::from(
+                        market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS - 367,
+                    ) * 86_400_000_000_000,
+                )
+                .map_err(|_| ServiceError::InvalidRequest)?;
+            let mut records = vec![subject_record.clone()];
+            // Keep the caller's choice unchanged. Absence selects the admitted default; an explicit
+            // unavailable comparison stays unavailable and never becomes the default instrument.
+            let comparison = RecommendationBenchmarkSelectionReadCapability::new(
                 self.research.market_data_instruments(),
             )
             .select_comparison(
                 benchmark_instrument_id,
-                cutoff,
-                cutoff,
+                acquisition_at,
+                acquisition_at,
                 context.deadline(),
                 context.cancellation(),
             )?;
-            let selected = |value: &crate::application::SelectedRecommendationBenchmark| {
-                (value.instrument_id(), value.reference_revision_digest())
-            };
-            if comparison.as_ref().map(selected) != final_comparison.as_ref().map(selected) {
-                return Err(ServiceError::Unavailable);
-            }
-            Ok(prepared)
-        });
-        let outcome = match prepared {
-            Ok(prepared) => {
-                let reference = prepared.plan().price_reference().map_err(|_| ServiceError::InvalidResult)?;
-                let cutoff = prepared.cutoff();
-                if reference.knowledge_cutoff() != cutoff || cutoff < started || !reference.requested_instruments().contains(&instrument) {
-                    return Err(ServiceError::InvalidResult);
+            if let Some(comparison) = comparison
+                .as_ref()
+                .filter(|value| value.instrument_id() != instrument)
+            {
+                let benchmark_id = comparison.instrument_id();
+                let query = market_squawk_data::MarketDataInstrumentPopulationQuery::try_new(
+                    vec![benchmark_id],
+                    acquisition_at,
+                    acquisition_at,
+                )
+                .map_err(|_| ServiceError::InvalidRequest)?;
+                let reader = self.research.market_data_instruments();
+                let selection = reader
+                    .pin_population_as_of(query, context.deadline(), context.cancellation())
+                    .map_err(crate::application::map_market_definition_read_error)?;
+                if selection.disposition()
+                    == market_squawk_data::MarketDataInstrumentPopulationDisposition::Complete
+                    && selection.exclusions().is_empty()
+                {
+                    let [record] = selection.records() else {
+                        return Err(ServiceError::InvalidResult);
+                    };
+                    if record.definition().instrument_id() != benchmark_id
+                        || record.revision_digest() != comparison.reference_revision_digest()
+                    {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                    records.push(record.clone());
                 }
-                let bytes = serde_json::to_vec(&reference).map_err(|_| ServiceError::InvalidResult)?;
-                let digest = EvidenceDigest::new(market_squawk_domain::DigestAlgorithm::Sha256, Sha256::digest(bytes).into());
-                source_action_reference = Some(reference); action_cutoff = Some(cutoff);
-                Ok(digest)
             }
-            Err(error) => Err(error),
-        };
-        steps.push(SourcePreparationStep::from_attempt("selected_history", started, outcome, context)?);
-        steps.push(match &source_action_reference {
-            Some(reference) => SourcePreparationStep::from_attempt("source_actions", started,
-                Ok(EvidenceDigest::new(market_squawk_domain::DigestAlgorithm::Sha256,
-                    Sha256::digest(serde_json::to_vec(reference).map_err(|_| ServiceError::InvalidResult)?).into())), context)?,
-            None => SourcePreparationStep::unavailable("source_actions", started, "source_prerequisite_unavailable".to_owned(), clock()?),
-        });
+            let mut prepared = self
+                .actions
+                .prepare_selected_complete_histories(
+                    &records,
+                    population_start,
+                    acquisition_at,
+                    context,
+                )
+                .await;
+            if records.len() == 2
+                && matches!(
+                    prepared,
+                    Err(ServiceError::Unavailable | ServiceError::NotFound)
+                )
+            {
+                // An unavailable comparison never suppresses genuine subject-only higher/cost events.
+                prepared = self
+                    .actions
+                    .prepare_selected_complete_histories(
+                        &[subject_record],
+                        population_start,
+                        acquisition_at,
+                        context,
+                    )
+                    .await;
+            }
+            // Acquisition may cross a canonical revision. The returned source-action cutoff is
+            // also the later probability selector's cutoff, so compare the exact same selection now.
+            let prepared = prepared.and_then(|prepared| {
+                let cutoff = prepared.cutoff();
+                let final_comparison = RecommendationBenchmarkSelectionReadCapability::new(
+                    self.research.market_data_instruments(),
+                )
+                .select_comparison(
+                    benchmark_instrument_id,
+                    cutoff,
+                    cutoff,
+                    context.deadline(),
+                    context.cancellation(),
+                )?;
+                let selected = |value: &crate::application::SelectedRecommendationBenchmark| {
+                    (value.instrument_id(), value.reference_revision_digest())
+                };
+                if comparison.as_ref().map(selected) != final_comparison.as_ref().map(selected) {
+                    return Err(ServiceError::Unavailable);
+                }
+                Ok(prepared)
+            });
+            let outcome = match prepared {
+                Ok(prepared) => {
+                    let reference = prepared
+                        .plan()
+                        .price_reference()
+                        .map_err(|_| ServiceError::InvalidResult)?;
+                    let cutoff = prepared.cutoff();
+                    if reference.knowledge_cutoff() != cutoff
+                        || cutoff < started
+                        || !reference.requested_instruments().contains(&instrument)
+                    {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                    let bytes =
+                        serde_json::to_vec(&reference).map_err(|_| ServiceError::InvalidResult)?;
+                    let digest = EvidenceDigest::new(
+                        market_squawk_domain::DigestAlgorithm::Sha256,
+                        Sha256::digest(bytes).into(),
+                    );
+                    source_action_reference = Some(reference);
+                    action_cutoff = Some(cutoff);
+                    Ok(digest)
+                }
+                Err(error) => Err(error),
+            };
+            steps.push(SourcePreparationStep::from_attempt(
+                "selected_history",
+                started,
+                outcome,
+                context,
+            )?);
+            steps.push(match &source_action_reference {
+                Some(reference) => SourcePreparationStep::from_attempt(
+                    "source_actions",
+                    started,
+                    Ok(EvidenceDigest::new(
+                        market_squawk_domain::DigestAlgorithm::Sha256,
+                        Sha256::digest(
+                            serde_json::to_vec(reference)
+                                .map_err(|_| ServiceError::InvalidResult)?,
+                        )
+                        .into(),
+                    )),
+                    context,
+                )?,
+                None => SourcePreparationStep::unavailable(
+                    "source_actions",
+                    started,
+                    "source_prerequisite_unavailable".to_owned(),
+                    clock()?,
+                ),
+            });
         }
         // Explicit unavailable prerequisite outcomes do not masquerade as provider attempts.
         for source in ["selected_history", "source_actions"] {
@@ -578,12 +867,14 @@ impl SourcePreparationStep {
                 started_at_unix_nanos: started_at.unix_nanos().to_string(),
                 completed_at_unix_nanos: completed_at.unix_nanos().to_string(),
             }),
-            Err(error @ (ServiceError::Unavailable | ServiceError::NotFound)) => Ok(Self::unavailable(
-                source,
-                started_at,
-                service_failure(error).to_owned(),
-                completed_at,
-            )),
+            Err(error @ (ServiceError::Unavailable | ServiceError::NotFound)) => {
+                Ok(Self::unavailable(
+                    source,
+                    started_at,
+                    service_failure(error).to_owned(),
+                    completed_at,
+                ))
+            }
             Err(error) => Err(error),
         }
     }

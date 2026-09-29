@@ -612,6 +612,32 @@ impl SealedResearchJournalStore {
         Ok(verified)
     }
 
+    /// Verifies all raw custody evidence while retaining only one decoded frame at a time.
+    ///
+    /// The receipt is issued only after the complete file hash, every physical frame, and the
+    /// final named/opened file identities pass. No raw payload corpus escapes this operation.
+    pub fn verify_claim_with_control(
+        &self,
+        claim: &SealedResearchJournalSegmentClaim,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<SealedResearchJournalSegmentReceipt, SealedResearchJournalStoreError> {
+        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+        let _operation = match self.operation.try_lock() {
+            Ok(operation) => operation,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ResearchObjectControlError::Unavailable.into());
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(SealedResearchJournalStoreError::OperationLockPoisoned);
+            }
+        };
+        self.validate_owner()?;
+        let receipt =
+            self.visit_verified_claim_inner_with_control(claim, Some(control), |_| Ok(()))?;
+        control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
+        Ok(receipt)
+    }
+
     fn validate_owner(&self) -> Result<(), SealedResearchJournalStoreError> {
         let named = self
             .root
@@ -792,8 +818,8 @@ impl SealedResearchJournalStore {
         let published_new = match self.staging.hard_link(stage_name, &shard, &filename) {
             Ok(()) => true,
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = self.open_verified_from_shard(&shard, &filename, &claim)?;
-                if existing.receipt() != &receipt {
+                let existing = self.verify_from_shard(&shard, &filename, &claim)?;
+                if existing != receipt {
                     return Err(SealedResearchJournalStoreError::StateConflict);
                 }
                 false
@@ -829,11 +855,11 @@ impl SealedResearchJournalStore {
                     )
                 })?;
                 sync_directory(&self.staging)?;
-                let verified = self.open_verified_from_shard(&shard, &filename, &claim)?;
-                if verified.receipt() != &receipt {
+                let verified = self.verify_from_shard(&shard, &filename, &claim)?;
+                if verified != receipt {
                     return Err(SealedResearchJournalStoreError::StateConflict);
                 }
-                Ok(verified.receipt)
+                Ok(verified)
             })();
             return completed
                 .map_err(|_error| SealedResearchJournalStoreError::RawPublicationIndeterminate);
@@ -844,11 +870,11 @@ impl SealedResearchJournalStore {
             SealedResearchJournalStoreError::io("failed to remove published MSJ1 stage", source)
         })?;
         sync_directory(&self.staging)?;
-        let verified = self.open_verified_from_shard(&shard, &filename, &claim)?;
-        if verified.receipt() != &receipt {
+        let verified = self.verify_from_shard(&shard, &filename, &claim)?;
+        if verified != receipt {
             return Err(SealedResearchJournalStoreError::StateConflict);
         }
-        Ok(verified.receipt)
+        Ok(verified)
     }
 
     fn open_verified_claim_inner(
@@ -863,6 +889,26 @@ impl SealedResearchJournalStore {
         claim: &SealedResearchJournalSegmentClaim,
         control: Option<&dyn ResearchObjectControl>,
     ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
+        let mut records = Vec::new();
+        let receipt = self.visit_verified_claim_inner_with_control(claim, control, |record| {
+            records
+                .try_reserve(1)
+                .map_err(|_| SealedResearchJournalStoreError::ObjectAllocationFailed)?;
+            records.push(record);
+            Ok(())
+        })?;
+        Ok(SealedResearchJournalSegment {
+            receipt,
+            records: records.into_boxed_slice(),
+        })
+    }
+
+    fn visit_verified_claim_inner_with_control(
+        &self,
+        claim: &SealedResearchJournalSegmentClaim,
+        control: Option<&dyn ResearchObjectControl>,
+        visit: impl FnMut(RawCaptureRecord) -> Result<(), SealedResearchJournalStoreError>,
+    ) -> Result<SealedResearchJournalSegmentReceipt, SealedResearchJournalStoreError> {
         validate_claim_shape(claim)?;
         let hex = digest_hex(claim.content_digest);
         let shard = self
@@ -875,25 +921,26 @@ impl SealedResearchJournalStore {
                 )
             })?;
         let filename = format!("{hex}.msj");
-        self.open_verified_from_shard_with_control(&shard, &filename, claim, control)
+        self.visit_verified_from_shard_with_control(&shard, &filename, claim, control, visit)
     }
 
-    fn open_verified_from_shard(
+    fn verify_from_shard(
         &self,
         shard: &Dir,
         filename: &str,
         claim: &SealedResearchJournalSegmentClaim,
-    ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
-        self.open_verified_from_shard_with_control(shard, filename, claim, None)
+    ) -> Result<SealedResearchJournalSegmentReceipt, SealedResearchJournalStoreError> {
+        self.visit_verified_from_shard_with_control(shard, filename, claim, None, |_| Ok(()))
     }
 
-    fn open_verified_from_shard_with_control(
+    fn visit_verified_from_shard_with_control(
         &self,
         shard: &Dir,
         filename: &str,
         claim: &SealedResearchJournalSegmentClaim,
         control: Option<&dyn ResearchObjectControl>,
-    ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
+        mut visit: impl FnMut(RawCaptureRecord) -> Result<(), SealedResearchJournalStoreError>,
+    ) -> Result<SealedResearchJournalSegmentReceipt, SealedResearchJournalStoreError> {
         let named = shard.symlink_metadata(filename).map_err(|source| {
             SealedResearchJournalStoreError::io("failed to inspect sealed MSJ1 object", source)
         })?;
@@ -931,16 +978,37 @@ impl SealedResearchJournalStore {
         {
             return Err(SealedResearchJournalStoreError::ReceiptMismatch);
         }
-        let records = read_msj_records_bounded(
+        let mut verified_payload_bytes = 0_u64;
+        let mut verified_end = u64::try_from(CURRENT_MAGIC.len())
+            .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?;
+        let count = visit_msj_records_bounded(
             file,
             claim.frames.len(),
             claim.size_bytes.saturating_sub(CURRENT_MAGIC.len() as u64),
             control,
+            |ordinal, offset, framed_bytes, record| {
+                let frame = claim
+                    .frames
+                    .get(ordinal)
+                    .ok_or(SealedResearchJournalStoreError::ReceiptMismatch)?;
+                validate_frame_receipt(
+                    &record,
+                    frame,
+                    ordinal,
+                    offset,
+                    framed_bytes,
+                    &mut verified_payload_bytes,
+                    control,
+                )?;
+                verified_end = offset
+                    .checked_add(framed_bytes)
+                    .ok_or(SealedResearchJournalStoreError::ReceiptMismatch)?;
+                visit(record)
+            },
         )?;
-        if records.len() != claim.frames.len() {
+        if count != claim.frames.len() || verified_end != claim.size_bytes {
             return Err(SealedResearchJournalStoreError::ReceiptMismatch);
         }
-        validate_frame_receipts(&records, claim, control)?;
         let named_after = shard.symlink_metadata(filename).map_err(|source| {
             SealedResearchJournalStoreError::io("failed to re-inspect sealed MSJ1 object", source)
         })?;
@@ -954,57 +1022,41 @@ impl SealedResearchJournalStore {
         {
             return Err(SealedResearchJournalStoreError::StateConflict);
         }
-        Ok(SealedResearchJournalSegment {
-            receipt: SealedResearchJournalSegmentReceipt {
-                claim: claim.clone(),
-            },
-            records: records.into_boxed_slice(),
+        Ok(SealedResearchJournalSegmentReceipt {
+            claim: claim.clone(),
         })
     }
 }
 
-fn validate_frame_receipts(
-    records: &[RawCaptureRecord],
-    claim: &SealedResearchJournalSegmentClaim,
+fn validate_frame_receipt(
+    record: &RawCaptureRecord,
+    frame: &SealedResearchJournalFrameReceipt,
+    ordinal: usize,
+    offset: u64,
+    framed_bytes: u64,
+    verified_payload_bytes: &mut u64,
     control: Option<&dyn ResearchObjectControl>,
 ) -> Result<(), SealedResearchJournalStoreError> {
-    let mut offset = u64::try_from(CURRENT_MAGIC.len())
-        .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?;
-    let mut verified_payload_bytes = 0_u64;
-    for (ordinal, (record, frame)) in records.iter().zip(claim.frames.iter()).enumerate() {
-        let serialized = serialized_record_bytes(record, control)?;
-        let framed_bytes = serialized
-            .checked_add(8)
-            .ok_or(SealedResearchJournalStoreError::ReceiptMismatch)?;
-        let received_at = record
-            .received_at()
-            .timestamp_nanos_opt()
-            .map(Timestamp::from_unix_nanos)
-            .ok_or(SealedResearchJournalStoreError::InvalidReceiveTimestamp)?;
-        let provider_payload_digest =
-            sha256_with_control(record.payload(), &mut verified_payload_bytes, control)?;
-        if frame.ordinal
-            != u32::try_from(ordinal).map_err(|_| {
-                SealedResearchJournalStoreError::FrameLimitExceeded {
-                    max: MAX_SEALED_FRAMES,
-                }
-            })?
-            || frame.offset != offset
-            || frame.framed_bytes != framed_bytes
-            || frame.provider_payload_bytes
-                != u64::try_from(record.payload().len())
-                    .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?
-            || frame.provider_payload_digest != provider_payload_digest
-            || frame.received_at != received_at
-            || frame.source_sequence != record.source_sequence()
-        {
-            return Err(SealedResearchJournalStoreError::ReceiptMismatch);
-        }
-        offset = offset
-            .checked_add(framed_bytes)
-            .ok_or(SealedResearchJournalStoreError::ReceiptMismatch)?;
-    }
-    if offset != claim.size_bytes {
+    let serialized = serialized_record_bytes(record, control)?;
+    let received_at = record
+        .received_at()
+        .timestamp_nanos_opt()
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(SealedResearchJournalStoreError::InvalidReceiveTimestamp)?;
+    let provider_payload_digest =
+        sha256_with_control(record.payload(), verified_payload_bytes, control)?;
+    if frame.ordinal
+        != u32::try_from(ordinal).map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?
+        || frame.offset != offset
+        || frame.framed_bytes != framed_bytes
+        || serialized.checked_add(8) != Some(framed_bytes)
+        || frame.provider_payload_bytes
+            != u64::try_from(record.payload().len())
+                .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?
+        || frame.provider_payload_digest != provider_payload_digest
+        || frame.received_at != received_at
+        || frame.source_sequence != record.source_sequence()
+    {
         return Err(SealedResearchJournalStoreError::ReceiptMismatch);
     }
     Ok(())
@@ -1066,13 +1118,19 @@ fn validate_exact_records(
     let clone = file.try_clone().map_err(|source| {
         SealedResearchJournalStoreError::io("failed to clone sealed MSJ1 stage", source)
     })?;
-    let actual = read_msj_records_bounded(
+    let count = visit_msj_records_bounded(
         clone,
         expected.len(),
         MAX_SEALED_BYTES.saturating_sub(CURRENT_MAGIC.len() as u64),
         None,
+        |ordinal, _, _, record| {
+            if expected.get(ordinal) != Some(&record) {
+                return Err(SealedResearchJournalStoreError::ReceiptMismatch);
+            }
+            Ok(())
+        },
     )?;
-    if actual != expected {
+    if count != expected.len() {
         return Err(SealedResearchJournalStoreError::ReceiptMismatch);
     }
     Ok(())
@@ -1089,13 +1147,14 @@ fn validate_unclaimed_msj_with_control(
     let clone = file.try_clone().map_err(|source| {
         SealedResearchJournalStoreError::io("failed to clone recovered MSJ1 object", source)
     })?;
-    let records = read_msj_records_bounded(
+    let count = visit_msj_records_bounded(
         clone,
         MAX_SEALED_FRAMES,
         size_bytes.saturating_sub(CURRENT_MAGIC.len() as u64),
         control,
+        |_, _, _, _| Ok(()),
     )?;
-    if records.is_empty() {
+    if count == 0 {
         return Err(SealedResearchJournalStoreError::ReceiptMismatch);
     }
     Ok(())
@@ -1131,26 +1190,25 @@ impl<R: Read> Read for RecoveryControlledReader<'_, '_, R> {
     }
 }
 
-fn read_msj_records_bounded(
+fn visit_msj_records_bounded(
     mut file: File,
     maximum_records: usize,
     maximum_bytes: u64,
     control: Option<&dyn ResearchObjectControl>,
-) -> Result<Vec<RawCaptureRecord>, SealedResearchJournalStoreError> {
+    visit: impl FnMut(usize, u64, u64, RawCaptureRecord) -> Result<(), SealedResearchJournalStoreError>,
+) -> Result<usize, SealedResearchJournalStoreError> {
     file.seek(SeekFrom::Start(0)).map_err(|source| {
         SealedResearchJournalStoreError::io("failed to rewind sealed MSJ1 object", source)
     })?;
     let Some(control) = control else {
-        return Ok(JournalReader::new(file).read_all_bounded(maximum_records, maximum_bytes)?);
+        let mut reader = JournalReader::new(file);
+        if reader.ensure_format()? != super::JournalFormat::MarketSquawkMsj1 {
+            return Err(SealedResearchJournalStoreError::ReceiptMismatch);
+        }
+        return reader.visit_bounded_with_checkpoint(maximum_records, maximum_bytes, None, visit);
     };
     let failure = Cell::new(None);
-    let result = JournalReader::new(RecoveryControlledReader {
-        inner: file,
-        control,
-        failure: &failure,
-        observed_bytes: 0,
-    })
-    .read_all_bounded_with_checkpoint(maximum_records, maximum_bytes, |offset_bytes| {
+    let checkpoint = |offset_bytes| {
         if let Err(error) =
             control.checkpoint(ResearchObjectControlPoint::BeforeVerificationChunk { offset_bytes })
         {
@@ -1160,11 +1218,28 @@ fn read_msj_records_bounded(
             ));
         }
         Ok(())
+    };
+    let mut reader = JournalReader::new(RecoveryControlledReader {
+        inner: file,
+        control,
+        failure: &failure,
+        observed_bytes: 0,
     });
+    let result = (|| {
+        if reader.ensure_format()? != super::JournalFormat::MarketSquawkMsj1 {
+            return Err(SealedResearchJournalStoreError::ReceiptMismatch);
+        }
+        reader.visit_bounded_with_checkpoint(
+            maximum_records,
+            maximum_bytes,
+            Some(&checkpoint),
+            visit,
+        )
+    })();
     if let Some(error) = failure.get() {
         return Err(error.into());
     }
-    Ok(result?)
+    result
 }
 
 fn serialized_record_bytes(
@@ -1994,6 +2069,41 @@ mod tests {
         let reopened = store.open_verified(&receipt)?;
         assert_eq!(reopened.records(), std::slice::from_ref(&first));
         assert_eq!(reopened.records()[0].payload(), br#"{"page":1}"#);
+        assert_eq!(
+            store.verify_claim_with_control(receipt.claim(), &Allow)?,
+            receipt
+        );
+        // A self-consistent physical claim still cannot change metadata in the raw envelope.
+        let mut wrong_sequence = receipt.claim().clone();
+        wrong_sequence.frames[0].source_sequence = Some(7);
+        wrong_sequence.physical_receipt_digest = super::physical_receipt_digest(
+            wrong_sequence.relative_reference(),
+            wrong_sequence.content_digest(),
+            wrong_sequence.size_bytes(),
+            wrong_sequence.frames(),
+        );
+        assert!(matches!(
+            store.verify_claim_with_control(&wrong_sequence, &Allow),
+            Err(super::SealedResearchJournalStoreError::ReceiptMismatch)
+        ));
+
+        struct StopBeforeReceipt;
+        impl ResearchObjectControl for StopBeforeReceipt {
+            fn checkpoint(
+                &self,
+                point: ResearchObjectControlPoint,
+            ) -> Result<(), ResearchObjectControlError> {
+                if matches!(point, ResearchObjectControlPoint::BeforeCommit) {
+                    return Err(ResearchObjectControlError::Cancelled);
+                }
+                Ok(())
+            }
+        }
+        assert!(
+            store
+                .verify_claim_with_control(receipt.claim(), &StopBeforeReceipt)
+                .is_err()
+        );
 
         let second = RawCaptureRecord::try_new_live(
             Uuid::new_v4(),
@@ -2020,6 +2130,21 @@ mod tests {
             first.payload()
         );
         assert!(store.open_verified(&orphan).is_err());
+        // Late corruption cannot issue a verify-only receipt after successful earlier reads.
+        use std::io::{Seek as _, Write as _};
+        let path = temporary
+            .path()
+            .join(super::STORE_DIRECTORY)
+            .join(receipt.relative_reference());
+        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.seek(std::io::SeekFrom::End(-1))?;
+        file.write_all(&[0])?;
+        file.sync_all()?;
+        assert!(
+            store
+                .verify_claim_with_control(receipt.claim(), &Allow)
+                .is_err()
+        );
         Ok(())
     }
 }

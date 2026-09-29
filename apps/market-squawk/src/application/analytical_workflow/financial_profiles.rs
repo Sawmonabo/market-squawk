@@ -549,6 +549,7 @@ pub(super) struct FinancialProfileOptions {
     benchmark_choices: Vec<BenchmarkChoice>,
     model_choices: Vec<ModelChoice>,
     fixed_settings: Vec<FixedSetting>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -577,15 +578,32 @@ struct FixedSetting {
 pub(super) async fn profile_options(
     state: &WorkflowState,
     generation: &Arc<WorkflowGeneration>,
+    cursor: Option<&str>,
+    limit: Option<u16>,
 ) -> Result<AnalyticalControllerResponse, WorkflowError> {
     state.admit_current(generation)?;
+    let limit = limit.unwrap_or(25);
+    if !(1..=100).contains(&limit)
+        || cursor.is_some_and(|cursor| {
+            cursor.is_empty() || cursor.len() > 512 || cursor.chars().any(char::is_control)
+        })
+    {
+        return Err(WorkflowError::invalid_request(
+            "The model choices page is invalid. Restart the model list.",
+        ));
+    }
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("limit".to_owned(), json!(limit));
+    if let Some(cursor) = cursor {
+        arguments.insert("cursor".to_owned(), json!(cursor));
+    }
     let request =
         RequestId::try_string(format!("desktop-profile-options-{}", uuid::Uuid::new_v4()))
             .map_err(|_error| WorkflowError::internal())?;
     let response = invoke_analytical_operation(
         generation,
         "AnalyticalProfile.GetCatalog",
-        serde_json::Map::new(),
+        arguments,
         InvocationAuthority::ReadOnly,
         request,
         CancellationToken::new(),
@@ -593,16 +611,24 @@ pub(super) async fn profile_options(
     .await?;
     state.admit_current(generation)?;
     let data = response.get("data").ok_or_else(WorkflowError::internal)?;
-    let choices = data.get("benchmarkChoices").and_then(Value::as_array)
-        .filter(|choices| choices.len() <= 3).ok_or_else(WorkflowError::internal)?;
+    let choices = data
+        .get("benchmarkChoices")
+        .and_then(Value::as_array)
+        .filter(|choices| choices.len() <= 3)
+        .ok_or_else(WorkflowError::internal)?;
     let mut benchmark_choices = Vec::with_capacity(choices.len());
     let mut benchmark_ids = HashSet::new();
     let mut has_default = false;
     for choice in choices {
-        let instrument_id = choice.get("instrumentId").and_then(Value::as_str)
-            .and_then(|id| id.parse::<uuid::Uuid>().ok()).filter(|id| !id.is_nil())
+        let instrument_id = choice
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+            .filter(|id| !id.is_nil())
             .ok_or_else(WorkflowError::internal)?;
-        let is_default = choice.get("isDefault").and_then(Value::as_bool)
+        let is_default = choice
+            .get("isDefault")
+            .and_then(Value::as_bool)
             .ok_or_else(WorkflowError::internal)?;
         if !benchmark_ids.insert(instrument_id) || is_default && has_default {
             return Err(WorkflowError::internal());
@@ -629,8 +655,19 @@ pub(super) async fn profile_options(
     let models = data
         .get("models")
         .and_then(Value::as_array)
-        .filter(|models| models.len() <= 1_000)
+        .filter(|models| models.len() <= usize::from(limit))
         .ok_or_else(WorkflowError::internal)?;
+    let next_cursor = match data.get("nextCursor") {
+        Some(Value::Null) => None,
+        Some(Value::String(cursor))
+            if !cursor.is_empty()
+                && cursor.len() <= 512
+                && !cursor.chars().any(char::is_control) =>
+        {
+            Some(cursor.clone())
+        }
+        _ => return Err(WorkflowError::internal()),
+    };
     let mut model_choices = vec![ModelChoice {
         token: "recommended".to_owned(),
         label: "Recommended calibrated forecast".to_owned(),
@@ -695,6 +732,7 @@ pub(super) async fn profile_options(
             benchmark_choices,
             model_choices,
             fixed_settings,
+            next_cursor,
         },
     })
 }

@@ -30,10 +30,10 @@ use crate::{
         },
         model::forecast::{ForecastProductHorizon, ForecastProductIdentity, ForecastProductTarget},
         model::forecast_preparation::{
-            ForecastCurrentFeatureInputSelection, ForecastEvidenceDataset, ForecastEvidencePolicy, ForecastInstrumentAvailability,
-            ForecastModelSummary, ForecastPreparationAuthority, ForecastPreparationCatalog,
-            ForecastPreparationError, ForecastPreparationPreview, ForecastPreparationSelection,
-            PreparedForecast, PreparedForecastJobInput,
+            ForecastCurrentFeatureInputSelection, ForecastEvidenceDataset, ForecastEvidencePolicy,
+            ForecastInstrumentAvailability, ForecastModelSummary, ForecastPreparationAuthority,
+            ForecastPreparationCatalog, ForecastPreparationError, ForecastPreparationPreview,
+            ForecastPreparationSelection, PreparedForecast, PreparedForecastJobInput,
         },
         opaque_product_token,
     },
@@ -63,7 +63,9 @@ impl InstalledForecastPreparation {
         Self {
             authority,
             instruments: product.instrument_context_read_capability(),
-            calendars: CompletedMarketSessionReadCapability::new(product.research(), product.market_runtime(),
+            calendars: CompletedMarketSessionReadCapability::new(
+                product.research(),
+                product.market_runtime(),
             ),
             runtime,
         }
@@ -76,29 +78,141 @@ impl InstalledForecastPreparation {
         )
     }
 
-    /// Shares the installed model inventory with financial settings without constructing another
-    /// runtime or retaining a second catalogue. Defaults remain available before model setup.
+    /// Resolves only the exact model pin required to validate this profile.
     pub(super) async fn financial_profile_catalog(
         &self,
+        configuration: &crate::application::analytical_profile::AnalyticalProfileConfiguration,
+        context: &RequestContext,
+    ) -> Result<Option<ForecastPreparationCatalog>, ServiceError> {
+        use crate::application::analytical_profile::AnalyticalModelBundlePolicy;
+        ensure_live(context)?;
+        let AnalyticalModelBundlePolicy::Exact { model_token } = configuration.model_bundle_policy
+        else {
+            return Ok(None);
+        };
+        let authority = self.authority.as_ref().ok_or(ServiceError::Unavailable)?;
+        authority
+            .catalog_for_model_token(
+                context.origin().ok_or(ServiceError::Unauthorized)?,
+                self.workspace()?,
+                super::runtime::current_timestamp().map_err(|_| ServiceError::Unavailable)?,
+                None,
+                model_token,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map(Some)
+            .map_err(map_preparation)
+    }
+
+    /// Reuses the request's typed financial configuration for exact model membership only.
+    pub(super) async fn financial_profile_catalog_for_request(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<Option<ForecastPreparationCatalog>, ServiceError> {
+        let configuration = request
+            .arguments()
+            .get("financialProfile")
+            .and_then(|profile| profile.get("configuration"))
+            .ok_or(ServiceError::InvalidRequest)?;
+        let configuration = serde_json::from_value(configuration.clone())
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        self.financial_profile_catalog(&configuration, context)
+            .await
+    }
+
+    pub(super) async fn revalidate_profile(
+        &self,
+        profile: &AnalyticalProfileResolution,
+        context: &RequestContext,
+    ) -> Result<crate::application::analytical_profile::ValidatedAnalyticalProfile, ServiceError>
+    {
+        let catalog = self
+            .financial_profile_catalog(&profile.configuration, context)
+            .await?;
+        revalidate(profile, catalog.as_ref()).map_err(Into::into)
+    }
+
+    /// Produces one pinned page of choices; callers never collect the inventory.
+    pub(super) async fn model_catalog_page(
+        &self,
+        cursor: Option<String>,
+        limit: usize,
         context: &RequestContext,
     ) -> Result<Option<ForecastPreparationCatalog>, ServiceError> {
         ensure_live(context)?;
         let Some(authority) = self.authority.as_ref() else {
             return Ok(None);
         };
-        let catalog = authority
+        authority
             .catalog(
                 context.origin().ok_or(ServiceError::Unauthorized)?,
                 self.workspace()?,
                 super::runtime::current_timestamp().map_err(|_| ServiceError::Unavailable)?,
                 None,
+                cursor,
+                limit,
                 context.deadline(),
                 context.cancellation().clone(),
             )
             .await
-            .map_err(map_preparation)?;
-        ensure_live(context)?;
-        Ok(Some(catalog))
+            .map(Some)
+            .map_err(map_preparation)
+    }
+
+    /// Folds bounded pages under the unchanged deterministic selection ordering.
+    async fn best_investment_catalog(
+        &self,
+        input: &InvestmentForecastPreparationRequest,
+        source_cutoff: Timestamp,
+        current_feature_input: Option<&ForecastCurrentFeatureInputSelection>,
+        cohort: Option<&ForecastSessionCohort>,
+        context: &RequestContext,
+    ) -> Result<ForecastPreparationCatalog, ServiceError> {
+        let authority = self.authority.as_ref().ok_or(ServiceError::Unavailable)?;
+        let profile = revalidate(&input.financial_profile, None)?;
+        let mut cursor = None;
+        let mut winner = None;
+        loop {
+            ensure_live(context)?;
+            let page = authority
+                .catalog(
+                    context.origin().ok_or(ServiceError::Unauthorized)?,
+                    self.workspace()?,
+                    source_cutoff,
+                    current_feature_input,
+                    cursor,
+                    25,
+                    context.deadline(),
+                    context.cancellation().clone(),
+                )
+                .await
+                .map_err(map_preparation)?;
+            let next = page.next_cursor().map(str::to_owned);
+            match profile.select_forecast_ranked(&page, input.instrument_id, source_cutoff, cohort)
+            {
+                Ok((_, rank)) => {
+                    if winner.as_ref().is_none_or(|(prior, _)| rank > *prior) {
+                        winner = Some((rank, page));
+                    }
+                }
+                Err(AnalyticalProfileError::ModelUnavailable) => {
+                    if next.is_none() && winner.is_none() {
+                        return Ok(page);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let Some(next) = next else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        winner
+            .map(|(_, page)| page)
+            .ok_or(ServiceError::InvalidResult)
     }
 
     pub(super) async fn call(
@@ -112,12 +226,27 @@ impl InstalledForecastPreparation {
         let workspace = self.workspace()?;
         let (content, item_count) = match request.name() {
             GET_FORECAST_PREPARATION => {
+                let input: ForecastPreparationPageRequest =
+                    decode(&super::business_arguments(request.arguments()))?;
+                let limit = input.limit.unwrap_or(25);
+                if !(1..=100).contains(&limit)
+                    || input.cursor.as_ref().is_some_and(|cursor| {
+                        cursor.is_empty()
+                            || cursor.len() > 512
+                            || cursor.chars().any(char::is_control)
+                    })
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
                 let catalog = authority
                     .catalog(
                         origin,
                         workspace,
-                        super::runtime::current_timestamp().map_err(|_| ServiceError::Unavailable)?,
+                        super::runtime::current_timestamp()
+                            .map_err(|_| ServiceError::Unavailable)?,
                         None,
+                        input.cursor,
+                        usize::from(limit),
                         context.deadline(),
                         context.cancellation().clone(),
                     )
@@ -131,16 +260,39 @@ impl InstalledForecastPreparation {
                     super::runtime::current_timestamp().map_err(|_| ServiceError::Unavailable)?;
                 let arguments = super::business_arguments(request.arguments());
                 let investment_input: Option<InvestmentForecastPreparationRequest> =
-                    if request.name() == PREPARE_INVESTMENT_FORECAST { Some(decode(&arguments)?) } else { None };
-                let catalog_cutoff = investment_input.as_ref().map(InvestmentForecastPreparationRequest::source_cutoff)
-                    .transpose()?.unwrap_or(requested_at);
-                if catalog_cutoff > requested_at { return Err(ServiceError::InvalidRequest); }
-                let cohort_reference = investment_input.as_ref().and_then(|input| input.forecast_cohort.clone());
+                    if request.name() == PREPARE_INVESTMENT_FORECAST {
+                        Some(decode(&arguments)?)
+                    } else {
+                        None
+                    };
+                let forecast_input: Option<ForecastPreparationRequest> =
+                    if request.name() == PREPARE_FORECAST {
+                        Some(decode(&arguments)?)
+                    } else {
+                        None
+                    };
+                let catalog_cutoff = investment_input
+                    .as_ref()
+                    .map(InvestmentForecastPreparationRequest::source_cutoff)
+                    .transpose()?
+                    .unwrap_or(requested_at);
+                if catalog_cutoff > requested_at {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let cohort_reference = investment_input
+                    .as_ref()
+                    .and_then(|input| input.forecast_cohort.clone());
                 let cohort = if let Some(reference) = &cohort_reference {
-                    Some(self.reopen_cohort(reference, catalog_cutoff, requested_at, context).await?,
+                    Some(
+                        self.reopen_cohort(reference, catalog_cutoff, requested_at, context)
+                            .await?,
                     )
-                } else { None };
-                let current_feature_input = investment_input.as_ref().and_then(|input| input.current_feature_input.clone())
+                } else {
+                    None
+                };
+                let current_feature_input = investment_input
+                    .as_ref()
+                    .and_then(|input| input.current_feature_input.clone())
                     .map(|input| match &cohort_reference {
                         Some(reference) => input.with_session_cohort(reference.clone()),
                         None => input,
@@ -148,36 +300,83 @@ impl InstalledForecastPreparation {
                 if cohort_reference.is_some() && current_feature_input.is_none() {
                     return Err(ServiceError::InvalidRequest);
                 }
-                let catalog = authority
-                    .catalog(
-                        origin,
-                        workspace,
+                let validated_profile = match &investment_input {
+                    Some(input) => {
+                        let profile_catalog = match input.financial_profile.configuration.model_bundle_policy {
+                            crate::application::analytical_profile::AnalyticalModelBundlePolicy::Exact { model_token } => {
+                                Some(authority.catalog_for_model_token(
+                                    origin, workspace, catalog_cutoff, current_feature_input.as_ref(),
+                                    model_token, context.deadline(), context.cancellation().child_token(),
+                                ).await.map_err(map_preparation)?)
+                            }
+                            crate::application::analytical_profile::AnalyticalModelBundlePolicy::BestAdmittedCalibratedMeanV1 => None,
+                        };
+                        Some(revalidate(
+                            &input.financial_profile,
+                            profile_catalog.as_ref(),
+                        )?)
+                    }
+                    None => None,
+                };
+                let selected_model_token = forecast_input.as_ref().map(|input| input.selection.model_token)
+                    .or_else(|| investment_input.as_ref().and_then(|input| {
+                        input.probability_selection.as_ref().map(|selection| selection.model_token)
+                            .or_else(|| match input.financial_profile.configuration.model_bundle_policy {
+                                crate::application::analytical_profile::AnalyticalModelBundlePolicy::Exact { model_token } => Some(model_token),
+                                crate::application::analytical_profile::AnalyticalModelBundlePolicy::BestAdmittedCalibratedMeanV1 => None,
+                            })
+                    }));
+                let catalog = if let Some(model_token) = selected_model_token {
+                    authority
+                        .catalog_for_model_token(
+                            origin,
+                            workspace,
+                            catalog_cutoff,
+                            current_feature_input.as_ref(),
+                            model_token,
+                            context.deadline(),
+                            context.cancellation().child_token(),
+                        )
+                        .await
+                        .map_err(map_preparation)?
+                } else {
+                    self.best_investment_catalog(
+                        investment_input
+                            .as_ref()
+                            .ok_or(ServiceError::InvalidRequest)?,
                         catalog_cutoff,
                         current_feature_input.as_ref(),
-                        context.deadline(),
-                        context.cancellation().child_token(),
+                        cohort.as_ref(),
+                        context,
                     )
-                    .await
-                    .map_err(map_preparation)?;
-                let (mut selection, source_cutoff, profile_digest, instrument_id) =
-                    if request.name() == PREPARE_INVESTMENT_FORECAST {
-                        let input = investment_input.as_ref().ok_or(ServiceError::InvalidRequest)?;
-                        let source_cutoff = input.source_cutoff()?;
-                        if source_cutoff > requested_at {
-                            return Err(ServiceError::InvalidRequest);
-                        }
-                        let selection = self.resolve_investment_selection(
-                            &catalog,
-                            input,
-                            source_cutoff,
-                            cohort.as_ref(),
-                            context,
-                        )?;
-                        let Some(selection) = selection else {
-                            // Only a completed, valid catalogue selection may prove absence.
-                            // Failed reads and a rejected full profile never enter this branch.
-                            ensure_live(context)?;
-                            return TypedToolResult::try_new(
+                    .await?
+                };
+                let (mut selection, source_cutoff, profile_digest, instrument_id) = if request
+                    .name()
+                    == PREPARE_INVESTMENT_FORECAST
+                {
+                    let input = investment_input
+                        .as_ref()
+                        .ok_or(ServiceError::InvalidRequest)?;
+                    let source_cutoff = input.source_cutoff()?;
+                    if source_cutoff > requested_at {
+                        return Err(ServiceError::InvalidRequest);
+                    }
+                    let selection = self.resolve_investment_selection(
+                        &catalog,
+                        input,
+                        validated_profile
+                            .as_ref()
+                            .ok_or(ServiceError::InvalidRequest)?,
+                        source_cutoff,
+                        cohort.as_ref(),
+                        context,
+                    )?;
+                    let Some(selection) = selection else {
+                        // Only a completed, valid catalogue selection may prove absence.
+                        // Failed reads and a rejected full profile never enter this branch.
+                        ensure_live(context)?;
+                        return TypedToolResult::try_new(
                                 json!({
                                     "instrumentId": input.instrument_id,
                                     "availability": {
@@ -196,22 +395,22 @@ impl InstalledForecastPreparation {
                                 context.limits(),
                             )
                             .map_err(ServiceError::from);
-                        };
-                        (
-                            selection,
-                            source_cutoff,
-                            Some(input.financial_profile.configuration_digest.clone()),
-                            Some(input.instrument_id),
-                        )
-                    } else {
-                        let input: ForecastPreparationRequest = decode(&arguments)?;
-                        (
-                            resolve_selection(&catalog, input.selection)?,
-                            requested_at,
-                            None,
-                            None,
-                        )
                     };
+                    (
+                        selection,
+                        source_cutoff,
+                        Some(input.financial_profile.configuration_digest.clone()),
+                        Some(input.instrument_id),
+                    )
+                } else {
+                    let input = forecast_input.ok_or(ServiceError::InvalidRequest)?;
+                    (
+                        resolve_selection(&catalog, input.selection)?,
+                        requested_at,
+                        None,
+                        None,
+                    )
+                };
                 if let Some(input) = current_feature_input {
                     selection.selection = selection.selection.with_current_feature_input(input);
                 }
@@ -254,7 +453,10 @@ impl InstalledForecastPreparation {
                     )
                     .await
                     .map_err(map_preparation)?;
-                if selection.expected_origin.is_some_and(|origin| prepared.preview().observed_through() != origin) {
+                if selection
+                    .expected_origin
+                    .is_some_and(|origin| prepared.preview().observed_through() != origin)
+                {
                     return Err(ServiceError::InvalidResult);
                 }
                 let value = prepared_value(&prepared, &selection)?;
@@ -313,30 +515,48 @@ impl InstalledForecastPreparation {
     }
 
     async fn reopen_cohort(
-        &self, reference: &ForecastSessionCohortReference, source_cutoff: Timestamp,
-        evaluated_at: Timestamp, context: &RequestContext,
+        &self,
+        reference: &ForecastSessionCohortReference,
+        source_cutoff: Timestamp,
+        evaluated_at: Timestamp,
+        context: &RequestContext,
     ) -> Result<ForecastSessionCohort, ServiceError> {
         reference.validate().map_err(map_cohort)?;
         let knowledge = reference.knowledge_cutoff().map_err(map_cohort)?;
-        if knowledge != source_cutoff { return Err(ServiceError::InvalidRequest); }
-        let calendar = self.calendars.read_reference(reference.calendar(), knowledge,
-            context.deadline(), context.cancellation().clone(),
-            ).await.map_err(map_cohort)?
-            .ok_or(ServiceError::Unavailable)?;
-        calendar.reopen_forecast_session_cohort(reference, evaluated_at, context.deadline(), context.cancellation(),
+        if knowledge != source_cutoff {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let calendar = self
+            .calendars
+            .read_reference(
+                reference.calendar(),
+                knowledge,
+                context.deadline(),
+                context.cancellation().clone(),
             )
-            .map_err(map_cohort)?.ok_or(ServiceError::Unavailable)
+            .await
+            .map_err(map_cohort)?
+            .ok_or(ServiceError::Unavailable)?;
+        calendar
+            .reopen_forecast_session_cohort(
+                reference,
+                evaluated_at,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .map_err(map_cohort)?
+            .ok_or(ServiceError::Unavailable)
     }
 
     fn resolve_investment_selection(
         &self,
         catalog: &ForecastPreparationCatalog,
         input: &InvestmentForecastPreparationRequest,
+        profile: &crate::application::analytical_profile::ValidatedAnalyticalProfile,
         source_cutoff: Timestamp,
         cohort: Option<&ForecastSessionCohort>,
         context: &RequestContext,
     ) -> Result<Option<ResolvedForecastSelection>, ServiceError> {
-        let profile = revalidate(&input.financial_profile, Some(catalog))?;
         let identities = self.instruments.as_ref().ok_or(ServiceError::Unavailable)?;
         let identity = identities
             .read(
@@ -431,11 +651,12 @@ impl InstalledForecastPreparation {
             }
             return Ok(matches.pop());
         }
-        let selection = match profile.select_forecast(catalog, input.instrument_id, source_cutoff, cohort) {
-            Ok(selection) => selection,
-            Err(AnalyticalProfileError::ModelUnavailable) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
+        let selection =
+            match profile.select_forecast(catalog, input.instrument_id, source_cutoff, cohort) {
+                Ok(selection) => selection,
+                Err(AnalyticalProfileError::ModelUnavailable) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
         let history = catalog
             .evidence()
             .datasets()
@@ -445,12 +666,21 @@ impl InstalledForecastPreparation {
                     && dataset.analysis_manifest() == selection.analysis_manifest()
             })
             .ok_or(ServiceError::Unavailable)?;
-        let available = history.instruments().iter().find(|value| value.instrument_id() == input.instrument_id)
+        let available = history
+            .instruments()
+            .iter()
+            .find(|value| value.instrument_id() == input.instrument_id)
             .ok_or(ServiceError::InvalidResult)?;
-        let expected_origin = available.session_origin().map(|origin| origin.observed_through());
+        let expected_origin = available
+            .session_origin()
+            .map(|origin| origin.observed_through());
         if let Some(cohort) = cohort {
-            let origin = available.session_origin().ok_or(ServiceError::InvalidResult)?;
-            if !cohort.matches_origin(origin) { return Err(ServiceError::InvalidResult); }
+            let origin = available
+                .session_origin()
+                .ok_or(ServiceError::InvalidResult)?;
+            if !cohort.matches_origin(origin) {
+                return Err(ServiceError::InvalidResult);
+            }
         }
         let horizon = ForecastProductHorizon::try_from_horizon(selection.horizon())
             .map_err(|_| ServiceError::InvalidResult)?;
@@ -515,6 +745,13 @@ impl std::fmt::Debug for InstalledForecastPreparation {
             .field("runtime", &self.runtime)
             .finish()
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForecastPreparationPageRequest {
+    cursor: Option<String>,
+    limit: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -637,7 +874,9 @@ fn resolve_selection(
     )
     .map_err(map_preparation)?;
     Ok(ResolvedForecastSelection {
-        expected_origin: investment.session_origin().map(|origin| origin.observed_through()),
+        expected_origin: investment
+            .session_origin()
+            .map(|origin| origin.observed_through()),
         selection,
         investment_token: retained_investment_token,
         horizon_label,
@@ -727,7 +966,10 @@ fn catalog_value(
         .flatten()
         .collect::<Vec<_>>();
     let item_count = models.len();
-    Ok((json!({ "models": models }), item_count))
+    Ok((
+        json!({ "models": models, "nextCursor": catalog.next_cursor() }),
+        item_count,
+    ))
 }
 
 fn dataset_matches_model(dataset: &ForecastEvidenceDataset, model: &ForecastModelSummary) -> bool {
@@ -815,7 +1057,8 @@ fn preview_limitations(preview: &ForecastPreparationPreview) -> Vec<String> {
         .map(|limitation| limitation.to_string())
         .collect::<Vec<_>>();
     if preview.model().output_semantics() == ModelOutputSemantics::Regression
-        && !preview.model().has_calibrated_intervals() {
+        && !preview.model().has_calibrated_intervals()
+    {
         limitations.push(
             "Calibrated forecast ranges are unavailable, so this forecast must be treated as limited evidence."
                 .to_owned(),

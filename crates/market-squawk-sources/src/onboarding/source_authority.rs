@@ -4,17 +4,21 @@ use std::fmt::Write as _;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier,
+    AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
 
 use crate::{
-    ApiEndpointRule, BackoffPolicy, BudgetScope, BudgetWindowSemantics, EndpointPolicy,
-    HttpRequestBounds, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderRateWeightedDimension, ProviderRateWeightedWindow,
+    ApiEndpointRule, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
+    BudgetWindowSemantics, CoverageDomain, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
+    HttpRequestBounds, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderRateWeightedDimension, ProviderRateWeightedWindow, SourceCapabilities, SourceClass,
+    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 
 const SECOND_NANOS: u64 = 1_000_000_000;
@@ -429,6 +433,70 @@ impl FilingTaxonomySourceAuthority {
         ))
     }
 
+    /// Builds stable extraction metadata for a hidden standards dependency. SEC itself retains
+    /// its activation-bound onboarding metadata and is deliberately rejected here.
+    pub fn dependency_source_metadata(
+        self,
+    ) -> Result<SourceMetadata, FilingTaxonomyAuthorityContractError> {
+        if self.request_header_class == FilingTaxonomyRequestHeaderClass::SecIdentifyingContact {
+            return Err(FilingTaxonomyAuthorityContractError::InvalidSourceMetadata);
+        }
+        let invalid = |_| FilingTaxonomyAuthorityContractError::InvalidSourceMetadata;
+        let validity =
+            EffectiveInterval::new(Timestamp::from_unix_nanos(0), None).map_err(invalid)?;
+        let evidence =
+            ExactPayloadEvidence::from_content_digest(self.descriptor_evidence_digest()?);
+        let coverage = SourceCoverage::try_non_instrument(
+            evidence.clone(),
+            validity,
+            CoverageDomain::RegulatoryFilings,
+            CoverageDelay::NotApplicable,
+            DeliveryEvidence::Unknown,
+        )
+        .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidSourceMetadata)?;
+        let freshness = FreshnessPolicy::try_new(
+            self.total_timeout_nanos,
+            self.total_timeout_nanos,
+            self.total_timeout_nanos,
+            self.total_timeout_nanos,
+            0,
+        )
+        .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidSourceMetadata)?;
+        SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            self.canonical_source_id()?,
+            self.revision_evidence()?,
+            SourceClass::StandardsPublisher,
+            SourceIdentifier::try_from(self.rate_scope)
+                .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorIdentity)?,
+            AuthorizationGrant::new(
+                AuthorizationMode::PublicInterface,
+                AuthorizationBasis::new(
+                    SourceIdentifier::try_from("public-taxonomy-descriptor").map_err(|_| {
+                        FilingTaxonomyAuthorityContractError::InvalidDescriptorIdentity
+                    })?,
+                ),
+                evidence,
+                validity,
+            ),
+            coverage,
+            DataQuality::OfficialDelayed,
+            NetworkAccessPolicy::Allowlisted(self.endpoint_policy()?),
+            freshness,
+            Some(self.budget_policy()?),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::RevisionPreserving,
+                false,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))
+        .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidSourceMetadata)
+    }
+
     /// Binds one activation receipt to the complete code-owned descriptor for runtime metadata.
     pub fn activation_revision_evidence(
         self,
@@ -698,6 +766,9 @@ pub enum FilingTaxonomyAuthorityContractError {
     /// A code-owned request-budget policy is invalid.
     #[error("code-owned filing taxonomy budget policy is invalid")]
     InvalidBudgetPolicy,
+    /// A dependency metadata contract is invalid or was requested for SEC onboarding.
+    #[error("code-owned filing taxonomy source metadata is invalid")]
+    InvalidSourceMetadata,
 }
 
 /// Failure to preserve an exact, supported taxonomy publisher mapping.

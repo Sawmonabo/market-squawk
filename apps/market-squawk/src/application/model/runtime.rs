@@ -1,41 +1,40 @@
 //! Durable production model admission and restart-safe backend composition.
 
 use std::fmt;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use market_squawk_data::{PythonDatasetVerificationLimits, Sha256Digest};
+use market_squawk_data::{
+    ModelInventoryCatalogCapability, ModelInventoryError, ModelInventoryHead, ModelInventoryRecord,
+    PythonDatasetVerificationLimits, Sha256Digest,
+};
 use market_squawk_domain::ModelId;
 use market_squawk_modeling::{
-    BundleId, BundleMetadataRef, BundleRegistration, ControlledModelRoot, InferenceBackend,
-    MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError, ModelBundle, ModelFormat, ModelRegistry,
-    ModelRegistryError, NativeBackendError, NativeLinearBackend, OnnxBackendError, OnnxModelPolicy,
-    OnnxWorkerProgram, ProductionFeatureRegistry, PythonDatasetAdmissionAuthority,
-    TractOnnxBackend, VerifiedTrainingEnvironment, recover_model_candidate, verify_model_candidate,
+    BundleId, BundleMetadataRef, ControlledModelRoot, InferenceBackend, MAX_BUNDLE_AUTHORITY_BYTES,
+    ModelAdmissionError, ModelBundle, ModelFormat, ModelRegistry, ModelRegistryError,
+    NativeBackendError, NativeLinearBackend, OnnxBackendError, OnnxModelPolicy, OnnxWorkerProgram,
+    ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, TractOnnxBackend,
+    VerifiedTrainingEnvironment, verify_model_candidate,
 };
-use market_squawk_platform::{
-    LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
-};
+use market_squawk_platform::{LocalPaths, PathError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::{ModelDomainServiceError, ModelReadImage, ModelReadImageState};
 
-pub use index::{ModelRuntimeIndexError, ModelRuntimeIndexLimits};
+pub use index::ModelRuntimeIndexError;
 
-use self::index::{
-    IndexAdmission, ModelRuntimeIndex, StoredRuntimePolicy, validate_candidate_directory,
-};
+use self::index::{IndexAdmission, StoredRuntimePolicy, validate_candidate_directory};
 
 mod admission_request;
 mod index;
+pub(super) mod inventory;
+use inventory::RuntimeInventory;
 
-const MODEL_RUNTIME_AUTHORITY_DIRECTORY: &str = "model/runtime-admissions";
 const MAXIMUM_VALIDATION_TIME: Duration = Duration::from_secs(60);
 const STANDARD_VALIDATION_TIME: Duration = Duration::from_secs(30);
-const STANDARD_REGISTRY_RETAINED_BYTES: usize = 512 * 1024 * 1024;
 
 /// Closed backend policy attached to one exact bundle admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,37 +114,27 @@ impl ModelAdmissionRequest {
     }
 }
 
-/// Fixed count, memory, dataset, and elapsed-time bounds for model runtime recovery.
+/// Dataset verification and elapsed-time bounds for each admitted model operation.
 #[derive(Clone, Copy, Debug)]
 pub struct ProductionModelRuntimeLimits {
-    index: ModelRuntimeIndexLimits,
-    registry_retained_bytes: NonZeroUsize,
     dataset_verification: PythonDatasetVerificationLimits,
     validation_time: Duration,
 }
 
 impl ProductionModelRuntimeLimits {
-    /// Constructs bounds no greater than the model, dataset, and authority-store ceilings.
+    /// Constructs per-operation dataset verification and validation bounds.
     ///
     /// # Errors
     ///
-    /// Rejects an empty or longer-than-60-second aggregate validation window and invalid index or
-    /// model-registry bounds.
+    /// Rejects an empty or longer-than-60-second validation window.
     pub fn try_new(
-        index: ModelRuntimeIndexLimits,
-        registry_retained_bytes: NonZeroUsize,
         dataset_verification: PythonDatasetVerificationLimits,
         validation_time: Duration,
     ) -> Result<Self, ProductionModelRuntimeError> {
-        ModelRuntimeIndexLimits::try_new(index.maximum_generations(), index.maximum_index_bytes())
-            .map_err(|_| ProductionModelRuntimeError::InvalidLimits)?;
-        ModelRegistry::try_new(index.maximum_generations(), registry_retained_bytes)?;
         if validation_time.is_zero() || validation_time > MAXIMUM_VALIDATION_TIME {
             return Err(ProductionModelRuntimeError::InvalidLimits);
         }
         Ok(Self {
-            index,
-            registry_retained_bytes,
             dataset_verification,
             validation_time,
         })
@@ -158,9 +147,6 @@ impl ProductionModelRuntimeLimits {
     /// Returns a typed error if fixed model or dataset limits no longer compose.
     pub fn standard() -> Result<Self, ProductionModelRuntimeError> {
         Self::try_new(
-            ModelRuntimeIndexLimits::standard(),
-            NonZeroUsize::new(STANDARD_REGISTRY_RETAINED_BYTES)
-                .ok_or(ProductionModelRuntimeError::InvalidLimits)?,
             PythonDatasetVerificationLimits::try_new(100_000, 256 * 1024 * 1024)
                 .map_err(ModelAdmissionError::from)?,
             STANDARD_VALIDATION_TIME,
@@ -253,13 +239,6 @@ pub struct ModelRuntimeSnapshot {
 }
 
 impl ModelRuntimeSnapshot {
-    /// Consumes this immutable snapshot into the existing model-domain constructor arguments.
-    #[must_use]
-    pub fn into_parts(self) -> (Arc<ModelRegistry>, Vec<Arc<dyn InferenceBackend>>) {
-        let image = self.read_image.load();
-        (Arc::clone(&image.registry), image.backends.to_vec())
-    }
-
     pub(super) fn into_read_image(self) -> Arc<ModelReadImageState> {
         self.read_image
     }
@@ -287,7 +266,7 @@ impl fmt::Debug for ModelRuntimeSnapshot {
 }
 
 struct RuntimeGate {
-    index: ModelRuntimeIndex,
+    head: ModelInventoryHead,
     publication_unresolved: bool,
 }
 
@@ -302,7 +281,73 @@ pub(super) struct RuntimeBackupCoordinate {
 
 pub(super) struct RetainedRuntimeBackup {
     pub(super) canonical_index: Box<[u8]>,
-    pub(super) models: Vec<(RuntimeBackupCoordinate, Arc<ModelBundle>)>,
+    pub(super) image: Arc<ModelReadImage>,
+}
+
+pub(super) struct RetainedRuntimeBackupEntry {
+    pub(super) coordinate: RuntimeBackupCoordinate,
+    pub(super) record: ModelInventoryRecord,
+    pub(super) sequence: u64,
+}
+
+impl RetainedRuntimeBackup {
+    pub(super) fn contains(
+        &self,
+        model_id: &str,
+        bundle_id: &str,
+        version: u64,
+    ) -> Result<bool, ProductionModelRuntimeError> {
+        let id = BundleId::try_new(bundle_id)
+            .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?;
+        let version =
+            NonZeroU64::new(version).ok_or(ProductionModelRuntimeError::CorruptRuntime)?;
+        match &self.image.registry {
+            super::read_image::ModelBundleInventory::Disk(inventory) => Ok(inventory
+                .admission(&id, version)?
+                .is_some_and(|entry| entry.model_id.to_string() == model_id)),
+            super::read_image::ModelBundleInventory::Memory(registry) => Ok(registry
+                .get(&id, version)?
+                .is_some_and(|bundle| bundle.metadata().model_id().to_string() == model_id)),
+        }
+    }
+    pub(super) fn page(
+        &self,
+        after: u64,
+    ) -> Result<Vec<RetainedRuntimeBackupEntry>, ProductionModelRuntimeError> {
+        let super::read_image::ModelBundleInventory::Disk(inventory) = &self.image.registry else {
+            return Ok(Vec::new());
+        };
+        inventory
+            .catalog
+            .page(inventory.head, after)?
+            .into_iter()
+            .map(|entry| {
+                let record = entry.admission.clone();
+                let sequence = entry.head.sequence;
+                let admission = RuntimeInventory::decode(entry)?;
+                Ok(RetainedRuntimeBackupEntry {
+                    coordinate: RuntimeBackupCoordinate {
+                        candidate_directory: admission.candidate_directory,
+                        metadata_path: admission.metadata_path,
+                        model_id: admission.model_id,
+                        bundle_id: admission.bundle_id,
+                        bundle_version: admission.bundle_version,
+                    },
+                    record,
+                    sequence,
+                })
+            })
+            .collect()
+    }
+    pub(super) fn bundle(
+        &self,
+        coordinate: &RuntimeBackupCoordinate,
+    ) -> Result<Arc<ModelBundle>, ProductionModelRuntimeError> {
+        self.image
+            .registry
+            .get(&coordinate.bundle_id, coordinate.bundle_version)?
+            .ok_or(ProductionModelRuntimeError::CorruptRuntime)
+    }
 }
 
 pub(super) struct RetainedForecastRuntime {
@@ -325,7 +370,7 @@ impl fmt::Debug for RetainedRuntimeBackup {
         formatter
             .debug_struct("RetainedRuntimeBackup")
             .field("canonical_index", &"[CANONICAL MODEL RUNTIME INDEX]")
-            .field("model_count", &self.models.len())
+            .field("model_count", &self.image.len())
             .finish()
     }
 }
@@ -333,24 +378,24 @@ impl fmt::Debug for RetainedRuntimeBackup {
 /// Application-owned durable model admission and backend recovery authority.
 pub struct ProductionModelRuntime {
     paths: LocalPaths,
-    store: LocalAuthorityStateStore,
-    feature_registry: ProductionFeatureRegistry,
+    catalog: Option<ModelInventoryCatalogCapability>,
+    feature_registry: Arc<ProductionFeatureRegistry>,
     training_environment: Option<VerifiedTrainingEnvironment>,
     onnx_worker: Option<OnnxWorkerProgram>,
     limits: ProductionModelRuntimeLimits,
     gate: Mutex<RuntimeGate>,
+    admission_validation: Mutex<()>,
     read_image: Arc<ModelReadImageState>,
 }
 
 impl ProductionModelRuntime {
-    pub(super) fn empty_backup(
-        limits: ProductionModelRuntimeLimits,
-    ) -> Result<RetainedRuntimeBackup, ProductionModelRuntimeError> {
+    pub(super) fn empty_backup() -> Result<RetainedRuntimeBackup, ProductionModelRuntimeError> {
+        let snapshot = Self::empty_snapshot()?;
         Ok(RetainedRuntimeBackup {
-            canonical_index: ModelRuntimeIndex::empty()
-                .encode(limits.index)?
+            canonical_index: serde_json::to_vec(&ModelInventoryHead::empty())
+                .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?
                 .into_boxed_slice(),
-            models: Vec::new(),
+            image: snapshot.read_image.load(),
         })
     }
 
@@ -370,7 +415,7 @@ impl ProductionModelRuntime {
 
     /// Reports whether the fixed durable runtime index contains any admitted generation.
     ///
-    /// The complete canonical index is decoded under the supplied production limits. This lets
+    /// The durable catalog head is read without loading admitted models. This lets
     /// application composition distinguish a genuinely fresh model namespace from an existing
     /// runtime that must not be hidden when its verified training-environment capability is
     /// unavailable.
@@ -379,11 +424,9 @@ impl ProductionModelRuntime {
     ///
     /// Returns a typed local-path, persistence, index-validation, or resource error.
     pub fn has_durable_admissions(
-        paths: &LocalPaths,
-        limits: ProductionModelRuntimeLimits,
+        catalog: ModelInventoryCatalogCapability,
     ) -> Result<bool, ProductionModelRuntimeError> {
-        let (_store, index) = open_runtime_index(paths, limits)?;
-        Ok(!index.entries().is_empty())
+        Ok(catalog.head()?.sequence != 0)
     }
 
     /// Constructs the truthful empty model inventory used only for a fresh local namespace.
@@ -396,24 +439,18 @@ impl ProductionModelRuntime {
     ///
     /// Returns a registry error if the code-owned production limits cannot construct an empty
     /// bounded registry.
-    pub fn empty_snapshot(
-        limits: ProductionModelRuntimeLimits,
-    ) -> Result<ModelRuntimeSnapshot, ProductionModelRuntimeError> {
-        let registry = Arc::new(ModelRegistry::try_new(
-            limits.index.maximum_generations(),
-            limits.registry_retained_bytes,
-        )?);
+    pub fn empty_snapshot() -> Result<ModelRuntimeSnapshot, ProductionModelRuntimeError> {
+        let registry = Arc::new(ModelRegistry::empty());
         let image = Arc::new(ModelReadImage::try_new(registry, Vec::new())?);
         Ok(ModelRuntimeSnapshot {
             read_image: Arc::new(ModelReadImageState::new(image)),
         })
     }
 
-    /// Opens the fixed model-control namespace and reconstructs every durable runtime generation.
+    /// Opens and verifies the durable inventory without materializing historical model artifacts.
     ///
-    /// An empty index is a valid admission owner but [`Self::snapshot`] refuses to represent it as
-    /// a usable model runtime. Every persisted record is revalidated; one bad record, missing ONNX
-    /// worker capability, or backend load failure rejects the complete constructor.
+    /// A selected generation is independently recovered on demand. Compilation and retirement
+    /// share one explicit execution slot across all retained inventory images.
     ///
     /// # Errors
     ///
@@ -421,41 +458,44 @@ impl ProductionModelRuntime {
     /// aggregate-deadline error without publishing a partial runtime.
     pub fn try_open(
         paths: &LocalPaths,
+        catalog: ModelInventoryCatalogCapability,
         training_environment: VerifiedTrainingEnvironment,
         onnx_worker: Option<OnnxWorkerProgram>,
         limits: ProductionModelRuntimeLimits,
     ) -> Result<Self, ProductionModelRuntimeError> {
-        let (store, index) = open_runtime_index(paths, limits)?;
-        let feature_registry = ProductionFeatureRegistry::try_new()?;
-        let image = build_runtime(
-            paths,
-            &index,
-            &feature_registry,
-            onnx_worker.as_ref(),
+        let head = catalog.head()?;
+        catalog.verify(head)?;
+        let feature_registry = Arc::new(ProductionFeatureRegistry::try_new()?);
+        let inventory = Arc::new(RuntimeInventory::new(
+            paths.clone(),
+            catalog.clone(),
+            head,
+            Arc::clone(&feature_registry),
+            onnx_worker.clone(),
             limits,
-            None,
-        )?;
-        let read_image = Arc::new(ModelReadImageState::new(image));
+        ));
+        let image = Arc::new(ModelReadImage::from_inventory(inventory));
         Ok(Self {
             paths: paths.clone(),
-            store,
+            catalog: Some(catalog),
             feature_registry,
             training_environment: Some(training_environment),
             onnx_worker,
             limits,
+            admission_validation: Mutex::new(()),
             gate: Mutex::new(RuntimeGate {
-                index,
+                head,
                 publication_unresolved: false,
             }),
-            read_image,
+            read_image: Arc::new(ModelReadImageState::new(image)),
         })
     }
 
     /// Durably admits one exact candidate or recognizes a fully identical replay.
     ///
     /// The method accepts no arbitrary local path or executable. It revalidates the configured
-    /// catalog selection and current training release, builds a complete proposed runtime, commits
-    /// the canonical two-copy index, then atomically swaps process state.
+    /// catalog selection and current training release, validates the new candidate in the shared
+    /// execution slot, commits one immutable catalog row, then publishes its inventory fence.
     ///
     /// # Errors
     ///
@@ -476,6 +516,12 @@ impl ProductionModelRuntime {
     ) -> Result<ModelAdmissionReceipt, ProductionModelRuntimeError> {
         let deadline = validation_deadline(self.limits.validation_time)?;
         check_admission_control(deadline, cancellation)?;
+        // Reserve admission validation before reading artifact payloads; concurrent admissions
+        // cannot each allocate an independently verified candidate.
+        let _admission_validation = self
+            .admission_validation
+            .try_lock()
+            .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
         let root = open_candidate_root(&self.paths, &request.candidate_directory)?;
         let candidate = self.verify_candidate(&root, &request, deadline, cancellation)?;
         let RuntimeValidatedCandidate {
@@ -528,6 +574,8 @@ impl ProductionModelRuntime {
             output_binding_sha256: metadata.output_binding().identity(),
             runtime_policy,
             training_job: request.training_job,
+            product_summary: super::product_model_summary(&bundle)
+                .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?,
         };
         check_admission_control(deadline, cancellation)?;
         let mut gate = self
@@ -537,42 +585,54 @@ impl ProductionModelRuntime {
         if gate.publication_unresolved {
             return Err(ProductionModelRuntimeError::PublicationUnresolved);
         }
-        let current = gate.index.encode(self.limits.index)?;
-        let mut proposed = ModelRuntimeIndex::decode(&current, self.limits.index)?;
-        let inserted = proposed.try_insert(admission.clone(), self.limits.index)?;
+        let bundle = Arc::new(bundle);
+        let current = self.read_image.load();
+        let super::read_image::ModelBundleInventory::Disk(previous) = &current.registry else {
+            return Err(ProductionModelRuntimeError::CorruptRuntime);
+        };
+        // Admission and inference share the same execution slot, including compilation and retirement.
+        let _validation = previous.validate_candidate(
+            Arc::clone(&bundle),
+            &admission.runtime_policy,
+            deadline,
+            cancellation,
+        )?;
+        check_admission_control(deadline, cancellation)?;
+        let record = ModelInventoryRecord {
+            model_id: admission.model_id,
+            model_token: super::forecast_model_evidence_projection(&bundle)
+                .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?
+                .model_token(),
+            bundle_id: admission.bundle_id.as_str().to_owned(),
+            bundle_version: admission.bundle_version,
+            candidate_directory: admission.candidate_directory.to_string(),
+            record: admission.encode_record()?,
+        };
+        let (head, inserted) = match self
+            .catalog
+            .as_ref()
+            .ok_or(ProductionModelRuntimeError::RuntimeUnavailable)?
+            .publish(&record)
+        {
+            Ok(receipt) => receipt,
+            Err(ModelInventoryError::Storage(_)) => {
+                gate.publication_unresolved = true;
+                return Err(ProductionModelRuntimeError::PublicationUnresolved);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let inventory = Arc::new(previous.with_head(head));
+        inventory.remember(&bundle)?;
+        gate.head = head;
+        self.read_image
+            .publish(Arc::new(ModelReadImage::from_inventory(inventory)));
         if !inserted {
             return Ok(receipt(
                 &admission,
                 ModelAdmissionDisposition::AlreadyAdmitted,
             ));
         }
-        let image = build_runtime(
-            &self.paths,
-            &proposed,
-            &self.feature_registry,
-            self.onnx_worker.as_ref(),
-            self.limits,
-            Some(PreparedRuntimeCandidate {
-                candidate_directory: admission.candidate_directory.clone(),
-                metadata_sha256: admission.metadata_sha256,
-                bundle,
-            }),
-        )?;
-        let encoded = proposed.encode(self.limits.index)?;
-        check_admission_control(deadline, cancellation)?;
-        if let Err(error) = self.store.store(&encoded) {
-            match self.store.load() {
-                Ok(Some(actual)) if actual == encoded => {}
-                Ok(Some(actual)) if actual == current => return Err(error.into()),
-                Ok(None) if gate.index.entries().is_empty() => return Err(error.into()),
-                Ok(_) | Err(_) => {
-                    gate.publication_unresolved = true;
-                    return Err(ProductionModelRuntimeError::PublicationUnresolved);
-                }
-            }
-        }
-        gate.index = proposed;
-        self.read_image.publish(image);
+
         Ok(receipt(&admission, ModelAdmissionDisposition::Inserted))
     }
 
@@ -596,35 +656,11 @@ impl ProductionModelRuntime {
         if gate.publication_unresolved {
             return Err(ProductionModelRuntimeError::PublicationUnresolved);
         }
-        let canonical_index = gate.index.encode(self.limits.index)?.into_boxed_slice();
-        let image = self.read_image.load();
-        if image.registry.len()? != gate.index.entries().len() {
-            return Err(ProductionModelRuntimeError::CorruptRuntime);
-        }
-        let mut models = Vec::new();
-        models
-            .try_reserve_exact(gate.index.entries().len())
-            .map_err(|_| ProductionModelRuntimeError::ResourceExhausted)?;
-        for admission in gate.index.entries() {
-            let bundle = image
-                .registry
-                .get(&admission.bundle_id, admission.bundle_version)?
-                .ok_or(ProductionModelRuntimeError::CorruptRuntime)?;
-            validate_recovered_bundle(&bundle, admission)?;
-            models.push((
-                RuntimeBackupCoordinate {
-                    candidate_directory: admission.candidate_directory.clone(),
-                    metadata_path: admission.metadata_path.clone(),
-                    model_id: admission.model_id,
-                    bundle_id: admission.bundle_id.clone(),
-                    bundle_version: admission.bundle_version,
-                },
-                bundle,
-            ));
-        }
         Ok(RetainedRuntimeBackup {
-            canonical_index,
-            models,
+            canonical_index: serde_json::to_vec(&gate.head)
+                .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?
+                .into_boxed_slice(),
+            image: self.read_image.load(),
         })
     }
 
@@ -635,33 +671,12 @@ impl ProductionModelRuntime {
             .gate
             .lock()
             .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
-        let encoded = gate.index.encode(self.limits.index)?;
-        let image = self.read_image.load();
-        if image.backends.len() != gate.index.entries().len()
-            || image.registry.len()? != image.backends.len()
-        {
-            return Err(ProductionModelRuntimeError::CorruptRuntime);
-        }
-        for admission in gate.index.entries() {
-            let matching = image.backends.iter().filter(|backend| {
-                let metadata = backend.metadata();
-                metadata.model_id() == admission.model_id
-                    && metadata.bundle_id() == &admission.bundle_id
-                    && metadata.bundle_version() == admission.bundle_version
-                    && metadata.metadata_hash() == admission.metadata_sha256
-                    && metadata.artifact_hash() == admission.artifact_sha256
-                    && metadata.training_run_hash() == admission.training_run_sha256
-                    && metadata.dataset().export_digest() == admission.dataset_export_sha256
-                    && metadata.dataset().selection_digest() == admission.dataset_selection_sha256
-                    && metadata.output_binding().identity() == admission.output_binding_sha256
-            });
-            if matching.count() != 1 {
-                return Err(ProductionModelRuntimeError::CorruptRuntime);
-            }
+        if gate.publication_unresolved {
+            return Err(ProductionModelRuntimeError::PublicationUnresolved);
         }
         Ok(RetainedForecastRuntime {
-            generation_sha256: Sha256Digest::new(Sha256::digest(encoded).into()),
-            image,
+            generation_sha256: Sha256Digest::new(gate.head.sha256),
+            image: self.read_image.load(),
         })
     }
 
@@ -673,8 +688,7 @@ impl ProductionModelRuntime {
             .gate
             .lock()
             .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
-        let observed =
-            Sha256Digest::new(Sha256::digest(gate.index.encode(self.limits.index)?).into());
+        let observed = Sha256Digest::new(gate.head.sha256);
         if observed != expected {
             return Err(ProductionModelRuntimeError::StaleForecastGeneration);
         }
@@ -698,39 +712,43 @@ impl ProductionModelRuntime {
         ))
     }
 
-    pub(super) fn backup_coordinates(
-        canonical_index: &[u8],
-        limits: ProductionModelRuntimeLimits,
-    ) -> Result<Vec<RuntimeBackupCoordinate>, ProductionModelRuntimeError> {
-        let index = ModelRuntimeIndex::decode(canonical_index, limits.index)?;
-        Ok(index
-            .entries()
-            .iter()
-            .map(|admission| RuntimeBackupCoordinate {
-                candidate_directory: admission.candidate_directory.clone(),
-                metadata_path: admission.metadata_path.clone(),
-                model_id: admission.model_id,
-                bundle_id: admission.bundle_id.clone(),
-                bundle_version: admission.bundle_version,
-            })
-            .collect())
-    }
-
-    pub(super) fn stage_backup_index(
-        paths: &LocalPaths,
-        canonical_index: &[u8],
-        limits: ProductionModelRuntimeLimits,
-    ) -> Result<(), ProductionModelRuntimeError> {
-        let decoded = ModelRuntimeIndex::decode(canonical_index, limits.index)?;
-        if decoded.encode(limits.index)? != canonical_index {
+    pub(super) fn decode_backup_head(
+        bytes: &[u8],
+    ) -> Result<ModelInventoryHead, ProductionModelRuntimeError> {
+        let head: ModelInventoryHead = serde_json::from_slice(bytes)
+            .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?;
+        if serde_json::to_vec(&head).map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?
+            != bytes
+        {
             return Err(ProductionModelRuntimeError::CorruptRuntime);
         }
-        let (store, existing) = open_runtime_index(paths, limits)?;
-        if !existing.entries().is_empty() || store.load()?.is_some() {
-            return Err(ProductionModelRuntimeError::RestoreTargetNotFresh);
+        Ok(head)
+    }
+
+    pub(super) fn validate_backup_record(
+        record: &ModelInventoryRecord,
+    ) -> Result<RuntimeBackupCoordinate, ProductionModelRuntimeError> {
+        let admission = IndexAdmission::decode_record(&record.record)?;
+        if admission
+            .product_summary
+            .get("modelToken")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            != Some(record.model_token)
+            || admission.model_id != record.model_id
+            || admission.bundle_id.as_str() != record.bundle_id
+            || admission.bundle_version != record.bundle_version
+            || admission.candidate_directory.as_ref() != record.candidate_directory
+        {
+            return Err(ProductionModelRuntimeError::CorruptRuntime);
         }
-        store.store(canonical_index)?;
-        Ok(())
+        Ok(RuntimeBackupCoordinate {
+            candidate_directory: admission.candidate_directory,
+            metadata_path: admission.metadata_path,
+            model_id: admission.model_id,
+            bundle_id: admission.bundle_id,
+            bundle_version: admission.bundle_version,
+        })
     }
 
     #[cfg(test)]
@@ -742,24 +760,20 @@ impl ProductionModelRuntime {
             return Err(ProductionModelRuntimeError::InvalidAdmission);
         }
         let limits = ProductionModelRuntimeLimits::standard()?;
-        let (store, index) = open_runtime_index(paths, limits)?;
-        if !index.entries().is_empty() {
-            return Err(ProductionModelRuntimeError::CorruptRuntime);
-        }
-        let feature_registry = ProductionFeatureRegistry::try_new()?;
-        let image = build_runtime(paths, &index, &feature_registry, None, limits, None)?;
+        let snapshot = Self::empty_snapshot()?;
         Ok(Self {
             paths: paths.clone(),
-            store,
-            feature_registry,
+            catalog: None,
+            feature_registry: Arc::new(ProductionFeatureRegistry::try_new()?),
             training_environment: None,
             onnx_worker: None,
             limits,
+            admission_validation: Mutex::new(()),
             gate: Mutex::new(RuntimeGate {
-                index,
+                head: ModelInventoryHead::empty(),
                 publication_unresolved: false,
             }),
-            read_image: Arc::new(ModelReadImageState::new(image)),
+            read_image: snapshot.read_image,
         })
     }
 
@@ -801,41 +815,12 @@ struct RuntimeValidatedCandidate {
     dataset: PythonDatasetAdmissionAuthority,
 }
 
-struct PreparedRuntimeCandidate {
-    candidate_directory: Box<str>,
-    metadata_sha256: Sha256Digest,
-    bundle: ModelBundle,
-}
-
-impl PreparedRuntimeCandidate {
-    fn matches(&self, admission: &IndexAdmission) -> bool {
-        self.candidate_directory == admission.candidate_directory
-            && self.metadata_sha256 == admission.metadata_sha256
-    }
-}
-
-fn open_runtime_index(
-    paths: &LocalPaths,
-    limits: ProductionModelRuntimeLimits,
-) -> Result<(LocalAuthorityStateStore, ModelRuntimeIndex), ProductionModelRuntimeError> {
-    let control = paths.control_root()?;
-    control.try_clone_directory()?;
-    let store =
-        LocalAuthorityStateStore::try_open(control.root().join(MODEL_RUNTIME_AUTHORITY_DIRECTORY))?;
-    control.try_clone_directory()?;
-    let index = store.load()?.map_or_else(
-        || Ok(ModelRuntimeIndex::empty()),
-        |bytes| ModelRuntimeIndex::decode(&bytes, limits.index),
-    )?;
-    Ok((store, index))
-}
-
 impl fmt::Debug for ProductionModelRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProductionModelRuntime")
             .field("paths", &"[PREPARED LOCAL PATHS]")
-            .field("store", &self.store)
+            .field("catalog", &self.catalog)
             .field("feature_registry", &self.feature_registry)
             .field("training_environment", &"[VERIFIED TRAINING ENVIRONMENT]")
             .field("onnx_worker", &self.onnx_worker.is_some())
@@ -845,82 +830,24 @@ impl fmt::Debug for ProductionModelRuntime {
     }
 }
 
-fn build_runtime(
-    paths: &LocalPaths,
-    index: &ModelRuntimeIndex,
-    feature_registry: &ProductionFeatureRegistry,
-    onnx_worker: Option<&OnnxWorkerProgram>,
-    limits: ProductionModelRuntimeLimits,
-    mut prepared: Option<PreparedRuntimeCandidate>,
-) -> Result<Arc<ModelReadImage>, ProductionModelRuntimeError> {
-    let deadline = validation_deadline(limits.validation_time)?;
-    let registry = Arc::new(ModelRegistry::try_new(
-        limits.index.maximum_generations(),
-        limits.registry_retained_bytes,
-    )?);
-    let mut backends = Vec::new();
-    backends
-        .try_reserve_exact(index.entries().len())
-        .map_err(|_| ProductionModelRuntimeError::ResourceExhausted)?;
-    let cancellation = CancellationToken::new();
-    for admission in index.entries() {
-        if Instant::now() >= deadline {
-            return Err(ProductionModelRuntimeError::ValidationDeadline);
-        }
-        let bundle = if prepared
-            .as_ref()
-            .is_some_and(|candidate| candidate.matches(admission))
-        {
-            match prepared.take() {
-                Some(candidate) => candidate.bundle,
-                None => return Err(ProductionModelRuntimeError::CorruptRuntime),
-            }
-        } else {
-            let root = open_candidate_root(paths, &admission.candidate_directory)?;
-            let metadata =
-                BundleMetadataRef::try_new(&admission.metadata_path, admission.metadata_sha256)
-                    .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?;
-            let dataset = admission.dataset_authority()?;
-            recover_model_candidate(
-                &root,
-                &metadata,
-                &admission.authority_bytes,
-                admission.authority_sha256,
-                paths.root(),
-                dataset,
-                feature_registry,
-                limits.dataset_verification,
-                deadline,
-                &cancellation,
-            )?
-            .into_bundle()
-        };
-        validate_recovered_bundle(&bundle, admission)?;
-        let bundle_id = bundle.metadata().bundle_id().clone();
-        let bundle_version = bundle.metadata().bundle_version();
-        if registry.try_register(bundle)? != BundleRegistration::Inserted {
-            return Err(ProductionModelRuntimeError::CorruptRuntime);
-        }
-        let retained = registry
-            .get(&bundle_id, bundle_version)?
-            .ok_or(ProductionModelRuntimeError::CorruptRuntime)?;
-        backends.push(build_backend(
-            retained,
-            &admission.runtime_policy,
-            onnx_worker,
-        )?);
-    }
-    if prepared.is_some() {
-        return Err(ProductionModelRuntimeError::CorruptRuntime);
-    }
-    Ok(Arc::new(ModelReadImage::try_new(registry, backends)?))
-}
-
 fn validate_recovered_bundle(
     bundle: &ModelBundle,
     admission: &IndexAdmission,
 ) -> Result<(), ProductionModelRuntimeError> {
-    let metadata = bundle.metadata();
+    validate_recovered_metadata(bundle.metadata(), admission)?;
+    if super::product_model_summary(bundle)
+        .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?
+        != admission.product_summary
+    {
+        return Err(ProductionModelRuntimeError::CorruptRuntime);
+    }
+    Ok(())
+}
+
+fn validate_recovered_metadata(
+    metadata: &market_squawk_modeling::ModelMetadata,
+    admission: &IndexAdmission,
+) -> Result<(), ProductionModelRuntimeError> {
     if metadata.model_id() != admission.model_id
         || metadata.bundle_id() != &admission.bundle_id
         || metadata.bundle_version() != admission.bundle_version
@@ -949,6 +876,18 @@ fn stored_policy(
                 && policy.output_semantics_bound()
                 && policy.output_semantics() == bundle.metadata().output_semantics() =>
         {
+            let derived = OnnxModelPolicy::try_new_for_bundle(
+                bundle,
+                policy.opset(),
+                policy.input_shape(),
+                policy.output_shape(),
+                policy.inference_deadline(),
+                policy.fallback(),
+            )
+            .map_err(|_| ProductionModelRuntimeError::BackendPolicyMismatch)?;
+            if derived != policy {
+                return Err(ProductionModelRuntimeError::BackendPolicyMismatch);
+            }
             StoredRuntimePolicy::try_onnx(policy).map_err(Into::into)
         }
         _ => Err(ProductionModelRuntimeError::BackendPolicyMismatch),
@@ -1068,27 +1007,37 @@ impl ProductionModelRuntime {
         if gate.publication_unresolved {
             return Err(ProductionModelRuntimeError::PublicationUnresolved);
         }
-        let mut found = gate.index.entries().iter().filter(|entry| {
-            entry.training_job.as_ref().is_some_and(|job| {
-                job.id == snapshot.id().as_uuid()
-                    && job.generation.get() == snapshot.generation().get()
-                    && job.input_sha256 == snapshot.spec().input().digest().bytes()
-            })
-        });
-        let value = found
-            .next()
-            .map(|entry| {
-                Ok::<_, ProductionModelRuntimeError>((
-                    receipt(entry, ModelAdmissionDisposition::AlreadyAdmitted),
-                    entry
-                        .training_result_sha256()
-                        .ok_or(ProductionModelRuntimeError::CorruptRuntime)?,
-                ))
-            })
-            .transpose()?;
-        if found.next().is_some() {
-            return Err(ProductionModelRuntimeError::CorruptRuntime);
+        let Some(catalog) = &self.catalog else {
+            return Ok(None);
+        };
+        let mut after = 0;
+        let mut value = None;
+        loop {
+            let page = catalog.page(gate.head, after)?;
+            if page.is_empty() {
+                break;
+            }
+            for record in page {
+                after = record.head.sequence;
+                let entry = RuntimeInventory::decode(record)?;
+                if entry.training_job.as_ref().is_some_and(|job| {
+                    job.id == snapshot.id().as_uuid()
+                        && job.generation.get() == snapshot.generation().get()
+                        && job.input_sha256 == snapshot.spec().input().digest().bytes()
+                }) {
+                    if value.is_some() {
+                        return Err(ProductionModelRuntimeError::CorruptRuntime);
+                    }
+                    value = Some((
+                        receipt(&entry, ModelAdmissionDisposition::AlreadyAdmitted),
+                        entry
+                            .training_result_sha256()
+                            .ok_or(ProductionModelRuntimeError::CorruptRuntime)?,
+                    ));
+                }
+            }
         }
+
         Ok(value)
     }
 }
@@ -1135,6 +1084,9 @@ fn receipt(
 /// Durable production model runtime construction, recovery, or admission failure.
 #[derive(Debug, Error)]
 pub enum ProductionModelRuntimeError {
+    /// Durable indexed inventory publication or integrity failed.
+    #[error(transparent)]
+    Inventory(#[from] ModelInventoryError),
     /// A durable index write has an unknown outcome; its candidate files must be retained.
     #[error("production model publication requires exact restart reconciliation")]
     PublicationUnresolved,
@@ -1150,9 +1102,6 @@ pub enum ProductionModelRuntimeError {
     /// Prepared local path authority failed.
     #[error("production model local path authority failed: {0}")]
     Path(#[from] PathError),
-    /// Two-copy model runtime authority failed.
-    #[error("production model durable authority failed: {0}")]
-    State(#[from] LocalAuthorityStateStoreError),
     /// Canonical model runtime index validation failed.
     #[error("production model runtime index failed: {0}")]
     Index(#[from] ModelRuntimeIndexError),

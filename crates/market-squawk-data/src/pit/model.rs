@@ -15,13 +15,13 @@ use crate::DatasetManifestRef;
 
 /// Canonical identity schema used by this selector release.
 pub const POINT_IN_TIME_IDENTITY_SCHEMA_VERSION: u16 = 2;
-/// Fixed process ceiling for candidates examined by one selection.
+/// Default work allowance for candidates examined by one selection.
 pub const MAX_POINT_IN_TIME_CANDIDATES: usize = 1_000_000;
-/// Fixed process ceiling for distinct natural-identity families.
+/// Default work allowance for distinct natural-identity families.
 pub const MAX_POINT_IN_TIME_FAMILIES: usize = 1_000_000;
-/// Fixed process ceiling for divergent same-revision conflict groups.
+/// Default work allowance for divergent same-revision conflict groups.
 pub const MAX_POINT_IN_TIME_CONFLICTS: usize = 100_000;
-/// Fixed process ceiling for usable result rows.
+/// Default work allowance for usable result rows.
 pub const MAX_POINT_IN_TIME_RESULT_ROWS: usize = 1_000_000;
 /// Fixed process ceiling for selector-owned peak retained bytes.
 pub const MAX_POINT_IN_TIME_RETAINED_BYTES: usize = 512 * 1024 * 1024;
@@ -84,7 +84,7 @@ pub struct PointInTimeLimits {
 }
 
 impl PointInTimeLimits {
-    /// Constructs nonzero caller bounds within fixed process ceilings.
+    /// Constructs nonzero work bounds and a separately bounded resident working set.
     pub fn try_new(
         max_candidates: usize,
         max_families: usize,
@@ -93,13 +93,9 @@ impl PointInTimeLimits {
         max_retained_bytes: usize,
     ) -> Result<Self, PointInTimeError<'static>> {
         if max_candidates == 0
-            || max_candidates > MAX_POINT_IN_TIME_CANDIDATES
             || max_families == 0
-            || max_families > MAX_POINT_IN_TIME_FAMILIES
             || max_conflicts == 0
-            || max_conflicts > MAX_POINT_IN_TIME_CONFLICTS
             || max_result_rows == 0
-            || max_result_rows > MAX_POINT_IN_TIME_RESULT_ROWS
             || max_retained_bytes == 0
             || max_retained_bytes > MAX_POINT_IN_TIME_RETAINED_BYTES
         {

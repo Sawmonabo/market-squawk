@@ -1,3 +1,4 @@
+import { chartDisplaySchema, chartOriginalPointFields } from "../shared/chart-projection"
 import { z } from "zod"
 
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
@@ -836,12 +837,14 @@ const forecastOriginSchema = z.discriminatedUnion("state", [
 ])
 const chartHistoryPointSchema = z.union([
   z.object({
+    ...chartOriginalPointFields,
     coordinate: chartCoordinateSchema,
     availableAtUnixNanos: chartTimeSchema,
     value: chartValueSchema,
     quality: chartQualitySchema,
   }).strict(),
   z.object({
+    ...chartOriginalPointFields,
     coordinate: chartCoordinateSchema,
     availableAtUnixNanos: z.null(), value: z.null(), quality: z.null(),
   }).strict(),
@@ -850,7 +853,8 @@ const chartHistorySchema = z.discriminatedUnion("state", [
   z.object({
     state: z.literal("available"), summary: productTextSchema,
     basis: z.literal("split_adjusted_price"),
-    points: z.array(chartHistoryPointSchema).min(1).max(4_096),
+    points: z.array(chartHistoryPointSchema).max(4_096),
+    display: chartDisplaySchema,
   }).strict(),
   z.object({
     state: z.literal("unavailable"), summary: productTextSchema,
@@ -884,7 +888,7 @@ const chartForecastSchema = z.discriminatedUnion("state", [
     state: z.literal("available"), summary: productTextSchema,
     basis: z.literal("saved_price_projection"),
     observedThroughUnixNanos: chartTimeSchema, origin: forecastOriginSchema,
-    points: z.tuple([forecastPointSchema]),
+    points: z.array(forecastPointSchema).max(1),
   }).strict(),
   z.object({
     state: z.literal("unavailable"), summary: productTextSchema,
@@ -909,6 +913,7 @@ const benchmarkMembersSchema = z.union([
   ]),
 ])
 const unavailableBenchmarkMembersSchema = z.union([
+  z.tuple([]),
   z.tuple([benchmarkMemberSchema.extend({ role: z.literal("subject") })]),
   benchmarkMembersSchema,
 ])
@@ -929,35 +934,40 @@ const benchmarkHistorySchema = z.discriminatedUnion("state", [
     state: z.literal("available"), summary: productTextSchema,
     basis: benchmarkBasisSchema, members: benchmarkMembersSchema,
     baseline: benchmarkCoordinateSchema,
+    display: chartDisplaySchema,
     points: z.array(z.object({
+      ...chartOriginalPointFields,
       coordinate: benchmarkCoordinateSchema,
       observations: z.array(benchmarkObservationSchema.nullable()).min(2).max(3),
-    }).strict()).min(1).max(4_096),
+    }).strict()).max(4_096),
   }).strict(),
   z.object({
     state: z.literal("unavailable"), summary: productTextSchema,
     basis: benchmarkBasisSchema, members: unavailableBenchmarkMembersSchema,
     reason: z.enum([
       "selection_unavailable", "missing_subject", "missing_selected_comparison",
-      "no_common_observation", "storage_unavailable", "integrity_unproven",
+      "no_common_observation", "storage_unavailable", "integrity_unproven", "not_requested",
     ]),
   }).strict(),
 ]).superRefine((benchmark, context) => {
   if (benchmark.state !== "available") {
-    if (benchmark.members.length === 1 && benchmark.reason !== "selection_unavailable") {
+    if (benchmark.members.length === 0 && benchmark.reason !== "not_requested") {
+      context.addIssue({ code: "custom", message: "Unavailable comparison history lacks its saved identity." })
+    }
+    if (benchmark.members.length === 1 && benchmark.reason !== "selection_unavailable" && benchmark.reason !== "not_requested") {
       context.addIssue({ code: "custom", message: "Unavailable comparison history lacks its saved selection." })
     }
     return
   }
-  const first = benchmark.points[0]
-  if (!first || first.coordinate.date !== benchmark.baseline.date
-    || first.coordinate.sessionCloseUnixNanos !== benchmark.baseline.sessionCloseUnixNanos
-    || first.observations[0]?.priceIndex !== "100"
-    || first.observations[1]?.priceIndex !== "100") {
-    context.addIssue({ code: "custom", message: "The saved comparison has no common base-100 observation." })
+  // A viewport may start after the authoritative base-100 session. The saved
+  // baseline remains separate from its displayed original observations.
+  if (benchmark.display.returnedPointCount !== benchmark.points.length) {
+    context.addIssue({ code: "custom", message: "The comparison display count does not match its original points." })
   }
   benchmark.points.forEach((point, index) => {
     if (point.observations.length !== benchmark.members.length
+      || point.breakBefore.length !== benchmark.members.length
+      || index > 0 && BigInt(point.originalOrdinal) <= BigInt(benchmark.points[index - 1]!.originalOrdinal)
       || index > 0 && (point.coordinate.date <= benchmark.points[index - 1]!.coordinate.date
         || BigInt(point.coordinate.sessionCloseUnixNanos) <= BigInt(benchmark.points[index - 1]!.coordinate.sessionCloseUnixNanos))) {
       context.addIssue({ code: "custom", path: ["points", index], message: "Comparison sessions or members are inconsistent." })
@@ -987,7 +997,7 @@ const chartActionRangesSchema = z.discriminatedUnion("state", [
   }).strict(),
   z.object({ state: z.literal("unavailable"), ...chartActionClocks,
     reason: z.enum(["no_supported_action_ranges", "share_conversion_unavailable",
-      "original_history_unavailable", "expired_at_admission", "range_conversion_unavailable"]),
+      "original_history_unavailable", "expired_at_admission", "range_conversion_unavailable", "not_requested"]),
     ranges: z.tuple([]),
   }).strict(),
 ]).superRefine((levels, context) => {
@@ -997,7 +1007,15 @@ const chartActionRangesSchema = z.discriminatedUnion("state", [
     context.addIssue({ code: "custom", message: "Saved action references contradict their original admission interval." })
   }
 })
-const investmentChartSchema = z.object({
+export const investmentChartSchema = z.object({
+  viewport: z.strictObject({
+    startUnixNanos: chartTimeSchema.nullable(),
+    endUnixNanos: chartTimeSchema.nullable(),
+    pointLimit: z.number().int().min(8).max(4_096),
+    layer: z.enum(["all", "history", "forecast", "benchmark", "price_pattern", "action_ranges"]),
+    fullStartUnixNanos: chartTimeSchema.nullable(),
+    fullEndUnixNanos: chartTimeSchema.nullable(),
+  }),
   informationCurrentThroughUnixNanos: chartTimeSchema,
   basisExplanation: productTextSchema,
   history: chartHistorySchema,
@@ -1026,15 +1044,26 @@ const investmentChartSchema = z.object({
 }).strict().superRefine((chart, context) => {
   const history = chart.history
   const cutoff = BigInt(chart.informationCurrentThroughUnixNanos)
-  if (chart.actionRanges.informationCurrentThroughUnixNanos !== chart.informationCurrentThroughUnixNanos
-    || chart.actionRanges.state === "available" && history.state !== "available") {
+  const viewport = chart.viewport
+  if (viewport.startUnixNanos !== null && viewport.endUnixNanos !== null
+    && BigInt(viewport.startUnixNanos) > BigInt(viewport.endUnixNanos)
+    || (viewport.fullStartUnixNanos === null) !== (viewport.fullEndUnixNanos === null)
+    || viewport.fullStartUnixNanos !== null && viewport.fullEndUnixNanos !== null
+      && BigInt(viewport.fullStartUnixNanos) > BigInt(viewport.fullEndUnixNanos)) {
+    context.addIssue({ code: "custom", path: ["viewport"], message: "The requested chart interval is reversed or incomplete." })
+  }
+  for (const series of [chart.history, chart.benchmark]) {
+    if (series.state === "available" && series.points.length > viewport.pointLimit) {
+      context.addIssue({ code: "custom", path: ["viewport"], message: "The saved chart exceeds its requested display resolution." })
+    }
+  }
+  if (chart.actionRanges.informationCurrentThroughUnixNanos !== chart.informationCurrentThroughUnixNanos) {
     context.addIssue({ code: "custom", path: ["actionRanges"],
-      message: "Saved action references lack their original chart history or information cutoff." })
+      message: "Saved action references contradict their original information cutoff." })
   }
   if (history.state === "available") {
-    if (history.points.at(-1)?.value === null) {
-      context.addIssue({ code: "custom", path: ["history", "points"],
-        message: "Saved history must end at a genuine observed price." })
+    if (history.display.returnedPointCount !== history.points.length) {
+      context.addIssue({ code: "custom", message: "The history display count does not match its original points." })
     }
     history.points.forEach((point, index) => {
       const coordinate = point.coordinate
@@ -1043,7 +1072,9 @@ const investmentChartSchema = z.object({
       const previous = history.points[index - 1]?.coordinate
       const previousTime = previous?.kind === "timestamp"
         ? previous.timeUnixNanos : previous?.sessionCloseUnixNanos
-      if (BigInt(time) > cutoff
+      if (point.breakBefore.length !== 1
+        || index > 0 && BigInt(point.originalOrdinal) <= BigInt(history.points[index - 1]!.originalOrdinal)
+        || BigInt(time) > cutoff
         || point.availableAtUnixNanos !== null && BigInt(point.availableAtUnixNanos) > cutoff
         || previousTime !== undefined && BigInt(time) <= BigInt(previousTime)
         || coordinate.kind === "session_date" && previous?.kind === "session_date"
@@ -1056,7 +1087,7 @@ const investmentChartSchema = z.object({
   const forecast = chart.forecast
   if (forecast.state === "available") {
     if (BigInt(forecast.observedThroughUnixNanos) > cutoff
-      || BigInt(forecast.points[0].timeUnixNanos) <= BigInt(forecast.observedThroughUnixNanos)) {
+      || forecast.points[0] !== undefined && BigInt(forecast.points[0].timeUnixNanos) <= BigInt(forecast.observedThroughUnixNanos)) {
       context.addIssue({ code: "custom", path: ["forecast"],
         message: "The saved forecast endpoint or origin contradicts its evidence cutoff." })
     }
@@ -1068,15 +1099,7 @@ const investmentChartSchema = z.object({
         context.addIssue({ code: "custom", path: ["forecast", "origin"],
           message: "The original price does not match the saved forecast cutoff." })
       }
-      if (history.state === "available") {
-        const last = history.points.at(-1)!
-        const lastTime = last.coordinate.kind === "timestamp"
-          ? last.coordinate.timeUnixNanos : last.coordinate.sessionCloseUnixNanos
-        if (lastTime !== originTime || last.value !== origin.value) {
-          context.addIssue({ code: "custom", path: ["forecast", "origin"],
-            message: "The saved forecast origin does not match its final observed price." })
-        }
-      }
+
     }
   }
   const pattern = chart.pricePattern
@@ -1143,7 +1166,8 @@ export const investmentAnalysisSchema = z
     recommendation: recommendationSchema,
     horizon: horizonSchema,
     priceSummary: priceSummarySchema,
-    chart: investmentChartSchema,
+    chart: z.null(),
+    chartAvailable: z.boolean(),
     probabilities: savedProbabilitiesSchema,
     reasons: z.array(productTextSchema).min(1).max(32),
     risks: z.array(productTextSchema).max(32),
@@ -1653,6 +1677,8 @@ const savedScreenProductEnvelopeSchema = z
   })
   .strict()
 
+export type InvestmentChart = z.infer<typeof investmentChartSchema>
+
 export type InvestmentAnalysis = z.infer<typeof investmentAnalysisSchema>
 export type StudyQualification = z.infer<typeof studyQualificationSchema>
 export type InvestmentAnalysisLocator = z.infer<
@@ -1690,6 +1716,20 @@ export function parseSavedScreenProduct(
     throw new Error("This saved screen could not be opened.")
   }
   return parsed.data.data
+}
+
+export function parseInvestmentChart(result: ApplicationResult, expected: {
+  startUnixNanos?: string; endUnixNanos?: string; pointLimit: number; layer: InvestmentChart["viewport"]["layer"]
+}): InvestmentChart {
+  const parsed = investmentChartSchema.safeParse(result.data)
+  if (!parsed.success || result.metadata.returnedItems !== 1 || result.metadata.availableItems !== 1
+    || result.metadata.completeness !== "complete"
+    || parsed.data.viewport.startUnixNanos !== (expected.startUnixNanos ?? null)
+    || parsed.data.viewport.endUnixNanos !== (expected.endUnixNanos ?? null)
+    || parsed.data.viewport.pointLimit !== expected.pointLimit || parsed.data.viewport.layer !== expected.layer) {
+    throw new Error("This saved chart could not be opened.")
+  }
+  return parsed.data
 }
 
 export function parseInvestmentAnalysis(

@@ -9,8 +9,8 @@ use super::{
     FeatureLabelComponentInput,
 };
 use crate::{
-    CompleteMarketBarHistoryOutput, DatasetManifestRef, ObservationFamilyKey, PointInTimeCandidate,
-    Sha256Digest,
+    CompleteMarketBarHistoryCursor, CompleteMarketBarHistoryOutput, DatasetManifestRef,
+    ObservationFamilyKey, PointInTimeCandidate, Sha256Digest,
 };
 use market_squawk_domain::{
     CalendarDate, EvidenceDigest, HistoricalStudyBasis, MarketBarAdjustment, MarketBarObservation,
@@ -319,7 +319,120 @@ pub(super) struct NominalDailyExampleSource {
     pub(super) manifest: DatasetManifestRef,
 }
 
+/// Borrows one of the two sealed history representations for the same dataset validation.
+pub(super) enum DatasetHistory<'a> {
+    Memory(&'a CompleteMarketBarHistoryOutput),
+    Indexed(&'a CompleteMarketBarHistoryCursor),
+}
+impl DatasetHistory<'_> {
+    pub(super) fn selection(&self) -> &crate::CompleteMarketBarHistorySelection {
+        match self {
+            Self::Memory(history) => history.selection(),
+            Self::Indexed(history) => history.selection(),
+        }
+    }
+    pub(super) fn read_receipt(&self) -> &crate::CompleteMarketBarHistoryReadReceipt {
+        match self {
+            Self::Memory(history) => history.read_receipt(),
+            Self::Indexed(history) => history.read_receipt(),
+        }
+    }
+    fn native_sessions(&self) -> Option<&crate::RetainedHistoryNativeSessions> {
+        match self {
+            Self::Memory(history) => history.native_sessions(),
+            Self::Indexed(history) => history.native_sessions(),
+        }
+    }
+    pub(super) fn selected_bar(
+        &self,
+        family: &ObservationFamilyKey,
+    ) -> Result<MarketBarObservation, DatasetBuildError> {
+        let ObservationFamilyKey::MarketBar { effective, .. } = family else {
+            return Err(DatasetBuildError::ComponentEvidenceMismatch);
+        };
+        let bar = match self {
+            Self::Memory(history) => {
+                let index = if let Some(timestamp) = effective.exact_timestamp() {
+                    history
+                        .bars()
+                        .binary_search_by_key(&Some(timestamp), |bar| {
+                            bar.context().time().effective().exact_timestamp()
+                        })
+                } else if let Some(date) = effective.calendar_date_value() {
+                    history.bars().binary_search_by_key(&Some(date), |bar| {
+                        bar.time_semantics()
+                            .nominal_daily_date()
+                            .map(|value| value.date())
+                    })
+                } else {
+                    return Err(DatasetBuildError::ComponentEvidenceMismatch);
+                }
+                .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
+                history.bars()[index].clone()
+            }
+            Self::Indexed(history) => history
+                .bar_at_coordinate(effective)
+                .map_err(map_history_read_error)?
+                .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?,
+        };
+        let candidate = PointInTimeCandidate::new(
+            ResearchObservation::MarketBar(bar.clone()),
+            self.selection().pinned().manifest().clone(),
+        );
+        if candidate
+            .family_key()
+            .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?
+            != *family
+        {
+            return Err(DatasetBuildError::ComponentEvidenceMismatch);
+        }
+        Ok(bar)
+    }
+}
+
 impl CompleteMarketBarHistoryOutput {
+    /// Derives a retrospective dataset example from this sealed original history.
+    pub fn try_nominal_daily_dataset_example(
+        &self,
+        example_id: &str,
+        native_date: CalendarDate,
+        study: DatasetStudyPolicy,
+        components: Vec<FeatureLabelComponentInput>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<DatasetExample, DatasetBuildError> {
+        DatasetHistory::Memory(self).try_nominal_daily_dataset_example(
+            example_id,
+            native_date,
+            study,
+            components,
+            deadline,
+            cancellation,
+        )
+    }
+}
+impl CompleteMarketBarHistoryCursor {
+    /// Derives the same retrospective example by reading only its original indexed bars.
+    pub fn try_nominal_daily_dataset_example(
+        &self,
+        example_id: &str,
+        native_date: CalendarDate,
+        study: DatasetStudyPolicy,
+        components: Vec<FeatureLabelComponentInput>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<DatasetExample, DatasetBuildError> {
+        DatasetHistory::Indexed(self).try_nominal_daily_dataset_example(
+            example_id,
+            native_date,
+            study,
+            components,
+            deadline,
+            cancellation,
+        )
+    }
+}
+impl DatasetHistory<'_> {
     /// Derives a retrospective decision from an authentic date/session association. The provider
     /// observation retains its original date, availability and absent completion instant.
     pub fn try_nominal_daily_dataset_example(
@@ -367,9 +480,9 @@ impl CompleteMarketBarHistoryOutput {
             } else {
                 (right, left)
             };
-        let prior = self.nominal_session_row(prior)?;
+        let prior = self.nominal_session_row(&prior)?;
         let current_bar = current;
-        let current = self.nominal_session_row(current)?;
+        let current = self.nominal_session_row(&current_bar)?;
         if current.native_date != native_date {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         }
@@ -403,14 +516,14 @@ impl CompleteMarketBarHistoryOutput {
             let [selector] = label.selectors() else {
                 return Err(DatasetBuildError::ComponentEvidenceMismatch);
             };
-            Some(self.nominal_session_row(self.selected_nominal_bar(selector.family())?)?)
+            Some(self.nominal_session_row(&self.selected_nominal_bar(selector.family())?)?)
         } else {
             None
         };
         let source = self.nominal_source(prior, current, terminal)?;
         source
             .origin
-            .validate(current_bar, &source.manifest, study, target_at)?;
+            .validate(&current_bar, &source.manifest, study, target_at)?;
         check_control(deadline, cancellation)?;
         DatasetExample::from_nominal_daily(
             example_id,
@@ -466,34 +579,14 @@ impl CompleteMarketBarHistoryOutput {
     fn selected_nominal_bar(
         &self,
         family: &ObservationFamilyKey,
-    ) -> Result<&MarketBarObservation, DatasetBuildError> {
+    ) -> Result<MarketBarObservation, DatasetBuildError> {
         let ObservationFamilyKey::MarketBar { effective, .. } = family else {
             return Err(DatasetBuildError::ComponentEvidenceMismatch);
         };
-        let date = effective
+        effective
             .calendar_date_value()
             .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?;
-        let index = self
-            .bars()
-            .binary_search_by_key(&Some(date), |bar| {
-                bar.time_semantics()
-                    .nominal_daily_date()
-                    .map(|value| value.date())
-            })
-            .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
-        let bar = &self.bars()[index];
-        let candidate = PointInTimeCandidate::new(
-            ResearchObservation::MarketBar(bar.clone()),
-            self.selection().pinned().manifest().clone(),
-        );
-        if &candidate
-            .family_key()
-            .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?
-            != family
-        {
-            return Err(DatasetBuildError::ComponentEvidenceMismatch);
-        }
-        Ok(bar)
+        self.selected_bar(family)
     }
 
     fn nominal_session_row(
@@ -509,10 +602,10 @@ impl CompleteMarketBarHistoryOutput {
             .native_sessions()
             .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?
             .sessions();
-        let index = sessions
-            .binary_search_by_key(&native_date, |session| session.native_date())
-            .map_err(|_| DatasetBuildError::ComponentEvidenceMismatch)?;
-        let session = &sessions[index];
+        let session = sessions
+            .find_date(native_date)
+            .map_err(map_history_read_error)?
+            .ok_or(DatasetBuildError::ComponentEvidenceMismatch)?;
         if session.provider_timestamp().is_some()
             || session.provider_period().is_some()
             || !session.bar_present()
@@ -595,4 +688,16 @@ where
     T: Deserialize<'de>,
 {
     Option::deserialize(deserializer)
+}
+
+pub(super) fn map_history_read_error(error: crate::AnalyticalReadError) -> DatasetBuildError {
+    match error {
+        crate::AnalyticalReadError::Query(crate::query::QueryError::Cancelled) => {
+            DatasetBuildError::Cancelled
+        }
+        crate::AnalyticalReadError::Query(crate::query::QueryError::DeadlineExceeded) => {
+            DatasetBuildError::DeadlineExceeded
+        }
+        _ => DatasetBuildError::ComponentEvidenceMismatch,
+    }
 }

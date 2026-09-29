@@ -231,7 +231,7 @@ pub(super) fn select<'a>(
     })
 }
 
-fn admission(
+pub(super) fn admission(
     request: &PointInTimeRequest,
     candidate: &PointInTimeCandidate,
 ) -> (PointInTimeExclusionReasons, PointInTimeRevisionState) {
@@ -675,4 +675,151 @@ fn materialize_conflicts<'a>(
         });
     }
     Ok(conflicts)
+}
+
+#[cfg(test)]
+mod disk_regression {
+    use std::error::Error;
+    use std::num::NonZeroU32;
+    use std::time::{Duration, Instant};
+
+    use market_squawk_domain::{
+        AvailabilityEvidence, DataQuality, DigestAlgorithm, MacroObservation, PayloadHash,
+        PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+        ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
+        SourceId, SourceIdentifier, Timestamp,
+    };
+    use rust_decimal::Decimal;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::pit::{
+        PointInTimeCandidate, PointInTimeError, PointInTimeLimits, PointInTimePolicy,
+        PointInTimeRequest, PointInTimeRevisionMode, disk::CandidateStore,
+    };
+    use crate::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest};
+
+    #[test]
+    fn disk_batches_preserve_complete_revision_and_conflict_audits() -> Result<(), Box<dyn Error>> {
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from("pit-disk-regression")?,
+            1,
+            DatasetSchemaRegistry::local().canonical_research_observations()?,
+            Sha256Digest::new([1; 32]),
+        )?;
+        let make = |revision, value, available| -> Result<PointInTimeCandidate, Box<dyn Error>> {
+            let context = ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: SourceId::try_from("pit-disk")?,
+                    instrument_id: None,
+                    venue_id: None,
+                    source_identifier: SourceIdentifier::try_from("same-natural-family")?,
+                    source_timestamp: None,
+                    received_at: Timestamp::from_unix_nanos(1000),
+                    ingested_at: Timestamp::from_unix_nanos(1001),
+                    quality: DataQuality::OfficialDelayed,
+                    payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+                        DigestAlgorithm::Sha256,
+                        [7; 32],
+                    )),
+                    availability: AvailabilityEvidence::local_first_observed(
+                        Timestamp::from_unix_nanos(available),
+                    ),
+                })?,
+                ResearchTime::try_new_with_coordinates(
+                    ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(10)),
+                    None,
+                    RevisionNumber::new(revision)?,
+                    None,
+                )?,
+            )?;
+            Ok(PointInTimeCandidate::new(
+                ResearchObservation::Macro(MacroObservation::new(
+                    context,
+                    SourceIdentifier::try_from("series")?,
+                    Decimal::new(value, 0),
+                    SourceIdentifier::try_from("index")?,
+                )),
+                manifest.clone(),
+            ))
+        };
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // A duplicate and a lower revision cross append boundaries. A future conflicting
+        // payload must remain an exclusion and must not poison the eligible revision group.
+        let mut candidates = vec![
+            make(2, 20, 20)?,
+            make(1, 10, 20)?,
+            make(2, 20, 20)?,
+            make(2, 99, 200)?,
+        ];
+        let mut disk =
+            CandidateStore::for_test(1024 * 1024, 32 * 1024 * 1024, &cancellation, deadline)?;
+        for candidate in &candidates {
+            disk.append(
+                vec![candidate.observation().clone()],
+                candidate.source_manifest(),
+            )?;
+        }
+        let limits = PointInTimeLimits::try_new(100, 100, 100, 100, 1024 * 1024)?;
+        for mode in [
+            PointInTimeRevisionMode::LatestKnown,
+            PointInTimeRevisionMode::AllKnown,
+        ] {
+            let request = PointInTimeRequest::try_new(
+                PointInTimePolicy::try_new(NonZeroU32::MIN, mode)?,
+                Timestamp::from_unix_nanos(100),
+                None,
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(50)),
+                None,
+                limits,
+            )?;
+            let expected = super::select(&request, &candidates, &cancellation, deadline)
+                .map_err(|error| format!("{error:?}"))?;
+            // The consumer may retain no selected rows without changing the complete audit.
+            let filtered = disk.select(&request, |_| false)?;
+            assert!(filtered.records().is_empty());
+            assert_eq!(filtered.content_identity(), expected.content_identity());
+            assert_eq!(filtered.audit_identity(), expected.audit_identity());
+            let complete = disk.select(&request, |_| true)?;
+            assert_eq!(complete.records().len(), expected.records().len());
+            for (actual, expected) in complete.records().iter().zip(expected.records()) {
+                assert_eq!(actual.candidate(), expected.candidate());
+                assert_eq!(actual.evidence_identity(), expected.evidence_identity());
+            }
+        }
+        let conflict = make(2, 21, 20)?;
+        disk.append(
+            vec![conflict.observation().clone()],
+            conflict.source_manifest(),
+        )?;
+        candidates.push(conflict);
+        let request = PointInTimeRequest::try_new(
+            PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)?,
+            Timestamp::from_unix_nanos(100),
+            None,
+            ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(50)),
+            None,
+            limits,
+        )?;
+        let Err(PointInTimeError::RevisionConflicts { report }) =
+            super::select(&request, &candidates, &cancellation, deadline)
+        else {
+            return Err("expected pure conflict".into());
+        };
+        let Err(PointInTimeError::DiskRevisionConflicts {
+            counts,
+            audit_identity,
+        }) = disk.select(&request, |_| true)
+        else {
+            return Err("expected disk conflict".into());
+        };
+        assert_eq!(counts, report.conflict_counts());
+        assert_eq!(audit_identity, report.audit_identity());
+        cancellation.cancel();
+        assert!(matches!(
+            disk.select(&request, |_| true),
+            Err(PointInTimeError::Cancelled)
+        ));
+        Ok(())
+    }
 }

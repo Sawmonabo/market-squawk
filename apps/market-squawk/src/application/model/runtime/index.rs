@@ -1,6 +1,6 @@
 //! Canonical bounded model-admission index and immutable-coordinate conflict rules.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 use std::path::{Component, Path};
 use std::str::FromStr;
 use std::time::Duration;
@@ -8,74 +8,16 @@ use std::time::Duration;
 use market_squawk_data::{CatalogEndpointIdentity, FeatureDatasetProductContract, Sha256Digest};
 use market_squawk_domain::{ModelId, Timestamp};
 use market_squawk_modeling::{
-    BundleId, BundleMetadataRef, MAX_MODEL_REGISTRY_GENERATIONS, ModelOutputSemantics,
-    OnnxFallbackPolicy, OnnxModelPolicy, PythonDatasetAdmissionAuthority,
+    BundleId, BundleMetadataRef, ModelOutputSemantics, OnnxFallbackPolicy, OnnxModelPolicy,
+    PythonDatasetAdmissionAuthority,
 };
-use market_squawk_platform::LocalAuthorityStateStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-const INDEX_SCHEMA_VERSION: u16 = 1;
-const HARD_MAXIMUM_INDEX_GENERATIONS: usize = 256;
-const STANDARD_MAXIMUM_INDEX_GENERATIONS: usize = 64;
-const STANDARD_MAXIMUM_INDEX_BYTES: usize = 7 * 1024 * 1024;
 const MAXIMUM_AUTHORITY_BYTES: usize = 256 * 1024;
 const MAXIMUM_CANDIDATE_DIRECTORY_BYTES: usize = 512;
 const MAXIMUM_CANDIDATE_DIRECTORY_DEPTH: usize = 32;
-
-/// Count and encoded-byte ceilings for the durable model-admission index.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ModelRuntimeIndexLimits {
-    maximum_generations: NonZeroUsize,
-    maximum_index_bytes: NonZeroUsize,
-}
-
-impl ModelRuntimeIndexLimits {
-    /// Constructs limits no greater than the process registry and authority-store ceilings.
-    ///
-    /// # Errors
-    ///
-    /// Rejects more than 256 generations or an index larger than the two-copy store can commit.
-    pub fn try_new(
-        maximum_generations: NonZeroUsize,
-        maximum_index_bytes: NonZeroUsize,
-    ) -> Result<Self, ModelRuntimeIndexError> {
-        if maximum_generations.get() > HARD_MAXIMUM_INDEX_GENERATIONS
-            || maximum_generations.get() > MAX_MODEL_REGISTRY_GENERATIONS
-            || maximum_index_bytes.get() > LocalAuthorityStateStore::maximum_payload_bytes()
-        {
-            return Err(ModelRuntimeIndexError::InvalidLimits);
-        }
-        Ok(Self {
-            maximum_generations,
-            maximum_index_bytes,
-        })
-    }
-
-    /// Returns bounded local production defaults.
-    #[must_use]
-    pub const fn standard() -> Self {
-        Self {
-            maximum_generations: match NonZeroUsize::new(STANDARD_MAXIMUM_INDEX_GENERATIONS) {
-                Some(value) => value,
-                None => NonZeroUsize::MIN,
-            },
-            maximum_index_bytes: match NonZeroUsize::new(STANDARD_MAXIMUM_INDEX_BYTES) {
-                Some(value) => value,
-                None => NonZeroUsize::MIN,
-            },
-        }
-    }
-
-    pub(super) const fn maximum_generations(self) -> NonZeroUsize {
-        self.maximum_generations
-    }
-
-    pub(super) const fn maximum_index_bytes(self) -> NonZeroUsize {
-        self.maximum_index_bytes
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum StoredRuntimePolicy {
@@ -112,29 +54,48 @@ pub(super) struct TrainingJobBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct IndexAdmission {
-    pub(super) candidate_directory: Box<str>,
-    pub(super) metadata_path: Box<str>,
-    pub(super) metadata_sha256: Sha256Digest,
-    pub(super) authority_bytes: Box<[u8]>,
-    pub(super) authority_sha256: Sha256Digest,
-    pub(super) dataset_export_sha256: Sha256Digest,
-    pub(super) dataset_product_contract: FeatureDatasetProductContract,
-    pub(super) dataset_as_of: Timestamp,
-    pub(super) dataset_selection_sha256: Sha256Digest,
-    pub(super) catalog_identity: CatalogEndpointIdentity,
-    pub(super) model_id: ModelId,
-    pub(super) bundle_id: BundleId,
-    pub(super) bundle_version: NonZeroU64,
-    pub(super) artifact_sha256: Sha256Digest,
-    pub(super) training_run_sha256: Sha256Digest,
-    pub(super) training_environment_sha256: Sha256Digest,
-    pub(super) output_binding_sha256: Sha256Digest,
-    pub(super) runtime_policy: StoredRuntimePolicy,
+pub(in crate::application::model) struct IndexAdmission {
+    pub(in crate::application::model) candidate_directory: Box<str>,
+    pub(in crate::application::model) metadata_path: Box<str>,
+    pub(in crate::application::model) metadata_sha256: Sha256Digest,
+    pub(in crate::application::model) authority_bytes: Box<[u8]>,
+    pub(in crate::application::model) authority_sha256: Sha256Digest,
+    pub(in crate::application::model) dataset_export_sha256: Sha256Digest,
+    pub(in crate::application::model) dataset_product_contract: FeatureDatasetProductContract,
+    pub(in crate::application::model) dataset_as_of: Timestamp,
+    pub(in crate::application::model) dataset_selection_sha256: Sha256Digest,
+    pub(in crate::application::model) catalog_identity: CatalogEndpointIdentity,
+    pub(in crate::application::model) model_id: ModelId,
+    pub(in crate::application::model) bundle_id: BundleId,
+    pub(in crate::application::model) bundle_version: NonZeroU64,
+    pub(in crate::application::model) artifact_sha256: Sha256Digest,
+    pub(in crate::application::model) training_run_sha256: Sha256Digest,
+    pub(in crate::application::model) training_environment_sha256: Sha256Digest,
+    pub(in crate::application::model) output_binding_sha256: Sha256Digest,
+    pub(in crate::application::model) runtime_policy: StoredRuntimePolicy,
+    pub(in crate::application::model) product_summary: serde_json::Value,
     pub(super) training_job: Option<TrainingJobBinding>,
 }
 
 impl IndexAdmission {
+    pub(super) fn encode_record(&self) -> Result<Box<[u8]>, ModelRuntimeIndexError> {
+        self.validate()?;
+        serde_json::to_vec(&EntryView::from(self))
+            .map(Vec::into_boxed_slice)
+            .map_err(|_| ModelRuntimeIndexError::InvalidRecord)
+    }
+
+    pub(super) fn decode_record(bytes: &[u8]) -> Result<Self, ModelRuntimeIndexError> {
+        let wire: EntryWire =
+            serde_json::from_slice(bytes).map_err(|_| ModelRuntimeIndexError::InvalidRecord)?;
+        let entry = wire.into_admission()?;
+        entry.validate()?;
+        if entry.encode_record()?.as_ref() != bytes {
+            return Err(ModelRuntimeIndexError::InvalidRecord);
+        }
+        Ok(entry)
+    }
+
     pub(super) fn dataset_authority(
         &self,
     ) -> Result<PythonDatasetAdmissionAuthority, ModelRuntimeIndexError> {
@@ -153,6 +114,29 @@ impl IndexAdmission {
         BundleMetadataRef::try_new(&self.metadata_path, self.metadata_sha256)
             .map_err(|_| ModelRuntimeIndexError::InvalidRecord)?;
         self.dataset_authority()?;
+        let summary = self
+            .product_summary
+            .as_object()
+            .ok_or(ModelRuntimeIndexError::InvalidRecord)?;
+        if summary.len() != 3
+            || summary
+                .get("modelToken")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<uuid::Uuid>().ok())
+                .is_none()
+            || summary
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.is_empty() || value.len() > 1024)
+            || !matches!(
+                summary
+                    .get("evidenceState")
+                    .and_then(serde_json::Value::as_str),
+                Some("sufficient" | "limited" | "unavailable")
+            )
+        {
+            return Err(ModelRuntimeIndexError::InvalidRecord);
+        }
         if self.authority_bytes.is_empty()
             || self.authority_bytes.len() > MAXIMUM_AUTHORITY_BYTES
             || Sha256Digest::new(Sha256::digest(&self.authority_bytes).into())
@@ -214,155 +198,6 @@ impl IndexAdmission {
         hash.update(job.stderr_sha256);
         Some(Sha256Digest::new(hash.finalize().into()))
     }
-
-    fn coordinate(&self) -> (&BundleId, NonZeroU64) {
-        (&self.bundle_id, self.bundle_version)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ModelRuntimeIndex {
-    entries: Vec<IndexAdmission>,
-}
-
-impl ModelRuntimeIndex {
-    pub(super) const fn empty() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    pub(super) fn decode(
-        bytes: &[u8],
-        limits: ModelRuntimeIndexLimits,
-    ) -> Result<Self, ModelRuntimeIndexError> {
-        validate_limits(limits)?;
-        if bytes.len() > limits.maximum_index_bytes.get() {
-            return Err(ModelRuntimeIndexError::CorruptIndex);
-        }
-        let wire: IndexWire =
-            serde_json::from_slice(bytes).map_err(|_| ModelRuntimeIndexError::CorruptIndex)?;
-        if wire.schema_version != INDEX_SCHEMA_VERSION
-            || wire.entries.len() > limits.maximum_generations.get()
-        {
-            return Err(ModelRuntimeIndexError::CorruptIndex);
-        }
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(wire.entries.len())
-            .map_err(|_| ModelRuntimeIndexError::ResourceExhausted)?;
-        for entry in wire.entries {
-            let admission = entry.into_admission()?;
-            admission.validate()?;
-            entries.push(admission);
-        }
-        if entries
-            .windows(2)
-            .any(|pair| pair[0].coordinate() >= pair[1].coordinate())
-            || has_series_conflict(&entries)
-        {
-            return Err(ModelRuntimeIndexError::CorruptIndex);
-        }
-        let index = Self { entries };
-        if index
-            .encode(limits)
-            .map_err(|_| ModelRuntimeIndexError::CorruptIndex)?
-            != bytes
-        {
-            return Err(ModelRuntimeIndexError::CorruptIndex);
-        }
-        Ok(index)
-    }
-
-    pub(super) fn encode(
-        &self,
-        limits: ModelRuntimeIndexLimits,
-    ) -> Result<Vec<u8>, ModelRuntimeIndexError> {
-        validate_limits(limits)?;
-        if self.entries.len() > limits.maximum_generations.get()
-            || has_series_conflict(&self.entries)
-        {
-            return Err(ModelRuntimeIndexError::ResourceExhausted);
-        }
-        for entry in &self.entries {
-            entry.validate()?;
-        }
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.entries.len())
-            .map_err(|_| ModelRuntimeIndexError::ResourceExhausted)?;
-        entries.extend(self.entries.iter().map(EntryView::from));
-        let bytes = serde_json::to_vec(&IndexView {
-            schema_version: INDEX_SCHEMA_VERSION,
-            entries,
-        })
-        .map_err(|_| ModelRuntimeIndexError::CorruptIndex)?;
-        if bytes.len() > limits.maximum_index_bytes.get()
-            || bytes.len() > LocalAuthorityStateStore::maximum_payload_bytes()
-        {
-            return Err(ModelRuntimeIndexError::ResourceExhausted);
-        }
-        Ok(bytes)
-    }
-
-    pub(super) fn try_insert(
-        &mut self,
-        admission: IndexAdmission,
-        limits: ModelRuntimeIndexLimits,
-    ) -> Result<bool, ModelRuntimeIndexError> {
-        validate_limits(limits)?;
-        admission.validate()?;
-        match self
-            .entries
-            .binary_search_by(|entry| entry.coordinate().cmp(&admission.coordinate()))
-        {
-            Ok(position) if self.entries[position] == admission => return Ok(false),
-            Ok(_) => return Err(ModelRuntimeIndexError::ImmutableConflict),
-            Err(_) if self.entries.len() >= limits.maximum_generations.get() => {
-                return Err(ModelRuntimeIndexError::ResourceExhausted);
-            }
-            Err(_) => {}
-        }
-        if self.entries.iter().any(|entry| {
-            (entry.bundle_id == admission.bundle_id && entry.model_id != admission.model_id)
-                || (entry.model_id == admission.model_id && entry.bundle_id != admission.bundle_id)
-                || entry.candidate_directory == admission.candidate_directory
-        }) {
-            return Err(ModelRuntimeIndexError::ImmutableConflict);
-        }
-        let position = self
-            .entries
-            .binary_search_by(|entry| entry.coordinate().cmp(&admission.coordinate()))
-            .unwrap_or_else(|position| position);
-        self.entries
-            .try_reserve_exact(1)
-            .map_err(|_| ModelRuntimeIndexError::ResourceExhausted)?;
-        self.entries.insert(position, admission);
-        if let Err(error) = self.encode(limits) {
-            self.entries.remove(position);
-            return Err(error);
-        }
-        Ok(true)
-    }
-
-    pub(super) fn entries(&self) -> &[IndexAdmission] {
-        &self.entries
-    }
-}
-
-fn validate_limits(limits: ModelRuntimeIndexLimits) -> Result<(), ModelRuntimeIndexError> {
-    ModelRuntimeIndexLimits::try_new(limits.maximum_generations, limits.maximum_index_bytes)
-        .map(|_| ())
-}
-
-fn has_series_conflict(entries: &[IndexAdmission]) -> bool {
-    entries.iter().enumerate().any(|(position, entry)| {
-        entries[position + 1..].iter().any(|other| {
-            (entry.bundle_id == other.bundle_id && entry.model_id != other.model_id)
-                || (entry.model_id == other.model_id && entry.bundle_id != other.bundle_id)
-                || entry.candidate_directory == other.candidate_directory
-        })
-    })
 }
 
 pub(super) fn validate_candidate_directory(value: &str) -> Result<(), ModelRuntimeIndexError> {
@@ -399,13 +234,6 @@ pub(super) fn validate_candidate_directory(value: &str) -> Result<(), ModelRunti
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IndexView<'a> {
-    schema_version: u16,
-    entries: Vec<EntryView<'a>>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct EntryView<'a> {
     candidate_directory: &'a str,
     metadata_path: &'a str,
@@ -426,6 +254,7 @@ struct EntryView<'a> {
     output_binding_sha256: String,
     runtime_policy: RuntimePolicyView<'a>,
     training_job: Option<&'a TrainingJobBinding>,
+    product_summary: &'a serde_json::Value,
 }
 
 impl<'a> From<&'a IndexAdmission> for EntryView<'a> {
@@ -450,6 +279,7 @@ impl<'a> From<&'a IndexAdmission> for EntryView<'a> {
             output_binding_sha256: encode_hex(value.output_binding_sha256.bytes()),
             runtime_policy: RuntimePolicyView::from(&value.runtime_policy),
             training_job: value.training_job.as_ref(),
+            product_summary: &value.product_summary,
         }
     }
 }
@@ -464,6 +294,7 @@ enum RuntimePolicyView<'a> {
         input_shape: &'a [usize],
         output_shape: &'a [usize],
         output_semantics: &'static str,
+        forecast_horizons: Option<&'a [u32]>,
         inference_deadline_nanos: u64,
         fallback: &'static str,
         policy_sha256: String,
@@ -486,19 +317,13 @@ impl<'a> From<&'a StoredRuntimePolicy> for RuntimePolicyView<'a> {
                     ModelOutputSemantics::Regression => "regression",
                     ModelOutputSemantics::BinaryProbability => "binary_probability",
                 },
+                forecast_horizons: policy.forecast_horizons(),
                 inference_deadline_nanos: *inference_deadline_nanos,
                 fallback: "no_action",
                 policy_sha256: encode_hex(policy.policy_digest()),
             },
         }
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct IndexWire {
-    schema_version: u16,
-    entries: Vec<EntryWire>,
 }
 
 #[derive(Deserialize)]
@@ -524,6 +349,7 @@ struct EntryWire {
     runtime_policy: RuntimePolicyWire,
     #[serde(deserialize_with = "Option::deserialize")]
     training_job: Option<TrainingJobBinding>,
+    product_summary: serde_json::Value,
 }
 
 impl EntryWire {
@@ -562,6 +388,7 @@ impl EntryWire {
             output_binding_sha256: Sha256Digest::new(decode_hex(&self.output_binding_sha256)?),
             runtime_policy: self.runtime_policy.into_policy(artifact_sha256)?,
             training_job: self.training_job,
+            product_summary: self.product_summary,
         })
     }
 }
@@ -576,6 +403,8 @@ enum RuntimePolicyWire {
         input_shape: Vec<usize>,
         output_shape: Vec<usize>,
         output_semantics: String,
+        #[serde(deserialize_with = "Option::deserialize")]
+        forecast_horizons: Option<Vec<u32>>,
         inference_deadline_nanos: u64,
         fallback: String,
         policy_sha256: String,
@@ -595,6 +424,7 @@ impl RuntimePolicyWire {
                 input_shape,
                 output_shape,
                 output_semantics,
+                forecast_horizons,
                 inference_deadline_nanos,
                 fallback,
                 policy_sha256,
@@ -605,8 +435,17 @@ impl RuntimePolicyWire {
                     return Err(ModelRuntimeIndexError::InvalidRecord);
                 }
                 let deadline = Duration::from_nanos(inference_deadline_nanos);
-                let policy = match output_semantics.as_str() {
-                    "regression" => OnnxModelPolicy::try_new_with_output_semantics(
+                let policy = match (output_semantics.as_str(), forecast_horizons.as_deref()) {
+                    ("regression", Some(horizons)) => OnnxModelPolicy::try_new_forecast(
+                        artifact_sha256,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        horizons,
+                        deadline,
+                        OnnxFallbackPolicy::NoAction,
+                    ),
+                    ("regression", None) => OnnxModelPolicy::try_new_with_output_semantics(
                         artifact_sha256,
                         opset,
                         &input_shape,
@@ -615,7 +454,7 @@ impl RuntimePolicyWire {
                         deadline,
                         OnnxFallbackPolicy::NoAction,
                     ),
-                    "binary_probability" => OnnxModelPolicy::try_new_with_output_semantics(
+                    ("binary_probability", None) => OnnxModelPolicy::try_new_with_output_semantics(
                         artifact_sha256,
                         opset,
                         &input_shape,
@@ -689,18 +528,12 @@ const fn nibble(value: u8) -> Option<u8> {
 /// Durable model-index validation or immutable admission failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelRuntimeIndexError {
-    /// Configured bounds exceed fixed process or persistence ceilings.
-    #[error("model runtime index limits are invalid")]
-    InvalidLimits,
     /// Persisted bytes are noncanonical, corrupt, or internally inconsistent.
     #[error("model runtime index is corrupt")]
     CorruptIndex,
     /// One record contains an invalid path, identity, digest, authority, or runtime policy.
     #[error("model runtime index record is invalid")]
     InvalidRecord,
-    /// An immutable coordinate, model series, bundle series, or candidate root was reused.
-    #[error("model runtime immutable admission conflicts")]
-    ImmutableConflict,
     /// Count, encoded-byte, or allocation bounds were exhausted.
     #[error("model runtime index resource ceiling was exceeded")]
     ResourceExhausted,
@@ -739,29 +572,148 @@ impl IndexAdmission {
             output_binding_sha256: Sha256Digest::new([10; 32]),
             runtime_policy: StoredRuntimePolicy::Native,
             training_job: None,
+            product_summary: serde_json::json!({"modelToken":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","label":"fixture","evidenceState":"limited"}),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexAdmission, ModelRuntimeIndex, ModelRuntimeIndexLimits};
+    use super::IndexAdmission;
 
     #[test]
-    fn model_runtime_index_replay_is_canonical_and_conflicts_fail_closed()
+    fn model_admission_record_round_trip_rejects_noncanonical_and_changed_summary()
     -> Result<(), Box<dyn std::error::Error>> {
-        let limits = ModelRuntimeIndexLimits::standard();
         let first = IndexAdmission::fixture(1)?;
-        let conflict = IndexAdmission::fixture(2)?;
-        let mut index = ModelRuntimeIndex::empty();
+        let encoded = first.encode_record()?;
+        let recovered = IndexAdmission::decode_record(&encoded)?;
+        assert_eq!(recovered, first);
+        let mut noncanonical = encoded.to_vec();
+        noncanonical.push(b' ');
+        assert!(IndexAdmission::decode_record(&noncanonical).is_err());
+        let mut invalid = first;
+        invalid.product_summary["evidenceState"] = serde_json::json!("unsupported");
+        assert!(invalid.encode_record().is_err());
 
-        assert_eq!(index.try_insert(first.clone(), limits), Ok(true));
-        assert_eq!(index.try_insert(first, limits), Ok(false));
-        assert!(index.try_insert(conflict, limits).is_err());
-
-        let encoded = index.encode(limits)?;
-        let recovered = ModelRuntimeIndex::decode(&encoded, limits)?;
-        assert_eq!(recovered.encode(limits)?, encoded);
+        // Canonical inventory durability, not candidate/weight admission: reuse this
+        // existing opaque model-owner fixture through the real sole catalog authority.
+        use market_squawk_data::{
+            AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
+            CatalogLimit, CatalogResultLimits, ModelInventoryError, ModelInventoryRecord,
+            ObjectStoreConfig,
+        };
+        use market_squawk_platform::LocalPaths;
+        use std::{num::NonZeroU64, time::Duration};
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path().join("model-inventory"))?;
+        let config = CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(250),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?;
+        let objects = ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?;
+        let service = AnalyticalDataService::initialize(
+            CatalogAuthority::open(config.clone())?,
+            AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+            paths.artifacts()?.clone(),
+            objects,
+        )?;
+        let inventory = service.model_inventory();
+        let record = |version: u8| -> Result<ModelInventoryRecord, Box<dyn std::error::Error>> {
+            let mut admission = IndexAdmission::fixture(version)?;
+            admission.bundle_version =
+                NonZeroU64::new(u64::from(version)).ok_or("nonzero version")?;
+            let model_token = uuid::Uuid::from_bytes([version; 16]);
+            admission.product_summary["modelToken"] = serde_json::json!(model_token);
+            Ok(ModelInventoryRecord {
+                model_id: admission.model_id,
+                model_token,
+                bundle_id: admission.bundle_id.as_str().to_owned(),
+                bundle_version: admission.bundle_version,
+                candidate_directory: admission.candidate_directory.to_string(),
+                record: admission.encode_record()?,
+            })
+        };
+        for version in 1..=65 {
+            let (head, inserted) = inventory.publish(&record(version)?)?;
+            assert!(inserted);
+            assert_eq!(head.sequence, u64::from(version));
+        }
+        let fence = inventory.head()?;
+        let first_page = inventory.page(fence, 0)?;
+        assert_eq!(first_page.len(), 32);
+        for (version, entry) in (1..=32).zip(&first_page) {
+            assert_eq!(entry.admission, record(version)?);
+        }
+        let continuation = first_page
+            .last()
+            .ok_or("nonempty first page")?
+            .head
+            .sequence;
+        let (current_head, inserted) = inventory.publish(&record(66)?)?;
+        assert!(inserted);
+        assert_eq!(current_head.sequence, 66);
+        // Drop every capability owning the writer before reopening this same physical catalog.
+        drop(inventory);
+        drop(service);
+        let reopened = AnalyticalDataService::open(
+            CatalogAuthority::open(config)?,
+            AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+            paths.artifacts()?.clone(),
+            objects,
+        )?;
+        let inventory = reopened.model_inventory();
+        assert_eq!(inventory.head()?, current_head);
+        inventory.verify(current_head)?;
+        inventory.verify(fence)?;
+        let second_page = inventory.page(fence, continuation)?;
+        assert_eq!(second_page.len(), 32);
+        for (version, entry) in (33..=64).zip(&second_page) {
+            assert_eq!(entry.admission, record(version)?);
+        }
+        let last_page = inventory.page(
+            fence,
+            second_page
+                .last()
+                .ok_or("nonempty second page")?
+                .head
+                .sequence,
+        )?;
+        assert_eq!(last_page.len(), 1);
+        assert_eq!(last_page[0].admission, record(65)?);
+        assert!(inventory.page(fence, 65)?.is_empty());
+        let unseen = record(66)?;
+        assert!(
+            inventory
+                .get(fence, &unseen.bundle_id, unseen.bundle_version)?
+                .is_none()
+        );
+        assert_eq!(
+            inventory
+                .by_token(current_head, unseen.model_token)?
+                .ok_or("exact new token")?
+                .admission,
+            unseen
+        );
+        let retained = record(65)?;
+        assert_eq!(inventory.publish(&retained)?, (current_head, false));
+        let mut changed = retained.clone();
+        let mut admission = IndexAdmission::decode_record(&changed.record)?;
+        admission.product_summary["label"] = serde_json::json!("changed immutable row");
+        changed.record = admission.encode_record()?;
+        assert!(matches!(
+            inventory.publish(&changed),
+            Err(ModelInventoryError::Conflict)
+        ));
+        assert_eq!(inventory.head()?, current_head);
+        assert_eq!(
+            inventory
+                .get(fence, &retained.bundle_id, retained.bundle_version)?
+                .ok_or("exact retained version")?
+                .admission,
+            retained
+        );
         Ok(())
     }
 }

@@ -1,8 +1,8 @@
 //! Single per-user installed-service composition and lifecycle authority.
 
 mod analysis;
-mod analytical_workflow;
 mod analytical_profile;
+mod analytical_workflow;
 mod backtest_preparation;
 mod bootstrap;
 #[cfg(debug_assertions)]
@@ -13,7 +13,6 @@ mod forecast_preparation;
 mod governance;
 mod governance_persistence;
 mod historical_study;
-mod probability;
 mod jobs;
 mod lifecycle;
 mod logging;
@@ -28,6 +27,7 @@ mod operations_bootstrap;
 mod operations_composition;
 mod portfolio_analysis;
 mod portfolio_import;
+mod probability;
 mod provider_credential_import;
 mod provider_setup;
 mod ready_admission;
@@ -264,7 +264,7 @@ impl InstalledServiceConnector {
         if timeout.is_zero() || timeout > MAXIMUM_CLIENT_TIMEOUT {
             return Err(InstalledServiceError::InvalidComposition);
         }
-        let structure = JsonStructureLimits::try_new(64, 64 * 1024, 10_000, 2_000)
+        let structure = JsonStructureLimits::try_new(64, 128 * 1024, 10_000, 2_000)
             .map_err(|_error| InstalledServiceError::InvalidComposition)?;
         let admitted = ready_admission::request(&self.paths, client, timeout)?;
         runtime::connect_admitted_client(admitted, origin, structure, RESPONSE_BODY_BYTES, timeout)
@@ -985,11 +985,18 @@ impl InstalledService {
         let _workflow_cancel_on_drop = analytical_workflow.cancellation_on_drop();
         // Startup failure still traverses admission, transport, task, job, application,
         // repository and credential shutdown; no fallible early exit owns live authorities.
-        let workflow_start = runtime.registration(NamedClient::Desktop).and_then(|registration| {
-            let origin = RequestOrigin::try_new(runtime.runtime().workspace_id().as_uuid(), registration.client_id().as_uuid())
+        let workflow_start = runtime
+            .registration(NamedClient::Desktop)
+            .and_then(|registration| {
+                let origin = RequestOrigin::try_new(
+                    runtime.runtime().workspace_id().as_uuid(),
+                    registration.client_id().as_uuid(),
+                )
                 .map_err(|_| InstalledServiceError::InvalidComposition)?;
-            analytical_workflow.launch(origin).map_err(|_| InstalledServiceError::CompositionStage("analytical workflow startup"))
-        });
+                analytical_workflow.launch(origin).map_err(|_| {
+                    InstalledServiceError::CompositionStage("analytical workflow startup")
+                })
+            });
         let transport_cancellation = CancellationToken::new();
         let mut serving = Box::pin(server.run_until(
             transport_cancellation.clone(),
@@ -1003,21 +1010,23 @@ impl InstalledService {
             completed_transport,
         ) = if workflow_start.is_err() {
             (None, false, false, None)
-        } else { tokio::select! {
-            biased;
-            expected_next = lifecycle.wait_for_restart() => {
-                (Some(expected_next), false, false, None)
+        } else {
+            tokio::select! {
+                biased;
+                expected_next = lifecycle.wait_for_restart() => {
+                    (Some(expected_next), false, false, None)
+                }
+                () = cancellation.cancelled() => {
+                    (None, false, false, None)
+                }
+                result = &mut serving => {
+                    (None, true, false, Some(result.is_ok()))
+                }
+                () = admission.failed() => {
+                    (None, false, true, None)
+                }
             }
-            () = cancellation.cancelled() => {
-                (None, false, false, None)
-            }
-            result = &mut serving => {
-                (None, true, false, Some(result.is_ok()))
-            }
-            () = admission.failed() => {
-                (None, false, true, None)
-            }
-        }};
+        };
         let admission_retired = admission.shutdown().await;
         transport_cancellation.cancel();
         let transport = match completed_transport {
@@ -1148,10 +1157,10 @@ async fn compose_transport(
         workspace_selector,
         workspace_placement,
     } = composition;
-    let structure = JsonStructureLimits::try_new(64, 64 * 1024, 10_000, 2_000)
+    let structure = JsonStructureLimits::try_new(64, 128 * 1024, 10_000, 2_000)
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let service_limits =
-        ServiceLimits::try_new(64 * 1024, 1_000, RESPONSE_BODY_BYTES, 1_000_000, structure)
+        ServiceLimits::try_new(256 * 1024, 1_000, RESPONSE_BODY_BYTES, 1_000_000, structure)
             .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let router_limits = RuntimeRouterLimits::try_new(
         REQUEST_BODY_BYTES,
@@ -1272,7 +1281,9 @@ async fn compose_transport(
     );
     let analytical_workflow = Arc::clone(&services.analytical_workflow);
     let workflow_services: Arc<dyn market_squawk_services::ToolServices> = services.clone();
-    analytical_workflow.bind(Arc::downgrade(&workflow_services)).map_err(|_|InstalledServiceError::CompositionStage("analytical workflow binding"))?;
+    analytical_workflow
+        .bind(Arc::downgrade(&workflow_services))
+        .map_err(|_| InstalledServiceError::CompositionStage("analytical workflow binding"))?;
     drop(workflow_services);
     let recovery_deadline = Instant::now()
         .checked_add(CLIENT_TIMEOUT)
