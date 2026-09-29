@@ -492,6 +492,8 @@ transaction pages after restart plus a later import; its holdings/exposure/compa
 passed. Native Desktop library compilation and `git diff --check` passed. Local evidence is retained under
 `.agents/tmp/v1-first-stock/portfolio-transactions-*.log`. No extra test target, review round, CI gate,
 live/installed completion or resource measurement is claimed.
+Source checkpoint `bcce0161692e50d7802d98bfeed03cc3cafa6406` is pushed to origin and recorded in
+[PR #43 delivery evidence](https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5889453208).
 
 The read-only financial trace is complete and owns no files. Next sequence is explicit snapshot-bound
 stress assumptions, corrected rebalance proposals, then position impact, preserving all three required
