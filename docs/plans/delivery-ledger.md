@@ -1,36 +1,52 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — plans reviewed, implementation paused — 2026-09-29
+## Current execution — first-stock wave resumed — 2026-09-29
 
-The [owner-test goal](v1-owner-test-goal.md) is the tracked scope and finite acceptance contract.
-Completion planning and four fresh, disjoint senior GPT-6 Astra High reviews are complete.
-Two Important and two Minor planning findings were corrected and explicitly closed by their
-reviewers; all four approved the final document hashes recorded in the
-[plan review report](../reports/2026-09-29-v1-completion-plan-review.md). Product implementation,
-builds, tests, provider calls and measurements remain paused until explicit resume.
-Author/reviewer assignments are closed; no implementation files are assigned.
+The owner resumed the registered goal after reviewed planning. The [owner-test goal](v1-owner-test-goal.md)
+remains the acceptance contract; the [reviewed first-stock wave](v1-first-stock-wave.md) supplies
+bounded tasks. Source refresh at `21b7f2254743f92d4e5ebe756916fdd8701b67b5` found only documentation
+changes since reviewed base `523da3b9`; product baseline remains `9543ed35`. Planning approval is
+recorded in the [independent review](../reports/2026-09-29-v1-completion-plan-review.md).
 
-Reviewed plans were committed and pushed at `d9b87115d9cccee1a81466abeae803ff3dc525a6`.
-The owner subsequently authorized direct plan references in the tracked goal and local goal
-attachment. Those references preserve the existing scope and pause; they do not resume execution.
+One primary worktree on `feature/v1-installed-product-experience`; no new branches/worktrees.
+No Cargo/rustc build was active at resume; free disk was 126 GiB. Rust target was deliberately
+cleaned. Root alone schedules one-job, nonincremental builds and relevant critical checks. No
+ordinary-task CI, release gate or whole-app RAM measurement. Sessions and recovery backups stay intact.
 
-The latest **product-code checkpoint** is `9543ed357349a83715079ba0720b0f4789f9da58`, pushed to
-`feature/v1-installed-product-experience` and recorded in draft PR #43. This documentation
-checkpoint changes no application code and does not inherit or claim fresh exact-head release
-approval. Three local branches, three origin heads and one primary worktree remain, with no linked
-worktrees. Main/release are unchanged. The earlier documentation checkpoint preserved the parent-workspace troubleshooting note;
-sessions and recovery backups remain intact.
-
-| Outcome | Current owner/status | Next dependency and evidence |
+| Task / concrete outcome | Current owner and exclusive files | State / next dependency / critical evidence |
 | --- | --- | --- |
-| Resource processing remediation | Implemented and pushed at `9543ed35`; implementation assignments closed | Focused evidence below; complete installed workflows and final measurement remain unproven |
-| Owner-test goal and instruction alignment | Completed and pushed at `523da3b9` | Current scope and ownership supersede historical execution instructions |
-| Completion plan and first-stock wave | Written and independently approved; all four valid findings closed | [Completion plan](v1-workflow-completion-plan.md), [first-stock wave](v1-first-stock-wave.md), [exact review evidence](../reports/2026-09-29-v1-completion-plan-review.md); owner review and explicit implementation resume |
-| First complete stock analysis and saved-result restart | Pending explicit resume; no implementation files assigned | Brief refresh of the seven acceptance items against current source, then exact disjoint provider/financial/Desktop assignments |
+| S0/P1: actual stock/benchmark/fiscal readiness | Sol High readiness handoff complete; lead owns runtime/setup scheduling. `apps/market-squawk/src/application/research/corporate_actions/preflight/history.rs` remains unchanged and unassigned until a demonstrated failure | Both retained workspaces have no admitted stock/benchmark/fiscal inputs or confirmed account/allocation setup. Retained model runtime receipts are stale. Local read-only findings and source-defined commands: `.agents/tmp/v1-first-stock/readiness.md`. Root must start a current service before acquisition proof. |
+| F1: valid absent forecast/current-market publication | Astra High handoff integrated; ownership released | Implemented and critically verified in `c33065b2`. One existing-library regression passes all three forecast/market combinations through actual canonical request admission, preserves independent evidence, checks binding agreement and begins with the real market-token producer. |
+| R1: admitted lookup destination | Lead integration complete; ownership released | Implemented in `c33065b2`: existing point-in-time market-reference search and exact-ID pinning return canonical selection tokens through the shared contract. No whole-universe load or execution-definition prerequisite. Compiled and covered at the Desktop destination seam; live catalog lookup remains part of P1/I1 proof. |
+| R1 follow-through: admit actual Markets tokens into analysis | Lead integration complete; ownership released | Corrected in `c33065b2`: workflow admission, command schema and shared schema validator use the actual 32-character market-token suffix. The critical regression uses the real producer and registers application capabilities; existing schema assertions pass. Obsolete hyphenated format removed in place. |
+| U1: requested investment and truthful profile availability | Sol High handoff integrated; ownership released | Implemented in `c33065b2`: backend-token routing, exact requested detail, stale-selection recovery and actual profile availability. Final existing lookup/market critical checks passed (2 selected tests); TypeScript passed. These are fixture checks, not live Desktop proof. |
+| I1: real saved brief and shared-service restart | Lead; existing lifecycle/persistence tests only if an uncovered critical seam requires extension | Depends on usable P1 inputs and F1/R1/U1 integration. Actual positive stock result, immutable saved readback and restart are not yet proved. |
 
-On resume, update this single table with bounded outcomes, exact file ownership, dependencies,
-critical evidence, blockers and pushed commits. Distinguish missing implementation from implemented
-but unproven behavior. Do not restart completed resource work or an open-ended infrastructure audit.
+Lead reserves all other shared contracts/composition/transport/manifests/lockfiles, Git and test
+scheduling. Additional file ownership requires an explicit ledger assignment before edits. Inspect
+actual handoffs, integrate producer/consumer slices, verify, commit/push and then release ownership.
+The token follow-through also assigns `crates/market-squawk-services/src/output_schema.rs` to the
+lead: its existing closed-schema validator carries the same obsolete hyphenated token pattern.
+Update that pattern and its existing critical admission assertions together; no new test harness.
+Current blockers: no admitted first-stock inputs or confirmed account/allocation; retained model
+runtime is stale. Next barrier: start the current service and acquire actual inputs through native
+setup. Existing model-less startup can support
+connection setup because neither workspace has durable model admissions; positive forecasting still
+requires a refreshed model runtime. No runtime-admission bypass is authorized.
+Source checkpoint `c33065b2` integrates F1/R1/U1 and the token follow-through. Both shared Rust
+checks passed with one compiler job: `publication_action_references_follow_forecast_and_market_admission`
+(1 selected test, including application capability registration) and
+`operation_schema_must_be_specific_and_runtime_validation_is_closed` (1 selected test). Existing
+Desktop lookup/market checks passed (2 selected tests) and TypeScript passed. `git diff --check`
+passed. Logs are retained locally under `.agents/tmp/v1-first-stock/`; the test names and scope above
+are the durable evidence summary. No full CI, release gate, RAM measurement, live provider admission,
+positive forecast, saved-Brief restart or installed-journey completion is claimed.
+
+Root now owns the existing service/CLI/helper build and normal development workspace setup
+(`.market-squawk/development-installation`, data `.market-squawk/development`). No source edits or
+additional worker dispatch are assigned during that startup attempt. Build scheduling stays serial,
+one-job and nonincremental. Stale model-runtime binaries are not used as current proof.
+
 All earlier active/current tables and local wave handoffs are historical, not live assignments.
 
 ## Resource processing checkpoint — 2026-09-29
