@@ -1,5 +1,37 @@
 # Branch and worktree reconciliation audit — 2026-09-23
 
+## Final branch retirement after the integrated V1 checkpoint
+
+The combined source API and consumers are committed and pushed together at
+`ff16c370c90d930979e3b69b4f641f19ede43302`. The remaining historical branches
+were compared by required behavior, not treated as patch-equivalent. Useful
+behavior is incorporated in the current implementation; replaced public
+attestation, synchronous publication, setup-website and older proposal paths
+were explicitly retired rather than restored by wholesale cherry-picking.
+
+The lead independently verified all 26 remaining stale refs against the
+complete September 7 recovery bundle, its SHA-256
+`0b8cba3838cb3c0c7bc4aa0fe63212f1a57264f406ef0b780e15ee30ce020ee6`,
+current committed replacement hashes, live origin heads, sole worktree and
+open PRs. Both divergent Alpaca tips were checked separately. The 11 origin
+heads were deleted atomically with exact expected-head leases, followed by
+the 15 exact-checked local labels and remote-tracking pruning.
+
+The removed local branches were Census's pre-facade checkpoint; Codex's
+Alpaca shutdown, common-seal integration and Schwab handoff; and the feature
+branches for Alpaca identity, BEA, BLS, Census, Coinbase identity, current-market
+attestation, IEX HIST, Kraken handoff, Kraken identity, opportunities and Schwab.
+All matching live origin heads were removed. The five incorporated Dependabot
+updates and their closed PRs are recorded below; no bot branch remains.
+
+Verified result: **3 local branches, 3 live origin branches, 1 primary
+worktree and zero linked worktrees**. Only `main`,
+`release/market-squawk-v0.1.0` and `feature/v1-installed-product-experience`
+remain. Main and release were unchanged; no merge or public release occurred.
+The original session and all independent recovery backups remain intact.
+The dated counts below are historical. Repository reconciliation is complete;
+complete installed V1 product acceptance remains open.
+
 ## September 29 subsequent worktree retirement
 
 After the dependency checkpoint below, two obsolete archival branch labels,

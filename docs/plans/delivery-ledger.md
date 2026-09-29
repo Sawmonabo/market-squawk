@@ -3,28 +3,30 @@
 ## Current integration and cleanup barrier — 2026-09-29
 
 The active target is `feature/v1-installed-product-experience`. This combined
-source checkpoint follows pushed base `52f4f4a5167a0eb046aa018d40f64929210dd5e6`;
-its exact commit is recorded in PR #43 delivery evidence. Dependency checkpoint `a7987440`
+source checkpoint is committed and pushed at `ff16c370c90d930979e3b69b4f641f19ede43302`;
+PR #43 records its focused verification and remaining acceptance gaps. Dependency checkpoint `a7987440`
 incorporates futures-util 0.3.34, async-trait 0.1.92, rust_decimal 1.43.0,
 clap 4.6.7 and uuid 1.26.1. The five corresponding Dependabot PRs are closed
 and their origin branches are absent. Main and release remain untouched.
 
-Fresh inventory is **18 local branches, 14 origin heads and one local
-worktree: the V1 target**. All linked worktrees have been retired. Alpaca and Kraken worktrees were retired after exact
-source and independent-backup comparison; their branch references remain. Census and Schwab checkouts were also removed
+Fresh inventory is **3 local branches, 3 origin heads and one primary
+worktree: the V1 target; zero linked worktrees**. The only remaining branches
+are V1, main and release. All stale Codex and provider branches are retired.
+Alpaca and Kraken worktrees were retired after exact
+source and independent-backup comparison. Census and Schwab checkouts were also removed
 after independently verifying all 26 archived changed files, exact Git state,
 bundled histories and Schwab ignored proof files. Finally, the common-seal
 checkout was removed normally after independently verifying all 255 working
 states and reconstructing all 14 staged versions from the untouched recovery
-backup. Local and remote branch retirement remains separate.
-Seven redundant or obsolete local branch labels were removed during this
-closure wave. The original session and independent recovery backups remain
-intact. The reconciliation report records actual removals separately from
-pending branch disposition.
+backup. After checkpoint `ff16c370`, the final 15 local labels and 11 origin
+heads were removed following semantic disposition and independent verification
+of every exact tip in the recovery bundle. Remote deletions were atomic and
+used exact expected-head leases. Main and release heads remained unchanged.
+The original session and independent recovery backups remain intact.
 
 The source API, native identity callers, current-share generation, chart ranges
-and retained recovery changes coexist in the target working tree. They are
-collected in this coherent source checkpoint, not accepted complete V1 delivery.
+and retained recovery changes are committed together in this coherent source
+checkpoint. This is not accepted complete V1 delivery.
 The application library check passed before the final backup artifact change;
 the final backup decoding fix also passed the application library check.
 A subsequent startup correction isolates unavailable retained sources to the
@@ -39,9 +41,9 @@ Current dependency and ownership wave:
 
 | Lane | Owner and scope | Next dependency |
 | --- | --- | --- |
-| Financial generation and recovery | Astra High; current-share generation, decision persistence and source-artifact backup | Source-backed financial generation/restart regression and per-share fundamental valuation |
-| Provider reconciliation | Sol High; completed donor handoff and cleanup receipts | All linked worktrees removed; branch disposition follows the combined checkpoint |
-| Integration | Lead; shared composition, manifests, Git, documentation and serialized checks | Push this combined API/consumer checkpoint; retire superseded branch references |
+| SEC filing context | Sol High; canonical filing context preservation and verified typed reads | Expose complete source facts to valuation without duplicating context graphs |
+| Financial valuation and recovery | Astra High; per-share DCF, residual-income and comparables evidence, persisted replay | Consume verified filing context; prove genuine generated-decision restart |
+| Integration | Lead; shared composition, manifests, Git, documentation and serialized checks | Wire the financial consumers after the filing-reader contract; run focused integrated verification |
 
 No new branch or worktree is needed. Only one Cargo command runs at a time,
 with one compiler job. Automatic CI is limited to release-branch pushes; the manual frozen-candidate
