@@ -500,7 +500,7 @@ function calibrationStateLabel(
 ): string {
   switch (state) {
     case "calibrated":
-      return "Calibrated ranges available"
+      return "Calibration available"
     case "limited":
       return "Limited; ranges may be unavailable"
     case "unavailable":

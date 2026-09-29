@@ -257,6 +257,12 @@ pub(crate) fn select_latest_from_retained(
         if !decision_is_time_valid(decision, overrides, request.as_of())?
             || approval_status_at(approval, applicable_revocation, request.as_of())
                 != ApprovalStatus::Active
+            || measurement.inputs().iter().any(|input| {
+                input
+                    .evidence()
+                    .derived_exclusive_expiry()
+                    .is_some_and(|expiry| request.as_of() >= expiry)
+            })
         {
             continue;
         }

@@ -28,7 +28,7 @@ impl DecisionApplication {
             .state
             .lock()
             .map_err(|_error| DecisionApplicationError::Unavailable)?;
-        if state.poisoned || state.backup_retained {
+        if state.poisoned || state.source_replay_deferred || state.backup_retained {
             return Err(DecisionApplicationError::Unavailable);
         }
         state.backup_retained = true;
@@ -45,21 +45,53 @@ impl DecisionApplication {
         }
     }
 
+    /// Inert controlled-artifact dependencies from the same retained generated request owner.
+    /// The source backup lease revalidates this inventory after the journal mutation fence is held.
+    pub(crate) fn source_recipe_artifacts(
+        &self,
+    ) -> Result<Vec<market_squawk_services::ArtifactReference>, DecisionApplicationError> {
+        let state = self.state.lock().map_err(|_| DecisionApplicationError::Unavailable)?;
+        if state.poisoned || state.source_replay_deferred { return Err(DecisionApplicationError::Unavailable); }
+        let repository = state.authority.repository();
+        let mut references = Vec::new();
+        for decision in repository.investment_proposals() {
+            let Some(bundle) = repository.prepared_published_investment_analysis(decision.analysis_id()) else { continue; };
+            let Some(provenance) = bundle.request_provenance() else { continue; };
+            let request: super::investment_request::GenerateRequest = serde_json::from_slice(provenance.canonical_request())
+                .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+            for source in [request.source_action_reference, request.current_share_action_reference].into_iter().flatten() {
+                if let Some(reference) = source.current_recipe_artifact().map_err(|_| DecisionApplicationError::InvalidPersistentState)? {
+                    match references.binary_search_by(|entry: &market_squawk_services::ArtifactReference| entry.id().cmp(reference.id())) {
+                        Ok(index) if references[index] != reference => return Err(DecisionApplicationError::InvalidPersistentState),
+                        Ok(_) => {},
+                        Err(index) => {
+                            references.try_reserve(1).map_err(|_| DecisionApplicationError::Allocation)?;
+                            references.insert(index, reference);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(references)
+    }
+
     /// Restores the complete typed journal only into a fresh database and reopens it through the
     /// normal application recovery boundary before returning any decision authority.
-    pub(crate) fn restore_backup_fresh(
+    pub(crate) async fn restore_backup_fresh(
         location: DecisionDatabaseLocation,
         limits: DecisionRepositoryLimits,
         bytes: &[u8],
         expected_content_sha256: [u8; 32],
+        replay: &super::current_share::CurrentShareReplayCapability,
+        context: &market_squawk_services::RequestContext,
     ) -> Result<Self, DecisionApplicationError> {
         if expected_content_sha256 == [0; 32]
             || <[u8; 32]>::from(Sha256::digest(bytes)) != expected_content_sha256
         {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
-        let restored_semantic = DecisionJournal::restore_fresh(&location, limits, bytes)?;
-        let application = Self::open(location, limits)?;
+        let restored_semantic = DecisionJournal::restore_fresh(&location, limits, bytes, replay, context).await?;
+        let application = Self::open_with_current_share_replay(location, limits, replay, context).await?;
         let state = application
             .state
             .lock()
@@ -108,6 +140,7 @@ impl RetainedDecisionBackupSnapshot {
             .lock()
             .map_err(|_error| DecisionApplicationError::Unavailable)?;
         if state.poisoned
+            || state.source_replay_deferred
             || !state.backup_retained
             || semantic_revision(&state)? != self.authority_revision_sha256()
         {
@@ -151,5 +184,5 @@ fn semantic_revision(state: &DecisionState) -> Result<[u8; 32], DecisionApplicat
     let repository = DecisionRepository::try_new(state.limits)?;
     let mut authority = DecisionAuthority::new(repository);
     let mut recovery = RecoveryContext::try_new(state.limits.maximum_screen_runs())?;
-    state.journal.recover(&mut authority, &mut recovery)
+    state.journal.recover_with_retained(&mut authority, &mut recovery, &state.authority)
 }

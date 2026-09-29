@@ -39,7 +39,7 @@ const REQUIRED_COMPONENTS: [ProductBackupComponentKind; 9] = [
     ProductBackupComponentKind::JobsAndReceipts,
     ProductBackupComponentKind::FairValueEvidence,
 ];
-const MAXIMUM_COMPONENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub(in crate::local_product) const MAXIMUM_COMPONENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Immutable identity and schema declared by one workspace component owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,7 +261,12 @@ impl ProductBackupSnapshotAuthority for InstalledWorkspaceBackupAuthority {
             if cancellation.is_cancelled() {
                 return Err(ProductBackupError::Cancelled);
             }
-            let lease = authority.retain(cancellation).await?;
+            let lease = authority.retain(cancellation).await.inspect_err(|error| {
+                tracing::warn!(
+                    component = ?authority.descriptors().first().map(WorkspaceComponentDescriptor::kind),
+                    stage = "retain", error = %error, "workspace backup component failed"
+                );
+            })?;
             if lease.descriptors() != authority.descriptors() {
                 return Err(ProductBackupError::IncompleteComponents);
             }
@@ -307,7 +312,9 @@ impl ProductRestoreComponentAuthority for InstalledWorkspaceBackupAuthority {
                 let mut verified = DigestingReader::new(reader, component.byte_length());
                 session
                     .stage_component(component, &mut verified, cancellation)
-                    .await?;
+                    .await.inspect_err(|error| {
+                        tracing::warn!(component = ?expected, stage = "restore_stage", error = %error, "workspace backup component failed");
+                    })?;
                 verified.finish(component.sha256())?;
             }
             session.complete(manifest, cancellation).await
@@ -406,7 +413,9 @@ impl ProductBackupSnapshotLease for RetainedWorkspaceSnapshot {
                 let receipt = owner
                     .lease
                     .write_snapshot(descriptor.kind, snapshot, &mut writer, cancellation)
-                    .await?;
+                    .await.inspect_err(|error| {
+                        tracing::warn!(component = ?descriptor.kind, stage = "materialize", error = %error, "workspace backup component failed");
+                    })?;
                 let observed = writer.finish()?;
                 if observed.byte_length != receipt.byte_length
                     || observed.sha256 != receipt.sha256
@@ -486,7 +495,9 @@ impl ProductBackupSnapshotLease for RetainedWorkspaceSnapshot {
                 owner
                     .lease
                     .revalidate(descriptor.kind, snapshot, receipt, cancellation)
-                    .await?;
+                    .await.inspect_err(|error| {
+                        tracing::warn!(component = ?descriptor.kind, stage = "revalidate", error = %error, "workspace backup component failed");
+                    })?;
                 component_index = component_index
                     .checked_add(1)
                     .ok_or(ProductBackupError::IncompleteComponents)?;
@@ -499,7 +510,7 @@ impl ProductBackupSnapshotLease for RetainedWorkspaceSnapshot {
     }
 }
 
-struct DigestingWriter<'writer> {
+pub(super) struct DigestingWriter<'writer> {
     writer: &'writer mut (dyn Write + Send),
     digest: Sha256,
     observed: u64,
@@ -507,7 +518,7 @@ struct DigestingWriter<'writer> {
 }
 
 impl<'writer> DigestingWriter<'writer> {
-    fn new(writer: &'writer mut (dyn Write + Send), maximum: u64) -> Self {
+    pub(super) fn new(writer: &'writer mut (dyn Write + Send), maximum: u64) -> Self {
         Self {
             writer,
             digest: Sha256::new(),
@@ -516,7 +527,7 @@ impl<'writer> DigestingWriter<'writer> {
         }
     }
 
-    fn finish(self) -> Result<ObservedComponentArtifact, ProductBackupError> {
+    pub(super) fn finish(self) -> Result<ObservedComponentArtifact, ProductBackupError> {
         if self.observed == 0 || self.observed > self.maximum {
             return Err(ProductBackupError::InvalidComponent);
         }
@@ -527,9 +538,9 @@ impl<'writer> DigestingWriter<'writer> {
     }
 }
 
-struct ObservedComponentArtifact {
-    byte_length: u64,
-    sha256: [u8; 32],
+pub(super) struct ObservedComponentArtifact {
+    pub(super) byte_length: u64,
+    pub(super) sha256: [u8; 32],
 }
 
 impl Write for DigestingWriter<'_> {

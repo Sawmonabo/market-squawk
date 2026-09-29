@@ -100,7 +100,13 @@ pub(super) fn sizing_projection_digest(
     hash.instrument(inputs.portfolio.instrument_id);
     hash.portfolio_revision(&inputs.portfolio.portfolio_revision);
     hash.money(inputs.portfolio.marked_equity_at_selected_mark);
-    hash.money(inputs.portfolio.settlement_available_cash);
+    match inputs.portfolio.settlement_available_cash {
+        Some(cash) => {
+            hash.tag(1);
+            hash.money(cash);
+        }
+        None => hash.tag(0),
+    }
     hash.i64(inputs.portfolio.current_lots.get());
     hash.money(inputs.constraints.minimum_cash_reserve);
     hash.u16(inputs.constraints.preferred_weight_lower_basis_points);
@@ -311,6 +317,7 @@ impl CanonicalHasher {
 
     fn capacity_range(&mut self, value: CapacityRange) {
         match value {
+            CapacityRange::NoFeasibleLots => self.tag(2),
             CapacityRange::Lots(range) => {
                 self.tag(0);
                 self.lot_range(range);
@@ -358,6 +365,7 @@ impl CanonicalHasher {
 
     fn unavailable_reason(&mut self, value: SizingUnavailableReason) {
         match value {
+            SizingUnavailableReason::SettlementCashNotSupplied => self.tag(8),
             SizingUnavailableReason::CapacityNotSupplied(kind) => {
                 self.tag(0);
                 self.constraint_kind(kind);

@@ -23,12 +23,11 @@ use crate::{
     PaperOrderState, PaperPosition,
 };
 
-const PREVIOUS_CHECKPOINT_SCHEMA_VERSION: u32 = 10;
-
 /// Immutable simulation terms that governed the complete paper state image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaperSimulationSnapshot {
     configuration_version: u64,
+    allow_short: bool,
     minimum_latency_nanos: u64,
     maximum_latency_nanos: u64,
     cancel_latency_nanos: u64,
@@ -47,6 +46,7 @@ impl PaperSimulationSnapshot {
         let fees = input.fee_schedule;
         Self {
             configuration_version: input.configuration_version.get(),
+            allow_short: input.allow_short,
             minimum_latency_nanos: input.minimum_latency_nanos,
             maximum_latency_nanos: input.maximum_latency_nanos,
             cancel_latency_nanos: input.cancel_latency_nanos,
@@ -60,6 +60,9 @@ impl PaperSimulationSnapshot {
         }
     }
 
+    pub const fn allow_short(self) -> bool {
+        self.allow_short
+    }
     pub const fn configuration_version(self) -> u64 {
         self.configuration_version
     }
@@ -289,6 +292,10 @@ pub struct PaperExecutionSnapshot {
     accounts: Box<[PaperAccountRiskSnapshot]>,
     cash: Box<[PaperCashBalance]>,
     positions: Box<[PaperPosition]>,
+    cash_entitlements: Box<[crate::PaperCashEntitlement]>,
+    executable_marks: Box<[crate::PaperExecutableMark]>,
+    action_origin: Option<(Timestamp, Vec<crate::PaperAccountBootstrap>)>,
+    action_source_reference: Option<Vec<u8>>,
 }
 
 impl PaperExecutionSnapshot {
@@ -334,6 +341,10 @@ impl PaperExecutionSnapshot {
             accounts: ledger.account_risk_snapshot().into_boxed_slice(),
             cash: ledger.cash_snapshot().into_boxed_slice(),
             positions: ledger.position_snapshot().into_boxed_slice(),
+            cash_entitlements: ledger.cash_entitlement_snapshot().into_boxed_slice(),
+            executable_marks: ledger.executable_mark_snapshot().into_boxed_slice(),
+            action_origin: ledger.action_origin_snapshot(),
+            action_source_reference: ledger.action_source_reference(),
         }
     }
 
@@ -371,6 +382,20 @@ impl PaperExecutionSnapshot {
     }
     pub const fn cash(&self) -> &[PaperCashBalance] {
         &self.cash
+    }
+    pub fn original_accounts(&self) -> Option<(Timestamp, &[crate::PaperAccountBootstrap])> {
+        self.action_origin
+            .as_ref()
+            .map(|(at, accounts)| (*at, accounts.as_slice()))
+    }
+    pub fn action_source_reference(&self) -> Option<&[u8]> {
+        self.action_source_reference.as_deref()
+    }
+    pub fn executable_marks(&self) -> &[crate::PaperExecutableMark] {
+        &self.executable_marks
+    }
+    pub const fn cash_entitlements(&self) -> &[crate::PaperCashEntitlement] {
+        &self.cash_entitlements
     }
     pub const fn positions(&self) -> &[PaperPosition] {
         &self.positions
@@ -550,11 +575,6 @@ impl PaperExecutionCheckpoint {
         repository_id: [u8; 32],
         generation: NonZeroU64,
     ) {
-        // A version-10 artifact is first reserialized and verified in its original schema by the
-        // repository. Only that exact manifest-authority boundary may normalize it to version 11.
-        if self.schema_version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION {
-            self.schema_version = crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION;
-        }
         self.durable_sequence = self.sequence;
         self.accepted_repository_id = repository_id;
         self.accepted_repository_generation = generation.get();
@@ -645,11 +665,7 @@ impl PaperExecutionCheckpoint {
         }
         let header: CheckpointHeaderWire =
             serde_json::from_slice(bytes).map_err(PaperCheckpointError::Encoding)?;
-        if !matches!(
-            header.schema_version,
-            PREVIOUS_CHECKPOINT_SCHEMA_VERSION
-                | crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
-        ) {
+        if header.schema_version != crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION {
             return Err(PaperCheckpointError::IncompatibleSchema {
                 expected: crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION,
                 actual: header.schema_version,
@@ -670,12 +686,6 @@ impl PaperExecutionCheckpoint {
             .ok_or(PaperCheckpointError::InvalidHeader)?;
         if wire.configuration_digest != config.digest()
             || !wire.complete
-            || (wire.schema_version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION
-                && wire
-                    .orders
-                    .iter()
-                    .chain(&wire.archived_orders)
-                    .any(PaperOrderRecoveryWire::has_target_reference))
             || wire.orders.len() > limits.maximum_orders.get()
             || wire.fills.len() > limits.maximum_fills.get()
             || wire.archived_orders.len() > limits.maximum_archived_orders.get()
@@ -720,6 +730,46 @@ impl PaperExecutionCheckpoint {
         )?;
         let ledger = PaperLedger::try_from_recovery_wire(config.ledger_config(), wire.ledger)
             .map_err(PaperCheckpointError::Ledger)?;
+        if config.input().session_policy.calendar().is_none() {
+            if wire.sequence != 0
+                || wire.durable_sequence != 0
+                || wire.reconciliation_required
+                || !orders.is_empty()
+                || !fills.is_empty()
+                || !archived_orders.is_empty()
+                || !archived_fills.is_empty()
+                || !wire.idempotency.is_empty()
+                || !wire.reconciled_orders.is_empty()
+                || !wire.acknowledged_reconciliation_batches.is_empty()
+            {
+                return Err(PaperCheckpointError::InvalidHeader);
+            }
+            let (opened_at, accounts) = ledger
+                .action_origin_snapshot()
+                .ok_or(PaperCheckpointError::InvalidHeader)?;
+            if accounts.len() != 1
+                || accounts.iter().any(|account| {
+                    account.cash.len() != 1
+                        || !account.positions.is_empty()
+                        || !account.position_cost_basis.is_empty()
+                        || account.cash[0] != account.capital
+                        || account.capital != account.peak_capital
+                        || !account.gross_exposure.amount().is_zero()
+                        || !account.realized_pnl.amount().is_zero()
+                        || !account.realized_loss.amount().is_zero()
+                })
+            {
+                return Err(PaperCheckpointError::InvalidHeader);
+            }
+            let mut original = PaperLedger::try_new(config.ledger_config(), accounts)
+                .map_err(PaperCheckpointError::Ledger)?;
+            original
+                .retain_action_origin(opened_at)
+                .map_err(PaperCheckpointError::Ledger)?;
+            if original != ledger {
+                return Err(PaperCheckpointError::InvalidHeader);
+            }
+        }
         validate_reservation_shape(&orders, &ledger, &fill_totals)?;
         let idempotency = validate_idempotency(wire.idempotency, &orders)?;
         validate_archive_identities(&orders, &idempotency, &archived_orders)?;

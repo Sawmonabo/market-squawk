@@ -16,6 +16,7 @@ use tokio_util::task::TaskTracker;
 mod backup;
 mod codec;
 mod engine;
+mod start;
 
 pub use backup::{
     JOBS_AND_RECEIPTS_BACKUP_SCHEMA, JobsAndReceiptsBackupBinding, JobsAndReceiptsBackupExport,
@@ -31,7 +32,8 @@ use engine::{
 use crate::{
     AdmittedJobSpec, JobEvent, JobEventPage, JobEventPageLimit, JobEventSequence, JobGeneration,
     JobId, JobListCursor, JobListPage, JobListPageLimit, JobRecoveryPage, JobRepository,
-    JobRepositoryError, JobSnapshot, JobState, RecoveryCursor, RecoveryPageLimit,
+    JobRepositoryError, JobSnapshot, JobStartAdmission, JobStartBinding, JobStartReconciliation,
+    JobState, RecoveryCursor, RecoveryPageLimit,
 };
 
 const SCHEMA_VERSION: i64 = 1;
@@ -82,6 +84,14 @@ struct RepositoryInner {
 
 #[derive(Debug)]
 enum WriteCommand {
+    BeginStart {
+        binding: JobStartBinding,
+        reply: oneshot::Sender<Result<JobStartAdmission, JobRepositoryError>>,
+    },
+    CancelStart {
+        binding: JobStartBinding,
+        reply: oneshot::Sender<Result<JobStartReconciliation, JobRepositoryError>>,
+    },
     Create {
         spec: AdmittedJobSpec,
         reply: oneshot::Sender<Result<JobSnapshot, JobRepositoryError>>,
@@ -262,6 +272,57 @@ impl Drop for RepositoryInner {
 
 #[async_trait]
 impl JobRepository for SqliteJobRepository {
+    async fn begin_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartAdmission, JobRepositoryError> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(JobRepositoryError::Unavailable);
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.inner
+            .writer
+            .send(WriteCommand::BeginStart {
+                binding: binding.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        receiver
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?
+    }
+
+    async fn reconcile_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartReconciliation, JobRepositoryError> {
+        let binding = binding.clone();
+        self.read(move |connection| start::reconcile(connection, &binding))
+            .await
+    }
+
+    async fn cancel_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartReconciliation, JobRepositoryError> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(JobRepositoryError::Unavailable);
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.inner
+            .writer
+            .send(WriteCommand::CancelStart {
+                binding: binding.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        receiver
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?
+    }
+
     async fn create(&self, spec: &AdmittedJobSpec) -> Result<JobSnapshot, JobRepositoryError> {
         let spec = spec.clone();
         self.send(|reply| WriteCommand::Create { spec, reply })

@@ -1,3 +1,6 @@
+#[path = "../../../../market-squawk-sources/tests/common/mod.rs"]
+mod source_fixture;
+
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::str::FromStr;
@@ -210,10 +213,12 @@ pub(super) struct SourceHarness {
 
 impl SourceHarness {
     pub(super) fn try_new(source: &str, generation: u64) -> TestResult<Self> {
-        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let revision = format!("{source}-revision");
-        let registered =
-            registry.register(metadata(source, &revision)?, Timestamp::from_unix_nanos(1))?;
+        let (registry, registered) = source_fixture::register_fixture_source(
+            metadata(source, &revision)?,
+            &[(instrument_id()?, "BTC-USD")],
+            Timestamp::from_unix_nanos(1),
+        )?;
         Self::activate(registry, registered, generation)
     }
 
@@ -323,6 +328,11 @@ impl SourceHarness {
             id(source_identifier)?,
             VenueId::try_from(VENUE)?,
             instrument_id()?,
+            market_squawk_sources::ProviderNativeInstrumentIdentity::new(
+                market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+                market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+                market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+            ),
             ProviderTimestampEvidence::Provided {
                 value: self.timestamp(FRAME_AT)?,
                 rule: rule("coinbase-timestamp")?,

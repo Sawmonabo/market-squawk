@@ -259,18 +259,19 @@ impl InstalledBacktestPreparation {
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect::<Vec<_>>();
-                let starts_at = evidence
+                let first_decision = evidence
                     .rows()
-                    .iter()
-                    .map(|row| row.cutoff_at())
-                    .min()
+                    .first()
+                    .and_then(|row| row.decision_at())
                     .ok_or(ServiceError::InvalidResult)?;
-                let ends_at = evidence
-                    .rows()
-                    .iter()
-                    .map(|row| row.cutoff_at())
-                    .max()
-                    .ok_or(ServiceError::InvalidResult)?
+                let (starts_at, last_decision) = evidence.rows().iter().try_fold(
+                    (first_decision, first_decision),
+                    |(start, end), row| {
+                        let decision = row.decision_at().ok_or(ServiceError::InvalidResult)?;
+                        Ok::<_, ServiceError>((start.min(decision), end.max(decision)))
+                    },
+                )?;
+                let ends_at = last_decision
                     .checked_add_nanos(1)
                     .map_err(|_error| ServiceError::InvalidResult)?;
                 let dataset_id = generation.manifest().dataset_id().as_str();

@@ -284,6 +284,12 @@ impl ExactSizeIterator for BoundedOrderIntentIterator {}
 
 /// Route-owned bounded strategy contract.
 pub trait Strategy: Send + std::fmt::Debug {
+    /// Explicit simulation strategy support; existing live/model strategies remain unchanged.
+    fn supports_virtual_paper(&self) -> bool { false }
+    /// Authority-free original quote/explicit simulator terms. This does not mint an approval.
+    fn on_virtual_paper_quote(&mut self, _route: &ShardKey, _market: ExecutionMarketReference)
+        -> Result<BoundedOrderIntents, StrategyError> { Err(StrategyError::Evaluation) }
+
     fn on_market_event(
         &mut self,
         context: &StrategyContext<'_>,

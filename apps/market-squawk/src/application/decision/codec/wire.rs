@@ -44,6 +44,7 @@ pub(super) enum WireRecord {
     Review(ReviewWire),
     Invalidation(InvalidationWire),
     ScreenJobInput(Box<ScreenJobPlanWire>),
+    CurrentFindCustody(Box<super::super::current_find::CurrentFindCustodyRecord>),
     InvestmentProposal(Box<InvestmentProposalWire>),
     PreparedPublishedInvestmentAnalysis(Box<PreparedPublishedInvestmentAnalysisWire>),
     InvestmentAnalysisPublication(InvestmentAnalysisPublicationWire),
@@ -61,7 +62,7 @@ impl WireRecord {
             Self::Target(_) => KIND_TARGET,
             Self::Review(_) => KIND_REVIEW,
             Self::Invalidation(_) => KIND_INVALIDATION,
-            Self::ScreenJobInput(_) => KIND_SCREEN_JOB_INPUT,
+            Self::ScreenJobInput(_) | Self::CurrentFindCustody(_) => KIND_SCREEN_JOB_INPUT,
             Self::InvestmentProposal(_) => KIND_INVESTMENT_PROPOSAL,
             Self::PreparedPublishedInvestmentAnalysis(_)
             | Self::InvestmentAnalysisPublication(_)

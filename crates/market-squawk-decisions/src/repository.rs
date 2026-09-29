@@ -3,17 +3,17 @@
 use std::fmt;
 
 use crate::{
-    AnalyticalProfileBindingReference, CandidateId, DecisionDossier, GovernedTargetSet,
-    InvestmentAnalysisId, InvestmentOutcomeProjection, InvestmentProjectionDigest,
-    InvestmentProposalAuthority, InvestmentProposalDecision, InvestmentProposalId,
-    InvestmentSizingProjection, InvestmentTargetSetId, NoActionReason,
-    PreparedPublishedInvestmentAnalysis, ProposalUnavailableReason, PublishedInvestmentAnalysis,
-    RecommendationAction, RecommendationDerivationDigest, RecommendationEvidenceDigest,
-    RecommendationOutcomeCohort, RecommendationOutcomeCurrentIndexEntry,
-    RecommendationOutcomeStatus, RecommendationOutcomeStatusRecord, RecommendationPolicyDigest,
-    RecommendationTrackRecord, RecommendationTrackRecordGroup, SavedScreen, ScreenExecution,
-    ScreenId, ScreenRun, ScreenRunId, TargetInvalidation, TargetReview, TargetReviewDisposition,
-    TargetState, TargetStatus,
+    AnalyticalProfileBindingReference, CandidateId, DecisionContentDigest, DecisionDossier,
+    GovernedTargetSet, InvestmentAnalysisId, InvestmentAnalysisWorkflowReference,
+    InvestmentOutcomeProjection, InvestmentProjectionDigest, InvestmentProposalAuthority,
+    InvestmentProposalDecision, InvestmentProposalId, InvestmentSizingProjection,
+    InvestmentTargetSetId, NoActionReason, PreparedPublishedInvestmentAnalysis,
+    ProposalUnavailableReason, PublishedInvestmentAnalysis, RecommendationAction,
+    RecommendationDerivationDigest, RecommendationEvidenceDigest, RecommendationOutcomeCohort,
+    RecommendationOutcomeCurrentIndexEntry, RecommendationOutcomeStatus,
+    RecommendationOutcomeStatusRecord, RecommendationPolicyDigest, RecommendationTrackRecord,
+    RecommendationTrackRecordGroup, SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId,
+    TargetInvalidation, TargetReview, TargetReviewDisposition, TargetState, TargetStatus,
 };
 use market_squawk_domain::{AccountId, Currency, InstrumentId, RevisionNumber, Timestamp};
 
@@ -537,6 +537,58 @@ impl fmt::Display for DecisionRepositoryError {
 
 impl std::error::Error for DecisionRepositoryError {}
 
+// Replay proves the persisted result from exact retained identities; it does not authenticate
+// recovered valuation evidence for a new recommendation. Live append and staging use Fresh.
+enum InvestmentAdmission {
+    Fresh,
+    Replay,
+}
+
+impl InvestmentAdmission {
+    fn revalidate(
+        self,
+        decision: &InvestmentProposalDecision,
+    ) -> Result<InvestmentProposalDecision, DecisionRepositoryError> {
+        let evidence = decision.evidence().clone();
+        let policy = decision.policy().clone();
+        match self {
+            Self::Fresh => InvestmentProposalAuthority::generate(evidence, policy),
+            Self::Replay => match decision {
+                InvestmentProposalDecision::Generated(value) => {
+                    InvestmentProposalAuthority::try_recover_generated(
+                        evidence,
+                        policy,
+                        value.analysis_id(),
+                        value.derivation_digest(),
+                        value.proposal_id(),
+                    )
+                    .map(InvestmentProposalDecision::Generated)
+                }
+                InvestmentProposalDecision::NoAction(value) => {
+                    InvestmentProposalAuthority::try_recover_no_action(
+                        evidence,
+                        policy,
+                        value.analysis_id(),
+                        value.derivation_digest(),
+                        value.proposal_id(),
+                    )
+                    .map(InvestmentProposalDecision::NoAction)
+                }
+                InvestmentProposalDecision::Unavailable(value) => {
+                    InvestmentProposalAuthority::try_recover_unavailable(
+                        evidence,
+                        policy,
+                        value.analysis_id(),
+                        value.reason(),
+                    )
+                    .map(InvestmentProposalDecision::Unavailable)
+                }
+            },
+        }
+        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)
+    }
+}
+
 /// One-writer, compare-and-append repository with scan-only bounded indexes.
 #[derive(Debug)]
 pub struct DecisionRepository {
@@ -575,7 +627,7 @@ impl DecisionRepository {
         })
     }
 
-    /// Replays a typed snapshot through every ordinary append invariant.
+    /// Replays a typed snapshot with exact saved identities and ordinary repository invariants.
     pub fn recover(
         limits: DecisionRepositoryLimits,
         snapshot: DecisionJournalSnapshot,
@@ -604,7 +656,7 @@ impl DecisionRepository {
                     repository.append_invalidation(value)?;
                 }
                 DecisionRecord::InvestmentProposal(value) => {
-                    repository.append_investment_proposal(value)?;
+                    repository.replay_investment_proposal(value)?;
                 }
                 DecisionRecord::InvestmentAnalysisPublication(value) => {
                     repository.append_investment_analysis_publication(value)?;
@@ -619,7 +671,7 @@ impl DecisionRepository {
                     repository.append_recommendation_outcome_status(value)?;
                 }
                 DecisionRecord::PreparedPublishedInvestmentAnalysis(value) => {
-                    repository.append_prepared_published_investment_analysis(value)?;
+                    repository.replay_prepared_published_investment_analysis(value)?;
                 }
             }
         }
@@ -898,6 +950,21 @@ impl DecisionRepository {
         &mut self,
         decision: InvestmentProposalDecision,
     ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.append_investment_proposal_with_admission(decision, InvestmentAdmission::Fresh)
+    }
+
+    pub(crate) fn replay_investment_proposal(
+        &mut self,
+        decision: InvestmentProposalDecision,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.append_investment_proposal_with_admission(decision, InvestmentAdmission::Replay)
+    }
+
+    fn append_investment_proposal_with_admission(
+        &mut self,
+        decision: InvestmentProposalDecision,
+        admission: InvestmentAdmission,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
         if self
             .prepared_published_investment_analysis(decision.analysis_id())
             .is_some()
@@ -920,11 +987,7 @@ impl DecisionRepository {
         }) {
             return Err(DecisionRepositoryError::Conflict);
         }
-        let regenerated = InvestmentProposalAuthority::generate(
-            decision.evidence().clone(),
-            decision.policy().clone(),
-        )
-        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        let regenerated = admission.revalidate(&decision)?;
         if regenerated != decision {
             return Err(DecisionRepositoryError::EvidenceMismatch);
         }
@@ -940,8 +1003,18 @@ impl DecisionRepository {
         &self,
         bundle: PreparedPublishedInvestmentAnalysis,
     ) -> Result<StagedPublishedInvestmentAnalysisAppend, DecisionRepositoryError> {
+        self.stage_prepared_investment_analysis_with_admission(bundle, InvestmentAdmission::Fresh)
+    }
+
+    fn stage_prepared_investment_analysis_with_admission(
+        &self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+        admission: InvestmentAdmission,
+    ) -> Result<StagedPublishedInvestmentAnalysisAppend, DecisionRepositoryError> {
         let analysis_id = bundle.decision().analysis_id();
-        if let Some(existing) = self.prepared_published_investment_analysis(analysis_id) {
+        if let Some(existing) =
+            self.prepared_investment_analysis_for_workflow(bundle.publication().workflow())?
+        {
             return if existing == &bundle {
                 Ok(StagedPublishedInvestmentAnalysisAppend {
                     outcome: AppendOutcome::AlreadyPresent,
@@ -954,7 +1027,10 @@ impl DecisionRepository {
                 Err(DecisionRepositoryError::Conflict)
             };
         }
-        if self.standalone_investment_proposal(analysis_id).is_some()
+        if self
+            .prepared_published_investment_analysis(analysis_id)
+            .is_some()
+            || self.standalone_investment_proposal(analysis_id).is_some()
             || self
                 .standalone_investment_analysis_publication(analysis_id)
                 .is_some()
@@ -968,37 +1044,54 @@ impl DecisionRepository {
         }) {
             return Err(DecisionRepositoryError::Conflict);
         }
-        let (run, candidate) = self
-            .candidate(bundle.selected_candidate().candidate_id())
-            .ok_or(DecisionRepositoryError::NotFound)?;
-        let screen = self
-            .screen(run.screen().id(), run.screen().revision())
-            .ok_or(DecisionRepositoryError::NotFound)?;
-        let selected_candidate =
-            crate::SelectedCandidateAnalysisEvidence::try_new(screen, run, candidate)
-                .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
-        if &selected_candidate != bundle.selected_candidate()
-            || bundle.decision().evidence().selected_candidate()
-                != Some(bundle.selected_candidate())
-        {
+        let selected_candidate = if let Some(expected) = bundle.selected_candidate() {
+            let (run, candidate) = self
+                .candidate(expected.candidate_id())
+                .ok_or(DecisionRepositoryError::NotFound)?;
+            let screen = self
+                .screen(run.screen().id(), run.screen().revision())
+                .ok_or(DecisionRepositoryError::NotFound)?;
+            let selected =
+                crate::SelectedCandidateAnalysisEvidence::try_new(screen, run, candidate)
+                    .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+            if &selected != expected {
+                return Err(DecisionRepositoryError::EvidenceMismatch);
+            }
+            Some(selected)
+        } else {
+            None
+        };
+        if bundle.decision().evidence().selected_candidate() != selected_candidate.as_ref() {
             return Err(DecisionRepositoryError::EvidenceMismatch);
         }
-        let regenerated_decision = InvestmentProposalAuthority::generate(
-            bundle.decision().evidence().clone(),
-            bundle.decision().policy().clone(),
-        )
-        .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        let regenerated_decision = admission.revalidate(bundle.decision())?;
         if regenerated_decision != *bundle.decision() {
             return Err(DecisionRepositoryError::EvidenceMismatch);
         }
-        let regenerated = PreparedPublishedInvestmentAnalysis::try_new(
-            regenerated_decision,
-            selected_candidate,
-            bundle.publication().analytical_profile().clone(),
-            bundle.publication().workflow().clone(),
-            bundle.publication().published_at(),
-        )
+        let regenerated = match bundle.request_provenance() {
+            Some(provenance) => PreparedPublishedInvestmentAnalysis::try_from_generated_request(
+                regenerated_decision,
+                selected_candidate,
+                bundle.publication().analytical_profile().clone(),
+                bundle.publication().workflow().clone(),
+                provenance.clone(),
+                bundle.publication().published_at(),
+            ),
+            None => PreparedPublishedInvestmentAnalysis::try_new(
+                regenerated_decision,
+                selected_candidate,
+                bundle.publication().analytical_profile().clone(),
+                bundle.publication().workflow().clone(),
+                bundle.publication().published_at(),
+            ),
+        }
         .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
+        let regenerated = match bundle.sizing_inputs() {
+            Some(inputs) => regenerated
+                .try_with_sizing_inputs(inputs.clone())
+                .map_err(|_| DecisionRepositoryError::EvidenceMismatch)?,
+            None => regenerated,
+        };
         if regenerated != bundle {
             return Err(DecisionRepositoryError::EvidenceMismatch);
         }
@@ -1014,9 +1107,16 @@ impl DecisionRepository {
             outcome: AppendOutcome::Appended,
             expected_record_count: self.records.len(),
             expected_index_count: self.investment_analysis_index.len(),
-            index_entry: Some(InvestmentAnalysisCurrentIndexEntry::new(
-                bundle.publication().clone(),
-            )),
+            index_entry: Some(InvestmentAnalysisCurrentIndexEntry {
+                publication: bundle.publication().clone(),
+                outcome_projection_digest: bundle
+                    .outcome_projection()
+                    .map(|value| value.result_digest()),
+                sizing_projection_digest: bundle
+                    .sizing_projection()
+                    .map(|value| value.result_digest()),
+                current_outcome: None,
+            }),
             bundle: Some(bundle),
         })
     }
@@ -1074,6 +1174,17 @@ impl DecisionRepository {
         self.commit_staged_published_investment_analysis(staged)
     }
 
+    pub(crate) fn replay_prepared_published_investment_analysis(
+        &mut self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        let staged = self.stage_prepared_investment_analysis_with_admission(
+            bundle,
+            InvestmentAdmission::Replay,
+        )?;
+        self.commit_staged_published_investment_analysis(staged)
+    }
+
     /// Appends the sole immutable profile/workflow publication for one analysis.
     pub fn append_investment_analysis_publication(
         &mut self,
@@ -1093,6 +1204,11 @@ impl DecisionRepository {
             } else {
                 Err(DecisionRepositoryError::Conflict)
             };
+        }
+        if self.investment_analysis_index.iter().any(|entry| {
+            entry.publication().workflow().workflow_id() == publication.workflow().workflow_id()
+        }) {
+            return Err(DecisionRepositoryError::Conflict);
         }
         let decision = self
             .investment_proposal(publication.analysis_id())
@@ -1135,6 +1251,12 @@ impl DecisionRepository {
         if self.investment_analysis_publication(analysis_id).is_none() {
             return Err(DecisionRepositoryError::NotFound);
         }
+        if self
+            .prepared_published_investment_analysis(analysis_id)
+            .is_some()
+        {
+            return Err(DecisionRepositoryError::Conflict);
+        }
         let regenerated =
             InvestmentOutcomeProjection::try_from_proposal(generated, projection.position_scale())
                 .map_err(|_error| DecisionRepositoryError::EvidenceMismatch)?;
@@ -1168,6 +1290,12 @@ impl DecisionRepository {
             .ok_or(DecisionRepositoryError::NotFound)?;
         if self.investment_analysis_publication(analysis_id).is_none() {
             return Err(DecisionRepositoryError::NotFound);
+        }
+        if self
+            .prepared_published_investment_analysis(analysis_id)
+            .is_some()
+        {
+            return Err(DecisionRepositoryError::Conflict);
         }
         let regenerated =
             InvestmentSizingProjection::try_from_proposal(generated, projection.inputs().clone())
@@ -1619,6 +1747,50 @@ impl DecisionRepository {
         })
     }
 
+    /// Resolves the sole atomic bundle for one stable workflow before reopening its inputs.
+    ///
+    /// A reused workflow identity must preserve its exact revision, content, and authenticated
+    /// request commitment. The retained bounded journal is the only idempotency authority.
+    pub fn generated_investment_analysis(
+        &self,
+        workflow: &InvestmentAnalysisWorkflowReference,
+        request_digest: DecisionContentDigest,
+    ) -> Result<Option<&PreparedPublishedInvestmentAnalysis>, DecisionRepositoryError> {
+        let retained = self.prepared_investment_analysis_for_workflow(workflow)?;
+        if retained.is_some_and(|bundle| bundle.request_digest() != Some(request_digest)) {
+            return Err(DecisionRepositoryError::Conflict);
+        }
+        Ok(retained)
+    }
+
+    fn prepared_investment_analysis_for_workflow(
+        &self,
+        workflow: &InvestmentAnalysisWorkflowReference,
+    ) -> Result<Option<&PreparedPublishedInvestmentAnalysis>, DecisionRepositoryError> {
+        let mut retained = None;
+        for record in &self.records {
+            let bundle = match record {
+                DecisionRecord::InvestmentAnalysisPublication(publication)
+                    if publication.workflow().workflow_id() == workflow.workflow_id() =>
+                {
+                    // A separately published pure decision has no installed request provenance.
+                    // It reserves the workflow rather than reopening sources under a new meaning.
+                    return Err(DecisionRepositoryError::Conflict);
+                }
+                DecisionRecord::PreparedPublishedInvestmentAnalysis(bundle) => bundle,
+                _ => continue,
+            };
+            if bundle.publication().workflow().workflow_id() != workflow.workflow_id() {
+                continue;
+            }
+            if bundle.publication().workflow() != workflow || retained.is_some() {
+                return Err(DecisionRepositoryError::Conflict);
+            }
+            retained = Some(bundle);
+        }
+        Ok(retained)
+    }
+
     /// Returns one durable outcome projection by generated proposal identity.
     pub fn investment_outcome_projection(
         &self,
@@ -1629,6 +1801,11 @@ impl DecisionRepository {
                 if projection.binding().proposal_id() == proposal_id =>
             {
                 Some(projection)
+            }
+            DecisionRecord::PreparedPublishedInvestmentAnalysis(bundle)
+                if bundle.decision().proposal_id() == Some(proposal_id) =>
+            {
+                bundle.outcome_projection()
             }
             _ => None,
         })
@@ -1644,6 +1821,11 @@ impl DecisionRepository {
                 if projection.binding().proposal_id() == proposal_id =>
             {
                 Some(projection)
+            }
+            DecisionRecord::PreparedPublishedInvestmentAnalysis(bundle)
+                if bundle.decision().proposal_id() == Some(proposal_id) =>
+            {
+                bundle.sizing_projection()
             }
             _ => None,
         })
@@ -1727,18 +1909,15 @@ impl DecisionRepository {
         let mut analysis_unavailable_count = 0_u32;
         for entry in &self.investment_analysis_index {
             let publication = entry.publication();
-            if publication.analytical_profile() != analytical_profile
-                || publication
-                    .horizon_at()
-                    .unix_nanos()
-                    .checked_sub(publication.as_of().unix_nanos())
-                    != Some(horizon_nanos)
-            {
+            if publication.analytical_profile() != analytical_profile {
                 continue;
             }
             let decision = self
                 .investment_proposal(publication.analysis_id())
                 .ok_or(DecisionRepositoryError::NotFound)?;
+            if decision.policy().horizon_nanos() != horizon_nanos {
+                continue;
+            }
             let cohort = match decision {
                 InvestmentProposalDecision::Generated(value) => {
                     RecommendationOutcomeCohort::Generated(value.action())

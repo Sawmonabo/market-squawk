@@ -63,6 +63,7 @@ impl CatalogAuthority {
         source_id: &SourceId,
         query: &str,
         maximum_rows: usize,
+        exact_venue: Option<&VenueId>,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<ListingReferenceSearchPage, ListingReferenceError> {
@@ -83,7 +84,7 @@ impl CatalogAuthority {
         let result = (|| {
             let retrieval_limit = i64::try_from(maximum_rows.saturating_add(1))
                 .map_err(|_| ListingReferenceError::InvalidLimit)?;
-            let symbol_query = canonical::normalize_symbol(query);
+            let symbol_query = if exact_venue.is_some() { query.to_owned() } else { canonical::normalize_symbol(query) };
             let name_query = canonical::normalize_name(query);
             let mut statement = connection.prepare(CURRENT_LISTING_SEARCH_SQL)?;
             let rows = statement.query_map(
@@ -92,6 +93,7 @@ impl CatalogAuthority {
                     symbol_query,
                     name_query,
                     retrieval_limit,
+                    exact_venue.map(VenueId::as_str),
                 ],
                 decode_row,
             )?;
@@ -492,6 +494,7 @@ SELECT files.file_kind,
        memberships.value_digest,
        memberships.record_digest,
        CASE
+           WHEN ?5 IS NOT NULL THEN 'provider_symbol'
            WHEN instr(values_.normalized_provider_symbol, ?2)>0 THEN 'provider_symbol'
            WHEN values_.cqs_symbol IS NOT NULL AND instr(upper(values_.cqs_symbol), ?2)>0
                THEN 'cqs_symbol'
@@ -506,10 +509,13 @@ JOIN listing_reference_files AS files
  AND files.file_kind=memberships.file_kind
 WHERE memberships.generation_digest=?1
   AND (
+      (?5 IS NOT NULL AND values_.provider_symbol=?2 AND values_.listing_venue=?5)
+      OR (?5 IS NULL AND (
       instr(values_.normalized_provider_symbol, ?2)>0
       OR instr(values_.normalized_security_name, ?3)>0
       OR (values_.cqs_symbol IS NOT NULL AND instr(upper(values_.cqs_symbol), ?2)>0)
       OR (values_.nasdaq_symbol IS NOT NULL AND instr(upper(values_.nasdaq_symbol), ?2)>0)
+      ))
   )
 ORDER BY CASE
     WHEN values_.normalized_provider_symbol=?2 THEN 0

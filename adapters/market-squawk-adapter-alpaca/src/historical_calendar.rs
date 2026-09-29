@@ -1,4 +1,4 @@
-//! Sealed authenticated transport for exact Alpaca v3 IEX/UTC calendar-range requests.
+//! Sealed authenticated transport for exact Alpaca v3 market/UTC calendar-range requests.
 
 use std::{
     sync::Arc,
@@ -24,14 +24,17 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::historical_transport::{AlpacaHistoricalEndpoint, AlpacaHistoricalTransport};
-use crate::{ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS, AlpacaCredentials, AlpacaError};
+use crate::{AlpacaCredentials, AlpacaError};
 
 /// Maximum retained raw body for one exact bounded v3 calendar-range response.
 ///
-/// One admitted historical plan spans at most ten years. This ceiling admits that complete
+/// One admitted calendar range spans at most eleven civil years. This ceiling admits that complete
 /// provider range without allowing the transport to inherit the wider caller HTTP bound.
 pub const ALPACA_HISTORICAL_CALENDAR_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAXIMUM_RETRY_AFTER_FIELD_BYTES: usize = 128;
+// Calendar coverage needs ten completed years plus an opening endpoint, including leap days.
+// This independent resource ceiling establishes no source sessions or financial availability.
+const MAXIMUM_CALENDAR_SPAN_DAYS: i32 = 11 * 366;
 const USER_AGENT: &str = "market-squawk/0.1 alpaca-historical-calendar";
 
 /// Exact Alpaca Trading API account environment retained by account activation.
@@ -53,11 +56,59 @@ impl AlpacaTradingApiEnvironment {
     }
 }
 
+/// Exact US equity calendar market explicitly supported by the Trading API.
+/// Calendar scope is independent of the account's quote feed subscription.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AlpacaCalendarMarket {
+    /// Investors Exchange calendar; not a substitute for another listing venue.
+    Iex,
+    /// New York Stock Exchange calendar, requested by its exact MIC.
+    Nyse,
+    /// NASDAQ calendar, requested by its exact MIC.
+    Nasdaq,
+}
+
+impl AlpacaCalendarMarket {
+    /// Returns the exact market path component admitted by the official calendar contract.
+    pub const fn request_code(self) -> &'static str {
+        match self {
+            Self::Iex => "IEX",
+            Self::Nyse => "XNYS",
+            Self::Nasdaq => "XNAS",
+        }
+    }
+    /// Returns the native market acronym whose response is accepted for this request.
+    pub const fn acronym(self) -> &'static str {
+        match self {
+            Self::Iex => "IEX",
+            Self::Nyse => "NYSE",
+            Self::Nasdaq => "NASDAQ",
+        }
+    }
+    /// Returns the exact native MIC, used to reject contradictory returned market metadata.
+    pub const fn mic(self) -> &'static str {
+        match self {
+            Self::Iex => "IEXG",
+            Self::Nyse => "XNYS",
+            Self::Nasdaq => "XNAS",
+        }
+    }
+    /// Returns the existing canonical venue spelling without relabeling a different request.
+    pub const fn venue(self) -> &'static str {
+        match self {
+            Self::Iex => "iex",
+            Self::Nyse => "XNYS",
+            Self::Nasdaq => "XNAS",
+        }
+    }
+}
+
 /// Exact credential-free coordinates independently comparable with the application calendar
 /// producer request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlpacaAuthenticatedCalendarRequest {
     environment: AlpacaTradingApiEnvironment,
+    market: AlpacaCalendarMarket,
     start_date: CalendarDate,
     end_date: CalendarDate,
     path_and_query: Box<str>,
@@ -71,6 +122,16 @@ impl AlpacaAuthenticatedCalendarRequest {
         start_date: CalendarDate,
         end_date: CalendarDate,
     ) -> Result<Self, AlpacaError> {
+        Self::try_for_market(environment, AlpacaCalendarMarket::Iex, start_date, end_date)
+    }
+
+    /// Constructs one explicitly selected market request under the same finite source bounds.
+    pub fn try_for_market(
+        environment: AlpacaTradingApiEnvironment,
+        market: AlpacaCalendarMarket,
+        start_date: CalendarDate,
+        end_date: CalendarDate,
+    ) -> Result<Self, AlpacaError> {
         let inclusive_span_days = end_date
             .days_since_unix_epoch()
             .checked_sub(start_date.days_since_unix_epoch())
@@ -78,13 +139,14 @@ impl AlpacaAuthenticatedCalendarRequest {
         if start_date > end_date
             || start_date.year() > 9_999
             || end_date.year() > 9_999
-            || inclusive_span_days
-                .is_none_or(|days| days > i32::from(ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS) + 1)
+            || inclusive_span_days.is_none_or(|days| days > MAXIMUM_CALENDAR_SPAN_DAYS)
         {
             return Err(AlpacaError::InvalidHistoricalPlan);
         }
-        let path_and_query =
-            format!("/v3/calendar/IEX?start={start_date}&end={end_date}&timezone=UTC");
+        let path_and_query = format!(
+            "/v3/calendar/{}?start={start_date}&end={end_date}&timezone=UTC",
+            market.request_code()
+        );
         let target = format!("{}{path_and_query}", environment.origin());
         let url = Url::parse(&target).map_err(|_| AlpacaError::InvalidHistoricalPlan)?;
         if url.as_str() != target {
@@ -92,6 +154,7 @@ impl AlpacaAuthenticatedCalendarRequest {
         }
         Ok(Self {
             environment,
+            market,
             start_date,
             end_date,
             path_and_query: path_and_query.into_boxed_str(),
@@ -114,6 +177,11 @@ impl AlpacaAuthenticatedCalendarRequest {
         &self.path_and_query
     }
 
+    /// Returns the exact explicitly requested source market.
+    pub const fn market(&self) -> AlpacaCalendarMarket {
+        self.market
+    }
+
     /// Returns the inclusive first requested civil date.
     pub const fn start_date(&self) -> CalendarDate {
         self.start_date
@@ -122,6 +190,11 @@ impl AlpacaAuthenticatedCalendarRequest {
     /// Returns the inclusive last requested civil date.
     pub const fn end_date(&self) -> CalendarDate {
         self.end_date
+    }
+
+    /// Exact credential-free identity used by the retained physical calendar capture.
+    pub fn capture_request_identity(&self) -> Result<EvidenceDigest, AlpacaError> {
+        calendar_request_identity(self)
     }
 }
 
@@ -206,7 +279,14 @@ impl AlpacaAuthenticatedCalendarResponse {
         let connection_id =
             Uuid::new_v5(&Uuid::NAMESPACE_URL, &capture.observation_digest().bytes());
         let mut event_identity = Sha256::new();
-        event_identity.update(b"market-squawk/alpaca-iex-calendar-capture-event/v1\0");
+        event_identity.update(match self.request.market() {
+            AlpacaCalendarMarket::Iex => {
+                b"market-squawk/alpaca-iex-calendar-capture-event/v1\0".as_slice()
+            }
+            AlpacaCalendarMarket::Nyse | AlpacaCalendarMarket::Nasdaq => {
+                b"market-squawk/alpaca-market-calendar-capture-event/v1\0".as_slice()
+            }
+        });
         event_identity.update(request_identity.bytes());
         event_identity.update(body_digest.bytes());
         let event_id = Uuid::new_v5(&connection_id, &event_identity.finalize());
@@ -348,6 +428,42 @@ pub(crate) async fn authenticated_bounded_get(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<AuthenticatedGetResponse, AlpacaError> {
+    authenticated_bounded_get_with_completion(
+        client,
+        credentials,
+        url,
+        bounds,
+        hard_maximum_bytes,
+        deadline,
+        cancellation,
+        |status, headers, body| {
+            Ok(AuthenticatedGetResponse {
+                status,
+                body,
+                headers,
+                received_at: system_timestamp()?,
+            })
+        },
+    )
+    .await?
+}
+
+/// Calls one synchronous, bounded completion immediately after the exact body reaches EOF.
+/// No await, cancellation, deadline or semantic response check intervenes after completion.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded transport and its owned completion remain explicit"
+)]
+pub(crate) async fn authenticated_bounded_get_with_completion<T>(
+    client: &reqwest::Client,
+    credentials: &AlpacaCredentials,
+    url: &Url,
+    bounds: HttpRequestBounds,
+    hard_maximum_bytes: usize,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    complete: impl FnOnce(u16, HeaderMap, Box<[u8]>) -> T,
+) -> Result<T, AlpacaError> {
     if cancellation.is_cancelled() {
         return Err(AlpacaError::Cancelled);
     }
@@ -421,19 +537,21 @@ pub(crate) async fn authenticated_bounded_get(
             .map_err(|_| AlpacaError::Allocation)?;
         body.extend_from_slice(&chunk);
     }
-    Ok(AuthenticatedGetResponse {
-        status,
-        body: body.into_boxed_slice(),
-        headers,
-        received_at: system_timestamp()?,
-    })
+    Ok(complete(status, headers, body.into_boxed_slice()))
 }
 
 fn calendar_request_identity(
     request: &AlpacaAuthenticatedCalendarRequest,
 ) -> Result<EvidenceDigest, AlpacaError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/alpaca-iex-calendar-capture-request/v1\0");
+    digest.update(match request.market() {
+        AlpacaCalendarMarket::Iex => {
+            b"market-squawk/alpaca-iex-calendar-capture-request/v1\0".as_slice()
+        }
+        AlpacaCalendarMarket::Nyse | AlpacaCalendarMarket::Nasdaq => {
+            b"market-squawk/alpaca-market-calendar-capture-request/v1\0".as_slice()
+        }
+    });
     hash_request_field(&mut digest, request.method())?;
     hash_request_field(&mut digest, request.origin())?;
     hash_request_field(&mut digest, request.path_and_query())?;
@@ -574,7 +692,7 @@ mod tests {
             )
             .is_err()
         );
-        let overlong_end = CalendarDate::new(2035, 11, 29).expect("valid overlong end");
+        let overlong_end = CalendarDate::new(2036, 11, 29).expect("valid overlong end");
         assert!(
             AlpacaAuthenticatedCalendarRequest::try_new(
                 AlpacaTradingApiEnvironment::Paper,

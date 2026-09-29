@@ -12,6 +12,8 @@ mod bounds;
 mod callback;
 mod canonical;
 mod error;
+mod instrument_reference;
+mod market_hours_publication;
 mod oauth;
 mod option_publication;
 mod publication;
@@ -19,7 +21,9 @@ mod rest;
 mod rest_quote_publication;
 mod sensitive;
 mod streamer;
+mod streamer_family_publication;
 mod streamer_publication;
+mod streamer_screener;
 mod transport;
 mod vertical;
 
@@ -43,10 +47,17 @@ pub use canonical::{
     SchwabCanonicalStreamerRecord, SchwabInstrumentCandidate, SchwabOptionCandidateAbstention,
     SchwabOptionCandidateOutcome, SchwabOptionSnapshotCandidate, SchwabQuoteAbstention,
     SchwabQuoteCanonicalOutcome, SchwabResolvedProviderIdentity, SchwabStreamerFieldDictionary,
-    SchwabStreamerSemanticField, canonicalize_instrument_candidates, canonicalize_option_chain,
-    canonicalize_quote, canonicalize_streamer_batch, canonicalize_streamer_quote_record,
+    SchwabStreamerSemanticField, canonicalize_instrument_candidates,
+    canonicalize_market_data_quote, canonicalize_option_chain, canonicalize_quote,
+    canonicalize_streamer_batch, canonicalize_streamer_quote_record,
+    streamer_quote_source_timestamp,
 };
 pub use error::SchwabAdapterError;
+pub use instrument_reference::{SchwabInstrumentReferenceError, SchwabSealedInstrumentReference};
+pub use market_hours_publication::{
+    SchwabMarketHoursPublicationError, SchwabMarketHoursPublicationRequest,
+    SchwabSealedMarketHoursPublication,
+};
 pub use oauth::{
     ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AuthorizationRequest, CallbackOutcome, OAuthCallback,
     OAuthTokenHttpRequest, REFRESH_TOKEN_LIFETIME_SECONDS, RefreshTokenGeneration,
@@ -95,6 +106,9 @@ pub use streamer::{
     StreamerResponseCode, StreamerSubscription, TransientStreamerRequest, parse_streamer_frame,
     parse_user_preference,
 };
+pub use streamer_family_publication::{
+    SchwabStreamerFamilyRecordRequest, streamer_family_source_timestamp,
+};
 pub use streamer_publication::{
     SchwabSealedRawStreamerPublication, SchwabSealedStreamerQuotePublication,
     SchwabStreamerPublicationError, SchwabStreamerQuoteMarketDataEvidence,
@@ -102,6 +116,7 @@ pub use streamer_publication::{
     SchwabStreamerQuoteRecordRequest, SchwabStreamerRecordDisposition,
     SchwabStreamerRecordDispositionReason,
 };
+pub use streamer_screener::{SchwabStreamerScreenerField, SchwabStreamerScreenerItem};
 pub use transport::{
     AccessTokenAdmission, AccessTokenGeneration, CapturedRestResponse, ExecutedRestResponse,
     InboundStreamerFrame, ProductionSchwabStreamerConnector, RawRestResponseReceipt,
@@ -114,12 +129,14 @@ pub use transport::{
     SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabSealedStreamerCapture,
     SchwabStreamerConnection, SchwabStreamerConnectionControl,
     SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
-    SchwabStreamerConnector, SchwabStreamerDesiredStateSendError, SchwabStreamerDesiredStateSender,
-    SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence, SchwabStreamerServiceResponseEvidence,
-    SchwabTransportError, SchwabTransportTelemetry, SchwabTransportTelemetrySnapshot,
-    SchwabUserPreferenceEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
-    StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit, StreamerTransportBounds,
-    TokenAuthorityError, TransientAccessToken,
+    SchwabStreamerConnectionPermit, SchwabStreamerConnector, SchwabStreamerDesiredStateSendError,
+    SchwabStreamerDesiredStateSender, SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence,
+    SchwabStreamerRequestAcknowledgement, SchwabStreamerRequestPermit,
+    SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent,
+    SchwabStreamerServiceResponseEvidence, SchwabTransportError, SchwabTransportTelemetry,
+    SchwabTransportTelemetrySnapshot, SchwabUserPreferenceEvidence, StreamerCaptureSink,
+    StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit,
+    StreamerTransportBounds, TokenAuthorityError, TransientAccessToken,
 };
 pub use vertical::{
     SchwabCapabilityCurrentness, SchwabFamilyDoctorInput, SchwabMarketDataDelay,

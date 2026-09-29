@@ -1045,7 +1045,10 @@ impl SchwabMarketDataDoctorObservation {
             return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
         }
         self.user_preference.validate()?;
-        if matches!(self.quote_delay, Some(CoverageDelay::Delayed(0))) {
+        if matches!(
+            self.quote_delay,
+            Some(CoverageDelay::Delayed(0) | CoverageDelay::NotApplicable | CoverageDelay::Unknown)
+        ) {
             return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
         }
         for (evidence, expected) in self.families.iter().zip(SCHWAB_MARKET_DATA_FAMILIES) {

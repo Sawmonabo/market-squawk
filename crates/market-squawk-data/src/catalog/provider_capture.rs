@@ -1,5 +1,10 @@
 //! Immutable provider raw observations and their canonical publication bindings.
 
+pub(super) mod metadata;
+pub(crate) use metadata::ProviderMetadataCaptureEvidence;
+pub(super) mod original;
+pub use original::ProviderCaptureOriginalReceipt;
+
 use std::collections::BTreeSet;
 
 use market_squawk_domain::{
@@ -403,6 +408,7 @@ impl PersistedProviderCaptureBindingEvidence {
 #[derive(Debug)]
 pub(crate) struct PreparedProviderCaptureBinding {
     pub(crate) evidence: PersistedProviderCaptureBindingEvidence,
+    pub(crate) metadata: Option<ProviderMetadataCaptureEvidence>,
 }
 
 /// Exact run-local physical output coordinate for one direct provider input.
@@ -623,7 +629,7 @@ impl PreparedProviderCaptureBinding {
             physical_claims,
         };
         evidence.verify_integrity()?;
-        Ok(Self { evidence })
+        Ok(Self { evidence, metadata: None })
     }
 
     pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
@@ -698,6 +704,444 @@ impl ProviderMacroPlanCompletionCapture {
 }
 
 impl Catalog {
+    /// Rejoins only coordinates emitted by the fixed PIT query, without scanning ancestor rows.
+    pub(crate) fn selected_provider_capture_rows(
+        &self,
+        selection: crate::analytical_read::SelectedProviderCaptureRows,
+        maximum_bytes: usize,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::ingest::SelectedProviderCaptureEvidence, CatalogError> {
+        use crate::ingest::{SelectedProviderCaptureBinding, SelectedProviderCaptureRowEvidence};
+        use std::{collections::BTreeMap, sync::Arc};
+        self.market_recovery_read(deadline, cancellation, || {
+            if selection.rows.is_empty() || selection.rows.len() > 32 || maximum_bytes == 0 {
+                return Err(CatalogError::ResultRowLimitExceeded);
+            }
+            let connection = &self.connection;
+            let manifest = &selection.manifest;
+            let generation: i64 = connection
+                .query_row(
+                    "SELECT generation_sequence FROM analytical_generations
+             WHERE dataset_id=?1 AND manifest_version=?2 AND schema_name=?3
+               AND schema_version=?4 AND schema_fingerprint=?5 AND content_hash=?6",
+                    params![
+                        manifest.dataset_id().as_str(),
+                        to_i64(manifest.manifest_version())?,
+                        manifest.schema().name(),
+                        i64::from(manifest.schema().version().get()),
+                        manifest.schema().fingerprint().as_slice(),
+                        manifest.content_hash().bytes()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(CatalogError::ProviderCaptureMismatch)?;
+            let mut headers =
+                BTreeMap::<[u8; 32], Arc<SelectedProviderCaptureBinding>>::new();
+            let mut claims =
+                BTreeMap::<[u8; 32], Arc<PersistedProviderCapturePhysicalClaim>>::new();
+            let mut seen = BTreeSet::new();
+            let mut retained_bytes = 0usize;
+            let mut charge = |bytes: usize| -> Result<(), CatalogError> {
+                retained_bytes = retained_bytes
+                    .checked_add(bytes)
+                    .ok_or(CatalogError::ResultByteLimitExceeded)?;
+                if retained_bytes > maximum_bytes.min(MAX_PROVIDER_NATIVE_BYTES) {
+                    return Err(CatalogError::ResultByteLimitExceeded);
+                }
+                Ok(())
+            };
+            charge(
+                selection.rows.len() * std::mem::size_of::<SelectedProviderCaptureRowEvidence>(),
+            )?;
+            let mut selected = Vec::new();
+            selected
+                .try_reserve_exact(selection.rows.len())
+                .map_err(|_| CatalogError::Allocation)?;
+            for coordinate in &selection.rows {
+                if coordinate.binding_digest.algorithm() != DigestAlgorithm::Sha256 {
+                    return Err(CatalogError::ProviderCaptureMismatch);
+                }
+                let binding_key = coordinate.binding_digest.bytes();
+                if !seen.insert((binding_key, coordinate.canonical_row_ordinal)) {
+                    return Err(CatalogError::ProviderCaptureMismatch);
+                }
+                let binding = if let Some(header) = headers.get(&binding_key) {
+                    Arc::clone(header)
+                } else {
+                    // Predicate joins the exact selected generation, including its already-retained
+                    // cumulative lineage, to the original binding. No ancestor walk is needed.
+                    let (capture_len, sidecar_len): (i64, i64) = connection
+                        .query_row(
+                            "SELECT length(raw.capture_json), COALESCE(length(native.batch_sidecar_payload),0)
+                     FROM analytical_generation_provider_capture_bindings AS selected
+                     JOIN provider_capture_bindings AS binding ON binding.binding_digest=selected.binding_digest
+                     JOIN provider_raw_observations AS raw ON raw.capture_observation_digest=binding.capture_observation_digest
+                     JOIN provider_capture_binding_native_lineage AS native ON native.binding_digest=binding.binding_digest
+                     WHERE selected.generation_sequence=?1 AND selected.binding_digest=?2 AND selected.source_id=?3",
+                            params![
+                                generation,
+                                digest_bytes(coordinate.binding_digest),
+                                selection.source_id.as_str()
+                            ],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?
+                        .ok_or(CatalogError::ProviderCaptureMismatch)?;
+                    let capture_len =
+                        usize::try_from(capture_len).map_err(|_| CatalogError::CorruptCatalog)?;
+                    let sidecar_len =
+                        usize::try_from(sidecar_len).map_err(|_| CatalogError::CorruptCatalog)?;
+                    if capture_len > MAX_PROVIDER_CLAIM_JSON_BYTES
+                        || sidecar_len > MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES
+                    {
+                        return Err(CatalogError::ResultByteLimitExceeded);
+                    }
+                    charge(
+                        capture_len
+                            .checked_add(sidecar_len)
+                            .ok_or(CatalogError::ResultByteLimitExceeded)?,
+                    )?;
+                    let (
+                        capture_json,
+                        content,
+                        count,
+                        version,
+                        implementation,
+                        fingerprint,
+                        row_count,
+                        batch_digest,
+                        sidecar,
+                        sidecar_digest,
+                    ): (
+                        String,
+                        Vec<u8>,
+                        i64,
+                        i64,
+                        String,
+                        Vec<u8>,
+                        i64,
+                        Vec<u8>,
+                        Option<Vec<u8>>,
+                        Option<Vec<u8>>,
+                    ) = connection.query_row(
+                        "SELECT raw.capture_json,binding.extraction_content_digest,binding.canonical_record_count,
+                            native.schema_version,native.implementation,native.schema_fingerprint,
+                            native.row_count,native.batch_digest,native.batch_sidecar_payload,native.batch_sidecar_digest
+                     FROM provider_capture_bindings AS binding
+                     JOIN provider_raw_observations AS raw ON raw.capture_observation_digest=binding.capture_observation_digest
+                     JOIN provider_capture_binding_native_lineage AS native ON native.binding_digest=binding.binding_digest
+                     WHERE binding.binding_digest=?1",
+                        [digest_bytes(coordinate.binding_digest)],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                                row.get(9)?,
+                            ))
+                        },
+                    )?;
+                    let capture: ProviderCaptureSetReceipt = serde_json::from_str(&capture_json)?;
+                    let count = usize::try_from(count).map_err(|_| CatalogError::CorruptCatalog)?;
+                    if count == 0
+                        || count > MAX_PROVIDER_CAPTURE_ROWS
+                        || row_count != count as i64
+                        || capture.source_id() != &selection.source_id
+                        || capture.observation_digest() != coordinate.capture_observation_digest
+                        || capture_json.len() != capture_len
+                        || sidecar.as_ref().map_or(0, Vec::len) != sidecar_len
+                        || sidecar.is_some() != sidecar_digest.is_some()
+                    {
+                        return Err(CatalogError::ProviderCaptureMismatch);
+                    }
+                    validate_retained_source_revisions(connection, &capture)?;
+                    let sidecar_digest = sidecar_digest
+                        .map(|digest| parse_digest(1, &digest))
+                        .transpose()?;
+                    if sidecar
+                        .as_ref()
+                        .zip(sidecar_digest)
+                        .is_some_and(|(bytes, digest)| sha256_evidence(bytes) != digest)
+                    {
+                        return Err(CatalogError::CorruptCatalog);
+                    }
+                    // Provider decoder verifies the complete batch commitment from its original
+                    // sidecar. Shared custody validates only the exact selected coordinates here.
+                    parse_native_implementation(&implementation)?;
+                    let header = Arc::new(SelectedProviderCaptureBinding {
+                        binding_digest: coordinate.binding_digest,
+                        capture,
+                        extraction_content_identity: parse_digest(1, &content)?,
+                        native: PersistedProviderNativeLineageSchema {
+                            version: u16::try_from(version)
+                                .map_err(|_| CatalogError::CorruptCatalog)?,
+                            implementation,
+                            fingerprint: parse_digest(1, &fingerprint)?,
+                            row_count: count,
+                            batch_digest: parse_digest(1, &batch_digest)?,
+                            batch_sidecar: sidecar,
+                            batch_sidecar_digest: sidecar_digest,
+                        },
+                    });
+                    headers.insert(binding_key, Arc::clone(&header));
+                    header
+                };
+                let native_len: i64 = connection
+                    .query_row(
+                        "SELECT length(native_semantic_payload) FROM provider_capture_binding_rows
+                 WHERE binding_digest=?1 AND canonical_row_ordinal=?2",
+                        params![
+                            digest_bytes(coordinate.binding_digest),
+                            i64::from(coordinate.canonical_row_ordinal)
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(CatalogError::ProviderCaptureMismatch)?;
+                let native_len =
+                    usize::try_from(native_len).map_err(|_| CatalogError::CorruptCatalog)?;
+                if native_len == 0
+                    || native_len > market_squawk_sources::MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES
+                {
+                    return Err(CatalogError::ResultByteLimitExceeded);
+                }
+                charge(native_len)?;
+                let row = connection.query_row(
+                    "SELECT canonical_record_digest,native_semantic_payload,native_semantic_digest,
+                        capture_page_ordinal,segment_ordinal,raw_claim_digest,physical_receipt_digest,
+                        physical_frame_ordinal,page_body_digest,received_at_ns,source_sequence,capture_observation_digest
+                 FROM provider_capture_binding_rows WHERE binding_digest=?1 AND canonical_row_ordinal=?2",
+                    params![
+                        digest_bytes(coordinate.binding_digest),
+                        i64::from(coordinate.canonical_row_ordinal)
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, Option<[u8; 8]>>(10)?,
+                            row.get::<_, Vec<u8>>(11)?,
+                        ))
+                    },
+                )?;
+                if parse_digest(1, &row.11)? != coordinate.capture_observation_digest {
+                    return Err(CatalogError::ProviderCaptureMismatch);
+                }
+                let row = PersistedProviderCaptureBindingRow {
+                    canonical_row_ordinal: coordinate.canonical_row_ordinal,
+                    canonical_row_digest: parse_digest(1, &row.0)?,
+                    native_semantic_payload: row.1,
+                    native_semantic_digest: parse_digest(1, &row.2)?,
+                    capture_page_ordinal: u16::try_from(row.3)
+                        .map_err(|_| CatalogError::CorruptCatalog)?,
+                    segment_ordinal: u16::try_from(row.4)
+                        .map_err(|_| CatalogError::CorruptCatalog)?,
+                    raw_claim_digest: parse_digest(1, &row.5)?,
+                    physical_receipt_digest: parse_digest(1, &row.6)?,
+                    physical_frame_ordinal: u32::try_from(row.7)
+                        .map_err(|_| CatalogError::CorruptCatalog)?,
+                    page_body_digest: parse_digest(1, &row.8)?,
+                    received_at: Timestamp::from_unix_nanos(row.9),
+                    source_sequence: parse_source_sequence(row.10),
+                };
+                if row.canonical_row_ordinal as usize >= binding.native.row_count()
+                    || row.canonical_row_digest != coordinate.canonical_row_digest
+                    || row.native_semantic_digest != coordinate.native_semantic_digest
+                    || row.capture_page_ordinal != coordinate.capture_page_ordinal
+                    || row.segment_ordinal != coordinate.segment_ordinal
+                    || row.physical_frame_ordinal != coordinate.physical_frame_ordinal
+                    || row.page_body_digest != coordinate.page_body_digest
+                    || row.native_semantic_payload.len() != native_len
+                    || sha256_evidence(&row.native_semantic_payload) != row.native_semantic_digest
+                {
+                    return Err(CatalogError::ProviderCaptureMismatch);
+                }
+                let physical = if let Some(claim) = claims.get(&row.raw_claim_digest.bytes()) {
+                    Arc::clone(claim)
+                } else {
+                    let claim_len: i64 = connection
+                        .query_row(
+                            "SELECT length(raw_claim_json) FROM sealed_raw_objects WHERE raw_claim_digest=?1 AND physical_receipt_digest=?2 AND raw_claim_kind='journal_segment'",
+                            params![
+                                digest_bytes(row.raw_claim_digest),
+                                digest_bytes(row.physical_receipt_digest)
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .ok_or(CatalogError::ProviderCaptureMismatch)?;
+                    let claim_len =
+                        usize::try_from(claim_len).map_err(|_| CatalogError::CorruptCatalog)?;
+                    if claim_len > MAX_PROVIDER_CLAIM_JSON_BYTES {
+                        return Err(CatalogError::ResultByteLimitExceeded);
+                    }
+                    charge(claim_len)?;
+                    let (content, observation, receipt, json): (Vec<u8>, Vec<u8>, Vec<u8>, String) =
+                        connection
+                            .query_row(
+                                "SELECT edge.object_capture_content_digest,edge.object_capture_observation_digest,edge.capture_receipt_digest,object.raw_claim_json
+                     FROM provider_capture_binding_objects AS selected
+                     JOIN provider_raw_observation_objects AS edge ON edge.capture_observation_digest=selected.capture_observation_digest
+                       AND edge.input_ordinal=selected.input_ordinal AND edge.raw_claim_digest=selected.raw_claim_digest
+                       AND edge.physical_receipt_digest=selected.physical_receipt_digest
+                     JOIN sealed_raw_objects AS object ON object.raw_claim_digest=edge.raw_claim_digest AND object.physical_receipt_digest=edge.physical_receipt_digest AND object.raw_claim_kind='journal_segment'
+                     WHERE selected.binding_digest=?1 AND selected.input_ordinal=?2 AND selected.raw_claim_digest=?3 AND selected.physical_receipt_digest=?4",
+                                params![
+                                    digest_bytes(coordinate.binding_digest),
+                                    i64::from(row.segment_ordinal),
+                                    digest_bytes(row.raw_claim_digest),
+                                    digest_bytes(row.physical_receipt_digest)
+                                ],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                            )
+                            .optional()?
+                            .ok_or(CatalogError::ProviderCaptureMismatch)?;
+                    if json.len() != claim_len
+                        || raw_claim_digest(json.as_bytes()) != row.raw_claim_digest
+                    {
+                        return Err(CatalogError::ProviderCaptureMismatch);
+                    }
+                    let physical = Arc::new(PersistedProviderCapturePhysicalClaim {
+                        raw_claim_digest: row.raw_claim_digest,
+                        capture_content_digest: parse_digest(1, &content)?,
+                        capture_observation_digest: parse_digest(1, &observation)?,
+                        sealed_capture_receipt_digest: parse_digest(1, &receipt)?,
+                        claim: parse_journal_claim(&json)?,
+                    });
+                    claims.insert(row.raw_claim_digest.bytes(), Arc::clone(&physical));
+                    physical
+                };
+                // Even cached claims must have this binding's exact relational edge.
+                let has_edge: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM provider_capture_binding_objects WHERE binding_digest=?1 AND input_ordinal=?2 AND raw_claim_digest=?3 AND physical_receipt_digest=?4)",
+                    params![
+                        digest_bytes(coordinate.binding_digest),
+                        i64::from(row.segment_ordinal),
+                        digest_bytes(row.raw_claim_digest),
+                        digest_bytes(row.physical_receipt_digest)
+                    ],
+                    |row| row.get(0),
+                )?;
+                let frame = physical
+                    .claim
+                    .frames()
+                    .get(row.physical_frame_ordinal as usize)
+                    .ok_or(CatalogError::ProviderCaptureMismatch)?;
+                let page = binding
+                    .capture
+                    .pages()
+                    .get(usize::from(row.capture_page_ordinal))
+                    .ok_or(CatalogError::ProviderCaptureMismatch)?;
+                if !has_edge
+                    || physical.claim.physical_receipt_digest() != row.physical_receipt_digest
+                    || frame.ordinal() != row.physical_frame_ordinal
+                    || frame.provider_payload_digest() != row.page_body_digest
+                    || frame.received_at() != row.received_at
+                    || frame.source_sequence() != row.source_sequence
+                    || page.ordinal() != row.capture_page_ordinal
+                    || page.body_digest() != row.page_body_digest
+                    || page.received_at() != row.received_at
+                {
+                    return Err(CatalogError::ProviderCaptureMismatch);
+                }
+                selected.push(SelectedProviderCaptureRowEvidence {
+                    stored_payload_digest: coordinate.observation_digest,
+                    binding,
+                    row,
+                    physical,
+                });
+            }
+            Ok(crate::ingest::SelectedProviderCaptureEvidence {
+                selection,
+                rows: selected.into_boxed_slice(),
+            })
+        })
+    }
+
+    /// Retains a separately verified macro reobservation without changing the original run.
+    ///
+    /// The ingest owner has compared the original canonical/native rows. This transaction
+    /// preserves exact physical evidence, current request rights, original custody consumption,
+    /// recovery capacity, and an audit relationship to the unchanged publication binding.
+    #[allow(clippy::too_many_arguments, reason = "exact replay retention keeps each authority explicit")]
+    pub(crate) fn retain_macro_reobservation(
+        &self,
+        reservation: &crate::IngestReservation,
+        original: &PersistedProviderCaptureBindingEvidence,
+        fresh: &PreparedProviderCaptureBinding,
+        grant: &crate::RegisteredRightsGrant,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), CatalogError> {
+        self.market_recovery_read(deadline, cancellation, || {
+            if reservation.catalog_id() != self.catalog_id || grant.catalog_id != self.catalog_id
+                || grant.payload_digest() != fresh.capture().content_digest()
+            {
+                return Err(CatalogError::InvalidRightsCapability);
+            }
+            let transaction = self.connection.unchecked_transaction()?;
+            let now = super::storage::trusted_catalog_now(&transaction)?;
+            let succeeded: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ingest_runs WHERE run_id=?1 AND state='succeeded'
+                 AND source_id=?2 AND payload_algorithm=1 AND payload_digest=?3 AND operation='persist')",
+                params![reservation.run_id().to_string(), fresh.source_id().as_str(), grant.payload_digest().bytes()],
+                |row| row.get(0),
+            )?;
+            let admitted: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM source_rights WHERE rights_id=?1 AND source_id=?2
+                 AND payload_algorithm=1 AND payload_digest=?3 AND (operation_mask & ?4)<>0
+                 AND admitted_at_ns<=?5 AND (authorization_expires_at_ns IS NULL OR authorization_expires_at_ns>?5))",
+                params![grant.rights_id(), fresh.source_id().as_str(), grant.payload_digest().bytes(),
+                    i64::from(crate::SourceOperation::Persist.mask()), now.unix_nanos()],
+                |row| row.get(0),
+            )?;
+            if !admitted { return Err(CatalogError::InvalidRightsCapability); }
+            if !succeeded || load_provider_capture_for_run(&transaction, reservation.run_id())?.as_ref() != Some(original)
+                || original.capture().content_digest() != fresh.capture().content_digest()
+            {
+                return Err(CatalogError::ProviderCaptureConflict);
+            }
+            if let Some(existing) = load_provider_capture_binding_evidence(&transaction, fresh.binding_digest())? {
+                let linked: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM audit_events WHERE event_type='provider-capture-binding.reobserved'
+                     AND subject_id=?1 AND details_digest=?2)",
+                    params![reservation.run_id().to_string(), fresh.binding_digest().bytes()],
+                    |row| row.get(0),
+                )?;
+                if existing != fresh.evidence || !linked {
+                    return Err(CatalogError::ProviderCaptureConflict);
+                }
+            } else {
+                retain_staged_provider_capture_binding(&transaction, fresh, now)?;
+                original::consume_for_publication(&transaction, &fresh.evidence)?;
+                // The run retains its immutable original binding; this event links the fresh
+                // binding without adding it to the canonical generation's creating inputs.
+                append_audit(&transaction, "provider-capture-binding.reobserved",
+                    &reservation.run_id().to_string(), fresh.binding_digest().bytes(), now)?;
+            }
+            if cancellation.is_cancelled() { return Err(CatalogError::MarketRecoveryReadCancelled); }
+            if std::time::Instant::now() >= deadline { return Err(CatalogError::MarketRecoveryReadDeadlineExceeded); }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
     /// Loads bounded historical evidence for one exact published binding.
     pub fn provider_capture_binding_evidence(
         &self,
@@ -770,6 +1214,10 @@ impl Catalog {
                 "SELECT raw_claim_digest, raw_claim_kind, raw_claim_json
                  FROM sealed_raw_objects
                  WHERE raw_claim_digest > ?1 AND (
+                     EXISTS (SELECT 1 FROM provider_capture_metadata_dependencies AS dependency
+                      JOIN ingest_run_provider_capture_bindings AS input ON input.metadata_dependency_digest=dependency.dependency_digest
+                      WHERE dependency.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND dependency.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest) OR EXISTS(SELECT 1 FROM provider_capture_originals AS original WHERE original.raw_claim_digest=sealed_raw_objects.raw_claim_digest) OR
                     EXISTS (
                       SELECT 1 FROM provider_capture_binding_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
@@ -793,6 +1241,12 @@ impl Catalog {
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
+                      SELECT 1 FROM provider_logical_original_objects AS object
+                      JOIN provider_logical_originals AS original
+                        ON original.coordinate_digest=object.coordinate_digest
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
                       SELECT 1 FROM provider_logical_publication_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
@@ -800,6 +1254,10 @@ impl Catalog {
                       SELECT 1 FROM provider_logical_publication_partitions AS partition
                       WHERE partition.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND partition.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1 FROM market_data_native_reference_captures AS capture
+                      WHERE capture.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND capture.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
                       SELECT 1 FROM official_options_reference_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
@@ -821,7 +1279,10 @@ impl Catalog {
             let mut statement = self.connection.prepare(
                 "SELECT raw_claim_digest, raw_claim_kind, raw_claim_json
                  FROM sealed_raw_objects
-                 WHERE EXISTS (
+                 WHERE EXISTS (SELECT 1 FROM provider_capture_metadata_dependencies AS dependency
+                      JOIN ingest_run_provider_capture_bindings AS input ON input.metadata_dependency_digest=dependency.dependency_digest
+                      WHERE dependency.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND dependency.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest) OR EXISTS(SELECT 1 FROM provider_capture_originals AS original WHERE original.raw_claim_digest=sealed_raw_objects.raw_claim_digest) OR EXISTS (
                       SELECT 1 FROM provider_capture_binding_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
@@ -844,6 +1305,12 @@ impl Catalog {
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
+                      SELECT 1 FROM provider_logical_original_objects AS object
+                      JOIN provider_logical_originals AS original
+                        ON original.coordinate_digest=object.coordinate_digest
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
                       SELECT 1 FROM provider_logical_publication_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
@@ -851,6 +1318,10 @@ impl Catalog {
                       SELECT 1 FROM provider_logical_publication_partitions AS partition
                       WHERE partition.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND partition.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1 FROM market_data_native_reference_captures AS capture
+                      WHERE capture.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND capture.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
                       SELECT 1 FROM official_options_reference_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
@@ -1012,6 +1483,10 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
             recorded_at,
         )?;
         let evidence = &binding.evidence;
+        if let Some(metadata) = binding.metadata.as_ref() {
+            metadata.validate_data(&evidence.capture)?;
+            metadata::retain(connection, metadata, recorded_at)?;
+        }
         let associated: bool = connection.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM ingest_run_provider_capture_bindings WHERE binding_digest=?1
@@ -1031,15 +1506,16 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
         let inserted = connection.execute(
             "INSERT INTO ingest_run_provider_capture_bindings
              (run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
-              binding_digest, source_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+              binding_digest, source_id, metadata_dependency_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 run_id.to_string(),
                 input_ordinal,
                 output_artifact_ordinal,
                 object_input_ordinal,
                 digest_bytes(evidence.binding_digest),
-                evidence.capture.source_id().as_str()
+                evidence.capture.source_id().as_str(),
+                binding.metadata.as_ref().map(|metadata| metadata.digest.bytes())
             ],
         )?;
         if inserted != 1 {
@@ -1051,6 +1527,7 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
                 WHERE run_id=?1 AND input_ordinal=?2
                   AND output_artifact_ordinal=?3 AND object_input_ordinal=?4
                   AND binding_digest=?5 AND source_id=?6
+                  AND metadata_dependency_digest IS ?7
              )",
             params![
                 run_id.to_string(),
@@ -1058,13 +1535,15 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
                 output_artifact_ordinal,
                 object_input_ordinal,
                 digest_bytes(evidence.binding_digest),
-                evidence.capture.source_id().as_str()
+                evidence.capture.source_id().as_str(),
+                binding.metadata.as_ref().map(|metadata| metadata.digest.bytes())
             ],
             |row| row.get(0),
         )?;
         if !exact_association {
             return Err(CatalogError::ProviderCaptureConflict);
         }
+        original::consume_for_publication(connection, evidence)?;
         append_audit(
             connection,
             "provider-capture-binding.retained",
@@ -1901,6 +2380,9 @@ pub(super) const fn native_implementation_name(
     implementation: ProviderNativeLineageImplementation,
 ) -> &'static str {
     match implementation {
+        ProviderNativeLineageImplementation::AlpacaCorporateActionsV1 => {
+            "alpaca_corporate_actions_v1"
+        }
         ProviderNativeLineageImplementation::AlpacaIexMarketDataV1 => "alpaca_iex_market_data_v1",
         ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1 => {
             "alpaca_indicative_options_v1"
@@ -1925,9 +2407,13 @@ pub(super) const fn native_implementation_name(
         }
         ProviderNativeLineageImplementation::SecEdgarV1 => "sec_edgar_v1",
         ProviderNativeLineageImplementation::AlpacaHistoricalBarV1 => "alpaca_historical_bar_v1",
+        ProviderNativeLineageImplementation::AlpacaCalendarV1 => "alpaca_calendar_v1",
         ProviderNativeLineageImplementation::SchwabRestMarketDataV1 => "schwab_rest_market_data_v1",
         ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1 => {
             "schwab_streamer_market_data_v1"
+        }
+        ProviderNativeLineageImplementation::TiingoCorporateActionsV1 => {
+            "tiingo_corporate_actions_v1"
         }
         ProviderNativeLineageImplementation::TiingoFundNavV1 => "tiingo_fund_nav_v1",
         ProviderNativeLineageImplementation::TiingoEodMarketBarV1 => "tiingo_eod_market_bar_v1",
@@ -1940,6 +2426,9 @@ pub(super) fn parse_native_implementation(
     value: &str,
 ) -> Result<ProviderNativeLineageImplementation, CatalogError> {
     match value {
+        "alpaca_corporate_actions_v1" => {
+            Ok(ProviderNativeLineageImplementation::AlpacaCorporateActionsV1)
+        }
         "alpaca_iex_market_data_v1" => {
             Ok(ProviderNativeLineageImplementation::AlpacaIexMarketDataV1)
         }
@@ -1965,6 +2454,7 @@ pub(super) fn parse_native_implementation(
             Ok(ProviderNativeLineageImplementation::NasdaqSymbolDirectoryV1)
         }
         "sec_edgar_v1" => Ok(ProviderNativeLineageImplementation::SecEdgarV1),
+        "alpaca_calendar_v1" => Ok(ProviderNativeLineageImplementation::AlpacaCalendarV1),
         "alpaca_historical_bar_v1" => {
             Ok(ProviderNativeLineageImplementation::AlpacaHistoricalBarV1)
         }
@@ -1973,6 +2463,9 @@ pub(super) fn parse_native_implementation(
         }
         "schwab_streamer_market_data_v1" => {
             Ok(ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1)
+        }
+        "tiingo_corporate_actions_v1" => {
+            Ok(ProviderNativeLineageImplementation::TiingoCorporateActionsV1)
         }
         "tiingo_fund_nav_v1" => Ok(ProviderNativeLineageImplementation::TiingoFundNavV1),
         "tiingo_eod_market_bar_v1" => Ok(ProviderNativeLineageImplementation::TiingoEodMarketBarV1),

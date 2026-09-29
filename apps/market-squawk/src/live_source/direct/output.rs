@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use market_squawk_adapter_coinbase::{
     CoinbaseDirectNonBookEvent, CoinbaseDirectOrderLevelPayload, CoinbaseDirectOrderLevelUpdate,
     CoinbaseDirectOutput, CoinbaseDirectOutputAdmission, CoinbaseDirectProductEvidence,
-    CoinbaseMarketFeed, CoinbaseMarketHandoff, CoinbaseMarketPhysicalCaptureIdentity,
-    CoinbaseMarketPublicationContext, CoinbaseMarketRawLineage,
+    CoinbaseDirectProductReferenceEvidence, CoinbaseMarketFeed, CoinbaseMarketHandoff,
+    CoinbaseMarketPhysicalCaptureIdentity, CoinbaseMarketPublicationContext,
+    CoinbaseMarketRawLineage,
 };
 use market_squawk_domain::{
     ChecksumEvidence, DataQuality, ProviderProduct, SequenceCapability, SequenceEvidence,
@@ -217,6 +218,26 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
         Ok(())
     }
 
+    fn try_publish_preflight_product(
+        &mut self,
+        evidence: &CoinbaseDirectProductReferenceEvidence,
+    ) -> Result<(), SinkError> {
+        if evidence.product() != &self.product {
+            return Err(self.fail(CoinbaseDirectOutputFailure::ProductMismatch));
+        }
+        if evidence.trading_status() != TradingStatus::Active
+            || evidence.trading_disabled()
+            || evidence.cancel_only()
+            || evidence.post_only()
+            || evidence.limit_only()
+            || evidence.auction_mode()
+        {
+            return Err(self.fail(CoinbaseDirectOutputFailure::ProductUnavailable));
+        }
+        self.product_active = true;
+        Ok(())
+    }
+
     fn try_publish_non_book(&mut self, event: CoinbaseDirectNonBookEvent) -> Result<(), SinkError> {
         let _captured = self.take_last_capture(event.evidence())?;
         Ok(())
@@ -269,6 +290,13 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
         Ok(())
     }
 
+    fn try_publish_snapshot_http(
+        &mut self,
+        batch: market_squawk_sources::NormalizedHttpResponseBatch,
+    ) -> Result<(), SinkError> {
+        self.sink.try_process_http_response_batch(batch)
+    }
+
     fn try_publish_order_level(
         &mut self,
         update: CoinbaseDirectOrderLevelUpdate<'_>,
@@ -284,15 +312,6 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
         };
         if captured.frame_id != update.decoder_evidence().frame_id() {
             return Err(self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch));
-        }
-        if matches!(
-            update.payload(),
-            CoinbaseDirectOrderLevelPayload::Snapshot { .. }
-        ) {
-            let batch = update
-                .try_snapshot_http_batch()
-                .map_err(|_error| self.fail(CoinbaseDirectOutputFailure::OrderLevelPublication))?;
-            self.sink.try_process_http_response_batch(batch)?;
         }
         let Some(ingress) = self.order_level.as_ref() else {
             return Err(self.fail(CoinbaseDirectOutputFailure::OrderLevelPublication));
@@ -337,20 +356,27 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
         if handoff.evidence().feed() != CoinbaseMarketFeed::ExchangeDirectFull {
             return Err(self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch));
         }
-        let CoinbaseMarketRawLineage::DirectInitial(lineage) = handoff.raw_lineage() else {
-            return Err(self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch));
+        let (frames, snapshot_id) = match handoff.raw_lineage() {
+            CoinbaseMarketRawLineage::DirectInitial(lineage) => (
+                lineage.replay(),
+                Some(*lineage.snapshot().receipt().event_id().as_bytes()),
+            ),
+            CoinbaseMarketRawLineage::DirectSuccessor(lineage) => (lineage.frames(), None),
+            CoinbaseMarketRawLineage::AdvancedTrade(_) => {
+                return Err(self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch));
+            }
         };
         let admission = self
             .replay_admission
             .ok_or_else(|| self.fail(CoinbaseDirectOutputFailure::ReplayAdmission))?;
         let mut captures = std::mem::take(&mut self.sequenced_captures);
         let captured_bytes = std::mem::replace(&mut self.sequenced_capture_bytes, 0);
-        if captures.len() != lineage.replay().len() {
+        if captures.len() != frames.len() {
             return Err(self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch));
         }
         let mut event_ids = Vec::new();
         event_ids
-            .try_reserve_exact(lineage.replay().len().saturating_add(1))
+            .try_reserve_exact(frames.len().saturating_add(1))
             .map_err(|_error| self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch))?;
         if event_ids.capacity() > admission.maximum_container_slots() {
             return Err(self.fail(CoinbaseDirectOutputFailure::ReplayAdmission));
@@ -358,7 +384,7 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
         let mut claimed_bytes = 0_usize;
         let mut connection_id = None;
         let mut terminal = None;
-        for replay in lineage.replay() {
+        for replay in frames {
             let mut matched = captures
                 .pop_front()
                 .ok_or_else(|| self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch))?;
@@ -401,12 +427,15 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
         {
             return Err(self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch));
         }
+        self.sequenced_captures = captures;
         let terminal_batch = handoff.typed_batch().clone();
         let terminal =
             terminal.ok_or_else(|| self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch))?;
         let connection_id = connection_id
             .ok_or_else(|| self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch))?;
-        event_ids.insert(0, *lineage.snapshot().receipt().event_id().as_bytes());
+        if let Some(snapshot_id) = snapshot_id {
+            event_ids.insert(0, snapshot_id);
+        }
         let physical =
             CoinbaseMarketPhysicalCaptureIdentity::try_new(*connection_id.as_bytes(), event_ids)
                 .map_err(|_error| self.fail(CoinbaseDirectOutputFailure::EvidenceMismatch))?;
@@ -421,7 +450,9 @@ impl CoinbaseDirectOutput for CoinbaseDirectProductOutput<'_, '_> {
             .try_submit_direct(handoff, context, observed_at)
             .map_err(|_input| self.fail(CoinbaseDirectOutputFailure::ReplayAdmission))?;
         self.sink
-            .try_process_captured_outcome(DecodeOutcome::Data(terminal_batch), terminal.receipt)
+            .try_process_captured_outcome(DecodeOutcome::Data(terminal_batch), terminal.receipt)?;
+        self.bootstrap_permit.take();
+        Ok(())
     }
 }
 

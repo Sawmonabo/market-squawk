@@ -2,31 +2,33 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    AggressorSide, HaltTransition, InstrumentId, IntegrityRule, SourceIdentifier, Timestamp,
-    VenueId,
+    AggressorSide, HaltTransition, InstrumentId, IntegrityRule, MarketDataReference,
+    SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
     DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction, DecoderEvidence,
     IgnoredFrameReason, MarketDecoder, ProviderAggressorEvidence, ProviderBookLevel,
-    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
-    ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
-    ProviderSnapshotEvidence, ProviderStatusEvidence, ProviderTimestampEvidence, QuarantineReason,
-    ResynchronizationReason, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
-    ValidatedRawMarketFrame,
+    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNativeInstrumentIdentity,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderStatusEvidence,
+    ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason, SourceMetadata,
+    SourceMetadataProvider, TransportFrameKind, ValidatedRawMarketFrame,
 };
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Number, Value};
 
+use crate::boot_snapshot::AlpacaIexBootSnapshotHandoff;
 use crate::config::{ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, IEX_VENUE, INDICATIVE_OPTIONS_VENUE};
+use crate::market_publication::{AlpacaMarketEventSurface, AlpacaPreparedMarketEventPublication};
 use crate::{AlpacaError, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig};
 
 const MAX_MESSAGES_PER_FRAME: usize = market_squawk_sources::MAX_DECODED_EVENTS;
 
 /// Stateful JSON decoder for one Alpaca IEX connection generation.
 #[derive(Clone, Debug)]
-pub struct AlpacaIexDecoder(AlpacaDecoder);
+pub struct AlpacaIexDecoder(AlpacaDecoder, Option<AlpacaIexBootSnapshotHandoff>);
 
 impl AlpacaIexDecoder {
     /// Constructs a decoder whose expected subscription exactly matches the admitted 30-symbol
@@ -35,15 +37,73 @@ impl AlpacaIexDecoder {
         let symbols = config
             .mappings()
             .iter()
-            .map(|mapping| (mapping.symbol().to_owned(), mapping.instrument()))
-            .collect::<Vec<_>>();
-        Ok(Self(AlpacaDecoder::try_new(
-            config.metadata(),
-            symbols,
-            VenueId::try_from(IEX_VENUE)?,
-            DecoderSurface::Iex,
-            config.transport_limits().max_frame_bytes(),
-        )?))
+            .map(|mapping| {
+                let native = mapping
+                    .native_identity()
+                    .ok_or(AlpacaError::InvalidCoverage)?;
+                Ok((
+                    mapping.symbol().to_owned(),
+                    mapping.instrument(),
+                    ProviderNativeInstrumentIdentity::new(
+                        native.namespace.clone(),
+                        native.provider_instrument_id.clone(),
+                        native.venue_symbol.clone(),
+                    ),
+                ))
+            })
+            .collect::<Result<Vec<_>, AlpacaError>>()?;
+        Ok(Self(
+            AlpacaDecoder::try_new(
+                config.metadata(),
+                symbols,
+                VenueId::try_from(IEX_VENUE)?,
+                DecoderSurface::Iex,
+                config.transport_limits().max_frame_bytes(),
+            )?,
+            None,
+        ))
+    }
+
+    pub(crate) fn install_boot_snapshot_handoff(&mut self, handoff: AlpacaIexBootSnapshotHandoff) {
+        self.1 = Some(handoff);
+    }
+
+    /// Decodes one validated IEX response/stream frame and, for data frames, prepares the exact
+    /// durable canonical/native publication without accepting caller-created events or JSON.
+    ///
+    /// The generic live outcome is returned beside the optional one-use publication so central
+    /// live processing and immutable publication consume the same decoder decision.
+    pub fn decode_for_publication(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+        definitions: &[MarketDataReference],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, DecodeInternalError> {
+        let surface = if self.0.state == SessionState::AwaitingBootSnapshot {
+            AlpacaMarketEventSurface::IexBootSnapshot
+        } else {
+            AlpacaMarketEventSurface::IexStream
+        };
+        let bootstrap = if surface == AlpacaMarketEventSurface::IexBootSnapshot {
+            self.1
+                .as_ref()
+                .map(|handoff| handoff.take(frame.frame()))
+                .transpose()
+                .map_err(|_| DecodeInternalError::InvariantViolation)?
+        } else {
+            None
+        };
+        let mut handoff = self.0.decode_for_publication(
+            frame,
+            TransportFrameKind::Text,
+            surface,
+            definitions,
+            ingested_at,
+        )?;
+        if let Some(publication) = &mut handoff.publication {
+            publication.bind_boot_snapshot(bootstrap);
+        }
+        Ok(handoff)
     }
 }
 
@@ -73,8 +133,21 @@ impl AlpacaOptionsDecoder {
         let symbols = config
             .mappings()
             .iter()
-            .map(|mapping| (mapping.symbol().to_owned(), mapping.instrument()))
-            .collect::<Vec<_>>();
+            .map(|mapping| {
+                let native = mapping
+                    .native_identity()
+                    .ok_or(AlpacaError::InvalidCoverage)?;
+                Ok((
+                    mapping.symbol().to_owned(),
+                    mapping.instrument(),
+                    ProviderNativeInstrumentIdentity::new(
+                        native.namespace.clone(),
+                        native.provider_instrument_id.clone(),
+                        native.venue_symbol.clone(),
+                    ),
+                ))
+            })
+            .collect::<Result<Vec<_>, AlpacaError>>()?;
         Ok(Self(AlpacaDecoder::try_new(
             config.metadata(),
             symbols,
@@ -82,6 +155,37 @@ impl AlpacaOptionsDecoder {
             DecoderSurface::IndicativeOptions,
             config.transport_limits().max_frame_bytes(),
         )?))
+    }
+
+    /// Decodes one validated indicative-options frame and, for data frames, prepares the exact
+    /// delayed/indicative durable publication without accepting caller-created events or JSON.
+    pub fn decode_for_publication(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+        definitions: &[MarketDataReference],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, DecodeInternalError> {
+        self.0.decode_for_publication(
+            frame,
+            TransportFrameKind::Binary,
+            AlpacaMarketEventSurface::IndicativeOptionsStream,
+            definitions,
+            ingested_at,
+        )
+    }
+}
+
+/// One-use result of a single stateful Alpaca decode at the publication boundary.
+#[derive(Debug)]
+pub struct AlpacaMarketDecodeHandoff {
+    live: DecodeOutcome,
+    publication: Option<AlpacaPreparedMarketEventPublication>,
+}
+
+impl AlpacaMarketDecodeHandoff {
+    /// Consumes the handoff into the generic live result and optional exact prepared publication.
+    pub fn into_parts(self) -> (DecodeOutcome, Option<AlpacaPreparedMarketEventPublication>) {
+        (self.live, self.publication)
     }
 }
 
@@ -120,6 +224,7 @@ enum SessionState {
 struct AlpacaDecoder {
     metadata: SourceMetadata,
     instruments: BTreeMap<String, InstrumentId>,
+    native_identities: BTreeMap<InstrumentId, ProviderNativeInstrumentIdentity>,
     expected_symbol_order: Box<[String]>,
     expected_symbols: BTreeSet<String>,
     venue: VenueId,
@@ -138,7 +243,7 @@ struct AlpacaDecoder {
 impl AlpacaDecoder {
     fn try_new(
         metadata: &SourceMetadata,
-        ordered_instruments: Vec<(String, InstrumentId)>,
+        ordered_instruments: Vec<(String, InstrumentId, ProviderNativeInstrumentIdentity)>,
         venue: VenueId,
         surface: DecoderSurface,
         max_frame_bytes: usize,
@@ -178,17 +283,27 @@ impl AlpacaDecoder {
             .ok_or(AlpacaError::Protocol)?;
         let expected_symbol_order = ordered_instruments
             .iter()
-            .map(|(symbol, _instrument)| symbol.clone())
+            .map(|(symbol, _instrument, _native)| symbol.clone())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let instruments = ordered_instruments.into_iter().collect::<BTreeMap<_, _>>();
-        if instruments.len() != expected_symbol_order.len() {
+        let native_identities = ordered_instruments
+            .iter()
+            .map(|(_symbol, instrument, native)| (*instrument, native.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let instruments = ordered_instruments
+            .into_iter()
+            .map(|(symbol, instrument, _native)| (symbol, instrument))
+            .collect::<BTreeMap<_, _>>();
+        if instruments.len() != expected_symbol_order.len()
+            || native_identities.len() != expected_symbol_order.len()
+        {
             return Err(AlpacaError::InvalidCoverage);
         }
         let expected_symbols = instruments.keys().cloned().collect();
         Ok(Self {
             metadata: metadata.clone(),
             instruments,
+            native_identities,
             expected_symbol_order,
             expected_symbols,
             venue,
@@ -289,6 +404,35 @@ impl AlpacaDecoder {
             ));
         }
         self.decode_data(messages, evidence)
+    }
+
+    fn decode_for_publication(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+        expected_transport: TransportFrameKind,
+        surface: AlpacaMarketEventSurface,
+        definitions: &[MarketDataReference],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, DecodeInternalError> {
+        let live = self.decode(frame, expected_transport)?;
+        let publication = match &live {
+            DecodeOutcome::Data(batch) => Some(
+                AlpacaPreparedMarketEventPublication::try_from_decoded(
+                    &self.metadata,
+                    surface,
+                    &self.instruments,
+                    batch,
+                    definitions,
+                    ingested_at,
+                )
+                .map_err(|_| DecodeInternalError::InvariantViolation)?,
+            ),
+            DecodeOutcome::Control(_)
+            | DecodeOutcome::Ignored(_)
+            | DecodeOutcome::Resynchronize(_)
+            | DecodeOutcome::Quarantine(_) => None,
+        };
+        Ok(AlpacaMarketDecodeHandoff { live, publication })
     }
 
     fn decode_boot_snapshot(
@@ -745,6 +889,10 @@ impl AlpacaDecoder {
             source_identifier,
             self.venue.clone(),
             input.instrument,
+            self.native_identities
+                .get(&input.instrument)
+                .cloned()
+                .ok_or(market_squawk_sources::DecodeError::InvalidProviderEvidence)?,
             ProviderTimestampEvidence::Provided {
                 value: input.timestamp,
                 rule: self.timestamp_rule.clone(),

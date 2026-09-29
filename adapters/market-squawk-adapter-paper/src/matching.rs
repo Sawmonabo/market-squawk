@@ -32,7 +32,13 @@ impl AvailableMarket {
         config: &PaperExecutionConfig,
     ) -> Result<Self, MatchingError> {
         let market = update.market();
-        if market.quality() != DataQuality::DirectVerified {
+        if market.quality()
+            != if market.is_virtual_paper() {
+                DataQuality::DirectUnverified
+            } else {
+                DataQuality::DirectVerified
+            }
+        {
             return Err(MatchingError::InvalidMarket);
         }
         let bids = copy_side(market, OrderSide::Sell)?;
@@ -65,7 +71,8 @@ impl AvailableMarket {
         update: ExecutionMarketUpdate,
         config: &PaperExecutionConfig,
     ) -> Result<MatchPlan, MatchingError> {
-        if order.terms != self.market.execution_terms()
+        if order.virtual_paper != self.market.is_virtual_paper()
+            || order.terms != self.market.execution_terms()
             || self.market.observed_at() < order.eligible_at
             || self.market.observed_at() > order.expires_at
         {

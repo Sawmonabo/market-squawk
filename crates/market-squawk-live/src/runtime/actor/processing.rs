@@ -269,8 +269,6 @@ impl ShardActor {
                     return Err(error.into());
                 }
             };
-            let row_count = cursor.remaining_len();
-            let mut wire_ordinal = 0usize;
             loop {
                 let applied = match owner
                     .processor
@@ -283,15 +281,8 @@ impl ShardActor {
                         return Err(error.into());
                     }
                 };
-                let disposition = process_applied_observation(
-                    &key,
-                    owner,
-                    applied,
-                    _retained_bytes,
-                    wire_ordinal,
-                    row_count,
-                )?;
-                wire_ordinal = wire_ordinal.saturating_add(1);
+                let disposition =
+                    process_applied_observation(&key, owner, applied, _retained_bytes)?;
                 feature_unavailable |= disposition.feature_unavailable;
                 action_failed |= disposition.action_failed;
                 qualified_market_export_dropped |= disposition.qualified_market_export_dropped;
@@ -328,8 +319,6 @@ fn process_applied_observation(
     owner: &mut RouteOwner,
     applied: AppliedLiveObservation,
     conservative_retained_bytes: u32,
-    wire_ordinal: usize,
-    row_count: usize,
 ) -> Result<AppliedObservationDisposition, ActorError> {
     if let Some(authority) = applied.authority.as_ref() {
         owner.processor.validate_applied_current(authority)?;
@@ -485,8 +474,10 @@ fn process_applied_observation(
                     applied.committed_state_revision,
                     applied.generation,
                     applied.source_evidence,
-                    wire_ordinal,
-                    row_count,
+                    applied.provider_identity,
+                    applied.source_authority,
+                    applied.row_ordinal,
+                    applied.row_count,
                     applied.stable_trade_id,
                 );
                 observation.is_none_or(|observation| {
@@ -522,6 +513,21 @@ fn event_received_at(event: &market_squawk_domain::MarketEvent) -> market_squawk
     match event {
         market_squawk_domain::MarketEvent::Trade(value) => value.provenance().received_at(),
         market_squawk_domain::MarketEvent::Quote(value) => value.provenance().received_at(),
+        market_squawk_domain::MarketEvent::MarketDataTrade(value) => {
+            value.provenance().received_at()
+        }
+        market_squawk_domain::MarketEvent::MarketDataQuote(value) => {
+            value.provenance().received_at()
+        }
+        market_squawk_domain::MarketEvent::MarketDataBook(value) => {
+            value.provenance().received_at()
+        }
+        market_squawk_domain::MarketEvent::MarketDataChart(value) => {
+            value.provenance().received_at()
+        }
+        market_squawk_domain::MarketEvent::MarketDataScreener(value) => {
+            value.provenance().received_at()
+        }
         market_squawk_domain::MarketEvent::BookSnapshot(value) => value.provenance().received_at(),
         market_squawk_domain::MarketEvent::BookDelta(value) => value.provenance().received_at(),
         market_squawk_domain::MarketEvent::Auction(value) => value.provenance().received_at(),

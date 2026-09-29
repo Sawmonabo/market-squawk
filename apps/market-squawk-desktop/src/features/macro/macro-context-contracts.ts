@@ -9,8 +9,12 @@ const outputTimestampSchema = timestampSchema.regex(
 const dateSchema = z.string().date().refine((value) => !value.startsWith("0000-"))
 const monthSchema = z.string().regex(/^[0-9]{4}-(?:0[1-9]|1[0-2])$/)
   .refine((value) => dateSchema.safeParse(`${value}-01`).success)
+const quarterSchema = z.string().regex(/^[0-9]{4}-Q[1-4]$/)
+  .refine((value) => !value.startsWith("0000-"))
+const yearSchema = z.string().regex(/^[0-9]{4}$/).refine((value) => value !== "0000")
 const decimalSchema = z.string().regex(/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/)
 const observedDecimalSchema = decimalSchema.regex(/^-?(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/)
+const rateDecimalSchema = decimalSchema.max(64)
 export const macroContextCutoffsSchema = z.union([
   z.object({ knowledgeCutoff: z.literal(""), effectiveDateCutoff: z.literal("") }).strict(),
   z
@@ -62,6 +66,8 @@ const indicatorIds = [
   "us-government-yield-30y",
   "us-unemployment-rate",
   "us-residential-electricity-price",
+  "california-beginning-quarter-employment",
+  "california-annual-personal-income",
 ] as const
 
 const indicatorCount = indicatorIds.length
@@ -70,18 +76,18 @@ const observationSchema = z
   .object({
     indicatorId: z.enum(indicatorIds),
     label: z.string().min(1).max(128),
-    category: z.enum(["interest_rates", "labor_market", "energy_prices"]),
-    frequency: z.enum(["business_daily", "monthly"]),
+    category: z.enum(["interest_rates", "labor_market", "energy_prices", "income"]),
+    frequency: z.enum(["business_daily", "monthly", "quarterly", "annual"]),
     seasonalAdjustment: z.enum(["not_applicable", "seasonally_adjusted", "not_supplied"]),
     unit: z
       .object({
-        code: z.enum(["percent_per_year", "percent_of_labor_force", "native_energy_price"]),
+        code: z.enum(["percent_per_year", "percent_of_labor_force", "native_energy_price", "persons", "native_income"]),
         label: z.string().min(1).max(32 * 1024),
         symbol: z.string().min(1).max(8).nullable(),
       })
       .strict(),
     effectiveDate: dateSchema.nullable(),
-    effectivePeriod: monthSchema.optional(),
+    effectivePeriod: z.union([monthSchema, quarterSchema, yearSchema]).optional(),
     recorded: recordedSchema,
     availableAt: outputTimestampSchema.nullable(),
     revision: z.number().int().positive().max(4_294_967_295).nullable(),
@@ -92,9 +98,56 @@ const observationSchema = z
   })
   .strict()
 
+const calendarDateCoordinateSchema = z
+  .object({
+    schema_version: z.literal(2),
+    coordinate: z
+      .object({
+        precision: z.literal("calendar_date"),
+        value: z
+          .object({
+            year: z.number().int().min(1).max(9999),
+            month: z.number().int().min(1).max(12),
+            day: z.number().int().min(1).max(31),
+          })
+          .strict()
+          .refine(({ year, month, day }) => dateSchema.safeParse(
+            `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
+          ).success, "The effective coordinate must be a valid calendar date."),
+      })
+      .strict(),
+  })
+  .strict()
+
+const investmentContextSchema = z.discriminatedUnion("availability", [
+  z.object({ availability: z.literal("unavailable") }).strict(),
+  z
+    .object({
+      availability: z.literal("available"),
+      curve: z.enum(["upward_sloping", "flat", "inverted", "mixed"]),
+      effective: calendarDateCoordinateSchema,
+      threeMonthToTenYearSpreadPercentagePoints: rateDecimalSchema,
+      twoYearToTenYearSpreadPercentagePoints: rateDecimalSchema,
+      governmentYieldReferences: z.tuple([
+        z.object({
+          maturityYears: z.literal(10),
+          annualPercent: rateDecimalSchema,
+          availableAt: outputTimestampSchema,
+        }).strict(),
+        z.object({
+          maturityYears: z.literal(30),
+          annualPercent: rateDecimalSchema,
+          availableAt: outputTimestampSchema,
+        }).strict(),
+      ]),
+    })
+    .strict(),
+])
+
 export const macroContextSchema = z
   .object({
     availability: z.enum(["available", "partial", "unavailable"]),
+    investmentContext: investmentContextSchema,
     selection: z
       .object({
         knowledgeCutoff: outputTimestampSchema,
@@ -132,25 +185,44 @@ export const macroContextSchema = z
           message: "Indicators must retain the canonical application order.",
         })
       }
-      const energy = index === indicatorCount - 1
+      const energy = index === 12
+      const employment = index === 13
+      const income = index === 14
+      const unemployment = index === 11
+      const laborMonth = unemployment && observation.effectivePeriod !== undefined
+      const periodBased = energy || employment || income || laborMonth
+      const quarterCutoff = completedQuarter(context.selection.effectiveDateCutoff)
+      const yearCutoff = completedYear(context.selection.effectiveDateCutoff)
       const interestRate = index < 11
-      const expectedCategory = index < 11 ? "interest_rates" : energy ? "energy_prices" : "labor_market"
-      const expectedFrequency = index < 11 ? "business_daily" : "monthly"
-      const expectedSeasonality = index < 11 ? "not_applicable" : energy ? "not_supplied" : "seasonally_adjusted"
-      const expectedUnit = index < 11 ? "percent_per_year" : energy ? "native_energy_price" : "percent_of_labor_force"
-      const expectedUnitLabel = interestRate ? "Percent per year" : "Percent of labor force"
+      const expectedCategory = interestRate ? "interest_rates" : energy ? "energy_prices" : income ? "income" : "labor_market"
+      const expectedFrequency = interestRate ? "business_daily" : employment ? "quarterly" : income ? "annual" : "monthly"
+      const expectedSeasonality = interestRate ? "not_applicable" : unemployment ? "seasonally_adjusted" : "not_supplied"
+      const expectedUnit = interestRate ? "percent_per_year" : energy ? "native_energy_price" : employment ? "persons" : income ? "native_income" : "percent_of_labor_force"
+      const expectedUnitLabel = interestRate ? "Percent per year" : employment ? "Persons" : "Percent of labor force"
       if (
         observation.category !== expectedCategory ||
         observation.frequency !== expectedFrequency ||
         observation.seasonalAdjustment !== expectedSeasonality ||
         observation.unit.code !== expectedUnit ||
-        (energy ? observation.unit.symbol !== null :
-          observation.unit.label !== expectedUnitLabel || observation.unit.symbol !== "%") ||
-        (energy ? observation.effectiveDate !== null : observation.effectivePeriod !== undefined) ||
-        (energy && observation.effectivePeriod !== undefined &&
-          (context.selection.effectiveMonthCutoff === null ||
+        (energy || income ? observation.unit.symbol !== null :
+          observation.unit.label !== expectedUnitLabel || observation.unit.symbol !== (employment ? null : "%")) ||
+        (income && (observation.label !== "California annual personal income" || observation.unit.label.length > 128)) ||
+        (periodBased ? observation.effectiveDate !== null : observation.effectivePeriod !== undefined) ||
+        (unemployment && (observation.availability === "unavailable"
+          ? observation.effectiveDate !== null || observation.effectivePeriod !== undefined
+          : !laborMonth && observation.effectiveDate === null)) ||
+        ((energy || laborMonth) && observation.effectivePeriod !== undefined &&
+          (!monthSchema.safeParse(observation.effectivePeriod).success ||
+            context.selection.effectiveMonthCutoff === null ||
             observation.effectivePeriod > context.selection.effectiveMonthCutoff)) ||
-        (energy && (observation.availability === "unavailable") !== (observation.effectivePeriod === undefined))
+        (employment && (observation.label !== "California beginning-of-quarter employment" ||
+          (observation.effectivePeriod !== undefined &&
+            (!quarterSchema.safeParse(observation.effectivePeriod).success || quarterCutoff === null ||
+              observation.effectivePeriod > quarterCutoff)))) ||
+        (income && observation.effectivePeriod !== undefined &&
+          (!yearSchema.safeParse(observation.effectivePeriod).success || yearCutoff === null ||
+            observation.effectivePeriod > yearCutoff)) ||
+        (periodBased && (observation.availability === "unavailable") !== (observation.effectivePeriod === undefined))
       ) {
         refinement.addIssue({
           code: "custom",
@@ -235,4 +307,19 @@ function completedMonth(date: string): string | null {
   if (!dateSchema.safeParse(`${date.slice(0, 7)}-${nextDay}`).success) return date.slice(0, 7)
   if (month > 1) return `${date.slice(0, 4)}-${String(month - 1).padStart(2, "0")}`
   return year > 1 ? `${String(year - 1).padStart(4, "0")}-12` : null
+}
+
+function completedQuarter(date: string): string | null {
+  const month = completedMonth(date)
+  if (month === null) return null
+  const year = Number(month.slice(0, 4))
+  const quarter = Math.floor(Number(month.slice(5, 7)) / 3)
+  if (quarter > 0) return `${month.slice(0, 4)}-Q${quarter}`
+  return year > 1 ? `${String(year - 1).padStart(4, "0")}-Q4` : null
+}
+
+function completedYear(date: string): string | null {
+  const year = Number(date.slice(0, 4))
+  if (date.slice(5) === "12-31") return date.slice(0, 4)
+  return year > 1 ? String(year - 1).padStart(4, "0") : null
 }

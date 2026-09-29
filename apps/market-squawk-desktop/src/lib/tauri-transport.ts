@@ -55,6 +55,7 @@ export function createDesktopTransport(): DesktopTransport {
 function productPort(transport: ProductTransport): ProductTransport {
   return Object.freeze({
     query: transport.query.bind(transport),
+    analyticalController: transport.analyticalController.bind(transport),
     modelProducts: transport.modelProducts.bind(transport),
     backtestProducts: transport.backtestProducts.bind(transport),
     datasetPreparation: transport.datasetPreparation.bind(transport),
@@ -63,6 +64,7 @@ function productPort(transport: ProductTransport): ProductTransport {
     researchExport: transport.researchExport.bind(transport),
     paperControl: transport.paperControl.bind(transport),
     manualPaper: transport.manualPaper.bind(transport),
+    recommendationSetup: transport.recommendationSetup.bind(transport),
   })
 }
 
@@ -72,7 +74,6 @@ function systemPort(transport: SystemTransport): SystemTransport {
     bootstrapService: transport.bootstrapService.bind(transport),
     installation: transport.installation.bind(transport),
     systemQuery: transport.systemQuery.bind(transport),
-    analyticalController: transport.analyticalController.bind(transport),
     researchControl: transport.researchControl.bind(transport),
     startBacktestFromFile: transport.startBacktestFromFile.bind(transport),
     modelControl: transport.modelControl.bind(transport),
@@ -138,7 +139,7 @@ class TauriTransport implements ProductTransport, SystemTransport {
   }
 
   async analyticalController(
-    request: Parameters<SystemTransport["analyticalController"]>[0],
+    request: Parameters<ProductTransport["analyticalController"]>[0],
     confirmed = false,
   ) {
     const value = await invoke("analytical_controller", { request, confirmed })
@@ -235,6 +236,27 @@ class TauriTransport implements ProductTransport, SystemTransport {
   async manualPaper(request: ManualPaperRequest, confirmed = false) {
     const value = await invoke("paper_control", { request, confirmed })
     return applicationResultSchema.parse(value)
+  }
+
+  async recommendationSetup(request: Parameters<ProductTransport["recommendationSetup"]>[0], confirmed = false) {
+    const actions = {
+      status: "getRecommendationSetup",
+      preview: "previewRecommendationSetup",
+      commit: "commitRecommendationSetup",
+    } as const
+    const value = await invoke("analysis_control", {
+      request: { ...request, action: actions[request.action] },
+      confirmed,
+    })
+    const result = nativeEvidenceApplicationResultSchema.parse(value)
+    return {
+      data: result.data,
+      metadata: {
+        completeness: result.metadata.completeness,
+        returnedItems: result.metadata.returnedItems,
+        availableItems: result.metadata.availableItems,
+      },
+    }
   }
 
   async jobControl(request: JobControlRequest, confirmed = false) {
@@ -463,6 +485,10 @@ class UnavailableBrowserTransport implements ProductTransport, SystemTransport {
   }
 
   manualPaper(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  recommendationSetup(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

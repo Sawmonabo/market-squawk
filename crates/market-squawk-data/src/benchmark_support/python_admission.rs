@@ -292,6 +292,7 @@ fn build_request(
         CorporateActionPolicy::new(CorporateActionAdjustment::Raw, NonZeroU32::MIN),
         MissingValuePolicy::Preserve,
         SourceIdentifier::try_from("release-dataset-builder-v1")?,
+        None,
     );
     let output_rows = example_count
         .checked_mul(2)

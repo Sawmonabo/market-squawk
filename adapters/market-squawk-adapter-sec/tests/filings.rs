@@ -5,15 +5,14 @@ mod bulk {
     use cap_std::{ambient_authority, fs::Dir};
     use market_squawk_adapter_sec::{
         RawEvidenceStore, SecBulkCapture, SecBulkCoverage, SecBulkError, SecBulkFamily,
-        SecBulkLayoutManifest, SecBulkMediaKind, SecBulkNativePublicationSession,
-        SecBulkParseLimits, SecBulkProjectionDisposition, SecBulkProviderProjection,
-        SecBulkQueryLimits, SecBulkRelatedRowsState, SecBulkSelection, SecBulkTableKind,
-        SecBulkTransportEvidence, SecBulkTypedValue, SecFundHoldingIdentityInput,
-        SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPendingLogicalRows,
-        SecFundPublicationScope, SecFundSecurityIdentifierKind, SecFundShareClassIdentityInput,
-        SecHttpValidators, SecPendingBulkLogicalPublication, SecQuarter, SecRepresentationLimits,
-        SecRepresentationRegistry, inspect_bulk_archive, query_nport_holding_supplements,
-        recover_bulk_archive, scan_bulk_archive, scan_bulk_archive_typed,
+        SecBulkLayoutManifest, SecBulkMediaKind, SecBulkParseLimits, SecBulkProjectionDisposition,
+        SecBulkProviderProjection, SecBulkSelection, SecBulkTableKind, SecBulkTransportEvidence,
+        SecBulkTypedValue, SecFundHoldingIdentityInput, SecFundIdentityAuthority,
+        SecFundPartitionAdmissions, SecFundPendingLogicalRows, SecFundPublicationScope,
+        SecFundSecurityIdentifierKind, SecFundShareClassIdentityInput, SecHttpValidators,
+        SecPendingBulkLogicalPublication, SecQuarter, SecRepresentationLimits,
+        SecRepresentationRegistry, inspect_bulk_archive, recover_bulk_archive,
+        scan_bulk_archive_typed,
     };
     use market_squawk_domain::{
         EvidenceDigest, ExactPayloadEvidence, FundEvidenceRecord, FundHoldingSecurityIdentity,
@@ -477,49 +476,6 @@ mod bulk {
             Err(SecBulkError::RelationalIntegrity)
         ));
 
-        let mut native = SecBulkNativePublicationSession::new(
-            &store,
-            manifest.clone(),
-            observed_at,
-            deadline,
-            cancellation.clone(),
-        )?;
-        scan_bulk_archive(
-            &store,
-            &manifest,
-            limits,
-            deadline,
-            &cancellation,
-            &mut native,
-        )?;
-        let native = native
-            .published_generation()
-            .cloned()
-            .ok_or(SecBulkError::PublicationNotReady)?;
-        let supplements = query_nport_holding_supplements(
-            &store,
-            &native,
-            &SourceIdentifier::try_from("0000000001-26-000001")?,
-            &SourceIdentifier::try_from("101")?,
-            SecBulkQueryLimits::try_new(1_000, 100)?,
-            deadline,
-            &cancellation,
-        )?;
-        assert_eq!(supplements.tables().len(), 19);
-        for table in [
-            SecBulkTableKind::NportIdentifiers,
-            SecBulkTableKind::NportDebtSecurity,
-        ] {
-            let related = supplements
-                .tables()
-                .iter()
-                .find(|related| related.table() == table)
-                .ok_or(SecBulkError::InvalidCanonicalMapping)?;
-            assert_eq!(related.state(), SecBulkRelatedRowsState::ReportedRows);
-            assert_eq!(related.rows().len(), 1);
-            assert_eq!(related.rows()[0].primary_key()[0].value(), "101");
-        }
-
         let (archive_admission, readme_admission) =
             SecPendingBulkLogicalPublication::logical_object_admissions(&manifest)?;
         let sealed = LocalPaths::prepare(root.join("nport-sealed-journal"))?
@@ -572,16 +528,19 @@ mod bulk {
             })
             .ok_or(SecBulkError::InvalidCanonicalMapping)?;
         assert_eq!(holding.holding_id().as_str(), "101");
+        assert_eq!(holding.supplements().len(), 18);
         for table in [
             FundSourceTable::NportIdentifiers,
             FundSourceTable::NportDebtSecurity,
         ] {
-            assert!(
+            assert_eq!(
                 holding
                     .lineage()
                     .rows()
                     .iter()
-                    .any(|row| row.table() == table)
+                    .filter(|row| row.table() == table)
+                    .count(),
+                1
             );
         }
         assert!(

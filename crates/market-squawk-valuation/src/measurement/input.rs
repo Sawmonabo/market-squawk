@@ -102,6 +102,7 @@ impl ValuationInput {
                 definition_revision: terms.definition_revision().get(),
                 activity_policy_hash: activity_policy.hash().bytes(),
                 activity_set_hash,
+                publication: None,
             },
             source_timestamp: selected.source_timestamp(),
             effective_at: None,
@@ -237,14 +238,14 @@ impl ValuationInput {
                 row: value.row(),
                 revision: value.component_version().get(),
             },
-            source_timestamp: Some(value.cutoff_at()),
-            effective_at: Some(value.cutoff_at()),
+            source_timestamp: Some(value.source_selection_as_of()),
+            effective_at: Some(value.source_selection_as_of()),
             published_at: None,
-            available_at: Some(value.cutoff_at()),
+            available_at: Some(value.source_selection_as_of()),
             received_at: None,
             qualification_evaluated_at: None,
             qualification_valid_until: None,
-            ingested_at: value.cutoff_at(),
+            ingested_at: value.source_selection_as_of(),
             verification: EvidenceVerification::Verified,
         })?;
         Ok(ValuationInputSpec {
@@ -419,6 +420,7 @@ impl ValuationInput {
     }
 
     fn try_from_validated_spec(spec: ValuationInputSpec) -> Result<Self, FairValueError> {
+        spec.evidence.validate_input_binding(&spec)?;
         let same = spec.subject_instrument_id == spec.reference_instrument_id;
         if same != (spec.relationship == InputInstrumentRelation::Identical) {
             return Err(FairValueError::InvalidInstrumentRelationship);

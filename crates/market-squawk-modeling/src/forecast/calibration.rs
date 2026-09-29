@@ -2,6 +2,7 @@
 
 use super::contracts::MAX_CALIBRATION_ASSUMPTION_BYTES;
 use super::*;
+use market_squawk_domain::{CalendarDate, ResearchTemporalCoordinate};
 
 /// Closed target coverage for the three product forecast bands.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -74,8 +75,7 @@ pub enum CalibrationMethod {
 /// Exact historical interval used for calibration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CalibrationWindow {
-    pub(super) start: Timestamp,
-    pub(super) end: Timestamp,
+    period: TrainingPeriod,
     pub(super) observations: NonZeroU32,
 }
 
@@ -86,27 +86,55 @@ impl CalibrationWindow {
         end: Timestamp,
         observations: NonZeroU32,
     ) -> Result<Self, ForecastError> {
-        if end <= start {
-            Err(ForecastError::InvalidCalibration)
-        } else {
-            Ok(Self {
-                start,
-                end,
-                observations,
-            })
-        }
+        let period =
+            TrainingPeriod::try_new(start, end).map_err(|_| ForecastError::InvalidCalibration)?;
+        Ok(Self {
+            period,
+            observations,
+        })
+    }
+
+    /// Admits a native calendar-date calibration interval.
+    pub fn try_fiscal(
+        start: CalendarDate,
+        end: CalendarDate,
+        observations: NonZeroU32,
+    ) -> Result<Self, ForecastError> {
+        let period = TrainingPeriod::try_fiscal(start, end)
+            .map_err(|_| ForecastError::InvalidCalibration)?;
+        Ok(Self {
+            period,
+            observations,
+        })
     }
 
     /// Inclusive calibration start.
     #[must_use]
-    pub const fn start(self) -> Timestamp {
-        self.start
+    pub const fn start(self) -> Option<Timestamp> {
+        self.period.start()
     }
 
     /// Exclusive calibration end.
     #[must_use]
-    pub const fn end(self) -> Timestamp {
-        self.end
+    pub const fn end(self) -> Option<Timestamp> {
+        self.period.end()
+    }
+
+    /// Exact fiscal bounds, with no assumed midnight.
+    pub const fn fiscal_bounds(self) -> Option<[CalendarDate; 2]> {
+        self.period.fiscal_bounds()
+    }
+    /// Inclusive economic start retaining its precision.
+    pub fn start_coordinate(self) -> ResearchTemporalCoordinate {
+        self.period.start_coordinate()
+    }
+    /// Exclusive economic end retaining its precision.
+    pub fn end_coordinate(self) -> ResearchTemporalCoordinate {
+        self.period.end_coordinate()
+    }
+    /// Whether all evaluated coordinates have ended by the actual clock.
+    pub fn ends_by(self, as_of: Timestamp) -> bool {
+        self.period.ends_by(as_of)
     }
 
     /// Admitted calibration observations.
@@ -116,13 +144,49 @@ impl CalibrationWindow {
     }
 }
 
-/// One target band expressed as finite offsets from each central point.
+/// Untouched evaluation of one already frozen model and interval policy.
+///
+/// This is deliberately absent from forecast-path calibration evidence. Its
+/// observations become usable only after the separate evaluation window ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CalibrationCoverageEvaluation {
+    window: CalibrationWindow,
+    realized: [RealizedCoverage; 3],
+}
+
+impl CalibrationCoverageEvaluation {
+    pub(crate) fn try_new(
+        window: CalibrationWindow,
+        realized: [RealizedCoverage; 3],
+    ) -> Result<Self, ForecastError> {
+        if realized
+            .iter()
+            .any(|item| item.total().get() != u64::from(window.observations().get()))
+        {
+            return Err(ForecastError::InvalidCalibration);
+        }
+        Ok(Self { window, realized })
+    }
+
+    /// Exact evaluation window, ending after all evaluated targets mature.
+    #[must_use]
+    pub const fn window(&self) -> CalibrationWindow {
+        self.window
+    }
+
+    /// Ordered observed 50/80/95 coverage counts, never future probabilities.
+    #[must_use]
+    pub const fn realized(&self) -> &[RealizedCoverage; 3] {
+        &self.realized
+    }
+}
+
+/// One fitted target band expressed as finite offsets from each central point.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CalibrationBand {
     pub(super) coverage: ForecastCoverage,
     pub(super) lower_offset: f64,
     pub(super) upper_offset: f64,
-    pub(super) realized: RealizedCoverage,
 }
 
 impl CalibrationBand {
@@ -131,7 +195,6 @@ impl CalibrationBand {
         coverage: ForecastCoverage,
         lower_offset: f64,
         upper_offset: f64,
-        realized: RealizedCoverage,
     ) -> Result<Self, ForecastError> {
         if !lower_offset.is_finite()
             || !upper_offset.is_finite()
@@ -145,7 +208,6 @@ impl CalibrationBand {
             coverage,
             lower_offset,
             upper_offset,
-            realized,
         })
     }
 
@@ -165,12 +227,6 @@ impl CalibrationBand {
     #[must_use]
     pub const fn upper_offset(self) -> f64 {
         self.upper_offset
-    }
-
-    /// Realized validation coverage observation.
-    #[must_use]
-    pub const fn realized(self) -> RealizedCoverage {
-        self.realized
     }
 }
 
@@ -322,6 +378,14 @@ impl CalibrationEvidence {
     }
 
     pub(super) fn matches(&self, metadata: &ModelMetadata, cutoff: Timestamp) -> bool {
+        self.matches_coordinate(metadata, &ResearchTemporalCoordinate::exact(cutoff))
+    }
+
+    pub(super) fn matches_coordinate(
+        &self,
+        metadata: &ModelMetadata,
+        cutoff: &ResearchTemporalCoordinate,
+    ) -> bool {
         self.model_id == metadata.model_id()
             && self.bundle_id == *metadata.bundle_id()
             && self.bundle_version == metadata.bundle_version()
@@ -339,7 +403,7 @@ impl CalibrationEvidence {
                     && admitted.bands() == &self.bands
                     && admitted.dependence_assumptions() == self.dependence_assumptions.as_ref()
             })
-            && self.window.end() <= cutoff
+            && self.window.period.ends_before_coordinate(cutoff)
     }
 }
 
@@ -380,8 +444,11 @@ fn digest_calibration_evidence(
         CalibrationMethod::MapieAci => 2,
         CalibrationMethod::ResidualQuantile => 3,
     }]);
-    hash.update(window.start().unix_nanos().to_be_bytes());
-    hash.update(window.end().unix_nanos().to_be_bytes());
+    for coordinate in [window.start_coordinate(), window.end_coordinate()] {
+        let bytes =
+            serde_json::to_vec(&coordinate).map_err(|_| ForecastError::InvalidCalibration)?;
+        update_bounded(&mut hash, &bytes)?;
+    }
     hash.update(window.observations().get().to_be_bytes());
     hash.update(policy_hash.bytes());
     hash.update(policy_size_bytes.to_be_bytes());
@@ -391,8 +458,6 @@ fn digest_calibration_evidence(
         hash.update(band.coverage().basis_points().to_be_bytes());
         hash.update(band.lower_offset().to_bits().to_be_bytes());
         hash.update(band.upper_offset().to_bits().to_be_bytes());
-        hash.update(band.realized().covered().to_be_bytes());
-        hash.update(band.realized().total().get().to_be_bytes());
     }
     update_bounded(&mut hash, assumptions.as_bytes())?;
     Ok(Sha256Digest::new(hash.finalize().into()))
@@ -406,4 +471,193 @@ fn update_bounded(hash: &mut Sha256, value: &[u8]) -> Result<(), ForecastError> 
     );
     hash.update(value);
     Ok(())
+}
+
+/// One empirical residual bin. Its mass comes from validation observations, never interval coverage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ForecastResidualMass {
+    offset: f64,
+    probability_ppm: NonZeroU32,
+    observations: NonZeroU32,
+}
+
+impl ForecastResidualMass {
+    /// Applies this admitted empirical residual under the forecast's fixed decimal policy.
+    pub fn apply_to(self, central: ForecastValue) -> Result<ForecastValue, ForecastError> {
+        central.checked_add_offset(self.offset)
+    }
+    /// Mean signed residual in this ordered empirical bin.
+    #[must_use]
+    pub const fn offset(self) -> f64 {
+        self.offset
+    }
+
+    /// Normalized empirical frequency in parts per million.
+    #[must_use]
+    pub const fn probability_ppm(self) -> NonZeroU32 {
+        self.probability_ppm
+    }
+
+    /// Number of distinct held-out examples contributing to this bin.
+    #[must_use]
+    pub const fn observations(self) -> NonZeroU32 {
+        self.observations
+    }
+}
+
+/// Bounded empirical predictive-error distribution from an admitted frozen direct estimator.
+///
+/// Validation residuals determine at most 32 equal-count bins and their means. Test residuals
+/// remain excluded from fitting both the model and this distribution. Empirical masses assume
+/// future errors resemble the retained validation cohort; they are not guaranteed probabilities.
+/// Model admission alone can construct this value, after verifying the complete calibration pair.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForecastResidualDistribution {
+    identity: Sha256Digest,
+    residuals_hash: Sha256Digest,
+    validation_observations: NonZeroU32,
+    masses: Box<[ForecastResidualMass]>,
+}
+
+impl ForecastResidualDistribution {
+    pub(crate) fn try_from_admitted_residuals(
+        residuals: &[u8],
+        validation_observations: usize,
+        residuals_hash: Sha256Digest,
+        training_run_hash: Sha256Digest,
+    ) -> Result<Self, ForecastError> {
+        let count = NonZeroU32::new(
+            u32::try_from(validation_observations)
+                .map_err(|_| ForecastError::InvalidCalibration)?,
+        )
+        .ok_or(ForecastError::InvalidCalibration)?;
+        let boundary = validation_observations
+            .checked_mul(size_of::<f64>())
+            .ok_or(ForecastError::InvalidCalibration)?;
+        if validation_observations < 2
+            || residuals_hash.bytes() == [0; 32]
+            || training_run_hash.bytes() == [0; 32]
+            || boundary >= residuals.len()
+            || residuals.len() > crate::MAX_FORECAST_RESIDUAL_BYTES
+            || !residuals.len().is_multiple_of(size_of::<f64>())
+            || <[u8; 32]>::from(Sha256::digest(residuals)) != residuals_hash.bytes()
+        {
+            return Err(ForecastError::InvalidCalibration);
+        }
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(validation_observations)
+            .map_err(|_| ForecastError::Capacity)?;
+        for chunk in residuals[..boundary].chunks_exact(size_of::<f64>()) {
+            let value = f64::from_le_bytes(
+                chunk
+                    .try_into()
+                    .map_err(|_| ForecastError::InvalidCalibration)?,
+            );
+            if !value.is_finite() {
+                return Err(ForecastError::InvalidCalibration);
+            }
+            ordered.push(value);
+        }
+        ordered.sort_unstable_by(f64::total_cmp);
+        let bins = ordered.len().min(32);
+        let mut masses: Vec<ForecastResidualMass> = Vec::new();
+        masses
+            .try_reserve_exact(bins)
+            .map_err(|_| ForecastError::Capacity)?;
+        let mut previous_mass = 0;
+        for bin in 0..bins {
+            let start = bin * ordered.len() / bins;
+            let end = (bin + 1) * ordered.len() / bins;
+            let observations = end - start;
+            // Divide before accumulation so a finite mean need not overflow its unscaled sum.
+            let offset = ordered[start..end]
+                .iter()
+                .try_fold(0.0, |total, value| {
+                    let next = total + *value / observations as f64;
+                    next.is_finite().then_some(next)
+                })
+                .ok_or(ForecastError::InvalidCalibration)?;
+            let cumulative = u32::try_from(
+                u64::try_from(end).map_err(|_| ForecastError::InvalidCalibration)? * 1_000_000
+                    / u64::from(count.get()),
+            )
+            .map_err(|_| ForecastError::InvalidCalibration)?;
+            let probability_ppm = NonZeroU32::new(cumulative - previous_mass)
+                .ok_or(ForecastError::InvalidCalibration)?;
+            previous_mass = cumulative;
+            let observations = NonZeroU32::new(
+                u32::try_from(observations).map_err(|_| ForecastError::InvalidCalibration)?,
+            )
+            .ok_or(ForecastError::InvalidCalibration)?;
+            // Preserve one support point for equal bin means, with the combined actual mass.
+            if let Some(previous) = masses.last_mut()
+                && previous.offset == offset
+            {
+                previous.probability_ppm =
+                    NonZeroU32::new(previous.probability_ppm.get() + probability_ppm.get())
+                        .ok_or(ForecastError::InvalidCalibration)?;
+                previous.observations =
+                    NonZeroU32::new(previous.observations.get() + observations.get())
+                        .ok_or(ForecastError::InvalidCalibration)?;
+            } else {
+                masses.push(ForecastResidualMass {
+                    offset,
+                    probability_ppm,
+                    observations,
+                });
+            }
+        }
+        if previous_mass != 1_000_000
+            || masses
+                .windows(2)
+                .any(|pair| pair[0].offset >= pair[1].offset)
+        {
+            return Err(ForecastError::InvalidCalibration);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/validation-residual-distribution/v1\0");
+        digest.update(residuals_hash.bytes());
+        digest.update(training_run_hash.bytes());
+        digest.update(count.get().to_be_bytes());
+        for mass in &masses {
+            digest.update(mass.offset.to_bits().to_be_bytes());
+            digest.update(mass.probability_ppm.get().to_be_bytes());
+            digest.update(mass.observations.get().to_be_bytes());
+        }
+        Ok(Self {
+            identity: Sha256Digest::new(digest.finalize().into()),
+            residuals_hash,
+            validation_observations: count,
+            masses: masses.into_boxed_slice(),
+        })
+    }
+
+    /// Exact versioned identity of the source residuals, training run, and discretization.
+    #[must_use]
+    pub const fn identity(&self) -> Sha256Digest {
+        self.identity
+    }
+
+    /// Source calibration residual member, including the separately retained test partition.
+    #[must_use]
+    pub const fn residuals_hash(&self) -> Sha256Digest {
+        self.residuals_hash
+    }
+
+    /// Number of validation examples determining empirical frequencies.
+    #[must_use]
+    pub const fn validation_observations(&self) -> NonZeroU32 {
+        self.validation_observations
+    }
+
+    /// Ordered empirical support, whose positive masses sum exactly to one million.
+    #[must_use]
+    pub fn masses(&self) -> &[ForecastResidualMass] {
+        &self.masses
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.masses.len() * size_of::<ForecastResidualMass>()
+    }
 }

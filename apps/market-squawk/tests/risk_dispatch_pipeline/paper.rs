@@ -1,5 +1,5 @@
 use super::*;
-use market_squawk_adapter_paper::PaperCheckpointRepository;
+use market_squawk_adapter_paper::{PaperCheckpointRepository, PaperPortfolioReplay};
 use market_squawk_platform::LocalPaths;
 
 const PAPER_ORDER_COUNT: usize = 6;
@@ -322,7 +322,9 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         maximum_latency_nanos: 0,
         cancel_latency_nanos: 1_000_000,
         maximum_mark_age_nanos: 60_000_000_000,
-        day_session_calendar: session_calendar,
+        session_policy: market_squawk_adapter_paper::PaperExecutionSessionPolicy::Venue(
+            session_calendar,
+        ),
         maximum_participation_basis_points: 10_000,
         impact_basis_points_per_level: 0,
         reporting_currency: usd,
@@ -598,6 +600,35 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let persistence =
         checkpoint_repository.persist_with_replay(&durable_checkpoint, &durable_replay)?;
     let persistence_authority = dispatcher.persistence_acknowledgement()?;
+    // A later genuine mark makes this read differ from the issued persistence checkpoint.
+    // Portfolio publication must leave the original receipt's issuance binding intact.
+    let (_, portfolio_mark) = source.batch_with_price("paper-portfolio-mark", 7, "98.00")?;
+    ingress.try_publish(portfolio_mark)?;
+    paper_market.wait_for(7).await?;
+    let portfolio_checkpoint = paper_adapter.portfolio_checkpoint(paper_control()?).await?;
+    assert!(portfolio_checkpoint.sequence() > durable_checkpoint.sequence());
+    assert_ne!(
+        portfolio_checkpoint.recovery_digest()?,
+        durable_checkpoint.recovery_digest()?
+    );
+    let portfolio_replay =
+        PaperPortfolioReplay::capture(&portfolio_checkpoint, &paper_config, 1024 * 1024)?;
+    let portfolio_bytes = portfolio_replay.encode(1024 * 1024)?;
+    let reopened_portfolio = PaperPortfolioReplay::decode(&portfolio_bytes, 1024 * 1024)?;
+    assert_eq!(
+        reopened_portfolio.checkpoint_digest(),
+        portfolio_checkpoint.recovery_digest()?
+    );
+    assert_eq!(reopened_portfolio.snapshot(), portfolio_replay.snapshot());
+    assert_eq!(
+        reopened_portfolio.snapshot(),
+        &paper_adapter.snapshot(paper_control()?).await?
+    );
+    assert_eq!(
+        reopened_portfolio.available_cash(account_id, usd)?,
+        portfolio_replay.available_cash(account_id, usd)?
+    );
+    reopened_portfolio.verify_action_plan(None)?;
     paper_adapter
         .acknowledge_persistence(persistence_authority, persistence)
         .await?;
@@ -779,7 +810,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         90,
         &initial_portfolio_revision,
     )?)?;
-    let (_, subsequent) = source.batch_with_price("paper-subsequent-order", 7, "97.00")?;
+    let (_, subsequent) = source.batch_with_price("paper-subsequent-order", 8, "97.00")?;
     ingress.try_publish(subsequent)?;
     accepted_digests.insert(
         order_ids[5],
@@ -792,10 +823,10 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         .and_then(|bounds| bounds.get(&order_ids[5]).copied())
         .ok_or("final sell approval did not propagate its execution-price bound")?;
     let (_, above_bound) =
-        source.two_sided_book_delta_at_prices("paper-above-bound-book", 8, "120.00", "121.00")?;
+        source.two_sided_book_delta_at_prices("paper-above-bound-book", 9, "120.00", "121.00")?;
     assert!(PriceTicks::new(12_000) > maximum_execution_price);
     ingress.try_publish(above_bound)?;
-    paper_market.wait_for(8).await?;
+    paper_market.wait_for(9).await?;
     let subsequent_barrier = paper_adapter.snapshot(paper_control()?).await?;
     let subsequent_order = subsequent_barrier
         .orders()

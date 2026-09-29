@@ -75,13 +75,18 @@ pub(crate) struct MacroProviderPeriodLatestKnownOutput {
 
 impl MacroProviderPeriodLatestKnownOutput {
     /// Returns the exact manifest-only selector proven reopenable before the typed read.
-    pub(crate) const fn restart_selector(&self) -> &ProviderMacroPlanRestartSelector {
-        self.live.read().restart_selector()
+    pub(crate) fn restart_selector(&self) -> ProviderMacroPlanRestartSelector {
+        self.live.publication().restart_selector()
     }
 
     /// Returns canonical macro rows with provider period, missingness, and exact clocks preserved.
-    pub(crate) const fn canonical(&self) -> &AnalyticalMacroProviderPeriodLatestKnownOutput {
-        self.live.read().output()
+    pub(crate) fn canonical(&self) -> Option<&AnalyticalMacroProviderPeriodLatestKnownOutput> {
+        self.live.read().map(|read| read.output())
+    }
+
+    /// Retains the exact requested cutoffs when the committed generation is incomplete there.
+    pub(crate) const fn state(&self) -> &crate::application::BlsMacroCapabilityState {
+        self.live.state()
     }
 
     /// Returns the exact whole-plan publication identity retained by the neutral operation.
@@ -257,6 +262,80 @@ impl ProviderAdapterActivation {
         Ok((replacement, activation))
     }
 
+    /// Uses the existing whole-plan publisher after explicit source activation. The read cutoff
+    /// is the trusted request-start clock; newly observed rows may honestly be absent at it.
+    pub(crate) async fn publish_bls_macro(
+        &self,
+        context: &RequestContext,
+    ) -> Result<MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodOperationError> {
+        use chrono::Datelike as _;
+        let now = chrono::Utc::now();
+        let knowledge = Timestamp::from_unix_nanos(
+            now.timestamp_nanos_opt()
+                .ok_or(MacroProviderPeriodOperationError::Unavailable)?,
+        );
+        let remaining = context
+            .deadline()
+            .checked_duration_since(Instant::now())
+            .ok_or(MacroProviderPeriodOperationError::Unavailable)?;
+        let provider_deadline = Timestamp::from_unix_nanos(
+            knowledge
+                .unix_nanos()
+                .checked_add(
+                    i64::try_from(remaining.as_nanos())
+                        .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?,
+                )
+                .ok_or(MacroProviderPeriodOperationError::Unavailable)?,
+        );
+        let period = ResearchPeriod::try_new(
+            market_squawk_domain::SourceIdentifier::try_from("bls-monthly")
+                .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?,
+            u16::try_from(now.year())
+                .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?,
+            std::num::NonZeroU16::new(
+                u16::try_from(now.month())
+                    .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?,
+            )
+            .ok_or(MacroProviderPeriodOperationError::Unavailable)?,
+            market_squawk_domain::SourceIdentifier::try_from(format!("M{:02}", now.month()))
+                .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?,
+        )
+        .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?;
+        let series = AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(vec![
+            market_squawk_domain::SourceIdentifier::try_from("LNS14000000")
+                .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?,
+        ])
+        .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?;
+        let limits = QueryLimits::try_new_with_inline_bytes(
+            32,
+            4 * 1024 * 1024,
+            4 * 1024 * 1024,
+            64 * 1024 * 1024,
+            4,
+            2048,
+            4096,
+            remaining.min(std::time::Duration::from_secs(60)),
+        )
+        .map_err(|_| MacroProviderPeriodOperationError::Unavailable)?;
+        self.execute_macro_provider_period_latest_known(
+            MacroProviderPeriodLatestKnownRequest::new(
+                provider_deadline,
+                provider_deadline,
+                context.deadline(),
+                NonZeroU32::new(100_000).ok_or(MacroProviderPeriodOperationError::Unavailable)?,
+                NonZeroU64::new(32 * 1024 * 1024)
+                    .ok_or(MacroProviderPeriodOperationError::Unavailable)?,
+                series,
+                knowledge,
+                period,
+                limits,
+                context.deadline(),
+            ),
+            context,
+        )
+        .await
+    }
+
     /// Executes the neutral canonical macro operation against the exact current BLS source.
     pub(crate) async fn execute_macro_provider_period_latest_known(
         &self,
@@ -284,7 +363,8 @@ impl ProviderAdapterActivation {
         let live = activation
             .runtime()
             .publish_and_read(request.live, context)
-            .await?;
+            .await
+            .inspect_err(|error| error.record_diagnostic())?;
         Ok(MacroProviderPeriodLatestKnownOutput { live })
     }
 }

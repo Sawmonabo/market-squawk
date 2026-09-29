@@ -1045,6 +1045,52 @@ impl ListingReferenceReadCapability {
             )
     }
 
+    /// Requires the exact retained generation to remain current in the publication catalog.
+    ///
+    /// The caller already holds the catalog writer lock through publication. This check uses
+    /// that borrowed authority without locking this reader again, preserves the reader's exact
+    /// dataset/source binding, and revalidates current display rights and source metadata.
+    pub fn require_current_in_catalog(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &ListingReferenceGenerationReceipt,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ListingReferenceError> {
+        canonical::check_operation(deadline, cancellation)?;
+        let current = catalog.current_listing_reference_generation(
+            &self.dataset,
+            &self.source_id,
+            deadline,
+            cancellation,
+        )?;
+        canonical::check_operation(deadline, cancellation)?;
+        if current.as_ref() != Some(expected) {
+            return Err(ListingReferenceError::SupersededGeneration);
+        }
+        Ok(())
+    }
+
+    /// Checks exact retained generation under an already held catalog authority.
+    pub(crate) fn require_retained_generation_in_catalog(
+        catalog: &CatalogAuthority,
+        expected: &ListingReferenceGenerationReceipt,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ListingReferenceError> {
+        canonical::check_operation(deadline, cancellation)?;
+        let actual = catalog.current_listing_reference_generation(
+            expected.dataset(),
+            expected.source_id(),
+            deadline,
+            cancellation,
+        )?;
+        if actual.as_ref() != Some(expected) {
+            return Err(ListingReferenceError::SupersededGeneration);
+        }
+        canonical::check_operation(deadline, cancellation)
+    }
+
     /// Searches the current official directory without creating tradable instruments.
     pub fn search(
         &self,
@@ -1072,9 +1118,32 @@ impl ListingReferenceReadCapability {
                 &self.source_id,
                 query,
                 maximum_rows,
+                None,
                 deadline,
                 cancellation,
             )
+    }
+
+    /// Selects one exact native symbol and venue in the current authorized directory.
+    /// Unrelated discovery matches do not participate; two exact matches fail closed.
+    pub fn exact_current(
+        &self,
+        symbol: &str,
+        venue: &VenueId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ListingReferenceRecord>, ListingReferenceError> {
+        if symbol.is_empty() || symbol.len() > MAX_SEARCH_QUERY_BYTES || symbol.chars().any(char::is_control) {
+            return Err(ListingReferenceError::InvalidInput);
+        }
+        canonical::check_operation(deadline, cancellation)?;
+        let page = self.authority.try_lock()
+            .map_err(|_| ListingReferenceError::AuthorityUnavailable)?
+            .search_listing_references(
+                &self.dataset, &self.source_id, symbol, 1, Some(venue), deadline, cancellation,
+            )?;
+        if page.has_more() { return Err(ListingReferenceError::CorruptCatalog); }
+        Ok(page.matches.into_vec().pop().map(|matched| matched.record))
     }
 
     /// Enumerates one immutable current or point-in-time generation in canonical row order.
@@ -1117,6 +1186,50 @@ impl ListingReferenceReadCapability {
     reason = "bounded read coordinates and authority evidence stay explicit"
 )]
 fn read_listing_reference_memberships(
+    authority: &CatalogAuthority,
+    dataset: &SourceIdentifier,
+    source_id: &SourceId,
+    selection: ListingReferenceGenerationSelection,
+    after: Option<&ListingReferenceMembershipCursor>,
+    maximum_rows: usize,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<ListingReferenceMembershipPage, ListingReferenceError> {
+    canonical::check_operation(deadline, cancellation)?;
+    let connection = &authority.catalog().connection;
+    let busy: u32 = connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+    connection.busy_timeout(std::time::Duration::ZERO)?;
+    let token = cancellation.clone();
+    let install = connection.progress_handler(
+        SQLITE_PROGRESS_OPERATIONS,
+        Some(move || token.is_cancelled() || Instant::now() >= deadline),
+    );
+    let result = (|| {
+        install?;
+        read_listing_reference_memberships_inner(
+            authority,
+            dataset,
+            source_id,
+            selection,
+            after,
+            maximum_rows,
+            deadline,
+            cancellation,
+        )
+    })();
+    let progress_cleanup = connection.progress_handler::<fn() -> bool>(0, None);
+    let busy_cleanup = connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy)));
+    canonical::check_operation(deadline, cancellation)?;
+    progress_cleanup?;
+    busy_cleanup?;
+    classify_membership_operation(result, deadline, cancellation)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "same bounded listing read parameters"
+)]
+fn read_listing_reference_memberships_inner(
     authority: &CatalogAuthority,
     dataset: &SourceIdentifier,
     source_id: &SourceId,
@@ -1200,11 +1313,6 @@ fn read_listing_reference_memberships(
     }
     canonical::check_operation(deadline, cancellation)?;
 
-    let token = cancellation.clone();
-    connection.progress_handler(
-        SQLITE_PROGRESS_OPERATIONS,
-        Some(move || token.is_cancelled() || Instant::now() >= deadline),
-    )?;
     let result = (|| {
         let retrieval_limit = maximum_rows
             .checked_add(1)
@@ -1287,8 +1395,7 @@ fn read_listing_reference_memberships(
             receipt,
         })
     })();
-    connection.progress_handler::<fn() -> bool>(0, None)?;
-    classify_membership_operation(result, deadline, cancellation)
+    result
 }
 
 fn require_membership_read_authority(
@@ -1917,4 +2024,79 @@ pub enum ListingReferenceError {
     Storage(#[from] rusqlite::Error),
     #[error("listing-reference source metadata serialization failed")]
     Serialization(#[from] serde_json::Error),
+}
+
+impl CatalogAuthority {
+    /// Registers the source's explicit cohort grant through the existing rights registry.
+    /// The caller holds the sole catalog authority; SQLite work remains deadline controlled.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact source and grant admission coordinates"
+    )]
+    pub(crate) fn admit_listing_research_source(
+        &self,
+        source: &SourceMetadata,
+        registered_at: Timestamp,
+        rights: crate::RightsDecisionInput,
+        uses: crate::ResearchUseSet,
+        evidence: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<RegisteredRightsGrant, crate::IngestError> {
+        use crate::{CatalogError, IngestError};
+        let check = || -> Result<(), IngestError> {
+            if cancellation.is_cancelled() {
+                return Err(IngestError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(IngestError::DeadlineExceeded);
+            }
+            Ok(())
+        };
+        check()?;
+        let connection = &self.catalog().connection;
+        let busy: u32 = connection
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .map_err(CatalogError::from)?;
+        connection
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(CatalogError::from)?;
+        let token = cancellation.clone();
+        let install = connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        );
+        let result = (|| {
+            install.map_err(CatalogError::from)?;
+            check()?;
+            if self
+                .source(source.source_id())?
+                .as_ref()
+                .is_none_or(|current| current != source)
+            {
+                self.register_source(source, registered_at)?;
+            }
+            check()?;
+            let expiry = rights.authorization_expires_at;
+            let grant = self.admit_source_rights(rights)?;
+            check()?;
+            let input =
+                crate::ResearchUseGrantInput::try_new(grant.rights_id(), uses, evidence, expiry)
+                    .map_err(|e| IngestError::ResearchUse(Box::new(e)))?;
+            self.admit_research_use_grant(input)
+                .map_err(|e| IngestError::ResearchUse(Box::new(e)))?;
+            check()?;
+            Ok(grant)
+        })();
+        let progress_cleanup = connection
+            .progress_handler::<fn() -> bool>(0, None)
+            .map_err(CatalogError::from);
+        let busy_cleanup = connection
+            .busy_timeout(std::time::Duration::from_millis(u64::from(busy)))
+            .map_err(CatalogError::from);
+        check()?;
+        progress_cleanup?;
+        busy_cleanup?;
+        result
+    }
 }

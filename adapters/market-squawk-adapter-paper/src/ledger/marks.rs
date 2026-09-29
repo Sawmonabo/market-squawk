@@ -17,6 +17,7 @@ pub(super) struct PaperMarkInput {
     pub(super) venue_digest: [u8; 32],
     pub(super) connection_generation: ConnectionGeneration,
     pub(super) quality: DataQuality,
+    pub(super) virtual_paper: bool,
     pub(super) event_class: LiveEventClass,
     pub(super) assessment_digest: [u8; 32],
     pub(super) observed_at: Timestamp,
@@ -27,11 +28,12 @@ pub(super) struct PaperMarkInput {
 /// Exact current executable-exit evidence retained independently of order matching state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct PaperMarkEvidence {
+pub struct PaperMarkEvidence {
     terms: InstrumentExecutionTerms,
     venue_digest: [u8; 32],
     connection_generation: ConnectionGeneration,
     quality: DataQuality,
+    virtual_paper: bool,
     event_class: LiveEventClass,
     assessment_digest: [u8; 32],
     observed_at: Timestamp,
@@ -47,8 +49,22 @@ pub(crate) enum PaperMarkDisposition {
 }
 
 impl PaperMarkEvidence {
+    /// Retains simulation purpose independently of the source quality.
+    pub const fn is_virtual_paper(self) -> bool {
+        self.virtual_paper
+    }
+    pub const fn quality(self) -> DataQuality {
+        self.quality
+    }
+
     pub(super) fn try_new(input: PaperMarkInput) -> Result<Self, PaperLedgerError> {
-        if input.quality != DataQuality::DirectVerified
+        if input.quality
+            != if input.virtual_paper {
+                DataQuality::DirectUnverified
+            } else {
+                DataQuality::DirectVerified
+            }
+            || (input.virtual_paper && input.event_class != LiveEventClass::Quote)
             || !matches!(
                 input.event_class,
                 LiveEventClass::Trade
@@ -70,6 +86,7 @@ impl PaperMarkEvidence {
             venue_digest: input.venue_digest,
             connection_generation: input.connection_generation,
             quality: input.quality,
+            virtual_paper: input.virtual_paper,
             event_class: input.event_class,
             assessment_digest: input.assessment_digest,
             observed_at: input.observed_at,
@@ -83,7 +100,7 @@ impl PaperMarkEvidence {
         self.terms.instrument_id()
     }
 
-    pub(super) fn try_from_update(update: ExecutionMarketUpdate) -> Result<Self, PaperLedgerError> {
+    pub(crate) fn try_from_update(update: ExecutionMarketUpdate) -> Result<Self, PaperLedgerError> {
         let market = update.market();
         let best_bid = market
             .best_bid()
@@ -98,6 +115,7 @@ impl PaperMarkEvidence {
             venue_digest: update.venue_digest(),
             connection_generation: update.connection_generation(),
             quality: market.quality(),
+            virtual_paper: market.is_virtual_paper(),
             event_class: update.event_class(),
             assessment_digest: update.assessment_digest(),
             observed_at: market.observed_at(),
@@ -106,8 +124,31 @@ impl PaperMarkEvidence {
         })
     }
 
-    pub(super) const fn observed_at(self) -> Timestamp {
+    pub const fn execution_terms(self) -> InstrumentExecutionTerms {
+        self.terms
+    }
+    pub const fn best_bid(self) -> PriceTicks {
+        self.best_bid
+    }
+    pub const fn best_ask(self) -> PriceTicks {
+        self.best_ask
+    }
+    pub const fn evidence_digest(self) -> [u8; 32] {
+        self.digest
+    }
+    pub const fn observed_at(self) -> Timestamp {
         self.observed_at
+    }
+
+    pub(super) fn validate_successor(self, previous: Self) -> Result<(), PaperLedgerError> {
+        if previous.terms != self.terms || previous.venue_digest != self.venue_digest
+            || previous.virtual_paper != self.virtual_paper {
+            return Err(PaperLedgerError::InvalidMark);
+        }
+        if self.connection_generation < previous.connection_generation || self.observed_at < previous.observed_at {
+            return Err(PaperLedgerError::MarkRegression);
+        }
+        Ok(())
     }
 
     pub(super) fn validate_recovered(self) -> Result<(), PaperLedgerError> {
@@ -116,6 +157,7 @@ impl PaperMarkEvidence {
             venue_digest: self.venue_digest,
             connection_generation: self.connection_generation,
             quality: self.quality,
+            virtual_paper: self.virtual_paper,
             event_class: self.event_class,
             assessment_digest: self.assessment_digest,
             observed_at: self.observed_at,
@@ -166,7 +208,10 @@ impl PaperLedger {
             return Err(PaperLedgerError::Capacity);
         }
         if let Some(current) = self.marks.get(&instrument_id).copied() {
-            if current.terms != mark.terms || current.venue_digest != mark.venue_digest {
+            if current.terms != mark.terms
+                || current.venue_digest != mark.venue_digest
+                || current.virtual_paper != mark.virtual_paper
+            {
                 return Err(PaperLedgerError::InvalidMark);
             }
             if mark.connection_generation < current.connection_generation
@@ -203,6 +248,30 @@ impl PaperLedger {
             self.accounts.insert(account_id, account);
         }
         Ok(PaperMarkDisposition::Applied)
+    }
+
+    pub(super) fn refresh_action_marks(
+        &mut self,
+        valued_at: Timestamp,
+        maximum_mark_age_nanos: u64,
+    ) -> Result<(), PaperLedgerError> {
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve_exact(self.accounts.len())
+            .map_err(|_| PaperLedgerError::Capacity)?;
+        for (id, account) in &self.accounts {
+            let image = self
+                .calculate_account_marks(*id, *account, valued_at, maximum_mark_age_nanos, None)?
+                .ok_or(PaperLedgerError::StaleMark)?;
+            replacements.push((
+                *id,
+                account_with_image(*account, account.revision, Some(image))?,
+            ));
+        }
+        for (id, account) in replacements {
+            self.accounts.insert(id, account);
+        }
+        Ok(())
     }
 
     pub(super) fn compact_unused_marks(&mut self) {
@@ -250,7 +319,9 @@ impl PaperLedger {
     ) -> Result<Option<MarkedAccountImage>, PaperLedgerError> {
         let zero = Money::new(rust_decimal::Decimal::ZERO, account.currency);
         let mut exposure = zero;
-        let mut unrealized = zero;
+        // Accrued cash is economic P&L until the genuine retained payable boundary.
+        // Spendable cash and settled capital remain independent.
+        let mut unrealized = self.unpaid_action_cash(account_id, account.currency)?;
         let mut aggregate = Sha256::new();
         aggregate.update(b"market-squawk/paper-account-marks/v1\0");
         aggregate.update(account_id.as_uuid().as_bytes());
@@ -391,6 +462,7 @@ fn validate_fresh(
 fn mark_digest(input: PaperMarkInput) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/paper-executable-mark/v1\0");
+    digest.update([u8::from(input.virtual_paper)]);
     digest.update(input.terms.instrument_id().as_uuid().as_bytes());
     digest.update(input.terms.definition_revision().get().to_be_bytes());
     digest_decimal(&mut digest, input.terms.price_tick().as_decimal());
@@ -422,6 +494,8 @@ const fn event_class_tag(event_class: LiveEventClass) -> u8 {
         LiveEventClass::TradingHalt => 5,
         LiveEventClass::InstrumentStatus => 6,
         LiveEventClass::CorporateAction => 7,
+        LiveEventClass::Chart => 8,
+        LiveEventClass::Screener => 9,
     }
 }
 
@@ -517,6 +591,7 @@ mod tests {
                     venue_digest: [6; 32],
                     connection_generation: ConnectionGeneration::new(1)?,
                     quality: DataQuality::DirectVerified,
+                    virtual_paper: false,
                     event_class: LiveEventClass::Quote,
                     assessment_digest: [5; 32],
                     observed_at: Timestamp::from_unix_nanos(999),
@@ -535,6 +610,7 @@ mod tests {
             venue_digest: [7; 32],
             connection_generation: ConnectionGeneration::new(2)?,
             quality: DataQuality::DirectVerified,
+            virtual_paper: false,
             event_class: LiveEventClass::BookDelta,
             assessment_digest: [8; 32],
             observed_at: Timestamp::from_unix_nanos(999),
@@ -559,6 +635,7 @@ mod tests {
             venue_digest: [7; 32],
             connection_generation: ConnectionGeneration::new(1)?,
             quality: DataQuality::DirectVerified,
+            virtual_paper: false,
             event_class: LiveEventClass::BookDelta,
             assessment_digest: [9; 32],
             observed_at: Timestamp::from_unix_nanos(1_000),

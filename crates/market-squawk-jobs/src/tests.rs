@@ -134,7 +134,7 @@ impl JobRunner for PublicationRaceRunner {
         Ok(JobCompletion::Published(self.result.clone(), published))
     }
 
-    fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
         if self.publication_unresolved {
             JobRecoveryDisposition::ReconciliationRequired
         } else {
@@ -166,7 +166,7 @@ impl JobRunner for StartSignalRunner {
         Ok(JobCompletion::Cancelled)
     }
 
-    fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
         JobRecoveryDisposition::MarkInterrupted
     }
 }
@@ -197,7 +197,7 @@ impl JobRunner for HeldRunner {
         Err(JobRunError::Failed(self.failure.clone()))
     }
 
-    fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
         JobRecoveryDisposition::MarkInterrupted
     }
 }
@@ -286,6 +286,13 @@ async fn jobs_backup_retains_the_mutation_cut_and_restores_by_replay() -> Result
     let source_temp = TempDir::new()?;
     let repository = repository(&source_temp).await?;
     let spec = job_spec("product-backup")?;
+    let cancelled_start = JobStartBinding::new(
+        spec.origin().clone(),
+        RequestId::Integer(99),
+        source("Model.StartPreparedForecast")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [12; 32]),
+    );
+    repository.cancel_start(&cancelled_start).await?;
     let (started_tx, started_rx) = oneshot::channel();
     let runner = Arc::new(HeldRunner {
         kind: spec.kind().clone(),
@@ -341,6 +348,10 @@ async fn jobs_backup_retains_the_mutation_cut_and_restores_by_replay() -> Result
     let config = JobRepositoryConfig::try_new(Duration::from_millis(250), 16)?;
     SqliteJobRepository::restore_fresh(restored_location.clone(), config, &encoded).await?;
     let restored = SqliteJobRepository::open(restored_location, config).await?;
+    assert_eq!(
+        restored.reconcile_start(&cancelled_start).await?.state(),
+        JobStartState::NotAdmitted
+    );
     let interrupted =
         recover_one(&restored, runner.as_ref(), Timestamp::from_unix_nanos(22)).await?;
     assert_eq!(interrupted.state(), JobState::Interrupted);
@@ -594,9 +605,78 @@ async fn lifecycle_rejects_illegal_transitions_and_stale_sequences() -> Result<(
 async fn cancellation_survives_disconnect_and_publishes_one_terminal_state() -> Result<(), TestError>
 {
     let temp = TempDir::new()?;
-    let spec = job_spec("dataset-build")?;
     let store = repository(&temp).await?;
+    let original = job_spec("dataset-build")?;
+    let binding = JobStartBinding::new(
+        original.origin().clone(),
+        original.request_id().clone(),
+        source("Analysis.StartPreparedFeatureDatasetBuild")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [41; 32]),
+    );
+    let JobStartAdmission::Execute(permit) = store.begin_start(&binding).await? else {
+        return Err("first original request did not acquire admission".into());
+    };
+    let spec = AdmittedJobSpec::try_new(
+        permit.id(),
+        original.generation(),
+        original.kind().clone(),
+        original.origin().clone(),
+        original.request_id().clone(),
+        original.input().clone(),
+        original.authority().clone(),
+        original.attempt_limit(),
+        original.admitted_at(),
+    )?;
     let queued = store.create(&spec).await?;
+    // A lost start acknowledgement must reconcile the original input, never create a second job.
+    let JobStartAdmission::Existing(replay) = store.begin_start(&binding).await? else {
+        return Err("duplicate original request acquired a second admission".into());
+    };
+    assert_eq!(replay.snapshot(), Some(&queued));
+    let conflict = JobStartBinding::new(
+        binding.origin().clone(),
+        binding.request_id().clone(),
+        binding.operation().clone(),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [42; 32]),
+    );
+    assert!(matches!(
+        store.begin_start(&conflict).await,
+        Err(JobRepositoryError::Conflict)
+    ));
+    let other_client = JobStartBinding::new(
+        JobOrigin::new(source("workspace-primary")?, source("other-client")?),
+        binding.request_id().clone(),
+        binding.operation().clone(),
+        binding.arguments_digest(),
+    );
+    assert_eq!(
+        store.reconcile_start(&other_client).await?.state(),
+        JobStartState::Unknown
+    );
+    let stopped = JobStartBinding::new(
+        binding.origin().clone(),
+        RequestId::Integer(8),
+        binding.operation().clone(),
+        binding.arguments_digest(),
+    );
+    assert_eq!(
+        store.cancel_start(&stopped).await?.state(),
+        JobStartState::NotAdmitted
+    );
+    assert!(
+        matches!(store.begin_start(&stopped).await?, JobStartAdmission::Existing(state)
+        if state.state() == JobStartState::NotAdmitted)
+    );
+    let unfinished = JobStartBinding::new(
+        binding.origin().clone(),
+        RequestId::Integer(9),
+        binding.operation().clone(),
+        binding.arguments_digest(),
+    );
+    let JobStartAdmission::Execute(unfinished_permit) = store.begin_start(&unfinished).await?
+    else {
+        return Err("unfinished request did not acquire admission".into());
+    };
     let cancelling = store
         .request_cancellation(
             spec.id(),
@@ -609,6 +689,30 @@ async fn cancellation_survives_disconnect_and_publishes_one_terminal_state() -> 
     drop(store);
 
     let reopened = repository(&temp).await?;
+    assert_eq!(
+        reopened.reconcile_start(&binding).await?.snapshot(),
+        Some(&cancelling)
+    );
+    assert_eq!(
+        reopened.reconcile_start(&unfinished).await?.state(),
+        JobStartState::NotAdmitted
+    );
+    // The old permit cannot resurrect a request fenced by restart, cancellation, or lost ACK.
+    let late = AdmittedJobSpec::try_new(
+        unfinished_permit.id(),
+        original.generation(),
+        original.kind().clone(),
+        unfinished.origin().clone(),
+        unfinished.request_id().clone(),
+        original.input().clone(),
+        original.authority().clone(),
+        original.attempt_limit(),
+        original.admitted_at(),
+    )?;
+    assert_eq!(
+        reopened.create(&late).await,
+        Err(JobRepositoryError::Conflict)
+    );
     let persisted = reopened.get(spec.id(), spec.generation()).await?;
     assert_eq!(persisted, cancelling);
     assert!(persisted.cancellation_requested());
@@ -650,7 +754,7 @@ impl JobRunner for RetryRunner {
         Err(JobRunError::Cancelled)
     }
 
-    fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
         JobRecoveryDisposition::RetryFromImmutableInput
     }
 }

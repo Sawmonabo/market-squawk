@@ -205,6 +205,8 @@ pub(in crate::policy) struct BudgetAllocation {
     pub(in crate::policy) state: Mutex<BudgetState>,
     pub(in crate::policy) clock: Arc<dyn BudgetClock>,
     pub(in crate::policy) availability_generation: AtomicU64,
+    // Process-local revocation for established transports; request capacity is separate.
+    pub(in crate::policy) transport_generation: AtomicU64,
     pub(in crate::policy) provider_rate_state_version: AtomicU64,
     pub(in crate::policy) terminal: AtomicBool,
     pub(in crate::policy) durability: Option<BudgetDurabilityBinding>,

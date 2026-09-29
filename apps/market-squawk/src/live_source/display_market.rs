@@ -9,6 +9,8 @@
 #[path = "display_runtime.rs"]
 pub(crate) mod runtime;
 
+mod equity_paper;
+
 use std::{
     mem::size_of,
     num::{NonZeroU32, NonZeroUsize},
@@ -26,9 +28,10 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp, TradeTakerOrderType, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
-    CoverageHealth, CurrentDecodedProviderBatch, CurrentProviderObservation,
-    CurrentSourceAuthorityLease, FrameId, FreshnessPolicy, ProviderBookLevel,
-    ProviderDecimalLexeme, ProviderObservationPayload, ProviderTimestampEvidence, RegistryError,
+    CoverageHealth, CurrentDecodedProviderBatch, CurrentProviderIdentity,
+    CurrentProviderObservation, CurrentSourceAuthorityLease, FrameId, FreshnessPolicy,
+    ProviderBookLevel, ProviderDecimalLexeme, ProviderObservationPayload,
+    ProviderTimestampEvidence, RegistryError,
 };
 use rust_decimal::Decimal;
 use thiserror::Error;
@@ -260,8 +263,16 @@ pub(crate) enum DisplayMarketIntegrityFailure {
     BatchIdentity,
     #[error("observation identity or current authority differs from its batch")]
     ObservationIdentity,
-    #[error("frame, stream, coverage, or metadata identity is inconsistent")]
-    ProvenanceMismatch,
+    #[error("observations in one display batch have different frame identities")]
+    MixedFrameIdentities,
+    #[error("display scope identity mismatch: {0}")]
+    ScopeIdentityMismatch(&'static str),
+    #[error("display frame receive time is later than its validation time")]
+    FutureFrame,
+    #[error("display frame receive time precedes its coverage interval")]
+    BeforeCoverageInterval,
+    #[error("display frame receive time exceeds its coverage interval")]
+    AfterCoverageInterval,
     #[error("observation payload is not a supported quote, trade, or status event")]
     UnsupportedPayload,
     #[error("source object is not applicable to the live display projection")]
@@ -488,6 +499,7 @@ impl DisplayDecimal {
 pub(crate) struct DisplayQuoteSide {
     price: DisplayDecimal,
     quantity: DisplayDecimal,
+    accumulated: Option<Box<market_squawk_sources::ProviderAccumulatedQuoteEvidence>>,
 }
 
 impl DisplayQuoteSide {
@@ -499,10 +511,17 @@ impl DisplayQuoteSide {
         &self.quantity
     }
 
+    pub(crate) fn accumulated_evidence(
+        &self,
+    ) -> Option<&market_squawk_sources::ProviderAccumulatedQuoteEvidence> {
+        self.accumulated.as_deref()
+    }
+
     fn try_from_provider(level: &ProviderBookLevel) -> Result<Self, ProjectionError> {
         Ok(Self {
             price: DisplayDecimal::try_from_provider(level.price().value())?,
             quantity: DisplayDecimal::try_from_provider(level.quantity().value())?,
+            accumulated: level.accumulated_evidence().cloned().map(Box::new),
         })
     }
 
@@ -510,13 +529,19 @@ impl DisplayQuoteSide {
         Ok(Self {
             price: self.price.try_clone()?,
             quantity: self.quantity.try_clone()?,
+            accumulated: self.accumulated.clone(),
         })
     }
 
     fn retained_bytes(&self) -> Option<usize> {
         self.price
             .retained_bytes()
-            .checked_add(self.quantity.retained_bytes())
+            .checked_add(self.quantity.retained_bytes())?
+            .checked_add(
+                self.accumulated
+                    .as_ref()
+                    .map_or(Some(0), |value| value.retained_bytes().ok())?,
+            )
     }
 }
 
@@ -819,10 +844,18 @@ pub(crate) struct DisplayMarketSnapshotLease {
     quote: Option<DisplayMarketReadObservation>,
     status: Option<DisplayMarketReadObservation>,
     terminal_failure: Option<DisplayMarketTerminalFailure>,
+    virtual_paper: Option<market_squawk_live::virtual_paper::VirtualPaperSourceLease>,
     _ticket: ReadBudgetTicket,
 }
 
 impl DisplayMarketSnapshotLease {
+    /// Consumes the real actor read lease while retaining only its opaque simulation source proof.
+    pub(crate) fn into_virtual_paper(
+        self,
+    ) -> Option<market_squawk_live::virtual_paper::VirtualPaperSourceLease> {
+        self.virtual_paper.map(|source| source.retain(self._ticket))
+    }
+
     pub(crate) fn key(&self) -> &DisplayMarketKey {
         &self.key
     }
@@ -934,6 +967,7 @@ struct ReadBudgetTicket {
 
 #[derive(Debug)]
 struct ReadCommand {
+    include_virtual_paper: bool,
     at: Timestamp,
     response: oneshot::Sender<Result<DisplayMarketSnapshotLease, DisplayMarketReadError>>,
     ticket: ReadBudgetTicket,
@@ -945,6 +979,7 @@ struct ReadClient {
     count_budget: Arc<Semaphore>,
     byte_budget: Arc<Semaphore>,
     maximum_snapshot_bytes: u32,
+    maximum_virtual_snapshot_bytes: Option<u32>,
     actor_cancellation: CancellationToken,
 }
 
@@ -954,8 +989,15 @@ impl ReadClient {
         at: Timestamp,
         cancellation: &CancellationToken,
         deadline: Instant,
+        include_virtual_paper: bool,
     ) -> Result<DisplayMarketSnapshotLease, DisplayMarketReadError> {
         require_read_time(cancellation, deadline)?;
+        let charged_bytes = if include_virtual_paper {
+            self.maximum_virtual_snapshot_bytes
+                .ok_or(DisplayMarketReadError::AccountingOverflow)?
+        } else {
+            self.maximum_snapshot_bytes
+        };
         let count_permit = acquire_one(
             Arc::clone(&self.count_budget),
             &self.actor_cancellation,
@@ -965,19 +1007,20 @@ impl ReadClient {
         .await?;
         let byte_permit = acquire_many(
             Arc::clone(&self.byte_budget),
-            self.maximum_snapshot_bytes,
+            charged_bytes,
             &self.actor_cancellation,
             cancellation,
             deadline,
         )
         .await?;
         let ticket = ReadBudgetTicket {
-            charged_bytes: self.maximum_snapshot_bytes,
+            charged_bytes,
             _count_permit: count_permit,
             _byte_permit: byte_permit,
         };
         let (response, receiver) = oneshot::channel();
         let command = ReadCommand {
+            include_virtual_paper,
             at,
             response,
             ticket,
@@ -1183,6 +1226,11 @@ impl DisplayMarketDirectory {
             count_budget: read_count_budget,
             byte_budget: read_byte_budget,
             maximum_snapshot_bytes: limits.maximum_snapshot_bytes.get(),
+            maximum_virtual_snapshot_bytes: limits
+                .maximum_snapshot_bytes
+                .get()
+                .checked_add(limits.retained_state_bytes.get())
+                .filter(|bytes| *bytes <= limits.read_bytes.get()),
             actor_cancellation: actor_cancellation.clone(),
         };
         entries.insert(
@@ -1263,7 +1311,7 @@ impl DisplayMarketDirectory {
             .try_reserve_exact(match_count)
             .map_err(|_error| DisplayMarketReadError::Allocation)?;
         for client in clients {
-            snapshots.push(client.snapshot(at, cancellation, deadline).await?);
+            snapshots.push(client.snapshot(at, cancellation, deadline, false).await?);
         }
         Ok(snapshots)
     }
@@ -1399,6 +1447,7 @@ impl Drop for ActorEntry {
 
 #[derive(Debug, Default)]
 struct DisplayMarketState {
+    virtual_paper: market_squawk_live::virtual_paper::VirtualPaperSourceOwner,
     revision: u64,
     last_frame_id: Option<FrameId>,
     trade: Option<RetainedObservation>,
@@ -1409,8 +1458,10 @@ struct DisplayMarketState {
 
 #[derive(Debug)]
 struct RetainedObservation {
+    virtual_quote: Option<Arc<CurrentProviderObservation>>,
     observation: DisplayMarketObservation,
     authority: CurrentSourceAuthorityLease,
+    provider_identity: CurrentProviderIdentity,
     stale_after: Timestamp,
     expires_after: Timestamp,
     retained_charge: usize,
@@ -1508,6 +1559,7 @@ fn enter_terminal(
     ingress: &mut mpsc::Receiver<IngressCommand>,
     ingress_open: &mut bool,
 ) {
+    state.virtual_paper.revoke();
     if state.terminal_failure.is_none() {
         state.terminal_failure = Some(failure);
         status.send_replace(Some(failure));
@@ -1544,7 +1596,7 @@ fn project_batch(
             Some(expected) if expected == frame_id => {}
             Some(_different) => {
                 return Err(DisplayMarketTerminalFailure::Integrity(
-                    DisplayMarketIntegrityFailure::ProvenanceMismatch,
+                    DisplayMarketIntegrityFailure::MixedFrameIdentities,
                 ));
             }
         }
@@ -1573,6 +1625,9 @@ fn validate_observation_identity(
         .current_lease()
         .validate_at(validated_at)
         .map_err(DisplayMarketTerminalFailure::Registry)?;
+    current
+        .validate_at(validated_at)
+        .map_err(DisplayMarketTerminalFailure::Registry)?;
     let binding = current.evidence().binding();
     let authority_binding = current.current_lease().binding();
     let policy = current.policy();
@@ -1599,23 +1654,40 @@ fn validate_observation_identity(
         ));
     }
     let health = current.current_lease().runtime_health();
-    if stream.source_id() != key.source_id()
-        || stream.venue() != key.venue_id()
-        || stream.instrument() != key.instrument_id()
-        || coverage.source_id() != key.source_id()
-        || coverage.venue() != key.venue_id()
-        || coverage.event_class() != observation.event_class()
-        || coverage.depth() != observation.depth()
-        || coverage.provider_product() != stream.provider_product()
-        || coverage.provider_channel() != stream.provider_channel()
-        || coverage.metadata_revision() != binding.metadata_revision()
-        || health.source_id() != key.source_id()
-        || health.metadata_revision() != binding.metadata_revision()
-        || health.session_id() != binding.session_id()
-        || health.connection_generation() != key.generation()
-    {
+    let scope_mismatch = if stream.source_id() != key.source_id() {
+        Some("stream.source_id")
+    } else if stream.venue() != key.venue_id() {
+        Some("stream.venue")
+    } else if stream.instrument() != key.instrument_id() {
+        Some("stream.instrument")
+    } else if coverage.source_id() != key.source_id() {
+        Some("coverage.source_id")
+    } else if coverage.venue() != key.venue_id() {
+        Some("coverage.venue")
+    } else if coverage.event_class() != observation.event_class() {
+        Some("coverage.event_class")
+    } else if coverage.depth() != observation.depth() {
+        Some("coverage.depth")
+    } else if coverage.provider_product() != stream.provider_product() {
+        Some("coverage.provider_product")
+    } else if coverage.provider_channel() != stream.provider_channel() {
+        Some("coverage.provider_channel")
+    } else if coverage.metadata_revision() != binding.metadata_revision() {
+        Some("coverage.metadata_revision")
+    } else if health.source_id() != key.source_id() {
+        Some("health.source_id")
+    } else if health.metadata_revision() != binding.metadata_revision() {
+        Some("health.metadata_revision")
+    } else if health.session_id() != binding.session_id() {
+        Some("health.session_id")
+    } else if health.connection_generation() != key.generation() {
+        Some("health.connection_generation")
+    } else {
+        None
+    };
+    if let Some(field) = scope_mismatch {
         return Err(DisplayMarketTerminalFailure::Integrity(
-            DisplayMarketIntegrityFailure::ProvenanceMismatch,
+            DisplayMarketIntegrityFailure::ScopeIdentityMismatch(field),
         ));
     }
     match policy.quality_ceiling() {
@@ -1720,17 +1792,23 @@ fn project_observation(
     let received_at = frame.received_at();
     if received_at > validated_at {
         return Err(DisplayMarketTerminalFailure::Integrity(
-            DisplayMarketIntegrityFailure::ProvenanceMismatch,
+            DisplayMarketIntegrityFailure::FutureFrame,
         ));
     }
     let effective_at = source_at.unwrap_or(received_at);
-    if effective_at < coverage.effective_from()
-        || coverage
-            .effective_until()
-            .is_some_and(|until| effective_at > until)
+    // Coverage authorizes delivery under this metadata revision. A genuine latest-value
+    // snapshot may retain an older event time; its original source clock still sets freshness.
+    if received_at < coverage.effective_from() {
+        return Err(DisplayMarketTerminalFailure::Integrity(
+            DisplayMarketIntegrityFailure::BeforeCoverageInterval,
+        ));
+    }
+    if coverage
+        .effective_until()
+        .is_some_and(|until| received_at > until)
     {
         return Err(DisplayMarketTerminalFailure::Integrity(
-            DisplayMarketIntegrityFailure::ProvenanceMismatch,
+            DisplayMarketIntegrityFailure::AfterCoverageInterval,
         ));
     }
     let display_depth = match observation.payload() {
@@ -1767,7 +1845,22 @@ fn project_observation(
             .min(current.current_lease().valid_until()),
         minimum_optional_timestamp(coverage.effective_until(), runtime_deadline),
     );
-    let stale_after = freshness_deadline(received_at, source_at, policy.freshness())?;
+    let mut stale_after = freshness_deadline(received_at, source_at, policy.freshness())?;
+    if let ProviderObservationPayload::Quote { bid, ask } = observation.payload() {
+        for original in bid
+            .iter()
+            .chain(ask.iter())
+            .filter_map(ProviderBookLevel::accumulated_evidence)
+        {
+            for field in [original.price(), original.quantity()] {
+                stale_after = stale_after.min(freshness_deadline(
+                    field.native_received_at(),
+                    field.source_at(),
+                    policy.freshness(),
+                )?);
+            }
+        }
+    }
     let coverage = DisplayCoverage {
         provider_product: try_clone_source_identifier(
             coverage.provider_product().as_source_identifier(),
@@ -1815,15 +1908,28 @@ fn project_observation(
         },
         payload,
     };
+    let provider_identity = current.provider_identity().clone();
+    let identity_charge = provider_identity
+        .retained_bytes()
+        .map_err(DisplayMarketTerminalFailure::Registry)?;
     let retained_charge = batch_charge
-        .checked_add(
-            observation_retained_bytes(&observation)
-                .ok_or(DisplayMarketTerminalFailure::AccountingOverflow)?,
-        )
+        .checked_add(identity_charge)
+        .and_then(|value| value.checked_add(2 * size_of::<usize>()))
+        .and_then(|value| {
+            value.checked_add(observation_retained_bytes(&observation).unwrap_or(usize::MAX))
+        })
         .ok_or(DisplayMarketTerminalFailure::AccountingOverflow)?;
+    let authority = current.current_lease().clone();
+    let virtual_quote = matches!(
+        current.observation().payload(),
+        ProviderObservationPayload::Quote { .. }
+    )
+    .then(|| Arc::new(current));
     Ok(RetainedObservation {
+        virtual_quote,
         observation,
-        authority: current.current_lease().clone(),
+        authority,
+        provider_identity,
         stale_after,
         expires_after,
         retained_charge,
@@ -1871,6 +1977,25 @@ fn apply_update(
     if retained > retained_state_limit as usize {
         return Err(DisplayMarketTerminalFailure::AccountingOverflow);
     }
+    let virtual_quote = update
+        .quote
+        .as_ref()
+        .and_then(|value| value.virtual_quote.as_ref())
+        .map(Arc::clone);
+    let current_status = update.status.as_ref().or(state.status.as_ref());
+    let trading_allowed = current_status.is_none_or(|status| match &status.observation.payload {
+        DisplayMarketPayload::Status(DisplayStatus::TradingHalt { transition, .. }) => {
+            *transition == HaltTransition::Resumed
+        }
+        DisplayMarketPayload::Status(DisplayStatus::Instrument { trading_status, .. }) => {
+            *trading_status == TradingStatus::Active
+        }
+        _ => false,
+    });
+    state
+        .virtual_paper
+        .commit(virtual_quote, trading_allowed)
+        .map_err(|_| DisplayMarketTerminalFailure::AccountingOverflow)?;
     state.revision = state
         .revision
         .checked_add(1)
@@ -1894,11 +2019,12 @@ fn process_read(
     command: ReadCommand,
 ) -> Option<DisplayMarketTerminalFailure> {
     let ReadCommand {
+        include_virtual_paper,
         at,
         response,
         ticket,
     } = command;
-    let result = snapshot_from_state(Arc::clone(key), state, at, ticket);
+    let result = snapshot_from_state(Arc::clone(key), state, at, ticket, include_virtual_paper);
     let failure = result.as_ref().err().and_then(|error| match error {
         DisplayMarketReadError::AccountingOverflow => {
             Some(DisplayMarketTerminalFailure::AccountingOverflow)
@@ -1920,6 +2046,7 @@ fn snapshot_from_state(
     state: &DisplayMarketState,
     at: Timestamp,
     ticket: ReadBudgetTicket,
+    include_virtual_paper: bool,
 ) -> Result<DisplayMarketSnapshotLease, DisplayMarketReadError> {
     let trade = state
         .trade
@@ -1936,7 +2063,24 @@ fn snapshot_from_state(
         .as_ref()
         .map(|value| try_read_observation(value, at, state.terminal_failure))
         .transpose()?;
+    let virtual_paper = if include_virtual_paper && state.terminal_failure.is_none() {
+        state.virtual_paper.read().ok()
+    } else {
+        None
+    };
+    // Each read can outlive the actor's next quote. Charge the complete original batch conservatively
+    // against the existing read byte ticket; a display-only ticket can never hide this retention.
     let retained = snapshot_retained_bytes(&trade, &quote, &status)
+        .and_then(|bytes| {
+            bytes.checked_add(if virtual_paper.is_some() {
+                state
+                    .quote
+                    .as_ref()
+                    .map_or(0, |quote| quote.retained_charge)
+            } else {
+                0
+            })
+        })
         .ok_or(DisplayMarketReadError::AccountingOverflow)?;
     if retained > ticket.charged_bytes as usize {
         return Err(DisplayMarketReadError::AccountingOverflow);
@@ -1948,6 +2092,7 @@ fn snapshot_from_state(
         quote,
         status,
         terminal_failure: state.terminal_failure,
+        virtual_paper,
         _ticket: ticket,
     })
 }
@@ -1959,7 +2104,12 @@ fn try_read_observation(
 ) -> Result<DisplayMarketReadObservation, DisplayMarketReadError> {
     let availability = if let Some(failure) = terminal {
         DisplayMarketAvailability::Quarantined { failure }
-    } else if at > retained.expires_after || retained.authority.validate_at(at).is_err() {
+    } else if at > retained.expires_after
+        || retained
+            .authority
+            .validate_provider_identity_at(&retained.provider_identity, at)
+            .is_err()
+    {
         DisplayMarketAvailability::Expired {
             expired_after: retained.expires_after,
         }

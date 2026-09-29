@@ -394,7 +394,7 @@ fn validate_metadata(
             .any(|asset| !matches!(asset, AssetClass::Equity | AssetClass::Fund))
         || metadata.coverage().topology().is_not_applicable()
         || metadata.coverage().topology().is_consolidated()
-        || metadata.coverage().live().is_some()
+        || !metadata.coverage().live_channels().is_empty()
         || metadata.coverage().delivery() != DeliveryEvidence::Indirect
         || capabilities.live()
         || !capabilities.extraction()

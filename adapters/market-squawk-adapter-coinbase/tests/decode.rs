@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/selected.rs"]
+mod selected;
 
 use bytes::Bytes;
 use common::{TestResult, config, identifier};
@@ -10,16 +12,17 @@ use market_squawk_domain::{
     AggressorSide, ConnectionGeneration, LiveEventClass, MarketDepth, SequenceCapability, Timestamp,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, ControlFrameKind, DecodeOutcome, IgnoredFrameReason,
-    MAX_DECODED_BOOK_ITEMS, ProviderBookSide, ProviderChecksumEvidence, ProviderObservationPayload,
-    ProviderSequenceEvidence, QuarantineReason, SessionId, TransportFrameKind,
+    ControlFrameKind, DecodeOutcome, IgnoredFrameReason, MAX_DECODED_BOOK_ITEMS, ProviderBookSide,
+    ProviderChecksumEvidence, ProviderObservationPayload, ProviderSequenceEvidence,
+    QuarantineReason, SessionId, TransportFrameKind,
 };
+use selected::selected_fixture;
 use sha2::{Digest, Sha256};
 
 fn decode_provider(payload: &[u8]) -> TestResult<CoinbaseMarketDecodeOutcome> {
-    let config = config()?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config;
+    let (mut registry, registered) = fixture.catalog.selected_registry(config.metadata())?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(identifier("coinbase-decoder-session")?),
@@ -309,9 +312,9 @@ fn classifies_control_extensions_and_provider_input_failures() -> TestResult {
 
 #[test]
 fn binary_and_oversized_cardinality_fail_closed() -> TestResult {
-    let config = config()?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config;
+    let (mut registry, registered) = fixture.catalog.selected_registry(config.metadata())?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(identifier("coinbase-session-binary")?),

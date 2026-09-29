@@ -1,15 +1,23 @@
 //! Production composition for bounded Tiingo Starter daily NAV and EOD operations.
 
+mod history;
+pub(crate) use history::{
+    TiingoEodHistoryOperation, TiingoEquityPremiumHistoryPreparation, TiingoHistoryMetadataInput,
+    TiingoHistoryOriginalContext,
+};
+
+mod current_actions;
+pub(crate) use current_actions::TiingoCurrentActionAcquisition;
+
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
 use market_squawk_adapter_tiingo::{
-    TiingoAdapterError, TiingoApiToken, TiingoEodBarTimeAuthority, TiingoEodContractEvidence,
-    TiingoEodInstrumentAuthority, TiingoFundContext, TiingoFundNavContractEvidence,
-    TiingoHttpSource, TiingoHttpSourceError, TiingoLatestPublicationError, TiingoQuotaError,
-    TiingoQuotaWindows, TiingoSchemaCircuitState, TiingoTicker, prepare_latest_publication,
-    tiingo_provider_rate_declaration,
+    TiingoAdapterError, TiingoApiToken, TiingoEodContractEvidence, TiingoEodInstrumentAuthority,
+    TiingoFundContext, TiingoFundNavContractEvidence, TiingoHttpSource, TiingoHttpSourceError,
+    TiingoLatestPublicationError, TiingoQuotaError, TiingoQuotaWindows, TiingoSchemaCircuitState,
+    TiingoTicker, prepare_latest_publication, tiingo_provider_rate_declaration,
 };
 use market_squawk_data::{
     AnalyticalFundNavOutput, AnalyticalFundNavReadRequest, AnalyticalMarketBarOutput,
@@ -107,7 +115,6 @@ pub(crate) enum TiingoLatestOperation {
         connection_id: Uuid,
         instrument: TiingoEodInstrumentAuthority,
         contract: TiingoEodContractEvidence,
-        bar_time_authority: Arc<dyn TiingoEodBarTimeAuthority>,
         extraction_request: ExtractionRequest,
         analytical_dataset: DatasetId,
     },
@@ -409,7 +416,6 @@ impl TiingoProductActivation {
                 connection_id,
                 instrument,
                 contract,
-                bar_time_authority,
                 extraction_request,
                 analytical_dataset,
             } => {
@@ -451,7 +457,6 @@ impl TiingoProductActivation {
                         seal_request,
                         instrument,
                         contract,
-                        bar_time_authority,
                         extraction_request,
                         analytical_dataset,
                         observed_at,

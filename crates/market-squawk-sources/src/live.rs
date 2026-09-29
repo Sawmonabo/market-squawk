@@ -439,11 +439,12 @@ impl<'de> Deserialize<'de> for RawMarketFrame {
 
 /// Nonblocking bounded sink used by a live source reader before decoding.
 pub trait RawMarketSink: Send {
-    /// Binds an exact active provider request to health derived from this live stream.
+    /// Binds an exact provider request or established transport to this live stream's health.
     ///
-    /// Sources whose connection itself consumes a provider concurrency slot call this once after
-    /// the transport handshake and before publishing the first frame. Sinks that do not qualify
-    /// live authority may ignore the opaque lease.
+    /// Sources call this once after the transport handshake and before publishing the first
+    /// frame. A successfully upgraded transport may release request concurrency through its
+    /// permit while retaining the same owner-bound lease. Sinks that do not qualify live
+    /// authority may ignore the opaque lease.
     ///
     /// # Errors
     ///
@@ -463,6 +464,28 @@ pub trait RawMarketSink: Send {
     /// Saturation, closure, and capture-integrity failure are explicit and must invalidate or
     /// degrade the affected stream according to supervision policy.
     fn try_publish(&mut self, frame: RawMarketFrame) -> Result<(), SinkError>;
+
+    /// Retains one complete raw response before any post-response currentness checks.
+    ///
+    /// Implementations keep the exact capture receipt privately until
+    /// [`Self::try_publish_captured`] consumes it. This grants no decoding or live authority.
+    /// Admission is nonblocking; the existing owned capture writer must drain at shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported sinks, saturation, closure, duplicate pending capture or lost custody.
+    fn try_capture_for_publication(&mut self, _frame: &RawMarketFrame) -> Result<(), SinkError> {
+        Err(SinkError::Closed)
+    }
+
+    /// Consumes the exact previously captured frame without enqueueing it a second time.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing/transplanted capture and performs all normal live-currentness checks.
+    fn try_publish_captured(&mut self, _frame: RawMarketFrame) -> Result<(), SinkError> {
+        Err(SinkError::Closed)
+    }
 
     /// Returns the earliest generation-local monotonic deadline that must interrupt transport
     /// receive waiting.

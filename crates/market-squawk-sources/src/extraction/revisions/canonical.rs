@@ -118,6 +118,17 @@ impl CanonicalObservationFamily {
                     encoder.u8(fund_nav_valuation_basis_tag(value.valuation_basis()))?;
                     encoder.str(value.currency().as_str())
                 }
+                ResearchObservation::MarketCalendar(value) => {
+                    encoder.u8(12)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.option_str(provenance.venue_id().map(|venue| venue.as_str()))?;
+                    encoder.serializable(value.scope())?;
+                    encoder.u8(u8::from(matches!(
+                        value.payload(),
+                        market_squawk_domain::MarketCalendarPayload::Coverage { .. }
+                    )))?;
+                    encode_coordinate(encoder, context.time().effective())
+                }
                 ResearchObservation::PortfolioPosition(value) => {
                     encoder.u8(4)?;
                     encoder.str(provenance.source_id().as_str())?;
@@ -141,6 +152,11 @@ impl CanonicalObservationFamily {
                     }
                     encoder.str(value.account_id().as_str())?;
                     encoder.str(value.source_record_id().as_str())
+                }
+                ResearchObservation::CorporateActionSource(_) => {
+                    encoder.u8(15)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.str(provenance.source_identifier().as_str())
                 }
                 ResearchObservation::CorporateAction(_) => {
                     encoder.u8(6)?;
@@ -226,9 +242,11 @@ fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
         ResearchObservation::Macro(value) => value.context(),
         ResearchObservation::MarketBar(value) => value.context(),
         ResearchObservation::FundNav(value) => value.context(),
+        ResearchObservation::MarketCalendar(value) => value.context(),
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
+        ResearchObservation::CorporateActionSource(value) => value.context(),
         ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),
     }
@@ -263,8 +281,17 @@ fn encode_market_bar_series_semantics(
     encoder: &mut PitV1CanonicalEncoder<'_>,
     semantics: &market_squawk_domain::BarTimeSemantics,
 ) -> Result<(), PitV1EncodingError> {
-    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
-    encode_market_bar_session(encoder, semantics.session())
+    match semantics {
+        market_squawk_domain::BarTimeSemantics::TimestampedPeriod(period) => {
+            encoder.u8(1)?;
+            encoder.u8(bar_timestamp_basis_tag(period.timestamp_basis()))?;
+            encode_market_bar_session(encoder, period.session())
+        }
+        market_squawk_domain::BarTimeSemantics::NominalDailyDate(date) => {
+            encoder.u8(2)?;
+            encoder.str(date.ruleset().as_str())
+        }
+    }
 }
 
 fn encode_market_bar_session(

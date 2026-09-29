@@ -157,6 +157,63 @@ impl DecisionJournal {
         Ok(semantic)
     }
 
+    pub(super) async fn recover_with_replay(
+        &mut self,
+        authority: &mut DecisionAuthority,
+        recovery: &mut RecoveryContext,
+        replay: &super::current_share::CurrentShareReplayCapability,
+        context: &market_squawk_services::RequestContext,
+    ) -> Result<Option<[u8; 32]>, DecisionApplicationError> {
+        self.validate_capabilities()?;
+        verify_integrity(&self.connection)?;
+        verify_schema(&self.connection)?;
+        let semantic = replay_records(&mut self.connection, self.maximum_records, authority, recovery, replay, context).await?;
+        self.validate_capabilities()?;
+        Ok(semantic)
+    }
+
+    pub(super) fn recover_with_retained(
+        &self,
+        authority: &mut DecisionAuthority,
+        recovery: &mut RecoveryContext,
+        retained: &DecisionAuthority,
+    ) -> Result<[u8; 32], DecisionApplicationError> {
+        self.validate_capabilities()?;
+        verify_integrity(&self.connection)?;
+        verify_schema(&self.connection)?;
+        let semantic = visit_records(&self.connection, self.maximum_records,
+            |_, kind, key, payload, _| recovery.apply_with_retained(authority, retained, kind, key, payload))?;
+        self.validate_capabilities()?;
+        Ok(semantic)
+    }
+
+    /// Reads one exact small preparation receipt; recipes and full history are never cached.
+    pub(super) fn current_find_record(
+        &self,
+        key: &str,
+    ) -> Result<Option<super::current_find::CurrentFindCustodyRecord>, DecisionApplicationError>
+    {
+        if !key.starts_with("current-find:") || key.len() > MAX_RECORD_KEY_BYTES {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        self.validate_capabilities()?;
+        let retained = self.connection.query_row(
+            "SELECT payload_json,payload_sha256 FROM decision_records WHERE kind=7 AND record_key=?1",
+            [key], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,Vec<u8>>(1)?)),
+        ).optional().map_err(|_| DecisionApplicationError::Persistence)?;
+        self.validate_capabilities()?;
+        let Some((payload, expected)) = retained else {
+            return Ok(None);
+        };
+        if payload.is_empty()
+            || payload.len() > 8 * 1024 * 1024
+            || sha256(&payload).as_slice() != expected.as_slice()
+        {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        super::codec::decode_current_find_custody(key, &payload).map(Some)
+    }
+
     /// Creates one full, transactionally consistent SQLite image through SQLite's online-backup
     /// API. The live database, WAL, and shared-memory files are never copied.
     pub(in crate::application::decision) fn online_backup(
@@ -203,10 +260,12 @@ impl DecisionJournal {
     /// Installs a verified owner-issued image only at a previously unused database location.
     /// The image is decoded as SQLite and copied through the online-backup API before normal
     /// [`super::DecisionApplication::open`] recovery is allowed to acquire the writer lease.
-    pub(in crate::application::decision) fn restore_fresh(
+    pub(in crate::application::decision) async fn restore_fresh(
         location: &DecisionDatabaseLocation,
         limits: DecisionRepositoryLimits,
         bytes: &[u8],
+        replay: &super::current_share::CurrentShareReplayCapability,
+        context: &market_squawk_services::RequestContext,
     ) -> Result<[u8; 32], DecisionApplicationError> {
         let maximum_records = journal_record_limit(limits)?;
         if bytes.is_empty() || bytes.len() > MAX_BACKUP_BYTES {
@@ -237,12 +296,13 @@ impl DecisionJournal {
         verify_schema(&source)?;
         let mut normalized =
             Connection::open_in_memory().map_err(|_error| DecisionApplicationError::Persistence)?;
-        let normalization = rusqlite::backup::Backup::new(&source, &mut normalized)
-            .map_err(|_error| DecisionApplicationError::Persistence)?;
-        normalization
-            .run_to_completion(BACKUP_PAGE_BATCH, BACKUP_PAGE_PAUSE, None)
-            .map_err(|_error| DecisionApplicationError::Persistence)?;
-        drop(normalization);
+        {
+            let normalization = rusqlite::backup::Backup::new(&source, &mut normalized)
+                .map_err(|_error| DecisionApplicationError::Persistence)?;
+            normalization
+                .run_to_completion(BACKUP_PAGE_BATCH, BACKUP_PAGE_PAUSE, None)
+                .map_err(|_error| DecisionApplicationError::Persistence)?;
+        }
         disable_trusted_schema(&normalized)?;
         initialize(&normalized)?;
         verify_integrity(&normalized)?;
@@ -250,13 +310,8 @@ impl DecisionJournal {
         let repository = DecisionRepository::try_new(limits)?;
         let mut authority = DecisionAuthority::new(repository);
         let mut recovery = RecoveryContext::try_new(limits.maximum_screen_runs())?;
-        let source_semantic = visit_records(
-            &normalized,
-            maximum_records,
-            |_sequence, kind, key, payload, _payload_sha256| {
-                recovery.apply(&mut authority, kind, key, payload)
-            },
-        )?;
+        let source_semantic = replay_records(&mut normalized, maximum_records, &mut authority,
+            &mut recovery, replay, context).await?.ok_or(DecisionApplicationError::Unavailable)?;
         let writer_guard = location
             .acquire_writer()
             .map_err(|_error| DecisionApplicationError::Persistence)?;
@@ -734,6 +789,56 @@ fn visit_records(
         update_semantic_digest(&mut semantic, sequence, kind, &key, &payload, &digest)?;
     }
     Ok(semantic.finalize().into())
+}
+
+/// One owned row is retained across source I/O; SQLite cursors never escape a synchronous read.
+async fn replay_records(
+    connection: &mut Connection,
+    maximum_records: usize,
+    authority: &mut DecisionAuthority,
+    recovery: &mut RecoveryContext,
+    replay: &super::current_share::CurrentShareReplayCapability,
+    context: &market_squawk_services::RequestContext,
+) -> Result<Option<[u8; 32]>, DecisionApplicationError> {
+    let mut source_unavailable = false;
+    let mut sequence = 0_i64;
+    let mut count = 0_usize;
+    let mut total_bytes = 0_usize;
+    let mut semantic = semantic_digest_start();
+    loop {
+        if context.cancellation().is_cancelled() || std::time::Instant::now() >= context.deadline() {
+            return Err(DecisionApplicationError::Unavailable);
+        }
+        let row = connection.query_row(
+            "SELECT sequence, kind, record_key, payload_json, payload_sha256 FROM decision_records WHERE sequence > ?1 ORDER BY sequence LIMIT 1",
+            [sequence], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,String>(2)?, row.get::<_,Vec<u8>>(3)?, row.get::<_,Vec<u8>>(4)?)),
+        ).optional().map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+        let Some((next, kind, key, payload, digest)) = row else { break };
+        count = count.checked_add(1).ok_or(DecisionApplicationError::Capacity)?;
+        total_bytes = total_bytes.checked_add(payload.len()).ok_or(DecisionApplicationError::Capacity)?;
+        if count > maximum_records || total_bytes > MAX_JOURNAL_BYTES
+            || sequence.checked_add(1) != Some(next) || !valid_kind(kind)
+            || key.is_empty() || key.len() > MAX_RECORD_KEY_BYTES
+            || payload.is_empty() || payload.len() > MAX_RECORD_BYTES
+            || digest.len() != 32 || sha256(&payload).as_slice() != digest.as_slice()
+        { return Err(DecisionApplicationError::InvalidPersistentState); }
+        if source_unavailable {
+            super::codec::validate_record_envelope(kind, &payload)?;
+        } else {
+            match recovery.apply_with_replay(authority, kind, &key, &payload, replay, context).await {
+                Ok(()) => {},
+                Err(DecisionApplicationError::Unavailable)
+                    if !context.cancellation().is_cancelled() && std::time::Instant::now() < context.deadline() => {
+                    source_unavailable = true;
+                    super::codec::validate_record_envelope(kind, &payload)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        update_semantic_digest(&mut semantic, next, kind, &key, &payload, &digest)?;
+        sequence = next;
+    }
+    Ok((!source_unavailable).then(|| semantic.finalize().into()))
 }
 
 fn semantic_digest_start() -> Sha256 {

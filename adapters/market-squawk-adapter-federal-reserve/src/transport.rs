@@ -31,6 +31,7 @@ use crate::source::{BoardDatasetProfile, BoardSourceError};
 #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
 use crate::{
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_DOCTOR_PROBE_URL,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL,
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL, BoardDatasetContract,
@@ -265,6 +266,8 @@ pub struct BoardScriptedTransportCounters {
     doctor_responses: u64,
     production_attempts: u64,
     production_responses: u64,
+    full_history_attempts: u64,
+    full_history_responses: u64,
 }
 
 #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
@@ -287,6 +290,16 @@ impl BoardScriptedTransportCounters {
     /// Returns successfully consumed production responses.
     pub const fn production_responses(self) -> u64 {
         self.production_responses
+    }
+
+    /// Returns exact full-history executor calls, including rejected calls.
+    pub const fn full_history_attempts(self) -> u64 {
+        self.full_history_attempts
+    }
+
+    /// Returns successfully consumed full-history responses.
+    pub const fn full_history_responses(self) -> u64 {
+        self.full_history_responses
     }
 }
 
@@ -327,12 +340,16 @@ pub(crate) struct BoardScriptedQueue {
 
 #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
 impl BoardScriptedQueue {
-    fn one(response: BoardScriptedCsvResponse) -> Self {
+    fn new(responses: VecDeque<BoardScriptedCsvResponse>) -> Self {
         Self {
-            responses: Mutex::new(VecDeque::from([response])),
+            responses: Mutex::new(responses),
             attempts: AtomicU64::new(0),
             completed: AtomicU64::new(0),
         }
+    }
+
+    fn one(response: BoardScriptedCsvResponse) -> Self {
+        Self::new(VecDeque::from([response]))
     }
 
     fn execute(
@@ -430,6 +447,7 @@ impl BoardScriptedDoctorExecutor {
 pub struct BoardScriptedTransportFactory {
     doctor: Arc<BoardScriptedQueue>,
     production: Arc<BoardScriptedQueue>,
+    full_history: Arc<BoardScriptedQueue>,
 }
 
 #[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
@@ -444,7 +462,28 @@ impl BoardScriptedTransportFactory {
         Ok(Self {
             doctor: Arc::new(BoardScriptedQueue::one(doctor)),
             production: Arc::new(BoardScriptedQueue::one(production)),
+            full_history: Arc::new(BoardScriptedQueue::new(VecDeque::new())),
         })
+    }
+
+    /// Admits two different complete-file responses for the exact official full-history route.
+    /// The ordinary doctor and rolling queues remain disjoint.
+    pub fn try_new_with_full_history(
+        doctor: [BoardScriptedCsvResponse; 2],
+        production: BoardScriptedCsvResponse,
+        full_history: [BoardScriptedCsvResponse; 2],
+    ) -> Result<Self, BoardScriptedTransportError> {
+        let mut factory = Self::try_new(doctor[0].clone(), production)?;
+        validate_scripted_h15_response(&doctor[1], true)?;
+        factory.doctor = Arc::new(BoardScriptedQueue::new(VecDeque::from(doctor)));
+        for response in &full_history {
+            validate_scripted_full_history_response(response)?;
+        }
+        if full_history[0].body() == full_history[1].body() {
+            return Err(BoardScriptedTransportError::InvalidResponse);
+        }
+        factory.full_history = Arc::new(BoardScriptedQueue::new(VecDeque::from(full_history)));
+        Ok(factory)
     }
 
     /// Returns a cloneable executor over only the doctor response queue.
@@ -461,11 +500,50 @@ impl BoardScriptedTransportFactory {
             doctor_responses: self.doctor.completed.load(Ordering::Relaxed),
             production_attempts: self.production.attempts.load(Ordering::Relaxed),
             production_responses: self.production.completed.load(Ordering::Relaxed),
+            full_history_attempts: self.full_history.attempts.load(Ordering::Relaxed),
+            full_history_responses: self.full_history.completed.load(Ordering::Relaxed),
         }
     }
 
     pub(crate) fn production_queue(&self) -> Arc<BoardScriptedQueue> {
         Arc::clone(&self.production)
+    }
+
+    pub(crate) fn full_history_queue(&self) -> Arc<BoardScriptedQueue> {
+        Arc::clone(&self.full_history)
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+fn validate_scripted_full_history_response(
+    response: &BoardScriptedCsvResponse,
+) -> Result<(), BoardScriptedTransportError> {
+    let contract = BoardDatasetContract::h15_treasury_constant_maturities_production_csv()
+        .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
+    let parsed = parse_csv(
+        &contract,
+        response.body(),
+        BoardParseLimits::h15_treasury_constant_maturities_full_history(),
+    )
+    .map_err(|_| BoardScriptedTransportError::InvalidResponse)?;
+    let dates = parsed
+        .series()
+        .first()
+        .map_or(0, |series| series.observations().len());
+    let expected_observations = u64::try_from(dates)
+        .ok()
+        .and_then(|dates| dates.checked_mul(11));
+    if parsed.series().len() == 11
+        && dates > BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT
+        && parsed
+            .series()
+            .iter()
+            .all(|series| series.observations().len() == dates)
+        && Some(parsed.observation_count()) == expected_observations
+    {
+        Ok(())
+    } else {
+        Err(BoardScriptedTransportError::InvalidResponse)
     }
 }
 
@@ -865,7 +943,9 @@ pub(crate) trait BoardTransport: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub(crate) struct BoardScriptedProductionTransport {
     queue: Arc<BoardScriptedQueue>,
+    full_history_queue: Arc<BoardScriptedQueue>,
     maximum_response_bytes: usize,
+    full_history_maximum_response_bytes: usize,
     maximum_deadline_duration: Duration,
 }
 
@@ -873,12 +953,16 @@ pub(crate) struct BoardScriptedProductionTransport {
 impl BoardScriptedProductionTransport {
     pub(crate) fn new(
         queue: Arc<BoardScriptedQueue>,
+        full_history_queue: Arc<BoardScriptedQueue>,
         maximum_response_bytes: usize,
+        full_history_maximum_response_bytes: usize,
         maximum_deadline_duration: Duration,
     ) -> Self {
         Self {
             queue,
+            full_history_queue,
             maximum_response_bytes,
+            full_history_maximum_response_bytes,
             maximum_deadline_duration,
         }
     }
@@ -895,10 +979,22 @@ impl BoardTransport for BoardScriptedProductionTransport {
     ) -> BoxFuture<'_, Result<BoardHttpResponse, BoardSourceError>> {
         Box::pin(async move {
             if request.conditional.is_some()
-                || max_bytes != self.maximum_response_bytes
                 || timeout.is_zero()
                 || timeout > self.maximum_deadline_duration
             {
+                return Err(BoardSourceError::InvalidProfile);
+            }
+            let (queue, expected_maximum_response_bytes) = match request.url.as_str() {
+                BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL => {
+                    (&self.queue, self.maximum_response_bytes)
+                }
+                BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL => (
+                    &self.full_history_queue,
+                    self.full_history_maximum_response_bytes,
+                ),
+                _ => return Err(BoardSourceError::InvalidProfile),
+            };
+            if max_bytes != expected_maximum_response_bytes {
                 return Err(BoardSourceError::InvalidProfile);
             }
             let scripted = BoardScriptedHttpRequest::try_new(
@@ -910,12 +1006,12 @@ impl BoardTransport for BoardScriptedProductionTransport {
                 request.deadline,
             )
             .map_err(map_scripted_error)?;
-            let response = self
-                .queue
+            let expected_url = scripted.url().to_owned();
+            let response = queue
                 .execute(
                     &scripted,
-                    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_URL,
-                    self.maximum_response_bytes,
+                    &expected_url,
+                    expected_maximum_response_bytes,
                     self.maximum_deadline_duration,
                     &cancellation,
                 )
@@ -1056,7 +1152,7 @@ impl BoardHttpClient {
         cancellation: &CancellationToken,
     ) -> Result<BoardRawRetrievalOutcome, BoardFetchFailure> {
         let started_at = system_timestamp()
-            .map_err(|error| failure_without_response(map_source_error(error)))?;
+            .map_err(|_| failure_without_response(SourceError::InvalidProtocolState.into()))?;
         authority
             .validate_current()
             .map_err(|error| failure_without_response(error.into()))?;
@@ -1066,7 +1162,7 @@ impl BoardHttpClient {
             ));
         }
         let timeout = remaining_timeout(deadline, started_at, self.total_timeout)
-            .map_err(|error| failure_without_response(map_source_error(error)))?;
+            .map_err(|_| failure_without_response(ExtractionSourceError::DeadlineExceeded))?;
         let request = profile.contract().request();
         let request_identity = request_identity(request.request_digest(), conditional);
         let permit = authority
@@ -1109,7 +1205,7 @@ impl BoardHttpClient {
             Err(error) => {
                 in_flight.release();
                 return Err(failure_after_execute(
-                    map_source_error(error),
+                    map_source_error(error, maximum),
                     transport_started.elapsed(),
                 ));
             }
@@ -1474,11 +1570,12 @@ fn failure_after_execute(error: ExtractionSourceError, latency: Duration) -> Boa
     failure
 }
 
-fn map_source_error(error: BoardSourceError) -> ExtractionSourceError {
+fn map_source_error(error: BoardSourceError, maximum: usize) -> ExtractionSourceError {
     match error {
         BoardSourceError::Cancelled => ExtractionSourceError::Cancelled,
         BoardSourceError::DeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
-        BoardSourceError::Network | BoardSourceError::BodyTooLarge => SourceError::Network.into(),
+        BoardSourceError::Network => SourceError::Network.into(),
+        BoardSourceError::BodyTooLarge => SourceError::FrameTooLarge { max: maximum }.into(),
         BoardSourceError::InvalidMetadata
         | BoardSourceError::InvalidProfile
         | BoardSourceError::PartitionedExtractionRequired
@@ -1523,7 +1620,7 @@ fn validate_parse_continuation(
     if cancellation.is_cancelled() {
         return Err(ExtractionSourceError::Cancelled);
     }
-    if system_timestamp().map_err(map_source_error)? >= deadline {
+    if system_timestamp().map_err(|_| SourceError::InvalidProtocolState)? >= deadline {
         Err(ExtractionSourceError::DeadlineExceeded)
     } else {
         Ok(())
@@ -1537,10 +1634,10 @@ fn duration_nanos(value: Duration) -> u64 {
 pub(crate) fn system_timestamp() -> Result<Timestamp, BoardSourceError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| BoardSourceError::Network)?
+        .map_err(|_| BoardSourceError::HealthUnavailable)?
         .as_nanos();
     Ok(Timestamp::from_unix_nanos(
-        i64::try_from(nanos).map_err(|_| BoardSourceError::Network)?,
+        i64::try_from(nanos).map_err(|_| BoardSourceError::HealthUnavailable)?,
     ))
 }
 

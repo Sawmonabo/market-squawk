@@ -1,16 +1,24 @@
 //! Single per-user installed-service composition and lifecycle authority.
 
 mod analysis;
+mod analytical_workflow;
+mod analytical_profile;
 mod backtest_preparation;
 mod bootstrap;
+#[cfg(debug_assertions)]
+mod crypto_installed_fixture;
 mod decision;
 mod dispatch;
 mod forecast_preparation;
 mod governance;
 mod governance_persistence;
+mod historical_study;
+mod probability;
 mod jobs;
 mod lifecycle;
 mod logging;
+mod market_evidence;
+mod market_session_context;
 mod mcp_client;
 mod mcp_control;
 mod operations;
@@ -18,15 +26,18 @@ mod operations_activity;
 mod operations_activity_bindings;
 mod operations_bootstrap;
 mod operations_composition;
+mod portfolio_analysis;
 mod portfolio_import;
 mod provider_credential_import;
 mod provider_setup;
 mod ready_admission;
+mod recommendation_backtest;
 mod recommendation_setup;
 mod research_dataset;
 mod research_file_import;
 mod runtime;
 mod tool_services;
+pub(crate) use tool_services::training_preparation::InstalledProductTraining;
 mod update_package;
 mod workspace_recovery;
 mod workspace_selector;
@@ -72,6 +83,10 @@ use uuid::Uuid;
 pub use bootstrap::{
     BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceBootstrapStatus,
 };
+#[cfg(debug_assertions)]
+pub use crypto_installed_fixture::{
+    CryptoInstalledPublicationProbe, CryptoInstalledPublicationReader, CryptoInstalledTypedRead,
+};
 
 use mcp_client::InstalledMcpRelayTransport;
 
@@ -82,6 +97,8 @@ use operations_bootstrap::{PreparedInstalledOperations, ReadyInstalledOperations
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use crate::BoardInstalledFixtureBundle;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use crate::H15InstalledAcceptance;
 use crate::{
     AppConfig, LocalProduct, LocalProductError, SchwabOAuthInstallationCapabilityError,
     SchwabOAuthInstallationTrustAction, SchwabOAuthInstallationTrustState,
@@ -395,6 +412,7 @@ pub async fn launch_foreground_keyring_broker(
 
 /// Sole per-user owner for the product, jobs, private runtime, and stateless MCP endpoint.
 pub struct InstalledService {
+    analytical_workflow: Arc<crate::application::analytical_workflow::host::WorkflowHost>,
     server: market_squawk_runtime::RuntimeServer,
     product: LocalProduct,
     jobs: InstalledJobAuthority,
@@ -430,6 +448,14 @@ impl std::fmt::Debug for InstalledService {
 }
 
 impl InstalledService {
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    pub fn h15_installed_acceptance(&self) -> H15InstalledAcceptance {
+        H15InstalledAcceptance::new(
+            self.product.research_ingest(),
+            self.product.macro_context_read_capability(),
+        )
+    }
+
     /// Composes every installed-product authority, proves the bound route is ready, then publishes
     /// the authenticated rendezvous as the final startup step.
     pub async fn start(config: AppConfig) -> Result<Self, InstalledServiceError> {
@@ -815,6 +841,7 @@ impl InstalledService {
                 return Err(composition_stage(error, "settings startup reconciliation"));
             }
             let ComposedTransport {
+                analytical_workflow,
                 audit,
                 server,
                 readiness,
@@ -893,6 +920,7 @@ impl InstalledService {
                 return Err(error);
             }
             Ok(Self {
+                analytical_workflow,
                 server,
                 product,
                 jobs,
@@ -941,6 +969,7 @@ impl InstalledService {
         cancellation: CancellationToken,
     ) -> Result<InstalledServiceRunOutcome, InstalledServiceError> {
         let Self {
+            analytical_workflow,
             server,
             product,
             jobs,
@@ -953,6 +982,14 @@ impl InstalledService {
             _workspace_selector,
             _selected_workspace_guard,
         } = self;
+        let _workflow_cancel_on_drop = analytical_workflow.cancellation_on_drop();
+        // Startup failure still traverses admission, transport, task, job, application,
+        // repository and credential shutdown; no fallible early exit owns live authorities.
+        let workflow_start = runtime.registration(NamedClient::Desktop).and_then(|registration| {
+            let origin = RequestOrigin::try_new(runtime.runtime().workspace_id().as_uuid(), registration.client_id().as_uuid())
+                .map_err(|_| InstalledServiceError::InvalidComposition)?;
+            analytical_workflow.launch(origin).map_err(|_| InstalledServiceError::CompositionStage("analytical workflow startup"))
+        });
         let transport_cancellation = CancellationToken::new();
         let mut serving = Box::pin(server.run_until(
             transport_cancellation.clone(),
@@ -964,7 +1001,9 @@ impl InstalledService {
             transport_stopped_unexpectedly,
             admission_stopped_unexpectedly,
             completed_transport,
-        ) = tokio::select! {
+        ) = if workflow_start.is_err() {
+            (None, false, false, None)
+        } else { tokio::select! {
             biased;
             expected_next = lifecycle.wait_for_restart() => {
                 (Some(expected_next), false, false, None)
@@ -978,7 +1017,7 @@ impl InstalledService {
             () = admission.failed() => {
                 (None, false, true, None)
             }
-        };
+        }};
         let admission_retired = admission.shutdown().await;
         transport_cancellation.cancel();
         let transport = match completed_transport {
@@ -986,12 +1025,13 @@ impl InstalledService {
             None => (&mut serving).await.is_ok(),
         };
         drop(serving);
+        let workflow_stopped = analytical_workflow.shutdown().await.is_ok();
         let jobs_stopped = if let Ok(at) = current_timestamp() {
             jobs.shutdown_authority(at, JOB_RUNNER_DRAIN).await.is_ok()
         } else {
             false
         };
-        let application = shutdown_application(product.application()).await;
+        let application = shutdown_application(product.application()).await && workflow_stopped;
         let audit_flushed = audit.flush().is_ok();
         let jobs_closed = jobs.shutdown_repository().await.is_ok();
         let rendezvous_retired = runtime.retire().unwrap_or(false);
@@ -1015,6 +1055,7 @@ impl InstalledService {
         drop(audit);
         drop(jobs);
         drop(product);
+        drop(analytical_workflow);
         drop(lifecycle);
         drop(installation_paths);
         drop(_workspace_selector);
@@ -1026,6 +1067,7 @@ impl InstalledService {
         } else if report.is_complete() && transport_stopped_unexpectedly {
             Err(InstalledServiceError::TransportStopped)
         } else if report.is_complete() {
+            workflow_start?;
             Ok(
                 expected_next.map_or(InstalledServiceRunOutcome::Stopped, |expected_next| {
                     InstalledServiceRunOutcome::RestartRequested { expected_next }
@@ -1075,6 +1117,7 @@ fn recover_failed_workspace_startup(
 }
 
 struct ComposedTransport {
+    analytical_workflow: Arc<crate::application::analytical_workflow::host::WorkflowHost>,
     audit: Arc<crate::mcp::audit::DurableAuditSink>,
     server: market_squawk_runtime::RuntimeServer,
     readiness: LoopbackApplicationClient,
@@ -1227,6 +1270,10 @@ async fn compose_transport(
         )
         .map_err(|_error| InstalledServiceError::CompositionStage("installed tool services"))?,
     );
+    let analytical_workflow = Arc::clone(&services.analytical_workflow);
+    let workflow_services: Arc<dyn market_squawk_services::ToolServices> = services.clone();
+    analytical_workflow.bind(Arc::downgrade(&workflow_services)).map_err(|_|InstalledServiceError::CompositionStage("analytical workflow binding"))?;
+    drop(workflow_services);
     let recovery_deadline = Instant::now()
         .checked_add(CLIENT_TIMEOUT)
         .ok_or(InstalledServiceError::InvalidComposition)?;
@@ -1382,6 +1429,7 @@ async fn compose_transport(
         CLIENT_TIMEOUT,
     )?;
     Ok(ComposedTransport {
+        analytical_workflow,
         audit,
         server,
         readiness,

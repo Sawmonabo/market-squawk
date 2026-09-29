@@ -1,5 +1,6 @@
 import { z } from "zod"
 
+import { admittedAnalysisActionToken } from "@/features/opportunities/contracts"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { ManualPaperRequest, ProductTransport } from "@/lib/transport"
 
@@ -69,13 +70,26 @@ const orderChoiceSchema = z
   })
   .strict()
 
-const governedTargetSchema = z
+const provenanceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("governed_target"),
+    thesis: z.string().min(1).max(4_096),
+    reviewDueAt: timestampSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("generated_proposal"),
+    analysisActionToken: z.string().refine((value) => admittedAnalysisActionToken(value) !== null),
+    publishedAt: timestampSchema,
+    recommendation: z.enum(["buy", "add", "trim", "sell"]),
+  }).strict(),
+])
+
+const manualTargetSchema = z
   .object({
     targetToken: targetTokenSchema,
     investment: investmentSchema,
-    thesis: z.string().min(1).max(4_096),
+    provenance: provenanceSchema,
     expiresAt: timestampSchema,
-    reviewDueAt: timestampSchema,
     ladder: z
       .array(
         z
@@ -93,7 +107,7 @@ const governedTargetSchema = z
   .strict()
 
 const targetCatalogSchema = z
-  .object({ targets: z.array(governedTargetSchema).max(100) })
+  .object({ targets: z.array(manualTargetSchema).max(100) })
   .strict()
 const acceptedManualPaperDraftSchema = z
   .object({
@@ -106,6 +120,7 @@ const manualPaperPreviewSchema = z
     confirmationToken: targetTokenSchema,
     expiresAt: timestampSchema,
     investment: investmentSchema,
+    provenance: provenanceSchema,
     direction: z.enum(["Buy", "Sell"]),
     orderApproach: z.enum(["Market", "Limit", "Stop", "Stop limit"]),
     quantity: z.string().min(1).max(128),
@@ -141,7 +156,7 @@ const completeMetadataSchema = z
   })
   .passthrough()
 
-export type GovernedPaperTarget = z.infer<typeof governedTargetSchema>
+export type ManualPaperTarget = z.infer<typeof manualTargetSchema>
 export type TargetLevel = z.infer<typeof targetLevelSchema>
 export type ManualPaperOrderType = z.infer<typeof orderTypeSchema>
 export type ManualPaperSide = z.infer<typeof orderSideSchema>
@@ -163,7 +178,10 @@ export function asManualPaperTransport(value: unknown): ManualPaperTransport | n
   return value as ManualPaperTransport
 }
 
-export function parseGovernedPaperTargets(result: ApplicationResult): GovernedPaperTarget[] {
+export function parseManualPaperTargets(
+  result: ApplicationResult,
+  analysisActionToken?: string,
+): ManualPaperTarget[] {
   const catalog = targetCatalogSchema.safeParse(result.data)
   const metadata = completeMetadataSchema.safeParse(result.metadata)
   if (
@@ -171,6 +189,12 @@ export function parseGovernedPaperTargets(result: ApplicationResult): GovernedPa
     !metadata.success ||
     metadata.data.returnedItems !== catalog.data.targets.length ||
     metadata.data.availableItems !== catalog.data.targets.length ||
+    new Set(catalog.data.targets.map((target) => target.targetToken)).size !== catalog.data.targets.length ||
+    (analysisActionToken !== undefined && catalog.data.targets.length > 1) ||
+    !catalog.data.targets.every((target) => analysisActionToken === undefined
+      ? target.provenance.kind === "governed_target"
+      : target.provenance.kind === "generated_proposal" &&
+        target.provenance.analysisActionToken === analysisActionToken) ||
     !hasExactLadder(catalog.data.targets) ||
     !hasUniquePreparedChoices(catalog.data.targets)
   ) {
@@ -193,11 +217,15 @@ export function parseAcceptedManualPaperDraft(result: ApplicationResult): string
   return accepted.data.message
 }
 
-export function parseManualPaperPreview(result: ApplicationResult): ManualPaperPreview {
+export function parseManualPaperPreview(
+  result: ApplicationResult,
+  expected: ManualPaperTarget["provenance"],
+): ManualPaperPreview {
   const preview = manualPaperPreviewSchema.safeParse(result.data)
   const metadata = completeMetadataSchema.safeParse(result.metadata)
   if (
     !preview.success ||
+    !sameProvenance(preview.data.provenance, expected) ||
     !metadata.success ||
     metadata.data.returnedItems !== 1 ||
     metadata.data.availableItems !== 1
@@ -216,7 +244,7 @@ export function isPositiveLotQuantity(value: string): boolean {
   }
 }
 
-function hasExactLadder(targets: GovernedPaperTarget[]): boolean {
+function hasExactLadder(targets: ManualPaperTarget[]): boolean {
   const expected = new Set<TargetLevel>([
     "downside",
     "add",
@@ -239,7 +267,7 @@ function hasExactLadder(targets: GovernedPaperTarget[]): boolean {
   })
 }
 
-function hasUniquePreparedChoices(targets: GovernedPaperTarget[]): boolean {
+function hasUniquePreparedChoices(targets: ManualPaperTarget[]): boolean {
   return targets.every(
     (target) =>
       new Set(target.sideChoices.map((choice) => choice.value)).size ===
@@ -252,4 +280,17 @@ function hasUniquePreparedChoices(targets: GovernedPaperTarget[]): boolean {
           choice.timeInForceChoices.length,
       ),
   )
+}
+
+function sameProvenance(
+  actual: ManualPaperTarget["provenance"],
+  expected: ManualPaperTarget["provenance"],
+): boolean {
+  if (actual.kind === "governed_target" && expected.kind === "governed_target") {
+    return actual.thesis === expected.thesis && actual.reviewDueAt === expected.reviewDueAt
+  }
+  return actual.kind === "generated_proposal" && expected.kind === "generated_proposal" &&
+    actual.analysisActionToken === expected.analysisActionToken &&
+    actual.publishedAt === expected.publishedAt &&
+    actual.recommendation === expected.recommendation
 }

@@ -9,25 +9,27 @@ use market_squawk_adapter_paper::{
     PaperOrderState,
 };
 use market_squawk_data::{InstrumentDefinitionReadCapability, MarketDataInstrumentReadCapability};
-use market_squawk_decisions::TargetState;
+use market_squawk_decisions::RecommendationAction;
 use market_squawk_domain::{
-    AccountId, BasisPoints, InstrumentDefinition, InstrumentExecutionTerms, InstrumentId, Money,
-    OrderSide, PriceTicks, QuantityLots, Timestamp,
+    AccountId, BasisPoints, InstrumentExecutionTerms, InstrumentId, Money, OrderSide, PriceTicks,
+    QuantityLots, Timestamp,
 };
 use market_squawk_execution::{CancelReceipt, CancelStatus, RiskLimitsSnapshot};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::paper_bot::ProductionPaperBotRuntime;
+
 use super::{
     PaperStrategyMode, ProductAuthorityTokens, ProductionExecutionAuditRecord,
-    ProductionExecutionAuditSnapshot, ServiceError, TargetLadderSelector, product_risk_outcome,
-    product_risk_reason,
+    ProductionExecutionAuditSnapshot, ResolvedPaperTarget, ServiceError, TargetLadderSelector,
+    product_risk_outcome, product_risk_reason,
 };
 
 pub(super) struct ProductInstrument {
     id: InstrumentId,
-    definition: InstrumentDefinition,
+    terms: InstrumentExecutionTerms,
     name: Box<str>,
     symbol: Option<Box<str>>,
 }
@@ -72,6 +74,7 @@ pub(super) fn execution_instruments(snapshot: &PaperExecutionSnapshot) -> Vec<In
 
 pub(super) fn load_instruments(
     ids: &[InstrumentId],
+    runtime: &ProductionPaperBotRuntime,
     definitions: &InstrumentDefinitionReadCapability,
     market_data: &MarketDataInstrumentReadCapability,
     deadline: Instant,
@@ -80,9 +83,35 @@ pub(super) fn load_instruments(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut executable = definitions
-        .latest(ids, ids.len().max(1), deadline, cancellation)
-        .map_err(|_| ServiceError::Unavailable)?;
+    let mut executable = Vec::new();
+    executable
+        .try_reserve_exact(ids.len())
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    if runtime.is_virtual_equity() {
+        for id in ids {
+            let mut matching = runtime
+                .manual_paper_routes()
+                .iter()
+                .filter(|route| route.execution_terms().instrument_id() == *id);
+            let route = matching.next().ok_or(ServiceError::Unavailable)?;
+            if matching.next().is_some() {
+                return Err(ServiceError::Unavailable);
+            }
+            executable.push(route.execution_terms());
+        }
+    } else {
+        let definitions = definitions
+            .latest(ids, ids.len().max(1), deadline, cancellation)
+            .map_err(|_| ServiceError::Unavailable)?;
+        if definitions.len() != ids.len() {
+            return Err(ServiceError::Unavailable);
+        }
+        executable.extend(
+            definitions
+                .iter()
+                .map(|definition| definition.execution_terms()),
+        );
+    }
     if executable.len() != ids.len() {
         return Err(ServiceError::Unavailable);
     }
@@ -98,11 +127,11 @@ pub(super) fn load_instruments(
         .try_reserve_exact(ids.len())
         .map_err(|_| ServiceError::ResourceExhausted)?;
     for id in ids {
-        let definition = executable
+        let terms = executable
             .binary_search_by_key(id, |candidate| candidate.instrument_id())
             .ok()
             .and_then(|index| executable.get(index))
-            .cloned()
+            .copied()
             .ok_or(ServiceError::Unavailable)?;
         let display = market_data
             .latest(*id, deadline, cancellation)
@@ -116,7 +145,7 @@ pub(super) fn load_instruments(
             .ok_or(ServiceError::Unavailable)?;
         output.push(ProductInstrument {
             id: *id,
-            definition,
+            terms,
             name: name.into_boxed_str(),
             // No stable primary-symbol authority exists in the current canonical definition.
             // Venue/provider mapping order must not choose an ordinary product symbol.
@@ -180,7 +209,7 @@ pub(super) fn quantity(
 
 fn position_quantity(value: i64, instrument: &ProductInstrument) -> Result<String, ServiceError> {
     Decimal::from(value)
-        .checked_mul(instrument.definition.lot_size().as_decimal())
+        .checked_mul(instrument.terms.lot_size().as_decimal())
         .map(|value| value.normalize().to_string())
         .ok_or(ServiceError::Unavailable)
 }
@@ -397,14 +426,11 @@ pub(super) fn cancel(
 }
 
 pub(super) fn manual_target(
-    target: &TargetState,
+    target: &ResolvedPaperTarget,
     target_token: &str,
     instrument: &ProductInstrument,
     can_sell: bool,
 ) -> Result<Value, ServiceError> {
-    if target.target().thesis().as_str().len() > 4_096 {
-        return Err(ServiceError::Unavailable);
-    }
     let mut ladder = Vec::new();
     ladder
         .try_reserve_exact(10)
@@ -424,20 +450,33 @@ pub(super) fn manual_target(
         ladder.push(json!({
             "level": level.level(),
             "label": level.label(),
-            "value": money(level.price(target)),
+            "value": money(target.price(level)?),
         }));
     }
-    let mut side_choices = vec![json!({
-        "value": "buy",
-        "label": "Buy",
-        "explanation": "Practice adding this investment to the virtual portfolio.",
-    })];
-    if can_sell {
+    let mut side_choices = Vec::new();
+    side_choices
+        .try_reserve_exact(2)
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    if target.permits_side(OrderSide::Buy)? {
+        side_choices.push(json!({
+            "value": "buy",
+            "label": "Buy",
+            "explanation": "Practice adding this investment to the virtual portfolio.",
+        }));
+    }
+    if can_sell && target.permits_side(OrderSide::Sell)? {
         side_choices.push(json!({
             "value": "sell",
             "label": "Sell",
-            "explanation": "Practice reducing a virtual position or establishing a permitted short position.",
+            "explanation": if target.proposal()?.is_some() {
+                "Practice reducing this investment's existing virtual position."
+            } else {
+                "Practice reducing a virtual position or establishing a permitted short position."
+            },
         }));
+    }
+    if side_choices.is_empty() {
+        return Err(ServiceError::Unavailable);
     }
     let day = json!({"value": "day", "label": "Today", "explanation": "Cancel any unfilled amount when today's session ends."});
     let gtc = json!({"value": "good_til_cancelled", "label": "Until cancelled", "explanation": "Keep the virtual order available until it fills, expires, or you cancel it."});
@@ -452,11 +491,44 @@ pub(super) fn manual_target(
     Ok(json!({
         "targetToken": target_token,
         "investment": investment(instrument),
-        "thesis": target.target().thesis().as_str(),
-        "expiresAt": timestamp(target.target().target().expires_at()),
-        "reviewDueAt": timestamp(target.target().review_due_at()),
+        "provenance": manual_provenance(target)?,
+        "expiresAt": timestamp(target.expires_at()),
         "ladder": ladder,
         "sideChoices": side_choices,
         "orderChoices": order_choices,
     }))
+}
+
+pub(super) fn manual_provenance(target: &ResolvedPaperTarget) -> Result<Value, ServiceError> {
+    match target {
+        ResolvedPaperTarget::Governed(state) => {
+            if state.target().thesis().as_str().len() > 4_096 {
+                return Err(ServiceError::Unavailable);
+            }
+            Ok(json!({
+                "kind": "governed_target",
+                "thesis": state.target().thesis().as_str(),
+                "reviewDueAt": timestamp(state.target().review_due_at()),
+            }))
+        }
+        ResolvedPaperTarget::Generated {
+            action_token,
+            original,
+        } => {
+            let proposal = target.proposal()?.ok_or(ServiceError::Unavailable)?;
+            let action = match proposal.action() {
+                RecommendationAction::Buy => "buy",
+                RecommendationAction::Add => "add",
+                RecommendationAction::Trim => "trim",
+                RecommendationAction::Sell => "sell",
+                RecommendationAction::Hold => return Err(ServiceError::Unavailable),
+            };
+            Ok(json!({
+                "kind": "generated_proposal",
+                "analysisActionToken": action_token,
+                "publishedAt": timestamp(original.publication().published_at()),
+                "recommendation": action,
+            }))
+        }
+    }
 }

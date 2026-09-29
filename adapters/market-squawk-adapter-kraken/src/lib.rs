@@ -7,10 +7,14 @@ mod level3;
 mod messages;
 mod publication;
 mod qualification;
+mod reference;
 mod session;
 mod subscription;
 
-pub use config::{KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth};
+pub use config::{
+    KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth, KrakenNativeMarketCoordinates,
+    KrakenReferenceSelectionEvidence,
+};
 pub use decoder::{
     KrakenDecodeOutcome, KrakenDecoder, KrakenDecoderState, KrakenMarketDecodeHandoff,
     KrakenMarketDecoder,
@@ -51,4 +55,8 @@ pub use session::{
     KrakenHealth, KrakenL3EstablishedSessionSender, KrakenL3SubscriptionDispatch,
     KrakenSentSubscriptionReceipt, KrakenSocketHandoffConsumer, KrakenSource,
     KrakenSubscriptionReceiptError, KrakenWrittenSubscription,
+};
+
+pub use reference::{
+    KrakenSpotPairReference, KrakenSpotPairReferenceError, MAX_KRAKEN_INSTRUMENT_SNAPSHOT_BYTES,
 };

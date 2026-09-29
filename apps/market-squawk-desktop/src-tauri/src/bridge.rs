@@ -3,7 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{
+        Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -28,7 +31,6 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-use crate::analytical_controller::DesktopAnalyticalController;
 use crate::contracts::{
     ApplicationInvocation, DesktopBootstrap, DesktopCommandError, DesktopServiceBootstrapCommand,
     DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopServiceReconnect,
@@ -352,6 +354,7 @@ pub(crate) struct DesktopState {
     service: Arc<DesktopServiceAuthority>,
     context: DesktopCompositionContext,
     restart_program: OnceLock<PathBuf>,
+    shutting_down: AtomicBool,
 }
 
 pub(crate) struct DesktopGeneration {
@@ -366,8 +369,6 @@ pub(crate) struct DesktopGeneration {
     research_preparation_receipts: Mutex<OneUseProductTokens>,
     research_activities: Mutex<StableProductTokens>,
     mcp_clients: Arc<DesktopMcpClientState>,
-    analytical_controller: Arc<DesktopAnalyticalController>,
-    analytical_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -523,6 +524,7 @@ impl DesktopState {
             service,
             context,
             restart_program: OnceLock::new(),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
@@ -603,6 +605,12 @@ impl DesktopState {
             .current
             .write()
             .map_err(|_error| DesktopCommandError::internal())?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(DesktopCommandError::new(
+                "desktop_shutting_down",
+                "Market Squawk is shutting down. Reopen it before reconnecting.",
+            ));
+        }
         admit_replacement(
             current.runtime(),
             &current.data_root,
@@ -649,6 +657,7 @@ impl DesktopState {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
         if let Ok(generation) = self.current_generation() {
             generation.begin_shutdown();
         }
@@ -656,6 +665,17 @@ impl DesktopState {
 
     pub(crate) async fn finish_shutdown(&self) {
         self.begin_shutdown();
+        let generation = match self.current.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => {
+                // Cleanup can retain the owned task even after a prior commit panic.
+                // This does not readmit the poisoned generation for product operations.
+                eprintln!("Desktop generation lock was poisoned during driver shutdown.");
+                Arc::clone(&poisoned.into_inner())
+            }
+        };
+        generation.begin_shutdown();
+
     }
 }
 
@@ -717,10 +737,6 @@ impl DesktopGeneration {
         )?;
         let local_paths = LocalPaths::open_existing(&data_root)
             .map_err(|_error| DesktopCommandError::internal())?;
-        let analytical_controller = DesktopAnalyticalController::try_open(
-            &local_paths,
-            service_bootstrap.runtime.workspace_id().as_uuid(),
-        )?;
         let mcp_clients = DesktopMcpClientState::try_new(
             &local_paths,
             context.relay_program.clone(),
@@ -743,8 +759,6 @@ impl DesktopGeneration {
             research_preparation_receipts: Mutex::new(OneUseProductTokens::default()),
             research_activities: Mutex::new(StableProductTokens::default()),
             mcp_clients: Arc::new(mcp_clients),
-            analytical_controller: Arc::new(analytical_controller),
-            analytical_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -779,13 +793,18 @@ impl DesktopGeneration {
             research_preparation_receipts: Mutex::new(OneUseProductTokens::default()),
             research_activities: Mutex::new(StableProductTokens::default()),
             mcp_clients: Arc::clone(&current.mcp_clients),
-            analytical_controller: Arc::clone(&current.analytical_controller),
-            analytical_gate: Arc::clone(&current.analytical_gate),
         })
     }
 
     pub(crate) fn application(&self) -> Arc<LoopbackApplicationClient> {
         Arc::clone(&self.application)
+    }
+
+    pub(crate) fn has_operation(&self, operation: &str) -> bool {
+        self.service_bootstrap
+            .operations
+            .iter()
+            .any(|descriptor| descriptor.name == operation)
     }
 
     pub(crate) const fn runtime(&self) -> RuntimeIdentity {
@@ -911,14 +930,6 @@ impl DesktopGeneration {
 
     pub(crate) fn mcp_clients(&self) -> &DesktopMcpClientState {
         self.mcp_clients.as_ref()
-    }
-
-    pub(crate) fn analytical_controller(&self) -> &DesktopAnalyticalController {
-        self.analytical_controller.as_ref()
-    }
-
-    pub(crate) async fn analytical_retirement_fence(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        Arc::clone(&self.analytical_gate).lock_owned().await
     }
 
     async fn bootstrap(
@@ -1254,7 +1265,7 @@ pub(crate) async fn desktop_service_bootstrap(
                 )
             })?;
             if let Err(error) =
-                commit_reconnected_generation(&state, &subscriptions, *expected_runtime, connection)
+                commit_reconnected_generation(&app, &state, &subscriptions, *expected_runtime, connection)
                     .await
             {
                 // Foreground recovery already produced a connection. The old generation remains
@@ -1273,6 +1284,7 @@ pub(crate) async fn desktop_service_bootstrap(
 
 #[tauri::command]
 pub(crate) async fn desktop_service_reconnect(
+    app: tauri::AppHandle,
     request: DesktopServiceReconnect,
     window: tauri::Window,
     state: State<'_, DesktopState>,
@@ -1311,6 +1323,7 @@ pub(crate) async fn desktop_service_reconnect(
     match startup {
         DesktopServiceStartup::Ready(connection) => {
             let bootstrap = commit_reconnected_generation(
+                &app,
                 &state,
                 &subscriptions,
                 expected_runtime,
@@ -1331,6 +1344,7 @@ pub(crate) async fn desktop_service_reconnect(
 }
 
 async fn commit_reconnected_generation(
+    _app: &tauri::AppHandle,
     state: &DesktopState,
     subscriptions: &DesktopEventSubscriptions,
     expected_runtime: RuntimeIdentity,
@@ -1338,8 +1352,6 @@ async fn commit_reconnected_generation(
 ) -> Result<DesktopBootstrap, DesktopCommandError> {
     let old = state.current_generation()?;
     let retirement_fence = old.mcp_clients().retirement_fence().await;
-    state.admit_current(&old)?;
-    let analytical_fence = old.analytical_retirement_fence().await;
     state.admit_current(&old)?;
     let prepared = state
         .prepare_replacement(&old, expected_runtime, connection)
@@ -1355,7 +1367,6 @@ async fn commit_reconnected_generation(
         .await?;
     retired.begin_shutdown();
     drop(retirement_fence);
-    drop(analytical_fence);
     drop(retired);
     Ok(prepared.bootstrap)
 }
@@ -1621,8 +1632,86 @@ async fn invoke_generation_operation(
     )
     .await?;
     let result = lossless_webview_value(result);
-    validate_desktop_json(&result, MAXIMUM_DESKTOP_RESULT_BYTES as usize, false)?;
+    validate_desktop_json(&result, desktop_result_byte_limit(operation) as usize, false)?;
     Ok(result)
+}
+
+/// Prepares exact wire arguments before a native controller retains their recovery digest.
+/// Reusing retained arguments is idempotent; different saved limits are never overwritten.
+pub(crate) fn prepare_analytical_arguments(
+    generation: &DesktopGeneration,
+    operation: &str,
+    mut arguments: Map<String, Value>,
+    authority: InvocationAuthority,
+) -> Result<Map<String, Value>, DesktopCommandError> {
+    let descriptor = generation
+        .service_bootstrap
+        .operations
+        .iter()
+        .find(|descriptor| descriptor.name == operation)
+        .ok_or_else(|| DesktopCommandError::new("not_found", "The operation is unavailable."))?;
+    if matches!(
+        authority,
+        InvocationAuthority::ExactConfirmed(_) | InvocationAuthority::RiskMediated(_)
+    ) {
+        arguments.insert("confirm".to_owned(), Value::Bool(true));
+    }
+    if descriptor.input_schema.pointer("/properties/resultLimits").is_some() {
+        let limits = desktop_result_limits(operation);
+        if arguments.get("resultLimits").is_some_and(|saved| saved != &limits) {
+            return Err(DesktopCommandError::invalid_request(
+                "The saved operation result limits differ from the desktop limits.",
+            ));
+        }
+        arguments.insert("resultLimits".to_owned(), limits);
+    }
+    Ok(arguments)
+}
+
+fn desktop_result_byte_limit(operation: &str) -> u64 {
+    match operation {
+        // One saved brief includes its bounded original history and forecast chart layers.
+        "Decision.GetInvestmentAnalysis" => 3 * 1024 * 1024,
+        _ => MAXIMUM_DESKTOP_RESULT_BYTES,
+    }
+}
+
+pub(crate) fn desktop_result_limits(operation: &str) -> Value {
+    json!({
+        "maximumItems": MAXIMUM_DESKTOP_RESULT_ITEMS,
+        "maximumBytes": desktop_result_byte_limit(operation),
+    })
+}
+
+/// Invokes a composable capability with the controller's durably retained request identity.
+/// Native evidence keeps its original JSON integer representation. Callers re-admit the current
+/// Desktop generation under the retirement fence before retaining any resulting checkpoint.
+pub(crate) async fn invoke_analytical_operation(
+    generation: &Arc<DesktopGeneration>,
+    operation: &'static str,
+    arguments: Map<String, Value>,
+    authority: InvocationAuthority,
+    request_id: RequestId,
+    cancellation: CancellationToken,
+) -> Result<Value, DesktopCommandError> {
+    let arguments = prepare_analytical_arguments(generation, operation, arguments, authority)?;
+    let request_cancellation = generation.cancellation();
+    let _cancel_on_exit = request_cancellation.clone().drop_guard();
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            Err(map_application_client_error(ApplicationClientError::Interrupted))
+        }
+        result = invoke_bounded_generation_operation(
+            generation,
+            operation,
+            arguments,
+            authority,
+            false,
+            request_id,
+            request_cancellation,
+        ) => result,
+    }
 }
 
 async fn invoke_bounded_generation_operation(
@@ -1669,10 +1758,7 @@ async fn invoke_bounded_generation_operation(
     {
         arguments.insert(
             "resultLimits".to_owned(),
-            json!({
-                "maximumItems": MAXIMUM_DESKTOP_RESULT_ITEMS,
-                "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
-            }),
+            desktop_result_limits(operation),
         );
     }
     let arguments = Value::Object(arguments);
@@ -1705,7 +1791,7 @@ async fn invoke_bounded_generation_operation(
         .await
         .map_err(map_application_client_error)?;
     let result = decode_application_result(response.result())?;
-    validate_desktop_json(&result, MAXIMUM_DESKTOP_RESULT_BYTES as usize, false)?;
+    validate_desktop_json(&result, desktop_result_byte_limit(operation) as usize, false)?;
     Ok(result)
 }
 

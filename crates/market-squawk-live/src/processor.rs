@@ -108,6 +108,10 @@ pub(crate) struct AppliedLiveObservation {
     pub(crate) stream: CurrentStreamKey,
     pub(crate) generation: ConnectionGeneration,
     pub(crate) source_evidence: CurrentObservationEvidence,
+    pub(crate) provider_identity: market_squawk_sources::CurrentProviderIdentity,
+    pub(crate) source_authority: market_squawk_sources::CurrentSourceAuthorityLease,
+    pub(crate) row_ordinal: usize,
+    pub(crate) row_count: usize,
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
     pub(crate) binding_digest: [u8; 32],
@@ -341,7 +345,8 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             && execution_enabled(current.observation().event_class())
         {
             Some(AppliedObservationAuthority::new(
-                cursor.admission.source().clone(),
+                current.current_lease().clone(),
+                current.provider_identity().clone(),
                 committed.generation,
                 self.liveness.shard.clone(),
                 self.liveness.runtime.clone(),
@@ -364,6 +369,10 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             stream: key,
             generation: cursor.admission.source().binding().connection_generation(),
             source_evidence,
+            provider_identity: current.provider_identity().clone(),
+            source_authority: current.current_lease().clone(),
+            row_ordinal: current.row_ordinal(),
+            row_count: current.row_count(),
             event: qualified.event,
             assessment: qualified.assessment,
             binding_digest: qualified.binding_digest,
@@ -441,7 +450,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         cursor: &CurrentBatchCursor,
         at: Timestamp,
     ) -> Result<(), LiveApplyError> {
-        current.current_lease().validate_at(at)?;
+        current.validate_at(at)?;
         cursor.admission.validate_at(at)?;
         self.liveness.validate()?;
         if !current

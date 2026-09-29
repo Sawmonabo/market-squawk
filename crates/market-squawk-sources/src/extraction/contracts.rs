@@ -583,7 +583,9 @@ impl ExtractionRequest {
         Self::try_new(object, self.max_records, self.max_bytes, self.deadline)
     }
 
-    pub(crate) fn dynamic_retained_bytes(&self) -> Result<u64, ExtractionError> {
+    /// Returns checked owned dynamic bytes using the same formula as batch admission.
+    /// Shared references are conservatively charged to each request owner.
+    pub fn dynamic_retained_bytes(&self) -> Result<u64, ExtractionError> {
         self.object.dynamic_retained_bytes()
     }
 }

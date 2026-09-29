@@ -32,7 +32,7 @@ from activated research providers into immutable analytical datasets.
 This page documents:
 
 - `ingest file <MANIFEST> --object <ID> --dataset <ID> --confirm`;
-- `ingest source <PROFILE> <OBJECT> --dataset <ID> --confirm`;
+- `ingest source <PROFILE> <OBJECT> --dataset <ID> --discovery-receipt <RECEIPT> --confirm`;
 - the CSV, JSON, NDJSON, and Parquet forms of the versioned local-file manifest;
 - the SEC EDGAR, FRED/ALFRED, BLS, and Treasury adapter identities that the current binary accepts;
 - the dedicated portfolio-import boundary to the extent it produces research data; and
@@ -272,49 +272,25 @@ reactivation step.
 
 ### 2. Select an exact object
 
-The coordinator first performs bounded discovery and then requires exactly one discovered object
-whose ID equals the supplied argument. A missing match returns not found; two matches fail as an
-invalid provider result.
-
-SEC submissions have a deterministic object ID. This is a complete example for Apple CIK
-`0000320193`:
+Run confirmed discovery for the exact provider dataset. For example:
 
 ```bash
-market-squawk \
-  --data-dir "$DATA_ROOT" \
-  --output json \
-  ingest source \
-  sec.edgar-public \
-  sec.submissions.composite.CIK0000320193 \
-  --dataset sec.submissions.cik.0000320193 \
-  --confirm
+market-squawk --data-dir "$DATA_ROOT" --output json \
+  source discover sec.edgar-public --dataset sec.submissions.cik.0000320193 --confirm
 ```
 
-SEC company facts use the exact official locator as the object ID:
-
-```bash
-market-squawk \
-  --data-dir "$DATA_ROOT" \
-  --output json \
-  ingest source \
-  sec.edgar-public \
-  https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json \
-  --dataset sec.company-facts.cik.0000320193 \
-  --confirm
-```
-
-The actual syntax has two positional values followed by a required dataset option:
+Select one entry from `data.objects`. Copy its `object_id`, `dataset`, and `discovery_receipt`
+unchanged. The receipt authorizes only that original object in the same running service and active
+workspace; it is single-use and expires. Provider receipts are opaque, not API credentials.
 
 ```text
-ingest source <PROFILE> <OBJECT> --dataset <DATASET> --confirm
+ingest source <PROFILE> <OBJECT> --dataset <DATASET> --discovery-receipt <RECEIPT> --confirm
 ```
 
-Do not use the older three-positional rendering of this command. The frozen CLI implementation
-declares `--dataset` as a named option.
-
-For FRED/ALFRED, BLS, or Treasury, run `source discover <PROFILE> --dataset <PROVIDER_DATASET>`
-first. Confirmed ingestion must use the complete returned object ID, fresh discovery receipt, same
-provider selector, and a profile whose current rights authorize persistence.
+Ingestion consumes the original discovery receipt without another discovery request. This preserves
+providers whose object identity includes the original request or observation time. A guessed,
+expired, consumed, or mismatched receipt fails closed. SEC, FRED/ALFRED, BLS, Treasury, and other
+activated research profiles use the same receipt contract and retain their own rights gates.
 
 ## Rights, availability, and revisions
 
@@ -396,7 +372,9 @@ If a command times out, is interrupted, or returns an indeterminate local I/O fa
 
 1. preserve the catalog, artifact tree, source manifest, rights evidence, and command arguments;
 2. inspect `dataset list` and `dataset manifest <DATASET>`;
-3. rerun the **identical** confirmed command against unchanged input; and
+3. for local files, rerun the identical confirmed command against unchanged input; for provider
+   ingestion, obtain a fresh confirmed discovery selection if the original receipt was consumed,
+   expired, or invalidated, and use that selection's exact object and receipt; and
 4. compare the returned manifest and payload digest with the first operation's evidence.
 
 An exact retry reuses the matching reservation. If publication already committed, recovery

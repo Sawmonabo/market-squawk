@@ -21,7 +21,14 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHWAB_DAILY_INTERVAL: &str = "1d";
+// The request proves daily frequency, but the retained first-party contract does not prove
+// adjustment or whether each candle timestamp starts or ends its aggregation period. No
+// canonical daily bar may be published while either meaning remains unknown.
+const REVIEWED_SCHWAB_DAILY_HISTORY_SEMANTICS: Option<(
+    &str,
+    MarketBarAdjustment,
+    BarTimestampBasis,
+)> = None;
 
 use crate::canonical::{
     SchwabDailyPriceHistoryCandidateRequest, SchwabPendingPriceHistoryCandidate,
@@ -33,12 +40,12 @@ use crate::{
     SchwabCanonicalError, SchwabCaptureCoordinates, SchwabMarketDataDelay,
     SchwabMarketDataQualification, SchwabOAuthAuthorityReceipt,
     SchwabPriceHistoryCapabilityObservation, SchwabResolvedProviderIdentity,
-    SchwabRestCaptureSealRejoin, SchwabRestPayload, SchwabTransportError,
+    SchwabRestCaptureSealRejoin, SchwabRestPayload, SchwabSealedRestResponse, SchwabTransportError,
     SchwabUserPreferenceEvidence,
 };
 use market_squawk_domain::{
-    BarTimeSemantics, Currency, InstrumentId, MarketBarAdjustment, MarketBarObservation,
-    ProviderInstrumentId, Timestamp,
+    BarTimeSemantics, BarTimestampBasis, Currency, InstrumentId, MarketBarAdjustment,
+    MarketBarObservation, ProviderInstrumentId, Timestamp,
 };
 
 /// Provider/feed/venue/delay evidence for one Schwab daily price-history response.
@@ -215,6 +222,10 @@ impl<'a> SchwabDailyPriceHistoryPublicationRequest<'a> {
 /// One accepted typed daily-history response awaiting the application-owned physical seal.
 pub struct SchwabPendingDailyPriceHistoryPublication {
     rejoin: SchwabRestCaptureSealRejoin,
+    mapping: DailyHistoryMapping,
+}
+
+struct DailyHistoryMapping {
     candidate: SchwabPendingPriceHistoryCandidate,
     extraction_request: ExtractionRequest,
     market_data: SchwabPriceHistoryMarketDataEvidence,
@@ -226,8 +237,8 @@ impl std::fmt::Debug for SchwabPendingDailyPriceHistoryPublication {
         formatter
             .debug_struct("SchwabPendingDailyPriceHistoryPublication")
             .field("rejoin", &self.rejoin)
-            .field("market_data", &self.market_data)
-            .field("canonical_records", &self.candidate.bars.len())
+            .field("market_data", &self.mapping.market_data)
+            .field("canonical_records", &self.mapping.candidate.bars.len())
             .field("raw_body", &"AWAITING COMMON PHYSICAL SEAL")
             .finish()
     }
@@ -247,6 +258,49 @@ impl ExecutedRestResponse {
         ),
         SchwabPriceHistoryPublicationError,
     > {
+        let mapping = DailyHistoryMapping::prepare(
+            request,
+            &coordinates,
+            self.capture().receipt(),
+            self.payload(),
+            self.accounting(),
+        )?;
+        let (rejoin, seal_request) = self
+            .into_pending_capture(coordinates, event_id)?
+            .into_sealing_parts();
+        Ok((
+            SchwabPendingDailyPriceHistoryPublication { rejoin, mapping },
+            seal_request,
+        ))
+    }
+}
+
+impl SchwabSealedRestResponse {
+    /// Maps the original physically sealed response without reconstructing or cloning its raw body.
+    pub fn into_daily_price_history_publication(
+        self,
+        request: SchwabDailyPriceHistoryPublicationRequest<'_>,
+    ) -> Result<SchwabSealedDailyPriceHistoryPublication, SchwabPriceHistoryPublicationError> {
+        let parts = self.into_parts();
+        let mapping = DailyHistoryMapping::prepare(
+            request,
+            &parts.coordinates,
+            &parts.receipt,
+            &parts.payload,
+            parts.accounting,
+        )?;
+        mapping.finish(parts)
+    }
+}
+
+impl DailyHistoryMapping {
+    fn prepare(
+        request: SchwabDailyPriceHistoryPublicationRequest<'_>,
+        coordinates: &SchwabCaptureCoordinates,
+        receipt: &crate::RawRestResponseReceipt,
+        payload: &SchwabRestPayload,
+        accounting: crate::RestItemAccounting,
+    ) -> Result<Self, SchwabPriceHistoryPublicationError> {
         let SchwabDailyPriceHistoryPublicationRequest {
             capability,
             oauth_authority,
@@ -261,38 +315,34 @@ impl ExecutedRestResponse {
             calendar_range,
             ingested_at,
         } = request;
-        // The admitted REST request is exactly `frequencyType=daily&frequency=1` and exposes no
-        // corporate-action adjustment selector. Preserve provider-returned values without
-        // allowing callers to relabel their interval or claim a provider-side adjustment.
-        let interval = SourceIdentifier::try_from(SCHWAB_DAILY_INTERVAL)
+        let (interval_name, adjustment, timestamp_basis) = REVIEWED_SCHWAB_DAILY_HISTORY_SEMANTICS
+            .ok_or(SchwabPriceHistoryPublicationError::SemanticsUnverified)?;
+        let interval = SourceIdentifier::try_from(interval_name)
             .map_err(|_| SchwabPriceHistoryPublicationError::InvalidEvidence)?;
-        let adjustment = MarketBarAdjustment::Raw;
         if !market_data
             .qualification
-            .validates_rest_response(SchwabMarketDataFamily::PriceHistory, &self)
+            .validates_rest_receipt(SchwabMarketDataFamily::PriceHistory, receipt)
             || calendar_range.publication_source_id() != coordinates.source_id()
             || calendar_range.venue_id() != market_data.venue_id()
             || calendar_range.interval() != &interval
             || calendar_range.adjustment() != adjustment
+            || calendar_range
+                .periods()
+                .iter()
+                .any(|period| period.timestamp_basis() != Some(timestamp_basis))
             || calendar_range.provider_request_digest()
-                != EvidenceDigest::new(
-                    DigestAlgorithm::Sha256,
-                    self.capture().receipt().request_sha256(),
-                )
+                != EvidenceDigest::new(DigestAlgorithm::Sha256, receipt.request_sha256())
         {
             return Err(SchwabPriceHistoryPublicationError::InvalidEvidence);
         }
-        validate_preseal_request(
-            &extraction_request,
-            &coordinates,
-            self.capture().receipt(),
-            ingested_at,
-        )?;
+        validate_preseal_request(&extraction_request, coordinates, receipt, ingested_at)?;
         let candidate = prepare_price_history_candidate(SchwabDailyPriceHistoryCandidateRequest {
             capability,
             oauth_authority,
             user_preference,
-            response: &self,
+            receipt,
+            payload,
+            accounting,
             instrument_id,
             instrument_revision_digest,
             admitted_plan_digest,
@@ -305,18 +355,12 @@ impl ExecutedRestResponse {
             calendar_range: calendar_range.as_ref(),
             ingested_at,
         })?;
-        let pending = self.into_pending_capture(coordinates, event_id)?;
-        let (rejoin, seal_request) = pending.into_sealing_parts();
-        Ok((
-            SchwabPendingDailyPriceHistoryPublication {
-                rejoin,
-                candidate,
-                extraction_request,
-                market_data,
-                calendar_range,
-            },
-            seal_request,
-        ))
+        Ok(Self {
+            candidate,
+            extraction_request,
+            market_data,
+            calendar_range,
+        })
     }
 }
 
@@ -357,7 +401,15 @@ impl SchwabPendingDailyPriceHistoryPublication {
         self,
         sealed: SealedProviderCaptureMaterial,
     ) -> Result<SchwabSealedDailyPriceHistoryPublication, SchwabPriceHistoryPublicationError> {
-        let sealed_rest = self.rejoin.try_rejoin_whole(sealed)?;
+        self.mapping.finish(self.rejoin.try_rejoin_whole(sealed)?)
+    }
+}
+
+impl DailyHistoryMapping {
+    fn finish(
+        self,
+        sealed_rest: SchwabSealedRestResponseParts,
+    ) -> Result<SchwabSealedDailyPriceHistoryPublication, SchwabPriceHistoryPublicationError> {
         validate_sealed_rest(&sealed_rest, &self.candidate)?;
         let SchwabRestPayload::PriceHistory(parsed) = &sealed_rest.payload else {
             return Err(SchwabPriceHistoryPublicationError::InvalidEvidence);
@@ -415,6 +467,11 @@ impl SchwabSealedDailyPriceHistoryPublication {
     /// Exact service/feed/venue/delay evidence persisted in the native-lineage sidecar.
     pub const fn market_data(&self) -> &SchwabPriceHistoryMarketDataEvidence {
         &self.market_data
+    }
+
+    /// Retains the exact calendar authority for revalidation through catalog commit.
+    pub fn calendar_range(&self) -> Arc<dyn SchwabDailyPriceHistoryCalendarRangeReceipt> {
+        Arc::clone(&self.calendar_range)
     }
 
     /// Bounded local-content revision input aligned with the canonical batch.
@@ -822,6 +879,9 @@ fn hex(bytes: [u8; 32]) -> String {
 /// Closed secret-free daily-history seal/publication failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SchwabPriceHistoryPublicationError {
+    /// The provider's adjustment or candle timestamp basis has no reviewed source evidence.
+    #[error("Schwab daily-history adjustment or timestamp basis is unverified")]
+    SemanticsUnverified,
     /// OAuth, capability, identity, calendar, or canonical mapping evidence did not match.
     #[error("Schwab daily-history canonical evidence is invalid")]
     InvalidEvidence,

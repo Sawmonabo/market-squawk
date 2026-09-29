@@ -36,6 +36,16 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
         "effective_from_unix_nanos":1700000000000000000,
         "effective_until_unix_nanos":1900000000000000000
       },
+      "reference_authorization":{
+        "mode":"public_interface",
+        "provider":"kraken",
+        "basis":"market-squawk-reviewed-kraken-instrument-reference",
+        "evidence_sha256":"9b4544298835999a3457f48dbd03e4061fce3d82b98bfc82129b6adbc20ae9be",
+        "evidence_reference":"https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument",
+        "evidence_version":"reviewed-2026-09-23",
+        "effective_from_unix_nanos":1700000000000000000,
+        "effective_until_unix_nanos":1900000000000000000
+      },
       "instrument":{
         "symbol":"BTC/USD",
         "instrument_id":"4c74ab95-53b9-42ad-9b66-0ed403b88fed",
@@ -79,14 +89,11 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
         vec![route],
         ProductionSourceProvider::Kraken,
     )?;
-    assert_eq!(composition.endpoint(), "wss://ws.kraken.com/v2");
-    let metadata = composition.source_metadata()?;
-    assert_eq!(metadata.len(), 2);
-    assert!(metadata.iter().all(|source| {
-        source.provider().as_str() == "kraken"
-            && source.quality_ceiling() == DataQuality::DirectUnverified
-    }));
-    assert_ne!(metadata[0].source_id(), metadata[1].source_id());
+    assert_eq!(composition.endpoint()?, "wss://ws.kraken.com/v2");
+    assert!(matches!(
+        composition.source_metadata(),
+        Err(super::super::composition::ProductionLiveSourceCompositionError::CatalogSelectionRequired)
+    ));
     Ok(())
 }
 
@@ -109,6 +116,16 @@ fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration(
         "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
         "evidence_version":"reviewed-2026-08-08",
+        "effective_from_unix_nanos":1700000000000000000,
+        "effective_until_unix_nanos":1900000000000000000
+      },
+      "reference_authorization":{
+        "mode":"public_interface",
+        "provider":"coinbase-exchange",
+        "basis":"market-squawk-reviewed-coinbase-product-reference",
+        "evidence_sha256":"6d6be28e5a9484c6bbfa75041b382cdaf2bbe387237d1cc4168aa02b59d58bd7",
+        "evidence_reference":"https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product",
+        "evidence_version":"reviewed-2026-09-23",
         "effective_from_unix_nanos":1700000000000000000,
         "effective_until_unix_nanos":1900000000000000000
       },

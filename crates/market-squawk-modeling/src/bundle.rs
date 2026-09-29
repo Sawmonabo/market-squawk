@@ -32,6 +32,8 @@ use crate::native::NativeArtifact;
 use crate::{BundleExpectations, ModelMetadata, ModelMetadataError};
 
 mod io;
+mod probability;
+pub use probability::{ProbabilityCalibrationArtifacts, ProbabilityReliabilityBin};
 mod validation;
 
 /// Maximum UTF-8 bytes in one path relative to a controlled model root.
@@ -139,6 +141,9 @@ pub struct ModelBundle {
     training_run_bytes: Box<[u8]>,
     forecast_residuals_bytes: Option<Box<[u8]>>,
     forecast_policy_bytes: Option<Box<[u8]>>,
+    probability_outcomes_bytes: Option<Box<[u8]>>,
+    probability_policy_bytes: Option<Box<[u8]>>,
+    forecast_residual_distribution: Option<crate::ForecastResidualDistribution>,
     retained_bytes: usize,
 }
 
@@ -241,10 +246,11 @@ impl ModelBundle {
         if wire.training_universe_id != expectations.universe_id().as_str() {
             return Err(BundleError::UniverseMismatch);
         }
-        if wire.training_period.start_unix_nanos
-            != expectations.training_period().start().unix_nanos()
-            || wire.training_period.end_unix_nanos
-                != expectations.training_period().end().unix_nanos()
+        if wire
+            .training_period
+            .decode()
+            .map_err(|_| BundleError::TrainingPeriodMismatch)?
+            != expectations.training_period()
         {
             return Err(BundleError::TrainingPeriodMismatch);
         }
@@ -283,71 +289,97 @@ impl ModelBundle {
             .map_err(|_| BundleError::TrainingRunSyntax)?;
         validate_training_run(&run, &wire, expectations, format, output_semantics)?;
 
-        let (forecast_calibration, forecast_residuals_bytes, forecast_policy_bytes) =
-            match wire.forecast_calibration.as_ref() {
-                Some(reference) => {
-                    if format != crate::ModelFormat::Onnx
-                        || output_semantics != crate::ModelOutputSemantics::Regression
-                        || reference.residuals.path != FORECAST_RESIDUALS_PATH
-                        || reference.policy.path != FORECAST_POLICY_PATH
-                        || reference.residuals.path == wire.artifact.path
-                        || reference.residuals.path == wire.training_run.path
-                        || reference.policy.path == wire.artifact.path
-                        || reference.policy.path == wire.training_run.path
-                        || reference.policy.path == reference.residuals.path
-                    {
-                        return Err(BundleError::InvalidForecastCalibration);
-                    }
-                    let residuals_hash = parse_digest(&reference.residuals.sha256)?;
-                    let policy_hash = parse_digest(&reference.policy.sha256)?;
-                    let residuals_reference =
-                        BundleMetadataRef::try_new(&reference.residuals.path, residuals_hash)?;
-                    let policy_reference =
-                        BundleMetadataRef::try_new(&reference.policy.path, policy_hash)?;
-                    let residuals_size = usize::try_from(reference.residuals.size_bytes)
-                        .map_err(|_| BundleError::ForecastCalibrationTooLarge)?;
-                    let policy_size = usize::try_from(reference.policy.size_bytes)
-                        .map_err(|_| BundleError::ForecastCalibrationTooLarge)?;
-                    if residuals_size == 0
-                        || residuals_size > MAX_FORECAST_RESIDUAL_BYTES
-                        || policy_size == 0
-                        || policy_size > MAX_FORECAST_POLICY_BYTES
-                    {
-                        return Err(BundleError::ForecastCalibrationTooLarge);
-                    }
-                    let residuals = read_exact_bounded(
-                        &root.directory,
-                        residuals_reference.relative_path(),
-                        MAX_FORECAST_RESIDUAL_BYTES,
-                        BundleError::ForecastCalibrationTooLarge,
-                    )?;
-                    let policy = read_exact_bounded(
-                        &root.directory,
-                        policy_reference.relative_path(),
-                        MAX_FORECAST_POLICY_BYTES,
-                        BundleError::ForecastCalibrationTooLarge,
-                    )?;
-                    if residuals.len() != residuals_size || policy.len() != policy_size {
-                        return Err(BundleError::ForecastCalibrationSizeMismatch);
-                    }
-                    if sha256_digest(&residuals) != residuals_hash
-                        || sha256_digest(&policy) != policy_hash
-                    {
-                        return Err(BundleError::ForecastCalibrationHashMismatch);
-                    }
-                    validate_json_structure(&policy)
-                        .map_err(|_| BundleError::ForecastCalibrationStructureLimit)?;
-                    let policy_wire: ForecastPolicyWire = serde_json::from_slice(&policy)
-                        .map_err(|_| BundleError::ForecastCalibrationSyntax)?;
-                    let calibration =
-                        validate_forecast_calibration(reference, policy_wire, &residuals)?;
-                    (
-                        Some(calibration),
-                        Some(residuals.into_boxed_slice()),
-                        Some(policy.into_boxed_slice()),
-                    )
+        let (
+            forecast_calibration,
+            forecast_residuals_bytes,
+            forecast_policy_bytes,
+            forecast_residual_distribution,
+        ) = match wire.forecast_calibration.as_ref() {
+            Some(reference) => {
+                if !matches!(
+                    format,
+                    crate::ModelFormat::NativeLinear | crate::ModelFormat::Onnx
+                ) || output_semantics != crate::ModelOutputSemantics::Regression
+                    || reference.residuals.path != FORECAST_RESIDUALS_PATH
+                    || reference.policy.path != FORECAST_POLICY_PATH
+                    || reference.residuals.path == wire.artifact.path
+                    || reference.residuals.path == wire.training_run.path
+                    || reference.policy.path == wire.artifact.path
+                    || reference.policy.path == wire.training_run.path
+                    || reference.policy.path == reference.residuals.path
+                {
+                    return Err(BundleError::InvalidForecastCalibration);
                 }
-                None => (None, None, None),
+                let residuals_hash = parse_digest(&reference.residuals.sha256)?;
+                let policy_hash = parse_digest(&reference.policy.sha256)?;
+                let residuals_reference =
+                    BundleMetadataRef::try_new(&reference.residuals.path, residuals_hash)?;
+                let policy_reference =
+                    BundleMetadataRef::try_new(&reference.policy.path, policy_hash)?;
+                let residuals_size = usize::try_from(reference.residuals.size_bytes)
+                    .map_err(|_| BundleError::ForecastCalibrationTooLarge)?;
+                let policy_size = usize::try_from(reference.policy.size_bytes)
+                    .map_err(|_| BundleError::ForecastCalibrationTooLarge)?;
+                if residuals_size == 0
+                    || residuals_size > MAX_FORECAST_RESIDUAL_BYTES
+                    || policy_size == 0
+                    || policy_size > MAX_FORECAST_POLICY_BYTES
+                {
+                    return Err(BundleError::ForecastCalibrationTooLarge);
+                }
+                let residuals = read_exact_bounded(
+                    &root.directory,
+                    residuals_reference.relative_path(),
+                    MAX_FORECAST_RESIDUAL_BYTES,
+                    BundleError::ForecastCalibrationTooLarge,
+                )?;
+                let policy = read_exact_bounded(
+                    &root.directory,
+                    policy_reference.relative_path(),
+                    MAX_FORECAST_POLICY_BYTES,
+                    BundleError::ForecastCalibrationTooLarge,
+                )?;
+                if residuals.len() != residuals_size || policy.len() != policy_size {
+                    return Err(BundleError::ForecastCalibrationSizeMismatch);
+                }
+                if sha256_digest(&residuals) != residuals_hash
+                    || sha256_digest(&policy) != policy_hash
+                {
+                    return Err(BundleError::ForecastCalibrationHashMismatch);
+                }
+                validate_json_structure(&policy)
+                    .map_err(|_| BundleError::ForecastCalibrationStructureLimit)?;
+                let policy_wire: ForecastPolicyWire = serde_json::from_slice(&policy)
+                    .map_err(|_| BundleError::ForecastCalibrationSyntax)?;
+                let calibration =
+                    validate_forecast_calibration(reference, policy_wire, &residuals, &run)?;
+                let distribution = validation::admitted_residual_distribution(
+                    &residuals,
+                    residuals_hash,
+                    training_run_hash,
+                    &run,
+                )?;
+                (
+                    Some(calibration),
+                    Some(residuals.into_boxed_slice()),
+                    Some(policy.into_boxed_slice()),
+                    distribution,
+                )
+            }
+            None => (None, None, None, None),
+        };
+
+        let (probability_calibration, probability_outcomes_bytes, probability_policy_bytes) =
+            match wire.probability_calibration.as_ref() {
+                Some(reference) => {
+                    let (proof, outcomes, policy) =
+                        probability::load(root, reference, &run, expectations, format)?;
+                    (Some(proof), Some(outcomes), Some(policy))
+                }
+                None if output_semantics != crate::ModelOutputSemantics::BinaryProbability => {
+                    (None, None, None)
+                }
+                None => return Err(BundleError::InvalidProbabilityCalibration),
             };
 
         let artifact_bytes = read_exact_bounded(
@@ -385,7 +417,8 @@ impl ModelBundle {
             wire.limitations,
             wire.fallback.reason,
         )
-        .with_forecast_calibration(forecast_calibration);
+        .with_forecast_calibration(forecast_calibration)
+        .with_probability_calibration(probability_calibration);
         let retained_bytes = size_of::<Self>()
             .checked_add(
                 metadata
@@ -395,6 +428,20 @@ impl ModelBundle {
             .and_then(|bytes| match &artifact {
                 BundleArtifact::Native(artifact) => bytes.checked_add(artifact.retained_bytes()?),
                 BundleArtifact::Onnx => Some(bytes),
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    probability_outcomes_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    probability_policy_bytes
+                        .as_ref()
+                        .map_or(0, |value| value.len()),
+                )
             })
             .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
             .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
@@ -416,6 +463,13 @@ impl ModelBundle {
                         .map_or(0, |value| value.len()),
                 )
             })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    forecast_residual_distribution
+                        .as_ref()
+                        .map_or(0, crate::ForecastResidualDistribution::retained_bytes),
+                )
+            })
             .ok_or(BundleError::RetainedSizeOverflow)?;
         Ok(Self {
             metadata,
@@ -428,6 +482,9 @@ impl ModelBundle {
             training_run_bytes: training_run_bytes.into_boxed_slice(),
             forecast_residuals_bytes,
             forecast_policy_bytes,
+            probability_outcomes_bytes,
+            probability_policy_bytes,
+            forecast_residual_distribution,
             retained_bytes,
         })
     }
@@ -474,6 +531,26 @@ impl ModelBundle {
         self.forecast_policy_bytes.as_deref()
     }
 
+    /// Empirical residual frequencies produced from this exact frozen direct estimator.
+    ///
+    /// Interval-only and autoregressive forecast bundles have no admitted distribution.
+    #[must_use]
+    pub const fn forecast_residual_distribution(
+        &self,
+    ) -> Option<&crate::ForecastResidualDistribution> {
+        self.forecast_residual_distribution.as_ref()
+    }
+
+    /// Derives one native-unit terminal distribution from this exact bundle and its vintage.
+    ///
+    /// The bounded support uses frozen validation residuals, never calibrated interval endpoints.
+    pub fn terminal_distribution(
+        &self,
+        vintage: &crate::ForecastVintage,
+    ) -> Result<Option<crate::ForecastTerminalDistribution>, crate::ForecastError> {
+        crate::ForecastTerminalDistribution::try_from_bundle(self, vintage)
+    }
+
     /// Iterates every exact admitted member in stable semantic order.
     ///
     /// Paths were validated by the same controlled-path grammar used during admission. Digests
@@ -510,6 +587,22 @@ impl ModelBundle {
                     sha256_digest(bytes),
                 )
             }),
+            self.probability_outcomes_bytes.as_deref().map(|bytes| {
+                (
+                    "probability_outcomes",
+                    probability::OUTCOMES_PATH,
+                    bytes,
+                    sha256_digest(bytes),
+                )
+            }),
+            self.probability_policy_bytes.as_deref().map(|bytes| {
+                (
+                    "probability_policy",
+                    probability::POLICY_PATH,
+                    bytes,
+                    sha256_digest(bytes),
+                )
+            }),
             self.forecast_policy_bytes.as_deref().map(|bytes| {
                 (
                     "forecast_policy",
@@ -521,6 +614,13 @@ impl ModelBundle {
         ]
         .into_iter()
         .flatten()
+    }
+
+    pub(crate) fn verify_probability_sources(
+        &self,
+        selection: &market_squawk_data::PythonDatasetSelection,
+    ) -> Result<(), BundleError> {
+        probability::verify_sources(self, selection)
     }
 
     pub(crate) const fn native_artifact(&self) -> Option<&NativeArtifact> {
@@ -640,6 +740,8 @@ pub enum BundleError {
     ForecastCalibrationSyntax,
     #[error("forecast calibration members or decoded policy are invalid")]
     InvalidForecastCalibration,
+    #[error("binary event calibration or original outcome evidence is invalid")]
+    InvalidProbabilityCalibration,
     #[error("model artifact exceeds JSON structural bounds")]
     ArtifactStructureLimit,
     #[error("model artifact syntax is invalid")]

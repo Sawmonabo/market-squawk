@@ -1,27 +1,42 @@
 //! Pure point-in-time recommendation-outcome evaluation with no execution authority.
 
+mod round_trip;
+
+pub use round_trip::{
+    AllOriginRoundTripDispositionV1, AllOriginRoundTripEvaluationV1,
+    AllOriginRoundTripEvaluatorV1, AllOriginRoundTripPolicyV1, AllOriginRoundTripResultV1,
+    AllOriginRoundTripUnavailableV1,
+};
+
 use std::collections::BTreeSet;
 
-use market_squawk_data::Sha256Digest;
+use market_squawk_data::{CorporateActionAdjustment, CorporateActionPlan, Sha256Digest};
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, Denomination,
-    InstrumentExecutionTerms, InstrumentId, OrderId, OrderReasonCode, OrderSide, OrderType,
-    PriceTicks, QuantityLots, SourceIdentifier, StrategyId, TimeInForce, Timestamp,
+    HistoricalStudyBasis, HistoricalStudyLimitation, InstrumentExecutionTerms, InstrumentId, Money,
+    OrderId, OrderReasonCode, OrderSide, OrderType, PriceTicks, QuantityLots, SourceIdentifier,
+    StrategyId, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{OrderIntent, OrderIntentInput};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::dataset::{BacktestDataset, BacktestObservation, HistoricalUniverseStatus};
+use crate::dataset::{
+    BacktestDataset, BacktestExecutionBasis, BacktestObservation, BacktestStudyQualification,
+    HistoricalUniverseStatus,
+};
+use crate::engine::RecommendationAccounting;
 use crate::fills::{
     RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,
     ResearchExecutionAssumptionsInput, ResearchFill, ResearchFillSimulator,
     ResearchLiquidityPriority,
 };
 
-/// Exact strict recommendation-outcome V1 target: 365 elapsed days after the PIT signal.
+/// Exact strict recommendation-outcome V1 target: 365 elapsed days after its financial origin.
 pub const RECOMMENDATION_TARGET_HORIZON_NANOS_V1: i64 = 365 * 24 * 60 * 60 * 1_000_000_000;
 /// Exact number of independent OOS folds in the strict recommendation materialization.
 pub const RECOMMENDATION_OOS_FOLD_COUNT_V1: usize = 3;
@@ -44,6 +59,7 @@ const HARD_MAX_EQUITY_POINTS_PER_OUTCOME: usize = 65_536;
 const HARD_MAX_TOTAL_EQUITY_POINTS: usize = 1_000_000;
 const HARD_MAX_OBSERVATION_VISITS: usize = 100_000_000;
 const HARD_MAX_EXECUTION_LAG_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+const DAILY_BAR_ASSUMED_FULL_SPREAD_BASIS_POINTS: i32 = 20;
 
 /// Returns the existing code-owned conservative research cost and fill profile.
 ///
@@ -101,8 +117,15 @@ impl RecommendationBenchmarkPolicyV1 {
 /// Untrusted complete input for strict recommendation-outcome V1 evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecommendationBacktestPolicyV1Input {
+    pub study_qualification: BacktestStudyQualification,
     pub subject_instrument_id: InstrumentId,
     pub benchmark: RecommendationBenchmarkPolicyV1,
+    pub accompanying_benchmark: RecommendationBenchmarkPolicyV1,
+    pub raw_price_evidence_digest: Sha256Digest,
+    pub corporate_action_content_digest: Sha256Digest,
+    pub corporate_action_audit_digest: Sha256Digest,
+    pub corporate_action_coverage_starts_at: Timestamp,
+    pub execution_basis: BacktestExecutionBasis,
     pub reporting_currency: Currency,
     pub subject_quantity: QuantityLots,
     pub benchmark_quantity: QuantityLots,
@@ -115,8 +138,15 @@ pub struct RecommendationBacktestPolicyV1Input {
 /// Immutable current recommendation-outcome policy with an exact 365-day coordinate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecommendationBacktestPolicyV1 {
+    study_qualification: BacktestStudyQualification,
     subject_instrument_id: InstrumentId,
     benchmark: RecommendationBenchmarkPolicyV1,
+    accompanying_benchmark: RecommendationBenchmarkPolicyV1,
+    raw_price_evidence_digest: Sha256Digest,
+    corporate_action_content_digest: Sha256Digest,
+    corporate_action_audit_digest: Sha256Digest,
+    corporate_action_coverage_starts_at: Timestamp,
+    execution_basis: BacktestExecutionBasis,
     reporting_currency: Currency,
     subject_quantity: QuantityLots,
     benchmark_quantity: QuantityLots,
@@ -132,7 +162,16 @@ impl RecommendationBacktestPolicyV1 {
     pub fn try_new(
         input: RecommendationBacktestPolicyV1Input,
     ) -> Result<Self, RecommendationBacktestError> {
+        input
+            .study_qualification
+            .validate()
+            .map_err(|_| RecommendationBacktestError::InvalidPolicy)?;
+        require_digest(input.raw_price_evidence_digest)?;
+        require_digest(input.corporate_action_content_digest)?;
+        require_digest(input.corporate_action_audit_digest)?;
         if input.subject_instrument_id == input.benchmark.instrument_id
+            || input.subject_instrument_id == input.accompanying_benchmark.instrument_id
+            || input.benchmark.instrument_id == input.accompanying_benchmark.instrument_id
             || input.subject_quantity.get() <= 0
             || input.benchmark_quantity.get() <= 0
             || !(input.execution_assumptions.latency_nanos()..=HARD_MAX_EXECUTION_LAG_NANOS)
@@ -155,8 +194,15 @@ impl RecommendationBacktestPolicyV1 {
             return Err(RecommendationBacktestError::InvalidPolicy);
         }
         let mut value = Self {
+            study_qualification: input.study_qualification,
             subject_instrument_id: input.subject_instrument_id,
             benchmark: input.benchmark,
+            accompanying_benchmark: input.accompanying_benchmark,
+            raw_price_evidence_digest: input.raw_price_evidence_digest,
+            corporate_action_content_digest: input.corporate_action_content_digest,
+            corporate_action_audit_digest: input.corporate_action_audit_digest,
+            corporate_action_coverage_starts_at: input.corporate_action_coverage_starts_at,
+            execution_basis: input.execution_basis,
             reporting_currency: input.reporting_currency,
             subject_quantity: input.subject_quantity,
             benchmark_quantity: input.benchmark_quantity,
@@ -176,6 +222,10 @@ impl RecommendationBacktestPolicyV1 {
         self.digest
     }
 
+    pub const fn study_qualification(self) -> BacktestStudyQualification {
+        self.study_qualification
+    }
+
     /// Returns the exact recommendation subject.
     #[must_use]
     pub const fn subject_instrument_id(self) -> InstrumentId {
@@ -186,6 +236,55 @@ impl RecommendationBacktestPolicyV1 {
     #[must_use]
     pub const fn benchmark(self) -> RecommendationBenchmarkPolicyV1 {
         self.benchmark
+    }
+
+    /// Returns the comparison selected alongside the primary before the study ran.
+    #[must_use]
+    pub const fn accompanying_benchmark(self) -> RecommendationBenchmarkPolicyV1 {
+        self.accompanying_benchmark
+    }
+
+    /// Exact raw-price generation evidence, qualified by the application producer for all three
+    /// selected instruments. This digest alone is provenance and does not confer authority.
+    #[must_use]
+    pub const fn raw_price_evidence_digest(self) -> Sha256Digest {
+        self.raw_price_evidence_digest
+    }
+
+    /// Exact complete corporate-action content selected for subject and both comparisons.
+    #[must_use]
+    pub const fn corporate_action_content_digest(self) -> Sha256Digest {
+        self.corporate_action_content_digest
+    }
+
+    /// Exact admission audit for the retained corporate-action population.
+    #[must_use]
+    pub const fn corporate_action_audit_digest(self) -> Sha256Digest {
+        self.corporate_action_audit_digest
+    }
+
+    /// Inclusive start of the application's selected complete corporate-action coverage.
+    #[must_use]
+    pub const fn corporate_action_coverage_starts_at(self) -> Timestamp {
+        self.corporate_action_coverage_starts_at
+    }
+
+    /// Returns the predeclared observed-quote or completed-daily-bar execution basis.
+    #[must_use]
+    pub const fn execution_basis(self) -> BacktestExecutionBasis {
+        self.execution_basis
+    }
+
+    /// Daily bars do not contain observed bid/ask spreads. V1 explicitly assumes a 20 bps full
+    /// spread, charged as 10 bps adverse half-spread on each leg before slippage and fees.
+    #[must_use]
+    pub const fn daily_bar_assumed_spread_basis_points(self) -> Option<BasisPoints> {
+        match self.execution_basis {
+            BacktestExecutionBasis::ObservedQuoteDepth => None,
+            BacktestExecutionBasis::CompletedDailyBar => {
+                Some(BasisPoints::new(DAILY_BAR_ASSUMED_FULL_SPREAD_BASIS_POINTS))
+            }
+        }
     }
 
     /// Returns the exact reporting currency required from both instruments.
@@ -365,7 +464,7 @@ impl RecommendationOosFoldV1 {
 }
 
 /// Closed reason why the pre-authorized producer emitted no recommendation outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RecommendationSignalUnavailableReasonV1 {
     InsufficientPointInTimeEvidence,
     ConflictingEvidence,
@@ -376,14 +475,14 @@ pub enum RecommendationSignalUnavailableReasonV1 {
 }
 
 /// Closed reason why a signal has no observable 365-day outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RecommendationSignalCensorReasonV1 {
     TargetAfterSimulationCutoff,
     OutsideAuthorizedDataset,
 }
 
 /// Pre-authorized signal disposition. It carries evidence, not execution authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RecommendationSignalInstructionV1 {
     Entry,
     NoAction,
@@ -398,22 +497,45 @@ pub struct RecommendationSignalV1 {
     fold_index: usize,
     signal_at: Timestamp,
     available_at: Timestamp,
+    source_selection_as_of: Timestamp,
+    study_qualification: BacktestStudyQualification,
+    target_origin: Timestamp,
+    target_at: Timestamp,
     evidence_digest: Sha256Digest,
     instruction: RecommendationSignalInstructionV1,
 }
 
 impl RecommendationSignalV1 {
-    /// Constructs one evidence-bound signal available no later than its decision coordinate.
+    /// Constructs one qualified signal with original source availability kept independently of
+    /// its historical or simulated decision. Calculation/publication clocks remain actual.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "financial origin, target and decision clocks stay independent"
+    )]
     pub fn try_new(
         signal_id: SourceIdentifier,
         fold_index: usize,
         signal_at: Timestamp,
         available_at: Timestamp,
+        source_selection_as_of: Timestamp,
+        study_qualification: BacktestStudyQualification,
+        target_origin: Timestamp,
+        target_at: Timestamp,
         evidence_digest: Sha256Digest,
         instruction: RecommendationSignalInstructionV1,
     ) -> Result<Self, RecommendationBacktestError> {
         require_digest(evidence_digest)?;
-        if available_at > signal_at {
+        if !study_qualification.admits_clocks(
+            target_origin,
+            available_at,
+            source_selection_as_of,
+            signal_at,
+        ) || target_at <= signal_at
+            || target_origin
+                .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
+                .map_err(|_| RecommendationBacktestError::InvalidSignalPlan)?
+                != target_at
+        {
             return Err(RecommendationBacktestError::InvalidSignalPlan);
         }
         Ok(Self {
@@ -421,6 +543,10 @@ impl RecommendationSignalV1 {
             fold_index,
             signal_at,
             available_at,
+            source_selection_as_of,
+            study_qualification,
+            target_origin,
+            target_at,
             evidence_digest,
             instruction,
         })
@@ -444,10 +570,30 @@ impl RecommendationSignalV1 {
         self.signal_at
     }
 
-    /// Returns when the signal evidence became PIT-available.
+    /// Returns the original source availability. A retrospective decision can precede this
+    /// actual clock; it never becomes a fabricated historical availability timestamp.
     #[must_use]
     pub const fn available_at(&self) -> Timestamp {
         self.available_at
+    }
+
+    pub const fn source_selection_as_of(&self) -> Timestamp {
+        self.source_selection_as_of
+    }
+    pub const fn study_qualification(&self) -> BacktestStudyQualification {
+        self.study_qualification
+    }
+
+    /// Exact financial reference origin, independent of source availability and decision time.
+    #[must_use]
+    pub const fn target_origin(&self) -> Timestamp {
+        self.target_origin
+    }
+
+    /// Original predeclared forecast target. Execution never recomputes this from decision time.
+    #[must_use]
+    pub const fn target_at(&self) -> Timestamp {
+        self.target_at
     }
 
     /// Returns the exact signal-evidence identity.
@@ -473,6 +619,7 @@ pub enum RecommendationSignalPlanCompletenessV1 {
 /// Strict current signal plan whose external digest is provenance, never an authority grant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecommendationSignalPlanV1 {
+    study_qualification: BacktestStudyQualification,
     preauthorized_signal_plan_digest: Sha256Digest,
     completeness: RecommendationSignalPlanCompletenessV1,
     folds: Box<[RecommendationOosFoldV1]>,
@@ -498,6 +645,13 @@ impl RecommendationSignalPlanV1 {
             || folds
                 .windows(2)
                 .any(|pair| pair[0].ends_at > pair[1].starts_at)
+        {
+            return Err(RecommendationBacktestError::InvalidSignalPlan);
+        }
+        let study_qualification = signals[0].study_qualification;
+        if signals
+            .iter()
+            .any(|signal| signal.study_qualification != study_qualification)
         {
             return Err(RecommendationBacktestError::InvalidSignalPlan);
         }
@@ -541,6 +695,7 @@ impl RecommendationSignalPlanV1 {
             return Err(RecommendationBacktestError::InvalidSignalPlan);
         }
         let mut value = Self {
+            study_qualification,
             preauthorized_signal_plan_digest,
             completeness,
             folds: folds.into_boxed_slice(),
@@ -589,6 +744,10 @@ struct BoundRecommendationSignalV1 {
     fold_index: usize,
     signal_at: Timestamp,
     available_at: Timestamp,
+    source_selection_as_of: Timestamp,
+    study_qualification: BacktestStudyQualification,
+    target_origin: Timestamp,
+    target_at: Timestamp,
     subject_lineage_digest: Sha256Digest,
     benchmark_lineage_digest: Sha256Digest,
     instruction_evidence_digest: Sha256Digest,
@@ -602,6 +761,12 @@ pub struct RecommendationSignalObservationV1<'dataset> {
 }
 
 impl<'dataset> RecommendationSignalObservationV1<'dataset> {
+    /// Exact contemporaneous tick, lot and currency terms of this observation.
+    #[must_use]
+    pub const fn execution_terms(self) -> InstrumentExecutionTerms {
+        self.observation.execution_terms
+    }
+
     /// Exact stable instrument identity.
     #[must_use]
     pub const fn instrument_id(self) -> InstrumentId {
@@ -620,7 +785,50 @@ impl<'dataset> RecommendationSignalObservationV1<'dataset> {
         self.observation.mid_price
     }
 
-    /// Point-in-time historical universe status.
+    /// Exact admitted completed-close reference in current decision units, or observed quote value.
+    pub fn market_reference(self) -> Option<Money> {
+        self.observation.market_reference.or_else(|| {
+            self.observation.mid_price.and_then(|price| {
+                price
+                    .checked_to_decimal(self.observation.execution_terms.price_tick())
+                    .ok()
+                    .map(|amount| {
+                        Money::new(amount, self.observation.execution_terms.quote_currency())
+                    })
+            })
+        })
+    }
+    /// Original sealed source epoch for this coordinate only; no outcome or future panel is exposed.
+    pub fn input_epoch(self) -> Option<&'dataset market_squawk_data::FeatureDatasetInputEpoch> {
+        self.observation
+            .input_coordinate
+            .as_ref()
+            .map(|coordinate| coordinate.epoch())
+    }
+    /// Sealed data-owned epoch and native model rows for this coordinate only.
+    pub fn input_coordinate(
+        self,
+    ) -> Option<market_squawk_data::FeatureDatasetInputCoordinate<'dataset>> {
+        self.observation
+            .input_coordinate
+            .as_ref()
+            .map(|coordinate| coordinate.coordinate())
+    }
+    /// Canonically admitted native model rows for this coordinate, never a future panel.
+    pub fn input_rows(self) -> &'dataset [market_squawk_data::ForecastFeatureRow] {
+        self.observation
+            .input_coordinate
+            .as_ref()
+            .map_or(&[], |coordinate| coordinate.rows())
+    }
+    pub const fn source_selection_as_of(self) -> Timestamp {
+        self.observation.source_selection_as_of
+    }
+    pub const fn available_at(self) -> Timestamp {
+        self.observation.available_at()
+    }
+
+    /// Historical universe status under the retained study basis.
     #[must_use]
     pub const fn universe(self) -> HistoricalUniverseStatus {
         self.observation.universe
@@ -636,15 +844,37 @@ impl<'dataset> RecommendationSignalObservationV1<'dataset> {
 /// One paired PIT coordinate available no later than the current signal coordinate.
 #[derive(Clone, Copy, Debug)]
 pub struct RecommendationSignalInformationCoordinateV1<'dataset> {
+    study_qualification: BacktestStudyQualification,
     subject: RecommendationSignalObservationV1<'dataset>,
     benchmark: RecommendationSignalObservationV1<'dataset>,
+    target_origin: Timestamp,
+    target_at: Timestamp,
 }
 
 impl<'dataset> RecommendationSignalInformationCoordinateV1<'dataset> {
+    pub const fn study_qualification(self) -> BacktestStudyQualification {
+        self.study_qualification
+    }
+    pub const fn source_selection_as_of(self) -> Timestamp {
+        self.subject.source_selection_as_of()
+    }
+
     /// Exact shared subject/benchmark decision coordinate.
     #[must_use]
     pub const fn signal_at(self) -> Timestamp {
         self.subject.decision_at()
+    }
+
+    /// Exact financial reference time authenticated by the current source epoch.
+    #[must_use]
+    pub const fn target_origin(self) -> Timestamp {
+        self.target_origin
+    }
+
+    /// Fixed 365-day forecast target retained by the source epoch.
+    #[must_use]
+    pub const fn target_at(self) -> Timestamp {
+        self.target_at
     }
 
     /// Subject observation with private lineage withheld from the issuer.
@@ -662,19 +892,48 @@ impl<'dataset> RecommendationSignalInformationCoordinateV1<'dataset> {
 
 /// Coordinate-local PIT information available when issuing one exact signal.
 ///
-/// No prior or future coordinate, fold bound, panel cardinality, dataset identity, availability,
-/// or private row lineage is exposed. Both observations were independently fenced at this exact
-/// signal coordinate before the callback was invoked.
+/// No prior or future coordinate values, labels, realized execution stream or study outcomes
+/// are exposed. The sealed current-coordinate source view retains the actual publication
+/// identity, source clocks and declared study basis needed by the model and valuation producers.
 #[derive(Clone, Copy, Debug)]
 pub struct RecommendationSignalInformationSetV1<'dataset> {
     current: RecommendationSignalInformationCoordinateV1<'dataset>,
 }
 
 impl<'dataset> RecommendationSignalInformationSetV1<'dataset> {
+    pub const fn study_qualification(self) -> BacktestStudyQualification {
+        self.current.study_qualification()
+    }
+    pub const fn basis(self) -> HistoricalStudyBasis {
+        self.study_qualification().basis()
+    }
+    pub const fn snapshot_as_of(self) -> Timestamp {
+        self.study_qualification().snapshot_as_of()
+    }
+    pub const fn source_snapshot_digest(self) -> Sha256Digest {
+        self.study_qualification().source_snapshot_digest()
+    }
+    pub const fn limitations(self) -> &'static [HistoricalStudyLimitation] {
+        self.study_qualification().limitations()
+    }
+    pub const fn source_selection_as_of(self) -> Timestamp {
+        self.current.source_selection_as_of()
+    }
+
     /// Exact decision coordinate being issued.
     #[must_use]
     pub const fn signal_at(self) -> Timestamp {
         self.current.signal_at()
+    }
+
+    #[must_use]
+    pub const fn target_origin(self) -> Timestamp {
+        self.current.target_origin()
+    }
+
+    #[must_use]
+    pub const fn target_at(self) -> Timestamp {
+        self.current.target_at()
     }
 
     /// Exact subject/benchmark pair at this coordinate.
@@ -688,33 +947,73 @@ impl<'dataset> RecommendationSignalInformationSetV1<'dataset> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecommendationSignalIssuanceV1 {
     signal_id: SourceIdentifier,
+    study_qualification: BacktestStudyQualification,
+    source_selection_as_of: Timestamp,
+    target_origin: Timestamp,
+    target_at: Timestamp,
     instruction_evidence_digest: Sha256Digest,
     instruction: RecommendationSignalInstructionV1,
+    instruction_evidence_payload: Option<Box<str>>,
 }
 
 impl RecommendationSignalIssuanceV1 {
     /// Constructs Entry, NoAction, or typed Unavailable evidence for one inspected coordinate.
     pub fn try_new(
         signal_id: SourceIdentifier,
+        study_qualification: BacktestStudyQualification,
+        source_selection_as_of: Timestamp,
+        target_origin: Timestamp,
+        target_at: Timestamp,
         instruction_evidence_digest: Sha256Digest,
         instruction: RecommendationSignalInstructionV1,
     ) -> Result<Self, RecommendationSignalPlanMaterializationErrorV1> {
-        if instruction_evidence_digest.bytes() == [0; 32]
+        if study_qualification.validate().is_err()
+            || source_selection_as_of > study_qualification.snapshot_as_of()
+            || instruction_evidence_digest.bytes() == [0; 32]
+            || target_origin
+                .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
+                .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction)?
+                != target_at
             || matches!(instruction, RecommendationSignalInstructionV1::Censored(_))
         {
             return Err(RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction);
         }
         Ok(Self {
             signal_id,
+            study_qualification,
+            source_selection_as_of,
+            target_origin,
+            target_at,
             instruction_evidence_digest,
             instruction,
+            instruction_evidence_payload: None,
         })
+    }
+
+    /// Attaches the original bounded receipt after matching its existing evidence commitment.
+    pub fn with_instruction_evidence_payload(
+        mut self,
+        payload: Box<str>,
+    ) -> Result<Self, RecommendationSignalPlanMaterializationErrorV1> {
+        validate_instruction_payload(self.instruction_evidence_digest, &payload)?;
+        self.instruction_evidence_payload = Some(payload);
+        Ok(self)
     }
 
     /// Exact code-owned issuer signal identity.
     #[must_use]
     pub const fn signal_id(&self) -> &SourceIdentifier {
         &self.signal_id
+    }
+
+    #[must_use]
+    pub const fn target_origin(&self) -> Timestamp {
+        self.target_origin
+    }
+
+    #[must_use]
+    pub const fn target_at(&self) -> Timestamp {
+        self.target_at
     }
 
     /// Immutable evidence for the issuer-derived instruction.
@@ -728,6 +1027,26 @@ impl RecommendationSignalIssuanceV1 {
     pub const fn instruction(&self) -> RecommendationSignalInstructionV1 {
         self.instruction
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedInstructionEvidenceV1 {
+    digest: [u8; 32],
+    payload: Box<str>,
+}
+
+fn validate_instruction_payload(
+    digest: Sha256Digest,
+    payload: &str,
+) -> Result<(), RecommendationSignalPlanMaterializationErrorV1> {
+    if payload.is_empty() || payload.len() > 16_384 {
+        return Err(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded);
+    }
+    if Sha256Digest::new(Sha256::digest(payload.as_bytes()).into()) != digest {
+        return Err(RecommendationSignalPlanMaterializationErrorV1::InstructionEvidenceMismatch);
+    }
+    Ok(())
 }
 
 /// Explicit semantic identity for a research signal issuer.
@@ -806,6 +1125,7 @@ pub struct MaterializedRecommendationSignalPlanV1 {
     paired_observation_count: usize,
     limits: RecommendationBacktestLimits,
     signal_plan: RecommendationSignalPlanV1,
+    instruction_evidence: Box<[Option<RetainedInstructionEvidenceV1>]>,
     digest: Sha256Digest,
 }
 
@@ -894,13 +1214,151 @@ impl MaterializedRecommendationSignalPlanV1 {
         self.signal_plan
     }
 
+    /// Encodes the complete immutable signal population for bounded controlled persistence.
+    /// This research receipt grants no application recommendation authority by itself.
+    pub fn encode_persisted(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, RecommendationSignalPlanMaterializationErrorV1> {
+        // Every encoded signal exceeds this lower bound before its identifier and timestamps.
+        // Reject a population that cannot fit before allocating a second owned representation.
+        if maximum_bytes == 0
+            || self
+                .signal_plan
+                .signals
+                .len()
+                .checked_mul(128)
+                .is_none_or(|minimum| minimum > maximum_bytes)
+        {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded);
+        }
+        let minimum_payload_bytes = self
+            .instruction_evidence
+            .iter()
+            .try_fold(0_usize, |total, item| {
+                total.checked_add(item.as_ref().map_or(0, |value| value.payload.len()))
+            })
+            .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+        if minimum_payload_bytes > maximum_bytes {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded);
+        }
+        let wire = PersistedRecommendationMaterializationV1::from_materialized(self);
+        let mut writer = BoundedMaterializationWriter {
+            bytes: Vec::new(),
+            maximum: maximum_bytes,
+        };
+        serde_json::to_writer(&mut writer, &wire)
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+        Ok(writer.bytes)
+    }
+
+    /// Restores a canonical research receipt against freshly pinned exact input authority.
+    /// Callers must authenticate their retained record separately; a digest is provenance only.
+    pub fn restore_persisted(
+        bytes: &[u8],
+        maximum_bytes: usize,
+        dataset: &BacktestDataset,
+        policy: RecommendationBacktestPolicyV1,
+        limits: RecommendationBacktestLimits,
+    ) -> Result<Self, RecommendationSignalPlanMaterializationErrorV1> {
+        use RecommendationSignalPlanMaterializationErrorV1 as Error;
+        if maximum_bytes == 0 || bytes.len() > maximum_bytes {
+            return Err(Error::LimitExceeded);
+        }
+        let wire: PersistedRecommendationMaterializationV1 =
+            serde_json::from_slice(bytes).map_err(|_| Error::MaterializationDrift)?;
+        validate_recommendation_materialization_policy(policy)?;
+        if wire.schema_version != 1
+            || wire.signals.len() > limits.max_signals()
+            || wire.folds.len() != RECOMMENDATION_OOS_FOLD_COUNT_V1
+            || wire.paired_observation_count != wire.signals.len()
+            || wire.instruction_evidence.len() != wire.signals.len()
+            || wire.limits != persisted_limits(limits)
+            || wire
+                .evaluation_starts_at
+                .checked_add_nanos(RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1)
+                .map_err(|_| Error::MaterializationDrift)?
+                != wire.evaluation_ends_at
+        {
+            return Err(Error::MaterializationDrift);
+        }
+        let issuer_identity = RecommendationSignalIssuerIdentityV1::try_new(
+            wire.producer,
+            wire.semantic_revision,
+            Sha256Digest::new(wire.bindings_digest),
+        )?;
+        let folds = wire
+            .folds
+            .into_iter()
+            .map(|(id, start, end)| {
+                RecommendationOosFoldV1::try_new(id, start, end)
+                    .map_err(|_| Error::MaterializationDrift)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let signals = wire
+            .signals
+            .into_iter()
+            .map(|signal| {
+                if matches!(
+                    signal.instruction,
+                    RecommendationSignalInstructionV1::Censored(_)
+                ) {
+                    return Err(Error::MaterializationDrift);
+                }
+                RecommendationSignalV1::try_new(
+                    signal.id,
+                    signal.fold_index,
+                    signal.signal_at,
+                    signal.available_at,
+                    signal.source_selection_as_of,
+                    signal.study_qualification,
+                    signal.target_origin,
+                    signal.target_at,
+                    Sha256Digest::new(signal.evidence_digest),
+                    signal.instruction,
+                )
+                .map_err(|_| Error::MaterializationDrift)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let signal_plan = RecommendationSignalPlanV1::try_new(
+            Sha256Digest::new(wire.preauthorized_signal_plan_digest),
+            RecommendationSignalPlanCompletenessV1::Complete,
+            folds,
+            signals,
+        )
+        .map_err(|_| Error::MaterializationDrift)?;
+        let materialized = Self {
+            dataset_identity: Sha256Digest::new(wire.dataset_identity),
+            dataset_manifest_content: Sha256Digest::new(wire.dataset_manifest_content),
+            object_graph_digest: Sha256Digest::new(wire.object_graph_digest),
+            point_in_time_content: Sha256Digest::new(wire.point_in_time_content),
+            point_in_time_audit: Sha256Digest::new(wire.point_in_time_audit),
+            policy_digest: Sha256Digest::new(wire.policy_digest),
+            issuer_identity,
+            evaluation_starts_at: wire.evaluation_starts_at,
+            evaluation_ends_at: wire.evaluation_ends_at,
+            paired_observation_count: wire.paired_observation_count,
+            limits,
+            signal_plan,
+            instruction_evidence: wire.instruction_evidence.into_boxed_slice(),
+            digest: Sha256Digest::new(wire.digest),
+        };
+        materialized.validate_against(dataset, policy, limits)?;
+        if materialized.encode_persisted(maximum_bytes)? != bytes {
+            return Err(Error::MaterializationDrift);
+        }
+        Ok(materialized)
+    }
+
     fn validate_against(
         &self,
         dataset: &BacktestDataset,
         policy: RecommendationBacktestPolicyV1,
         limits: RecommendationBacktestLimits,
     ) -> Result<(), RecommendationSignalPlanMaterializationErrorV1> {
-        if self.dataset_identity != dataset.identity()
+        if dataset.study_qualification != Some(policy.study_qualification)
+            || self.signal_plan.study_qualification != policy.study_qualification
+            || self.dataset_identity != dataset.identity()
             || self.dataset_manifest_content != dataset.manifest.content_hash()
             || self.object_graph_digest != dataset.object_graph_digest()
             || self.point_in_time_content != dataset.point_in_time_content
@@ -914,7 +1372,174 @@ impl MaterializedRecommendationSignalPlanV1 {
         {
             return Err(RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift);
         }
+        for signal in self.signal_plan.signals() {
+            let mut available_at = Timestamp::from_unix_nanos(i64::MIN);
+            let mut selection = None;
+            for instrument in [
+                policy.subject_instrument_id(),
+                policy.benchmark().instrument_id(),
+            ] {
+                let index = dataset
+                    .observations
+                    .binary_search_by(|observation| {
+                        observation
+                            .decision_at()
+                            .cmp(&signal.signal_at())
+                            .then_with(|| observation.instrument_id().cmp(&instrument))
+                    })
+                    .map_err(|_| {
+                        RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift
+                    })?;
+                let observation = &dataset.observations[index];
+                if materialization_target(observation, policy.execution_basis)?
+                    != (signal.target_origin(), signal.target_at())
+                {
+                    return Err(
+                        RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift,
+                    );
+                }
+                if selection
+                    .replace(observation.source_selection_as_of)
+                    .is_some_and(|prior| prior != observation.source_selection_as_of)
+                {
+                    return Err(
+                        RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift,
+                    );
+                }
+                available_at = available_at.max(observation.available_at());
+            }
+            if available_at != signal.available_at()
+                || selection != Some(signal.source_selection_as_of)
+            {
+                return Err(RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift);
+            }
+        }
         Ok(())
+    }
+}
+
+/// Refuses before an encoded receipt exceeds its admitted byte budget.
+struct BoundedMaterializationWriter {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+impl std::io::Write for BoundedMaterializationWriter {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(input.len())
+            .is_none_or(|len| len > self.maximum)
+        {
+            return Err(std::io::Error::other("materialization byte limit exceeded"));
+        }
+        self.bytes
+            .try_reserve(input.len())
+            .map_err(|_| std::io::Error::other("materialization capacity exceeded"))?;
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRecommendationMaterializationV1 {
+    schema_version: u16,
+    dataset_identity: [u8; 32],
+    dataset_manifest_content: [u8; 32],
+    object_graph_digest: [u8; 32],
+    point_in_time_content: [u8; 32],
+    point_in_time_audit: [u8; 32],
+    policy_digest: [u8; 32],
+    producer: SourceIdentifier,
+    semantic_revision: SourceIdentifier,
+    bindings_digest: [u8; 32],
+    evaluation_starts_at: Timestamp,
+    evaluation_ends_at: Timestamp,
+    paired_observation_count: usize,
+    limits: [usize; 5],
+    preauthorized_signal_plan_digest: [u8; 32],
+    folds: Vec<(SourceIdentifier, Timestamp, Timestamp)>,
+    signals: Vec<PersistedRecommendationSignalV1>,
+    instruction_evidence: Vec<Option<RetainedInstructionEvidenceV1>>,
+    digest: [u8; 32],
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRecommendationSignalV1 {
+    id: SourceIdentifier,
+    fold_index: usize,
+    signal_at: Timestamp,
+    available_at: Timestamp,
+    source_selection_as_of: Timestamp,
+    study_qualification: BacktestStudyQualification,
+    target_origin: Timestamp,
+    target_at: Timestamp,
+    evidence_digest: [u8; 32],
+    instruction: RecommendationSignalInstructionV1,
+}
+
+const fn persisted_limits(limits: RecommendationBacktestLimits) -> [usize; 5] {
+    [
+        limits.max_folds(),
+        limits.max_signals(),
+        limits.max_equity_points_per_outcome(),
+        limits.max_total_equity_points(),
+        limits.max_observation_visits(),
+    ]
+}
+
+impl PersistedRecommendationMaterializationV1 {
+    fn from_materialized(value: &MaterializedRecommendationSignalPlanV1) -> Self {
+        Self {
+            schema_version: 1,
+            dataset_identity: value.dataset_identity.bytes(),
+            dataset_manifest_content: value.dataset_manifest_content.bytes(),
+            object_graph_digest: value.object_graph_digest.bytes(),
+            point_in_time_content: value.point_in_time_content.bytes(),
+            point_in_time_audit: value.point_in_time_audit.bytes(),
+            policy_digest: value.policy_digest.bytes(),
+            producer: value.issuer_identity.producer.clone(),
+            semantic_revision: value.issuer_identity.semantic_revision.clone(),
+            bindings_digest: value.issuer_identity.bindings_digest.bytes(),
+            evaluation_starts_at: value.evaluation_starts_at,
+            evaluation_ends_at: value.evaluation_ends_at,
+            paired_observation_count: value.paired_observation_count,
+            limits: persisted_limits(value.limits),
+            preauthorized_signal_plan_digest: value
+                .signal_plan
+                .preauthorized_signal_plan_digest
+                .bytes(),
+            folds: value
+                .signal_plan
+                .folds
+                .iter()
+                .map(|fold| (fold.fold_id.clone(), fold.starts_at, fold.ends_at))
+                .collect(),
+            signals: value
+                .signal_plan
+                .signals
+                .iter()
+                .map(|signal| PersistedRecommendationSignalV1 {
+                    id: signal.signal_id.clone(),
+                    fold_index: signal.fold_index,
+                    signal_at: signal.signal_at,
+                    available_at: signal.available_at,
+                    source_selection_as_of: signal.source_selection_as_of,
+                    study_qualification: signal.study_qualification,
+                    target_origin: signal.target_origin,
+                    target_at: signal.target_at,
+                    evidence_digest: signal.evidence_digest.bytes(),
+                    instruction: signal.instruction,
+                })
+                .collect(),
+            instruction_evidence: value.instruction_evidence.to_vec(),
+            digest: value.digest.bytes(),
+        }
     }
 }
 
@@ -923,6 +1548,13 @@ impl MaterializedRecommendationSignalPlanV1 {
 pub struct RecommendationSignalPlanMaterializerV1;
 
 impl RecommendationSignalPlanMaterializerV1 {
+    /// Returns the exact predeclared three two-year OOS intervals used by materialization.
+    pub fn oos_folds(
+        evaluation_starts_at: Timestamp,
+    ) -> Result<Vec<RecommendationOosFoldV1>, RecommendationSignalPlanMaterializationErrorV1> {
+        recommendation_oos_folds(evaluation_starts_at)
+    }
+
     /// Sequentially issues and binds every instruction against its exact PIT information set.
     ///
     /// The callback runs once per coordinate in ascending time order. It sees only observations
@@ -954,7 +1586,21 @@ impl RecommendationSignalPlanMaterializerV1 {
         {
             return Err(RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction);
         }
-        let paired_capacity = dataset.observations.len() / 2;
+        if dataset.study_qualification != Some(policy.study_qualification) {
+            return Err(RecommendationSignalPlanMaterializationErrorV1::DatasetScopeMismatch);
+        }
+        let evaluation_ends_at = evaluation_starts_at
+            .checked_add_nanos(RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1)
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?;
+        let paired_capacity = dataset
+            .observations
+            .iter()
+            .filter(|observation| {
+                observation.instrument_id() == policy.subject_instrument_id()
+                    && observation.decision_at() >= evaluation_starts_at
+                    && observation.decision_at() < evaluation_ends_at
+            })
+            .count();
         if dataset.observations.len() > limits.max_observation_visits
             || paired_capacity > limits.max_signals
         {
@@ -965,57 +1611,67 @@ impl RecommendationSignalPlanMaterializerV1 {
             .last()
             .map(RecommendationOosFoldV1::ends_at)
             .ok_or(RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?;
-        let complete_outcome_offset = RECOMMENDATION_TARGET_HORIZON_NANOS_V1
-            .checked_add(policy.maximum_exit_lag_nanos())
-            .ok_or(RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow)?;
-        let signal_window_ends = folds
-            .iter()
-            .map(|fold| {
-                fold.ends_at()
-                    .checked_sub_nanos(complete_outcome_offset)
-                    .map_err(|_| {
-                        RecommendationSignalPlanMaterializationErrorV1::InvalidEvaluationWindow
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut bound = Vec::new();
         bound
             .try_reserve_exact(paired_capacity)
             .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+        let mut instruction_evidence = Vec::new();
+        instruction_evidence
+            .try_reserve_exact(paired_capacity)
+            .map_err(|_| RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
         let mut signal_ids = BTreeSet::new();
         let mut fold_pair_counts = [0_usize; RECOMMENDATION_OOS_FOLD_COUNT_V1];
-        let mut fold_entry_counts = [0_usize; RECOMMENDATION_OOS_FOLD_COUNT_V1];
         let mut fold_first = [None; RECOMMENDATION_OOS_FOLD_COUNT_V1];
         let mut fold_last = [None; RECOMMENDATION_OOS_FOLD_COUNT_V1];
         let mut previous_decision_at = None;
         let mut subject_terms = None;
         let mut benchmark_terms = None;
-        let mut pairs = dataset.observations.chunks_exact(2);
-        for pair in &mut pairs {
-            let left = pair.first().ok_or(
-                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
-            )?;
-            let right = pair.get(1).ok_or(
-                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
-            )?;
-            if left.decision_at() != right.decision_at() {
-                return Err(
-                    RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
-                );
+        for coordinate in dataset
+            .observations
+            .chunk_by(|left, right| left.decision_at() == right.decision_at())
+        {
+            if coordinate.first().is_none_or(|observation| {
+                observation.decision_at() < evaluation_starts_at
+                    || observation.decision_at() >= evaluation_ends_at
+            }) {
+                continue;
             }
-            let (subject, benchmark) = if left.instrument_id() == policy.subject_instrument_id()
-                && right.instrument_id() == policy.benchmark().instrument_id()
-            {
-                (left, right)
-            } else if right.instrument_id() == policy.subject_instrument_id()
-                && left.instrument_id() == policy.benchmark().instrument_id()
-            {
-                (right, left)
-            } else {
-                return Err(RecommendationSignalPlanMaterializationErrorV1::DatasetScopeMismatch);
-            };
-            validate_materialization_observation(subject, policy.reporting_currency())?;
-            validate_materialization_observation(benchmark, policy.reporting_currency())?;
+            let mut subject = None;
+            let mut benchmark = None;
+            let mut accompanying = None;
+            for observation in coordinate {
+                let slot = if observation.instrument_id() == policy.subject_instrument_id() {
+                    &mut subject
+                } else if observation.instrument_id() == policy.benchmark().instrument_id() {
+                    &mut benchmark
+                } else if observation.instrument_id()
+                    == policy.accompanying_benchmark().instrument_id()
+                {
+                    &mut accompanying
+                } else {
+                    return Err(
+                        RecommendationSignalPlanMaterializationErrorV1::DatasetScopeMismatch,
+                    );
+                };
+                if slot.replace(observation).is_some() {
+                    return Err(
+                        RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+                    );
+                }
+            }
+            // The accompanying comparison cannot change the primary signal population. Its own
+            // observations remain in the exact pinned dataset for independent outcome evaluation.
+            if subject.is_none() && benchmark.is_none() {
+                continue;
+            }
+            let subject = subject.ok_or(
+                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+            )?;
+            let benchmark = benchmark.ok_or(
+                RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+            )?;
+            validate_materialization_observation(subject, policy)?;
+            validate_materialization_observation(benchmark, policy)?;
             retain_stable_execution_terms(&mut subject_terms, subject.execution_terms)?;
             retain_stable_execution_terms(&mut benchmark_terms, benchmark.execution_terms)?;
             let decision_at = subject.decision_at();
@@ -1043,15 +1699,27 @@ impl RecommendationSignalPlanMaterializerV1 {
                 .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
             let _ = fold_first[fold_index].get_or_insert(decision_at);
             fold_last[fold_index] = Some(decision_at);
+            let (target_origin, target_at) =
+                materialization_target(subject, policy.execution_basis)?;
             let coordinate = RecommendationSignalInformationCoordinateV1 {
+                study_qualification: policy.study_qualification,
                 subject: RecommendationSignalObservationV1 {
                     observation: subject,
                 },
                 benchmark: RecommendationSignalObservationV1 {
                     observation: benchmark,
                 },
+                target_origin,
+                target_at,
             };
-            if subject.available_at() > decision_at || benchmark.available_at() > decision_at {
+            if materialization_target(benchmark, policy.execution_basis)?
+                != (coordinate.target_origin, coordinate.target_at)
+            {
+                return Err(
+                    RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
+                );
+            }
+            if subject.source_selection_as_of != benchmark.source_selection_as_of {
                 return Err(
                     RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel,
                 );
@@ -1060,50 +1728,62 @@ impl RecommendationSignalPlanMaterializerV1 {
                 current: coordinate,
             };
             let issued = issue(&information)?;
-            if !signal_ids.insert(issued.signal_id.clone()) {
+            if issued.study_qualification != information.study_qualification()
+                || issued.source_selection_as_of != information.source_selection_as_of()
+                || issued.target_origin != information.target_origin()
+                || issued.target_at != information.target_at()
+                || !signal_ids.insert(issued.signal_id.clone())
+            {
                 return Err(RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction);
             }
             if issued.instruction == RecommendationSignalInstructionV1::Entry {
-                if decision_at >= signal_window_ends[fold_index]
-                    || !materialization_entry_evidence(subject)
-                    || !materialization_entry_evidence(benchmark)
+                if !materialization_entry_evidence(subject, policy.execution_basis)
+                    || !materialization_entry_evidence(benchmark, policy.execution_basis)
                 {
                     return Err(
                         RecommendationSignalPlanMaterializationErrorV1::InstructionEvidenceMismatch,
                     );
                 }
-                fold_entry_counts[fold_index] = fold_entry_counts[fold_index]
-                    .checked_add(1)
-                    .ok_or(RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
             }
             let available_at = subject.available_at().max(benchmark.available_at());
-            if available_at > decision_at
-                || [
-                    subject.lineage_digest,
-                    benchmark.lineage_digest,
-                    issued.instruction_evidence_digest,
-                ]
-                .into_iter()
-                .any(|digest| digest.bytes() == [0; 32])
+            if !policy.study_qualification.admits_clocks(
+                target_origin,
+                available_at,
+                subject.source_selection_as_of,
+                decision_at,
+            ) || [
+                subject.lineage_digest,
+                benchmark.lineage_digest,
+                issued.instruction_evidence_digest,
+            ]
+            .into_iter()
+            .any(|digest| digest.bytes() == [0; 32])
             {
                 return Err(RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction);
             }
+            instruction_evidence.push(issued.instruction_evidence_payload.map(|payload| {
+                RetainedInstructionEvidenceV1 {
+                    digest: issued.instruction_evidence_digest.bytes(),
+                    payload,
+                }
+            }));
             bound.push(BoundRecommendationSignalV1 {
                 signal_id: issued.signal_id,
                 fold_index,
                 signal_at: decision_at,
                 available_at,
+                source_selection_as_of: subject.source_selection_as_of,
+                study_qualification: policy.study_qualification,
+                target_origin: issued.target_origin,
+                target_at: issued.target_at,
                 subject_lineage_digest: subject.lineage_digest,
                 benchmark_lineage_digest: benchmark.lineage_digest,
                 instruction_evidence_digest: issued.instruction_evidence_digest,
                 instruction: issued.instruction,
             });
         }
-        if !pairs.remainder().is_empty() || fold_pair_counts.contains(&0) {
+        if fold_pair_counts.contains(&0) {
             return Err(RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel);
-        }
-        if fold_entry_counts.contains(&0) {
-            return Err(RecommendationSignalPlanMaterializationErrorV1::MissingEntryInFold);
         }
         for (fold_index, fold) in folds.iter().enumerate() {
             let first = fold_first[fold_index].ok_or(
@@ -1156,6 +1836,10 @@ impl RecommendationSignalPlanMaterializerV1 {
                     instruction.fold_index,
                     instruction.signal_at,
                     instruction.available_at,
+                    instruction.source_selection_as_of,
+                    instruction.study_qualification,
+                    instruction.target_origin,
+                    instruction.target_at,
                     evidence_digest,
                     instruction.instruction,
                 )
@@ -1182,6 +1866,7 @@ impl RecommendationSignalPlanMaterializerV1 {
             paired_observation_count: paired_capacity,
             limits,
             signal_plan,
+            instruction_evidence: instruction_evidence.into_boxed_slice(),
             digest: Sha256Digest::new([0; 32]),
         };
         materialized.digest = materialized_signal_plan_digest(&materialized)?;
@@ -1251,6 +1936,15 @@ fn sequential_signal_plan_digest(
         update_text(&mut hash, instruction.signal_id.as_str());
         hash.update(instruction.signal_at.unix_nanos().to_be_bytes());
         hash.update(instruction.available_at.unix_nanos().to_be_bytes());
+        hash.update(
+            instruction
+                .source_selection_as_of
+                .unix_nanos()
+                .to_be_bytes(),
+        );
+        instruction.study_qualification.hash_into(&mut hash);
+        hash.update(instruction.target_origin.unix_nanos().to_be_bytes());
+        hash.update(instruction.target_at.unix_nanos().to_be_bytes());
         hash.update(instruction.subject_lineage_digest.bytes());
         hash.update(instruction.benchmark_lineage_digest.bytes());
         hash.update(instruction.instruction_evidence_digest.bytes());
@@ -1306,18 +2000,58 @@ fn recommendation_fold_index(folds: &[RecommendationOosFoldV1], at: Timestamp) -
 
 fn validate_materialization_observation(
     observation: &BacktestObservation,
-    reporting_currency: Currency,
+    policy: RecommendationBacktestPolicyV1,
 ) -> Result<(), RecommendationSignalPlanMaterializationErrorV1> {
+    let reporting_currency = policy.reporting_currency();
+    let (origin, _) = materialization_target(observation, policy.execution_basis)?;
     if observation.execution_terms.quote_currency() != reporting_currency
         || observation.execution_terms.settlement_denomination()
             != Denomination::Currency(reporting_currency)
         || observation.event_at() > observation.available_at()
-        || observation.available_at() > observation.decision_at()
+        || !policy.study_qualification.admits_clocks(
+            origin,
+            observation.available_at(),
+            observation.source_selection_as_of,
+            observation.decision_at(),
+        )
         || observation.lineage_digest.bytes() == [0; 32]
     {
         return Err(RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel);
     }
     Ok(())
+}
+
+fn materialization_target(
+    observation: &BacktestObservation,
+    execution_basis: BacktestExecutionBasis,
+) -> Result<(Timestamp, Timestamp), RecommendationSignalPlanMaterializationErrorV1> {
+    use RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel;
+    let (origin, target) = match observation.financial_target {
+        Some(coordinates) => coordinates,
+        None if execution_basis == BacktestExecutionBasis::ObservedQuoteDepth => {
+            // An observed quote's financial origin is its genuine event instant. Daily close
+            // studies require the separate sealed origin/target and cannot use this branch.
+            let origin = observation.event_at();
+            (
+                origin,
+                origin
+                    .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
+                    .map_err(|_| IncompletePointInTimePanel)?,
+            )
+        }
+        None => return Err(IncompletePointInTimePanel),
+    };
+    if origin < observation.event_at()
+        || origin > observation.available_at()
+        || target <= observation.decision_at()
+        || origin
+            .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
+            .map_err(|_| IncompletePointInTimePanel)?
+            != target
+    {
+        return Err(IncompletePointInTimePanel);
+    }
+    Ok((origin, target))
 }
 
 fn retain_stable_execution_terms(
@@ -1336,10 +2070,14 @@ fn retain_stable_execution_terms(
     }
 }
 
-fn materialization_entry_evidence(observation: &BacktestObservation) -> bool {
+fn materialization_entry_evidence(
+    observation: &BacktestObservation,
+    execution_basis: BacktestExecutionBasis,
+) -> bool {
     observation.universe == HistoricalUniverseStatus::Eligible
-        && observation.mid_price.is_some()
-        && observation.executable_depth.get() > 0
+        && (observation.mid_price.is_some() || observation.market_reference.is_some())
+        && (execution_basis == BacktestExecutionBasis::CompletedDailyBar
+            || observation.executable_depth.get() > 0)
 }
 
 fn materialized_signal_evidence_digest(
@@ -1356,6 +2094,10 @@ fn materialized_signal_evidence_digest(
     update_text(&mut hash, signal.signal_id.as_str());
     hash.update(signal.signal_at.unix_nanos().to_be_bytes());
     hash.update(signal.available_at.unix_nanos().to_be_bytes());
+    hash.update(signal.source_selection_as_of.unix_nanos().to_be_bytes());
+    signal.study_qualification.hash_into(&mut hash);
+    hash.update(signal.target_origin.unix_nanos().to_be_bytes());
+    hash.update(signal.target_at.unix_nanos().to_be_bytes());
     hash.update(signal.subject_lineage_digest.bytes());
     hash.update(signal.benchmark_lineage_digest.bytes());
     hash.update(signal.instruction_evidence_digest.bytes());
@@ -1396,6 +2138,20 @@ fn materialized_signal_plan_digest(
         );
     }
     hash.update(value.signal_plan.digest().bytes());
+    if value.instruction_evidence.len() != value.signal_plan.signals.len() {
+        return Err(RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift);
+    }
+    for receipt in &value.instruction_evidence {
+        match receipt {
+            None => hash.update([0]),
+            Some(receipt) => {
+                validate_instruction_payload(Sha256Digest::new(receipt.digest), &receipt.payload)?;
+                hash.update([1]);
+                hash.update(receipt.digest);
+                update_text(&mut hash, &receipt.payload);
+            }
+        }
+    }
     Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
@@ -1414,8 +2170,6 @@ pub enum RecommendationSignalPlanMaterializationErrorV1 {
     IncompletePointInTimePanel,
     #[error("recommendation materialization instruction is invalid")]
     InvalidInstruction,
-    #[error("recommendation materialization has no entry instruction in one or more OOS folds")]
-    MissingEntryInFold,
     #[error("recommendation materialization instruction evidence does not match pinned rows")]
     InstructionEvidenceMismatch,
     #[error("recommendation materialization resource limit exceeded")]
@@ -1543,6 +2297,7 @@ pub struct RecommendationRoundTripOutcomeV1 {
     exit_fill: ResearchFill,
     entry_cost: Decimal,
     exit_proceeds: Decimal,
+    unpaid_entitlement_value: Decimal,
     cost_adjusted_total_return: Decimal,
     maximum_drawdown: Decimal,
     equity_path: Box<[RecommendationEquityPointV1]>,
@@ -1550,6 +2305,12 @@ pub struct RecommendationRoundTripOutcomeV1 {
 }
 
 impl RecommendationRoundTripOutcomeV1 {
+    /// Original canonical tick, lot, currency and multiplier used by both simulated fills.
+    #[must_use]
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.execution_terms
+    }
+
     /// Returns the exact instrument evaluated.
     #[must_use]
     pub const fn instrument_id(&self) -> InstrumentId {
@@ -1580,7 +2341,13 @@ impl RecommendationRoundTripOutcomeV1 {
         self.exit_proceeds
     }
 
-    /// Returns the exact fee/slippage-adjusted round-trip return.
+    /// Returns distributions still owed at the terminal mark, separately from spendable cash.
+    #[must_use]
+    pub const fn unpaid_entitlement_value(&self) -> Decimal {
+        self.unpaid_entitlement_value
+    }
+
+    /// Returns the exact fee/slippage-adjusted total-wealth return, including unpaid entitlements.
     #[must_use]
     pub const fn cost_adjusted_total_return(&self) -> Decimal {
         self.cost_adjusted_total_return
@@ -1652,13 +2419,40 @@ pub struct RecommendationSignalResultV1 {
     fold_index: usize,
     signal_at: Timestamp,
     signal_available_at: Timestamp,
+    source_selection_as_of: Timestamp,
+    study_qualification: BacktestStudyQualification,
+    target_origin: Timestamp,
     target_at: Timestamp,
     signal_evidence_digest: Sha256Digest,
     disposition: RecommendationSignalDispositionV1,
+    accompanying_benchmark:
+        Option<Result<Box<RecommendationRoundTripOutcomeV1>, RecommendationBenchmarkGapV1>>,
     digest: Sha256Digest,
 }
 
 impl RecommendationSignalResultV1 {
+    pub const fn basis(&self) -> HistoricalStudyBasis {
+        self.study_qualification.basis()
+    }
+    pub const fn limitations(&self) -> &'static [HistoricalStudyLimitation] {
+        self.study_qualification.limitations()
+    }
+    pub const fn snapshot_as_of(&self) -> Timestamp {
+        self.study_qualification.snapshot_as_of()
+    }
+    pub const fn source_snapshot_digest(&self) -> Sha256Digest {
+        self.study_qualification.source_snapshot_digest()
+    }
+    pub const fn source_selection_as_of(&self) -> Timestamp {
+        self.source_selection_as_of
+    }
+
+    /// Returns the original financial reference time of the 365-day forecast.
+    #[must_use]
+    pub const fn target_origin(&self) -> Timestamp {
+        self.target_origin
+    }
+
     /// Returns the source signal identity.
     #[must_use]
     pub const fn signal_id(&self) -> &SourceIdentifier {
@@ -1683,7 +2477,7 @@ impl RecommendationSignalResultV1 {
         self.signal_at
     }
 
-    /// Returns when the signal first became PIT-available.
+    /// Returns when the signal's historical source information became PIT-available.
     #[must_use]
     pub const fn signal_available_at(&self) -> Timestamp {
         self.signal_available_at
@@ -1699,6 +2493,20 @@ impl RecommendationSignalResultV1 {
     #[must_use]
     pub const fn disposition(&self) -> &RecommendationSignalDispositionV1 {
         &self.disposition
+    }
+
+    /// Returns the accompanying comparison for a matured subject outcome. Absence means that
+    /// the subject itself did not complete; an error retains the comparison's exact evidence gap.
+    #[must_use]
+    pub fn accompanying_benchmark(
+        &self,
+    ) -> Option<Result<&RecommendationRoundTripOutcomeV1, RecommendationBenchmarkGapV1>> {
+        self.accompanying_benchmark
+            .as_ref()
+            .map(|value| match value {
+                Ok(outcome) => Ok(outcome.as_ref()),
+                Err(gap) => Err(*gap),
+            })
     }
 
     /// Returns the complete result content identity.
@@ -1729,6 +2537,7 @@ pub struct RecommendationAggregateV1 {
     positive_fold_stability: Decimal,
     positive_fold_stability_ppm: u32,
     benchmark: RecommendationBenchmarkAggregateV1,
+    accompanying_benchmark: RecommendationBenchmarkAggregateV1,
     digest: Sha256Digest,
 }
 
@@ -1781,6 +2590,12 @@ impl RecommendationAggregateV1 {
         self.benchmark
     }
 
+    /// Returns the accompanying comparison over exactly the same completed subject population.
+    #[must_use]
+    pub const fn accompanying_benchmark(self) -> RecommendationBenchmarkAggregateV1 {
+        self.accompanying_benchmark
+    }
+
     /// Returns the complete aggregate identity.
     #[must_use]
     pub const fn digest(self) -> Sha256Digest {
@@ -1824,6 +2639,34 @@ pub struct RecommendationBacktestStudyV1 {
 }
 
 impl RecommendationBacktestStudyV1 {
+    pub const fn basis(&self) -> HistoricalStudyBasis {
+        self.policy.study_qualification.basis()
+    }
+    pub const fn snapshot_as_of(&self) -> Timestamp {
+        self.policy.study_qualification.snapshot_as_of()
+    }
+    pub const fn source_snapshot_digest(&self) -> Sha256Digest {
+        self.policy.study_qualification.source_snapshot_digest()
+    }
+    pub const fn limitations(&self) -> &'static [HistoricalStudyLimitation] {
+        self.policy.study_qualification.limitations()
+    }
+
+    /// Binds actual completion/publication clocks after evaluation without changing its cutoff.
+    pub fn with_publication(
+        mut self,
+        publication: RecommendationBacktestPublicationV1,
+    ) -> Result<Self, RecommendationBacktestError> {
+        if publication.simulation_cutoff() != self.publication.simulation_cutoff()
+            || publication.evaluated_at() < self.publication.evaluated_at()
+        {
+            return Err(RecommendationBacktestError::InvalidPublication);
+        }
+        self.publication = publication;
+        self.digest = evidence_digest(&self)?;
+        Ok(self)
+    }
+
     /// Returns the exact PIT dataset identity.
     #[must_use]
     pub const fn dataset_identity(&self) -> Sha256Digest {
@@ -1930,9 +2773,11 @@ impl RecommendationBacktestKernelV1 {
     pub fn run_materialized_study(
         dataset: &BacktestDataset,
         policy: RecommendationBacktestPolicyV1,
+        corporate_actions: &CorporateActionPlan,
         materialized: &MaterializedRecommendationSignalPlanV1,
         publication: RecommendationBacktestPublicationV1,
         limits: RecommendationBacktestLimits,
+        cancellation: &CancellationToken,
     ) -> Result<RecommendationBacktestStudyV1, RecommendationMaterializedBacktestErrorV1> {
         materialized.validate_against(dataset, policy, limits)?;
         if publication.simulation_cutoff() != materialized.evaluation_ends_at() {
@@ -1943,9 +2788,11 @@ impl RecommendationBacktestKernelV1 {
         Self::run_study(
             dataset,
             policy,
+            corporate_actions,
             materialized.signal_plan(),
             publication,
             limits,
+            cancellation,
         )
         .map_err(Into::into)
     }
@@ -1954,10 +2801,46 @@ impl RecommendationBacktestKernelV1 {
     pub fn run_study(
         dataset: &BacktestDataset,
         policy: RecommendationBacktestPolicyV1,
+        corporate_actions: &CorporateActionPlan,
         signal_plan: &RecommendationSignalPlanV1,
         publication: RecommendationBacktestPublicationV1,
         limits: RecommendationBacktestLimits,
+        cancellation: &CancellationToken,
     ) -> Result<RecommendationBacktestStudyV1, RecommendationBacktestError> {
+        if dataset.study_qualification != Some(policy.study_qualification)
+            || signal_plan.study_qualification != policy.study_qualification
+            || policy.study_qualification.snapshot_as_of() > publication.evaluated_at()
+            || dataset.execution_basis() != policy.execution_basis
+            || dataset.daily_history.as_ref().is_some_and(|history| {
+                history.digest != policy.raw_price_evidence_digest
+                    || history.available_at > publication.evaluated_at()
+                    || history.nominal_sources.iter().any(|source| {
+                        corporate_actions.source_admission().is_none_or(|coverage| {
+                            coverage.knowledge_cutoff() != source.knowledge_cutoff
+                                || !coverage.instruments().contains(&source.instrument)
+                                || !coverage
+                                    .history_input_manifests()
+                                    .contains(&source.manifest)
+                                || coverage.application_starts_at(source.instrument).is_none_or(
+                                    |starts_at| starts_at > policy.corporate_action_coverage_starts_at,
+                                )
+                        })
+                    })
+            })
+            || corporate_actions.policy().adjustment() != CorporateActionAdjustment::TotalReturn
+            || corporate_actions.content_hash() != policy.corporate_action_content_digest
+            || corporate_actions.audit_hash() != policy.corporate_action_audit_digest
+            || !corporate_actions.conflicts().is_empty()
+            || !corporate_actions.exclusions().is_empty()
+            || corporate_actions.knowledge_cutoff() > publication.evaluated_at()
+            || corporate_actions.valuation_cutoff() != publication.simulation_cutoff()
+            || signal_plan
+                .signals()
+                .iter()
+                .any(|signal| signal.signal_at() < policy.corporate_action_coverage_starts_at)
+        {
+            return Err(RecommendationBacktestError::InvalidDataset);
+        }
         if signal_plan.folds.len() > limits.max_folds
             || signal_plan.signals.len() > limits.max_signals
         {
@@ -1970,29 +2853,23 @@ impl RecommendationBacktestKernelV1 {
             .try_reserve_exact(signal_plan.signals.len())
             .map_err(|_| RecommendationBacktestError::LimitExceeded)?;
         for signal in &signal_plan.signals {
+            if cancellation.is_cancelled() {
+                return Err(RecommendationBacktestError::Cancelled);
+            }
             if signal.signal_at > publication.simulation_cutoff
-                || signal.available_at > publication.simulation_cutoff
+                || signal.available_at > policy.study_qualification.snapshot_as_of()
             {
                 return Err(RecommendationBacktestError::InvalidSignalPlan);
             }
-            let target_at = signal
-                .signal_at
-                .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
+            let target_at = signal.target_at();
+            let outcome_window_end = target_at
+                .checked_add_nanos(policy.maximum_exit_lag_nanos)
                 .map_err(|_| RecommendationBacktestError::InvalidSignalPlan)?;
-            if signal.instruction == RecommendationSignalInstructionV1::Entry {
-                let outcome_window_end = target_at
-                    .checked_add_nanos(policy.maximum_exit_lag_nanos)
-                    .map_err(|_| RecommendationBacktestError::InvalidSignalPlan)?;
-                if outcome_window_end
-                    >= signal_plan
-                        .folds
-                        .get(signal.fold_index)
-                        .ok_or(RecommendationBacktestError::InvalidSignalPlan)?
-                        .ends_at
-                {
-                    return Err(RecommendationBacktestError::InvalidSignalPlan);
-                }
-            }
+            let fold_ends_at = signal_plan
+                .folds
+                .get(signal.fold_index)
+                .ok_or(RecommendationBacktestError::InvalidSignalPlan)?
+                .ends_at;
             let disposition = match signal.instruction {
                 RecommendationSignalInstructionV1::NoAction => {
                     RecommendationSignalDispositionV1::NoAction
@@ -2010,19 +2887,28 @@ impl RecommendationBacktestKernelV1 {
                         RecommendationSignalCensorReasonV1::TargetAfterSimulationCutoff,
                     )
                 }
+                // The issuer sees only its contemporaneous information set, never the study's
+                // eventual fold boundary. Preserve its Entry and explicitly censor its outcome
+                // when the complete exit window would cross into a different independent fold.
+                RecommendationSignalInstructionV1::Entry if outcome_window_end >= fold_ends_at => {
+                    RecommendationSignalDispositionV1::Censored(
+                        RecommendationSignalCensorReasonV1::OutsideAuthorizedDataset,
+                    )
+                }
                 RecommendationSignalInstructionV1::Entry => {
                     match simulate_round_trip(
                         dataset,
-                        policy,
+                        policy.into(),
+                        corporate_actions,
+                        cancellation,
                         policy.subject_instrument_id,
                         policy.subject_quantity,
-                        signal,
+                        RoundTripExecutionOrigin::recommendation(policy, signal, b"subject"),
                         target_at,
                         publication.simulation_cutoff,
                         limits,
                         &mut total_equity_points,
                         &mut observation_visits,
-                        b"subject",
                     )? {
                         RoundTripSimulation::EntryUnfilled { gap, partial_fill } => {
                             RecommendationSignalDispositionV1::EntryUnfilled { gap, partial_fill }
@@ -2042,21 +2928,29 @@ impl RecommendationBacktestKernelV1 {
                         RoundTripSimulation::Completed(subject) => {
                             match simulate_round_trip(
                                 dataset,
-                                policy,
+                                policy.into(),
+                                corporate_actions,
+                                cancellation,
                                 policy.benchmark.instrument_id,
                                 policy.benchmark_quantity,
-                                signal,
+                                RoundTripExecutionOrigin::recommendation(policy, signal, b"benchmark"),
                                 target_at,
                                 publication.simulation_cutoff,
                                 limits,
                                 &mut total_equity_points,
                                 &mut observation_visits,
-                                b"benchmark",
                             )? {
                                 RoundTripSimulation::Completed(benchmark) => {
-                                    RecommendationSignalDispositionV1::Completed {
-                                        subject,
-                                        benchmark,
+                                    if matching_execution_dates(&subject, &benchmark) {
+                                        RecommendationSignalDispositionV1::Completed {
+                                            subject,
+                                            benchmark,
+                                        }
+                                    } else {
+                                        RecommendationSignalDispositionV1::BenchmarkUnavailable {
+                                            subject,
+                                            gap: RecommendationBenchmarkGapV1::Unavailable(RecommendationSignalUnavailableReasonV1::InsufficientPointInTimeEvidence),
+                                        }
                                     }
                                 }
                                 RoundTripSimulation::EntryUnfilled { gap, .. } => {
@@ -2082,14 +2976,73 @@ impl RecommendationBacktestKernelV1 {
                     }
                 }
             };
+            let accompanying_benchmark = if matches!(
+                disposition,
+                RecommendationSignalDispositionV1::Completed { .. }
+                    | RecommendationSignalDispositionV1::BenchmarkUnavailable { .. }
+            ) {
+                Some(
+                    match simulate_round_trip(
+                        dataset,
+                        policy.into(),
+                        corporate_actions,
+                        cancellation,
+                        policy.accompanying_benchmark.instrument_id,
+                        policy.benchmark_quantity,
+                        RoundTripExecutionOrigin::recommendation(
+                            policy,
+                            signal,
+                            b"accompanying-benchmark",
+                        ),
+                        target_at,
+                        publication.simulation_cutoff,
+                        limits,
+                        &mut total_equity_points,
+                        &mut observation_visits,
+                    )? {
+                        RoundTripSimulation::Completed(outcome) => {
+                            let subject = match &disposition {
+                                RecommendationSignalDispositionV1::Completed {
+                                    subject, ..
+                                }
+                                | RecommendationSignalDispositionV1::BenchmarkUnavailable {
+                                    subject,
+                                    ..
+                                } => subject,
+                                _ => return Err(RecommendationBacktestError::InvalidDataset),
+                            };
+                            if matching_execution_dates(subject, &outcome) {
+                                Ok(outcome)
+                            } else {
+                                Err(RecommendationBenchmarkGapV1::Unavailable(RecommendationSignalUnavailableReasonV1::InsufficientPointInTimeEvidence))
+                            }
+                        }
+                        RoundTripSimulation::EntryUnfilled { gap, .. } => {
+                            Err(RecommendationBenchmarkGapV1::EntryUnfilled(gap))
+                        }
+                        RoundTripSimulation::ExitUnfilled { gap, .. } => {
+                            Err(RecommendationBenchmarkGapV1::ExitUnfilled(gap))
+                        }
+                        RoundTripSimulation::Unavailable(reason) => {
+                            Err(RecommendationBenchmarkGapV1::Unavailable(reason))
+                        }
+                    },
+                )
+            } else {
+                None
+            };
             let mut result = RecommendationSignalResultV1 {
                 signal_id: signal.signal_id.clone(),
                 fold_index: signal.fold_index,
                 signal_at: signal.signal_at,
                 signal_available_at: signal.available_at,
+                source_selection_as_of: signal.source_selection_as_of,
+                study_qualification: signal.study_qualification,
+                target_origin: signal.target_origin,
                 target_at,
                 signal_evidence_digest: signal.evidence_digest,
                 disposition,
+                accompanying_benchmark,
                 digest: Sha256Digest::new([0; 32]),
             };
             result.digest = signal_result_digest(&result)?;
@@ -2127,6 +3080,52 @@ pub enum RecommendationMaterializedBacktestErrorV1 {
     Backtest(#[from] RecommendationBacktestError),
 }
 
+#[derive(Clone, Copy)]
+struct RoundTripExecutionPolicy {
+    digest: Sha256Digest,
+    reason_code: &'static str,
+    reporting_currency: Currency,
+    maximum_entry_lag_nanos: i64,
+    maximum_exit_lag_nanos: i64,
+    execution_assumptions: ResearchExecutionAssumptions,
+    seed: u64,
+}
+
+impl From<RecommendationBacktestPolicyV1> for RoundTripExecutionPolicy {
+    fn from(policy: RecommendationBacktestPolicyV1) -> Self {
+        Self {
+            digest: policy.digest,
+            reason_code: "recommendation-backtest-v1",
+            reporting_currency: policy.reporting_currency,
+            maximum_entry_lag_nanos: policy.maximum_entry_lag_nanos,
+            maximum_exit_lag_nanos: policy.maximum_exit_lag_nanos,
+            execution_assumptions: policy.execution_assumptions,
+            seed: policy.seed,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RoundTripExecutionOrigin {
+    decision_at: Timestamp,
+    entry_identity: [u8; 32],
+    exit_identity: [u8; 32],
+}
+
+impl RoundTripExecutionOrigin {
+    fn recommendation(
+        policy: RecommendationBacktestPolicyV1,
+        signal: &RecommendationSignalV1,
+        role: &[u8],
+    ) -> Self {
+        Self {
+            decision_at: signal.signal_at,
+            entry_identity: execution_identity_digest(policy.digest, signal, role, b"entry"),
+            exit_identity: execution_identity_digest(policy.digest, signal, role, b"exit"),
+        }
+    }
+}
+
 enum RoundTripSimulation {
     Completed(Box<RecommendationRoundTripOutcomeV1>),
     EntryUnfilled {
@@ -2141,31 +3140,140 @@ enum RoundTripSimulation {
     Unavailable(RecommendationSignalUnavailableReasonV1),
 }
 
+fn matching_execution_dates(
+    left: &RecommendationRoundTripOutcomeV1,
+    right: &RecommendationRoundTripOutcomeV1,
+) -> bool {
+    left.entry_fill.executed_at() == right.entry_fill.executed_at()
+        && left.exit_fill.executed_at() == right.exit_fill.executed_at()
+}
+
+/// Realized execution observations are projected independently of the coordinate-local alpha
+/// facade. A daily bar's close and volume cannot enter the earlier signal information set.
+#[derive(Clone, Copy)]
+struct ExecutionObservation {
+    execution_terms: InstrumentExecutionTerms,
+    decision_at: Timestamp,
+    available_at: Timestamp,
+    reference_price: Option<Money>,
+    spread_basis_points: BasisPoints,
+    liquidity: ExecutionLiquidity,
+    bar_starts_at: Option<Timestamp>,
+    universe: HistoricalUniverseStatus,
+    lineage_digest: Sha256Digest,
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionLiquidity {
+    QuoteDepth(QuantityLots),
+    DailyTradedVolume(Decimal),
+}
+
+impl ExecutionObservation {
+    const fn instrument_id(self) -> InstrumentId {
+        self.execution_terms.instrument_id()
+    }
+
+    const fn decision_at(self) -> Timestamp {
+        self.decision_at
+    }
+
+    const fn available_at(self) -> Timestamp {
+        self.available_at
+    }
+
+    fn has_liquidity(self) -> bool {
+        match self.liquidity {
+            ExecutionLiquidity::QuoteDepth(depth) => depth.get() > 0,
+            ExecutionLiquidity::DailyTradedVolume(volume) => volume > Decimal::ZERO,
+        }
+    }
+}
+
+fn execution_observations_from(
+    dataset: &BacktestDataset,
+    starts_at: Timestamp,
+) -> impl Iterator<Item = ExecutionObservation> + '_ {
+    let quotes: &[BacktestObservation] = if dataset.daily_history.is_none() {
+        &dataset.observations
+    } else {
+        &[]
+    };
+    let quote_start = quotes.partition_point(|observation| observation.decision_at < starts_at);
+    let quotes = quotes
+        .iter()
+        .skip(quote_start)
+        .map(|observation| ExecutionObservation {
+            execution_terms: observation.execution_terms,
+            decision_at: observation.decision_at(),
+            available_at: observation.available_at(),
+            reference_price: observation
+                .mid_price
+                .and_then(|price| {
+                    price
+                        .checked_to_decimal(observation.execution_terms.price_tick())
+                        .ok()
+                })
+                .map(|amount| Money::new(amount, observation.execution_terms.quote_currency())),
+            spread_basis_points: observation.spread_basis_points,
+            liquidity: ExecutionLiquidity::QuoteDepth(observation.executable_depth),
+            bar_starts_at: None,
+            universe: observation.universe,
+            lineage_digest: observation.lineage_digest,
+        });
+    let bars = dataset
+        .daily_history
+        .as_ref()
+        .map_or(&[][..], |history| &history.bars[..]);
+    let bar_start = bars.partition_point(|bar| bar.ends_at < starts_at);
+    let bars = bars
+        .iter()
+        .skip(bar_start)
+        .map(move |bar| ExecutionObservation {
+            execution_terms: bar.execution_terms,
+            decision_at: bar.ends_at,
+            available_at: bar.available_at,
+            reference_price: Some(bar.close),
+            spread_basis_points: BasisPoints::new(DAILY_BAR_ASSUMED_FULL_SPREAD_BASIS_POINTS),
+            liquidity: ExecutionLiquidity::DailyTradedVolume(bar.traded_volume),
+            bar_starts_at: Some(bar.starts_at),
+            universe: HistoricalUniverseStatus::Eligible,
+            lineage_digest: bar.lineage_digest,
+        });
+    quotes.chain(bars)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "every outcome coordinate and resource authority is explicit"
 )]
 fn simulate_round_trip(
     dataset: &BacktestDataset,
-    policy: RecommendationBacktestPolicyV1,
+    policy: RoundTripExecutionPolicy,
+    corporate_actions: &CorporateActionPlan,
+    cancellation: &CancellationToken,
     instrument_id: InstrumentId,
     quantity: QuantityLots,
-    signal: &RecommendationSignalV1,
+    origin: RoundTripExecutionOrigin,
     target_at: Timestamp,
     simulation_cutoff: Timestamp,
     limits: RecommendationBacktestLimits,
     total_equity_points: &mut usize,
     observation_visits: &mut usize,
-    role: &[u8],
 ) -> Result<RoundTripSimulation, RecommendationBacktestError> {
-    let entry_start = signal
-        .signal_at
+    let entry_start = origin
+        .decision_at
         .checked_add_nanos(policy.execution_assumptions.latency_nanos())
         .map_err(|_| RecommendationBacktestError::Arithmetic)?;
-    let entry_end = signal
-        .signal_at
+    let entry_end = origin
+        .decision_at
         .checked_add_nanos(policy.maximum_entry_lag_nanos)
-        .map_err(|_| RecommendationBacktestError::Arithmetic)?;
+        .map_err(|_| RecommendationBacktestError::Arithmetic)?
+        .min(
+            target_at
+                .checked_sub_nanos(1)
+                .map_err(|_| RecommendationBacktestError::Arithmetic)?,
+        );
     let entry_observation = match first_eligible_observation(
         dataset,
         instrument_id,
@@ -2176,6 +3284,7 @@ fn simulate_round_trip(
         None,
         limits,
         observation_visits,
+        cancellation,
     ) {
         Ok(Some(observation)) => observation,
         Ok(None) => {
@@ -2198,14 +3307,12 @@ fn simulate_round_trip(
     };
     let entry_fill = simulate_leg(
         policy,
-        signal,
         entry_observation,
         quantity,
         OrderSide::Buy,
-        signal.signal_at,
+        origin.decision_at,
         entry_end,
-        role,
-        b"entry",
+        origin.entry_identity,
     )?;
     let Some(entry_fill) = entry_fill else {
         return Ok(RoundTripSimulation::EntryUnfilled {
@@ -2236,6 +3343,7 @@ fn simulate_round_trip(
         Some(entry_observation.execution_terms),
         limits,
         observation_visits,
+        cancellation,
     ) {
         Ok(Some(observation)) => observation,
         Ok(None) => {
@@ -2257,16 +3365,43 @@ fn simulate_round_trip(
         }
         Err(error) => return Err(error),
     };
+    if exit_observation.decision_at() > corporate_actions.valuation_cutoff()
+        || exit_observation.decision_at() > corporate_actions.knowledge_cutoff()
+    {
+        return Ok(RoundTripSimulation::Unavailable(
+            RecommendationSignalUnavailableReasonV1::InsufficientPointInTimeEvidence,
+        ));
+    }
+    count_action_visits(corporate_actions, limits, observation_visits)?;
+    let accounting = RecommendationAccounting::at(
+        &entry_fill,
+        entry_observation.execution_terms,
+        None,
+        corporate_actions,
+        exit_observation.decision_at(),
+    )
+    .map_err(|_| RecommendationBacktestError::InvalidDataset)?;
+    let Ok(quantity) = accounting.quantity().and_then(|quantity| {
+        QuantityLots::try_from_decimal(quantity, exit_observation.execution_terms.lot_size())
+            .map_err(Into::into)
+    }) else {
+        return Ok(RoundTripSimulation::Unavailable(
+            RecommendationSignalUnavailableReasonV1::UnsupportedInstrument,
+        ));
+    };
+    if quantity.get() <= 0 {
+        return Ok(RoundTripSimulation::Unavailable(
+            RecommendationSignalUnavailableReasonV1::UnsupportedInstrument,
+        ));
+    }
     let exit_fill = simulate_leg(
         policy,
-        signal,
         exit_observation,
         quantity,
         OrderSide::Sell,
         target_at,
         exit_end,
-        role,
-        b"exit",
+        origin.exit_identity,
     )?;
     let Some(exit_fill) = exit_fill else {
         return Ok(RoundTripSimulation::ExitUnfilled {
@@ -2284,11 +3419,13 @@ fn simulate_round_trip(
     }
     let outcome = match build_round_trip_outcome(
         dataset,
+        corporate_actions,
+        cancellation,
         entry_observation,
         exit_observation,
         entry_fill,
         exit_fill,
-        policy.reporting_currency,
+        policy,
         limits,
         total_equity_points,
         observation_visits,
@@ -2309,8 +3446,8 @@ fn simulate_round_trip(
     Ok(RoundTripSimulation::Completed(Box::new(outcome)))
 }
 
-fn first_eligible_observation<'a>(
-    dataset: &'a BacktestDataset,
+fn first_eligible_observation(
+    dataset: &BacktestDataset,
     instrument_id: InstrumentId,
     starts_at: Timestamp,
     ends_at: Timestamp,
@@ -2319,14 +3456,15 @@ fn first_eligible_observation<'a>(
     expected_terms: Option<InstrumentExecutionTerms>,
     limits: RecommendationBacktestLimits,
     observation_visits: &mut usize,
-) -> Result<Option<&'a BacktestObservation>, RecommendationBacktestError> {
+    cancellation: &CancellationToken,
+) -> Result<Option<ExecutionObservation>, RecommendationBacktestError> {
     if starts_at > ends_at || starts_at > simulation_cutoff {
         return Ok(None);
     }
-    let first = dataset
-        .observations
-        .partition_point(|observation| observation.decision_at < starts_at);
-    for observation in dataset.observations.iter().skip(first) {
+    for observation in execution_observations_from(dataset, starts_at) {
+        if cancellation.is_cancelled() {
+            return Err(RecommendationBacktestError::Cancelled);
+        }
         if observation.decision_at > ends_at || observation.decision_at > simulation_cutoff {
             break;
         }
@@ -2335,8 +3473,11 @@ fn first_eligible_observation<'a>(
             continue;
         }
         if observation.universe != HistoricalUniverseStatus::Eligible
-            || observation.mid_price.is_none()
-            || observation.executable_depth.get() <= 0
+            || observation.reference_price.is_none()
+            || !observation.has_liquidity()
+            || observation
+                .bar_starts_at
+                .is_some_and(|bar_start| bar_start < starts_at)
         {
             continue;
         }
@@ -2356,20 +3497,22 @@ fn first_eligible_observation<'a>(
     reason = "one simulated leg binds every exact order coordinate"
 )]
 fn simulate_leg(
-    policy: RecommendationBacktestPolicyV1,
-    signal: &RecommendationSignalV1,
-    observation: &BacktestObservation,
+    policy: RoundTripExecutionPolicy,
+    observation: ExecutionObservation,
     quantity: QuantityLots,
     side: OrderSide,
     leg_signal_at: Timestamp,
-    expires_at: Timestamp,
-    role: &[u8],
-    leg: &[u8],
+    last_permissible_at: Timestamp,
+    identity: [u8; 32],
 ) -> Result<Option<ResearchFill>, RecommendationBacktestError> {
-    if expires_at <= leg_signal_at {
+    if last_permissible_at <= leg_signal_at || observation.decision_at > last_permissible_at {
         return Ok(None);
     }
-    let identity = execution_identity_digest(policy.digest, signal, role, leg);
+    // The lookup window is inclusive; OrderIntent expiry is exclusive. In particular the last
+    // permissible entry is target−1ns, so its intent expires at the exact financial target.
+    let expires_at = last_permissible_at
+        .checked_add_nanos(1)
+        .map_err(|_| RecommendationBacktestError::Arithmetic)?;
     let policy_identity = policy.digest.bytes();
     let maximum_slippage = observation
         .spread_basis_points
@@ -2413,7 +3556,7 @@ fn simulate_leg(
         signal_at: leg_signal_at,
         expires_at,
         reason_codes: vec![
-            OrderReasonCode::try_from("recommendation-backtest-v1")
+            OrderReasonCode::try_from(policy.reason_code)
                 .map_err(|_| RecommendationBacktestError::InvalidPolicy)?,
         ],
         maximum_slippage,
@@ -2424,16 +3567,20 @@ fn simulate_leg(
         policy.execution_assumptions,
         deterministic_seed(policy.seed, identity),
     );
-    let capacity = simulator
-        .observation_capacity(observation.executable_depth)
-        .map_err(|_| RecommendationBacktestError::Arithmetic)?;
+    let capacity = match observation.liquidity {
+        ExecutionLiquidity::QuoteDepth(depth) => simulator.observation_capacity(depth),
+        ExecutionLiquidity::DailyTradedVolume(volume) => {
+            simulator.daily_bar_capacity(volume, observation.execution_terms.lot_size())
+        }
+    }
+    .map_err(|_| RecommendationBacktestError::Arithmetic)?;
     simulator
-        .simulate(
+        .simulate_money(
             &intent,
             quantity,
             observation.decision_at,
             observation
-                .mid_price
+                .reference_price
                 .ok_or(RecommendationBacktestError::InvalidDataset)?,
             observation.spread_basis_points,
             capacity,
@@ -2443,31 +3590,54 @@ fn simulate_leg(
 
 fn build_round_trip_outcome(
     dataset: &BacktestDataset,
-    entry_observation: &BacktestObservation,
-    exit_observation: &BacktestObservation,
+    corporate_actions: &CorporateActionPlan,
+    cancellation: &CancellationToken,
+    entry_observation: ExecutionObservation,
+    exit_observation: ExecutionObservation,
     entry_fill: ResearchFill,
     exit_fill: ResearchFill,
-    reporting_currency: Currency,
+    policy: RoundTripExecutionPolicy,
     limits: RecommendationBacktestLimits,
     total_equity_points: &mut usize,
     observation_visits: &mut usize,
 ) -> Result<RecommendationRoundTripOutcomeV1, RecommendationBacktestError> {
+    let reporting_currency = policy.reporting_currency;
     let execution_terms = entry_observation.execution_terms;
     if exit_observation.execution_terms != execution_terms {
         return Err(RecommendationBacktestError::ExecutionTermsChanged);
     }
     let entry_notional = fill_notional(&entry_fill, execution_terms, reporting_currency)?;
-    let exit_notional = fill_notional(&exit_fill, execution_terms, reporting_currency)?;
     let entry_cost = entry_notional
         .checked_add(entry_fill.fee().amount())
         .ok_or(RecommendationBacktestError::Arithmetic)?;
-    let exit_proceeds = exit_notional
-        .checked_sub(exit_fill.fee().amount())
+    count_action_visits(corporate_actions, limits, observation_visits)?;
+    let final_accounting = RecommendationAccounting::at(
+        &entry_fill,
+        execution_terms,
+        Some(&exit_fill),
+        corporate_actions,
+        exit_fill.executed_at(),
+    )
+    .map_err(|_| RecommendationBacktestError::InvalidDataset)?;
+    if !final_accounting
+        .quantity()
+        .map_err(|_| RecommendationBacktestError::InvalidDataset)?
+        .is_zero()
+    {
+        return Err(RecommendationBacktestError::InvalidDataset);
+    }
+    let exit_proceeds = final_accounting.cash().amount();
+    let unpaid_entitlement_value = final_accounting
+        .receivable_value()
+        .map_err(|_| RecommendationBacktestError::InvalidDataset)?
+        .amount();
+    let terminal_equity = exit_proceeds
+        .checked_add(unpaid_entitlement_value)
         .ok_or(RecommendationBacktestError::Arithmetic)?;
-    if entry_cost <= Decimal::ZERO || exit_proceeds < Decimal::ZERO {
+    if entry_cost <= Decimal::ZERO || terminal_equity < Decimal::ZERO {
         return Err(RecommendationBacktestError::Arithmetic);
     }
-    let cost_adjusted_total_return = exit_proceeds
+    let cost_adjusted_total_return = terminal_equity
         .checked_sub(entry_cost)
         .and_then(|difference| difference.checked_div(entry_cost))
         .ok_or(RecommendationBacktestError::Arithmetic)?;
@@ -2483,37 +3653,53 @@ fn build_round_trip_outcome(
         limits,
         *total_equity_points,
     )?;
-    let first = dataset
-        .observations
-        .partition_point(|observation| observation.decision_at <= entry_fill.executed_at());
-    for observation in dataset.observations.iter().skip(first) {
+    for observation in execution_observations_from(dataset, entry_fill.executed_at()) {
+        if cancellation.is_cancelled() {
+            return Err(RecommendationBacktestError::Cancelled);
+        }
         if observation.decision_at >= exit_fill.executed_at() {
             break;
         }
         count_observation_visit(observation_visits, limits)?;
+        if observation.decision_at <= entry_fill.executed_at() {
+            continue;
+        }
         if observation.instrument_id() != execution_terms.instrument_id() {
             continue;
         }
         if observation.universe != HistoricalUniverseStatus::Eligible
-            || observation.mid_price.is_none()
+            || observation.reference_price.is_none()
         {
             continue;
         }
         if observation.execution_terms != execution_terms {
             return Err(RecommendationBacktestError::ExecutionTermsChanged);
         }
-        let equity = observation
-            .mid_price
-            .ok_or(RecommendationBacktestError::InvalidDataset)?
-            .checked_mul_quantity(
-                entry_fill.quantity(),
-                execution_terms.price_tick(),
-                execution_terms.lot_size(),
-                reporting_currency,
-            )
-            .and_then(|money| money.checked_mul_decimal(execution_terms.contract_multiplier()))
-            .map_err(|_| RecommendationBacktestError::Arithmetic)?
+        count_action_visits(corporate_actions, limits, observation_visits)?;
+        let accounting = RecommendationAccounting::at(
+            &entry_fill,
+            execution_terms,
+            None,
+            corporate_actions,
+            observation.decision_at(),
+        )
+        .map_err(|_| RecommendationBacktestError::InvalidDataset)?;
+        let quantity = accounting
+            .quantity()
+            .map_err(|_| RecommendationBacktestError::InvalidDataset)?;
+        let receivable_value = accounting
+            .receivable_value()
+            .map_err(|_| RecommendationBacktestError::InvalidDataset)?
             .amount();
+        let equity = observation
+            .reference_price
+            .ok_or(RecommendationBacktestError::InvalidDataset)?
+            .amount()
+            .checked_mul(quantity)
+            .and_then(|value| value.checked_mul(execution_terms.contract_multiplier()))
+            .and_then(|value| value.checked_add(accounting.cash().amount()))
+            .and_then(|value| value.checked_add(receivable_value))
+            .ok_or(RecommendationBacktestError::Arithmetic)?;
         push_equity_point(
             &mut equity_path,
             RecommendationEquityPointV1 {
@@ -2532,7 +3718,7 @@ fn build_round_trip_outcome(
             marked_at: exit_fill.executed_at(),
             available_at: exit_observation.available_at(),
             lineage_digest: exit_observation.lineage_digest,
-            equity: exit_proceeds,
+            equity: terminal_equity,
         },
         limits,
         *total_equity_points,
@@ -2547,6 +3733,7 @@ fn build_round_trip_outcome(
         exit_fill,
         entry_cost,
         exit_proceeds,
+        unpaid_entitlement_value,
         cost_adjusted_total_return,
         maximum_drawdown,
         equity_path: equity_path.into_boxed_slice(),
@@ -2640,6 +3827,7 @@ fn aggregate_evidence(
                 &result.disposition,
                 RecommendationSignalDispositionV1::Completed { .. }
                     | RecommendationSignalDispositionV1::BenchmarkUnavailable { .. }
+                    | RecommendationSignalDispositionV1::Censored(_)
             )
         {
             return Ok(RecommendationAggregateEvidenceV1::Unavailable(
@@ -2652,6 +3840,8 @@ fn aggregate_evidence(
     let mut subject_drawdowns = Vec::new();
     let mut benchmark_returns = Vec::new();
     let mut excess_returns = Vec::new();
+    let mut accompanying_returns = Vec::new();
+    let mut accompanying_excess_returns = Vec::new();
     let mut benchmark_complete = true;
     for result in results {
         let (subject, benchmark) = match &result.disposition {
@@ -2676,6 +3866,14 @@ fn aggregate_evidence(
             excess_returns.push(
                 subject_return
                     .checked_sub(benchmark.cost_adjusted_total_return)
+                    .ok_or(RecommendationBacktestError::Arithmetic)?,
+            );
+        }
+        if let Some(Ok(accompanying)) = result.accompanying_benchmark() {
+            accompanying_returns.push(accompanying.cost_adjusted_total_return);
+            accompanying_excess_returns.push(
+                subject_return
+                    .checked_sub(accompanying.cost_adjusted_total_return)
                     .ok_or(RecommendationBacktestError::Arithmetic)?,
             );
         }
@@ -2724,6 +3922,14 @@ fn aggregate_evidence(
     } else {
         RecommendationBenchmarkAggregateV1::Unavailable
     };
+    let accompanying_benchmark = if accompanying_returns.len() == subject_returns.len() {
+        RecommendationBenchmarkAggregateV1::Available {
+            mean_cost_adjusted_total_return: decimal_mean(&accompanying_returns)?,
+            mean_excess_return: decimal_mean(&accompanying_excess_returns)?,
+        }
+    } else {
+        RecommendationBenchmarkAggregateV1::Unavailable
+    };
     let mut aggregate = RecommendationAggregateV1 {
         observation_count: subject_returns.len(),
         trial_count,
@@ -2733,6 +3939,7 @@ fn aggregate_evidence(
         positive_fold_stability,
         positive_fold_stability_ppm,
         benchmark,
+        accompanying_benchmark,
         digest: Sha256Digest::new([0; 32]),
     };
     aggregate.digest = aggregate_digest(aggregate)?;
@@ -2763,12 +3970,49 @@ fn count_observation_visit(
     Ok(())
 }
 
+fn count_action_visits(
+    plan: &CorporateActionPlan,
+    limits: RecommendationBacktestLimits,
+    visits: &mut usize,
+) -> Result<(), RecommendationBacktestError> {
+    *visits = visits
+        .checked_add(plan.steps().len())
+        .filter(|value| *value <= limits.max_observation_visits())
+        .ok_or(RecommendationBacktestError::LimitExceeded)?;
+    Ok(())
+}
+
 fn policy_digest(value: &RecommendationBacktestPolicyV1) -> Sha256Digest {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/recommendation-backtest-policy/v1\0");
+    value.study_qualification.hash_into(&mut hash);
     hash.update(value.subject_instrument_id.as_uuid().as_bytes());
     hash.update(value.benchmark.instrument_id.as_uuid().as_bytes());
     hash.update(value.benchmark.approval_digest.bytes());
+    hash.update(
+        value
+            .accompanying_benchmark
+            .instrument_id
+            .as_uuid()
+            .as_bytes(),
+    );
+    hash.update(value.accompanying_benchmark.approval_digest.bytes());
+    hash.update(value.raw_price_evidence_digest.bytes());
+    hash.update([match value.execution_basis {
+        BacktestExecutionBasis::ObservedQuoteDepth => 1,
+        BacktestExecutionBasis::CompletedDailyBar => 2,
+    }]);
+    if let Some(spread) = value.daily_bar_assumed_spread_basis_points() {
+        hash.update(spread.get().to_be_bytes());
+    }
+    hash.update(value.corporate_action_content_digest.bytes());
+    hash.update(value.corporate_action_audit_digest.bytes());
+    hash.update(
+        value
+            .corporate_action_coverage_starts_at
+            .unix_nanos()
+            .to_be_bytes(),
+    );
     update_text(&mut hash, value.reporting_currency.as_str());
     hash.update(value.subject_quantity.get().to_be_bytes());
     hash.update(value.benchmark_quantity.get().to_be_bytes());
@@ -2785,6 +4029,7 @@ fn signal_plan_digest(
 ) -> Result<Sha256Digest, RecommendationBacktestError> {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/recommendation-signal-plan/v1\0");
+    value.study_qualification.hash_into(&mut hash);
     hash.update(value.preauthorized_signal_plan_digest.bytes());
     update_completeness(&mut hash, value.completeness)?;
     update_length(&mut hash, value.folds.len())?;
@@ -2799,6 +4044,10 @@ fn signal_plan_digest(
         update_length(&mut hash, signal.fold_index)?;
         hash.update(signal.signal_at.unix_nanos().to_be_bytes());
         hash.update(signal.available_at.unix_nanos().to_be_bytes());
+        hash.update(signal.source_selection_as_of.unix_nanos().to_be_bytes());
+        signal.study_qualification.hash_into(&mut hash);
+        hash.update(signal.target_origin.unix_nanos().to_be_bytes());
+        hash.update(signal.target_at.unix_nanos().to_be_bytes());
         hash.update(signal.evidence_digest.bytes());
         update_instruction(&mut hash, signal.instruction);
     }
@@ -2833,6 +4082,10 @@ fn execution_identity_digest(
     hash.update((signal.fold_index as u64).to_be_bytes());
     hash.update(signal.signal_at.unix_nanos().to_be_bytes());
     hash.update(signal.available_at.unix_nanos().to_be_bytes());
+    hash.update(signal.source_selection_as_of.unix_nanos().to_be_bytes());
+    signal.study_qualification.hash_into(&mut hash);
+    hash.update(signal.target_origin.unix_nanos().to_be_bytes());
+    hash.update(signal.target_at.unix_nanos().to_be_bytes());
     hash.update(signal.evidence_digest.bytes());
     update_instruction(&mut hash, signal.instruction);
     hash.update((role.len() as u64).to_be_bytes());
@@ -2859,6 +4112,7 @@ fn round_trip_digest(
     for decimal in [
         value.entry_cost,
         value.exit_proceeds,
+        value.unpaid_entitlement_value,
         value.cost_adjusted_total_return,
         value.maximum_drawdown,
     ] {
@@ -2883,6 +4137,9 @@ fn signal_result_digest(
     update_length(&mut hash, value.fold_index)?;
     hash.update(value.signal_at.unix_nanos().to_be_bytes());
     hash.update(value.signal_available_at.unix_nanos().to_be_bytes());
+    hash.update(value.source_selection_as_of.unix_nanos().to_be_bytes());
+    value.study_qualification.hash_into(&mut hash);
+    hash.update(value.target_origin.unix_nanos().to_be_bytes());
     hash.update(value.target_at.unix_nanos().to_be_bytes());
     hash.update(value.signal_evidence_digest.bytes());
     match &value.disposition {
@@ -2914,20 +4171,35 @@ fn signal_result_digest(
         RecommendationSignalDispositionV1::BenchmarkUnavailable { subject, gap } => {
             hash.update([6]);
             hash.update(subject.digest.bytes());
-            match gap {
-                RecommendationBenchmarkGapV1::EntryUnfilled(reason) => {
-                    hash.update([0, execution_gap_code(*reason)]);
-                }
-                RecommendationBenchmarkGapV1::ExitUnfilled(reason) => {
-                    hash.update([1, execution_gap_code(*reason)]);
-                }
-                RecommendationBenchmarkGapV1::Unavailable(reason) => {
-                    hash.update([2, unavailable_reason_code(*reason)]);
-                }
-            }
+            update_benchmark_gap(&mut hash, *gap);
+        }
+    }
+    match value.accompanying_benchmark() {
+        None => hash.update([0]),
+        Some(Ok(outcome)) => {
+            hash.update([1]);
+            hash.update(outcome.digest.bytes());
+        }
+        Some(Err(gap)) => {
+            hash.update([2]);
+            update_benchmark_gap(&mut hash, gap);
         }
     }
     Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
+fn update_benchmark_gap(hash: &mut Sha256, gap: RecommendationBenchmarkGapV1) {
+    match gap {
+        RecommendationBenchmarkGapV1::EntryUnfilled(reason) => {
+            hash.update([0, execution_gap_code(reason)])
+        }
+        RecommendationBenchmarkGapV1::ExitUnfilled(reason) => {
+            hash.update([1, execution_gap_code(reason)])
+        }
+        RecommendationBenchmarkGapV1::Unavailable(reason) => {
+            hash.update([2, unavailable_reason_code(reason)])
+        }
+    }
 }
 
 fn aggregate_digest(
@@ -2945,16 +4217,18 @@ fn aggregate_digest(
     update_length(&mut hash, value.positive_fold_count)?;
     update_decimal(&mut hash, value.positive_fold_stability);
     hash.update(value.positive_fold_stability_ppm.to_be_bytes());
-    match value.benchmark {
-        RecommendationBenchmarkAggregateV1::Available {
-            mean_cost_adjusted_total_return,
-            mean_excess_return,
-        } => {
-            hash.update([1]);
-            update_decimal(&mut hash, mean_cost_adjusted_total_return);
-            update_decimal(&mut hash, mean_excess_return);
+    for comparison in [value.benchmark, value.accompanying_benchmark] {
+        match comparison {
+            RecommendationBenchmarkAggregateV1::Available {
+                mean_cost_adjusted_total_return,
+                mean_excess_return,
+            } => {
+                hash.update([1]);
+                update_decimal(&mut hash, mean_cost_adjusted_total_return);
+                update_decimal(&mut hash, mean_excess_return);
+            }
+            RecommendationBenchmarkAggregateV1::Unavailable => hash.update([0]),
         }
-        RecommendationBenchmarkAggregateV1::Unavailable => hash.update([0]),
     }
     Ok(Sha256Digest::new(hash.finalize().into()))
 }
@@ -3141,6 +4415,8 @@ fn encode_hex_prefix(bytes: [u8; 32], byte_count: usize) -> String {
 /// Strict recommendation-outcome validation or arithmetic failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RecommendationBacktestError {
+    #[error("recommendation backtest was cancelled")]
+    Cancelled,
     #[error("recommendation backtest policy is invalid")]
     InvalidPolicy,
     #[error("recommendation backtest limits are invalid")]

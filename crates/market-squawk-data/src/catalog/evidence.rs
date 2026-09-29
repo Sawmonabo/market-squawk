@@ -458,7 +458,10 @@ fn read_provider_relation_rows(
 ) -> Result<Vec<ProviderRelationEvidenceRow>, CatalogError> {
     let mut result = Vec::new();
     read_sealed_raw_object_evidence(connection, maximum, &mut result)?;
+    read_native_reference_evidence(connection, maximum, &mut result)?;
     read_provider_logical_evidence(connection, maximum, &mut result)?;
+    read_provider_logical_original_evidence(connection, maximum, &mut result)?;
+    read_provider_capture_original_evidence(connection, maximum, &mut result)?;
     read_provider_option_evidence(connection, maximum, &mut result)?;
     read_direct_provider_input_evidence(connection, maximum, &mut result)?;
     read_market_event_selection_evidence(connection, maximum, &mut result)?;
@@ -571,6 +574,48 @@ fn validate_provider_relation_integrity(connection: &Connection) -> Result<(), C
                 OR capacity.physical_claims != (SELECT COUNT(*) FROM sealed_raw_objects)
                 OR capacity.physical_bytes !=
                    COALESCE((SELECT SUM(object.size_bytes) FROM sealed_raw_objects AS object), 0)
+             UNION ALL
+             SELECT 1 FROM market_data_native_reference_captures AS capture
+             WHERE NOT EXISTS (SELECT 1 FROM market_data_instrument_revisions AS revision
+                     WHERE revision.revision_digest=capture.origin_revision_digest
+                       AND revision.published_at_ns<=capture.retained_at_ns)
+                OR NOT EXISTS (SELECT 1 FROM sealed_raw_objects AS raw
+                     WHERE raw.raw_claim_digest=capture.raw_claim_digest
+                       AND raw.physical_receipt_digest=capture.physical_receipt_digest
+                       AND raw.recorded_at_ns<=capture.retained_at_ns)
+             UNION ALL
+             SELECT 1 FROM provider_logical_originals AS original
+             WHERE original.object_count!=(SELECT COUNT(*) FROM provider_logical_original_objects
+                       WHERE coordinate_digest=original.coordinate_digest)
+                OR (SELECT MIN(object_ordinal) FROM provider_logical_original_objects
+                       WHERE coordinate_digest=original.coordinate_digest)!=0
+                OR (SELECT MAX(object_ordinal) FROM provider_logical_original_objects
+                       WHERE coordinate_digest=original.coordinate_digest)!=original.object_count-1
+                OR NOT EXISTS (SELECT 1 FROM source_rights AS rights
+                       WHERE rights.rights_id=original.rights_id AND rights.source_id=original.source_id
+                         AND rights.payload_algorithm=1 AND rights.payload_digest=original.original_digest
+                         AND (rights.operation_mask & 4)<>0 AND rights.admitted_at_ns<=original.retained_at_ns
+                         AND (rights.authorization_expires_at_ns IS NULL OR rights.authorization_expires_at_ns>original.retained_at_ns))
+                OR (original.publication_digest IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM provider_logical_publication_bindings AS binding
+                       JOIN ingest_run_provider_publication_bindings AS input ON input.publication_digest=binding.binding_digest
+                       JOIN ingest_runs AS run ON run.run_id=input.run_id AND run.state='succeeded'
+                       JOIN dataset_manifests AS anchor ON anchor.run_id=run.run_id
+                       JOIN analytical_generations AS generation ON generation.anchor_manifest_id=anchor.manifest_id
+                       WHERE binding.binding_digest=original.publication_digest AND binding.source_id=original.source_id
+                         AND input.publication_kind='provider_logical' AND generation.dataset_id=original.dataset_id
+                         AND binding.object_count=original.object_count))
+             UNION ALL
+             SELECT 1 FROM provider_logical_original_objects AS object
+             JOIN provider_logical_originals AS original ON original.coordinate_digest=object.coordinate_digest
+             WHERE NOT EXISTS (SELECT 1 FROM sealed_raw_objects AS claim
+                       WHERE claim.raw_claim_digest=object.raw_claim_digest
+                         AND claim.physical_receipt_digest=object.physical_receipt_digest AND claim.raw_claim_kind='logical_object')
+                OR (original.publication_digest IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM provider_logical_publication_objects AS published
+                       WHERE published.binding_digest=original.publication_digest AND published.object_ordinal=object.object_ordinal
+                         AND published.object_role=object.object_role AND published.semantic_identity=object.semantic_identity
+                         AND published.raw_claim_digest=object.raw_claim_digest AND published.physical_receipt_digest=object.physical_receipt_digest))
              UNION ALL
              SELECT 1
              FROM provider_logical_publication_bindings AS binding
@@ -790,7 +835,83 @@ fn read_provider_logical_evidence(
     read_provider_logical_families(connection, maximum, result)?;
     read_provider_logical_objects(connection, maximum, result)?;
     read_provider_logical_partitions(connection, maximum, result)?;
-    read_provider_logical_expectations(connection, maximum, result)
+    read_provider_logical_expectations(connection, maximum, result)?;
+    read_provider_logical_partition_artifacts(connection, maximum, result)
+}
+
+fn read_provider_logical_original_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_logical_originals";
+    let mut statement = connection.prepare(
+        "SELECT coordinate_digest, dataset_id, source_id, native_schema_digest,
+                source_revision_digest, original_digest, received_at_ns, checkpoint_digest,
+                checkpoint_bytes, object_count, object_set_digest, rights_id, custody_digest,
+                retained_at_ns, publication_digest, published_at_ns
+         FROM provider_logical_originals ORDER BY coordinate_digest LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let coordinate = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let dataset: String = row.get(1)?;
+        let source: String = row.get(2)?;
+        DatasetId::try_from(dataset.as_str()).map_err(|_| CatalogError::CorruptCatalog)?;
+        market_squawk_domain::SourceId::try_from(source.as_str())
+            .map_err(|_| CatalogError::CorruptCatalog)?;
+        let native = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let revision = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let original = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        let received: i64 = row.get(6)?;
+        let checkpoint_digest = parse_sha256(1, row.get::<_, Vec<u8>>(7)?)?;
+        let checkpoint: Vec<u8> = row.get(8)?;
+        let objects: i64 = row.get(9)?;
+        let object_set = parse_sha256(1, row.get::<_, Vec<u8>>(10)?)?;
+        let rights = parse_sha256(1, row.get::<_, Vec<u8>>(11)?)?;
+        let custody = parse_sha256(1, row.get::<_, Vec<u8>>(12)?)?;
+        let retained: i64 = row.get(13)?;
+        let publication: Option<Vec<u8>> = row.get(14)?;
+        let published: Option<i64> = row.get(15)?;
+        if checkpoint.is_empty()
+            || checkpoint.len() > super::MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES
+            || Sha256Digest::new(Sha256::digest(&checkpoint).into()) != checkpoint_digest
+            || !(1..=64).contains(&objects)
+            || received > retained
+            || publication.is_some() != published.is_some()
+            || published.is_some_and(|time| time < retained)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        if let Some(publication) = &publication {
+            parse_sha256(1, publication.clone())?;
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(coordinate);
+        digest.text(&dataset)?;
+        digest.text(&source)?;
+        digest.digest(native);
+        digest.digest(revision);
+        digest.digest(original);
+        digest.integer(received);
+        digest.digest(checkpoint_digest);
+        digest.bytes(&checkpoint)?;
+        digest.integer(objects);
+        digest.digest(object_set);
+        digest.digest(rights);
+        digest.digest(custody);
+        digest.integer(retained);
+        digest.optional_bytes(publication.as_deref())?;
+        digest.optional_integer(published);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_primary_key(coordinate),
+            digest.finish(),
+            0,
+        ));
+    }
+    read_provider_logical_original_objects(connection, maximum, result)
 }
 
 fn read_provider_logical_bindings(
@@ -809,6 +930,15 @@ fn read_provider_logical_bindings(
     while let Some(row) = rows.next()? {
         require_capacity(result, maximum)?;
         let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        super::provider_logical::load_provider_logical_publication_binding(
+            connection,
+            market_squawk_domain::EvidenceDigest::new(
+                market_squawk_domain::DigestAlgorithm::Sha256,
+                binding.bytes(),
+            ),
+        )?
+        .ok_or(CatalogError::CorruptCatalog)?;
+
         let format: i64 = row.get(1)?;
         let source: String = row.get(2)?;
         SourceIdentifier::try_from(source.clone()).map_err(|_| CatalogError::CorruptCatalog)?;
@@ -894,6 +1024,52 @@ fn read_provider_logical_objects(
                 raw_claim_digest, physical_receipt_digest
          FROM provider_logical_publication_objects
          ORDER BY binding_digest, object_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let ordinal: i64 = row.get(1)?;
+        let role: String = row.get(2)?;
+        let semantic = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let raw_claim = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let physical = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        if !(0..=63).contains(&ordinal)
+            || !matches!(
+                role.as_str(),
+                "catalog" | "provider_payload" | "expanded_payload" | "provider_component"
+            )
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(binding);
+        digest.integer(ordinal);
+        digest.text(&role)?;
+        digest.digest(semantic);
+        digest.digest(raw_claim);
+        digest.digest(physical);
+        result.push(provider_relation_row(
+            RELATION,
+            digest_ordinal_primary_key(binding, ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_provider_logical_original_objects(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_logical_original_objects";
+    let mut statement = connection.prepare(
+        "SELECT coordinate_digest, object_ordinal, object_role, semantic_identity,
+                raw_claim_digest, physical_receipt_digest
+         FROM provider_logical_original_objects
+         ORDER BY coordinate_digest, object_ordinal LIMIT ?1",
     )?;
     let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
     while let Some(row) = rows.next()? {
@@ -1569,4 +1745,131 @@ fn map_evidence_error(error: EvidenceError) -> CatalogError {
         EvidenceError::Cancelled => CatalogError::AnalyticalEvidenceCancelled,
         _ => CatalogError::AnalyticalEvidenceInvalid,
     }
+}
+
+fn read_provider_capture_original_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "provider_capture_originals";
+    let mut statement=connection.prepare("SELECT session_digest,ordinal,rights_id,retained_at_ns FROM provider_capture_originals ORDER BY session_digest,ordinal LIMIT ?1")?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let session = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let ordinal = row.get::<_, u16>(1)?;
+        let original = super::provider_capture::original::load(
+            connection,
+            market_squawk_domain::EvidenceDigest::new(
+                market_squawk_domain::DigestAlgorithm::Sha256,
+                session.bytes(),
+            ),
+            ordinal,
+        )?
+        .ok_or(CatalogError::CorruptCatalog)?;
+        let rights = parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?;
+        let retained = row.get::<_, i64>(3)?;
+        if retained < original.decoded_at().unix_nanos() {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(session);
+        digest.integer(i64::from(ordinal));
+        digest.digest(Sha256Digest::new(original.digest().bytes()));
+        digest.digest(rights);
+        digest.integer(retained);
+        digest.optional_bytes(
+            original
+                .published_binding()
+                .map(|v| v.bytes())
+                .as_ref()
+                .map(|v| v.as_slice()),
+        )?;
+        result.push(provider_relation_row(
+            RELATION,
+            digest_primary_key(Sha256Digest::new(original.digest().bytes())),
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn read_native_reference_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "market_data_native_reference_captures";
+    let mut statement = connection.prepare(
+        "SELECT identity_digest, origin_revision_digest, coordinate_json, raw_claim_digest,
+                physical_receipt_digest, custody_digest, retained_at_ns
+         FROM market_data_native_reference_captures ORDER BY identity_digest LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let identity = parse_sha256(1, row.get::<_, Vec<u8>>(0)?)?;
+        let origin = parse_sha256(1, row.get::<_, Vec<u8>>(1)?)?;
+        let coordinate: String = row.get(2)?;
+        let claim = parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?;
+        let physical = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let custody = parse_sha256(1, row.get::<_, Vec<u8>>(5)?)?;
+        let retained_at: i64 = row.get(6)?;
+        if !(2..=32_768).contains(&coordinate.len()) || retained_at <= 0 {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.digest(identity);
+        digest.digest(origin);
+        digest.text(&coordinate)?;
+        digest.digest(claim);
+        digest.digest(physical);
+        digest.digest(custody);
+        digest.integer(retained_at);
+        result.push(provider_relation_row(RELATION, digest_primary_key(identity), digest.finish(), 0));
+    }
+    Ok(())
+}
+
+fn read_provider_logical_partition_artifacts(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const RELATION: &str = "ingest_run_provider_logical_partition_artifacts";
+    let mut statement = connection.prepare(
+        "SELECT run_id, partition_ordinal, logical_binding_digest, output_artifact_ordinal, object_input_ordinal
+         FROM ingest_run_provider_logical_partition_artifacts
+         ORDER BY run_id, partition_ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let run = parse_uuid(row.get::<_, String>(0)?)?;
+        let ordinal: i64 = row.get(1)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?;
+        let output: i64 = row.get(3)?;
+        let local: i64 = row.get(4)?;
+        if !(0..=1023).contains(&ordinal)
+            || !(0..=1023).contains(&output)
+            || !(0..=1023).contains(&local)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(RELATION)?;
+        digest.bytes(run.as_bytes())?;
+        digest.integer(ordinal);
+        digest.digest(binding);
+        digest.integer(output);
+        digest.integer(local);
+        result.push(provider_relation_row(
+            RELATION,
+            run_ordinal_primary_key(run, ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
 }

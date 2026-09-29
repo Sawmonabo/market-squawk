@@ -411,7 +411,7 @@ impl DecisionApplication {
                 DecisionWorkspaceReadError::Unavailable
             }
         })?;
-        if state.poisoned {
+        if state.poisoned || state.source_replay_deferred {
             return Err(DecisionWorkspaceReadError::Unavailable);
         }
         ensure_live(deadline, cancellation)?;
@@ -847,7 +847,13 @@ fn selection_digest(
             hash.update(record.score().get().to_bits().to_be_bytes());
             hash.update(record.selected_at().unix_nanos().to_be_bytes());
             hash.update(assessment.coverage().get().to_bits().to_be_bytes());
-            hash.update(assessment.liquidity().get().to_bits().to_be_bytes());
+            match assessment.liquidity() {
+                Some(value) => {
+                    hash.update([1]);
+                    hash.update(value.get().to_bits().to_be_bytes());
+                }
+                None => hash.update([0]),
+            }
             hash.update([data_quality_tag(assessment.data_quality())]);
             hash_decision_content(&mut hash, assessment.evidence_identity());
             hash_count(&mut hash, selected.dossiers.len())?;

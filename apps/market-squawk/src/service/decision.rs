@@ -2,8 +2,12 @@
 
 mod dossier_preparation;
 mod investment_analysis;
+pub(super) mod investment_generation;
+mod investment_projection;
 mod screen_workflow;
 mod target_preparation;
+
+pub(super) use investment_analysis::expected_return_value as find_expected_return_value;
 
 use std::{
     num::{NonZeroU32, NonZeroUsize},
@@ -43,11 +47,13 @@ use crate::portfolio_application::PortfolioFairValueReadCapability;
 use self::{
     dossier_preparation::DossierPreparationOperations,
     investment_analysis::InvestmentAnalysisOperations, screen_workflow::ScreenWorkflowOperations,
+    investment_generation::InvestmentGenerationOperations,
     target_preparation::TargetPreparationOperations,
 };
 
 const SAVE_SCREEN: &str = "Decision.SaveScreen";
 pub(super) const RUN_SCREEN: &str = screen_workflow::RUN_SCREEN;
+pub(super) use investment_generation::GENERATE_INVESTMENT_ANALYSIS;
 const LIST_SCREENS: &str = "Decision.ListScreens";
 const GET_SCREEN: &str = "Decision.GetScreen";
 const GET_CANDIDATES: &str = "Decision.GetCandidates";
@@ -66,6 +72,7 @@ pub(super) struct InstalledDecisionOperations {
     features: ProductionFeatureRegistry,
     dossier_preparation: DossierPreparationOperations,
     investment_analysis: InvestmentAnalysisOperations,
+    investment_generation: InvestmentGenerationOperations,
     screen_workflow: ScreenWorkflowOperations,
     target_preparation: TargetPreparationOperations,
 }
@@ -80,6 +87,9 @@ impl InstalledDecisionOperations {
         portfolio: PortfolioFairValueReadCapability,
         account_catalog: crate::portfolio_application::PortfolioAccountCatalogReadCapability,
         runtime: market_squawk_runtime::RuntimeIdentity,
+        calendars: crate::application::market_calendar::CompletedMarketSessionReadCapability,
+        research: Arc<crate::ResearchService>,
+        investment_generation: InvestmentGenerationOperations,
     ) -> Result<Self, ServiceError> {
         let features =
             ProductionFeatureRegistry::try_new().map_err(|_error| ServiceError::Unavailable)?;
@@ -94,10 +104,13 @@ impl InstalledDecisionOperations {
                 Arc::clone(&decisions),
                 market_data_instruments,
                 account_catalog,
+                investment_generation.chart_reader(),
             ),
             screen_workflow: ScreenWorkflowOperations::new(
                 Arc::clone(&decisions),
                 analytical_reader,
+                calendars,
+                research,
             ),
             target_preparation: TargetPreparationOperations::new(
                 Arc::clone(&decisions),
@@ -106,6 +119,7 @@ impl InstalledDecisionOperations {
             ),
             decisions,
             features,
+            investment_generation,
         })
     }
 
@@ -116,6 +130,7 @@ impl InstalledDecisionOperations {
             || matches!(
                 operation,
                 SAVE_SCREEN
+                    | GENERATE_INVESTMENT_ANALYSIS
                     | RUN_SCREEN
                     | LIST_SCREENS
                     | GET_SCREEN
@@ -145,6 +160,20 @@ impl InstalledDecisionOperations {
             .await
     }
 
+    pub(super) async fn generate_investment_analysis(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        jobs: &super::jobs::InstalledJobOperations,
+        runner: &crate::jobs::ForecastJobRunner,
+        portfolios: &super::portfolio_analysis::InstalledPortfolioAnalysis,
+        preparation: &super::forecast_preparation::InstalledForecastPreparation,
+    ) -> Result<TypedToolResult, ServiceError> {
+        self.investment_generation
+            .call(request, context, jobs, runner, portfolios, preparation)
+            .await
+    }
+
     pub(super) async fn call(
         &self,
         request: &TypedToolRequest,
@@ -155,7 +184,7 @@ impl InstalledDecisionOperations {
             return self.dossier_preparation.call(request, context).await;
         }
         if InvestmentAnalysisOperations::owns(request.name()) {
-            return self.investment_analysis.call(request, context);
+            return self.investment_analysis.call(request, context).await;
         }
         if TargetPreparationOperations::owns(request.name()) {
             return self.target_preparation.call(request, context);
@@ -739,7 +768,7 @@ fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {
     }
 }
 
-fn map_application(error: DecisionApplicationError) -> ServiceError {
+pub(super) fn map_application(error: DecisionApplicationError) -> ServiceError {
     match error {
         DecisionApplicationError::Repository(DecisionRepositoryError::NotFound) => {
             ServiceError::NotFound
@@ -834,7 +863,7 @@ fn candidate_value(candidate: &CandidateAssessment) -> Value {
             "contribution": contribution.contribution().get(),
         })).collect::<Vec<_>>(),
         "coverage": candidate.coverage().get(),
-        "liquidity": candidate.liquidity().get(),
+        "liquidity": candidate.liquidity().map(|value| value.get()),
         "dataQuality": candidate.data_quality(),
         "portfolioRevision": candidate.portfolio_impact().map(PortfolioRevisionToken::bytes),
         "flags": candidate.flags().iter().copied().map(candidate_flag_name).collect::<Vec<_>>(),

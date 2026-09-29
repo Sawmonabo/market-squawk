@@ -18,7 +18,11 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
-use crate::application::{ProductionResearchIngestCoordinator, ResearchIngestCompositionError};
+use crate::application::{
+    AccountGroupStopReceipt, AccountMarketSurface, MarketRuntimeGroupGeneration,
+    PreparedMarketProviderConfigurationRequest, ProductionResearchIngestCoordinator,
+    ResearchIngestCompositionError,
+};
 use crate::provider_activation::ProviderMarketAccount;
 use crate::provider_onboarding::{
     ProviderOnboardingError, ProviderOnboardingService, ProviderRuntimeStartupAdmissions,
@@ -39,7 +43,7 @@ const MAXIMUM_PROVIDER_METADATA_BACKUP_BYTES: usize = 160 * 1024 * 1024;
 const MAXIMUM_BACKUP_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024;
 const RESTORED_REQUIREMENT_SCHEMA_VERSION: u16 = 1;
 
-pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 11] = [
+pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 13] = [
     SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -51,8 +55,10 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 11] = [
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
     "eia.api-v2",
+    "census.data-api",
+    "bea.api-data",
 ];
-pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 12] = [
+pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 14] = [
     SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -65,6 +71,8 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 12] = [
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
     "eia.api-v2",
+    "census.data-api",
+    "bea.api-data",
 ];
 
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
@@ -77,7 +85,7 @@ const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
 ];
 
 // The current backup records every lifecycle surface in this exact order.
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 18] = [
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 20] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
@@ -96,6 +104,8 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 18] = [
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
     "eia.api-v2",
+    "census.data-api",
+    "bea.api-data",
 ];
 
 /// Least-authority owner seam for the protected provider-metadata component.
@@ -331,6 +341,155 @@ pub(super) enum DurableSourceLifecyclePhase {
     ReconciliationRequired,
 }
 
+/// Inert coordinates copied from an actual registry allocation, never a runtime authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountAllocationCoordinates {
+    session_id: Uuid,
+    configuration_sha256: String,
+    verification_sha256: String,
+    credential_generation: u64,
+    physical_generation_sha256: String,
+}
+
+impl AccountAllocationCoordinates {
+    pub(super) fn from_observed(
+        request: PreparedMarketProviderConfigurationRequest,
+        generation: MarketRuntimeGroupGeneration,
+    ) -> Self {
+        Self {
+            session_id: request.onboarding_session_id(),
+            configuration_sha256: lower_hex(
+                &request.expected_public_configuration_digest().bytes(),
+            ),
+            verification_sha256: lower_hex(
+                &request
+                    .expected_runtime_verification_receipt_digest()
+                    .bytes(),
+            ),
+            credential_generation: request.expected_credential_generation().get(),
+            physical_generation_sha256: lower_hex(&generation.digest().bytes()),
+        }
+    }
+
+    pub(super) fn matches(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        generation: MarketRuntimeGroupGeneration,
+    ) -> bool {
+        self == &Self::from_observed(request, generation)
+    }
+
+    pub(super) fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub(super) fn validate(&self) -> Result<(), DurableProviderActivationStateError> {
+        if self.session_id.is_nil() || self.credential_generation == 0 {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        for text in [
+            &self.configuration_sha256,
+            &self.verification_sha256,
+            &self.physical_generation_sha256,
+        ] {
+            if digest_from_lower_hex(text)?.bytes() == [0; 32] {
+                return Err(DurableProviderActivationStateError::InvalidLifecycle);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AccountLifecycleAction {
+    Start,
+    Stop,
+    Retry,
+    Resynchronize,
+    Reconfigure,
+    Remove,
+    OAuthProcessShutdown,
+    OAuthUnlink,
+    OAuthCredentialReplacement,
+    Verify,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AccountStopDisposition {
+    AwaitingRuntime,
+    GracefullyDrained,
+    RecoveredAfterProcessExit,
+    NoPredecessor,
+}
+
+/// Original action and target survive interrupted cleanup and successor construction.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PendingAccountLifecycle {
+    pub(super) action: AccountLifecycleAction,
+    pub(super) predecessor: Option<AccountAllocationCoordinates>,
+    pub(super) disposition: AccountStopDisposition,
+    pub(super) target_session_id: Option<Uuid>,
+    pub(super) target_configuration_sha256: Option<String>,
+    pub(super) successor: Option<AccountAllocationCoordinates>,
+    pub(super) retired_successor: Option<AccountAllocationCoordinates>,
+    pub(super) successor_retirement: Option<AccountStopDisposition>,
+    pub(super) finished: bool,
+    pub(super) oauth_restore_active: bool,
+}
+
+impl PendingAccountLifecycle {
+    pub(super) fn target_configuration(
+        &self,
+    ) -> Result<Option<EvidenceDigest>, DurableProviderActivationStateError> {
+        self.target_configuration_sha256
+            .as_deref()
+            .map(digest_from_lower_hex)
+            .transpose()
+    }
+
+    fn validate(&self) -> Result<(), DurableProviderActivationStateError> {
+        if let Some(predecessor) = &self.predecessor {
+            predecessor.validate()?;
+        }
+        if let Some(successor) = &self.successor {
+            successor.validate()?;
+        }
+        if let Some(retired) = &self.retired_successor {
+            retired.validate()?;
+        }
+        if self.retired_successor.is_some() != self.successor_retirement.is_some()
+            || self.successor_retirement.is_some_and(|disposition| {
+                !matches!(
+                    disposition,
+                    AccountStopDisposition::GracefullyDrained
+                        | AccountStopDisposition::RecoveredAfterProcessExit
+                )
+            })
+        {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        if self.predecessor.is_none() != (self.disposition == AccountStopDisposition::NoPredecessor)
+            || self.target_session_id.is_some() != self.target_configuration_sha256.is_some()
+            || self
+                .target_session_id
+                .is_some_and(|session| session.is_nil())
+            || self
+                .target_configuration()?
+                .is_some_and(|digest| digest.bytes() == [0; 32])
+            || self.finished && self.disposition == AccountStopDisposition::AwaitingRuntime
+            || self.oauth_restore_active
+                && self.action != AccountLifecycleAction::OAuthProcessShutdown
+        {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        Ok(())
+    }
+}
+
 /// Validated durable lifecycle record used for compare-and-apply.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DurableSourceLifecycleRecord {
@@ -343,9 +502,17 @@ pub(super) struct DurableSourceLifecycleRecord {
     public_configuration_digest: Option<EvidenceDigest>,
     runtime_verification_receipt_digest: Option<EvidenceDigest>,
     credential_generation: Option<SecretGeneration>,
+    account: Option<PendingAccountLifecycle>,
 }
 
 impl DurableSourceLifecycleRecord {
+    pub(super) fn account(&self) -> Option<&PendingAccountLifecycle> {
+        self.account.as_ref()
+    }
+    pub(super) fn command_digest(&self) -> Option<EvidenceDigest> {
+        self.command_digest
+    }
+
     pub(super) const fn revision(&self) -> NonZeroU64 {
         self.revision
     }
@@ -414,6 +581,7 @@ struct SourceLifecycleWire {
     public_configuration_sha256: Option<String>,
     runtime_verification_receipt_sha256: Option<String>,
     credential_generation: Option<u64>,
+    account: Option<PendingAccountLifecycle>,
 }
 
 /// Secret-free evidence for one disabled activation recipe.
@@ -464,7 +632,16 @@ impl DurableProviderActivationState {
         &self,
     ) -> Result<ProviderRuntimeStartupAdmissions, ProviderOnboardingError> {
         let mut entries = Vec::new();
+        let mut unavailable_surfaces = Vec::new();
         for surface_id in RESTORABLE_RESEARCH_SURFACES {
+            if self.stored_lifecycle_unavailable(surface_id) {
+                tracing::warn!(
+                    surface_id,
+                    "source lifecycle state is unavailable; retaining its credential authority without starting the source"
+                );
+                unavailable_surfaces.push(SourceIdentifier::try_from(surface_id)?);
+                continue;
+            }
             let recovered = match self.load_recipe_for_startup_admission(surface_id) {
                 Ok(DurableActivationRecipeState::Desired(recipe)) => {
                     vec![recipe.session_id]
@@ -493,9 +670,14 @@ impl DurableProviderActivationState {
             );
         }
         for surface_id in SESSION_BACKED_LIVE_SURFACES {
-            let record = self
-                .source_lifecycle_record(surface_id)
-                .map_err(|_error| ProviderOnboardingError::InvalidSessionState)?;
+            let record = match self.source_lifecycle_record(surface_id) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(surface_id, %error, "source lifecycle state is unavailable; retaining its credential authority without starting the source");
+                    unavailable_surfaces.push(SourceIdentifier::try_from(surface_id)?);
+                    continue;
+                }
+            };
             let retained_session = match record.phase() {
                 DurableSourceLifecyclePhase::Active
                 | DurableSourceLifecyclePhase::Stopped
@@ -506,8 +688,25 @@ impl DurableProviderActivationState {
             if let Some(session_id) = retained_session {
                 entries.push((SourceIdentifier::try_from(surface_id)?, session_id));
             }
+            if let Some(pending) = record.account().filter(|pending| !pending.finished) {
+                for session_id in pending.target_session_id.into_iter().chain(
+                    pending
+                        .predecessor
+                        .as_ref()
+                        .map(AccountAllocationCoordinates::session_id),
+                ) {
+                    let provider = SourceIdentifier::try_from(surface_id)?;
+                    if !entries
+                        .iter()
+                        .any(|entry| entry == &(provider.clone(), session_id))
+                    {
+                        entries.push((provider, session_id));
+                    }
+                }
+            }
         }
-        ProviderRuntimeStartupAdmissions::try_new(entries)
+        Ok(ProviderRuntimeStartupAdmissions::try_new(entries)?
+            .with_unavailable_surfaces(unavailable_surfaces))
     }
 
     /// Serializes every activation that can mutate the shared runtime or evidence index.
@@ -523,6 +722,259 @@ impl DurableProviderActivationState {
 
     async fn acquire_provider_metadata_backup(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.activation_gate).lock_owned().await
+    }
+
+    /// OAuth callbacks may already hold the OAuth session lock. Never wait in that lock order.
+    pub(super) fn try_acquire_source_lifecycle(
+        &self,
+    ) -> Result<OwnedMutexGuard<()>, DurableProviderActivationStateError> {
+        Arc::clone(&self.activation_gate)
+            .try_lock_owned()
+            .map_err(|_| DurableProviderActivationStateError::LifecycleReconciliationRequired)
+    }
+
+    /// Claims the original account intent before consuming its actual runtime preparation.
+    pub(super) fn begin_account_lifecycle(
+        &self,
+        surface: &str,
+        expected: &DurableSourceLifecycleRecord,
+        operation_id: SourceIdentifier,
+        command_digest: EvidenceDigest,
+        pending: PendingAccountLifecycle,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        pending.validate()?;
+        if AccountMarketSurface::parse(surface).is_none()
+            || command_digest.bytes() == [0; 32]
+            || self.source_lifecycle_record(surface)? != *expected
+            || expected
+                .account
+                .as_ref()
+                .is_some_and(|pending| !pending.finished)
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let revision = expected
+            .revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(DurableProviderActivationStateError::ResourceExhausted)?;
+        let transition_digest =
+            source_lifecycle_transition_digest(surface, revision, &operation_id, command_digest)?;
+        let record = DurableSourceLifecycleRecord {
+            revision,
+            phase: DurableSourceLifecyclePhase::Applying,
+            operation_id: Some(operation_id),
+            command_digest: Some(command_digest),
+            transition_digest: Some(transition_digest),
+            account: Some(pending),
+            ..expected.clone()
+        };
+        self.store_source_lifecycle(surface, &record)?;
+        Ok(record)
+    }
+
+    pub(super) fn attach_account_lifecycle(
+        &self,
+        surface: &str,
+        expected: &DurableSourceLifecycleRecord,
+        pending: PendingAccountLifecycle,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        pending.validate()?;
+        if self.source_lifecycle_record(surface)? != *expected
+            || expected.phase != DurableSourceLifecyclePhase::Applying
+            || expected.account.is_some()
+            || expected.transition_digest.is_none()
+            || pending.action != AccountLifecycleAction::Verify
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let mut record = expected.clone();
+        record.account = Some(pending);
+        self.store_source_lifecycle(surface, &record)?;
+        Ok(record)
+    }
+
+    /// Bounded synchronous exact-record CAS. Caller holds the existing lifecycle serial gate.
+    pub(super) fn update_account_lifecycle(
+        &self,
+        surface: &str,
+        expected: &DurableSourceLifecycleRecord,
+        pending: PendingAccountLifecycle,
+        phase: DurableSourceLifecyclePhase,
+        successor: Option<PreparedMarketProviderConfigurationRequest>,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        pending.validate()?;
+        if pending.finished
+            != matches!(
+                phase,
+                DurableSourceLifecyclePhase::Active
+                    | DurableSourceLifecyclePhase::Stopped
+                    | DurableSourceLifecyclePhase::Removed
+            )
+        {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        let original = expected
+            .account
+            .as_ref()
+            .ok_or(DurableProviderActivationStateError::InvalidLifecycle)?;
+        if self.source_lifecycle_record(surface)? != *expected
+            || pending.action != original.action
+            || pending.predecessor != original.predecessor
+            || pending.target_session_id != original.target_session_id
+            || pending.target_configuration_sha256 != original.target_configuration_sha256
+            || pending.oauth_restore_active != original.oauth_restore_active
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let mut record = expected.clone();
+        record.phase = phase;
+        record.account = Some(pending);
+        if let Some(request) = successor {
+            if request.surface().surface_id() != surface
+                || record
+                    .account
+                    .as_ref()
+                    .and_then(|pending| pending.target_session_id)
+                    != Some(request.onboarding_session_id())
+                || record
+                    .account
+                    .as_ref()
+                    .ok_or(DurableProviderActivationStateError::InvalidLifecycle)?
+                    .target_configuration()?
+                    != Some(request.expected_public_configuration_digest())
+            {
+                return Err(DurableProviderActivationStateError::InvalidLifecycle);
+            }
+            record.session_id = Some(request.onboarding_session_id());
+            record.public_configuration_digest =
+                Some(request.expected_public_configuration_digest());
+            record.runtime_verification_receipt_digest =
+                Some(request.expected_runtime_verification_receipt_digest());
+            record.credential_generation = Some(request.expected_credential_generation());
+        }
+        if phase == DurableSourceLifecyclePhase::Removed {
+            record.session_id = None;
+            record.public_configuration_digest = None;
+            record.runtime_verification_receipt_digest = None;
+            record.credential_generation = None;
+        }
+        self.store_source_lifecycle(surface, &record)?;
+        Ok(record)
+    }
+
+    /// Only a runtime-minted completed owner can establish same-process predecessor retirement.
+    pub(super) fn acknowledge_account_predecessor(
+        &self,
+        surface: &str,
+        expected: &DurableSourceLifecycleRecord,
+        receipt: &AccountGroupStopReceipt,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        let mut pending = expected
+            .account
+            .clone()
+            .ok_or(DurableProviderActivationStateError::InvalidLifecycle)?;
+        if receipt.request().surface().surface_id() != surface
+            || !pending
+                .predecessor
+                .as_ref()
+                .is_some_and(|original| original.matches(receipt.request(), receipt.generation()))
+            || !matches!(
+                pending.disposition,
+                AccountStopDisposition::AwaitingRuntime | AccountStopDisposition::GracefullyDrained
+            )
+        {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        pending.disposition = AccountStopDisposition::GracefullyDrained;
+        let phase = match pending.action {
+            AccountLifecycleAction::Stop => {
+                pending.finished = true;
+                DurableSourceLifecyclePhase::Stopped
+            }
+            AccountLifecycleAction::Remove => {
+                pending.finished = true;
+                DurableSourceLifecyclePhase::Removed
+            }
+            AccountLifecycleAction::OAuthProcessShutdown
+            | AccountLifecycleAction::OAuthUnlink
+            | AccountLifecycleAction::OAuthCredentialReplacement => {
+                pending.finished = true;
+                if pending.oauth_restore_active {
+                    DurableSourceLifecyclePhase::Active
+                } else {
+                    DurableSourceLifecyclePhase::Stopped
+                }
+            }
+            _ => expected.phase,
+        };
+        self.update_account_lifecycle(surface, expected, pending, phase, None)
+    }
+
+    /// Installed replacement has already reconciled the source registry under this same guard.
+    /// This records process exit, never a graceful child/history receipt.
+    pub(super) fn recover_account_lifecycle_after_process_exit(
+        &self,
+        selected: &market_squawk_platform::InstalledServiceSelectedWorkspaceGuard,
+    ) -> Result<(), DurableProviderActivationStateError> {
+        let root = selected
+            .workspace_paths()
+            .control_root()
+            .map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)?;
+        if self.root != root.root().join(ACTIVATION_STATE_DIRECTORY) {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        for surface in SESSION_BACKED_LIVE_SURFACES {
+            if AccountMarketSurface::parse(surface).is_none() {
+                continue;
+            }
+            let current = match self.source_lifecycle_record(surface) {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(surface, %error, "account source lifecycle state is unavailable; source remains disabled");
+                    continue;
+                }
+            };
+            let Some(mut pending) = current.account.clone().filter(|pending| !pending.finished)
+            else {
+                continue;
+            };
+            if pending.disposition == AccountStopDisposition::AwaitingRuntime {
+                pending.disposition = AccountStopDisposition::RecoveredAfterProcessExit;
+            }
+            // A recorded successor was process-owned too. Its target remains original and must
+            // obtain fresh onboarding/runtime authority; no physical generation is reconstructed.
+            if let Some(successor) = pending.successor.take() {
+                pending.retired_successor = Some(successor);
+                pending.successor_retirement =
+                    Some(AccountStopDisposition::RecoveredAfterProcessExit);
+            }
+            self.update_account_lifecycle(
+                surface,
+                &current,
+                pending,
+                DurableSourceLifecyclePhase::ReconciliationRequired,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn reject_unclean_account_lifecycle(
+        &self,
+    ) -> Result<(), DurableProviderActivationStateError> {
+        for surface in SESSION_BACKED_LIVE_SURFACES {
+            if self
+                .source_lifecycle_record(surface)?
+                .account
+                .as_ref()
+                .is_some_and(|pending| !pending.finished)
+            {
+                return Err(DurableProviderActivationStateError::LifecycleReconciliationRequired);
+            }
+        }
+        Ok(())
     }
 
     /// Reports control support from the same closed set admitted by the lifecycle owner.
@@ -585,9 +1037,16 @@ impl DurableProviderActivationState {
                 public_configuration_digest: None,
                 runtime_verification_receipt_digest: None,
                 credential_generation: None,
+                account: None,
             });
         };
         Ok(record)
+    }
+
+    /// An unreadable retained lifecycle must not authorize startup or credential cleanup.
+    /// Mutation paths still read the original state and fail closed.
+    pub(super) fn stored_lifecycle_unavailable(&self, surface_id: &str) -> bool {
+        self.stored_source_lifecycle_record(surface_id).is_err()
     }
 
     fn stored_source_lifecycle_record(
@@ -616,6 +1075,13 @@ impl DurableProviderActivationState {
             return Err(DurableProviderActivationStateError::InvalidLifecycle);
         }
         let current = self.source_lifecycle_record(surface_id)?;
+        if current
+            .account
+            .as_ref()
+            .is_some_and(|pending| !pending.finished)
+        {
+            return Err(DurableProviderActivationStateError::LifecycleReconciliationRequired);
+        }
         if current.operation_id.as_ref() == Some(&operation_id)
             && current.command_digest == Some(command_digest)
         {
@@ -663,6 +1129,7 @@ impl DurableProviderActivationState {
                 .or(current.public_configuration_digest),
             runtime_verification_receipt_digest: current.runtime_verification_receipt_digest,
             credential_generation: current.credential_generation,
+            account: None,
         };
         self.store_source_lifecycle(surface_id, &applying)?;
         Ok(DurableSourceLifecycleTransition::Apply(applying))
@@ -692,7 +1159,15 @@ impl DurableProviderActivationState {
         {
             return Err(DurableProviderActivationStateError::StaleState);
         }
+        let mut account = current.account.clone();
+        if let Some(pending) = &mut account {
+            if pending.disposition == AccountStopDisposition::AwaitingRuntime {
+                return Err(DurableProviderActivationStateError::LifecycleReconciliationRequired);
+            }
+            pending.finished = true;
+        }
         let completed = DurableSourceLifecycleRecord {
+            account,
             phase,
             session_id,
             public_configuration_digest,
@@ -1640,6 +2115,7 @@ fn encode_source_lifecycle(
             .runtime_verification_receipt_digest
             .map(|value| lower_hex(&value.bytes())),
         credential_generation: record.credential_generation.map(SecretGeneration::get),
+        account: record.account.clone(),
     };
     serde_json::to_vec(&wire).map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)
 }
@@ -1652,6 +2128,21 @@ fn decode_source_lifecycle(
         .map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)?;
     if wire.schema_version != SOURCE_LIFECYCLE_SCHEMA_VERSION || wire.surface_id != surface_id {
         return Err(DurableProviderActivationStateError::InvalidLifecycle);
+    }
+    if let Some(account) = &wire.account {
+        account.validate()?;
+        if AccountMarketSurface::parse(surface_id).is_none()
+            || wire.transition_sha256.is_none()
+            || account.finished
+                != matches!(
+                    wire.phase,
+                    DurableSourceLifecyclePhase::Active
+                        | DurableSourceLifecyclePhase::Stopped
+                        | DurableSourceLifecyclePhase::Removed
+                )
+        {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
     }
     let revision = NonZeroU64::new(wire.revision)
         .ok_or(DurableProviderActivationStateError::InvalidLifecycle)?;
@@ -1712,6 +2203,7 @@ fn decode_source_lifecycle(
         public_configuration_digest,
         runtime_verification_receipt_digest,
         credential_generation,
+        account: wire.account,
     })
 }
 
@@ -1865,6 +2357,8 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
         "yahoo-finance.experimental-enrichment" => Ok("yahoo-enrichment"),
         "tiingo.starter-eod-nav" => Ok("tiingo-starter-eod-nav"),
         "eia.api-v2" => Ok("eia-api-v2"),
+        "census.data-api" => Ok("census-data-api"),
+        "bea.api-data" => Ok("bea-api-data"),
         _ => Err(DurableProviderActivationStateError::UnknownSurface),
     }
 }
@@ -2680,7 +3174,7 @@ mod tests {
             None,
         )?;
 
-        let recovered = crate::LocalProduct::try_new(config).await?;
+        let recovered = crate::LocalProduct::try_new(config.clone()).await?;
         assert!(matches!(
             state.load_recipe_for_startup_recovery(credential_surface)?,
             DurableActivationRecipeState::Missing
@@ -2710,6 +3204,70 @@ mod tests {
         ));
         assert!(
             recovered
+                .application
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        drop(recovered);
+
+        // One unreadable saved lifecycle must isolate only its source at the next startup.
+        LocalAuthorityStateStore::try_open(
+            state.lifecycle_root(lifecycle_surface_key(credential_surface)?),
+        )?
+        .store(br#"{"schema_version":0}"#)?;
+        let isolated = crate::LocalProduct::try_new(config).await?;
+        let lifecycle = isolated.source_lifecycle_authority();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let source = SourceIdentifier::try_from(credential_surface)?;
+        let affected = lifecycle.status(&source, &cancellation, deadline).await?;
+        assert_eq!(
+            affected.fields().state,
+            crate::application::source::SourceLifecycleState::Blocked
+        );
+        assert_eq!(
+            affected.fields().blocker,
+            Some(crate::application::source::SourceLifecycleBlocker::Reconciliation)
+        );
+        let unaffected = lifecycle
+            .status(
+                &SourceIdentifier::try_from("local.files")?,
+                &cancellation,
+                deadline,
+            )
+            .await?;
+        assert_ne!(
+            unaffected.fields().state,
+            crate::application::source::SourceLifecycleState::Blocked
+        );
+        assert_eq!(
+            isolated
+                .provider_onboarding()
+                .retained_credential_coordinate(credential_session)?,
+            credential_before
+        );
+        let start = crate::application::source::SourceLifecycleCommand::try_new(
+            crate::application::source::SourceLifecycleCommandInput {
+                provider: source,
+                action: crate::application::source::SourceLifecycleAction::Start,
+                expected_state_revision: affected.fields().state_revision,
+                expected_generation: None,
+                expected_runtime_generation_digest: None,
+                onboarding_session_id: None,
+                public_configuration_digest: None,
+                reason: None,
+                cancellation,
+                deadline,
+            },
+        )?;
+        assert!(matches!(
+            lifecycle.execute(start).await,
+            Err(crate::application::source::SourceLifecycleError::InvalidResult)
+        ));
+        assert!(state.stored_lifecycle_unavailable(credential_surface));
+        assert!(
+            isolated
                 .application
                 .shutdown(Instant::now() + Duration::from_secs(5))
                 .await

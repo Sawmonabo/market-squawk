@@ -230,6 +230,7 @@ fn market_origin(
     rules: &ClassificationRuleset,
 ) -> Result<EvidenceOrigin, Box<dyn std::error::Error>> {
     Ok(EvidenceOrigin::Market {
+        publication: None,
         venue_id: VenueId::try_from("XNYS")?,
         assessment_id: SourceIdentifier::try_from("qualification-1")?,
         binding_digest: [5; 32],

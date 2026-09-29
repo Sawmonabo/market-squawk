@@ -69,7 +69,7 @@ pub struct CandidateInput {
     instrument_id: InstrumentId,
     observations: Box<[ScreenFeatureObservation]>,
     coverage: StatisticalF64,
-    liquidity: StatisticalF64,
+    liquidity: Option<StatisticalF64>,
     data_quality: DataQuality,
     portfolio_impact: Option<PortfolioRevisionToken>,
     flags: Box<[CandidateFlag]>,
@@ -87,7 +87,7 @@ impl CandidateInput {
         instrument_id: InstrumentId,
         mut observations: Vec<ScreenFeatureObservation>,
         coverage: StatisticalF64,
-        liquidity: StatisticalF64,
+        liquidity: Option<StatisticalF64>,
         data_quality: DataQuality,
         portfolio_impact: Option<PortfolioRevisionToken>,
         mut flags: Vec<CandidateFlag>,
@@ -110,7 +110,7 @@ impl CandidateInput {
         if observations.is_empty()
             || observations.len() > MAX_SCREEN_FEATURE_BINDINGS
             || !(0.0..=1.0).contains(&coverage.get())
-            || liquidity.get() < 0.0
+            || liquidity.is_some_and(|value| value.get() < 0.0)
             || flags.len() > MAX_CANDIDATE_FLAGS
             || flags
                 .iter()
@@ -163,9 +163,9 @@ impl CandidateInput {
         self.coverage
     }
 
-    /// Finite upstream liquidity statistic in the saved screen's declared unit.
+    /// Finite upstream liquidity statistic, or explicit unavailability.
     #[must_use]
-    pub const fn liquidity(&self) -> StatisticalF64 {
+    pub const fn liquidity(&self) -> Option<StatisticalF64> {
         self.liquidity
     }
 
@@ -237,7 +237,7 @@ pub struct CandidateAssessment {
     record: CandidateRecord,
     score_contributions: Box<[CandidateScoreContribution]>,
     coverage: StatisticalF64,
-    liquidity: StatisticalF64,
+    liquidity: Option<StatisticalF64>,
     data_quality: DataQuality,
     portfolio_impact: Option<PortfolioRevisionToken>,
     flags: Box<[CandidateFlag]>,
@@ -263,9 +263,9 @@ impl CandidateAssessment {
         self.coverage
     }
 
-    /// Admitted liquidity statistic.
+    /// Admitted liquidity statistic, or explicit unavailability.
     #[must_use]
-    pub const fn liquidity(&self) -> StatisticalF64 {
+    pub const fn liquidity(&self) -> Option<StatisticalF64> {
         self.liquidity
     }
 
@@ -313,7 +313,7 @@ pub struct SelectedCandidateAnalysisEvidence {
     selected_at: Timestamp,
     score_contributions: Box<[CandidateScoreContribution]>,
     coverage: StatisticalF64,
-    liquidity: StatisticalF64,
+    liquidity: Option<StatisticalF64>,
     data_quality: DataQuality,
     portfolio_impact: Option<PortfolioRevisionToken>,
     flags: Box<[CandidateFlag]>,
@@ -481,9 +481,9 @@ impl SelectedCandidateAnalysisEvidence {
         self.coverage
     }
 
-    /// Returns the exact admitted screen-liquidity statistic.
+    /// Returns the exact admitted screen-liquidity statistic, when observed.
     #[must_use]
-    pub const fn liquidity(&self) -> StatisticalF64 {
+    pub const fn liquidity(&self) -> Option<StatisticalF64> {
         self.liquidity
     }
 
@@ -558,7 +558,13 @@ fn selected_candidate_evidence_digest(
         hash.update(canonical_statistical_bits(contribution.contribution).to_be_bytes());
     }
     hash.update(canonical_statistical_bits(value.coverage).to_be_bytes());
-    hash.update(canonical_statistical_bits(value.liquidity).to_be_bytes());
+    match value.liquidity {
+        Some(liquidity) => {
+            hash.update([1]);
+            hash.update(canonical_statistical_bits(liquidity).to_be_bytes());
+        }
+        None => hash.update([0]),
+    }
     hash.update([data_quality_tag(value.data_quality)]);
     match &value.portfolio_impact {
         Some(revision) => {
@@ -758,7 +764,10 @@ pub(crate) fn execute(
                 .zip(screen.feature_bindings())
                 .all(|(observation, binding)| observation.binding == *binding)
             || input.coverage.get() < screen.constraints().minimum_coverage().get()
-            || input.liquidity.get() < screen.constraints().minimum_liquidity().get()
+            || (screen.constraints().minimum_liquidity().get() > 0.0
+                && input.liquidity.is_none_or(|value| {
+                    value.get() < screen.constraints().minimum_liquidity().get()
+                }))
             || !screen
                 .constraints()
                 .admitted_data_qualities()

@@ -375,6 +375,9 @@ fn build_bundle(
         training_run_bytes,
         forecast_residuals_bytes: None,
         forecast_policy_bytes: None,
+        probability_outcomes_bytes: None,
+        probability_policy_bytes: None,
+        forecast_residual_distribution: None,
         retained_bytes,
     })
 }
@@ -438,6 +441,14 @@ fn training_dataset() -> Result<TrainingDatasetIdentity, ReleaseEvidenceInferenc
         Sha256Digest::new([27; 32]),
         Timestamp::from_unix_nanos(3),
         NonZeroU64::MIN,
+        market_squawk_data::ChronologicalSplitPolicy::try_new(
+            Timestamp::from_unix_nanos(1),
+            Timestamp::from_unix_nanos(2),
+            Timestamp::from_unix_nanos(3),
+        )
+        .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?,
+        None,
+        None,
     )
     .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)
 }

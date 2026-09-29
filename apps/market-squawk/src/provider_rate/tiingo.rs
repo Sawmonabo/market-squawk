@@ -1154,6 +1154,8 @@ const fn endpoint_id(endpoint: TiingoEndpointFamily) -> u8 {
         TiingoEndpointFamily::Metadata => 1,
         TiingoEndpointFamily::LatestDailyPrices => 2,
         TiingoEndpointFamily::HistoricalDailyPrices => 3,
+        TiingoEndpointFamily::CorporateActionDistributions => 4,
+        TiingoEndpointFamily::CorporateActionSplits => 5,
     }
 }
 
@@ -1162,6 +1164,8 @@ fn endpoint_from_id(value: u8) -> Result<TiingoEndpointFamily, TiingoProviderAut
         1 => Ok(TiingoEndpointFamily::Metadata),
         2 => Ok(TiingoEndpointFamily::LatestDailyPrices),
         3 => Ok(TiingoEndpointFamily::HistoricalDailyPrices),
+        4 => Ok(TiingoEndpointFamily::CorporateActionDistributions),
+        5 => Ok(TiingoEndpointFamily::CorporateActionSplits),
         _ => Err(TiingoProviderAuthorityError::Corrupt),
     }
 }

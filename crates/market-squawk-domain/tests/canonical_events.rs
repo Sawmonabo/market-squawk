@@ -193,6 +193,84 @@ fn delta_cannot_be_an_empty_marker_payload() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn canonical_book_payloads_reject_oversized_construction_and_json() -> Result<(), Box<dyn Error>> {
+    let quantity = QuantityLots::new(1)?;
+    let mut bids = Vec::with_capacity(BookSnapshotEvent::MAX_LEVELS_PER_SIDE);
+    for price in (1..=BookSnapshotEvent::MAX_LEVELS_PER_SIDE).rev() {
+        bids.push(BookLevel::new(
+            PriceTicks::new(i64::try_from(price)?),
+            quantity,
+        )?);
+    }
+    let snapshot = BookSnapshotEvent::new(
+        live_provenance(LiveEventClass::BookSnapshot)?,
+        MarketDepth::PriceLevel,
+        bids.clone(),
+        Vec::new(),
+        None,
+    )?;
+    assert_eq!(
+        serde_json::from_str::<BookSnapshotEvent>(&serde_json::to_string(&snapshot)?)?,
+        snapshot
+    );
+    let mut oversized_bids = bids;
+    oversized_bids.push(BookLevel::new(PriceTicks::new(0), quantity)?);
+    assert!(matches!(
+        BookSnapshotEvent::new(
+            live_provenance(LiveEventClass::BookSnapshot)?,
+            MarketDepth::PriceLevel,
+            oversized_bids,
+            Vec::new(),
+            None,
+        ),
+        Err(MarketEventError::BookSnapshotLevelLimitExceeded)
+    ));
+    let mut snapshot_wire = serde_json::to_value(&snapshot)?;
+    let bids_wire = snapshot_wire["bids"]
+        .as_array_mut()
+        .ok_or("snapshot bids must serialize as an array")?;
+    bids_wire.push(serde_json::to_value(BookLevel::new(
+        PriceTicks::new(0),
+        quantity,
+    )?)?);
+    assert!(
+        serde_json::from_str::<BookSnapshotEvent>(&serde_json::to_string(&snapshot_wire)?).is_err()
+    );
+
+    let change =
+        market_squawk_domain::BookChange::new(MarketSide::Bid, PriceTicks::new(100), quantity);
+    let changes = vec![change; BookDeltaEvent::MAX_CHANGES];
+    let delta = BookDeltaEvent::new(
+        live_provenance(LiveEventClass::BookDelta)?,
+        MarketDepth::PriceLevel,
+        changes.clone(),
+        None,
+    )?;
+    assert_eq!(
+        serde_json::from_str::<BookDeltaEvent>(&serde_json::to_string(&delta)?)?,
+        delta
+    );
+    let mut oversized_changes = changes;
+    oversized_changes.push(change);
+    assert!(matches!(
+        BookDeltaEvent::new(
+            live_provenance(LiveEventClass::BookDelta)?,
+            MarketDepth::PriceLevel,
+            oversized_changes,
+            None,
+        ),
+        Err(MarketEventError::BookDeltaChangeLimitExceeded)
+    ));
+    let mut delta_wire = serde_json::to_value(&delta)?;
+    let changes_wire = delta_wire["changes"]
+        .as_array_mut()
+        .ok_or("delta changes must serialize as an array")?;
+    changes_wire.push(serde_json::to_value(change)?);
+    assert!(serde_json::from_str::<BookDeltaEvent>(&serde_json::to_string(&delta_wire)?).is_err());
+    Ok(())
+}
+
+#[test]
 fn canonical_market_family_is_serializable() -> Result<(), Box<dyn Error>> {
     let event = MarketEvent::Trade(TradeEvent::new(
         live_provenance(LiveEventClass::Trade)?,

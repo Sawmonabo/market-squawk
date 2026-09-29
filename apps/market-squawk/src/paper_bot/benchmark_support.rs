@@ -74,7 +74,12 @@ impl ReleasePaperBotBenchmarkComposition {
                         as Box<dyn Strategy>))
                 },
             )?;
-        let mailbox_capacity = inner.runtime_config.mailbox_count_per_shard().get();
+        let mailbox_capacity = inner
+            .runtime_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("benchmark requires native live runtime"))?
+            .mailbox_count_per_shard()
+            .get();
         Ok(Self {
             inner,
             observer,

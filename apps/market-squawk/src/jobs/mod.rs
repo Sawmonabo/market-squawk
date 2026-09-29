@@ -16,6 +16,7 @@ pub use backup::{
     LifecycleJobCommand, LifecycleJobExecutionError, LifecycleJobPublication,
     LifecycleJobPublicationError, LifecycleJobRunnerError,
 };
+pub(crate) use forecast::ForecastJobResult;
 pub use forecast::{ForecastJobRunner, ForecastJobRunnerError};
 pub use recovery::{
     RecoveryJobAction, RecoveryJobAuthority, RecoveryJobCommand, RecoveryJobRunner,
@@ -26,6 +27,7 @@ pub use research::{
 };
 pub use scenario::ScenarioJobRunner;
 pub use screen::{ScreenJobCommand, ScreenJobRunner, ScreenJobRunnerError};
+pub(crate) use training::PreparedProductTraining;
 pub use training::{GovernedTrainingInput, TrainingJobRunner, TrainingJobRunnerError};
 pub use update::{UpdateJobAuthority, UpdateJobCommand, UpdateJobRunner};
 
@@ -133,12 +135,35 @@ impl InstalledJobRunners {
                 RUNNER_PENDING_CAPACITY,
                 RUNNER_DEADLINE,
             )
-            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+            .map_err(|_error| InstalledJobError::RunnerComposition)?
+            .with_recommendations(backtest::RecommendationBacktestRuntimeV1 {
+                inputs: product.backtest_inputs(), repository: product.backtest_repository(),
+            }),
         );
+        let forecast_preparation = product.model_runtime().map(|runtime| {
+            let descriptor = crate::application::internal_forecast_generation_descriptor()
+                .map_err(|_| InstalledJobError::RunnerComposition)?;
+            let evidence = Arc::new(crate::application::AnalyticalForecastEvidenceReader::new(
+                product.research().analytical_reader(),
+                Some(product.macro_context_read_capability()),
+                Some(crate::application::market_calendar::CompletedMarketSessionReadCapability::new(
+                    product.research(),
+                    product.market_runtime(),
+                )),
+            ));
+            crate::application::model::forecast_preparation::ForecastPreparationAuthority::try_new(
+                runtime,
+                evidence,
+                descriptor,
+                crate::application::model::forecast_preparation::ForecastPreparationLimits::standard()
+                    .map_err(|_| InstalledJobError::RunnerComposition)?,
+            ).map(Arc::new).map_err(|_| InstalledJobError::RunnerComposition)
+        }).transpose()?;
         let forecast = Arc::new(
             ForecastJobRunner::try_new(
                 product.model_domain(),
-                artifacts,
+                product.artifact_authority(),
+                forecast_preparation,
                 RUNNER_PENDING_CAPACITY,
                 RUNNER_DEADLINE,
             )

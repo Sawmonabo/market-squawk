@@ -4,7 +4,10 @@ use rust_decimal::Decimal;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{Currency, EffectiveInterval, EvidenceDigest, Money, ProviderInstrumentId, Timestamp};
+use crate::{
+    CalendarDate, Currency, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, Money,
+    PayloadReference, ProviderInstrumentId, ResearchTemporalCoordinate, Timestamp,
+};
 
 use super::{
     CorporateActionKind, FundamentalFactContext, PositionSide, QuantityLots, ResearchContext,
@@ -486,16 +489,16 @@ impl<'de> Deserialize<'de> for MarketBarSessionEvidence {
     }
 }
 
-/// Complete aggregation-period and session semantics for one completed market bar.
+/// A genuine timestamped aggregation period with retained provider anchor and session evidence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct BarTimeSemantics {
+pub struct TimestampedBarPeriod {
     period_start: Timestamp,
     period_end_exclusive: Timestamp,
     timestamp_basis: BarTimestampBasis,
     session: MarketBarSessionEvidence,
 }
 
-impl BarTimeSemantics {
+impl TimestampedBarPeriod {
     /// Constructs one nonempty aggregation period without altering the provider timestamp anchor.
     ///
     /// # Errors
@@ -549,19 +552,19 @@ impl BarTimeSemantics {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BarTimeSemanticsWire {
+struct TimestampedBarPeriodWire {
     period_start: Timestamp,
     period_end_exclusive: Timestamp,
     timestamp_basis: BarTimestampBasis,
     session: MarketBarSessionEvidence,
 }
 
-impl<'de> Deserialize<'de> for BarTimeSemantics {
+impl<'de> Deserialize<'de> for TimestampedBarPeriod {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let wire = BarTimeSemanticsWire::deserialize(deserializer)?;
+        let wire = TimestampedBarPeriodWire::deserialize(deserializer)?;
         Self::try_new(
             wire.period_start,
             wire.period_end_exclusive,
@@ -569,6 +572,186 @@ impl<'de> Deserialize<'de> for BarTimeSemantics {
             wire.session,
         )
         .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A provider-reported daily civil date with exact native payload evidence.
+///
+/// This carries no timestamp, aggregation period, or claim about a venue session. A separate
+/// retained calendar association may qualify a downstream analytical coordinate without changing
+/// this source value.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct NominalDailyDate {
+    date: CalendarDate,
+    ruleset: SourceIdentifier,
+    evidence: ExactPayloadEvidence,
+}
+
+impl NominalDailyDate {
+    /// Retains a civil date and the ruleset and native payload establishing its meaning.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an all-zero content digest.
+    pub fn try_new(
+        date: CalendarDate,
+        ruleset: SourceIdentifier,
+        evidence: ExactPayloadEvidence,
+    ) -> Result<Self, ResearchError> {
+        if evidence.content_digest().bytes() == [0; 32] {
+            return Err(ResearchError::InvalidNominalDailyDateEvidence);
+        }
+        Ok(Self {
+            date,
+            ruleset,
+            evidence,
+        })
+    }
+
+    /// Returns the original provider civil date without interpreting it as an instant.
+    pub const fn date(&self) -> CalendarDate {
+        self.date
+    }
+
+    /// Returns the exact ruleset for the provider's daily-date meaning.
+    pub const fn ruleset(&self) -> &SourceIdentifier {
+        &self.ruleset
+    }
+
+    /// Returns the native payload evidence establishing the date.
+    pub const fn evidence(&self) -> &ExactPayloadEvidence {
+        &self.evidence
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NominalDailyDateWire {
+    date: CalendarDate,
+    ruleset: SourceIdentifier,
+    evidence: ExactPayloadEvidence,
+}
+
+impl<'de> Deserialize<'de> for NominalDailyDate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = NominalDailyDateWire::deserialize(deserializer)?;
+        Self::try_new(wire.date, wire.ruleset, wire.evidence).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Source time semantics preserved at their original precision.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    tag = "precision",
+    content = "semantics",
+    rename_all = "snake_case"
+)]
+pub enum BarTimeSemantics {
+    /// The provider supplied a timestamp whose aggregation period is established by evidence.
+    TimestampedPeriod(TimestampedBarPeriod),
+    /// The provider supplied a daily date, with no exact provider timestamp or period.
+    NominalDailyDate(NominalDailyDate),
+}
+
+impl BarTimeSemantics {
+    /// Constructs a genuine timestamped aggregation period.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty or reversed period.
+    pub fn try_new(
+        period_start: Timestamp,
+        period_end_exclusive: Timestamp,
+        timestamp_basis: BarTimestampBasis,
+        session: MarketBarSessionEvidence,
+    ) -> Result<Self, ResearchError> {
+        TimestampedBarPeriod::try_new(period_start, period_end_exclusive, timestamp_basis, session)
+            .map(Self::TimestampedPeriod)
+    }
+
+    /// Retains a genuine nominal daily date without assigning a timestamp or session period.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing exact payload evidence.
+    pub fn try_nominal_daily_date(
+        date: CalendarDate,
+        ruleset: SourceIdentifier,
+        evidence: ExactPayloadEvidence,
+    ) -> Result<Self, ResearchError> {
+        NominalDailyDate::try_new(date, ruleset, evidence).map(Self::NominalDailyDate)
+    }
+
+    /// Returns timestamped-period semantics only when those semantics were actually supplied.
+    pub const fn timestamped_period(&self) -> Option<&TimestampedBarPeriod> {
+        match self {
+            Self::TimestampedPeriod(value) => Some(value),
+            Self::NominalDailyDate(_) => None,
+        }
+    }
+
+    /// Returns the original nominal civil-date semantics when supplied.
+    pub const fn nominal_daily_date(&self) -> Option<&NominalDailyDate> {
+        match self {
+            Self::TimestampedPeriod(_) => None,
+            Self::NominalDailyDate(value) => Some(value),
+        }
+    }
+
+    /// Returns the source effective coordinate at its retained precision.
+    pub const fn effective_coordinate(&self) -> ResearchTemporalCoordinate {
+        match self {
+            Self::TimestampedPeriod(value) => {
+                ResearchTemporalCoordinate::exact(value.provider_timestamp())
+            }
+            Self::NominalDailyDate(value) => {
+                ResearchTemporalCoordinate::calendar_date(value.date())
+            }
+        }
+    }
+
+    /// Returns an inclusive aggregation-period start only for timestamped periods.
+    pub const fn period_start(&self) -> Option<Timestamp> {
+        match self.timestamped_period() {
+            Some(value) => Some(value.period_start()),
+            None => None,
+        }
+    }
+
+    /// Returns an exclusive aggregation-period end only for timestamped periods.
+    pub const fn period_end_exclusive(&self) -> Option<Timestamp> {
+        match self.timestamped_period() {
+            Some(value) => Some(value.period_end_exclusive()),
+            None => None,
+        }
+    }
+
+    /// Returns the provider timestamp basis only for timestamped periods.
+    pub const fn timestamp_basis(&self) -> Option<BarTimestampBasis> {
+        match self.timestamped_period() {
+            Some(value) => Some(value.timestamp_basis()),
+            None => None,
+        }
+    }
+
+    /// Returns period session evidence only for timestamped periods.
+    pub const fn session(&self) -> Option<&MarketBarSessionEvidence> {
+        match self.timestamped_period() {
+            Some(value) => Some(value.session()),
+            None => None,
+        }
+    }
+
+    /// Returns the original provider timestamp without inventing one for a civil date.
+    pub const fn provider_timestamp(&self) -> Option<Timestamp> {
+        match self.timestamped_period() {
+            Some(value) => Some(value.provider_timestamp()),
+            None => None,
+        }
     }
 }
 
@@ -597,7 +780,7 @@ impl MarketBarObservation {
     ///
     /// # Errors
     ///
-    /// Rejects missing canonical identity, non-exact effective time, mixed currencies,
+    /// Rejects missing canonical identity, mismatched source time or payload evidence, mixed currencies,
     /// nonpositive prices, negative volume, or prices outside the retained low/high envelope.
     #[allow(
         clippy::too_many_arguments,
@@ -622,22 +805,36 @@ impl MarketBarObservation {
         if context.provenance().venue_id().is_none() {
             return Err(ResearchError::MissingVenue);
         }
-        let Some(effective_at) = context.time().effective().exact_timestamp() else {
-            return Err(ResearchError::MarketBarRequiresExactEffectiveTime);
-        };
-        let provider_timestamp = time_semantics.provider_timestamp();
-        if effective_at != provider_timestamp
-            || context.provenance().source_timestamp() != Some(provider_timestamp)
-        {
-            return Err(ResearchError::MarketBarProviderTimestampMismatch);
+        if context.time().effective() != &time_semantics.effective_coordinate() {
+            return Err(ResearchError::MarketBarEffectiveCoordinateMismatch);
         }
-        if context
+        let available_at = context
             .provenance()
             .availability()
             .conservative_available_at()
-            .is_none_or(|available_at| available_at < time_semantics.period_end_exclusive())
-        {
-            return Err(ResearchError::MarketBarUnavailableBeforeCompletion);
+            .ok_or(ResearchError::MarketBarRequiresConservativeAvailability)?;
+        match &time_semantics {
+            BarTimeSemantics::TimestampedPeriod(period) => {
+                if context.provenance().source_timestamp() != Some(period.provider_timestamp()) {
+                    return Err(ResearchError::MarketBarProviderTimestampMismatch);
+                }
+                if available_at < period.period_end_exclusive() {
+                    return Err(ResearchError::MarketBarUnavailableBeforeCompletion);
+                }
+            }
+            BarTimeSemantics::NominalDailyDate(nominal) => {
+                if context.provenance().source_timestamp().is_some() {
+                    return Err(ResearchError::MarketBarProviderTimestampMismatch);
+                }
+                let digest = nominal.evidence().content_digest();
+                if !matches!(context.provenance().payload_reference(),
+                    PayloadReference::ContentHash(payload)
+                        if payload.algorithm() == digest.algorithm()
+                            && payload.digest() == digest.bytes())
+                {
+                    return Err(ResearchError::InvalidNominalDailyDateEvidence);
+                }
+            }
         }
         let currency = open.currency();
         if [high, low, close]
@@ -702,13 +899,13 @@ impl MarketBarObservation {
         &self.interval
     }
 
-    /// Returns exact completed-period, provider-anchor, and session semantics.
+    /// Returns the source time semantics at their original timestamp or civil-date precision.
     pub const fn time_semantics(&self) -> &BarTimeSemantics {
         &self.time_semantics
     }
 
-    /// Returns the exclusive period end at which this bar became complete.
-    pub const fn completed_at(&self) -> Timestamp {
+    /// Returns the exact period completion only for genuine timestamped bars.
+    pub const fn completed_at(&self) -> Option<Timestamp> {
         self.time_semantics.period_end_exclusive()
     }
 

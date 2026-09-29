@@ -1,9 +1,13 @@
 //! Restart-safe registration and fresh resolution of governed-backtest inputs.
 
 mod index;
+mod issuer;
+mod plan;
 mod preparation;
 mod recipe;
 mod resolution;
+mod study;
+mod probability;
 
 use std::{
     fmt,
@@ -13,7 +17,8 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_backtesting::{
-    BacktestDataset, MaterializedRecommendationSignalPlanV1,
+    AllOriginRoundTripEvaluationV1, AllOriginRoundTripEvaluatorV1, AllOriginRoundTripPolicyV1,
+    BacktestDataset, BacktestExecutionBasis, MaterializedRecommendationSignalPlanV1,
     RECOMMENDATION_OOS_EVALUATION_HORIZON_NANOS_V1, RecommendationAggregateEvidenceV1,
     RecommendationBacktestKernelV1, RecommendationBacktestLimits, RecommendationBacktestPolicyV1,
     RecommendationBacktestPublicationV1, RecommendationBacktestStudyV1,
@@ -21,8 +26,10 @@ use market_squawk_backtesting::{
     RecommendationSignalIssuerIdentityV1, RecommendationSignalPlanCompletenessV1,
     RecommendationSignalPlanMaterializationErrorV1, RecommendationSignalPlanMaterializerV1,
 };
-use market_squawk_data::{DatasetManifestRef, Sha256Digest};
-use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_data::{
+    CompleteMarketBarHistoryOutput, CorporateActionPlan, DatasetManifestRef, Sha256Digest,
+};
+use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
 };
@@ -33,15 +40,27 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     GovernedBacktestCommand, GovernedBacktestInputResolver, ResolvedGovernedBacktestInput,
-    repository::lifecycle::{LinkedOperation, RepositoryLifecycle, ensure_operation_live},
+    repository::lifecycle::{
+        LinkedOperation, RepositoryLifecycle, await_blocking, ensure_operation_live,
+    },
 };
 use crate::ResearchService;
+
+pub(crate) use issuer::{
+    HistoricalRecommendationAlphaProducer, HistoricalRecommendationAlphaProducerReadCapability,
+    HistoricalRecommendationAlphaProducerReference,
+};
+pub(crate) use plan::{
+    HistoricalFoldTrainingAuthorityV1, HistoricalStudyDatasetPartV1,
+    HistoricalStudyPlanReadCapabilityV1, HistoricalStudyPlanReferenceV1, HistoricalStudyPlanV1,
+};
+pub(crate) use study::{PreparedRecommendationStudyV1, RecommendationStudyPreparationInputV1};
 
 use index::{
     InputIndex, InputIndexError, InputIndexLimits, InputInsertDisposition, StoredInputRecipe,
 };
 use recipe::{InputRecipe, RecipeError, RegistrationRecipe};
-use resolution::BacktestInputMaterializer;
+use resolution::{BacktestInputMaterializer, MaterializedInput, RecommendationInputFacts};
 
 pub use preparation::{
     BacktestPreparationCatalog, BacktestPreparationDatasetInput, BacktestPreparationError,
@@ -72,6 +91,10 @@ pub struct GovernedBacktestInputAuthorityLimits {
 }
 
 impl GovernedBacktestInputAuthorityLimits {
+    pub(crate) const fn maximum_backup_index_bytes(self) -> usize {
+        self.maximum_index_bytes
+    }
+
     /// Constructs limits within the process and crash-safe persistence ceilings.
     pub fn try_new(
         maximum_inputs: usize,
@@ -150,6 +173,55 @@ impl GovernedBacktestInputRegistrationReceipt {
     }
 }
 
+/// Exact identities returned only after the existing registrar has reopened and admitted all
+/// registered sealed raw histories. These facts supply policy inputs, not a financial recommendation,
+/// source-completeness approval, or signal-issuer capability.
+#[derive(Debug)]
+pub(crate) struct GovernedRecommendationDailyInputRegistrationReceiptV1 {
+    registration: GovernedBacktestInputRegistrationReceipt,
+    facts: RecommendationInputFacts,
+}
+
+impl GovernedRecommendationDailyInputRegistrationReceiptV1 {
+    pub(crate) const fn study_qualification(
+        &self,
+    ) -> market_squawk_backtesting::BacktestStudyQualification {
+        self.facts.study_qualification
+    }
+
+    pub(crate) fn command(&self) -> &GovernedBacktestCommand {
+        self.registration.command()
+    }
+
+    pub(crate) const fn dataset_identity(&self) -> Sha256Digest {
+        self.facts.dataset_identity
+    }
+
+    pub(crate) const fn raw_price_evidence_digest(&self) -> Sha256Digest {
+        self.facts.raw_price_evidence_digest
+    }
+
+    pub(crate) const fn corporate_action_content_digest(&self) -> Sha256Digest {
+        self.facts.corporate_action_content_digest
+    }
+
+    pub(crate) const fn corporate_action_audit_digest(&self) -> Sha256Digest {
+        self.facts.corporate_action_audit_digest
+    }
+
+    pub(crate) const fn corporate_action_valuation_cutoff(&self) -> Timestamp {
+        self.facts.corporate_action_valuation_cutoff
+    }
+
+    pub(crate) const fn admitted_at(&self) -> Timestamp {
+        self.facts.admitted_at
+    }
+
+    pub(crate) fn into_command(self) -> GovernedBacktestCommand {
+        self.registration.into_command()
+    }
+}
+
 /// Confined immutable recommendation materialization over one freshly resolved governed input.
 ///
 /// This bundle exposes the pinned dataset and exact materialization evidence required by the pure
@@ -162,6 +234,7 @@ impl GovernedBacktestInputRegistrationReceipt {
 #[derive(Debug)]
 pub(crate) struct GovernedRecommendationMaterializedInputV1 {
     dataset: BacktestDataset,
+    corporate_actions: CorporateActionPlan,
     signal_plan: MaterializedRecommendationSignalPlanV1,
 }
 
@@ -205,16 +278,69 @@ impl GovernedRecommendationMaterializedInputV1 {
         self,
         policy: RecommendationBacktestPolicyV1,
         publication: RecommendationBacktestPublicationV1,
+        cancellation: &CancellationToken,
     ) -> Result<GovernedRecommendationBacktestEvidenceV1, ServiceError> {
         let study = RecommendationBacktestKernelV1::run_materialized_study(
             &self.dataset,
             policy,
+            &self.corporate_actions,
             &self.signal_plan,
             publication,
             self.signal_plan.limits(),
+            cancellation,
+        )
+        .map_err(|_| {
+            if cancellation.is_cancelled() {
+                ServiceError::Cancelled
+            } else {
+                ServiceError::InvalidResult
+            }
+        })?;
+        GovernedRecommendationBacktestEvidenceV1::try_new(study, &self.signal_plan)
+    }
+}
+
+impl ProductionGovernedBacktestInputAuthority {
+    pub(in crate::application::analysis::backtest) async fn restore_recommendation_input(
+        &self,
+        command: &GovernedBacktestCommand,
+        policy: RecommendationBacktestPolicyV1,
+        limits: RecommendationBacktestLimits,
+        signal_plan_bytes: &[u8],
+        maximum_bytes: usize,
+        repository_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<GovernedRecommendationMaterializedInputV1, ServiceError> {
+        let materialized = self
+            .resolve_materialized(
+                command,
+                Some(Arc::clone(&repository_permit)),
+                cancellation.clone(),
+                deadline,
+            )
+            .await?;
+        let (dataset, corporate_actions, execution_assumptions) =
+            materialized.into_recommendation_dataset()?;
+        if execution_assumptions != policy.execution_assumptions()
+            || dataset.execution_basis() != policy.execution_basis()
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        let signal_plan = MaterializedRecommendationSignalPlanV1::restore_persisted(
+            signal_plan_bytes,
+            maximum_bytes,
+            &dataset,
+            policy,
+            limits,
         )
         .map_err(|_| ServiceError::InvalidResult)?;
-        GovernedRecommendationBacktestEvidenceV1::try_new(study, &self.signal_plan)
+        ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
+        Ok(GovernedRecommendationMaterializedInputV1 {
+            dataset,
+            corporate_actions,
+            signal_plan,
+        })
     }
 }
 
@@ -230,7 +356,7 @@ impl GovernedRecommendationMaterializedInputV1 {
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GovernedRecommendationBacktestEvidenceV1 {
-    study: RecommendationBacktestStudyV1,
+    study: Arc<RecommendationBacktestStudyV1>,
     materialized_signal_plan_digest: Sha256Digest,
     issuer_identity: RecommendationSignalIssuerIdentityV1,
     digest: Sha256Digest,
@@ -241,6 +367,37 @@ pub(crate) struct GovernedRecommendationBacktestEvidenceV1 {
     reason = "the installed recommendation recipe is composed at the next serialized seam"
 )]
 impl GovernedRecommendationBacktestEvidenceV1 {
+    pub(crate) fn basis(&self) -> market_squawk_domain::HistoricalStudyBasis {
+        self.study.basis()
+    }
+    pub(crate) fn limitations(&self) -> &[market_squawk_domain::HistoricalStudyLimitation] {
+        self.study.limitations()
+    }
+    pub(crate) fn snapshot_as_of(&self) -> Timestamp {
+        self.study.snapshot_as_of()
+    }
+    pub(crate) fn source_snapshot_digest(&self) -> Sha256Digest {
+        self.study.source_snapshot_digest()
+    }
+
+    pub(in crate::application::analysis::backtest) fn with_publication(
+        mut self,
+        publication: RecommendationBacktestPublicationV1,
+    ) -> Result<Self, ServiceError> {
+        self.study = Arc::new(
+            Arc::try_unwrap(self.study)
+                .unwrap_or_else(|study| (*study).clone())
+                .with_publication(publication)
+                .map_err(|_| ServiceError::InvalidResult)?,
+        );
+        self.digest = governed_recommendation_evidence_digest(
+            self.study.digest(),
+            self.materialized_signal_plan_digest,
+            self.issuer_identity.digest(),
+        );
+        Ok(self)
+    }
+
     fn try_new(
         study: RecommendationBacktestStudyV1,
         materialized: &MaterializedRecommendationSignalPlanV1,
@@ -270,7 +427,7 @@ impl GovernedRecommendationBacktestEvidenceV1 {
             issuer_identity.digest(),
         );
         Ok(Self {
-            study,
+            study: Arc::new(study),
             materialized_signal_plan_digest,
             issuer_identity,
             digest,
@@ -279,61 +436,61 @@ impl GovernedRecommendationBacktestEvidenceV1 {
 
     /// Complete research study admitted through the installed issuer path.
     #[must_use]
-    pub(crate) const fn study(&self) -> &RecommendationBacktestStudyV1 {
+    pub(crate) fn study(&self) -> &RecommendationBacktestStudyV1 {
         &self.study
     }
 
     /// Exact PIT dataset identity.
     #[must_use]
-    pub(crate) const fn dataset_identity(&self) -> Sha256Digest {
+    pub(crate) fn dataset_identity(&self) -> Sha256Digest {
         self.study.dataset_identity()
     }
 
     /// Complete strict recommendation policy.
     #[must_use]
-    pub(crate) const fn policy(&self) -> RecommendationBacktestPolicyV1 {
+    pub(crate) fn policy(&self) -> RecommendationBacktestPolicyV1 {
         self.study.policy()
     }
 
     /// Exact canonical signal-plan identity.
     #[must_use]
-    pub(crate) const fn signal_plan_digest(&self) -> Sha256Digest {
+    pub(crate) fn signal_plan_digest(&self) -> Sha256Digest {
         self.study.signal_plan_digest()
     }
 
     /// Exact content-derived sequential issuer-plan identity.
     #[must_use]
-    pub(crate) const fn preauthorized_signal_plan_digest(&self) -> Sha256Digest {
+    pub(crate) fn preauthorized_signal_plan_digest(&self) -> Sha256Digest {
         self.study.preauthorized_signal_plan_digest()
     }
 
     /// Exact evaluation and publication timing.
     #[must_use]
-    pub(crate) const fn publication(&self) -> RecommendationBacktestPublicationV1 {
+    pub(crate) fn publication(&self) -> RecommendationBacktestPublicationV1 {
         self.study.publication()
     }
 
     /// Exact aggregates or a typed incomplete-evidence refusal.
     #[must_use]
-    pub(crate) const fn aggregate(&self) -> RecommendationAggregateEvidenceV1 {
+    pub(crate) fn aggregate(&self) -> RecommendationAggregateEvidenceV1 {
         self.study.aggregate()
     }
 
     /// Exact sequential materialization identity.
     #[must_use]
-    pub(crate) const fn materialized_signal_plan_digest(&self) -> Sha256Digest {
+    pub(crate) fn materialized_signal_plan_digest(&self) -> Sha256Digest {
         self.materialized_signal_plan_digest
     }
 
     /// Exact semantic identity of the installed code-owned issuer.
     #[must_use]
-    pub(crate) const fn issuer_identity(&self) -> &RecommendationSignalIssuerIdentityV1 {
+    pub(crate) fn issuer_identity(&self) -> &RecommendationSignalIssuerIdentityV1 {
         &self.issuer_identity
     }
 
     /// Complete app-owned governed-evidence identity.
     #[must_use]
-    pub(crate) const fn digest(&self) -> Sha256Digest {
+    pub(crate) fn digest(&self) -> Sha256Digest {
         self.digest
     }
 }
@@ -351,44 +508,52 @@ fn governed_recommendation_evidence_digest(
     Sha256Digest::new(hash.finalize().into())
 }
 
-type GovernedRecommendationSignalIssueFnV1 = for<'dataset> fn(
-    &RecommendationSignalInformationSetV1<'dataset>,
-) -> Result<
-    RecommendationSignalIssuanceV1,
-    RecommendationSignalPlanMaterializationErrorV1,
->;
-
-/// Nonconstructible capability for the code-owned recommendation signal issuer.
-///
-/// The future recipe owner must be composed through this module before this capability can exist.
-/// Ordinary application callers cannot implement a trait or self-declare producer identity. The
-/// callback receives only the immutable lineage-confined view and returns economic instructions;
-/// the backtesting materializer derives row lineage, availability, and the complete plan digest.
-#[allow(
-    dead_code,
-    reason = "the code-owned issuer recipe is installed at the next serialized composition seam"
-)]
-#[derive(Debug)]
+/// Request-specific installed capability over the concrete source-qualified financial producer.
+/// There is no public callback constructor or caller-declared producer identity.
+#[derive(Clone, Debug)]
 pub(crate) struct GovernedRecommendationSignalIssuerV1 {
-    identity: RecommendationSignalIssuerIdentityV1,
-    issue: GovernedRecommendationSignalIssueFnV1,
+    producer: Arc<HistoricalRecommendationAlphaProducer>,
+    request_context: market_squawk_services::RequestContext,
 }
 
-#[allow(
-    dead_code,
-    reason = "the code-owned issuer recipe is installed at the next serialized composition seam"
-)]
 impl GovernedRecommendationSignalIssuerV1 {
-    fn issue(
-        &self,
-        view: &RecommendationSignalInformationSetV1<'_>,
-    ) -> Result<RecommendationSignalIssuanceV1, RecommendationSignalPlanMaterializationErrorV1>
-    {
-        (self.issue)(view)
+    pub(crate) fn from_producer(
+        producer: HistoricalRecommendationAlphaProducer,
+        context: &market_squawk_services::RequestContext,
+    ) -> Result<Self, ServiceError> {
+        context.origin().ok_or(ServiceError::Unauthorized)?;
+        Ok(Self {
+            producer: Arc::new(producer),
+            request_context: context.clone(),
+        })
     }
 
-    fn identity(&self) -> RecommendationSignalIssuerIdentityV1 {
-        self.identity.clone()
+    async fn issue(
+        &self,
+        view: &RecommendationSignalInformationSetV1<'_>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<RecommendationSignalIssuanceV1, ServiceError> {
+        let context = market_squawk_services::RequestContext::new(
+            self.request_context.request_id().clone(),
+            cancellation,
+            deadline,
+            self.request_context.limits(),
+        )
+        .with_origin(
+            self.request_context
+                .origin()
+                .ok_or(ServiceError::Unauthorized)?,
+        );
+        self.producer.issue(view, &context).await
+    }
+
+    pub(crate) fn identity(&self) -> RecommendationSignalIssuerIdentityV1 {
+        self.producer.identity().clone()
+    }
+
+    pub(crate) fn reference(&self) -> &HistoricalRecommendationAlphaProducerReference {
+        self.producer.reference()
     }
 }
 
@@ -412,6 +577,7 @@ pub(crate) trait GovernedRecommendationInputMaterializerV1: Send + Sync + 'stati
         evaluation_starts_at: Timestamp,
         issuer: &GovernedRecommendationSignalIssuerV1,
         limits: RecommendationBacktestLimits,
+        repository_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<GovernedRecommendationMaterializedInputV1, ServiceError>;
@@ -424,6 +590,7 @@ pub struct ProductionGovernedBacktestInputAuthority {
     materializer: BacktestInputMaterializer,
     limits: GovernedBacktestInputAuthorityLimits,
     lifecycle: Arc<RepositoryLifecycle>,
+    recommendation_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl ProductionGovernedBacktestInputAuthority {
@@ -461,7 +628,17 @@ impl ProductionGovernedBacktestInputAuthority {
             materializer,
             limits,
             lifecycle: RepositoryLifecycle::new(),
+            recommendation_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         })
+    }
+
+    /// Injects the existing source reader; it reopens original references and acquires no data.
+    pub(crate) fn with_source_action_reader(
+        mut self,
+        reader: crate::application::research::corporate_actions::SourceAppliedCorporateActionReadCapability,
+    ) -> Self {
+        self.materializer.source_actions = Some(reader);
+        self
     }
 
     /// Materializes, validates, and durably registers one complete immutable input recipe.
@@ -471,20 +648,182 @@ impl ProductionGovernedBacktestInputAuthority {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<GovernedBacktestInputRegistrationReceipt, ServiceError> {
+        let registration =
+            RegistrationRecipe::try_new(input).map_err(map_registration_recipe_error)?;
+        self.register_recipe(registration, cancellation, deadline)
+            .await
+            .map(|(receipt, _)| receipt)
+    }
+
+    /// Binds only genuine completed raw histories to the existing immutable recipe store.
+    /// The actual read cutoff must be the one used for every sealed selection. Reopening
+    /// compares every original receipt and result before anything is registered.
+    pub(crate) async fn register_recommendation_daily(
+        &self,
+        input: GovernedBacktestInputRegistrationInput,
+        histories: &[CompleteMarketBarHistoryOutput],
+        admitted_at: Timestamp,
+        source_action_reference: crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<GovernedRecommendationDailyInputRegistrationReceiptV1, ServiceError> {
+        let registration = RegistrationRecipe::try_new(input)
+            .and_then(|recipe| {
+                recipe.with_daily_history(histories, admitted_at, source_action_reference)
+            })
+            .map_err(map_registration_recipe_error)?;
+        let (registration, facts) = self
+            .register_recipe(registration, cancellation, deadline)
+            .await?;
+        Ok(GovernedRecommendationDailyInputRegistrationReceiptV1 {
+            registration,
+            facts: facts.ok_or(ServiceError::InvalidResult)?,
+        })
+    }
+
+    /// Reopens the registered subject-only StudyInputs population and evaluates every origin.
+    ///
+    /// The sealed dataset declares the population before outcomes are examined. This path uses
+    /// the original source-action replay and execution assumptions, without a strategy issuer,
+    /// authored fills, benchmark membership or outcome-dependent origin selection.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the original input, financial policy, bounds and lifecycle capabilities stay explicit"
+    )]
+    pub(crate) async fn evaluate_all_origin_round_trips(
+        &self,
+        command: &GovernedBacktestCommand,
+        subject: InstrumentId,
+        policy: AllOriginRoundTripPolicyV1,
+        limits: RecommendationBacktestLimits,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<AllOriginRoundTripEvaluationV1, ServiceError> {
+        if command.scope().instruments() != [subject]
+            || policy.target_policy().execution_basis
+                != market_squawk_data::ProbabilityExecutionBasisV1::CompletedDailyBar
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let _call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
+        let permit = tokio::select! {
+            () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
+            () = self.lifecycle.shutdown_token().cancelled() => return Err(ServiceError::Unavailable),
+            result = tokio::time::timeout_at(deadline.into(),
+                Arc::clone(&self.recommendation_gate).acquire_owned()) => {
+                result.map_err(|_| ServiceError::DeadlineExceeded)?
+                    .map_err(|_| ServiceError::Unavailable)?
+            }
+        };
+        // The recipe is immutable and content-addressed. Check the original simulation seed,
+        // which is deliberately separate from ResearchExecutionAssumptions, before reopening.
+        {
+            let stored = self
+                .index
+                .lock()
+                .map_err(|_| ServiceError::Unavailable)?
+                .get(command.input_id())
+                .ok_or(ServiceError::NotFound)?;
+            let recipe = InputRecipe::decode(stored.recipe_bytes())
+                .map_err(|_| ServiceError::InvalidResult)?;
+            if recipe.core().seed() != policy.target_policy().seed
+                || recipe.core().daily_history().is_none()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
+        let materialized = self
+            .resolve_materialized(
+                command,
+                None,
+                cancellation.clone(),
+                deadline,
+            )
+            .await?;
+        if !materialized.has_daily_history() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
+        let call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let operation = LinkedOperation::new(
+            cancellation.clone(),
+            self.lifecycle.shutdown_token().clone(),
+            deadline,
+        );
+        let worker_cancellation = operation.token().clone();
+        let request_cancellation = cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            let _call = call;
+            let _permit = permit;
+            ensure_operation_live(&request_cancellation, &lifecycle, deadline)?;
+            let (dataset, corporate_actions, execution_assumptions) =
+                materialized.into_recommendation_dataset()?;
+            if execution_assumptions != policy.execution_assumptions()
+                || dataset.execution_basis() != BacktestExecutionBasis::CompletedDailyBar
+                || dataset.study_qualification().is_none()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let evaluated = AllOriginRoundTripEvaluatorV1::evaluate(
+                &dataset,
+                &corporate_actions,
+                subject,
+                policy,
+                limits,
+                &worker_cancellation,
+            );
+            ensure_operation_live(&request_cancellation, &lifecycle, deadline)?;
+            evaluated.map_err(|error| match error {
+                market_squawk_backtesting::RecommendationBacktestError::Cancelled => {
+                    ServiceError::Cancelled
+                }
+                market_squawk_backtesting::RecommendationBacktestError::LimitExceeded => {
+                    ServiceError::ResourceExhausted
+                }
+                market_squawk_backtesting::RecommendationBacktestError::InvalidPolicy
+                | market_squawk_backtesting::RecommendationBacktestError::InvalidLimits => {
+                    ServiceError::InvalidRequest
+                }
+                _ => ServiceError::InvalidResult,
+            })
+        });
+        let evaluated = await_blocking(
+            worker,
+            &cancellation,
+            self.lifecycle.shutdown_token(),
+            deadline,
+        )
+        .await;
+        ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
+        evaluated
+    }
+
+    async fn register_recipe(
+        &self,
+        registration: RegistrationRecipe,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<
+        (
+            GovernedBacktestInputRegistrationReceipt,
+            Option<RecommendationInputFacts>,
+        ),
+        ServiceError,
+    > {
         let call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
         let linked = LinkedOperation::new(
             cancellation.clone(),
             self.lifecycle.shutdown_token().clone(),
             deadline,
         );
-        let registration =
-            RegistrationRecipe::try_new(input).map_err(map_registration_recipe_error)?;
         let materialized = self
             .materializer
-            .materialize(registration.core(), linked.token().clone(), deadline)
+            .materialize(registration.core(), None, linked.token().clone(), deadline)
             .await?;
         let evidence = materialized.evidence.clone();
-        materialized.validate_registration()?;
+        let facts = materialized.validate_registration()?;
         let recipe = registration
             .bind(evidence)
             .map_err(map_registration_recipe_error)?;
@@ -505,7 +844,7 @@ impl ProductionGovernedBacktestInputAuthority {
         });
         worker.await.map_err(|_| ServiceError::Internal)??;
         ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
-        Ok(GovernedBacktestInputRegistrationReceipt { command })
+        Ok((GovernedBacktestInputRegistrationReceipt { command }, facts))
     }
 }
 
@@ -530,6 +869,7 @@ impl GovernedRecommendationInputMaterializerV1 for ProductionGovernedBacktestInp
         evaluation_starts_at: Timestamp,
         issuer: &GovernedRecommendationSignalIssuerV1,
         limits: RecommendationBacktestLimits,
+        repository_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<GovernedRecommendationMaterializedInputV1, ServiceError> {
@@ -539,6 +879,7 @@ impl GovernedRecommendationInputMaterializerV1 for ProductionGovernedBacktestInp
         let mut expected_instruments = [
             policy.subject_instrument_id(),
             policy.benchmark().instrument_id(),
+            policy.accompanying_benchmark().instrument_id(),
         ];
         expected_instruments.sort_unstable();
         let expected_time_ranges = [(evaluation_starts_at, evaluation_ends_at)];
@@ -548,72 +889,78 @@ impl GovernedRecommendationInputMaterializerV1 for ProductionGovernedBacktestInp
             return Err(ServiceError::InvalidRequest);
         }
         let _call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
-        let linked = LinkedOperation::new(
+        let permit = tokio::select! {
+            () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
+            () = self.lifecycle.shutdown_token().cancelled() => return Err(ServiceError::Unavailable),
+            result = tokio::time::timeout_at(deadline.into(),
+                Arc::clone(&self.recommendation_gate).acquire_owned()) => {
+                result.map_err(|_| ServiceError::DeadlineExceeded)?
+                    .map_err(|_| ServiceError::Unavailable)?
+            }
+        };
+        let materialized = self
+            .resolve_materialized(
+                command,
+                Some(Arc::clone(&repository_permit)),
+                cancellation.clone(),
+                deadline,
+            )
+            .await?;
+        let (dataset, corporate_actions, execution_assumptions) =
+            materialized.into_recommendation_dataset()?;
+        if execution_assumptions != policy.execution_assumptions()
+            || dataset.execution_basis() != policy.execution_basis()
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
+        let call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let operation = LinkedOperation::new(
             cancellation.clone(),
             self.lifecycle.shutdown_token().clone(),
             deadline,
         );
-        let stored = self
-            .index
-            .lock()
-            .map_err(|_| ServiceError::Unavailable)?
-            .get(command.input_id())
-            .ok_or(ServiceError::NotFound)?;
-        let recipe =
-            InputRecipe::decode(stored.recipe_bytes()).map_err(|_| ServiceError::InvalidResult)?;
-        let registered_command = recipe
-            .core()
-            .command(stored.input_id().clone())
-            .map_err(|_| ServiceError::InvalidResult)?;
-        if &registered_command != command {
-            return Err(ServiceError::InvalidRequest);
-        }
-        let expected = recipe.expected().map_err(|_| ServiceError::InvalidResult)?;
-        let materialized = self
-            .materializer
-            .materialize(recipe.core(), linked.token().clone(), deadline)
-            .await?;
-        if materialized.evidence != expected || materialized.input.cohort.is_some() {
-            return Err(ServiceError::InvalidResult);
-        }
-        let crate::PinnedBacktestInput {
-            query,
-            instrument_definitions,
-            execution_assumptions,
-            portfolio: _,
-            corporate_actions,
-            sources: _,
-            seed: _,
-            limits: dataset_limits,
-            experiment: _,
-            cohort: _,
-        } = materialized.input;
-        if execution_assumptions != policy.execution_assumptions() || corporate_actions.is_some() {
-            return Err(ServiceError::InvalidRequest);
-        }
-        let dataset =
-            BacktestDataset::try_from_pinned_query(query, instrument_definitions, dataset_limits)
-                .map_err(|_| ServiceError::InvalidResult)?;
-        ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
-        let signal_plan = RecommendationSignalPlanMaterializerV1::materialize_sequentially(
-            &dataset,
-            policy,
-            evaluation_starts_at,
-            issuer.identity(),
-            limits,
-            |information| {
-                ensure_operation_live(&cancellation, &self.lifecycle, deadline).map_err(|_| {
-                    RecommendationSignalPlanMaterializationErrorV1::IssuerUnavailable
-                })?;
-                issuer.issue(information)
-            },
+        let worker_cancellation = operation.token().clone();
+        let issuer = issuer.clone();
+        let runtime_handle = tokio::runtime::Handle::current();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            let _call = call;
+            let _permit = permit;
+            let _repository_permit = repository_permit;
+            let signal_plan = RecommendationSignalPlanMaterializerV1::materialize_sequentially(
+                &dataset,
+                policy,
+                evaluation_starts_at,
+                issuer.identity(),
+                limits,
+                |information| {
+                    ensure_operation_live(&worker_cancellation, &lifecycle, deadline).map_err(
+                        |_| RecommendationSignalPlanMaterializationErrorV1::IssuerUnavailable,
+                    )?;
+                    runtime_handle
+                        .block_on(issuer.issue(information, worker_cancellation.clone(), deadline))
+                        .map_err(|_| {
+                            RecommendationSignalPlanMaterializationErrorV1::IssuerUnavailable
+                        })
+                },
+            );
+            ensure_operation_live(&worker_cancellation, &lifecycle, deadline)?;
+            let signal_plan = signal_plan.map_err(map_recommendation_materialization_error)?;
+            Ok(GovernedRecommendationMaterializedInputV1 {
+                dataset,
+                corporate_actions,
+                signal_plan,
+            })
+        });
+        await_blocking(
+            worker,
+            &cancellation,
+            self.lifecycle.shutdown_token(),
+            deadline,
         )
-        .map_err(map_recommendation_materialization_error)?;
-        ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
-        Ok(GovernedRecommendationMaterializedInputV1 {
-            dataset,
-            signal_plan,
-        })
+        .await
     }
 }
 
@@ -630,14 +977,14 @@ impl fmt::Debug for ProductionGovernedBacktestInputAuthority {
     }
 }
 
-#[async_trait]
-impl GovernedBacktestInputResolver for ProductionGovernedBacktestInputAuthority {
-    async fn resolve(
+impl ProductionGovernedBacktestInputAuthority {
+    async fn resolve_materialized(
         &self,
         command: &GovernedBacktestCommand,
+        repository_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
         cancellation: CancellationToken,
         deadline: Instant,
-    ) -> Result<ResolvedGovernedBacktestInput, ServiceError> {
+    ) -> Result<MaterializedInput, ServiceError> {
         let _call = RepositoryLifecycle::enter(&self.lifecycle, &cancellation, deadline)?;
         let linked = LinkedOperation::new(
             cancellation.clone(),
@@ -662,17 +1009,41 @@ impl GovernedBacktestInputResolver for ProductionGovernedBacktestInputAuthority 
         let expected = recipe.expected().map_err(|_| ServiceError::InvalidResult)?;
         let materialized = self
             .materializer
-            .materialize(recipe.core(), linked.token().clone(), deadline)
+            .materialize(
+                recipe.core(),
+                repository_permit,
+                linked.token().clone(),
+                deadline,
+            )
             .await?;
         if materialized.evidence != expected {
             return Err(ServiceError::InvalidResult);
         }
         ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
+        Ok(materialized)
+    }
+}
+
+#[async_trait]
+impl GovernedBacktestInputResolver for ProductionGovernedBacktestInputAuthority {
+    async fn resolve(
+        &self,
+        command: &GovernedBacktestCommand,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<ResolvedGovernedBacktestInput, ServiceError> {
+        let materialized = self
+            .resolve_materialized(command, None, cancellation, deadline)
+            .await?;
+        if materialized.has_daily_history() {
+            // The generic quote engine cannot reinterpret completed outcome bars as quote depth.
+            return Err(ServiceError::InvalidRequest);
+        }
         Ok(ResolvedGovernedBacktestInput::new(
             command.strategy_id().clone(),
             command.input_id().clone(),
             command.scope().clone(),
-            materialized.input,
+            materialized.into_generic()?,
         ))
     }
 
@@ -771,7 +1142,6 @@ fn map_recommendation_materialization_error(
         }
         RecommendationSignalPlanMaterializationErrorV1::DatasetScopeMismatch
         | RecommendationSignalPlanMaterializationErrorV1::IncompletePointInTimePanel
-        | RecommendationSignalPlanMaterializationErrorV1::MissingEntryInFold
         | RecommendationSignalPlanMaterializationErrorV1::InstructionEvidenceMismatch
         | RecommendationSignalPlanMaterializationErrorV1::MaterializationDrift => {
             ServiceError::InvalidResult
@@ -793,5 +1163,132 @@ fn map_authority_error_to_service(error: LocalAuthorityStateStoreError) -> Servi
         | LocalAuthorityStateStoreError::Allocation
         | LocalAuthorityStateStoreError::GenerationExhausted => ServiceError::ResourceExhausted,
         _ => ServiceError::Unavailable,
+    }
+}
+
+impl ProductionGovernedBacktestInputAuthority {
+    /// Captures one canonical index and its original sealed durable revision; no source authority is minted.
+    pub(crate) async fn export_backup_index(
+        &self,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(Vec<u8>, [u8; 32]), ServiceError> {
+        let call = RepositoryLifecycle::enter(&self.lifecycle, cancellation, deadline)?;
+        let index = Arc::clone(&self.index);
+        let store = Arc::clone(&self.store);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let limits = self.limits;
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _call = call;
+            ensure_operation_live(&worker_cancellation, &lifecycle, deadline)?;
+            let current = index.try_lock().map_err(|_| ServiceError::Unavailable)?;
+            let bytes = current
+                .encode(limits.index())
+                .map_err(map_index_error_to_service)?;
+            Self::validate_backup_index(&bytes, limits)?;
+            let durable = store
+                .load_snapshot()
+                .map_err(map_authority_error_to_service)?;
+            let mut revision = sha2::Sha256::new();
+            revision.update(b"market-squawk/input_index_directory-backup/v1\0");
+            match durable {
+                Some(snapshot) => {
+                    if snapshot.payload() != bytes.as_slice() {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                    revision.update([1]);
+                    revision.update(snapshot.context().authentication_bytes());
+                }
+                None if current.entries().is_empty() => revision.update([0]),
+                None => return Err(ServiceError::InvalidResult),
+            }
+            revision.update(&bytes);
+            ensure_operation_live(&worker_cancellation, &lifecycle, deadline)?;
+            Ok((bytes, revision.finalize().into()))
+        });
+        await_blocking(
+            worker,
+            cancellation,
+            self.lifecycle.shutdown_token(),
+            deadline,
+        )
+        .await
+    }
+
+    pub(crate) async fn revalidate_backup_index(
+        &self,
+        expected_revision: [u8; 32],
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ServiceError> {
+        let (_, actual) = self.export_backup_index(cancellation, deadline).await?;
+        if actual != expected_revision {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_backup_index(
+        bytes: &[u8],
+        limits: GovernedBacktestInputAuthorityLimits,
+    ) -> Result<(), ServiceError> {
+        let decoded =
+            InputIndex::decode(bytes, limits.index()).map_err(map_index_error_to_service)?;
+        for entry in decoded.entries() {
+            InputRecipe::decode(entry.recipe_bytes()).map_err(map_registration_recipe_error)?;
+        }
+        drop(decoded);
+        Ok(())
+    }
+
+    /// Writes only the existing fixed namespace in a fresh, unpublished restore target.
+    pub(crate) fn restore_backup_index_fresh(
+        paths: &LocalPaths,
+        limits: GovernedBacktestInputAuthorityLimits,
+        bytes: &[u8],
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ServiceError> {
+        Self::validate_backup_index(bytes, limits)?;
+        let ensure_live = || {
+            if cancellation.is_cancelled() {
+                Err(ServiceError::Cancelled)
+            } else if Instant::now() >= deadline {
+                Err(ServiceError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        };
+        ensure_live()?;
+        let control = paths
+            .control_root()
+            .map_err(|_| ServiceError::Unavailable)?;
+        control
+            .try_clone_directory()
+            .map_err(|_| ServiceError::Unavailable)?;
+        let store = LocalAuthorityStateStore::try_open(control.root().join(INPUT_INDEX_DIRECTORY))
+            .map_err(map_authority_error_to_service)?;
+        control
+            .try_clone_directory()
+            .map_err(|_| ServiceError::Unavailable)?;
+        if store
+            .load_snapshot()
+            .map_err(map_authority_error_to_service)?
+            .is_some()
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        ensure_live()?;
+        store.store(bytes).map_err(map_authority_error_to_service)?;
+        if store
+            .load()
+            .map_err(map_authority_error_to_service)?
+            .as_deref()
+            != Some(bytes)
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        ensure_live()
     }
 }

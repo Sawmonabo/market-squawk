@@ -3,9 +3,9 @@
 use std::num::NonZeroU64;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, BarTimeSemantics, BarTimestampBasis, CalendarDate, Currency,
+    AvailabilityEvidence, BarTimeSemantics, CalendarDate, Currency,
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, InstrumentId, MarketBarAdjustment,
-    MarketBarSessionKind, MetadataRevision, Money, ProviderInstrumentId,
+    MetadataRevision, Money, ProviderInstrumentId,
     RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt};
@@ -47,7 +47,7 @@ pub struct TiingoEodInstrumentAuthority {
     venue_id: VenueId,
     provider_instrument_id: ProviderInstrumentId,
     ticker: TiingoTicker,
-    provider_exchange_code: SourceIdentifier,
+    provider_exchange_code: crate::TiingoExchangeCode,
     kind: TiingoEodInstrumentKind,
     instrument_definition: RevisionBoundPayloadEvidence,
     provider_mapping_evidence: ExactPayloadEvidence,
@@ -67,7 +67,7 @@ impl TiingoEodInstrumentAuthority {
         venue_id: VenueId,
         provider_instrument_id: ProviderInstrumentId,
         ticker: TiingoTicker,
-        provider_exchange_code: SourceIdentifier,
+        provider_exchange_code: crate::TiingoExchangeCode,
         kind: TiingoEodInstrumentKind,
         instrument_definition: RevisionBoundPayloadEvidence,
         provider_mapping_evidence: ExactPayloadEvidence,
@@ -119,7 +119,7 @@ impl TiingoEodInstrumentAuthority {
     }
 
     /// Returns the exact Tiingo metadata exchange code mapped to the canonical venue.
-    pub const fn provider_exchange_code(&self) -> &SourceIdentifier {
+    pub const fn provider_exchange_code(&self) -> &crate::TiingoExchangeCode {
         &self.provider_exchange_code
     }
 
@@ -148,7 +148,8 @@ impl TiingoEodInstrumentAuthority {
         self.currency
     }
 
-    fn mapping_identity(&self) -> EvidenceDigest {
+    /// Exact mapping contract identity retained for source replay.
+    pub fn mapping_identity(&self) -> EvidenceDigest {
         let mut hasher = Sha256::new();
         append_field(&mut hasher, b"market-squawk/tiingo/eod-instrument/v2");
         append_field(&mut hasher, self.instrument_id.to_string().as_bytes());
@@ -310,7 +311,8 @@ impl TiingoEodContractEvidence {
         &self.adjusted_surface_evidence
     }
 
-    fn mapping_identity(&self) -> EvidenceDigest {
+    /// Exact mapping contract identity retained for source replay.
+    pub fn mapping_identity(&self) -> EvidenceDigest {
         let mut hasher = Sha256::new();
         append_field(&mut hasher, b"market-squawk/tiingo/eod-contract/v2");
         append_field(&mut hasher, self.source_id.as_str().as_bytes());
@@ -348,59 +350,6 @@ impl TiingoEodContractEvidence {
     }
 }
 
-/// Least-authority request for externally governed EOD session/calendar semantics.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TiingoEodBarTimeRequest {
-    instrument_id: InstrumentId,
-    venue_id: VenueId,
-    provider_instrument_id: ProviderInstrumentId,
-    ticker: TiingoTicker,
-    provider_date: CalendarDate,
-}
-
-impl TiingoEodBarTimeRequest {
-    /// Returns the canonical instrument identity.
-    pub const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
-    }
-
-    /// Returns the canonical venue identity.
-    pub const fn venue_id(&self) -> &VenueId {
-        &self.venue_id
-    }
-
-    /// Returns the exact provider instrument identity.
-    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
-        &self.provider_instrument_id
-    }
-
-    /// Returns the exact Tiingo ticker.
-    pub const fn ticker(&self) -> &TiingoTicker {
-        &self.ticker
-    }
-
-    /// Returns Tiingo's exact daily civil date without inventing midnight precision.
-    pub const fn provider_date(&self) -> CalendarDate {
-        self.provider_date
-    }
-}
-
-/// Revocable authority for exact completed EOD periods and venue-session evidence.
-///
-/// Tiingo's wire row supplies a UTC-midnight-shaped date string, not proof of an exchange session
-/// boundary. The mapper therefore delegates the exact provider timestamp basis, period, and
-/// session rules to independently governed calendar authority.
-pub trait TiingoEodBarTimeAuthority: Send + Sync {
-    /// Rejects use after the independently governed session/calendar mapping is revoked.
-    fn validate_current(&self) -> Result<(), TiingoEodMapError>;
-
-    /// Resolves one source civil date to exact provider timestamp and completed-session semantics.
-    fn resolve(
-        &self,
-        request: &TiingoEodBarTimeRequest,
-    ) -> Result<BarTimeSemantics, TiingoEodMapError>;
-}
-
 /// Exact financial-date scope submitted to independently governed market-calendar authority.
 ///
 /// This request is distinct from the Tiingo HTTP plan. It asks which venue sessions were expected
@@ -419,7 +368,9 @@ pub struct TiingoEodExpectedSessionRequest {
 }
 
 impl TiingoEodExpectedSessionRequest {
-    fn new(plan: &TiingoHistoryPlan, instrument: &TiingoEodInstrumentAuthority) -> Self {
+    /// Constructs the exact inert calendar request from the existing history plan and mapping.
+    /// Expected-session evidence and current publication authority are validated separately.
+    pub fn new(plan: &TiingoHistoryPlan, instrument: &TiingoEodInstrumentAuthority) -> Self {
         let history_plan_identity = plan.request_set_identity();
         let (start_date, end_date) = plan.interval();
         let instrument_authority_identity = instrument.mapping_identity();
@@ -510,6 +461,9 @@ impl TiingoEodExpectedSessionRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TiingoEodExpectedSessionEvidence {
     request_identity: EvidenceDigest,
+    origin_content_digest: EvidenceDigest,
+    capture_binding_digest: EvidenceDigest,
+    relationship: market_squawk_sources::ReviewedMarketCalendarRelationship,
     calendar_id: SourceIdentifier,
     calendar_revision: RevisionBoundPayloadEvidence,
     authority_generation: SourceIdentifier,
@@ -535,6 +489,9 @@ impl TiingoEodExpectedSessionEvidence {
         resolved_at: Timestamp,
         resolution_receipt: EvidenceDigest,
         expected_sessions: Vec<CalendarDate>,
+        origin_content_digest: EvidenceDigest,
+        capture_binding_digest: EvidenceDigest,
+        relationship: market_squawk_sources::ReviewedMarketCalendarRelationship,
     ) -> Result<Self, TiingoEodMapError> {
         let inclusive_calendar_days = request
             .end_date()
@@ -551,6 +508,10 @@ impl TiingoEodExpectedSessionEvidence {
             || calendar_available_at.unix_nanos() < 0
             || resolved_at < calendar_available_at
             || resolution_receipt.bytes() == [0; 32]
+            || origin_content_digest.bytes() == [0; 32]
+            || capture_binding_digest.bytes() == [0; 32]
+            || relationship.target_venue() != request.venue_id()
+            || relationship.requested_dates() != (request.start_date(), request.end_date())
             || expected_sessions.len() > inclusive_calendar_days
             || expected_sessions
                 .iter()
@@ -570,9 +531,15 @@ impl TiingoEodExpectedSessionEvidence {
             resolved_at,
             resolution_receipt,
             &expected_sessions,
+            origin_content_digest,
+            capture_binding_digest,
+            relationship.relationship_digest(),
         );
         Ok(Self {
             request_identity: request.request_identity(),
+            origin_content_digest,
+            capture_binding_digest,
+            relationship,
             calendar_id,
             calendar_revision,
             authority_generation,
@@ -588,6 +555,11 @@ impl TiingoEodExpectedSessionEvidence {
     pub const fn request_identity(&self) -> EvidenceDigest {
         self.request_identity
     }
+
+    /// Original immutable native calendar content and capture binding.
+    pub const fn origin_content_digest(&self) -> EvidenceDigest { self.origin_content_digest }
+    pub const fn capture_binding_digest(&self) -> EvidenceDigest { self.capture_binding_digest }
+    pub const fn relationship(&self) -> &market_squawk_sources::ReviewedMarketCalendarRelationship { &self.relationship }
 
     /// Returns the independently governed calendar identity.
     pub const fn calendar_id(&self) -> &SourceIdentifier {
@@ -987,8 +959,6 @@ pub struct TiingoEodMappingInput<'a> {
     pub instrument: &'a TiingoEodInstrumentAuthority,
     /// Activated source, schema, entitlement, and adjustment-surface evidence.
     pub contract: &'a TiingoEodContractEvidence,
-    /// Independent provider-calendar/session authority.
-    pub bar_time_authority: &'a dyn TiingoEodBarTimeAuthority,
     /// Time provider-local semantic mapping completed locally.
     pub ingested_at: Timestamp,
 }
@@ -1000,7 +970,6 @@ impl std::fmt::Debug for TiingoEodMappingInput<'_> {
             .field("request", self.response.evidence().request())
             .field("instrument", self.instrument)
             .field("contract", self.contract)
-            .field("bar_time_authority", &"[REVOCABLE AUTHORITY]")
             .field("ingested_at", &self.ingested_at)
             .finish()
     }
@@ -1621,6 +1590,9 @@ fn expected_session_evidence_identity(
     resolved_at: Timestamp,
     resolution_receipt: EvidenceDigest,
     expected_sessions: &[CalendarDate],
+    origin_content_digest: EvidenceDigest,
+    capture_binding_digest: EvidenceDigest,
+    relationship_digest: EvidenceDigest,
 ) -> EvidenceDigest {
     let mut hasher = Sha256::new();
     append_field(
@@ -1649,6 +1621,9 @@ fn expected_session_evidence_identity(
     append_field(&mut hasher, &resolved_at.unix_nanos().to_be_bytes());
     append_evidence_digest(&mut hasher, resolution_receipt);
     append_dates(&mut hasher, expected_sessions);
+    append_evidence_digest(&mut hasher, origin_content_digest);
+    append_evidence_digest(&mut hasher, capture_binding_digest);
+    append_evidence_digest(&mut hasher, relationship_digest);
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
@@ -1672,6 +1647,9 @@ fn validate_expected_session_evidence(
         evidence.resolved_at(),
         evidence.resolution_receipt(),
         evidence.expected_sessions(),
+        evidence.origin_content_digest(),
+        evidence.capture_binding_digest(),
+        evidence.relationship().relationship_digest(),
     );
     if evidence.request_identity() != request.request_identity()
         || evidence
@@ -1683,6 +1661,10 @@ fn validate_expected_session_evidence(
         || evidence.calendar_available_at().unix_nanos() < 0
         || evidence.resolved_at() < evidence.calendar_available_at()
         || evidence.resolution_receipt().bytes() == [0; 32]
+        || evidence.origin_content_digest().bytes() == [0; 32]
+        || evidence.capture_binding_digest().bytes() == [0; 32]
+        || evidence.relationship().target_venue() != request.venue_id()
+        || evidence.relationship().requested_dates() != (request.start_date(), request.end_date())
         || evidence.expected_sessions().len() > inclusive_calendar_days
         || evidence
             .expected_sessions()
@@ -1853,7 +1835,7 @@ pub fn map_eod_page_candidate(
         if !coverage.contains(row.date()) {
             return Err(TiingoEodMapError::OutsideMetadataCoverage);
         }
-        let time_semantics = resolve_time(&input, row.date())?;
+        let time_semantics = nominal_time(row)?;
         map_surface(
             &input,
             row,
@@ -2091,7 +2073,11 @@ fn validate_capture(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodMa
     let expected_dataset = match request.endpoint() {
         TiingoEndpointFamily::LatestDailyPrices => TIINGO_LATEST_DATASET,
         TiingoEndpointFamily::HistoricalDailyPrices => TIINGO_HISTORY_DATASET,
-        TiingoEndpointFamily::Metadata => return Err(TiingoEodMapError::WrongResponseFamily),
+        TiingoEndpointFamily::Metadata
+        | TiingoEndpointFamily::CorporateActionDistributions
+        | TiingoEndpointFamily::CorporateActionSplits => {
+            return Err(TiingoEodMapError::WrongResponseFamily);
+        }
     };
     if capture.pages().len() != 1
         || capture.source_id() != input.contract.source_id()
@@ -2220,24 +2206,13 @@ fn validate_response(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEodM
     Ok(())
 }
 
-fn resolve_time(
-    input: &TiingoEodMappingInput<'_>,
-    provider_date: CalendarDate,
-) -> Result<BarTimeSemantics, TiingoEodMapError> {
-    input.bar_time_authority.validate_current()?;
-    let request = TiingoEodBarTimeRequest {
-        instrument_id: input.instrument.instrument_id(),
-        venue_id: input.instrument.venue_id().clone(),
-        provider_instrument_id: input.instrument.provider_instrument_id().clone(),
-        ticker: input.instrument.ticker().clone(),
-        provider_date,
-    };
-    let semantics = input.bar_time_authority.resolve(&request)?;
-    input.bar_time_authority.validate_current()?;
-    if semantics.period_end_exclusive() > input.response.evidence().received_at() {
-        return Err(TiingoEodMapError::InvalidTimeAuthority);
-    }
-    Ok(semantics)
+pub(crate) fn nominal_time(row: &TiingoEodRow) -> Result<BarTimeSemantics, TiingoEodMapError> {
+    BarTimeSemantics::try_nominal_daily_date(
+        row.date(),
+        SourceIdentifier::try_from("tiingo-eod-native-nominal-date-v1")
+            .map_err(|_| TiingoEodMapError::InvalidCandidateIdentity)?,
+        ExactPayloadEvidence::from_content_digest(row.row_digest()),
+    ).map_err(|_| TiingoEodMapError::InvalidCandidateEvidence)
 }
 
 fn map_surface(
@@ -2377,38 +2352,12 @@ fn eod_bar_semantic_identity(
     );
     append_field(&mut hasher, feed.as_str().as_bytes());
     append_field(&mut hasher, interval.as_str().as_bytes());
-    append_field(
-        &mut hasher,
-        &time_semantics.period_start().unix_nanos().to_be_bytes(),
-    );
-    append_field(
-        &mut hasher,
-        &time_semantics
-            .period_end_exclusive()
-            .unix_nanos()
-            .to_be_bytes(),
-    );
-    append_field(
-        &mut hasher,
-        &[match time_semantics.timestamp_basis() {
-            BarTimestampBasis::PeriodStart => 0,
-            BarTimestampBasis::PeriodEnd => 1,
-        }],
-    );
-    append_field(
-        &mut hasher,
-        &[match time_semantics.session().kind() {
-            MarketBarSessionKind::Regular => 0,
-            MarketBarSessionKind::Extended => 1,
-            MarketBarSessionKind::Continuous => 2,
-            MarketBarSessionKind::ProviderDefined => 3,
-        }],
-    );
-    append_field(
-        &mut hasher,
-        time_semantics.session().ruleset().as_str().as_bytes(),
-    );
-    append_evidence_digest(&mut hasher, time_semantics.session().evidence());
+    if let Some(nominal) = time_semantics.nominal_daily_date() {
+        append_field(&mut hasher, b"nominal_daily_date");
+        append_field(&mut hasher, nominal.date().to_string().as_bytes());
+        append_field(&mut hasher, nominal.ruleset().as_str().as_bytes());
+        append_evidence_digest(&mut hasher, nominal.evidence().content_digest());
+    }
     append_field(&mut hasher, &[adjustment_discriminant(adjustment)]);
     append_field(&mut hasher, ohlc[0].currency().as_str().as_bytes());
     for value in ohlc {
@@ -2456,9 +2405,6 @@ pub enum TiingoEodMapError {
     /// A returned row fell outside the exact non-null metadata coverage interval.
     #[error("Tiingo EOD row is outside admitted metadata coverage")]
     OutsideMetadataCoverage,
-    /// The independently governed session/calendar authority was invalid or revoked.
-    #[error("Tiingo EOD time authority is unavailable or inconsistent")]
-    InvalidTimeAuthority,
     /// Exact calendar revision, request binding, expected-session ordering, or currentness failed.
     #[error("Tiingo EOD expected-session evidence is unavailable or inconsistent")]
     InvalidExpectedSessionEvidence,

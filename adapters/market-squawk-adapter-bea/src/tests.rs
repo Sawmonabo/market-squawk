@@ -77,8 +77,26 @@ fn metadata_and_data_contract_preserves_exact_dimensions_values_notes_and_counts
         crate::BeaParseLimits::production_defaults(),
     )?;
     assert_eq!(data.observations().len(), 2);
-    assert_eq!(data.observations()[0].identity().table(), Some("SAINC1"));
-    assert_eq!(data.observations()[0].identity().line(), Some("CAINC1-3"));
+    assert_eq!(data.observations()[0].identity().table(), Some("CAINC1"));
+    assert_eq!(data.observations()[0].identity().line(), Some("3"));
+    assert_eq!(
+        data.observations()[0]
+            .identity()
+            .dimensions()
+            .get("Code")
+            .map(String::as_str),
+        Some("CAINC1-3")
+    );
+    let wrong_line = String::from_utf8(response.clone())?.replace("CAINC1-3", "CAINC1-2");
+    assert!(matches!(
+        parse_data_page(
+            wrong_line.as_bytes(),
+            &data_request,
+            &user_id,
+            crate::BeaParseLimits::production_defaults(),
+        ),
+        Err(BeaError::InvalidField("Regional Code"))
+    ));
     assert_eq!(
         data.observations()[0].value().observed(),
         Some("45359".parse::<Decimal>()?)
@@ -172,7 +190,7 @@ fn data_request(
     parameters.insert(BeaParameterIdentity::try_new("LineCode")?, "3".to_owned());
     parameters.insert(
         BeaParameterIdentity::try_new("TableName")?,
-        "SAINC1".to_owned(),
+        "CAINC1".to_owned(),
     );
     parameters.insert(BeaParameterIdentity::try_new("Year")?, "2014".to_owned());
     BeaQuery::data(dataset, parameters, generation)?.single_page(expected_rows)
@@ -191,14 +209,14 @@ fn data_response(
                 {"ParameterName": "DATASETNAME", "ParameterValue": "REGIONAL"},
                 {"ParameterName": "GEOFIPS", "ParameterValue": "DE"},
                 {"ParameterName": "LINECODE", "ParameterValue": "3"},
-                {"ParameterName": "TABLENAME", "ParameterValue": "SAINC1"},
+                {"ParameterName": "TABLENAME", "ParameterValue": "CAINC1"},
                 {"ParameterName": "YEAR", "ParameterValue": "2014"},
                 {"ParameterName": "RESULTFORMAT", "ParameterValue": "JSON"}
             ]},
             "Results": {
                 "Statistic": "Per capita personal income",
                 "UnitOfMeasure": "Dollars",
-                "PublicTable": "SAINC1 State annual personal income summary",
+                "PublicTable": "CAINC1 County annual personal income summary",
                 "UTCProductionTime": production_time,
                 "NoteRef": "2",
                 "Dimensions": [

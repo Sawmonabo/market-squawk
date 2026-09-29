@@ -5,6 +5,13 @@
 //! and the source-qualified official row for the same asset family. A ticker, display name, or
 //! fuzzy match can never create the relationship.
 
+mod find;
+pub(crate) use find::{
+    FindPopulationCoverage, FindPopulationExclusion, FindPopulationExclusionReason,
+    FindPopulationReference, PreparedFindCandidate, PreparedFindPopulation,
+    prepare_find_population, prepare_fixed_current_population, read_find_population,
+};
+
 use std::fmt;
 use std::time::Instant;
 
@@ -171,6 +178,7 @@ impl InstrumentContextRequest {
 }
 
 /// Read-only composition of canonical identity and official-directory authorities.
+#[derive(Clone)]
 pub(crate) struct InstrumentContextReadCapability {
     identity: InstrumentIdentityReadCapability,
     listings: ListingReferenceReadCapability,
@@ -638,6 +646,18 @@ impl InstrumentContextRead {
 
     pub(crate) const fn outcome(&self) -> &InstrumentContextOutcome {
         &self.outcome
+    }
+
+    /// Borrows the original canonical source record from this exact completed identity read.
+    /// Missing or ambiguous outcomes cannot supply a listing to source preparation.
+    pub(crate) fn canonical_record(&self) -> Option<&market_squawk_data::MarketDataInstrumentRecord> {
+        let InstrumentContextOutcome::Exact(context) = &self.outcome else {
+            return None;
+        };
+        let [record] = self.evidence.definition.records() else {
+            return None;
+        };
+        (record.definition().instrument_id() == context.instrument_id()).then_some(record)
     }
 }
 

@@ -27,6 +27,10 @@ use market_squawk_sources::{
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::config::{
+    KRAKEN_BOOK_CHANNEL, KRAKEN_PRODUCT, KRAKEN_PROVIDER, KRAKEN_TRADE_CHANNEL,
+    KrakenNativeMarketCoordinates,
+};
 use crate::decoder::{KrakenPublicationContext, KrakenPublicationDecodeOutcome};
 use crate::{
     KrakenBookTransition, KrakenChannel, KrakenChecksumAvailability, KrakenConfig,
@@ -34,8 +38,6 @@ use crate::{
     KrakenSequenceAvailability, KrakenSubscriptionAcknowledgementEvidence,
     KrakenSubscriptionRequestEvidence,
 };
-
-const KRAKEN_VENUE: &str = "kraken";
 
 /// Explicit reason a sealed Kraken frame produced no market observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +74,7 @@ pub enum KrakenPublicationUnavailable {
 /// Immutable value evidence shared by every state of one Kraken publication handoff.
 #[derive(Debug)]
 pub struct KrakenPublicationEvidence {
+    native_coordinates: KrakenNativeMarketCoordinates,
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     dataset: SourceIdentifier,
@@ -98,6 +101,11 @@ pub struct KrakenPublicationEvidence {
 }
 
 impl KrakenPublicationEvidence {
+    /// Returns the exact selected provider identity, venue mapping, and common validity window.
+    pub const fn native_coordinates(&self) -> &KrakenNativeMarketCoordinates {
+        &self.native_coordinates
+    }
+
     /// Returns the exact source authority identity.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
@@ -512,6 +520,7 @@ impl KrakenSealedMarketPublicationMaterial {
     /// The common decoder supplies the exact closed decoded-graph charge. Provider-native rows,
     /// sidecar bytes, and application evidence retained after sealing are added here.
     pub fn conservative_retained_bytes(&self) -> Option<usize> {
+        let coordinates = &self.evidence.native_coordinates;
         let native_slots = size_of::<Bytes>().checked_mul(self.native_rows.len())?;
         let native_bytes = self
             .native_rows
@@ -532,6 +541,37 @@ impl KrakenSealedMarketPublicationMaterial {
             self.evidence.venue.retained_bytes(),
             self.evidence.provider_symbol.capacity(),
             self.evidence.session_id.retained_bytes(),
+            coordinates.source_id().retained_bytes(),
+            coordinates
+                .source_metadata_revision()
+                .as_source_identifier()
+                .retained_bytes(),
+            coordinates
+                .provider_identity_key()
+                .source_id()
+                .retained_bytes(),
+            coordinates
+                .provider_identity_key()
+                .provider_instrument_id()
+                .retained_bytes(),
+            coordinates
+                .provider_identity_revision()
+                .as_source_identifier()
+                .retained_bytes(),
+            coordinates
+                .reference_revision()
+                .as_source_identifier()
+                .retained_bytes(),
+            coordinates.venue().retained_bytes(),
+            coordinates.venue_symbol().retained_bytes(),
+            coordinates
+                .provider_product()
+                .as_source_identifier()
+                .retained_bytes(),
+            coordinates
+                .provider_channel()
+                .as_source_identifier()
+                .retained_bytes(),
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)?;
@@ -647,7 +687,7 @@ fn validate_committed_row(
         || binding.provider_product().as_source_identifier() != &evidence.provider_product
         || binding.provider_channel().as_source_identifier() != &evidence.feed
         || binding.venue_id() != &evidence.venue
-        || binding.instrument_id() != evidence.instrument_id
+        || binding.instrument_id() != Some(evidence.instrument_id)
         || binding.connection_generation() != evidence.connection_generation
         || committed.connection_generation() != evidence.connection_generation
         || committed
@@ -664,6 +704,17 @@ fn validate_committed_row(
         || provenance.ingested_at() < provenance.available_at()
         || normalized.venue() != &evidence.venue
         || normalized.instrument() != evidence.instrument_id
+        || normalized.native_identity().namespace()
+            != evidence
+                .native_coordinates
+                .provider_identity_key()
+                .source_id()
+        || normalized.native_identity().provider_instrument_id()
+            != evidence
+                .native_coordinates
+                .provider_identity_key()
+                .provider_instrument_id()
+        || normalized.native_identity().venue_symbol() != evidence.native_coordinates.venue_symbol()
         || event_class(event) != normalized.event_class()
         || event_depth(event) != normalized.depth()
         || event_sequence(event).is_some()
@@ -693,6 +744,11 @@ fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
     match event {
         MarketEvent::Trade(value) => value.provenance(),
         MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::MarketDataQuote(value) => value.provenance(),
+        MarketEvent::MarketDataTrade(value) => value.provenance(),
+        MarketEvent::MarketDataBook(value) => value.provenance(),
+        MarketEvent::MarketDataChart(value) => value.provenance(),
+        MarketEvent::MarketDataScreener(value) => value.provenance(),
         MarketEvent::BookSnapshot(value) => value.provenance(),
         MarketEvent::BookDelta(value) => value.provenance(),
         MarketEvent::Auction(value) => value.provenance(),
@@ -704,10 +760,14 @@ fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
 
 fn event_class(event: &MarketEvent) -> LiveEventClass {
     match event {
-        MarketEvent::Trade(_) => LiveEventClass::Trade,
-        MarketEvent::Quote(_) => LiveEventClass::Quote,
-        MarketEvent::BookSnapshot(_) => LiveEventClass::BookSnapshot,
+        MarketEvent::Trade(_) | MarketEvent::MarketDataTrade(_) => LiveEventClass::Trade,
+        MarketEvent::Quote(_) | MarketEvent::MarketDataQuote(_) => LiveEventClass::Quote,
+        MarketEvent::MarketDataBook(_) | MarketEvent::BookSnapshot(_) => {
+            LiveEventClass::BookSnapshot
+        }
         MarketEvent::BookDelta(_) => LiveEventClass::BookDelta,
+        MarketEvent::MarketDataChart(_) => LiveEventClass::Chart,
+        MarketEvent::MarketDataScreener(_) => LiveEventClass::Screener,
         MarketEvent::Auction(_) => LiveEventClass::Auction,
         MarketEvent::TradingHalt(_) => LiveEventClass::TradingHalt,
         MarketEvent::InstrumentStatus(_) => LiveEventClass::InstrumentStatus,
@@ -719,6 +779,7 @@ fn event_depth(event: &MarketEvent) -> Option<MarketDepth> {
     match event {
         MarketEvent::BookSnapshot(value) => Some(value.depth()),
         MarketEvent::BookDelta(value) => Some(value.depth()),
+        MarketEvent::MarketDataBook(_) => Some(MarketDepth::PriceLevel),
         _ => None,
     }
 }
@@ -753,6 +814,11 @@ fn validate_capture(
         .coverage()
         .live()
         .ok_or(KrakenPublicationError::InvalidMarketEvidence)?;
+    let channel = config.channel();
+    let (retained_depth, expected_feed) = match channel {
+        KrakenChannel::Book(depth) => (Some(depth), KRAKEN_BOOK_CHANNEL),
+        KrakenChannel::Trades => (None, KRAKEN_TRADE_CHANNEL),
+    };
     if capture.receipt().frames().len() != 1
         || capture.records().len() != 1
         || raw.transport() != TransportFrameKind::Text
@@ -766,20 +832,14 @@ fn validate_capture(
         || raw_receipt.source_sequence().is_some()
         || raw_record.payload() != raw.payload()
         || available_at < raw.received_at()
-        || live.provider_product().as_source_identifier().as_str() != "kraken-spot"
-        || !matches!(
-            live.provider_channel().as_source_identifier().as_str(),
-            "book-v2" | "trade-v2"
-        )
+        || !config
+            .native_coordinates()
+            .matches_surface(metadata, channel)
+        || !config
+            .native_coordinates()
+            .is_selected_at(raw.received_at())
     {
         return Err(KrakenPublicationError::InvalidCapture);
-    }
-    let (retained_depth, expected_feed) = match config.channel() {
-        KrakenChannel::Book(depth) => (Some(depth), "book-v2"),
-        KrakenChannel::Trades => (None, "trade-v2"),
-    };
-    if live.provider_channel().as_source_identifier().as_str() != expected_feed {
-        return Err(KrakenPublicationError::InvalidMarketEvidence);
     }
     let (
         subscription_request_id,
@@ -788,7 +848,8 @@ fn validate_capture(
         continuity,
     ) = match context {
         Some(context) => {
-            let (connection, instrument, acknowledgement, continuity) = context.into_parts();
+            let (connection, native_coordinates, instrument, acknowledgement, continuity) =
+                context.into_parts();
             let KrakenSubscriptionRequestEvidence::PublicExact {
                 request_id,
                 payload,
@@ -803,13 +864,15 @@ fn validate_capture(
             let expected_payload =
                 crate::config::public_subscription_payload(config.symbol(), config.channel())
                     .map_err(|_| KrakenPublicationError::InvalidMarketEvidence)?;
-            if connection.provider().as_str() != KRAKEN_VENUE
-                || connection.venue().as_str() != KRAKEN_VENUE
+            if connection.provider().as_str() != KRAKEN_PROVIDER
+                || connection.venue().as_str() != KRAKEN_PROVIDER
+                || connection.native_coordinates() != Some(native_coordinates.as_ref())
+                || native_coordinates.as_ref() != config.native_coordinates()
                 || connection
                     .provider_product()
                     .as_source_identifier()
                     .as_str()
-                    != "kraken-spot"
+                    != KRAKEN_PRODUCT
                 || connection
                     .provider_channel()
                     .as_source_identifier()
@@ -817,8 +880,13 @@ fn validate_capture(
                     != expected_feed
                 || *channel != config.channel()
                 || instrument.native_symbol().as_str() != config.symbol()
+                || instrument.provider_identity_key()
+                    != config.native_coordinates().provider_identity_key()
+                || instrument.venue_mapping() != config.native_coordinates().venue_mapping()
                 || instrument.externally_resolved_instrument() != config.instrument()
                 || instrument_binding.native_symbol() != instrument.native_symbol()
+                || instrument_binding.provider_identity_key() != instrument.provider_identity_key()
+                || instrument_binding.venue_mapping() != instrument.venue_mapping()
                 || instrument_binding.externally_resolved_instrument()
                     != instrument.externally_resolved_instrument()
                 || payload.as_bytes() != expected_payload.as_bytes()
@@ -842,14 +910,14 @@ fn validate_capture(
         None => (None, None, None, None),
     };
     Ok(KrakenPublicationEvidence {
+        native_coordinates: config.native_coordinates().clone(),
         source_id: raw.source_id().clone(),
         metadata_revision: raw.metadata_revision().clone(),
         dataset: receipt.dataset().clone(),
         stream_identity: receipt.stream_identity().clone(),
         provider_product: live.provider_product().as_source_identifier().clone(),
         feed: live.provider_channel().as_source_identifier().clone(),
-        venue: VenueId::try_from(KRAKEN_VENUE)
-            .map_err(|_| KrakenPublicationError::InvalidMarketEvidence)?,
+        venue: config.native_coordinates().venue().clone(),
         provider_symbol: config.symbol().to_owned(),
         instrument_id: config.instrument(),
         retained_depth,
@@ -873,26 +941,26 @@ fn continuity_matches_config(
     continuity: Option<KrakenMarketContinuity>,
     channel: KrakenChannel,
 ) -> bool {
-    match (continuity, channel) {
-        (None, _) => true,
-        (
-            Some(KrakenMarketContinuity::PriceLevelBook {
-                checksum: KrakenChecksumAvailability::Validated(_),
-                sequence: KrakenSequenceAvailability::ProviderUnsupported,
-                ..
-            }),
-            KrakenChannel::Book(_),
-        ) => true,
-        (
-            Some(KrakenMarketContinuity::Trades {
-                checksum: KrakenChecksumAvailability::Unsupported,
-                sequence: KrakenSequenceAvailability::ProviderUnsupported,
-                ..
-            }),
-            KrakenChannel::Trades,
-        ) => true,
-        _ => false,
-    }
+    matches!(
+        (continuity, channel),
+        (None, _)
+            | (
+                Some(KrakenMarketContinuity::PriceLevelBook {
+                    checksum: KrakenChecksumAvailability::Validated(_),
+                    sequence: KrakenSequenceAvailability::ProviderUnsupported,
+                    ..
+                }),
+                KrakenChannel::Book(_),
+            )
+            | (
+                Some(KrakenMarketContinuity::Trades {
+                    checksum: KrakenChecksumAvailability::Unsupported,
+                    sequence: KrakenSequenceAvailability::ProviderUnsupported,
+                    ..
+                }),
+                KrakenChannel::Trades,
+            )
+    )
 }
 
 fn validate_disposition(
@@ -906,8 +974,22 @@ fn validate_disposition(
         return Err(KrakenPublicationError::InvalidMarketEvidence);
     }
     for observation in observations {
-        if observation.venue().as_str() != KRAKEN_VENUE
+        if observation.venue().as_str() != KRAKEN_PROVIDER
             || observation.instrument() != config.instrument()
+            || observation.native_identity().namespace()
+                != config
+                    .native_coordinates()
+                    .provider_identity_key()
+                    .source_id()
+            || observation.native_identity().provider_instrument_id()
+                != config
+                    .native_coordinates()
+                    .provider_identity_key()
+                    .provider_instrument_id()
+            || observation.native_identity().venue_symbol()
+                != config.native_coordinates().venue_symbol()
+            || observation_timestamp(observation)
+                .is_none_or(|timestamp| !config.native_coordinates().is_valid_at(timestamp))
         {
             return Err(KrakenPublicationError::InvalidMarketEvidence);
         }
@@ -984,8 +1066,20 @@ struct KrakenNativeRowV1<'a> {
     provider_product: &'a str,
     feed: &'a str,
     provider_symbol: &'a str,
+    provider_instrument_id: &'a str,
+    provider_identity_revision: &'a str,
+    provider_identity_digest: EvidenceDigest,
     venue: &'a str,
     instrument_id: InstrumentId,
+    reference_revision: &'a str,
+    reference_payload_digest: EvidenceDigest,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_published_at: Timestamp,
+    reference_selection_digest: EvidenceDigest,
+    identity_selected_at: Timestamp,
+    identity_valid_from: Timestamp,
+    identity_valid_until: Option<Timestamp>,
     generation_frame_ordinal: u64,
     microbatch_frame_ordinal: u16,
     provider_row_ordinal: u32,
@@ -1058,12 +1152,27 @@ struct KrakenNativeBatchSidecarV1<'a> {
     family: &'static str,
     source_id: &'a str,
     metadata_revision: &'a str,
+    source_metadata_digest: EvidenceDigest,
     dataset: &'a str,
     stream_identity: &'a str,
     provider_product: &'a str,
     feed: &'a str,
     provider_symbol: &'a str,
+    provider_identity_source: &'a str,
+    provider_instrument_id: &'a str,
+    provider_identity_revision: &'a str,
+    provider_identity_digest: EvidenceDigest,
     venue: &'a str,
+    instrument_id: InstrumentId,
+    reference_revision: &'a str,
+    reference_payload_digest: EvidenceDigest,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_published_at: Timestamp,
+    reference_selection_digest: EvidenceDigest,
+    identity_selected_at: Timestamp,
+    identity_valid_from: Timestamp,
+    identity_valid_until: Option<Timestamp>,
     retained_depth: Option<usize>,
     session_id: &'a str,
     connection_generation: u64,
@@ -1106,18 +1215,40 @@ fn native_material(
     observations: &[ProviderNormalizedObservation],
     evidence: &KrakenPublicationEvidence,
 ) -> Result<(Box<[Bytes]>, Bytes), KrakenPublicationError> {
+    let coordinates = &evidence.native_coordinates;
     let mut rows = Vec::new();
     rows.try_reserve_exact(observations.len())
         .map_err(|_| KrakenPublicationError::NativeEncoding)?;
     for (ordinal, observation) in observations.iter().enumerate() {
         let row = KrakenNativeRowV1 {
             version: 1,
-            provider: KRAKEN_VENUE,
+            provider: KRAKEN_PROVIDER,
             provider_product: evidence.provider_product.as_str(),
             feed: evidence.feed.as_str(),
             provider_symbol: &evidence.provider_symbol,
+            provider_instrument_id: coordinates
+                .provider_identity_key()
+                .provider_instrument_id()
+                .as_str(),
+            provider_identity_revision: coordinates
+                .provider_identity_revision()
+                .as_source_identifier()
+                .as_str(),
+            provider_identity_digest: coordinates.provider_identity_digest(),
             venue: evidence.venue.as_str(),
             instrument_id: evidence.instrument_id,
+            reference_revision: coordinates
+                .reference_revision()
+                .as_source_identifier()
+                .as_str(),
+            reference_payload_digest: coordinates.reference_payload_digest(),
+            definition_revision_digest: coordinates.definition_revision_digest(),
+            definition_revision_sequence: coordinates.definition_revision_sequence(),
+            definition_published_at: coordinates.definition_published_at(),
+            reference_selection_digest: coordinates.reference_selection_digest(),
+            identity_selected_at: coordinates.selected_at(),
+            identity_valid_from: coordinates.valid_from(),
+            identity_valid_until: coordinates.valid_until(),
             generation_frame_ordinal: evidence.generation_frame_ordinal,
             microbatch_frame_ordinal: evidence.microbatch_frame_ordinal,
             provider_row_ordinal: u32::try_from(ordinal)
@@ -1178,12 +1309,36 @@ fn native_material(
         family: "kraken.spot.public-market-event",
         source_id: evidence.source_id.as_str(),
         metadata_revision: evidence.metadata_revision.as_source_identifier().as_str(),
+        source_metadata_digest: coordinates.source_metadata_digest(),
         dataset: evidence.dataset.as_str(),
         stream_identity: evidence.stream_identity.as_str(),
         provider_product: evidence.provider_product.as_str(),
         feed: evidence.feed.as_str(),
         provider_symbol: &evidence.provider_symbol,
+        provider_identity_source: coordinates.provider_identity_key().source_id().as_str(),
+        provider_instrument_id: coordinates
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        provider_identity_revision: coordinates
+            .provider_identity_revision()
+            .as_source_identifier()
+            .as_str(),
+        provider_identity_digest: coordinates.provider_identity_digest(),
         venue: evidence.venue.as_str(),
+        instrument_id: evidence.instrument_id,
+        reference_revision: coordinates
+            .reference_revision()
+            .as_source_identifier()
+            .as_str(),
+        reference_payload_digest: coordinates.reference_payload_digest(),
+        definition_revision_digest: coordinates.definition_revision_digest(),
+        definition_revision_sequence: coordinates.definition_revision_sequence(),
+        definition_published_at: coordinates.definition_published_at(),
+        reference_selection_digest: coordinates.reference_selection_digest(),
+        identity_selected_at: coordinates.selected_at(),
+        identity_valid_from: coordinates.valid_from(),
+        identity_valid_until: coordinates.valid_until(),
         retained_depth: evidence.retained_depth.map(KrakenDepth::get),
         session_id: evidence.session_id.as_str(),
         connection_generation: evidence.connection_generation.get(),

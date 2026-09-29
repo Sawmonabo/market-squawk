@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, InstrumentId, LiveEventClass, MarketEvent, SourceId,
-    SourceIdentifier, Timestamp, VenueId,
+    DigestAlgorithm, EvidenceDigest, InstrumentId, LiveEventClass, LiveEvidenceScope, MarketEvent,
+    ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -17,7 +17,7 @@ use crate::{
 };
 
 const SELECTION_DIGEST_DOMAIN: &[u8] =
-    b"market-squawk/provider-market-event-point-in-time-selection/v1";
+    b"market-squawk/provider-market-event-point-in-time-selection/v2";
 
 /// Maximum exact event rows one point-in-time request may retain across source surfaces.
 pub const MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES: usize = 256;
@@ -35,7 +35,7 @@ pub enum ProviderMarketEventEffectiveTimeBasis {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMarketEventPointInTimeRequest {
     dataset: DatasetId,
-    instrument_id: InstrumentId,
+    scope: LiveEvidenceScope,
     venue_id: VenueId,
     event_kind: LiveEventClass,
     as_of_cutoff: Timestamp,
@@ -44,6 +44,8 @@ pub struct ProviderMarketEventPointInTimeRequest {
     maximum_candidates: usize,
     exact_manifest: Option<DatasetManifestRef>,
     exact_source_surface: Option<SourceId>,
+    exact_product: Option<ProviderProduct>,
+    exact_channel: Option<ProviderChannel>,
 }
 
 impl ProviderMarketEventPointInTimeRequest {
@@ -124,6 +126,119 @@ impl ProviderMarketEventPointInTimeRequest {
         exact_manifest: Option<DatasetManifestRef>,
         exact_source_surface: Option<SourceId>,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
+        if event_kind == LiveEventClass::Screener {
+            return Err(ProviderMarketEventSelectionError::InvalidRequest);
+        }
+        Self::try_scoped(
+            dataset,
+            LiveEvidenceScope::Instrument(instrument_id),
+            venue_id,
+            event_kind,
+            as_of_cutoff,
+            knowledge_cutoff,
+            effective_time_basis,
+            maximum_candidates,
+            exact_manifest,
+            exact_source_surface,
+            None,
+            None,
+        )
+    }
+
+    /// Selects one exact source cohort from the newest eligible immutable generation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact cohort scope and bounds are mandatory"
+    )]
+    pub fn try_cohort_latest(
+        dataset: DatasetId,
+        cohort_key: SourceIdentifier,
+        venue_id: VenueId,
+        source: SourceId,
+        product: ProviderProduct,
+        channel: ProviderChannel,
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
+        maximum_candidates: usize,
+    ) -> Result<Self, ProviderMarketEventSelectionError> {
+        Self::try_scoped(
+            dataset,
+            LiveEvidenceScope::SourceCohort(cohort_key),
+            venue_id,
+            LiveEventClass::Screener,
+            as_of_cutoff,
+            knowledge_cutoff,
+            effective_time_basis,
+            maximum_candidates,
+            None,
+            Some(source),
+            Some(product),
+            Some(channel),
+        )
+    }
+
+    /// Pins an exact source cohort to an immutable manifest, including genuinely empty cohorts.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact cohort scope and bounds are mandatory"
+    )]
+    pub fn try_cohort_exact(
+        dataset: DatasetId,
+        cohort_key: SourceIdentifier,
+        venue_id: VenueId,
+        source: SourceId,
+        product: ProviderProduct,
+        channel: ProviderChannel,
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
+        maximum_candidates: usize,
+        exact_manifest: DatasetManifestRef,
+    ) -> Result<Self, ProviderMarketEventSelectionError> {
+        Self::try_scoped(
+            dataset,
+            LiveEvidenceScope::SourceCohort(cohort_key),
+            venue_id,
+            LiveEventClass::Screener,
+            as_of_cutoff,
+            knowledge_cutoff,
+            effective_time_basis,
+            maximum_candidates,
+            Some(exact_manifest),
+            Some(source),
+            Some(product),
+            Some(channel),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "closed selection identity remains atomic"
+    )]
+    fn try_scoped(
+        dataset: DatasetId,
+        scope: LiveEvidenceScope,
+        venue_id: VenueId,
+        event_kind: LiveEventClass,
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
+        maximum_candidates: usize,
+        exact_manifest: Option<DatasetManifestRef>,
+        exact_source_surface: Option<SourceId>,
+        exact_product: Option<ProviderProduct>,
+        exact_channel: Option<ProviderChannel>,
+    ) -> Result<Self, ProviderMarketEventSelectionError> {
+        if matches!(&scope, LiveEvidenceScope::SourceCohort(_))
+            != (event_kind == LiveEventClass::Screener)
+            || (matches!(&scope, LiveEvidenceScope::SourceCohort(_))
+                && (exact_source_surface.is_none()
+                    || exact_product.is_none()
+                    || exact_channel.is_none()))
+        {
+            return Err(ProviderMarketEventSelectionError::InvalidRequest);
+        }
         if maximum_candidates == 0
             || maximum_candidates > MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES
             || exact_manifest
@@ -142,7 +257,7 @@ impl ProviderMarketEventPointInTimeRequest {
         }
         Ok(Self {
             dataset,
-            instrument_id,
+            scope,
             venue_id,
             event_kind,
             as_of_cutoff,
@@ -151,6 +266,8 @@ impl ProviderMarketEventPointInTimeRequest {
             maximum_candidates,
             exact_manifest,
             exact_source_surface,
+            exact_product,
+            exact_channel,
         })
     }
 
@@ -160,8 +277,16 @@ impl ProviderMarketEventPointInTimeRequest {
     }
 
     /// Returns the internal canonical instrument identity.
-    pub const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
+    pub const fn instrument_id(&self) -> Option<InstrumentId> {
+        match &self.scope {
+            LiveEvidenceScope::Instrument(id) => Some(*id),
+            LiveEvidenceScope::SourceCohort(_) => None,
+        }
+    }
+
+    /// Returns the closed instrument or source-cohort scope.
+    pub const fn scope(&self) -> &LiveEvidenceScope {
+        &self.scope
     }
 
     /// Returns the exact venue identity.
@@ -204,21 +329,41 @@ impl ProviderMarketEventPointInTimeRequest {
         self.exact_source_surface.as_ref()
     }
 
+    /// Returns the exact cohort key; instrument requests never match a cohort.
+    pub fn cohort_key(&self) -> Option<&SourceIdentifier> {
+        match &self.scope {
+            LiveEvidenceScope::SourceCohort(key) => Some(key),
+            LiveEvidenceScope::Instrument(_) => None,
+        }
+    }
+
+    /// Returns the mandatory product of a cohort request.
+    pub const fn exact_product(&self) -> Option<&ProviderProduct> {
+        self.exact_product.as_ref()
+    }
+
+    /// Returns the mandatory channel of a cohort request.
+    pub const fn exact_channel(&self) -> Option<&ProviderChannel> {
+        self.exact_channel.as_ref()
+    }
+
     fn restart_request(
         &self,
         manifest: DatasetManifestRef,
     ) -> Result<Self, ProviderMarketEventSelectionError> {
-        Self::try_exact(
+        Self::try_scoped(
             self.dataset.clone(),
-            self.instrument_id,
+            self.scope.clone(),
             self.venue_id.clone(),
             self.event_kind,
             self.as_of_cutoff,
             self.knowledge_cutoff,
             self.effective_time_basis,
             self.maximum_candidates,
-            manifest,
+            Some(manifest),
             self.exact_source_surface.clone(),
+            self.exact_product.clone(),
+            self.exact_channel.clone(),
         )
     }
 }
@@ -268,7 +413,9 @@ pub struct ProviderMarketEventSelectionCoordinate {
     component_row_ordinal: u32,
     canonical_event_digest: EvidenceDigest,
     source_surface: SourceId,
-    instrument_id: InstrumentId,
+    provider_product: ProviderProduct,
+    provider_channel: ProviderChannel,
+    scope: LiveEvidenceScope,
     venue_id: VenueId,
     event_kind: LiveEventClass,
     source_timestamp: Option<Timestamp>,
@@ -319,8 +466,16 @@ impl ProviderMarketEventSelectionCoordinate {
     }
 
     /// Returns the internal canonical instrument identity.
-    pub const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
+    pub const fn instrument_id(&self) -> Option<InstrumentId> {
+        match &self.scope {
+            LiveEvidenceScope::Instrument(id) => Some(*id),
+            LiveEvidenceScope::SourceCohort(_) => None,
+        }
+    }
+
+    /// Returns the closed instrument or source-cohort scope.
+    pub const fn scope(&self) -> &LiveEvidenceScope {
+        &self.scope
     }
 
     /// Returns the exact venue identity.
@@ -779,7 +934,9 @@ impl ProviderMarketEventSelectedCandidate {
             canonical_event_digest: indexed.canonical_event_digest(),
             source_surface: SourceId::try_from(indexed.source_id().to_owned())
                 .map_err(|_| ProviderMarketEventSelectionError::EvidenceMismatch)?,
-            instrument_id: indexed.instrument_id(),
+            scope: indexed.scope().clone(),
+            provider_product: indexed.provider_product().clone(),
+            provider_channel: indexed.provider_channel().clone(),
             venue_id: VenueId::try_from(indexed.venue_id().to_owned())
                 .map_err(|_| ProviderMarketEventSelectionError::EvidenceMismatch)?,
             event_kind: indexed.event_kind(),
@@ -795,7 +952,15 @@ impl ProviderMarketEventSelectedCandidate {
             origin_generation_published_at: planned.origin_generation_published_at,
         };
         if !planned.matches_selected(&coordinate, request)
-            || coordinate.instrument_id != request.instrument_id
+            || coordinate.scope != request.scope
+            || request
+                .exact_product
+                .as_ref()
+                .is_some_and(|product| product != &coordinate.provider_product)
+            || request
+                .exact_channel
+                .as_ref()
+                .is_some_and(|channel| channel != &coordinate.provider_channel)
             || coordinate.venue_id != request.venue_id
             || coordinate.event_kind != request.event_kind
             || coordinate.available_at > request.knowledge_cutoff
@@ -836,7 +1001,21 @@ fn selection_digest(
     let mut hash = Sha256::new();
     hash_field(&mut hash, SELECTION_DIGEST_DOMAIN)?;
     hash_field(&mut hash, request.dataset.as_str().as_bytes())?;
-    hash.update(request.instrument_id.as_uuid().as_bytes());
+    hash_scope(&mut hash, &request.scope)?;
+    hash_optional_text(
+        &mut hash,
+        request
+            .exact_product
+            .as_ref()
+            .map(|value| value.as_source_identifier().as_str()),
+    )?;
+    hash_optional_text(
+        &mut hash,
+        request
+            .exact_channel
+            .as_ref()
+            .map(|value| value.as_source_identifier().as_str()),
+    )?;
     hash_field(&mut hash, request.venue_id.as_str().as_bytes())?;
     hash_field(&mut hash, event_kind_name(request.event_kind).as_bytes())?;
     hash.update(request.as_of_cutoff.unix_nanos().to_be_bytes());
@@ -922,7 +1101,23 @@ fn hash_coordinate(
     hash.update(coordinate.component_row_ordinal.to_be_bytes());
     hash.update(coordinate.canonical_event_digest.bytes());
     hash_field(hash, coordinate.source_surface.as_str().as_bytes())?;
-    hash.update(coordinate.instrument_id.as_uuid().as_bytes());
+    hash_scope(hash, &coordinate.scope)?;
+    hash_field(
+        hash,
+        coordinate
+            .provider_product
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_field(
+        hash,
+        coordinate
+            .provider_channel
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
     hash_field(hash, coordinate.venue_id.as_str().as_bytes())?;
     hash_field(hash, event_kind_name(coordinate.event_kind).as_bytes())?;
     hash_optional_timestamp(hash, coordinate.source_timestamp);
@@ -1008,6 +1203,8 @@ pub(crate) const fn event_kind_name(kind: LiveEventClass) -> &'static str {
         LiveEventClass::TradingHalt => "trading_halt",
         LiveEventClass::InstrumentStatus => "instrument_status",
         LiveEventClass::CorporateAction => "corporate_action",
+        LiveEventClass::Chart => "chart",
+        LiveEventClass::Screener => "screener",
     }
 }
 
@@ -1044,4 +1241,21 @@ impl From<rusqlite::Error> for ProviderMarketEventSelectionError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Manifest(ManifestCatalogError::Sqlite(error))
     }
+}
+
+fn hash_scope(
+    hash: &mut Sha256,
+    scope: &LiveEvidenceScope,
+) -> Result<(), ProviderMarketEventSelectionError> {
+    match scope {
+        LiveEvidenceScope::Instrument(id) => {
+            hash.update([1]);
+            hash.update(id.as_uuid().as_bytes());
+        }
+        LiveEvidenceScope::SourceCohort(key) => {
+            hash.update([2]);
+            hash_field(hash, key.as_str().as_bytes())?;
+        }
+    }
+    Ok(())
 }

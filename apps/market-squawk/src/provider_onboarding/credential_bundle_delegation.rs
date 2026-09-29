@@ -59,7 +59,7 @@ const IEX_HIST_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 const BLS_REGISTERED_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "bls.v2-registered",
     capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    release_state: ProfileReleaseState::Available,
 };
 const BEA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "bea.api-data",
@@ -68,8 +68,8 @@ const BEA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 };
 const CENSUS_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "census.data-api",
-    capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    capability_revision: 1,
+    release_state: ProfileReleaseState::RightsLimited,
 };
 const EIA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "eia.api-v2",

@@ -988,7 +988,9 @@ fn validate_capture(input: &TiingoFundNavMappingInput<'_>) -> Result<(), TiingoF
     let expected_dataset = match input.candidate.response_endpoint() {
         crate::TiingoEndpointFamily::LatestDailyPrices => "tiingo-daily-latest",
         crate::TiingoEndpointFamily::HistoricalDailyPrices => "tiingo-daily-history-window",
-        crate::TiingoEndpointFamily::Metadata => {
+        crate::TiingoEndpointFamily::Metadata
+        | crate::TiingoEndpointFamily::CorporateActionDistributions
+        | crate::TiingoEndpointFamily::CorporateActionSplits => {
             return Err(TiingoFundNavMapError::CaptureMismatch);
         }
     };

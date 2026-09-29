@@ -141,6 +141,9 @@ fn fair_value_evidence_value(evidence: &FairValueEvidence) -> Value {
 
 fn origin_value(origin: &EvidenceOrigin) -> Value {
     match origin {
+        EvidenceOrigin::PublishedMarket { .. } => {
+            json!({"kind": "published_market", "label": "Published market observation"})
+        }
         EvidenceOrigin::Market { venue_id, .. } => json!({
             "kind": "live",
             "label": "Current market",
@@ -157,6 +160,37 @@ fn origin_value(origin: &EvidenceOrigin) -> Value {
         EvidenceOrigin::Portfolio { .. } => json!({
             "kind": "portfolio",
             "label": "Portfolio position",
+        }),
+        EvidenceOrigin::Fundamental { .. } => json!({
+            "kind": "fundamental",
+            "label": "Published company fundamental",
+        }),
+        EvidenceOrigin::ForecastDistribution { evidence } => json!({
+            "kind": "forecast_distribution",
+            "label": match evidence.selection() {
+                market_squawk_valuation::ForecastValuationValueSelection::FinancialOrigin => "Published financial source amount",
+                market_squawk_valuation::ForecastValuationValueSelection::ConditionalMean => "Modeled financial center",
+                market_squawk_valuation::ForecastValuationValueSelection::Outcome(_) => "Modeled forecast outcome",
+            },
+            "targetAt": evidence.source().distribution().target_at().map(timestamp_value),
+            "financialTarget": evidence.source().distribution().financial_target(),
+            "publishedAt": timestamp_value(evidence.source().distribution().published_at()),
+        }),
+        EvidenceOrigin::AutomaticValuation { receipt } => json!({
+            "kind": "automatic_valuation",
+            "label": "Calculated valuation",
+            "method": match receipt.method() {
+                market_squawk_valuation::AutomaticValuationMethod::DiscountedCashFlow => "discounted_cash_flow",
+                market_squawk_valuation::AutomaticValuationMethod::ComparableCompanies => "comparable_companies",
+                market_squawk_valuation::AutomaticValuationMethod::ResidualIncome => "residual_income",
+                market_squawk_valuation::AutomaticValuationMethod::ForecastDistribution => "forecast_distribution",
+            },
+            "lower": amount_value(receipt.range().lower()),
+            "central": amount_value(receipt.range().central()),
+            "upper": amount_value(receipt.range().upper()),
+            "asOf": timestamp_value(receipt.measurement_at()),
+            "calculatedAt": timestamp_value(receipt.calculated_at()),
+            "expiresAt": timestamp_value(receipt.expires_at()),
         }),
     }
 }
@@ -189,6 +223,7 @@ pub(super) fn amount_value(amount: ValuationAmount) -> Value {
             ValuationAmountBasis::PerInstrumentUnit => "per_instrument_unit",
             ValuationAmountBasis::ReportingEntityTotal => "reporting_entity_total",
             ValuationAmountBasis::PositionTotal => "position_total",
+            ValuationAmountBasis::TotalCommonEquity => "total_common_equity",
         }
     })
 }

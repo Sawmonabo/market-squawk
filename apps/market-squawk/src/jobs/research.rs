@@ -1,5 +1,7 @@
 //! Durable runner adapters for application-owned research publications.
 
+mod recovery;
+
 use std::{
     collections::BTreeMap,
     fmt,
@@ -508,10 +510,13 @@ impl PhaseOneDerivedGenerationJobRunner {
             DigestAlgorithm::Sha256,
             request.build_spec_digest().digest().bytes(),
         );
-        let identity = identifier(format!(
-            "phase-one-derived-generation-request-{}",
-            encode_hex(digest.bytes())
-        ))?;
+        let contract = match &admission {
+            PhaseOneDerivedGenerationAdmission::Prepared { finalizer, .. } => {
+                Some(finalizer.contract())
+            }
+            PhaseOneDerivedGenerationAdmission::Unprepared(_) => None,
+        };
+        let identity = recovery::input_identity(request.output_dataset(), contract)?;
         let mut pending = self
             .pending
             .lock()
@@ -643,34 +648,7 @@ impl JobRunner for PhaseOneDerivedGenerationJobRunner {
                 ));
             }
         };
-        let product_admission = if let Some(finalizer) = finalizer {
-            let publisher = self
-                .production_publisher
-                .as_deref()
-                .ok_or(JobRunError::Recovery)?;
-            let (attested_at, currentness_expires_at) = post_build_attestation_window()?;
-            finalizer
-                .publish(
-                    &self.research,
-                    publisher,
-                    &request,
-                    &dataset,
-                    attested_at,
-                    currentness_expires_at,
-                    &cancellation,
-                )
-                .map_err(|_error| {
-                    failed("feature-dataset-production-finalization-failed", false)
-                })?;
-            "admitted_by_product_recipe_at_completion"
-        } else {
-            "not_admitted_by_phase_one_operation_at_completion"
-        };
-        let published = slot.take_published().or_else(|_error| {
-            context
-                .claim_terminal_publication(progressed.sequence())
-                .map(market_squawk_jobs::JobTerminalPublicationPermit::seal)
-        })?;
+        let product_contract = finalizer.as_ref().map(|value| value.contract());
         let manifest = dataset.manifest();
         let identity = identifier(format!(
             "phase-one-derived-generation-{}",
@@ -683,28 +661,19 @@ impl JobRunner for PhaseOneDerivedGenerationJobRunner {
             .python_export()
             .map_err(|error| map_phase_one_derived_generation_error(error.into()))?
             .content_hash();
-        let result_bytes = serde_json::to_vec(&serde_json::json!({
-            "publicationStage": "phase_one_derived_generation",
-            "productAdmission": product_admission,
-            "manifest": {
-                "dataset": manifest.dataset_id().as_str(),
-                "version": manifest.manifest_version(),
-                "schema": manifest.schema().name(),
-                "schemaVersion": manifest.schema_version().get(),
-                "schemaFingerprintSha256": encode_hex(manifest.schema().fingerprint()),
-                "contentSha256": encode_hex(manifest.content_hash().bytes()),
+        let result_bytes = recovery::encode_result(
+            context.snapshot(),
+            recovery::DatasetResultView {
+                contract: product_contract,
+                manifest,
+                build_spec: dataset.build_spec_digest(),
+                policy: dataset.policy_digest(),
+                universe: dataset.universe_digest(),
+                export: phase_one_descriptor_sha256,
+                study: dataset.study_policy().copied(),
+                splits,
             },
-            "buildSpecSha256": encode_hex(dataset.build_spec_digest().digest().bytes()),
-            "policySha256": encode_hex(dataset.policy_digest().bytes()),
-            "universeSha256": encode_hex(dataset.universe_digest().bytes()),
-            "phaseOneDescriptorSha256": encode_hex(phase_one_descriptor_sha256.bytes()),
-            "splitExamples": {
-                "train": splits.train_examples(),
-                "validation": splits.validation_examples(),
-                "test": splits.test_examples(),
-            },
-        }))
-        .map_err(|_error| failed("phase-one-derived-generation-result-invalid", false))?;
+        )?;
         let artifact = self
             .artifacts
             .publish(
@@ -720,13 +689,59 @@ impl JobRunner for PhaseOneDerivedGenerationJobRunner {
             vec![artifact],
         )
         .map_err(|_error| JobRunError::Recovery)?;
+        // Finish every fallible result operation before the product receipt can commit.
+        // The artifact is merely a staged result until this exact job publishes it.
+        let published = if let Some(finalizer) = finalizer {
+            let publisher = self
+                .production_publisher
+                .as_deref()
+                .ok_or(JobRunError::Recovery)?;
+            let (attested_at, currentness_expires_at) = post_build_attestation_window()?;
+            let permit = context.claim_terminal_publication(progressed.sequence())?;
+            if finalizer
+                .publish(
+                    &self.research,
+                    publisher,
+                    &request,
+                    &dataset,
+                    attested_at,
+                    currentness_expires_at,
+                    &cancellation,
+                )
+                .is_err()
+            {
+                // Resolve this exact build before declaring a potentially committed write failed.
+                match recovery::published_result(self, context.snapshot()).await {
+                    Ok(Some(published)) if published == result => {}
+                    Ok(None) => {
+                        return Err(failed(
+                            "feature-dataset-production-finalization-failed",
+                            false,
+                        ));
+                    }
+                    Ok(Some(_)) | Err(_) => {
+                        permit.retain_for_reconciliation();
+                        return Err(JobRunError::Recovery);
+                    }
+                }
+            }
+            permit.seal()
+        } else {
+            slot.take_published().or_else(|_| {
+                context
+                    .claim_terminal_publication(progressed.sequence())
+                    .map(market_squawk_jobs::JobTerminalPublicationPermit::seal)
+            })?
+        };
         Ok(JobCompletion::Published(result, published))
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
-        // Phase-one requests retain non-cloneable source/output authority. Restart never recreates
-        // it from serialized fields; any committed generation remains queryable by exact manifest.
-        JobRecoveryDisposition::MarkInterrupted
+    async fn recover(&self, snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+        match recovery::published_result(self, snapshot).await {
+            Ok(Some(result)) => JobRecoveryDisposition::CompleteAlreadyPublished(result),
+            Ok(None) => JobRecoveryDisposition::MarkInterrupted,
+            Err(_) => JobRecoveryDisposition::ReconciliationRequired,
+        }
     }
 }
 
@@ -870,7 +885,7 @@ impl JobRunner for ResearchJobRunner {
         Ok(JobCompletion::Published(reference, published))
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         // Discovery selections and provider leases are process-generation capabilities. The exact
         // immutable request identity remains durable, but V1 requires a fresh explicit start.
         JobRecoveryDisposition::MarkInterrupted
@@ -945,7 +960,7 @@ impl JobRunner for ResearchExportJobRunner {
             .await
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         JobRecoveryDisposition::MarkInterrupted
     }
 }
@@ -978,6 +993,12 @@ pub enum ResearchJobRunnerError {
     /// Pending request authority is unavailable.
     #[error("research job runner is unavailable")]
     Unavailable,
+    /// The caller cancelled before durable input admission.
+    #[error("job input admission was cancelled")]
+    Cancelled,
+    /// The caller's original input admission deadline elapsed.
+    #[error("job input admission deadline elapsed")]
+    DeadlineExceeded,
 }
 
 pub(super) fn map_service_error(error: ServiceError) -> JobRunError {
@@ -1012,6 +1033,9 @@ fn map_artifact_error(error: ArtifactError) -> JobRunError {
 
 fn map_phase_one_derived_generation_error(error: ResearchServiceError) -> JobRunError {
     match error {
+        ResearchServiceError::Dataset(DatasetBuildError::CurrentPopulation(error)) => {
+            map_service_error(crate::application::map_current_population_error(error))
+        }
         ResearchServiceError::Dataset(DatasetBuildError::Cancelled) => JobRunError::Cancelled,
         ResearchServiceError::Dataset(DatasetBuildError::DeadlineExceeded) => {
             failed("phase-one-derived-generation-deadline-exceeded", true)

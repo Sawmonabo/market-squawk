@@ -778,9 +778,18 @@ impl BoardScriptedTransportFactory {
             usize::try_from(bounds.max_response_bytes())
                 .map_err(|_| BoardSourceError::InvalidMetadata)?,
         );
+        let full_history_maximum_response_bytes =
+            BoardParseLimits::h15_treasury_constant_maturities_full_history()
+                .max_source_bytes()
+                .min(
+                    usize::try_from(bounds.max_response_bytes())
+                        .map_err(|_| BoardSourceError::InvalidMetadata)?,
+                );
         let transport = Arc::new(BoardScriptedProductionTransport::new(
             self.production_queue(),
+            self.full_history_queue(),
             maximum_response_bytes,
+            full_history_maximum_response_bytes,
             std::time::Duration::from_nanos(bounds.total_timeout_nanos()),
         ));
         BoardSource::try_new_with_transport(metadata, profile, transport)

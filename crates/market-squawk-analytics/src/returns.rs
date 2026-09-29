@@ -74,27 +74,56 @@ pub fn total_returns(
     for (index, distribution) in distributions.iter().copied().enumerate() {
         let previous = prices[index].value();
         let current = prices[index + 1].value();
-        let numerator = current
-            .checked_add(distribution)
-            .and_then(|with_distribution| with_distribution.checked_sub(previous))
-            .map_err(|_| AnalyticsError::DecimalArithmetic)?;
-        let numerator = StatisticalInput::try_from_decimal(
-            numerator.amount(),
-            StatisticalUnit::Currency(currency),
-            StatisticalScale::Unit,
-        )?;
-        let denominator = StatisticalInput::try_from_decimal(
-            previous.amount(),
-            StatisticalUnit::Currency(currency),
-            StatisticalScale::Unit,
-        )?;
-        output.push(StatisticalInput::try_new(
-            numerator.value() / denominator.value(),
-            StatisticalUnit::Return,
-            StatisticalScale::Unit,
+        output.push(cash_distribution_holding_return(
+            previous,
+            current,
+            distribution,
         )?);
     }
     StatisticalSeries::try_new(output, StatisticalUnit::Return)
+}
+
+/// Computes one cash-distribution holding return without inventing timestamps for native dates.
+///
+/// Values must describe the same held quantity, currency and economic interval. This arithmetic
+/// kernel provides no dividend, split, completeness, settlement or source authority.
+///
+/// # Errors
+///
+/// Rejects nonpositive prices, currency mismatch, checked money arithmetic or nonfinite output.
+pub fn cash_distribution_holding_return(
+    previous: market_squawk_domain::Money,
+    current: market_squawk_domain::Money,
+    distribution: market_squawk_domain::Money,
+) -> Result<StatisticalInput, AnalyticsError> {
+    let currency = previous.currency();
+    if current.currency() != currency || distribution.currency() != currency {
+        return Err(AnalyticsError::CurrencyMismatch);
+    }
+    if previous.amount() <= rust_decimal::Decimal::ZERO
+        || current.amount() <= rust_decimal::Decimal::ZERO
+    {
+        return Err(AnalyticsError::NonPositivePrice);
+    }
+    let numerator = current
+        .checked_add(distribution)
+        .and_then(|with_distribution| with_distribution.checked_sub(previous))
+        .map_err(|_| AnalyticsError::DecimalArithmetic)?;
+    let numerator = StatisticalInput::try_from_decimal(
+        numerator.amount(),
+        StatisticalUnit::Currency(currency),
+        StatisticalScale::Unit,
+    )?;
+    let denominator = StatisticalInput::try_from_decimal(
+        previous.amount(),
+        StatisticalUnit::Currency(currency),
+        StatisticalScale::Unit,
+    )?;
+    StatisticalInput::try_new(
+        numerator.value() / denominator.value(),
+        StatisticalUnit::Return,
+        StatisticalScale::Unit,
+    )
 }
 
 /// Compounds a homogeneous return series as `product(1 + r) - 1`.

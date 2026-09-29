@@ -3,11 +3,15 @@
 use std::{
     num::NonZeroUsize,
     sync::{Arc, atomic::Ordering},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+mod history;
+mod sizing;
 
 use market_squawk_adapter_portfolio::TransactionKind;
 use market_squawk_analytics::{StatisticalInput, StatisticalScale, StatisticalUnit};
+use market_squawk_data::AnalyticalReadCapability;
 use market_squawk_domain::{
     AccountId, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, LotSize, Money, SourceId,
     SourceIdentifier, Timestamp,
@@ -15,6 +19,7 @@ use market_squawk_domain::{
 use market_squawk_portfolio::PortfolioRevisionToken;
 use rust_decimal::prelude::ToPrimitive as _;
 use rust_decimal::{Decimal, RoundingStrategy};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +35,13 @@ use super::{
     },
     model::{PortfolioReadImage, PublishedRevision},
 };
-use crate::application::recommendation::SetupRequired;
+use crate::application::{
+    market_calendar::{
+        CompletedMarketSessionAuthority, CompletedMarketSessionReadCapability,
+        CompletedMarketSessionReference,
+    },
+    recommendation::SetupRequired,
+};
 
 const ANALYSIS_AUTHORITY: &str = concat!(
     "analysis_only;portfolio_mutation=false;execution_authority=false;",
@@ -41,32 +52,71 @@ const ANALYSIS_AUTHORITY: &str = concat!(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioAnalysisPrerequisitePolicy {
     minimum_historical_return_observations: NonZeroUsize,
+    maximum_historical_return_observations: NonZeroUsize,
     digest: EvidenceDigest,
 }
 
 impl PortfolioAnalysisPrerequisitePolicy {
     pub(crate) fn try_new(
         minimum_historical_return_observations: NonZeroUsize,
+        maximum_historical_return_observations: NonZeroUsize,
     ) -> Result<Self, PortfolioApplicationServiceError> {
+        if minimum_historical_return_observations > maximum_historical_return_observations {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
         let count = u64::try_from(minimum_historical_return_observations.get())
             .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
         let mut digest = Sha256::new();
         digest.update(b"market-squawk/portfolio-analysis-prerequisite-policy/v1\0");
         digest.update(count.to_be_bytes());
+        digest.update((maximum_historical_return_observations.get() as u64).to_be_bytes());
+        canonical_text(
+            &mut digest,
+            "current_weights_daily_adjusted_price_returns_reporting_currency_cash_constant",
+        );
         canonical_text(
             &mut digest,
             "exact_decimal_historical_var_expected_shortfall_95",
         );
-        canonical_text(&mut digest, "exact_selected_source_side_depth");
+        canonical_text(
+            &mut digest,
+            "exact_selected_source_side_depth_ask_preferred_upper_integral_lots_bid_current_held_integral_lots",
+        );
         canonical_text(&mut digest, ANALYSIS_AUTHORITY);
         Ok(Self {
             minimum_historical_return_observations,
+            maximum_historical_return_observations,
             digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
         })
     }
 
+    /// Binds the already validated complete financial profile, including current-market age.
+    pub(crate) fn bind_financial_configuration(
+        mut self,
+        configuration_digest: &str,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        if configuration_digest.len() != 64
+            || !configuration_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || configuration_digest.bytes().all(|byte| byte == b'0')
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/portfolio-analysis-financial-policy/v1\0");
+        canonical_evidence(&mut digest, self.digest);
+        canonical_text(&mut digest, configuration_digest);
+        self.digest = EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into());
+        Ok(self)
+    }
+
     pub(crate) const fn minimum_historical_return_observations(self) -> NonZeroUsize {
         self.minimum_historical_return_observations
+    }
+
+    pub(crate) const fn maximum_historical_return_observations(self) -> NonZeroUsize {
+        self.maximum_historical_return_observations
     }
 
     pub(crate) const fn digest(self) -> EvidenceDigest {
@@ -111,7 +161,8 @@ impl PortfolioAnalysisHoldingSnapshot {
     }
 }
 
-/// One exact historical portfolio return with its two immutable revision identities.
+/// Net statement-value change relative to opening equity, with two immutable revision identities.
+/// Cash transfers are subtracted without claiming intraperiod timing or time-weighted performance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioAnalysisHistoricalReturn {
     opening_revision: PortfolioRevisionToken,
@@ -158,6 +209,10 @@ pub(crate) enum PortfolioAnalysisRiskUnavailableReason {
     ReportingCurrencyMismatch { revision: PortfolioRevisionToken },
     NonPositiveOpeningValue { revision: PortfolioRevisionToken },
     InsufficientHistory { required: usize, available: usize },
+    MarketHistoryUnavailable { instrument_id: InstrumentId },
+    MarketHistoryCurrencyMismatch { instrument_id: InstrumentId },
+    MarketHistoryAdjustmentUnsupported { instrument_id: InstrumentId },
+    CurrentSessionCoverageUnavailable,
 }
 
 /// Typed 95% one-sided historical VaR/ES and the exact user-budget capacity calculation.
@@ -167,6 +222,7 @@ pub(crate) struct PortfolioAnalysisRiskEvidence {
     portfolio_revision: PortfolioRevisionToken,
     profile_digest: [u8; 32],
     returns: Box<[PortfolioAnalysisHistoricalReturn]>,
+    scenario: Option<history::PortfolioHistoricalScenarioEvidence>,
     confidence_basis_points: u16,
     value_at_risk: Decimal,
     expected_shortfall: Decimal,
@@ -189,6 +245,25 @@ impl PortfolioAnalysisRiskEvidence {
 
     pub(crate) const fn profile_digest(&self) -> [u8; 32] {
         self.profile_digest
+    }
+
+    pub(crate) fn historical_scenario(
+        &self,
+    ) -> Option<&history::PortfolioHistoricalScenarioEvidence> {
+        self.scenario.as_ref()
+    }
+
+    pub(crate) const fn basis_name(&self) -> &'static str {
+        match &self.scenario {
+            Some(scenario)
+                if scenario.is_cash_only() && scenario.receivables().amount().is_zero() =>
+            {
+                "reporting_currency_cash"
+            }
+            Some(scenario) if scenario.is_cash_only() => "reporting_currency_cash_and_receivables",
+            Some(_) => "current_weights_adjusted_price_return_scenarios",
+            None => "statement_change_net_of_external_flows",
+        }
     }
 
     pub(crate) fn returns(&self) -> &[PortfolioAnalysisHistoricalReturn] {
@@ -247,6 +322,8 @@ pub(crate) struct PortfolioAnalysisPortfolioSnapshot {
     revision: PortfolioRevisionToken,
     reporting_currency: Currency,
     source_cash_balance: Money,
+    source_receivable_value: Money,
+    settlement_available_cash: Option<Money>,
     effective_at: Timestamp,
     available_at: Timestamp,
     source_id: SourceId,
@@ -277,6 +354,14 @@ impl PortfolioAnalysisPortfolioSnapshot {
 
     pub(crate) const fn source_cash_balance(&self) -> Money {
         self.source_cash_balance
+    }
+
+    pub(crate) const fn source_receivable_value(&self) -> Money {
+        self.source_receivable_value
+    }
+
+    pub(crate) const fn settlement_available_cash(&self) -> Option<Money> {
+        self.settlement_available_cash
     }
 
     pub(crate) const fn effective_at(&self) -> Timestamp {
@@ -323,7 +408,12 @@ impl PortfolioAnalysisPortfolioSnapshot {
         instruments
             .try_reserve_exact(self.holdings.len().saturating_add(1))
             .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
-        instruments.extend(self.holdings.iter().map(|holding| holding.instrument_id));
+        instruments.extend(
+            self.holdings
+                .iter()
+                .filter(|holding| !holding.quantity.is_zero())
+                .map(|holding| holding.instrument_id),
+        );
         instruments.push(candidate);
         instruments.sort_unstable();
         instruments.dedup();
@@ -388,6 +478,7 @@ pub(crate) enum PortfolioAnalysisCurrentPosition {
 pub(crate) struct PortfolioAnalysisMarkedPortfolioEvidence {
     candidate_instrument_id: InstrumentId,
     source_cash_balance: Money,
+    source_receivable_value: Money,
     holdings: Box<[PortfolioAnalysisMarkedHolding]>,
     marked_equity: Money,
     current_position: PortfolioAnalysisCurrentPosition,
@@ -404,6 +495,10 @@ impl PortfolioAnalysisMarkedPortfolioEvidence {
 
     pub(crate) const fn source_cash_balance(&self) -> Money {
         self.source_cash_balance
+    }
+
+    pub(crate) const fn source_receivable_value(&self) -> Money {
+        self.source_receivable_value
     }
 
     pub(crate) fn holdings(&self) -> &[PortfolioAnalysisMarkedHolding] {
@@ -440,15 +535,42 @@ impl PortfolioAnalysisMarkedPortfolioEvidence {
 pub(crate) enum PortfolioAnalysisLiquidityCapacityUnavailableReason {
     Depth(super::candidate::PortfolioAnalysisDepthUnavailableReason),
     NoIntegralUpperWeightCapacity,
+    NoPositiveHeldPosition,
+    HeldQuantityNotIntegralLots,
+    HeldReferenceUnavailable,
 }
 
-/// One exact side's depth relative to the profile upper-weight analytical lot capacity.
+/// The independently established analytical reference amount for one action side.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PortfolioAnalysisLiquidityCapacityBasis {
+    PreferredUpperWeightIntegralLots,
+    CurrentHeldIntegralLots,
+}
+
+impl PortfolioAnalysisLiquidityCapacityBasis {
+    const fn side(self) -> PortfolioAnalysisLiquiditySide {
+        match self {
+            Self::PreferredUpperWeightIntegralLots => PortfolioAnalysisLiquiditySide::Ask,
+            Self::CurrentHeldIntegralLots => PortfolioAnalysisLiquiditySide::Bid,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreferredUpperWeightIntegralLots => "preferred_upper_weight_integral_lots",
+            Self::CurrentHeldIntegralLots => "current_held_integral_lots",
+        }
+    }
+}
+
+/// One exact side's depth relative to its identified analytical reference amount.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioAnalysisLiquidityCapacitySideEvidence {
     side: PortfolioAnalysisLiquiditySide,
+    basis: PortfolioAnalysisLiquidityCapacityBasis,
     executable_depth_notional: Money,
-    analytical_upper_weight_notional: Money,
-    analytical_upper_weight_lots: u64,
+    reference_notional: Money,
+    reference_lots: u64,
     capacity_ppm: u32,
     depth_evidence_digest: EvidenceDigest,
 }
@@ -458,16 +580,20 @@ impl PortfolioAnalysisLiquidityCapacitySideEvidence {
         self.side
     }
 
+    pub(crate) const fn basis(&self) -> PortfolioAnalysisLiquidityCapacityBasis {
+        self.basis
+    }
+
     pub(crate) const fn executable_depth_notional(&self) -> Money {
         self.executable_depth_notional
     }
 
-    pub(crate) const fn analytical_upper_weight_notional(&self) -> Money {
-        self.analytical_upper_weight_notional
+    pub(crate) const fn reference_notional(&self) -> Money {
+        self.reference_notional
     }
 
-    pub(crate) const fn analytical_upper_weight_lots(&self) -> u64 {
-        self.analytical_upper_weight_lots
+    pub(crate) const fn reference_lots(&self) -> u64 {
+        self.reference_lots
     }
 
     pub(crate) const fn capacity_ppm(&self) -> u32 {
@@ -578,11 +704,22 @@ pub(crate) struct PortfolioAnalysisPrerequisiteUnavailableEvidence {
     markets: PortfolioAnalysisMarketSet,
     marked_portfolio: Option<PortfolioAnalysisMarkedPortfolioEvidence>,
     reason: PortfolioAnalysisPrerequisiteUnavailableReason,
+    historical_scenario: Option<PortfolioAnalysisRiskEvidence>,
     evaluated_at: Timestamp,
+    calculated_at: Timestamp,
     evidence_digest: EvidenceDigest,
 }
 
 impl PortfolioAnalysisPrerequisiteUnavailableEvidence {
+    pub(crate) const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+
+    /// Actual calculation completion, separate from the financial/source cutoff.
+    pub(crate) const fn calculated_at(&self) -> Timestamp {
+        self.calculated_at
+    }
+
     pub(crate) const fn portfolio(&self) -> &PortfolioAnalysisPortfolioSnapshot {
         &self.portfolio
     }
@@ -595,6 +732,10 @@ impl PortfolioAnalysisPrerequisiteUnavailableEvidence {
         &self,
     ) -> Option<&PortfolioAnalysisMarkedPortfolioEvidence> {
         self.marked_portfolio.as_ref()
+    }
+
+    pub(crate) const fn historical_scenario(&self) -> Option<&PortfolioAnalysisRiskEvidence> {
+        self.historical_scenario.as_ref()
     }
 
     pub(crate) const fn reason(&self) -> &PortfolioAnalysisPrerequisiteUnavailableReason {
@@ -614,11 +755,18 @@ pub(crate) struct PortfolioRecommendationEvidence {
     marked_portfolio: PortfolioAnalysisMarkedPortfolioEvidence,
     risk: PortfolioAnalysisRiskEvidence,
     liquidity_capacity: PortfolioAnalysisLiquidityCapacityEvidence,
+    risk_sizing: Option<sizing::PortfolioRiskSizingEvidence>,
     evaluated_at: Timestamp,
+    calculated_at: Timestamp,
     evidence_digest: EvidenceDigest,
 }
 
 impl PortfolioRecommendationEvidence {
+    /// Actual calculation completion, separate from the financial/source cutoff.
+    pub(crate) const fn calculated_at(&self) -> Timestamp {
+        self.calculated_at
+    }
+
     pub(crate) const fn portfolio(&self) -> &PortfolioAnalysisPortfolioSnapshot {
         &self.portfolio
     }
@@ -637,6 +785,14 @@ impl PortfolioRecommendationEvidence {
 
     pub(crate) const fn liquidity_capacity(&self) -> &PortfolioAnalysisLiquidityCapacityEvidence {
         &self.liquidity_capacity
+    }
+
+    pub(crate) fn risk_sizing_range(&self) -> Option<market_squawk_decisions::CapacityRange> {
+        self.risk_sizing.as_ref().map(|value| value.range())
+    }
+
+    pub(crate) fn risk_sizing_digest(&self) -> Option<EvidenceDigest> {
+        self.risk_sizing.as_ref().map(|value| value.digest())
     }
 
     pub(crate) const fn evaluated_at(&self) -> Timestamp {
@@ -662,6 +818,396 @@ pub(crate) enum PortfolioAnalysisPrerequisiteResolution {
     },
     Unavailable(PortfolioAnalysisPrerequisiteUnavailableEvidence),
     Evaluated(PortfolioRecommendationEvidence),
+}
+
+/// Exact transport reference to the financial result and its original source calendar.
+/// Both references must be reopened through their existing authorities before reuse.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortfolioAnalysisReadReference {
+    prerequisites: PortfolioAnalysisPrerequisiteReference,
+    calendar: Option<CompletedMarketSessionReference>,
+}
+
+impl PortfolioAnalysisReadReference {
+    pub(crate) const fn new(
+        prerequisites: PortfolioAnalysisPrerequisiteReference,
+        calendar: Option<CompletedMarketSessionReference>,
+    ) -> Self {
+        Self {
+            prerequisites,
+            calendar,
+        }
+    }
+
+    pub(crate) const fn prerequisites(&self) -> &PortfolioAnalysisPrerequisiteReference {
+        &self.prerequisites
+    }
+
+    pub(crate) const fn calendar(&self) -> Option<&CompletedMarketSessionReference> {
+        self.calendar.as_ref()
+    }
+}
+
+/// Portable commitments to one exact prerequisite result. These values grant no authority;
+/// reopening checks the original explicit setup and recomputes every financial input and result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PortfolioAnalysisPrerequisiteReference {
+    candidate_instrument_id: InstrumentId,
+    source_cutoff_unix_nanos: String,
+    account_id: AccountId,
+    portfolio_revision: String,
+    setup_authority_digest: String,
+    configuration_digest: String,
+    profile_digest: String,
+    catalog_digest: String,
+    prerequisite_policy_digest: String,
+    minimum_historical_return_observations: usize,
+    maximum_historical_return_observations: usize,
+    evidence_digest: String,
+    portfolio_snapshot_digest: String,
+    market_set_digest: String,
+    calculated_at_unix_nanos: String,
+    status: PortfolioAnalysisPrerequisiteReferenceStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PortfolioAnalysisPrerequisiteReferenceStatus {
+    Evaluated,
+    Unavailable,
+}
+
+impl PortfolioAnalysisPrerequisiteReference {
+    pub(crate) const fn candidate_instrument_id(&self) -> InstrumentId {
+        self.candidate_instrument_id
+    }
+
+    pub(crate) const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    pub(crate) fn source_cutoff(&self) -> Result<Timestamp, PortfolioApplicationServiceError> {
+        reference_timestamp(&self.source_cutoff_unix_nanos)
+    }
+
+    /// Historical calculation coordinate only. A reopen returns its own actual calculation time.
+    pub(crate) fn original_calculated_at(
+        &self,
+    ) -> Result<Timestamp, PortfolioApplicationServiceError> {
+        reference_timestamp(&self.calculated_at_unix_nanos)
+    }
+
+    fn validate(
+        &self,
+        policy: PortfolioAnalysisPrerequisitePolicy,
+    ) -> Result<Timestamp, PortfolioApplicationServiceError> {
+        let as_of = self.source_cutoff()?;
+        let calculated = self.original_calculated_at()?;
+        if calculated < as_of
+            || calculated > calculation_time(as_of)?
+            || self.minimum_historical_return_observations
+                != policy.minimum_historical_return_observations().get()
+            || self.maximum_historical_return_observations
+                != policy.maximum_historical_return_observations().get()
+            || self.prerequisite_policy_digest != reference_hex(policy.digest().bytes())
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        for digest in [
+            &self.portfolio_revision,
+            &self.setup_authority_digest,
+            &self.configuration_digest,
+            &self.profile_digest,
+            &self.catalog_digest,
+            &self.prerequisite_policy_digest,
+            &self.evidence_digest,
+            &self.portfolio_snapshot_digest,
+            &self.market_set_digest,
+        ] {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || digest.bytes().all(|byte| byte == b'0')
+            {
+                return Err(PortfolioApplicationServiceError::InvalidRequest);
+            }
+        }
+        Ok(as_of)
+    }
+
+    fn matches_setup(&self, setup: &PortfolioAnalysisSetupSnapshot) -> bool {
+        let setup = setup.setup();
+        self.account_id == setup.selected_account().account_id()
+            && self.portfolio_revision == reference_hex(setup.current_head().revision().bytes())
+            && self.setup_authority_digest == reference_hex(setup.authority_digest())
+            && self.configuration_digest == reference_hex(setup.configuration_digest())
+            && self.profile_digest == reference_hex(setup.profile().digest())
+            && self.catalog_digest == reference_hex(setup.catalog_digest().bytes())
+            && self.source_cutoff_unix_nanos == setup.as_of().unix_nanos().to_string()
+    }
+}
+
+impl PortfolioAnalysisPrerequisiteResolution {
+    /// Setup-required has no selected account and cannot mint a portfolio evidence reference.
+    pub(crate) fn reference(
+        &self,
+        candidate_instrument_id: InstrumentId,
+    ) -> Result<Option<PortfolioAnalysisPrerequisiteReference>, PortfolioApplicationServiceError>
+    {
+        let (portfolio, markets, marked, as_of, calculated, digest, status) = match self {
+            Self::SetupRequired { .. } => return Ok(None),
+            Self::Unavailable(evidence) => (
+                evidence.portfolio(),
+                evidence.markets(),
+                evidence.marked_portfolio(),
+                evidence.evaluated_at(),
+                evidence.calculated_at(),
+                evidence.evidence_digest(),
+                PortfolioAnalysisPrerequisiteReferenceStatus::Unavailable,
+            ),
+            Self::Evaluated(evidence) => (
+                evidence.portfolio(),
+                evidence.markets(),
+                Some(evidence.marked_portfolio()),
+                evidence.evaluated_at(),
+                evidence.calculated_at(),
+                evidence.evidence_digest(),
+                PortfolioAnalysisPrerequisiteReferenceStatus::Evaluated,
+            ),
+        };
+        if markets.entry(candidate_instrument_id).is_none()
+            || marked
+                .is_some_and(|marked| marked.candidate_instrument_id() != candidate_instrument_id)
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let setup = portfolio.setup().setup();
+        Ok(Some(PortfolioAnalysisPrerequisiteReference {
+            candidate_instrument_id,
+            source_cutoff_unix_nanos: as_of.unix_nanos().to_string(),
+            account_id: portfolio.account_id(),
+            portfolio_revision: reference_hex(portfolio.revision().bytes()),
+            setup_authority_digest: reference_hex(setup.authority_digest()),
+            configuration_digest: reference_hex(setup.configuration_digest()),
+            profile_digest: reference_hex(setup.profile().digest()),
+            catalog_digest: reference_hex(setup.catalog_digest().bytes()),
+            prerequisite_policy_digest: reference_hex(portfolio.policy().digest().bytes()),
+            minimum_historical_return_observations: portfolio
+                .policy()
+                .minimum_historical_return_observations()
+                .get(),
+            maximum_historical_return_observations: portfolio
+                .policy()
+                .maximum_historical_return_observations()
+                .get(),
+            evidence_digest: reference_hex(digest.bytes()),
+            portfolio_snapshot_digest: reference_hex(portfolio.evidence_digest().bytes()),
+            market_set_digest: reference_hex(markets.digest().bytes()),
+            calculated_at_unix_nanos: calculated.unix_nanos().to_string(),
+            status,
+        }))
+    }
+}
+
+fn reference_timestamp(value: &str) -> Result<Timestamp, PortfolioApplicationServiceError> {
+    let nanos = value
+        .parse::<i64>()
+        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+    if nanos <= 0 || nanos.to_string() != value {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
+    Ok(Timestamp::from_unix_nanos(nanos))
+}
+
+fn reference_hex(bytes: [u8; 32]) -> String {
+    super::import::hex(&bytes)
+}
+
+/// Cloneable financial prerequisite reader composed from the existing independent owners.
+#[derive(Clone)]
+pub(crate) struct PortfolioAnalysisPrerequisiteReadCapability {
+    authority: Arc<dyn PortfolioCandidateResolutionAuthority>,
+    reader: PortfolioCandidateImpactReadCapability,
+    history: AnalyticalReadCapability,
+    research: Arc<crate::ResearchService>,
+    calendars: CompletedMarketSessionReadCapability,
+    completed_sessions: Option<Arc<CompletedMarketSessionAuthority>>,
+}
+
+impl PortfolioAnalysisPrerequisiteReadCapability {
+    pub(crate) fn new(
+        authority: Arc<dyn PortfolioCandidateResolutionAuthority>,
+        reader: PortfolioCandidateImpactReadCapability,
+        history: AnalyticalReadCapability,
+        research: Arc<crate::ResearchService>,
+        calendars: CompletedMarketSessionReadCapability,
+        completed_sessions: Option<Arc<CompletedMarketSessionAuthority>>,
+    ) -> Self {
+        Self {
+            authority,
+            reader,
+            history,
+            research,
+            calendars,
+            completed_sessions,
+        }
+    }
+
+    pub(crate) async fn read(
+        &self,
+        candidate_instrument_id: InstrumentId,
+        policy: PortfolioAnalysisPrerequisitePolicy,
+        as_of: Timestamp,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<PortfolioAnalysisPrerequisiteResolution, PortfolioApplicationServiceError> {
+        let operation = cancellation.child_token();
+        let _cancel_on_drop = operation.clone().drop_guard();
+        let read = resolve_portfolio_analysis_prerequisites(
+            &self.authority,
+            &self.reader,
+            &self.history,
+            &self.research,
+            &self.calendars,
+            self.completed_sessions.as_deref(),
+            candidate_instrument_id,
+            policy,
+            as_of,
+            deadline,
+            operation.clone(),
+        );
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = self.reader.runtime.cancellation.cancelled() => {
+                operation.cancel();
+                let _ = read.await;
+                Err(PortfolioApplicationServiceError::Cancelled)
+            }
+            _ = cancellation.cancelled() => {
+                operation.cancel();
+                let _ = read.await;
+                Err(PortfolioApplicationServiceError::Cancelled)
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                operation.cancel();
+                let _ = read.await;
+                Err(PortfolioApplicationServiceError::DeadlineExceeded)
+            }
+            result = &mut read => result,
+        }
+    }
+
+    /// Reopens only the original explicit account/revision/setup and original financial cutoff.
+    /// The result retains the actual new calculation clock; a caller-supplied historical clock
+    /// cannot become authority for a calculation or admission that did not occur.
+    pub(crate) async fn read_reference(
+        &self,
+        reference: &PortfolioAnalysisPrerequisiteReference,
+        policy: PortfolioAnalysisPrerequisitePolicy,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<PortfolioAnalysisPrerequisiteResolution, PortfolioApplicationServiceError> {
+        let as_of = reference.validate(policy)?;
+        let setup = self
+            .authority
+            .resolve_analysis_setup(as_of, deadline, cancellation.clone())
+            .await?;
+        let PortfolioAnalysisSetupResolution::Ready(setup) = setup else {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        };
+        if !reference.matches_setup(&setup) {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        let current = self
+            .read(
+                reference.candidate_instrument_id,
+                policy,
+                as_of,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        let mut current_reference = current
+            .reference(reference.candidate_instrument_id)?
+            .ok_or(PortfolioApplicationServiceError::StateChanged)?;
+        if reference.original_calculated_at()? > current_reference.original_calculated_at()? {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        // Compare financial commitments while preserving the new evidence's actual clock.
+        current_reference.calculated_at_unix_nanos = reference.calculated_at_unix_nanos.clone();
+        if &current_reference != reference {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        Ok(current)
+    }
+
+    /// Reconstructs the full exact setup, portfolio revision, market set, risk and liquidity
+    /// evidence. A later current portfolio or a different source selection cannot substitute.
+    pub(crate) async fn recheck(
+        &self,
+        candidate_instrument_id: InstrumentId,
+        policy: PortfolioAnalysisPrerequisitePolicy,
+        as_of: Timestamp,
+        expected: &PortfolioAnalysisPrerequisiteResolution,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let mut current = self
+            .read(
+                candidate_instrument_id,
+                policy,
+                as_of,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        // A replay has a new calculation clock but must reproduce every financial input/result.
+        match (&mut current, expected) {
+            (
+                PortfolioAnalysisPrerequisiteResolution::Evaluated(current),
+                PortfolioAnalysisPrerequisiteResolution::Evaluated(expected),
+            ) => {
+                if expected.calculated_at < expected.evaluated_at
+                    || expected.calculated_at > current.calculated_at
+                {
+                    return Err(PortfolioApplicationServiceError::StateChanged);
+                }
+                current.calculated_at = expected.calculated_at;
+            }
+            (
+                PortfolioAnalysisPrerequisiteResolution::Unavailable(current),
+                PortfolioAnalysisPrerequisiteResolution::Unavailable(expected),
+            ) => {
+                if expected.calculated_at < expected.evaluated_at
+                    || expected.calculated_at > current.calculated_at
+                {
+                    return Err(PortfolioApplicationServiceError::StateChanged);
+                }
+                current.calculated_at = expected.calculated_at;
+            }
+            _ => {}
+        }
+        if &current != expected {
+            return Err(PortfolioApplicationServiceError::StateChanged);
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PortfolioAnalysisPrerequisiteReadCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PortfolioAnalysisPrerequisiteReadCapability")
+            .field(
+                "authority",
+                &"[IMPORTED PORTFOLIO AND DURABLE MARKET READS]",
+            )
+            .finish()
+    }
 }
 
 impl PortfolioCandidateImpactReadCapability {
@@ -709,15 +1255,24 @@ impl PortfolioCandidateImpactReadCapability {
 /// The authority resolves only explicit setup and current market observations. The reader copies
 /// only immutable imported portfolio state. The result cannot mutate either owner or cross into
 /// paper/execution authority.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "independent portfolio, market, history and session authorities retain explicit policy and lifecycle bounds"
+)]
 pub(crate) async fn resolve_portfolio_analysis_prerequisites(
     authority: &Arc<dyn PortfolioCandidateResolutionAuthority>,
     reader: &PortfolioCandidateImpactReadCapability,
+    history_reader: &AnalyticalReadCapability,
+    research: &crate::ResearchService,
+    calendars: &CompletedMarketSessionReadCapability,
+    completed_sessions: Option<&CompletedMarketSessionAuthority>,
     candidate_instrument_id: InstrumentId,
     policy: PortfolioAnalysisPrerequisitePolicy,
     as_of: Timestamp,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<PortfolioAnalysisPrerequisiteResolution, PortfolioApplicationServiceError> {
+    let _guard = reader.runtime.admit()?;
     ensure_analysis_read_live(&reader.runtime, deadline, &cancellation)?;
     let setup = match authority
         .resolve_analysis_setup(as_of, deadline, cancellation.clone())
@@ -757,7 +1312,7 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
         })
         .collect::<Vec<_>>();
     if !unavailable_markets.is_empty() {
-        let unavailable = prerequisite_unavailable(
+        let mut unavailable = prerequisite_unavailable(
             portfolio,
             markets,
             None,
@@ -765,7 +1320,7 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
                 instruments: unavailable_markets.into_boxed_slice(),
             },
             as_of,
-        );
+        )?;
         recheck_all(
             authority,
             reader,
@@ -776,6 +1331,7 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
             &cancellation,
         )
         .await?;
+        unavailable.calculated_at = calculation_time(as_of)?;
         return Ok(PortfolioAnalysisPrerequisiteResolution::Unavailable(
             unavailable,
         ));
@@ -785,7 +1341,8 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
         match calculate_marked_portfolio(&portfolio, &markets, candidate_instrument_id, as_of)? {
             Ok(marked) => marked,
             Err(reason) => {
-                let unavailable = prerequisite_unavailable(portfolio, markets, None, reason, as_of);
+                let mut unavailable =
+                    prerequisite_unavailable(portfolio, markets, None, reason, as_of)?;
                 recheck_all(
                     authority,
                     reader,
@@ -796,22 +1353,34 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
                     &cancellation,
                 )
                 .await?;
+                unavailable.calculated_at = calculation_time(as_of)?;
                 return Ok(PortfolioAnalysisPrerequisiteResolution::Unavailable(
                     unavailable,
                 ));
             }
         };
-    let risk = match portfolio.risk() {
-        PortfolioAnalysisRiskAvailability::Available(risk) => risk.clone(),
+    let scenario = history::calculate(
+        history_reader,
+        research,
+        calendars,
+        completed_sessions,
+        &portfolio,
+        &marked,
+        as_of,
+        deadline,
+        &cancellation,
+    )
+    .await?;
+    let risk = match scenario {
+        PortfolioAnalysisRiskAvailability::Available(risk) => risk,
         PortfolioAnalysisRiskAvailability::Unavailable(reason) => {
-            let reason = reason.clone();
-            let unavailable = prerequisite_unavailable(
+            let mut unavailable = prerequisite_unavailable(
                 portfolio,
                 markets,
                 Some(marked),
                 PortfolioAnalysisPrerequisiteUnavailableReason::HistoricalRisk(reason),
                 as_of,
-            );
+            )?;
             recheck_all(
                 authority,
                 reader,
@@ -822,11 +1391,44 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
                 &cancellation,
             )
             .await?;
+            unavailable.calculated_at = calculation_time(as_of)?;
             return Ok(PortfolioAnalysisPrerequisiteResolution::Unavailable(
                 unavailable,
             ));
         }
     };
+    if risk
+        .historical_scenario()
+        .is_some_and(|scenario| !scenario.current_session_covered())
+    {
+        // The retained calendar proves its requested window, not that today has no later
+        // completed session. Preserve the real calculation without granting current risk.
+        let mut unavailable = prerequisite_unavailable(
+            portfolio,
+            markets,
+            Some(marked),
+            PortfolioAnalysisPrerequisiteUnavailableReason::HistoricalRisk(
+                PortfolioAnalysisRiskUnavailableReason::CurrentSessionCoverageUnavailable,
+            ),
+            as_of,
+        )?;
+        unavailable.historical_scenario = Some(risk);
+        unavailable.evidence_digest = prerequisite_unavailable_digest(&unavailable);
+        recheck_all(
+            authority,
+            reader,
+            &unavailable.portfolio,
+            &unavailable.markets,
+            as_of,
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        unavailable.calculated_at = calculation_time(as_of)?;
+        return Ok(PortfolioAnalysisPrerequisiteResolution::Unavailable(
+            unavailable,
+        ));
+    }
     let candidate_market = available_market(&markets, candidate_instrument_id)?;
     let liquidity_capacity = calculate_liquidity_capacity(
         portfolio.setup(),
@@ -834,13 +1436,29 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
         candidate_market.0,
         candidate_market.1,
     )?;
+    let risk_sizing = sizing::calculate(
+        history_reader,
+        research,
+        calendars,
+        completed_sessions,
+        &portfolio,
+        &marked,
+        &risk,
+        candidate_market.0,
+        as_of,
+        deadline,
+        &cancellation,
+    )
+    .await?;
     let mut evidence = PortfolioRecommendationEvidence {
         portfolio,
         markets,
         marked_portfolio: marked,
         risk,
         liquidity_capacity,
+        risk_sizing,
         evaluated_at: as_of,
+        calculated_at: calculation_time(as_of)?,
         evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
     };
     evidence.evidence_digest = recommendation_evidence_digest(&evidence);
@@ -854,6 +1472,30 @@ pub(crate) async fn resolve_portfolio_analysis_prerequisites(
         &cancellation,
     )
     .await?;
+    if let Some(scenario) = evidence.risk.historical_scenario() {
+        scenario
+            .recheck_current_session(
+                completed_sessions,
+                calendars,
+                as_of,
+                deadline,
+                &cancellation,
+            )
+            .await?;
+    }
+    if let Some(capacity) = &evidence.risk_sizing {
+        capacity
+            .recheck(
+                completed_sessions,
+                calendars,
+                as_of,
+                deadline,
+                &cancellation,
+            )
+            .await?;
+    }
+    ensure_analysis_read_live(&reader.runtime, deadline, &cancellation)?;
+    evidence.calculated_at = calculation_time(as_of)?;
     Ok(PortfolioAnalysisPrerequisiteResolution::Evaluated(evidence))
 }
 
@@ -921,7 +1563,13 @@ fn portfolio_snapshot_from_image(
     }
     let currency = revision.account.currency();
     let cash = revision.account.cash_balance();
-    if cash.currency() != currency {
+    if cash.currency() != currency
+        || revision.core.receivable_value().currency() != currency
+        || revision
+            .account
+            .settlement_available_cash()
+            .is_some_and(|value| value.currency() != currency)
+    {
         return Err(PortfolioApplicationServiceError::CorruptPublication);
     }
     let mut holdings = Vec::new();
@@ -966,6 +1614,8 @@ fn portfolio_snapshot_from_image(
         revision: token,
         reporting_currency: currency,
         source_cash_balance: cash,
+        source_receivable_value: revision.core.receivable_value(),
+        settlement_available_cash: revision.account.settlement_available_cash(),
         effective_at: revision.effective_at,
         available_at,
         source_id: revision.source_id.clone(),
@@ -980,6 +1630,10 @@ fn portfolio_snapshot_from_image(
     Ok(snapshot)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "statement-period accounting binds exact revision, currency, policy and cutoffs"
+)]
 fn historical_risk(
     history: &[PublishedRevision],
     account_id: AccountId,
@@ -1088,6 +1742,36 @@ fn historical_risk(
         .iter()
         .map(|period| (-period.value).max(Decimal::ZERO))
         .collect::<Vec<_>>();
+    let (
+        value_at_risk,
+        expected_shortfall,
+        expected_shortfall_basis_points_ceil,
+        risk_capacity_ppm,
+    ) = tail_risk(&losses, user_downside_budget_basis_points)?;
+    let mut evidence = PortfolioAnalysisRiskEvidence {
+        account_id,
+        portfolio_revision: portfolio_revision.clone(),
+        profile_digest,
+        returns: periods.into_boxed_slice(),
+        scenario: None,
+        confidence_basis_points: 9_500,
+        value_at_risk,
+        expected_shortfall,
+        expected_shortfall_basis_points_ceil,
+        user_downside_budget_basis_points,
+        risk_capacity_ppm,
+        policy_digest: policy.digest(),
+        evaluated_at: as_of,
+        evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
+    };
+    evidence.evidence_digest = risk_evidence_digest(&evidence);
+    Ok(PortfolioAnalysisRiskAvailability::Available(evidence))
+}
+
+fn tail_risk(
+    losses: &[Decimal],
+    user_downside_budget_basis_points: u16,
+) -> Result<(Decimal, Decimal, u32, u32), PortfolioApplicationServiceError> {
     let typed_losses = losses
         .iter()
         .copied()
@@ -1103,7 +1787,7 @@ fn historical_risk(
     let ExactHistoricalRiskResult {
         value_at_risk,
         expected_shortfall,
-    } = exact_historical_risk_95(&losses, &typed_losses)?;
+    } = exact_historical_risk_95(losses, &typed_losses)?;
     let expected_shortfall_basis_points_ceil = expected_shortfall
         .checked_mul(Decimal::from(10_000_u32))
         .map(|value| value.round_dp_with_strategy(0, RoundingStrategy::ToPositiveInfinity))
@@ -1124,23 +1808,12 @@ fn historical_risk(
             .ok_or(PortfolioApplicationServiceError::Analytics)?;
         u32::try_from(capacity).map_err(|_| PortfolioApplicationServiceError::Analytics)?
     };
-    let mut evidence = PortfolioAnalysisRiskEvidence {
-        account_id,
-        portfolio_revision: portfolio_revision.clone(),
-        profile_digest,
-        returns: periods.into_boxed_slice(),
-        confidence_basis_points: 9_500,
+    Ok((
         value_at_risk,
         expected_shortfall,
         expected_shortfall_basis_points_ceil,
-        user_downside_budget_basis_points,
         risk_capacity_ppm,
-        policy_digest: policy.digest(),
-        evaluated_at: as_of,
-        evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
-    };
-    evidence.evidence_digest = risk_evidence_digest(&evidence);
-    Ok(PortfolioAnalysisRiskAvailability::Available(evidence))
+    ))
 }
 
 fn source_reported_total_value(
@@ -1152,17 +1825,21 @@ fn source_reported_total_value(
     {
         return Err(PortfolioApplicationServiceError::Analytics);
     }
-    revision
-        .holdings
-        .iter()
-        .try_fold(revision.account.cash_balance(), |total, holding| {
+    revision.holdings.iter().try_fold(
+        revision
+            .account
+            .cash_balance()
+            .checked_add(revision.core.receivable_value())
+            .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
+        |total, holding| {
             if holding.currency() != currency || holding.market_value().currency() != currency {
                 return Err(PortfolioApplicationServiceError::Analytics);
             }
             total
                 .checked_add(holding.market_value())
                 .map_err(|_| PortfolioApplicationServiceError::Analytics)
-        })
+        },
+    )
 }
 
 /// Exact-decimal authority for the code-owned 95% nearest-rank VaR and fractional-tail ES policy.
@@ -1234,9 +1911,7 @@ fn exact_discrete_expected_shortfall_95(
         return Err(PortfolioApplicationServiceError::Analytics);
     }
     let mut sorted = losses.to_vec();
-    sorted.sort_unstable_by(|left, right| right.cmp(left));
-    let complete = sorted.len() / 20;
-    let remainder = sorted.len() % 20;
+    let (complete, remainder) = fractional_tail_95(&mut sorted)?;
     let complete_sum = sorted[..complete]
         .iter()
         .try_fold(Decimal::ZERO, |total, value| total.checked_add(*value))
@@ -1257,6 +1932,16 @@ fn exact_discrete_expected_shortfall_95(
         .and_then(|value| value.checked_div(Decimal::from(u64::try_from(losses.len()).ok()?)))
         .map(|value| value.normalize())
         .ok_or(PortfolioApplicationServiceError::Analytics)
+}
+
+fn fractional_tail_95<T: Ord>(
+    losses: &mut [T],
+) -> Result<(usize, usize), PortfolioApplicationServiceError> {
+    if losses.is_empty() {
+        return Err(PortfolioApplicationServiceError::Analytics);
+    }
+    losses.sort_unstable_by(|left, right| right.cmp(left));
+    Ok((losses.len() / 20, losses.len() % 20))
 }
 
 fn available_market(
@@ -1312,13 +1997,20 @@ fn calculate_marked_portfolio(
             },
         ));
     }
-    let mut marked_equity = portfolio.source_cash_balance;
+    let mut marked_equity = portfolio
+        .source_cash_balance
+        .checked_add(portfolio.source_receivable_value)
+        .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
     let mut marked_holdings = Vec::new();
     marked_holdings
         .try_reserve_exact(portfolio.holdings.len())
         .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
     let mut current_position = PortfolioAnalysisCurrentPosition::NoPosition;
-    for holding in &portfolio.holdings {
+    for holding in portfolio
+        .holdings
+        .iter()
+        .filter(|holding| !holding.quantity.is_zero())
+    {
         let (market, _liquidity) = available_market(markets, holding.instrument_id)?;
         if market.observation().unit_mark().currency() != currency
             || market.execution_terms().quote_currency() != currency
@@ -1329,9 +2021,9 @@ fn calculate_marked_portfolio(
                 },
             ));
         }
-        if holding.lot_size != market.execution_terms().lot_size()
-            || !is_lot_aligned(holding.quantity, holding.lot_size.as_decimal())
-        {
+        // Imported source units have already been admitted independently. A current order lot
+        // must not prohibit marking a genuine fractional holding in this read-only calculation.
+        if !is_lot_aligned(holding.quantity, holding.lot_size.as_decimal()) {
             return Ok(Err(
                 PortfolioAnalysisPrerequisiteUnavailableReason::HoldingExecutionTermsMismatch {
                     instrument_id: holding.instrument_id,
@@ -1370,6 +2062,7 @@ fn calculate_marked_portfolio(
     let mut marked = PortfolioAnalysisMarkedPortfolioEvidence {
         candidate_instrument_id,
         source_cash_balance: portfolio.source_cash_balance,
+        source_receivable_value: portfolio.source_receivable_value,
         holdings: marked_holdings.into_boxed_slice(),
         marked_equity,
         current_position,
@@ -1411,21 +2104,28 @@ fn calculate_liquidity_capacity(
         market.execution_terms().lot_size().as_decimal(),
         market.execution_terms().contract_multiplier(),
     )?;
-    let max_lots = exact_floor_ratio(upper_notional.amount(), per_lot_notional.amount())?;
-    let analytical_upper_weight_notional = per_lot_notional
-        .checked_mul_decimal(Decimal::from(max_lots))
+    let preferred_upper_lots =
+        exact_floor_ratio(upper_notional.amount(), per_lot_notional.amount())?;
+    let preferred_upper_notional = per_lot_notional
+        .checked_mul_decimal(Decimal::from(preferred_upper_lots))
         .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
-    let buy_add = liquidity_capacity_side(
-        PortfolioAnalysisLiquiditySide::Ask,
-        liquidity.ask(),
-        analytical_upper_weight_notional,
-        max_lots,
-    )?;
-    let trim_sell = liquidity_capacity_side(
-        PortfolioAnalysisLiquiditySide::Bid,
+    let buy_add = if preferred_upper_lots == 0 || preferred_upper_notional.amount() <= Decimal::ZERO
+    {
+        PortfolioAnalysisLiquidityCapacityAvailability::Unavailable(
+            PortfolioAnalysisLiquidityCapacityUnavailableReason::NoIntegralUpperWeightCapacity,
+        )
+    } else {
+        liquidity_capacity_side(
+            PortfolioAnalysisLiquidityCapacityBasis::PreferredUpperWeightIntegralLots,
+            liquidity.ask(),
+            preferred_upper_notional,
+            preferred_upper_lots,
+        )?
+    };
+    let trim_sell = held_liquidity_capacity(
+        marked.current_position(),
+        market.execution_terms().lot_size().as_decimal(),
         liquidity.bid(),
-        analytical_upper_weight_notional,
-        max_lots,
     )?;
     let mut evidence = PortfolioAnalysisLiquidityCapacityEvidence {
         account_id: setup.setup().selected_account().account_id(),
@@ -1445,19 +2145,65 @@ fn calculate_liquidity_capacity(
     Ok(evidence)
 }
 
-fn liquidity_capacity_side(
-    expected_side: PortfolioAnalysisLiquiditySide,
+fn held_liquidity_capacity(
+    position: PortfolioAnalysisCurrentPosition,
+    lot_size: Decimal,
     depth: &PortfolioAnalysisDepthAvailability<PortfolioAnalysisDepthSideEvidence>,
-    analytical_upper_weight_notional: Money,
-    analytical_upper_weight_lots: u64,
 ) -> Result<PortfolioAnalysisLiquidityCapacityAvailability, PortfolioApplicationServiceError> {
-    if analytical_upper_weight_lots == 0
-        || analytical_upper_weight_notional.amount() <= Decimal::ZERO
-    {
+    let PortfolioAnalysisCurrentPosition::Position {
+        quantity,
+        marked_value,
+    } = position
+    else {
         return Ok(PortfolioAnalysisLiquidityCapacityAvailability::Unavailable(
-            PortfolioAnalysisLiquidityCapacityUnavailableReason::NoIntegralUpperWeightCapacity,
+            PortfolioAnalysisLiquidityCapacityUnavailableReason::NoPositiveHeldPosition,
+        ));
+    };
+    if quantity <= Decimal::ZERO {
+        return Ok(PortfolioAnalysisLiquidityCapacityAvailability::Unavailable(
+            PortfolioAnalysisLiquidityCapacityUnavailableReason::NoPositiveHeldPosition,
         ));
     }
+    let Ok((held_units, lot_units)) = exact_common_scale(quantity, lot_size) else {
+        return Ok(PortfolioAnalysisLiquidityCapacityAvailability::Unavailable(
+            PortfolioAnalysisLiquidityCapacityUnavailableReason::HeldReferenceUnavailable,
+        ));
+    };
+    // The complete held quantity must be integral in current execution lots. Rounding down
+    // would invent a smaller position basis and overstate its available bid-side coverage.
+    if held_units % lot_units != 0 {
+        return Ok(PortfolioAnalysisLiquidityCapacityAvailability::Unavailable(
+            PortfolioAnalysisLiquidityCapacityUnavailableReason::HeldQuantityNotIntegralLots,
+        ));
+    }
+    let Ok(held_lots) = u64::try_from(held_units / lot_units) else {
+        return Ok(PortfolioAnalysisLiquidityCapacityAvailability::Unavailable(
+            PortfolioAnalysisLiquidityCapacityUnavailableReason::HeldReferenceUnavailable,
+        ));
+    };
+    if held_lots == 0 || marked_value.amount() <= Decimal::ZERO {
+        return Ok(PortfolioAnalysisLiquidityCapacityAvailability::Unavailable(
+            PortfolioAnalysisLiquidityCapacityUnavailableReason::HeldReferenceUnavailable,
+        ));
+    }
+    liquidity_capacity_side(
+        PortfolioAnalysisLiquidityCapacityBasis::CurrentHeldIntegralLots,
+        depth,
+        marked_value,
+        held_lots,
+    )
+}
+
+fn liquidity_capacity_side(
+    basis: PortfolioAnalysisLiquidityCapacityBasis,
+    depth: &PortfolioAnalysisDepthAvailability<PortfolioAnalysisDepthSideEvidence>,
+    reference_notional: Money,
+    reference_lots: u64,
+) -> Result<PortfolioAnalysisLiquidityCapacityAvailability, PortfolioApplicationServiceError> {
+    if reference_lots == 0 || reference_notional.amount() <= Decimal::ZERO {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    let expected_side = basis.side();
     let depth = match depth {
         PortfolioAnalysisDepthAvailability::Available(depth) => depth,
         PortfolioAnalysisDepthAvailability::Unavailable(reason) => {
@@ -1467,20 +2213,19 @@ fn liquidity_capacity_side(
         }
     };
     if depth.side() != expected_side
-        || depth.total_notional().currency() != analytical_upper_weight_notional.currency()
+        || depth.total_notional().currency() != reference_notional.currency()
     {
         return Err(PortfolioApplicationServiceError::CorruptPublication);
     }
-    let capacity_ppm = exact_floor_ratio_ppm(
-        depth.total_notional().amount(),
-        analytical_upper_weight_notional.amount(),
-    )?;
+    let capacity_ppm =
+        exact_floor_ratio_ppm(depth.total_notional().amount(), reference_notional.amount())?;
     Ok(PortfolioAnalysisLiquidityCapacityAvailability::Available(
         PortfolioAnalysisLiquidityCapacitySideEvidence {
             side: expected_side,
+            basis,
             executable_depth_notional: depth.total_notional(),
-            analytical_upper_weight_notional,
-            analytical_upper_weight_lots,
+            reference_notional,
+            reference_lots,
             capacity_ppm,
             depth_evidence_digest: depth.evidence_digest(),
         },
@@ -1566,17 +2311,35 @@ fn prerequisite_unavailable(
     marked_portfolio: Option<PortfolioAnalysisMarkedPortfolioEvidence>,
     reason: PortfolioAnalysisPrerequisiteUnavailableReason,
     evaluated_at: Timestamp,
-) -> PortfolioAnalysisPrerequisiteUnavailableEvidence {
+) -> Result<PortfolioAnalysisPrerequisiteUnavailableEvidence, PortfolioApplicationServiceError> {
     let mut evidence = PortfolioAnalysisPrerequisiteUnavailableEvidence {
         portfolio,
         markets,
         marked_portfolio,
         reason,
+        historical_scenario: None,
         evaluated_at,
+        calculated_at: calculation_time(evaluated_at)?,
         evidence_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
     };
     evidence.evidence_digest = prerequisite_unavailable_digest(&evidence);
-    evidence
+    Ok(evidence)
+}
+
+fn calculation_time(
+    source_cutoff: Timestamp,
+) -> Result<Timestamp, PortfolioApplicationServiceError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| PortfolioApplicationServiceError::Authority)?
+        .as_nanos();
+    let now = Timestamp::from_unix_nanos(
+        i64::try_from(nanos).map_err(|_| PortfolioApplicationServiceError::Authority)?,
+    );
+    if now < source_cutoff {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
+    Ok(now)
 }
 
 fn portfolio_snapshot_digest(snapshot: &PortfolioAnalysisPortfolioSnapshot) -> EvidenceDigest {
@@ -1587,6 +2350,14 @@ fn portfolio_snapshot_digest(snapshot: &PortfolioAnalysisPortfolioSnapshot) -> E
     digest.update(snapshot.revision.bytes());
     canonical_text(&mut digest, snapshot.reporting_currency.as_str());
     canonical_money(&mut digest, snapshot.source_cash_balance);
+    canonical_money(&mut digest, snapshot.source_receivable_value);
+    match snapshot.settlement_available_cash {
+        Some(cash) => {
+            digest.update([1]);
+            canonical_money(&mut digest, cash);
+        }
+        None => digest.update([0]),
+    }
     digest.update(snapshot.effective_at.unix_nanos().to_be_bytes());
     digest.update(snapshot.available_at.unix_nanos().to_be_bytes());
     canonical_text(&mut digest, snapshot.source_id.as_str());
@@ -1616,6 +2387,14 @@ fn risk_evidence_digest(evidence: &PortfolioAnalysisRiskEvidence) -> EvidenceDig
     digest.update(evidence.account_id.as_uuid().as_bytes());
     digest.update(evidence.portfolio_revision.bytes());
     digest.update(evidence.profile_digest);
+    canonical_text(&mut digest, evidence.basis_name());
+    match &evidence.scenario {
+        Some(scenario) => {
+            digest.update([1]);
+            canonical_evidence(&mut digest, scenario.digest());
+        }
+        None => digest.update([0]),
+    }
     digest.update((evidence.returns.len() as u64).to_be_bytes());
     for period in &evidence.returns {
         digest.update(period.opening_revision.bytes());
@@ -1648,6 +2427,7 @@ fn marked_portfolio_digest(evidence: &PortfolioAnalysisMarkedPortfolioEvidence) 
     digest.update(b"market-squawk/portfolio-analysis-complete-current-marks/v1\0");
     digest.update(evidence.candidate_instrument_id.as_uuid().as_bytes());
     canonical_money(&mut digest, evidence.source_cash_balance);
+    canonical_money(&mut digest, evidence.source_receivable_value);
     digest.update((evidence.holdings.len() as u64).to_be_bytes());
     for holding in &evidence.holdings {
         digest.update(holding.instrument_id.as_uuid().as_bytes());
@@ -1681,7 +2461,7 @@ fn liquidity_capacity_digest(
     evidence: &PortfolioAnalysisLiquidityCapacityEvidence,
 ) -> EvidenceDigest {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/portfolio-analysis-side-liquidity-capacity/v1\0");
+    digest.update(b"market-squawk/portfolio-analysis-side-liquidity-capacity/v2\0");
     digest.update(evidence.account_id.as_uuid().as_bytes());
     digest.update(evidence.portfolio_revision.bytes());
     digest.update(evidence.profile_digest);
@@ -1722,6 +2502,13 @@ fn prerequisite_unavailable_digest(
         None => digest.update([0]),
     }
     canonical_unavailable_reason(&mut digest, &evidence.reason);
+    match &evidence.historical_scenario {
+        Some(risk) => {
+            digest.update([1]);
+            canonical_evidence(&mut digest, risk.evidence_digest());
+        }
+        None => digest.update([0]),
+    }
     digest.update(evidence.evaluated_at.unix_nanos().to_be_bytes());
     canonical_text(&mut digest, ANALYSIS_AUTHORITY);
     EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
@@ -1735,6 +2522,13 @@ fn recommendation_evidence_digest(evidence: &PortfolioRecommendationEvidence) ->
     canonical_evidence(&mut digest, evidence.marked_portfolio.evidence_digest);
     canonical_evidence(&mut digest, evidence.risk.evidence_digest);
     canonical_evidence(&mut digest, evidence.liquidity_capacity.evidence_digest);
+    match &evidence.risk_sizing {
+        Some(capacity) => {
+            digest.update([1]);
+            canonical_evidence(&mut digest, capacity.digest());
+        }
+        None => digest.update([0]),
+    }
     digest.update(evidence.evaluated_at.unix_nanos().to_be_bytes());
     canonical_text(&mut digest, ANALYSIS_AUTHORITY);
     EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
@@ -1796,6 +2590,23 @@ fn canonical_risk_unavailable(
             digest.update((*required as u64).to_be_bytes());
             digest.update((*available as u64).to_be_bytes());
         }
+        PortfolioAnalysisRiskUnavailableReason::MarketHistoryUnavailable { instrument_id } => {
+            digest.update([6]);
+            digest.update(instrument_id.as_uuid().as_bytes());
+        }
+        PortfolioAnalysisRiskUnavailableReason::MarketHistoryCurrencyMismatch { instrument_id } => {
+            digest.update([7]);
+            digest.update(instrument_id.as_uuid().as_bytes());
+        }
+        PortfolioAnalysisRiskUnavailableReason::MarketHistoryAdjustmentUnsupported {
+            instrument_id,
+        } => {
+            digest.update([8]);
+            digest.update(instrument_id.as_uuid().as_bytes());
+        }
+        PortfolioAnalysisRiskUnavailableReason::CurrentSessionCoverageUnavailable => {
+            digest.update([9])
+        }
     }
 }
 
@@ -1807,9 +2618,10 @@ fn canonical_liquidity_capacity(
         PortfolioAnalysisLiquidityCapacityAvailability::Available(evidence) => {
             digest.update([1]);
             canonical_text(digest, evidence.side.as_str());
+            canonical_text(digest, evidence.basis.as_str());
             canonical_money(digest, evidence.executable_depth_notional);
-            canonical_money(digest, evidence.analytical_upper_weight_notional);
-            digest.update(evidence.analytical_upper_weight_lots.to_be_bytes());
+            canonical_money(digest, evidence.reference_notional);
+            digest.update(evidence.reference_lots.to_be_bytes());
             digest.update(evidence.capacity_ppm.to_be_bytes());
             canonical_evidence(digest, evidence.depth_evidence_digest);
         }
@@ -1822,6 +2634,15 @@ fn canonical_liquidity_capacity(
                 }
                 PortfolioAnalysisLiquidityCapacityUnavailableReason::NoIntegralUpperWeightCapacity => {
                     digest.update([2]);
+                }
+                PortfolioAnalysisLiquidityCapacityUnavailableReason::NoPositiveHeldPosition => {
+                    digest.update([3]);
+                }
+                PortfolioAnalysisLiquidityCapacityUnavailableReason::HeldQuantityNotIntegralLots => {
+                    digest.update([4]);
+                }
+                PortfolioAnalysisLiquidityCapacityUnavailableReason::HeldReferenceUnavailable => {
+                    digest.update([5]);
                 }
             }
         }

@@ -37,13 +37,20 @@ pins, inherited workspace MSRV enforcement, and a fresh locked all-feature verif
 
 ## Native connection setup — owner correction, 2026-09-08
 
-Connection setup belongs entirely in Desktop Settings → Connections → Set up connections.
+Connection setup belongs entirely in Desktop Settings → Onboarding, using the embedded Connections workspace.
 Remove the separate localhost setup website, server, CLI command, and browser-launch fallback;
 keeping that website as an explicit option does not satisfy the owner correction. Reuse saved
 credentials and exact saved data selections. A prepared credential file is a one-time native
 import input, not a second startup configuration authority. Genuine official provider OAuth may
 retain its required authorization handoff and bounded callback transport. Earlier dated portal
 references below remain historical evidence and do not authorize an active setup website.
+
+## Find ordering — owner decision, 2026-09-16
+
+After the existing data and risk checks, Find orders completed investment results by higher
+estimated gains first. Evidence strength remains clearly visible; this ordering does not loosen
+eligibility checks or treat an unavailable estimate as zero. SPY is the main performance scorecard,
+with VTI alongside it. Estimates are decision support, not promised returns.
 
 ## Current upstream research before unfamiliar fixes
 
@@ -114,6 +121,18 @@ not receive fictional operating instructions. Do not add redirect-only pages, em
 documentation checker scripts, prose tests, or new Rust test targets for documentation work.
 
 ## Maximum-safe parallelism
+
+### Agent effort — owner correction, 2026-09-16
+
+Use GPT-6 Astra with **medium** effort for ordinary coding and implementation. Use Astra with
+**high** effort for advanced financial modeling, forecasting, backtesting, harmonics, financial
+algorithms, and complex architectural or design work. This supersedes earlier xhigh agent requests.
+Before dispatching or replacing a worker, record its actual task, effort, reason, dependencies,
+and exclusive file ownership in the current wave. Classify by the task, not an inherited agent name.
+If an ordinary implementation lane encounters advanced financial or architectural work, split that
+specific work into an explicitly classified high-effort task. Do not silently increase all workers.
+Preserve paused predecessors and their unique work during context transfer; verify one transfer
+pilot before replacing the other workers. Completed workers need no replacement without remaining work.
 
 Parallelism follows dependencies and ownership, not raw agent count.
 
@@ -1692,3 +1711,52 @@ harmonic and non-harmonic features, forecast, financial model/valuation, realist
 calibrated decision, virtual-paper action or honest abstention, clean shutdown, and identical
 restart reads. Do not create a broad pattern fixture matrix or a second analytical stack; extend
 the existing feature, forecast, decision, backtest, and paper authorities in place.
+
+## 2026-09-23 owner decision: three probabilities and selectable comparison
+
+V1 must provide all three distinct probabilities over the same selected horizon: price rising,
+outperforming the selected benchmark, and profit after modeled trading costs. Each needs its own
+genuine outcome labels, chronological evaluation, calibration and evidence availability. Missing
+evidence is unavailable, never zero probability. Expected gain and price ranges remain separate
+from event probabilities; an event percentage is not an estimated percentage return.
+
+SPY remains the default main comparison, with VTI alongside it. The benchmark is configurable
+through admitted canonical instruments, with clear S&P 500, total U.S. market and Nasdaq choices
+where corresponding evidence exists. Distinguish an index from its tracking fund: SPY tracks the
+S&P 500 and must not be presented as a separate independent index. A Nasdaq choice must identify
+the actual selected index or fund, not an ambiguous invented symbol.
+
+The financial implementation keeps price-change and benchmark price-return comparisons on the
+same split-adjusted basis and dates. After-cost profit uses existing realistic simulation and
+total-wealth accounting, including supported distributions and entitlements. Explain these
+different meanings plainly. Models must retain exact benchmark and cost assumptions with saved
+results and restart reads. This decision defines required work; it is not completion evidence.
+
+## 2026-09-23 owner requirement: interactive investment forecast chart
+
+The complete V1 investment view includes an interactive market and forecast chart, integrated into
+the existing Obsidian Signal Desktop design. Hover or an accessible equivalent reveals the exact
+date, historical or predicted price, and available forecast bounds. Users can select timeframes
+and show or hide history, central forecast, calibrated uncertainty ranges, benchmark comparison
+and supported buy/trim/sell levels. Selecting a recommendation or price-pattern marker exposes its
+plain-language explanation and original evidence. Historical and forecast segments must be
+visually distinct; forecast uncertainty is explicit, not a guarantee or an invented scenario.
+
+Reuse existing chart components and dependencies. React renders backend-authoritative series and
+action ranges; it must not derive financial forecasts, confidence or recommendation levels.
+Benchmark comparisons use a backend-defined comparable basis rather than placing incomparable
+nominal prices on one scale. The three separately evidenced probabilities accompany the selected
+forecast horizon. Missing series are explained honestly, never filled with demonstration curves.
+These controls and their data connections are part of the full V1 owner-test acceptance journey,
+including saved analysis and restart. They are required delivery work, not a later design idea.
+
+Harmonic visuals are explicitly included in that chart requirement. A selectable Price patterns
+layer renders backend-supplied causal pivot points and pattern geometry for the required AB=CD,
+Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher and Shark families. Hovering or selecting evidence
+reveals formation and confirmation dates, completion or potential reversal zone, invalidation
+level, supported forming/confirmed/invalidated status, and relevant historical evaluation.
+Show how the pattern supports or conflicts with the wider forecast, valuation and risk evidence.
+Never infer a buy instruction, probability or confirmed pattern from geometry alone. Preserve
+original observation/confirmation cutoffs in historical views; do not draw later knowledge as if
+it were available earlier. Missing geometry or status must be explained rather than synthesized
+in React. Wire these visuals through the saved investment analysis and its restart reads.

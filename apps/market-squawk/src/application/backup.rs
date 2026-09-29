@@ -135,7 +135,9 @@ impl ProductBackupService {
         allocate_cutoff: impl FnOnce() -> Result<Timestamp, ProductBackupError>,
     ) -> Result<VerifiedProductBackup, ProductBackupError> {
         let product_root = destination.artifacts().clone();
-        let mut retained = self.components.retain(cancellation).await?;
+        let mut retained = self.components.retain(cancellation).await.inspect_err(|error| {
+            tracing::warn!(stage = "retain", error = %error, "product backup failed");
+        })?;
         if cancellation.is_cancelled() {
             return Err(ProductBackupError::Cancelled);
         }
@@ -143,11 +145,17 @@ impl ProductBackupService {
         let analytical = self
             .analytical
             .create(destination, cutoff, limits, cancellation)
-            .await?;
+            .await
+            .map_err(ProductBackupError::from)
+            .inspect_err(|error| {
+                tracing::warn!(stage = "analytical", error = %error, "product backup failed");
+            })?;
         let snapshot = ProductBackupSnapshot::from_analytical(cutoff, analytical.receipt())?;
         let materialized = retained
             .materialize(&product_root, snapshot, cancellation)
-            .await?;
+            .await.inspect_err(|error| {
+                tracing::warn!(stage = "materialize", error = %error, "product backup failed");
+            })?;
         if materialized.snapshot() != snapshot {
             return Err(ProductBackupError::SnapshotMismatch);
         }
@@ -166,7 +174,9 @@ impl ProductBackupService {
                 materialized.components(),
                 cancellation,
             )
-            .await?;
+            .await.inspect_err(|error| {
+                tracing::warn!(stage = "revalidate", error = %error, "product backup failed");
+            })?;
         manifest.verify_component_artifacts(&product_root, cancellation)?;
         Ok(VerifiedProductBackup {
             analytical,
@@ -744,7 +754,7 @@ pub trait ProductRestoreFinalizer: std::fmt::Debug + Send {
     /// Finalizes all staged non-analytical authorities against the restored analytical service.
     async fn finalize(
         self: Box<Self>,
-        analytical: &AnalyticalDataService,
+        analytical: std::sync::Arc<AnalyticalDataService>,
         cancellation: &CancellationToken,
     ) -> Result<(), ProductBackupError>;
 }
@@ -805,7 +815,7 @@ pub trait ProductRestoreComponentAuthority: std::fmt::Debug + Send + Sync {
 /// Fully restored inactive workspace retained for registration and generation-fenced switching.
 pub struct PreparedProductRestore {
     workspace: WorkspaceDescriptor,
-    analytical: AnalyticalDataService,
+    analytical: std::sync::Arc<AnalyticalDataService>,
     manifest: ProductBackupManifest,
 }
 
@@ -822,7 +832,7 @@ impl PreparedProductRestore {
         self,
     ) -> (
         WorkspaceDescriptor,
-        AnalyticalDataService,
+        std::sync::Arc<AnalyticalDataService>,
         ProductBackupManifest,
     ) {
         (self.workspace, self.analytical, self.manifest)
@@ -848,7 +858,9 @@ impl VerifiedProductBackup {
         components: &dyn ProductRestoreComponentAuthority,
         cancellation: &CancellationToken,
     ) -> Result<PreparedProductRestore, ProductBackupError> {
-        let target = components.stage(&self.manifest, cancellation).await?;
+        let target = components.stage(&self.manifest, cancellation).await.inspect_err(|error| {
+            tracing::warn!(stage = "stage_components", error = %error, "product restore failed");
+        })?;
         let workspace_id = target.workspace.workspace_id();
         if target.source_workspace != self.manifest.ownership().workspace_id()
             || target.active_workspace != active_workspace
@@ -874,7 +886,10 @@ impl VerifiedProductBackup {
         };
         match restored {
             Ok(analytical) => {
-                if let Err(error) = target.finalizer.finalize(&analytical, cancellation).await {
+                let analytical = std::sync::Arc::new(analytical);
+                if let Err(error) = target.finalizer.finalize(std::sync::Arc::clone(&analytical), cancellation).await {
+                    tracing::warn!(stage = "finalize_components", error = %error, "product restore failed");
+                    drop(analytical);
                     components.abandon(workspace_id, cancellation).await?;
                     return Err(error);
                 }
@@ -885,6 +900,7 @@ impl VerifiedProductBackup {
                 })
             }
             Err(error) => {
+                tracing::warn!(stage = "restore_analytical", "product restore failed");
                 components.abandon(workspace_id, cancellation).await?;
                 Err(ProductBackupError::Analytical(error))
             }

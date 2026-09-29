@@ -107,6 +107,8 @@ pub enum CapacityRange {
     Lots(LotRange),
     /// Capacity expressed as an exact target-position notional interval.
     Notional(NonnegativeMoneyRange),
+    /// The source authority evaluated the context and found no feasible whole-lot target.
+    NoFeasibleLots,
 }
 
 /// Identity- and time-bound capacity evidence for one exact sizing context.
@@ -242,7 +244,7 @@ pub struct CandidatePortfolioSizingState {
     pub(super) instrument_id: InstrumentId,
     pub(super) portfolio_revision: PortfolioRevisionToken,
     pub(super) marked_equity_at_selected_mark: Money,
-    pub(super) settlement_available_cash: Money,
+    pub(super) settlement_available_cash: Option<Money>,
     pub(super) current_lots: QuantityLots,
 }
 
@@ -273,7 +275,31 @@ impl CandidatePortfolioSizingState {
             instrument_id,
             portfolio_revision,
             marked_equity_at_selected_mark,
-            settlement_available_cash,
+            settlement_available_cash: Some(settlement_available_cash),
+            current_lots,
+        })
+    }
+
+    /// Captures an observed portfolio without asserting settlement cash authority.
+    ///
+    /// The exact source cash included in marked equity is not an available-cash receipt. The
+    /// cash constraint remains unavailable while downside and preferred-weight caps are computed.
+    pub fn try_without_settlement_cash(
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        portfolio_revision: PortfolioRevisionToken,
+        marked_equity_at_selected_mark: Money,
+        current_lots: QuantityLots,
+    ) -> Result<Self, InvestmentProjectionError> {
+        if marked_equity_at_selected_mark.amount() <= Decimal::ZERO {
+            return Err(InvestmentProjectionError::InvalidFinancialValue);
+        }
+        Ok(Self {
+            account_id,
+            instrument_id,
+            portfolio_revision,
+            marked_equity_at_selected_mark,
+            settlement_available_cash: None,
             current_lots,
         })
     }
@@ -302,9 +328,9 @@ impl CandidatePortfolioSizingState {
         self.marked_equity_at_selected_mark
     }
 
-    /// Returns exact settlement-available cash before any hypothetical target change.
+    /// Returns exact settlement-available cash, if separately supplied by its authority.
     #[must_use]
-    pub const fn settlement_available_cash(&self) -> Money {
+    pub const fn settlement_available_cash(&self) -> Option<Money> {
         self.settlement_available_cash
     }
 
@@ -491,6 +517,8 @@ pub enum SizingConstraintKind {
 /// Why a hard or preferred lot range could not be truthfully returned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SizingUnavailableReason {
+    /// The observed portfolio supplies no settlement-available cash authority.
+    SettlementCashNotSupplied,
     /// No exact capacity evidence was supplied for the named external authority.
     CapacityNotSupplied(SizingConstraintKind),
     /// Capacity evidence was not yet knowable at the evaluation time.
@@ -820,7 +848,10 @@ fn validate_sizing_context(
     if evidence.currency() != inputs.selected_mark.currency()
         || evidence.currency() != portfolio_risk.currency()
         || evidence.currency() != inputs.portfolio.marked_equity_at_selected_mark.currency()
-        || evidence.currency() != inputs.portfolio.settlement_available_cash.currency()
+        || inputs
+            .portfolio
+            .settlement_available_cash
+            .is_some_and(|cash| evidence.currency() != cash.currency())
         || evidence.currency() != inputs.constraints.minimum_cash_reserve.currency()
     {
         return Err(InvestmentProjectionError::CurrencyMismatch);
@@ -843,6 +874,17 @@ fn validate_sizing_context(
             return Err(InvestmentProjectionError::PortfolioStateMismatch);
         }
         PortfolioPositionState::NoPosition | PortfolioPositionState::Position { .. } => {}
+    }
+    // An off-tick forecast can retain these inputs without producing a sizing projection.
+    // Reject unrelated capacity receipts before that typed absence can short-circuit validation.
+    for capacity in [
+        &inputs.liquidity_capacity,
+        &inputs.risk_capacity,
+        &inputs.forward_cost_capacity,
+    ] {
+        if let SizingCapacityAvailability::Available(evidence) = capacity {
+            validate_capacity_binding(evidence, inputs)?;
+        }
     }
     let ladder = proposal.price_ladder();
     ensure_execution_terms(
@@ -901,13 +943,19 @@ fn cash_reserve_cap(
     inputs: &InvestmentSizingInputs,
     per_lot_notional: Money,
 ) -> Result<SizingConstraintCap, InvestmentProjectionError> {
+    let Some(settlement_cash) = inputs.portfolio.settlement_available_cash else {
+        return Ok(SizingConstraintCap::Unavailable {
+            kind: SizingConstraintKind::CashReserve,
+            reason: SizingUnavailableReason::SettlementCashNotSupplied,
+        });
+    };
     let current_notional = money_for_lots(
         inputs.selected_mark,
         inputs.execution_terms,
         inputs.portfolio.current_lots,
     )?;
     let gross_liquidatable_value = current_notional
-        .checked_add(inputs.portfolio.settlement_available_cash)
+        .checked_add(settlement_cash)
         .and_then(|value| value.checked_sub(inputs.constraints.minimum_cash_reserve))
         .map_err(map_financial_error)?;
     if gross_liquidatable_value.amount() < Decimal::ZERO {
@@ -1034,6 +1082,7 @@ fn capacity_cap(
         });
     }
     let lot_range = match evidence.range {
+        CapacityRange::NoFeasibleLots => None,
         CapacityRange::Lots(range) => Some(range),
         CapacityRange::Notional(range) => lot_range_for_notional(range, per_lot_notional)?,
     };

@@ -102,7 +102,16 @@ pub(crate) fn try_compose_installed_workspace_backup(
         Arc::new(ProviderMetadataWorkspaceBackupAuthority::try_new(
             product.provider_metadata_backup_authority(),
         )?),
-        Arc::new(SourceDataWorkspaceBackupAuthority::try_new()?),
+        Arc::new(SourceDataWorkspaceBackupAuthority::try_new(
+            product.research(),
+            product.decisions(),
+            Arc::clone(&product.paper_backup),
+            product.artifacts(),
+            std::num::NonZeroUsize::new(crate::paper_bot::LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)
+                .ok_or(ServiceError::Unavailable)?,
+            std::num::NonZeroUsize::new(crate::local_product::LOCAL_MAXIMUM_ARTIFACT_BYTES)
+                .ok_or(ServiceError::Unavailable)?,
+        )?),
         Arc::new(PortfolioWorkspaceBackupAuthority::try_new(
             product.portfolio().backup_authority(),
         )?),
@@ -117,6 +126,9 @@ pub(crate) fn try_compose_installed_workspace_backup(
         Arc::new(JobsAndReceiptsWorkspaceBackupAuthority::try_new(
             jobs,
             backup_runner,
+            product.artifact_authority(),
+            product.backtest_inputs(),
+            product.backtest_repository(),
         )?),
         Arc::new(FairValueWorkspaceBackupAuthority::try_new(
             product.fair_value_service(),

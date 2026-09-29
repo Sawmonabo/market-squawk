@@ -2,7 +2,9 @@
 
 use std::num::NonZeroU32;
 
-use market_squawk_domain::{AccountId, Currency, DataQuality, InstrumentId, Money, Timestamp};
+use market_squawk_domain::{
+    AccountId, Currency, DataQuality, HistoricalStudyBasis, InstrumentId, Money, Timestamp,
+};
 
 use crate::{DecisionText, TargetPriceCases, TargetPriceRange};
 
@@ -50,6 +52,7 @@ pub enum ProposalExecutionEligibility {
 /// exposed by [`GeneratedInvestmentProposal`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeneratedPriceLadder {
+    pub(super) current_share_basis: Option<crate::DecisionContentDigest>,
     pub(super) cases: TargetPriceCases,
     pub(super) downside_range: TargetPriceRange,
     pub(super) base_range: TargetPriceRange,
@@ -120,6 +123,7 @@ impl GeneratedPriceLadder {
             return Err(InvestmentProposalError::InvalidPrice);
         }
         Ok(Self {
+            current_share_basis: None,
             cases,
             downside_range,
             base_range,
@@ -130,6 +134,12 @@ impl GeneratedPriceLadder {
             trim_range,
             exit_range,
         })
+    }
+
+    /// Exact current-quote projection identity. Absent only on the unadmitted arithmetic kernel.
+    #[must_use]
+    pub const fn current_share_basis(self) -> Option<crate::DecisionContentDigest> {
+        self.current_share_basis
     }
 
     /// Returns generated downside, base, and upside cases.
@@ -187,9 +197,50 @@ impl GeneratedPriceLadder {
     }
 }
 
+/// Backend-only action overlays expressed in the original saved chart share frame.
+/// These contain no forecast path and grant no execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OriginalShareActionOverlay {
+    original_basis_identity: crate::DecisionContentDigest,
+    projection_identity: crate::DecisionContentDigest,
+    entry_range: TargetPriceRange,
+    add_range: TargetPriceRange,
+    trim_range: TargetPriceRange,
+    exit_range: TargetPriceRange,
+}
+
+impl OriginalShareActionOverlay {
+    /// Chart history/forecast must carry this exact original basis identity.
+    pub const fn original_basis_identity(self) -> crate::DecisionContentDigest {
+        self.original_basis_identity
+    }
+    /// Exact decision projection from the original frame into the current quote frame.
+    pub const fn projection_identity(self) -> crate::DecisionContentDigest {
+        self.projection_identity
+    }
+    /// Original-chart-unit entry overlay.
+    pub const fn entry_range(self) -> TargetPriceRange {
+        self.entry_range
+    }
+    /// Original-chart-unit add overlay.
+    pub const fn add_range(self) -> TargetPriceRange {
+        self.add_range
+    }
+    /// Original-chart-unit trim overlay.
+    pub const fn trim_range(self) -> TargetPriceRange {
+        self.trim_range
+    }
+    /// Original-chart-unit invalidation/exit overlay.
+    pub const fn exit_range(self) -> TargetPriceRange {
+        self.exit_range
+    }
+}
+
 /// Why mandatory evidence could not be admitted for policy evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProposalUnavailableReason {
+    /// Original forecast/model amounts have no source-proven conversion to the exact current quote.
+    UnprovenCurrentShareUnits,
     /// A configured mandatory producer supplied no evidence.
     MissingEvidence(RecommendationEvidenceKind),
     /// Evidence belongs to a different stable instrument.
@@ -244,12 +295,31 @@ pub enum ProposalUnavailableReason {
         /// Valuation measurement horizon.
         actual: Timestamp,
     },
+    /// Financial-model evidence did not measure the exact policy horizon.
+    FinancialModelHorizonMismatch {
+        expected: Timestamp,
+        actual: Timestamp,
+    },
     /// Backtest outcomes evaluated a different horizon from the recommendation policy.
     BacktestHorizonMismatch {
         /// Policy-required horizon in nanoseconds.
         expected_nanos: i64,
         /// Evaluated backtest outcome horizon in nanoseconds.
         actual_nanos: i64,
+    },
+    /// Independent out-of-sample outcomes evaluated a different policy horizon.
+    OutOfSampleHorizonMismatch {
+        expected_nanos: i64,
+        actual_nanos: i64,
+    },
+    /// The financial-model central value does not match the independently governed valuation.
+    FinancialModelValuationMismatch,
+    /// The chronological OOS receipt does not bind the admitted backtest study identities.
+    OutOfSampleBacktestMismatch,
+    /// The configured policy requires historically known data for its supporting study.
+    HistoricalStudyBasisNotAllowed {
+        /// Actual basis retained by the study producer.
+        actual: HistoricalStudyBasis,
     },
     /// Forecast calibration did not contain enough completed outcomes.
     InsufficientForecastOutcomes {
@@ -267,14 +337,25 @@ pub enum ProposalUnavailableReason {
         /// Exact declared nominal coverage.
         actual_ppm: u32,
     },
-    /// PIT backtest observation count was below the policy minimum.
+    /// Realized interval coverage failed hard admission independently of weighted reliability.
+    ForecastCalibrationBelowPolicy {
+        /// Minimum admitted realized coverage.
+        minimum_realized_ppm: u32,
+        /// Maximum admitted absolute nominal-versus-realized coverage difference.
+        maximum_error_ppm: u32,
+        /// Exact nominal interval coverage.
+        nominal_ppm: u32,
+        /// Exact realized interval coverage.
+        realized_ppm: u32,
+    },
+    /// Historical-study observation count was below the policy minimum.
     InsufficientBacktestObservations {
         /// Policy minimum.
         required: NonZeroU32,
         /// Exact evidence count.
         actual: NonZeroU32,
     },
-    /// PIT backtest trial count was below the policy minimum.
+    /// Historical-study fold count was below the policy minimum.
     InsufficientBacktestTrials {
         /// Policy minimum.
         required: NonZeroU32,
@@ -292,12 +373,18 @@ pub enum NoActionReason {
     ConflictingForecastAndValuation,
     /// A valid backtest failed cost-adjusted performance, stability, or drawdown policy.
     BacktestBelowPolicy,
+    /// Complete chronological OOS evidence failed sample, fold, or completion-coverage policy.
+    OutOfSampleBelowPolicy,
     /// Complete liquidity evidence failed spread or capacity policy.
     LiquidityBelowPolicy,
+    /// The prospective action lacks its required directional capacity evidence.
+    LiquidityCapacityUnavailable,
     /// Complete portfolio evidence failed account-specific risk capacity policy.
     PortfolioRiskBelowPolicy,
     /// Policy-weighted evidence reliability fell below the fixed policy floor.
     ConfidenceBelowPolicy,
+    /// Required reliability evidence or applicable configured weight is unavailable.
+    ConfidenceUnavailable,
     /// Evidence direction is not actionable for the proven current position state.
     PositionStateNotActionable,
     /// Exact policy rounding could not preserve a truthful strictly ordered price ladder.
@@ -311,6 +398,8 @@ pub enum ProposalInvalidator {
     ForecastValuationConflict,
     /// Backtest performance, stability, or drawdown is outside policy.
     BacktestPolicyBreach,
+    /// Independent chronological OOS evidence is outside policy.
+    OutOfSamplePolicyBreach,
     /// Liquidity spread or capacity is outside policy.
     LiquidityPolicyBreach,
     /// Portfolio risk capacity is outside policy.
@@ -341,6 +430,53 @@ pub struct GeneratedInvestmentProposal {
 }
 
 impl GeneratedInvestmentProposal {
+    /// Converts only action overlays back to the original chart frame with outward rounding.
+    /// The application must reopen saved source recipes before claiming chart comparability.
+    pub fn original_share_action_overlay(
+        &self,
+    ) -> Result<OriginalShareActionOverlay, InvestmentProposalError> {
+        use market_squawk_data::ShareConversionRounding;
+        let proof = self
+            .evidence
+            .current_share_projection
+            .as_ref()
+            .ok_or(InvestmentProposalError::InvalidEvidenceMetric)?;
+        if self.price_ladder.current_share_basis != Some(proof.identity()) {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        let conversion = proof.conversion();
+        let range = |value: TargetPriceRange| -> Result<TargetPriceRange, InvestmentProposalError> {
+            let lower = conversion
+                .inverse_money(value.lower(), ShareConversionRounding::Lower)
+                .map_err(|_| InvestmentProposalError::ArithmeticOverflow)?;
+            let upper = conversion
+                .inverse_money(value.upper(), ShareConversionRounding::Upper)
+                .map_err(|_| InvestmentProposalError::ArithmeticOverflow)?;
+            if lower.amount() >= upper.amount() {
+                return Err(InvestmentProposalError::InvalidPrice);
+            }
+            TargetPriceRange::try_new(lower, upper)
+                .map_err(|_| InvestmentProposalError::InvalidPrice)
+        };
+        let overlay = OriginalShareActionOverlay {
+            original_basis_identity: super::evidence::sha256_content(
+                conversion.original_basis_identity().bytes(),
+            )?,
+            projection_identity: proof.identity(),
+            entry_range: range(self.price_ladder.entry_range)?,
+            add_range: range(self.price_ladder.add_range)?,
+            trim_range: range(self.price_ladder.trim_range)?,
+            exit_range: range(self.price_ladder.exit_range)?,
+        };
+        if overlay.exit_range.upper().amount() >= overlay.add_range.lower().amount()
+            || overlay.add_range.upper().amount() >= overlay.entry_range.lower().amount()
+            || overlay.entry_range.upper().amount() >= overlay.trim_range.lower().amount()
+        {
+            return Err(InvestmentProposalError::InvalidPrice);
+        }
+        Ok(overlay)
+    }
+
     /// Returns the stable analysis identity.
     #[must_use]
     pub const fn analysis_id(&self) -> InvestmentAnalysisId {

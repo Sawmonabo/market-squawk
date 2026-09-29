@@ -76,7 +76,11 @@ impl AuthoritativeSourceRegistry {
         if health.observed_at().unix_nanos() <= previous_observed {
             return Err(RegistryError::StaleHealthObservation);
         }
-        let live_declaration = entry.metadata.coverage().live();
+        let live_declaration = match health.coverage() {
+            crate::CoverageHealth::Sufficient { provider_product, provider_channel, .. } =>
+                entry.metadata.coverage().live_for(provider_product, provider_channel),
+            _ => None,
+        };
         let quality_ceiling = entry.metadata.quality_ceiling();
         let exact_runtime_coverage = matches!(
             (health.coverage(), live_declaration),
@@ -285,6 +289,7 @@ impl AuthoritativeSourceRegistry {
             validated,
             health,
             attestation,
+            provider_identities: &entry.provider_identities,
             validated_at: validation_at,
             clock: &self.clock,
         })

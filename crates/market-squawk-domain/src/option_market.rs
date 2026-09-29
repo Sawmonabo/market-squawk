@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::{
     CalendarDate, EvidenceDigest, InstrumentId, Money, OccOptionIdentity, OptionKind,
-    ProviderInstrumentId, QuantityLots, SourceIdentifier, Timestamp,
+    ProviderInstrumentId, SourceIdentifier, Timestamp,
 };
 
 /// Maximum source-authored trade conditions retained by one option snapshot.
@@ -329,16 +329,16 @@ pub struct OptionSnapshotObservationInput {
     pub terms: OptionContractTerms,
     /// Bid price component.
     pub bid_price: OptionComponent<Money>,
-    /// Bid size component.
-    pub bid_size: OptionComponent<QuantityLots>,
+    /// Bid size in actual option contracts; independent of executable lot or deliverable size.
+    pub bid_size: OptionComponent<u64>,
     /// Ask price component.
     pub ask_price: OptionComponent<Money>,
-    /// Ask size component.
-    pub ask_size: OptionComponent<QuantityLots>,
+    /// Ask size in actual option contracts.
+    pub ask_size: OptionComponent<u64>,
     /// Last-trade price component.
     pub last_price: OptionComponent<Money>,
-    /// Last-trade size component.
-    pub last_size: OptionComponent<QuantityLots>,
+    /// Last-trade size in actual option contracts.
+    pub last_size: OptionComponent<u64>,
     /// Provider mark component, kept distinct from executable quote sides.
     pub mark_price: OptionComponent<Money>,
     /// Bounded source-authored trade conditions.
@@ -368,11 +368,11 @@ pub struct OptionSnapshotObservationInput {
 pub struct OptionSnapshotObservation {
     terms: OptionContractTerms,
     bid_price: OptionComponent<Money>,
-    bid_size: OptionComponent<QuantityLots>,
+    bid_size: OptionComponent<u64>,
     ask_price: OptionComponent<Money>,
-    ask_size: OptionComponent<QuantityLots>,
+    ask_size: OptionComponent<u64>,
     last_price: OptionComponent<Money>,
-    last_size: OptionComponent<QuantityLots>,
+    last_size: OptionComponent<u64>,
     mark_price: OptionComponent<Money>,
     trade_conditions: OptionComponent<Box<[SourceIdentifier]>>,
     volume: OptionComponent<u64>,
@@ -452,7 +452,7 @@ impl OptionSnapshotObservation {
     }
 
     /// Returns the bid-size component.
-    pub const fn bid_size(&self) -> &OptionComponent<QuantityLots> {
+    pub const fn bid_size(&self) -> &OptionComponent<u64> {
         &self.bid_size
     }
 
@@ -462,7 +462,7 @@ impl OptionSnapshotObservation {
     }
 
     /// Returns the ask-size component.
-    pub const fn ask_size(&self) -> &OptionComponent<QuantityLots> {
+    pub const fn ask_size(&self) -> &OptionComponent<u64> {
         &self.ask_size
     }
 
@@ -472,7 +472,7 @@ impl OptionSnapshotObservation {
     }
 
     /// Returns the last-trade-size component.
-    pub const fn last_size(&self) -> &OptionComponent<QuantityLots> {
+    pub const fn last_size(&self) -> &OptionComponent<u64> {
         &self.last_size
     }
 

@@ -35,6 +35,7 @@ use super::{
         DisplayMarketIngress, DisplayMarketKey, DisplayMarketMonitorError,
         DisplayMarketRouteIdentity, DisplayMarketSupervisorMonitor, DisplayMarketTerminalFailure,
     },
+    instruments::ProductionCatalogSelection,
     provider::{ProductionLiveSource, ProductionProviderError, ProductionSourceProfile},
     route_actor::{RouteActorWorker, RouteBufferLimits, spawn_route_activation},
     sink::{
@@ -55,6 +56,7 @@ const CAPTURE_FLUSH_RECORDS: usize = 256;
 // incorrectly quarantining a healthy source after a rebuild.
 const CAPTURE_HELPER_STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKOFF_JITTER_SAMPLE_BASIS_POINTS: u16 = 1_000;
+const CATALOG_SELECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One completed exact-generation source run after all generation-owned resources were reaped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +82,13 @@ impl ProductionGenerationOutcome {
     }
 }
 
+/// Both results come from the original supervisor after its physical cleanup joins.
+#[derive(Debug)]
+pub(super) struct ProductionSupervisorRunOutcome {
+    pub(super) run: Result<(), ProductionSupervisorError>,
+    pub(super) cleanup: Result<(), ProductionSupervisorError>,
+}
+
 /// Sole owner of durable source authority and exact-generation lifecycle transitions.
 #[derive(Debug)]
 pub(super) struct ProductionSourceSupervisor {
@@ -87,11 +96,14 @@ pub(super) struct ProductionSourceSupervisor {
     profile: ProductionSourceProfile,
     publication: ProductionCapturedPublicationIngress,
     registry: Option<AuthoritativeSourceRegistry>,
+    catalog: Option<ProductionCatalogSelection>,
     registered: RegisteredSource,
     backoff: ProviderBackoffAuthority,
     paths: LocalPaths,
     capture_process: CaptureProcessInfrastructure,
     output: ProductionSupervisorOutput,
+    cleanup_failure: Option<ProductionSupervisorError>,
+    completion: Option<Arc<super::composition::PublicSourceCompletion>>,
 }
 
 #[derive(Debug)]
@@ -171,6 +183,42 @@ impl ProductionSourceSupervisor {
             capture_process,
             output,
             provider_rate,
+            None,
+        )
+    }
+
+    /// Installs the actual catalog reader and selects every native route before registration can
+    /// yield a live session or capture/network work can begin.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "catalog selection, live ingress, rate, capture, and route bounds are separate authorities"
+    )]
+    pub(super) fn try_new_with_provider_rate_and_catalog(
+        config: &AppConfig,
+        profile: ProductionSourceProfile,
+        paths: LocalPaths,
+        capture_process: CaptureProcessInfrastructure,
+        live_ingress: LiveRuntimeIngress,
+        routes: Vec<ShardKey>,
+        route_buffer_limits: RouteBufferLimits,
+        provider_rate: ProviderRateAuthority,
+        catalog: &ProductionCatalogSelection,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, ProductionSupervisorError> {
+        let output = ProductionSupervisorOutput::Live {
+            ingress: live_ingress,
+            routes,
+            buffer_limits: route_buffer_limits,
+        };
+        Self::try_new_with_output(
+            config,
+            profile,
+            paths,
+            capture_process,
+            output,
+            provider_rate,
+            Some((catalog, deadline, cancellation)),
         )
     }
 
@@ -188,16 +236,28 @@ impl ProductionSourceSupervisor {
         actor_limits: DisplayMarketActorLimits,
         read_admission: super::display_market::DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
-    ) -> Result<Self, ProductionSupervisorError> {
+        catalog: &ProductionCatalogSelection,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Self,
+        (
+            ProductionSupervisorError,
+            Result<(), ProductionSupervisorError>,
+        ),
+    > {
         if !profile.supports_display_output() {
-            return Err(ProductionSupervisorError::UnsupportedDisplayProvider);
+            return Err((
+                ProductionSupervisorError::UnsupportedDisplayProvider,
+                Ok(()),
+            ));
         }
         if routes.is_empty() {
-            return Err(ProductionSupervisorError::MissingDisplayRoutes);
+            return Err((ProductionSupervisorError::MissingDisplayRoutes, Ok(())));
         }
         for (index, route) in routes.iter().enumerate() {
             if routes[index.saturating_add(1)..].contains(route) {
-                return Err(ProductionSupervisorError::DuplicateDisplayRoute);
+                return Err((ProductionSupervisorError::DuplicateDisplayRoute, Ok(())));
             }
         }
         let output = ProductionSupervisorOutput::Display {
@@ -213,7 +273,15 @@ impl ProductionSourceSupervisor {
             capture_process,
             output,
             provider_rate,
+            Some((catalog, deadline, cancellation)),
         )
+        .map_err(|error| match error {
+            ProductionSupervisorError::RegistryStartupCleanup { source, cleanup } => {
+                (*source, Err(ProductionSupervisorError::Registry(cleanup)))
+            }
+            // Every remaining constructor branch precedes ownership or explicitly shut down its registry.
+            cause => (cause, Ok(())),
+        })
     }
 
     fn try_new_with_output(
@@ -223,6 +291,7 @@ impl ProductionSourceSupervisor {
         capture_process: CaptureProcessInfrastructure,
         output: ProductionSupervisorOutput,
         provider_rate: ProviderRateAuthority,
+        catalog: Option<(&ProductionCatalogSelection, Instant, &CancellationToken)>,
     ) -> Result<Self, ProductionSupervisorError> {
         let registered_at = system_timestamp()?;
         let authority_path = paths.root().join("authority").join(profile.source_key());
@@ -234,31 +303,69 @@ impl ProductionSourceSupervisor {
             authorization_subject_resolver,
             provider_rate,
         )?;
-        let registered = match registry
-            .register_or_resume_exact(profile.metadata().clone(), registered_at)
-        {
+        if let Some((selection, _, _)) = catalog {
+            registry = registry.with_provider_identity_authority(Arc::new(selection.reader()))?;
+        }
+        let registered = match (|| {
+            let registered =
+                registry.register_or_resume_exact(profile.metadata().clone(), registered_at)?;
+            if let Some((selection, deadline, cancellation)) = catalog {
+                registry.record_provider_identities(
+                    &registered,
+                    selection.requests(),
+                    deadline,
+                    cancellation,
+                )?;
+            }
+            Ok::<_, RegistryError>(registered)
+        })() {
             Ok(registered) => registered,
             Err(source) => {
                 return match registry.shutdown() {
-                    Ok(()) => Err(ProductionSupervisorError::Registry(source)),
-                    Err(cleanup) => {
-                        Err(ProductionSupervisorError::RegistryStartupCleanup { source, cleanup })
-                    }
+                    Ok(()) => Err(ProductionSupervisorError::from_registry_selection(source)),
+                    Err(cleanup) => Err(ProductionSupervisorError::RegistryStartupCleanup {
+                        source: Box::new(ProductionSupervisorError::from_registry_selection(
+                            source,
+                        )),
+                        cleanup,
+                    }),
                 };
             }
         };
-        let backoff = registry.provider_backoff_authority(&registered)?;
+        let backoff = match registry.provider_backoff_authority(&registered) {
+            Ok(backoff) => backoff,
+            Err(source) => {
+                return match registry.shutdown() {
+                    Ok(()) => Err(ProductionSupervisorError::ProviderBackoff(source)),
+                    Err(cleanup) => Err(ProductionSupervisorError::RegistryStartupCleanup {
+                        source: Box::new(ProductionSupervisorError::ProviderBackoff(source)),
+                        cleanup,
+                    }),
+                };
+            }
+        };
         Ok(Self {
             config: config.clone(),
             profile,
             publication: ProductionCapturedPublicationIngress::none(),
             registry: Some(registry),
+            catalog: catalog.map(|(selection, _, _)| selection.clone()),
             registered,
             backoff,
             paths,
             capture_process,
             output,
+            cleanup_failure: None,
+            completion: None,
         })
+    }
+
+    pub(super) fn with_completion(
+        mut self,
+        completion: Option<Arc<super::composition::PublicSourceCompletion>>,
+    ) -> Self {
+        self.completion = completion;
+        self
     }
 
     pub(super) fn with_publication(
@@ -274,6 +381,10 @@ impl ProductionSourceSupervisor {
         cancellation: CancellationToken,
         startup: &mut Option<oneshot::Sender<()>>,
     ) -> Result<ProductionGenerationOutcome, ProductionSupervisorError> {
+        let shutdown_policy = ProcessCaptureShutdownPolicy::try_new(
+            self.config.capture_shutdown(),
+            self.config.capture_shutdown(),
+        )?;
         let at = system_timestamp()?;
         let session_id = SessionId::new(SourceIdentifier::try_from(format!(
             "{}-{}",
@@ -296,6 +407,29 @@ impl ProductionSourceSupervisor {
             .registry
             .as_mut()
             .ok_or(ProductionSupervisorError::AlreadyShutdown)?;
+        if let Some(selection) = &self.catalog {
+            let selection_deadline = Instant::now()
+                .checked_add(CATALOG_SELECTION_TIMEOUT)
+                .ok_or(ProductionSupervisorError::InvalidStaticPolicy)?;
+            let requests = selection
+                .requests()
+                .iter()
+                .cloned()
+                .map(|mut request| {
+                    request.knowledge_at = at;
+                    request.effective_at = at;
+                    request
+                })
+                .collect::<Vec<_>>();
+            registry
+                .record_provider_identities(
+                    &self.registered,
+                    &requests,
+                    selection_deadline,
+                    &cancellation,
+                )
+                .map_err(ProductionSupervisorError::from_registry_selection)?;
+        }
         let session = registry.begin_next_session(&self.registered, session_id, at)?;
         let generation = session.generation();
         let startup_required = startup.is_some();
@@ -456,14 +590,14 @@ impl ProductionSourceSupervisor {
                         ingress_timeout: self.config.source_shutdown(),
                         startup_readiness_policy: self.profile.startup_readiness_policy(),
                     };
-                    match startup.take() {
-                        Some(readiness) => {
-                            ProductionRawMarketSink::try_new_display_with_startup_readiness(
-                                input, readiness,
-                            )?
-                        }
-                        None => ProductionRawMarketSink::try_new_display(input)?,
+                    let mut sink = ProductionRawMarketSink::try_new_display_with_publication(
+                        input,
+                        self.publication.clone(),
+                    )?;
+                    if let Some(readiness) = startup.take() {
+                        sink.install_startup_readiness(readiness)?;
                     }
+                    sink
                 }
             };
             let result = if display_monitors.is_empty() {
@@ -490,6 +624,12 @@ impl ProductionSourceSupervisor {
             }
             drop(sink);
             let source_error = match (result, terminal) {
+                (
+                    _,
+                    Some(ProductionSinkFailure::Registry(
+                        RegistryError::ProviderIdentitySelectionStale,
+                    )),
+                ) => Err(ProductionSupervisorError::CatalogSelectionStale),
                 (Err(_error), Some(failure)) if failure.requires_generation_resynchronization() => {
                     Ok(Some(SourceError::GenerationResynchronizationRequired))
                 }
@@ -506,7 +646,14 @@ impl ProductionSourceSupervisor {
         .await;
 
         route_cancellation.cancel();
-        let mut cleanup_error = None;
+        let mut cleanup_error = if matches!(
+            source_result,
+            Err(ProductionSupervisorError::DisplaySourceShutdownDeadline)
+        ) {
+            Some(ProductionSupervisorError::SourceCleanupIncomplete)
+        } else {
+            None
+        };
         for worker in route_workers {
             let route_result = route_worker_cleanup_error(worker).await;
             if cleanup_error.is_none() {
@@ -534,10 +681,6 @@ impl ProductionSourceSupervisor {
             drop(control);
         }
         if let Some(handle) = writer_handle {
-            let shutdown_policy = ProcessCaptureShutdownPolicy::try_new(
-                self.config.capture_shutdown(),
-                self.config.capture_shutdown(),
-            )?;
             let shutdown = handle.shutdown(shutdown_policy).await;
             let clean = shutdown.disposition() == ProcessCaptureShutdownDisposition::Complete
                 && shutdown.helper_reaped()
@@ -552,7 +695,15 @@ impl ProductionSourceSupervisor {
             }
         }
         if let Some(error) = cleanup_error {
-            return Err(error);
+            self.cleanup_failure = Some(error);
+            return match source_result {
+                Err(cause) => Err(cause),
+                Ok((Some(source), ready)) if startup_required && !ready => Err(
+                    ProductionSupervisorError::SourceFailedBeforeReadiness(source),
+                ),
+                Ok((Some(source), _)) => Err(ProductionSupervisorError::TerminalSource(source)),
+                Ok((None, _)) => Err(ProductionSupervisorError::SourceCleanupIncomplete),
+            };
         }
         let (source_error, startup_ready) = source_result?;
         Ok(ProductionGenerationOutcome {
@@ -564,22 +715,49 @@ impl ProductionSourceSupervisor {
     }
 
     pub(super) async fn run(
-        mut self,
+        self,
         cancellation: CancellationToken,
         startup: oneshot::Sender<()>,
     ) -> Result<(), ProductionSupervisorError> {
-        let mut startup = Some(startup);
-        let run = self.run_loop(&cancellation, &mut startup).await;
-        let shutdown = self.shutdown();
-        match (run, shutdown) {
+        let completion = self.completion.clone();
+        let outcome = self.run_with_cleanup(cancellation, startup).await;
+        if let Some(completion) = completion {
+            completion.finish();
+        }
+        match (outcome.run, outcome.cleanup) {
             (Ok(()), Ok(())) => Ok(()),
-            (Err(source), Ok(())) => Err(source),
-            (Ok(()), Err(shutdown)) => Err(shutdown),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(source), Err(shutdown)) => Err(ProductionSupervisorError::RunShutdown {
                 source: Box::new(source),
                 shutdown: Box::new(shutdown),
             }),
         }
+    }
+
+    pub(super) async fn run_with_cleanup(
+        mut self,
+        cancellation: CancellationToken,
+        startup: oneshot::Sender<()>,
+    ) -> ProductionSupervisorRunOutcome {
+        let mut startup = Some(startup);
+        let run = self.run_loop(&cancellation, &mut startup).await;
+        let generation_cleanup = self.cleanup_failure.take();
+        let shutdown = self.shutdown();
+        let cleanup = match (generation_cleanup, shutdown) {
+            (None, result) => result,
+            (Some(error), Ok(())) => Err(error),
+            (Some(source), Err(shutdown)) => Err(ProductionSupervisorError::RunShutdown {
+                source: Box::new(source),
+                shutdown: Box::new(shutdown),
+            }),
+        };
+        if let Err(error) = &run {
+            trace_supervisor_failure("run", error);
+        }
+        if let Err(error) = &cleanup {
+            trace_supervisor_failure("cleanup", error);
+        }
+        ProductionSupervisorRunOutcome { run, cleanup }
     }
 
     async fn run_loop(
@@ -712,11 +890,15 @@ async fn run_display_source(
             result = &mut source_run => Outcome::Source(result),
             monitor = wait_for_display_terminal(monitors, &cancellation) => {
                 cancellation.cancel();
-                let stopped = tokio::time::timeout(shutdown_timeout, &mut source_run)
-                    .await
-                    .map_err(|_elapsed| {
-                        ProductionSupervisorError::DisplaySourceShutdownDeadline
-                    })?;
+                let stopped = match tokio::time::timeout(shutdown_timeout, &mut source_run).await {
+                    Ok(stopped) => stopped,
+                    Err(_elapsed) => {
+                        // Retain and finish the original source future; the expired cleanup
+                        // deadline remains an incomplete outcome even after it eventually exits.
+                        let _stopped = source_run.await;
+                        return Err(ProductionSupervisorError::DisplaySourceShutdownDeadline);
+                    }
+                };
                 match monitor {
                     Ok(failure) => Outcome::Terminal(failure),
                     Err(DisplayMarketMonitorError::Cancelled) => Outcome::Cancelled(stopped),
@@ -816,6 +998,8 @@ pub(super) fn activate_owned_capture<W>(
 pub enum ProductionSupervisorError {
     #[error("production source supervisor is already shut down")]
     AlreadyShutdown,
+    #[error("source generation cleanup did not complete successfully")]
+    SourceCleanupIncomplete,
     #[error("production source supervisor bounded allocation failed")]
     AllocationFailed,
     #[error("production source supervisor static policy is invalid")]
@@ -824,6 +1008,10 @@ pub enum ProductionSupervisorError {
     UnsupportedDisplayProvider,
     #[error("production display mode requires at least one mapped instrument")]
     MissingDisplayRoutes,
+    #[error("accepted catalog native routes are unavailable for this source")]
+    MissingCatalogSelection,
+    #[error("the accepted native catalog selection changed during this source generation")]
+    CatalogSelectionStale,
     #[error("production display mode contains a duplicate mapped instrument route")]
     DuplicateDisplayRoute,
     #[error("production display lifecycle deadline cannot be represented")]
@@ -862,7 +1050,7 @@ pub enum ProductionSupervisorError {
     Registry(#[from] RegistryError),
     #[error("source registration failed and clean registry rollback also failed")]
     RegistryStartupCleanup {
-        source: RegistryError,
+        source: Box<ProductionSupervisorError>,
         cleanup: RegistryError,
     },
     #[error("source supervisor run and clean registry shutdown both failed")]
@@ -898,4 +1086,92 @@ pub enum ProductionSupervisorError {
     SinkConstruction(#[from] ProductionSinkConstructionError),
     #[error("production sink failed closed: {0}")]
     Sink(ProductionSinkFailure),
+}
+
+impl ProductionSupervisorError {
+    fn from_registry_selection(error: RegistryError) -> Self {
+        match error {
+            RegistryError::ProviderIdentitySelectionStale => Self::CatalogSelectionStale,
+            other => Self::Registry(other),
+        }
+    }
+}
+
+fn trace_supervisor_failure(stage: &'static str, error: &ProductionSupervisorError) {
+    let category = match error {
+        ProductionSupervisorError::AlreadyShutdown => "AlreadyShutdown",
+        ProductionSupervisorError::SourceCleanupIncomplete => "SourceCleanupIncomplete",
+        ProductionSupervisorError::AllocationFailed => "AllocationFailed",
+        ProductionSupervisorError::InvalidStaticPolicy => "InvalidStaticPolicy",
+        ProductionSupervisorError::UnsupportedDisplayProvider => "UnsupportedDisplayProvider",
+        ProductionSupervisorError::MissingDisplayRoutes => "MissingDisplayRoutes",
+        ProductionSupervisorError::MissingCatalogSelection => "MissingCatalogSelection",
+        ProductionSupervisorError::CatalogSelectionStale => "CatalogSelectionStale",
+        ProductionSupervisorError::DuplicateDisplayRoute => "DuplicateDisplayRoute",
+        ProductionSupervisorError::DisplayDeadlineRange => "DisplayDeadlineRange",
+        ProductionSupervisorError::DisplaySourceShutdownDeadline => "DisplaySourceShutdownDeadline",
+        ProductionSupervisorError::DisplayMonitor => "DisplayMonitor",
+        ProductionSupervisorError::DisplayDirectory => "DisplayDirectory",
+        ProductionSupervisorError::IncompleteDisplayShutdown => "IncompleteDisplayShutdown",
+        ProductionSupervisorError::MissingCaptureControlOwnership => {
+            "MissingCaptureControlOwnership"
+        }
+        ProductionSupervisorError::MissingCaptureWriterOwnership => "MissingCaptureWriterOwnership",
+        ProductionSupervisorError::IncompleteCaptureShutdown(..) => "IncompleteCaptureShutdown",
+        ProductionSupervisorError::SourceFailedBeforeReadiness(..) => "SourceFailedBeforeReadiness",
+        ProductionSupervisorError::SourceCompletedBeforeReadiness => {
+            "SourceCompletedBeforeReadiness"
+        }
+        ProductionSupervisorError::TerminalSource(..) => "TerminalSource",
+        ProductionSupervisorError::BudgetUnavailable(..) => "BudgetUnavailable",
+        ProductionSupervisorError::ProviderBackoff(..) => "ProviderBackoff",
+        ProductionSupervisorError::AuthorityStore(..) => "AuthorityStore",
+        ProductionSupervisorError::Paths(..) => "Paths",
+        ProductionSupervisorError::ProviderRate(..) => "ProviderRate",
+        ProductionSupervisorError::Registry(..) => "Registry",
+        ProductionSupervisorError::RegistryStartupCleanup { .. } => "RegistryStartupCleanup",
+        ProductionSupervisorError::RunShutdown { .. } => "RunShutdown",
+        ProductionSupervisorError::Profile(..) => "Profile",
+        ProductionSupervisorError::Provider(..) => "Provider",
+        ProductionSupervisorError::Identity(..) => "Identity",
+        ProductionSupervisorError::CaptureChannel(..) => "CaptureChannel",
+        ProductionSupervisorError::CaptureGeneration(..) => "CaptureGeneration",
+        ProductionSupervisorError::CaptureWriterPolicy(..) => "CaptureWriterPolicy",
+        ProductionSupervisorError::ProcessCaptureConfig(..) => "ProcessCaptureConfig",
+        ProductionSupervisorError::ProcessCaptureShutdownPolicy(..) => {
+            "ProcessCaptureShutdownPolicy"
+        }
+        ProductionSupervisorError::ProcessCaptureSpawn(..) => "ProcessCaptureSpawn",
+        ProductionSupervisorError::RouteBind(..) => "RouteBind",
+        ProductionSupervisorError::RouteWorker(..) => "RouteWorker",
+        ProductionSupervisorError::Subscription(..) => "Subscription",
+        ProductionSupervisorError::SinkConstruction(..) => "SinkConstruction",
+        ProductionSupervisorError::Sink(..) => "Sink",
+    };
+    tracing::warn!(
+        stage,
+        category,
+        "production source supervisor boundary failed"
+    );
+    match error {
+        ProductionSupervisorError::Registry(error) => {
+            tracing::warn!(stage, error = ?error, "production source registry boundary failed");
+        }
+        ProductionSupervisorError::IncompleteCaptureShutdown(outcome) => {
+            tracing::warn!(stage, disposition = ?outcome.disposition(), helper_reaped = outcome.helper_reaped(),
+                worker_present = outcome.worker_termination().is_some(),
+                worker_deadline_elapsed = outcome.worker_termination().is_some_and(|worker| worker.shutdown_deadline_elapsed()),
+                worker_incomplete = outcome.worker_termination().is_some_and(|worker| worker.outcome().is_incomplete()),
+                "production capture shutdown incomplete");
+        }
+        ProductionSupervisorError::RunShutdown { source, shutdown } => {
+            trace_supervisor_failure("nested_run", source);
+            trace_supervisor_failure("nested_shutdown", shutdown);
+        }
+        ProductionSupervisorError::RegistryStartupCleanup { source, cleanup } => {
+            trace_supervisor_failure("registry_startup", source);
+            tracing::warn!(error = ?cleanup, "production registry startup cleanup failed");
+        }
+        _ => {}
+    }
 }

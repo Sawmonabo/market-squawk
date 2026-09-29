@@ -40,6 +40,19 @@ pub(crate) fn config() -> TestResult<CoinbaseExchangeConfig> {
 pub(crate) fn config_with_channels(
     channels: Vec<CoinbaseChannel>,
 ) -> TestResult<CoinbaseExchangeConfig> {
+    config_with_channels_and_mapping(
+        channels,
+        CoinbaseProductMapping::try_new(
+            ProviderProduct::new(identifier("BTC-USD")?),
+            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+        )?,
+    )
+}
+
+pub(crate) fn config_with_channels_and_mapping(
+    channels: Vec<CoinbaseChannel>,
+    mapping: CoinbaseProductMapping,
+) -> TestResult<CoinbaseExchangeConfig> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let authorization = AuthorizationGrant::new(
         AuthorizationMode::PublicInterface,
@@ -58,10 +71,6 @@ pub(crate) fn config_with_channels(
             NonZeroU64::new(1_000_000_000).ok_or("maximum backoff must be nonzero")?,
             1_000,
         )?,
-    )?;
-    let mapping = CoinbaseProductMapping::try_new(
-        ProviderProduct::new(identifier("BTC-USD")?),
-        InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
     )?;
     Ok(CoinbaseExchangeConfig::try_new(
         SourceId::try_from("coinbase-exchange-public")?,

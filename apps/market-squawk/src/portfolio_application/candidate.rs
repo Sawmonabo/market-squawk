@@ -516,7 +516,7 @@ impl PortfolioCandidateSourceSelection {
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
         let identity = selected.candidate().identity();
         if receipt.policy_revision() == 0
-            || receipt.selection_digest() != observation.selection_digest()
+            || receipt.source_evidence_digest() != observation.selection_digest()
             || receipt.selected_at() != observation.selected_at()
             || identity != observation.selected_source().candidate().identity()
         {
@@ -527,7 +527,7 @@ impl PortfolioCandidateSourceSelection {
             source_id: identity.source_id().clone(),
             policy_revision: receipt.policy_revision(),
             policy_digest: receipt.policy_digest(),
-            receipt_digest: receipt.selection_digest(),
+            receipt_digest: receipt.source_evidence_digest(),
             source_state_revision: observation.generation().map(|generation| generation.get()),
             selected_at: observation.selected_at(),
         })
@@ -673,7 +673,7 @@ impl PortfolioCandidateMarketObservation {
         let fresh_until = source_fresh_until.min(policy_fresh_until);
         let unit_mark = Money::new(mark.value(), mark.currency());
         let observation_digest = market_observation_digest(
-            receipt.selection_digest(),
+            receipt.source_evidence_digest(),
             mark.evidence_identity(),
             observation.instrument_id(),
             unit_mark,
@@ -1163,7 +1163,7 @@ impl PortfolioCandidateMarketEvidence {
         portfolio_revision: PortfolioRevisionToken,
     ) -> Result<Self, PortfolioApplicationServiceError> {
         if portfolio_revision.bytes() == [0; 32]
-            || receipt.selection_digest() != observation.selection_digest()
+            || receipt.source_evidence_digest() != observation.selection_digest()
             || receipt.selected_at() != observation.selected_at()
         {
             return Err(PortfolioApplicationServiceError::InvalidRequest);
@@ -1948,7 +1948,11 @@ impl CandidatePortfolioState {
         let mut current_quantity = Decimal::ZERO;
         let mut current_market_value = Money::new(Decimal::ZERO, currency);
         let mut seen_candidate = false;
-        let mut portfolio_value = revision.account.cash_balance();
+        let mut portfolio_value = revision
+            .account
+            .cash_balance()
+            .checked_add(revision.core.receivable_value())
+            .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
         if portfolio_value.currency() != currency {
             return Err(PortfolioApplicationServiceError::CorruptPublication);
         }

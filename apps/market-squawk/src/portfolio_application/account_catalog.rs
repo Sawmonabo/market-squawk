@@ -23,6 +23,7 @@ const ACCOUNT_CATALOG_DIGEST_DOMAIN: &[u8] =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioAccountHead {
     account_id: AccountId,
+    display_name: Box<str>,
     revision: PortfolioRevisionToken,
     reporting_currency: Currency,
     effective_at: Timestamp,
@@ -33,6 +34,11 @@ pub(crate) struct PortfolioAccountHead {
 }
 
 impl PortfolioAccountHead {
+    /// Returns the same provider-neutral name used by the portfolio workspace.
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
     /// Returns the stable portfolio account identity.
     pub(crate) const fn account_id(&self) -> AccountId {
         self.account_id
@@ -91,6 +97,7 @@ impl PortfolioAccountCatalogSnapshot {
             return Err(PortfolioAccountCatalogError::CorruptPublication);
         }
 
+        let display_catalog = super::product::account_catalog(image)?;
         let mut heads = Vec::new();
         heads
             .try_reserve_exact(image.accounts.len())
@@ -129,6 +136,11 @@ impl PortfolioAccountCatalogSnapshot {
             }
             heads.push(PortfolioAccountHead {
                 account_id: *account_id,
+                display_name: display_catalog
+                    .binary_search_by_key(account_id, |binding| binding.account_id())
+                    .ok()
+                    .map(|index| display_catalog[index].display_name().into())
+                    .ok_or(PortfolioAccountCatalogError::CorruptPublication)?,
                 revision,
                 reporting_currency: published.account.currency(),
                 effective_at: published.effective_at,
@@ -273,6 +285,7 @@ fn catalog_digest(
     );
     for head in heads {
         digest.update(head.account_id.as_uuid().as_bytes());
+        update_text(&mut digest, &head.display_name)?;
         digest.update(head.revision.bytes());
         update_text(&mut digest, head.reporting_currency.as_str())?;
         digest.update(head.effective_at.unix_nanos().to_be_bytes());

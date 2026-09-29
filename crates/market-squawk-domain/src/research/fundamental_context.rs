@@ -127,7 +127,7 @@ pub enum FundamentalAmendmentStatus {
 }
 
 /// Reporting cadence explicitly decoded from the source's fiscal-period contract.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FundamentalCadence {
     /// Source fiscal-period semantics identify an annual fact.

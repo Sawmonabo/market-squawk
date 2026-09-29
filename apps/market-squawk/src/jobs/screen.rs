@@ -193,7 +193,7 @@ impl JobRunner for ScreenJobRunner {
         Ok(JobCompletion::Published(result, permit.seal()))
     }
 
-    fn recover(&self, snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         if !self.valid_snapshot(snapshot) {
             return recovery_failed("screen-recovery-invalid");
         }

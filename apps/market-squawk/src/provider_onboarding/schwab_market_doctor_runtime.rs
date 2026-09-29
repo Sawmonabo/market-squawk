@@ -121,17 +121,16 @@ impl SchwabMarketDoctorRuntimeCoordinator {
         let sealer: Arc<dyn SchwabMarketDoctorCaptureSealer> = self.research.clone();
         let doctor =
             SchwabMarketDataDoctorExecutor::try_new(rate, sealer, Arc::clone(&self.probes))?;
-        let outcome = bounded(
-            doctor.run(
+        // The native doctor owns cancellation, deadlines, socket closure, and raw sealing.
+        // Retain it through cleanup before releasing the serialized run guard.
+        let outcome = doctor
+            .run(
                 binding,
                 authority.clone(),
                 cancellation.child_token(),
                 deadline,
-            ),
-            &cancellation,
-            deadline,
-        )
-        .await??;
+            )
+            .await?;
 
         let after_doctor = current_receipt(&authority, &cancellation, deadline).await?;
         if after_doctor != opening_oauth {

@@ -29,7 +29,7 @@ use super::{InvestmentProposalId, RecommendationDerivationDigest};
 /// Canonical schema version committed by every outcome-projection digest.
 pub const INVESTMENT_OUTCOME_PROJECTION_SCHEMA_VERSION: u16 = 2;
 /// Canonical schema version committed by every sizing-projection digest.
-pub const INVESTMENT_SIZING_PROJECTION_SCHEMA_VERSION: u16 = 1;
+pub const INVESTMENT_SIZING_PROJECTION_SCHEMA_VERSION: u16 = 2;
 
 /// Stable binding to the generated proposal and exact derivation being projected.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

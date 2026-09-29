@@ -1,6 +1,11 @@
 //! Exact retained range-calendar composition over returned Alpaca daily-bar coordinates.
 
-use std::{sync::Arc, time::Instant};
+mod publication;
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Datelike as _, LocalResult, NaiveDate, TimeZone as _, Utc};
 use chrono_tz::America::New_York;
@@ -8,8 +13,8 @@ use chrono_tz::America::New_York;
 use market_squawk_adapter_alpaca::{
     ALPACA_HISTORICAL_CALENDAR_MAX_RESPONSE_BYTES, ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS,
     AlpacaAdjustment, AlpacaAuthenticatedCalendarExecutor, AlpacaAuthenticatedCalendarRequest,
-    AlpacaAuthenticatedCalendarResponse, AlpacaError, AlpacaHistoricalBarTimeAuthority,
-    AlpacaHistoricalBarTimeRequest, AlpacaHistoricalEquityConfig,
+    AlpacaAuthenticatedCalendarResponse, AlpacaCalendarMarket, AlpacaError,
+    AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest, AlpacaHistoricalEquityConfig,
     AlpacaHistoricalEquityPreflightReceipt, AlpacaHistoricalReturnedBarTime,
     AlpacaHistoricalSeriesSemantics, AlpacaTradingApiEnvironment,
 };
@@ -21,8 +26,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservationDecision,
-    CompleteMarketBarHistoryV1, HttpRequestBounds, ProviderCaptureMaterial, SharedProviderBudget,
-    apply_http_retry_after,
+    BudgetUnavailableReason, CompleteMarketBarHistoryV1, HttpRequestBounds,
+    ProviderCaptureMaterial, SharedProviderBudget, apply_http_retry_after,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +46,7 @@ use super::{AlpacaHistoricalCapabilityError, AlpacaHistoricalRuntimeCapability, 
 const COMPOSITE_RULESET_ID: &str = "alpaca-v3-iex-utc-range-returned-dates-v2";
 const MAXIMUM_COMPOSITE_CALENDAR_BYTES: usize = 32 * 1024 * 1024;
 const MAXIMUM_CALENDAR_HTTP_ATTEMPTS: usize = 3;
+const CALENDAR_CONCURRENCY_RECHECK: Duration = Duration::from_millis(25);
 const MAXIMUM_RANGE_CALENDAR_ROWS: usize = ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS as usize + 2;
 
 struct RetainedCalendarRangeResponse {
@@ -240,11 +246,12 @@ impl AlpacaHistoricalBarTimeAuthority for AlpacaHistoricalCompositeCalendarAutho
         let fragment = self.fragments.get(index).ok_or(AlpacaError::Protocol)?;
         let resolved = fragment.authority.resolve(request)?;
         if resolved != fragment.original_semantics
-            || resolved.provider_timestamp() != fragment.returned.provider_timestamp()
-            || resolved.timestamp_basis() != self.series_semantics.timestamp_basis()
+            || resolved.provider_timestamp() != Some(fragment.returned.provider_timestamp())
+            || resolved.timestamp_basis() != Some(self.series_semantics.timestamp_basis())
         {
             return Err(AlpacaError::Protocol);
         }
+        let resolved = resolved.timestamped_period().ok_or(AlpacaError::Protocol)?;
         let rebound = BarTimeSemantics::try_new(
             resolved.period_start(),
             resolved.period_end_exclusive(),
@@ -258,6 +265,78 @@ impl AlpacaHistoricalBarTimeAuthority for AlpacaHistoricalCompositeCalendarAutho
 }
 
 impl AlpacaHistoricalRuntimeCapability {
+    /// Retrieves an exact calendar range independently of any historical bar response.
+    /// The accepted response must cross the existing physical capture sealer before it can
+    /// qualify a completed session. This uses the same account queue and revocable capability
+    /// as historical extraction; it creates no additional credential or transport authority.
+    pub(crate) async fn fetch_calendar_range(
+        &self,
+        start_date: CalendarDate,
+        end_date: CalendarDate,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<AlpacaAuthenticatedCalendarResponse>, AlpacaHistoricalCalendarError> {
+        self.fetch_market_calendar_range(
+            AlpacaCalendarMarket::Iex,
+            start_date,
+            end_date,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Fetches one exact supported source market without borrowing another market's coverage.
+    pub(crate) async fn fetch_market_calendar_range(
+        &self,
+        market: AlpacaCalendarMarket,
+        start_date: CalendarDate,
+        end_date: CalendarDate,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<AlpacaAuthenticatedCalendarResponse>, AlpacaHistoricalCalendarError> {
+        ensure_before(deadline, cancellation)?;
+        let _operation = self.inner.admit()?;
+        self.require_current(deadline, cancellation).await?;
+        let request = AlpacaAuthenticatedCalendarRequest::try_for_market(
+            self.trading_api_environment(),
+            market,
+            start_date,
+            end_date,
+        )?;
+        let (credentials, budget) = self.inner.historical_authority()?;
+        let executor = AlpacaAuthenticatedCalendarExecutor::try_new(
+            credentials,
+            self.historical_request_bounds(),
+        )?;
+        let responses = tokio::select! {
+            biased;
+            () = self.inner.cancellation.cancelled() => {
+                return Err(AlpacaHistoricalCapabilityError::Revoked.into());
+            }
+            () = cancellation.cancelled() => {
+                return Err(AlpacaHistoricalCapabilityError::Cancelled.into());
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(AlpacaHistoricalCapabilityError::DeadlineExceeded.into());
+            }
+            result = execute_rate_accounted_calendar(
+                &executor, &request, &budget, deadline, cancellation,
+            ) => result?,
+        };
+        validate_range_responses(&responses, &request)?;
+        let accepted = responses
+            .last()
+            .ok_or(AlpacaHistoricalCalendarError::InvalidRangeResponse)?;
+        if accepted.response.status() != 200 {
+            return Err(AlpacaHistoricalCalendarError::RangeHttpStatus(
+                accepted.response.status(),
+            ));
+        }
+        self.require_current(deadline, cancellation).await?;
+        Ok(Arc::clone(&accepted.response))
+    }
+
     /// Fetches one bounded inclusive calendar range, parses every returned session, and binds the
     /// exact subset needed by the returned daily bars into a stable plan-specific receipt.
     #[allow(
@@ -396,7 +475,12 @@ impl AlpacaHistoricalRuntimeCapability {
             )?;
             let expected_in_plan = expected_provider_timestamp >= preflight.plan().start()
                 && expected_provider_timestamp <= preflight.plan().end()
-                && resolved_semantics.period_end_exclusive() <= preflight.plan().end();
+                && resolved_semantics
+                    .period_end_exclusive()
+                    .is_some_and(|end| {
+                        end.checked_sub_nanos(1)
+                            .is_ok_and(|last_included| last_included <= preflight.plan().end())
+                    });
             let returned = returned_bar_times
                 .binary_search_by_key(&row.date, |returned| returned.calendar_date())
                 .ok()
@@ -563,7 +647,21 @@ async fn commit_calendar_dispatch(
                 wait_until_budget(budget, wait_until, deadline, cancellation).await?;
                 continue;
             }
-            BudgetReservationDecision::Unavailable(_reason) => {
+            BudgetReservationDecision::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted,
+            ) => {
+                // The active IEX poller shares this exact one-request account budget. Waiting
+                // consumes no provider request and preserves its original concurrency ceiling.
+                wait_for_calendar_budget(CALENDAR_CONCURRENCY_RECHECK, deadline, cancellation)
+                    .await?;
+                continue;
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                tracing::warn!(
+                    ?reason,
+                    stage = "calendar_reservation",
+                    "calendar provider budget unavailable"
+                );
                 return Err(AlpacaHistoricalCalendarError::BudgetUnavailable);
             }
         };
@@ -573,7 +671,16 @@ async fn commit_calendar_dispatch(
             BudgetDispatchDecision::WaitUntil(wait_until) => {
                 wait_until_budget(budget, wait_until, deadline, cancellation).await?;
             }
-            BudgetDispatchDecision::Unavailable(_reason) => {
+            BudgetDispatchDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted) => {
+                wait_for_calendar_budget(CALENDAR_CONCURRENCY_RECHECK, deadline, cancellation)
+                    .await?;
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                tracing::warn!(
+                    ?reason,
+                    stage = "calendar_dispatch",
+                    "calendar provider budget unavailable"
+                );
                 return Err(AlpacaHistoricalCalendarError::BudgetUnavailable);
             }
         }
@@ -608,6 +715,15 @@ async fn wait_until_budget(
     let wait = budget
         .remaining_wait(wait_until)
         .map_err(|_| AlpacaHistoricalCalendarError::BudgetUnavailable)?;
+    wait_for_calendar_budget(wait, deadline, cancellation).await
+}
+
+async fn wait_for_calendar_budget(
+    wait: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), AlpacaHistoricalCalendarError> {
+    ensure_before(deadline, cancellation)?;
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or(AlpacaHistoricalCapabilityError::DeadlineExceeded)?;
@@ -835,10 +951,13 @@ fn validate_fragments(
         }
     }
     for fragment in fragments {
-        if fragment.original_semantics.provider_timestamp()
-            != fragment.returned.provider_timestamp()
-            || fragment.original_semantics.timestamp_basis() != BarTimestampBasis::PeriodStart
-            || fragment.original_semantics.session().kind() != MarketBarSessionKind::ProviderDefined
+        let period = fragment
+            .original_semantics
+            .timestamped_period()
+            .ok_or(AlpacaHistoricalCalendarError::ConflictingFragment)?;
+        if period.provider_timestamp() != fragment.returned.provider_timestamp()
+            || period.timestamp_basis() != BarTimestampBasis::PeriodStart
+            || period.session().kind() != MarketBarSessionKind::ProviderDefined
         {
             return Err(AlpacaHistoricalCalendarError::ConflictingFragment);
         }
@@ -901,7 +1020,10 @@ fn composite_session_digest(
             .to_be_bytes(),
     );
     for fragment in fragments {
-        let semantics = &fragment.original_semantics;
+        let semantics = fragment
+            .original_semantics
+            .timestamped_period()
+            .ok_or(AlpacaHistoricalCalendarError::ConflictingFragment)?;
         digest.update(fragment.returned.calendar_date().year().to_be_bytes());
         digest.update([
             fragment.returned.calendar_date().month(),

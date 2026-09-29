@@ -163,8 +163,8 @@ Use `kraken.spot-public-market-data` or another exact registered profile identif
 
 | Symptom | Interpretation | Recovery |
 | --- | --- | --- |
-| Provider not found or not ready | Registration/onboarding/activation is incomplete | Resume `source setup`, complete the local portal evidence, then run the exact confirmed activation request |
-| Setup browser did not open | Browser launch failed, not necessarily the portal | Use the loopback URL printed by the command before its bounded lifetime expires |
+| Provider not found or not ready | Registration/onboarding/activation is incomplete | Open Settings → Connections and verify or resume the saved connection; keep its existing credential and data selection |
+| Connection setup is interrupted | Installed authority retained an incomplete verification or publication | Reconnect Settings, inspect the saved state, and use the offered resume action; no local setup website exists |
 | Activation recipe is rejected at restart | Durable recipe, rights, secret, endpoint, or adapter identity no longer matches | Refresh the evidence and perform an explicit activation; do not edit the recipe |
 | Public Coinbase or Kraken is connected but `DirectUnverified` | Public adapter metadata and runtime qualification retain the lower ceiling | This is the expected public-source status, not a freshness bug; use an admitted Coinbase Direct session when execution-quality evidence is required |
 | Coinbase Direct status becomes `failed` with `requiresStop: true` | The run token was cancelled or its account supervisor lost current liveness | Issue `Bot.Stop` through the owning MCP process, preserve the first source/credential/integrity failure, repair it, and start a new exact session/generation |

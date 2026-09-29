@@ -39,6 +39,38 @@ pub(super) struct InstalledRecommendationSetupOperations {
 }
 
 impl InstalledRecommendationSetupOperations {
+    pub(super) fn resolve_for_analysis(
+        &self,
+        context: &RequestContext,
+    ) -> Result<(crate::application::recommendation::ResolvedRecommendationSetup, PortfolioAccountCatalogSnapshot), ServiceError> {
+        self.authorize(context)?;
+        ensure_live(context)?;
+        let catalog = self.snapshot_catalog(context)?;
+        let as_of = super::runtime::current_timestamp().map_err(|_| ServiceError::Internal)?;
+        let RecommendationSetupResolution::Ready(resolved) =
+            self.authority.resolve(&catalog, as_of).map_err(map_setup)?
+        else {
+            return Err(ServiceError::Unavailable);
+        };
+        self.recheck_for_analysis(&resolved, &catalog, context)?;
+        Ok((resolved, catalog))
+    }
+
+    pub(super) fn recheck_for_analysis(
+        &self,
+        resolved: &crate::application::recommendation::ResolvedRecommendationSetup,
+        catalog: &PortfolioAccountCatalogSnapshot,
+        context: &RequestContext,
+    ) -> Result<(), ServiceError> {
+        self.authorize(context)?;
+        ensure_live(context)?;
+        self.catalog.recheck(catalog, context.deadline(), context.cancellation())
+            .map_err(map_catalog)?;
+        let as_of = super::runtime::current_timestamp().map_err(|_| ServiceError::Internal)?;
+        self.authority.recheck(resolved, catalog, as_of).map_err(map_setup)?;
+        ensure_live(context)
+    }
+
     pub(super) fn try_new(
         authority: Arc<RecommendationSetupAuthority>,
         catalog: PortfolioAccountCatalogReadCapability,
@@ -307,6 +339,7 @@ fn catalog_value(catalog: &PortfolioAccountCatalogSnapshot) -> Value {
         .map(|head| {
             json!({
                 "accountId": head.account_id().as_uuid(),
+                "displayName": head.display_name(),
                 "portfolioRevisionSha256": hex(head.revision().bytes()),
                 "reportingCurrency": head.reporting_currency().as_str(),
                 "effectiveAtUnixNanos": head.effective_at().unix_nanos().to_string(),

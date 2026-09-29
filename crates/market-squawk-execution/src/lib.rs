@@ -1,6 +1,7 @@
 //! Risk-enforced execution contracts with no public authority or dispatch bypass.
 
 mod account;
+pub mod virtual_paper;
 mod adapter;
 mod approval;
 mod audit;

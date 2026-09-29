@@ -15,7 +15,7 @@ use market_squawk_domain::{
     OptionExpirationObservation, OptionKind, OptionSnapshotObservation, ProviderChannel,
     ProviderInstrumentId, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::capture::{
@@ -891,6 +891,104 @@ impl ProviderOptionMarketBindingDigest {
     }
 }
 
+/// Maximum standalone original reference pages required by one option publication.
+pub const MAX_OPTION_REFERENCE_DEPENDENCIES: usize = 32;
+/// Maximum encoded original-reference relationship closure in one option publication.
+pub const MAX_OPTION_REFERENCE_DEPENDENCY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Exact association of one canonical term set to its original reference response row.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderOptionContractReferenceRow {
+    canonical_row_ordinal: u32,
+    source_row_ordinal: u32,
+    terms_digest: EvidenceDigest,
+}
+impl ProviderOptionContractReferenceRow {
+    /// Binds exact terms, never a caller scalar multiplier, to the native source row coordinate.
+    pub fn try_new(
+        canonical_row_ordinal: u32,
+        source_row_ordinal: u32,
+        terms: &market_squawk_domain::OptionContractTerms,
+    ) -> Result<Self, ProviderCaptureError> {
+        let bytes = serialize_bounded(
+            terms,
+            MAX_PROVIDER_OPTION_MARKET_ROW_BYTES,
+            MAX_PROVIDER_OPTION_MARKET_ROW_BYTES,
+        )?;
+        Ok(Self {
+            canonical_row_ordinal,
+            source_row_ordinal,
+            terms_digest: sha256(&bytes),
+        })
+    }
+    /// Returns the canonical option snapshot ordinal.
+    pub const fn canonical_row_ordinal(&self) -> u32 {
+        self.canonical_row_ordinal
+    }
+    /// Returns the native reference array position within its original response.
+    pub const fn source_row_ordinal(&self) -> u32 {
+        self.source_row_ordinal
+    }
+    /// Returns SHA-256 of the exact typed canonical terms interpreted from this reference.
+    pub const fn terms_digest(&self) -> EvidenceDigest {
+        self.terms_digest
+    }
+}
+
+/// Physically verified original reference dependency with exact term-row associations.
+/// This value is evidence only; catalog custody and rights remain separate commit authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderOptionContractReferenceDependency {
+    capture: SealedProviderCaptureSetReceipt,
+    rows: Box<[ProviderOptionContractReferenceRow]>,
+}
+impl ProviderOptionContractReferenceDependency {
+    /// Binds all canonical rows that consume this exact original reference page.
+    pub fn try_new(
+        capture: SealedProviderCaptureSetReceipt,
+        rows: Vec<ProviderOptionContractReferenceRow>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if capture.capture().terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+            || capture.capture().pages().len() != 1
+            || capture.segment().frames().len() != 1
+            || rows.len() > 1_000
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let rebound = SealedProviderCaptureSetReceipt::try_bind(
+            capture.capture().clone(),
+            capture.segment().clone(),
+        )?;
+        if rebound != capture {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let mut canonical = BTreeSet::new();
+        let mut native = BTreeSet::new();
+        for row in &rows {
+            require_sha256(row.terms_digest)?;
+            if row.source_row_ordinal >= 1_000
+                || !canonical.insert(row.canonical_row_ordinal)
+                || !native.insert(row.source_row_ordinal)
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+        }
+        Ok(Self {
+            capture,
+            rows: rows.into_boxed_slice(),
+        })
+    }
+    /// Returns the complete original raw/physical capture evidence.
+    pub const fn capture(&self) -> &SealedProviderCaptureSetReceipt {
+        &self.capture
+    }
+    /// Returns exact canonical-to-original row associations.
+    pub fn rows(&self) -> &[ProviderOptionContractReferenceRow] {
+        &self.rows
+    }
+}
+
 /// Non-reusable option-market publication authority derived from one sealed HTTP response set.
 #[derive(Debug)]
 pub struct SealedProviderOptionMarketBinding {
@@ -898,6 +996,7 @@ pub struct SealedProviderOptionMarketBinding {
     batch: ProviderOptionMarketBatch,
     native_lineage: ProviderOptionMarketNativeLineageBatch,
     row_frames: Box<[ProviderOptionMarketRowFrame]>,
+    reference_dependencies: Box<[ProviderOptionContractReferenceDependency]>,
     evidence_digest: ProviderOptionMarketBindingDigest,
 }
 
@@ -908,6 +1007,7 @@ impl SealedProviderOptionMarketBinding {
         batch: ProviderOptionMarketBatch,
         native_lineage: ProviderOptionMarketNativeLineageBatch,
         row_capture_page_ordinals: Vec<u16>,
+        reference_dependencies: Vec<ProviderOptionContractReferenceDependency>,
     ) -> Result<Self, ProviderCaptureError> {
         batch.validate()?;
         validate_capture_scope(&authority, &batch)?;
@@ -917,17 +1017,25 @@ impl SealedProviderOptionMarketBinding {
             &batch,
             &row_capture_page_ordinals,
         )?;
+        validate_reference_dependencies(
+            &authority,
+            &batch,
+            &native_lineage,
+            &reference_dependencies,
+        )?;
         let evidence_digest = option_market_binding_digest(
             &authority,
             batch.content_identity(),
             &native_lineage,
             &row_frames,
+            &reference_dependencies,
         )?;
         Ok(Self {
             authority,
             batch,
             native_lineage,
             row_frames,
+            reference_dependencies: reference_dependencies.into_boxed_slice(),
             evidence_digest,
         })
     }
@@ -937,6 +1045,12 @@ impl SealedProviderOptionMarketBinding {
         self.batch.validate()?;
         validate_capture_scope(&self.authority, &self.batch)?;
         self.native_lineage.validate(&self.batch)?;
+        validate_reference_dependencies(
+            &self.authority,
+            &self.batch,
+            &self.native_lineage,
+            &self.reference_dependencies,
+        )?;
         let ordinals = self
             .row_frames
             .iter()
@@ -950,11 +1064,17 @@ impl SealedProviderOptionMarketBinding {
                 self.batch.content_identity(),
                 &self.native_lineage,
                 &self.row_frames,
+                &self.reference_dependencies,
             )? != self.evidence_digest
         {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
         Ok(())
+    }
+
+    /// Returns original reference captures that must pass catalog custody before publication.
+    pub fn reference_dependencies(&self) -> &[ProviderOptionContractReferenceDependency] {
+        &self.reference_dependencies
     }
 
     /// Returns the exact canonical option batch.
@@ -981,6 +1101,78 @@ impl SealedProviderOptionMarketBinding {
     pub fn persisted_receipt(&self) -> &SealedProviderCaptureSetReceipt {
         self.authority.persisted_receipt()
     }
+}
+
+fn validate_reference_dependencies(
+    authority: &ProviderWholeCaptureToken,
+    batch: &ProviderOptionMarketBatch,
+    native: &ProviderOptionMarketNativeLineageBatch,
+    dependencies: &[ProviderOptionContractReferenceDependency],
+) -> Result<(), ProviderCaptureError> {
+    let required = native.schema().implementation()
+        == ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1;
+    if dependencies.len() > MAX_OPTION_REFERENCE_DEPENDENCIES
+        || (required && dependencies.is_empty())
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    if dependencies.is_empty() {
+        return Ok(());
+    }
+    let snapshots = batch
+        .snapshots()
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    let first_market_at = authority.persisted_receipt().capture().pages()[0].received_at();
+    let mut seen = BTreeSet::new();
+    let mut captures = BTreeSet::new();
+    let mut previous_at = None;
+    let mut relationship_bytes = 2_usize;
+    for dependency in dependencies {
+        // The catalog wire adds one 64-byte digest and fixed field names per page.
+        relationship_bytes = relationship_bytes
+            .checked_add(128)
+            .and_then(|count| {
+                count.checked_add(
+                    serialize_bounded(
+                        &dependency.rows,
+                        MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
+                        MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
+                    )
+                    .ok()?
+                    .len(),
+                )
+            })
+            .filter(|count| *count <= MAX_OPTION_REFERENCE_DEPENDENCY_BYTES)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        let capture = dependency.capture.capture();
+        let at = capture.pages()[0].received_at();
+        if capture.source_id() != batch.scope().source_id()
+            || capture.metadata_revision() != batch.scope().metadata_revision()
+            || at > first_market_at
+            || previous_at.is_some_and(|previous| previous > at)
+            || !captures.insert(capture.observation_digest().bytes())
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        previous_at = Some(at);
+        for row in &dependency.rows {
+            let snapshot = snapshots
+                .get(row.canonical_row_ordinal as usize)
+                .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+            let bytes = serialize_bounded(
+                snapshot.terms(),
+                MAX_PROVIDER_OPTION_MARKET_ROW_BYTES,
+                MAX_PROVIDER_OPTION_MARKET_ROW_BYTES,
+            )?;
+            if !seen.insert(row.canonical_row_ordinal) || sha256(&bytes) != row.terms_digest {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+        }
+    }
+    if seen.len() != snapshots.len() {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    Ok(())
 }
 
 fn validate_expiration_rows(
@@ -1248,6 +1440,7 @@ fn option_market_binding_digest(
     content_identity: ProviderOptionMarketContentIdentity,
     native_lineage: &ProviderOptionMarketNativeLineageBatch,
     row_frames: &[ProviderOptionMarketRowFrame],
+    reference_dependencies: &[ProviderOptionContractReferenceDependency],
 ) -> Result<ProviderOptionMarketBindingDigest, ProviderCaptureError> {
     let receipt = authority.persisted_receipt();
     let mut digest = Sha256::new();
@@ -1278,6 +1471,20 @@ fn option_market_binding_digest(
             None => digest.update([0]),
         }
     }
+    hash_length(&mut digest, reference_dependencies.len())?;
+    for dependency in reference_dependencies {
+        hash_digest(&mut digest, dependency.capture.receipt_digest());
+        hash_digest(
+            &mut digest,
+            dependency.capture.capture().observation_digest(),
+        );
+        hash_length(&mut digest, dependency.rows.len())?;
+        for row in &dependency.rows {
+            digest.update(row.canonical_row_ordinal.to_be_bytes());
+            digest.update(row.source_row_ordinal.to_be_bytes());
+            hash_digest(&mut digest, row.terms_digest);
+        }
+    }
     Ok(ProviderOptionMarketBindingDigest(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
@@ -1288,6 +1495,7 @@ fn option_market_schema_fingerprint() -> EvidenceDigest {
     let mut digest = Sha256::new();
     digest.update(OPTION_MARKET_SCHEMA_DOMAIN);
     digest.update(PROVIDER_OPTION_MARKET_SCHEMA_VERSION.to_be_bytes());
+    digest.update(b"native-option-contract-count-u64-v1");
     EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
 }
 

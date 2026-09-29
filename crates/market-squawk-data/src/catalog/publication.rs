@@ -50,10 +50,18 @@ pub(crate) enum PublicationSourceEvidence<'a> {
         &'a PreparedProviderOptionMarketBinding,
         ProviderArtifactInputCoordinate,
     ),
-    /// The provider publication consumes one exact streamed logical-publication binding.
+    /// One exact streamed logical binding and a coordinate for each canonical partition, in order.
     ProviderLogical(
         &'a SealedProviderLogicalPublicationBinding,
-        ProviderArtifactInputCoordinate,
+        &'a [ProviderArtifactInputCoordinate],
+    ),
+    /// A retained original, its complete binding, and ordered canonical partition placements
+    /// publish in this same controlled transaction.
+    ProviderLogicalOriginal(
+        &'a SealedProviderLogicalPublicationBinding,
+        &'a [ProviderArtifactInputCoordinate],
+        std::time::Instant,
+        &'a tokio_util::sync::CancellationToken,
     ),
 }
 
@@ -318,6 +326,7 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
             && publication_source_evidence_matches(
                 transaction,
                 reservation.run_id,
+                &manifest.dataset_name,
                 source_evidence,
             )? {
             Ok(existing)
@@ -438,15 +447,35 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
                 binding,
                 coordinate,
                 catalog_now,
+                &manifest.dataset_name,
             )?;
         }
-        PublicationSourceEvidence::ProviderLogical(binding, coordinate) => {
+        PublicationSourceEvidence::ProviderLogical(binding, coordinates) => {
             retain_sealed_provider_logical_publication_binding(
                 transaction,
                 reservation.run_id,
                 binding,
-                coordinate,
+                coordinates,
                 catalog_now,
+            )?;
+        }
+        PublicationSourceEvidence::ProviderLogicalOriginal(
+            binding,
+            coordinates,
+            deadline,
+            cancellation,
+        ) => {
+            let dataset = crate::DatasetId::try_from(manifest.dataset_name.as_str())
+                .map_err(|_| CatalogError::InvalidRecord)?;
+            super::provider_logical::publish_original(
+                transaction,
+                reservation.run_id,
+                &dataset,
+                binding,
+                coordinates,
+                catalog_now,
+                deadline,
+                cancellation,
             )?;
         }
     }
@@ -482,6 +511,7 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
 fn publication_source_evidence_matches(
     transaction: &Transaction<'_>,
     run_id: Uuid,
+    dataset_name: &SourceIdentifier,
     source_evidence: PublicationSourceEvidence<'_>,
 ) -> Result<bool, CatalogError> {
     let capture_count: i64 = transaction.query_row(
@@ -565,7 +595,7 @@ fn publication_source_evidence_matches(
                 binding.source_id().as_str(),
                 coordinate,
             )?),
-        PublicationSourceEvidence::ProviderLogical(binding, coordinate) => Ok(capture_count == 0
+        PublicationSourceEvidence::ProviderLogical(binding, coordinates) => Ok(capture_count == 0
             && publication_count == 1
             && retained_publication_input_matches(
                 transaction,
@@ -573,8 +603,46 @@ fn publication_source_evidence_matches(
                 binding.binding_digest(),
                 "provider_logical",
                 binding.terminal().source_id().as_str(),
-                coordinate,
+                ProviderArtifactInputCoordinate::try_new(0, 0)?,
+            )?
+            && super::provider_logical::partition_inputs_match(
+                transaction,
+                run_id,
+                binding,
+                coordinates,
             )?),
+        PublicationSourceEvidence::ProviderLogicalOriginal(
+            binding,
+            coordinates,
+            deadline,
+            cancellation,
+        ) => {
+            let dataset = crate::DatasetId::try_from(dataset_name.as_str())
+                .map_err(|_| CatalogError::InvalidRecord)?;
+            Ok(capture_count == 0
+                && publication_count == 1
+                && retained_publication_input_matches(
+                    transaction,
+                    run_id,
+                    binding.binding_digest(),
+                    "provider_logical",
+                    binding.terminal().source_id().as_str(),
+                    ProviderArtifactInputCoordinate::try_new(0, 0)?,
+                )?
+                && super::provider_logical::partition_inputs_match(
+                    transaction,
+                    run_id,
+                    binding,
+                    coordinates,
+                )?
+                && super::provider_logical::original_publication_matches(
+                    transaction,
+                    &dataset,
+                    binding,
+                    deadline,
+                    cancellation,
+                )?)
+        }
     }
 }
 

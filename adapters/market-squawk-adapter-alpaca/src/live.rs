@@ -19,9 +19,10 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 
-use crate::boot_snapshot::AlpacaIexBootSnapshotTransport;
+use crate::boot_snapshot::{AlpacaIexBootSnapshotHandoff, AlpacaIexBootSnapshotTransport};
 use crate::{
-    AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig, AlpacaTransportLimits,
+    AlpacaCredentials, AlpacaIexDecoder, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig,
+    AlpacaTransportLimits,
 };
 
 const KEY_ID_HEADER: HeaderName = HeaderName::from_static("apca-api-key-id");
@@ -39,6 +40,26 @@ pub struct AlpacaIexLiveSource {
 }
 
 impl AlpacaIexLiveSource {
+    /// Constructs the source and its decoder with one shared, transport-owned bootstrap receipt.
+    ///
+    /// The decoder can join the actual successful HTTP response to its captured first frame;
+    /// neither the application nor a later parser can invent the response status or request.
+    pub fn try_new_with_publication_handoff(
+        config: AlpacaIexLiveConfig,
+        generation: LiveSourceGeneration,
+        credentials: Arc<AlpacaCredentials>,
+    ) -> Result<(Self, AlpacaIexDecoder), SourceError> {
+        let mut decoder =
+            AlpacaIexDecoder::try_new(&config).map_err(|_| SourceError::InvalidProtocolState)?;
+        let mut source = Self::try_new(config, generation, credentials)?;
+        let handoff = AlpacaIexBootSnapshotHandoff::default();
+        source
+            .boot_snapshot
+            .install_publication_handoff(handoff.clone());
+        decoder.install_boot_snapshot_handoff(handoff);
+        Ok((source, decoder))
+    }
+
     /// Binds credentials and an exact registry-minted generation to IEX-only source metadata.
     pub fn try_new(
         config: AlpacaIexLiveConfig,
@@ -223,7 +244,7 @@ async fn run_transport(
         .max_write_buffer_size(64 * 1024)
         .max_message_size(Some(limits.max_frame_bytes()))
         .max_frame_size(Some(limits.max_frame_bytes()));
-    let permit = commit_budget(reservation)?;
+    let mut permit = commit_budget(reservation)?;
     let connect = connect_async_with_config(request, Some(websocket_config), true);
     let (mut socket, response) =
         await_websocket(&cancellation, limits.connect_timeout(), connect, |error| {
@@ -231,6 +252,9 @@ async fn run_transport(
         })
         .await?;
     drop(response);
+    permit
+        .complete_transport_handshake()
+        .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
     sink.bind_active_request_budget(permit.active_lease())?;
     let message = match subscription {
         SubscriptionPayload::Json(payload) => Message::Text(payload.into()),

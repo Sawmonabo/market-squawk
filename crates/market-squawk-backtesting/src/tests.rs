@@ -416,6 +416,23 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         Decimal::ONE,
     )?;
     let signal_times = [DAY, 401 * DAY, 801 * DAY];
+    let cutoff = signal_times[2] + RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 10;
+    let qualification = crate::dataset::BacktestStudyQualification::try_new(
+        market_squawk_domain::HistoricalStudyBasis::HistoricalAsKnown,
+        Timestamp::from_unix_nanos(cutoff + 1),
+        Sha256Digest::new([76; 32]),
+        None,
+        &[market_squawk_domain::HistoricalStudyLimitation::PresentDayFixedCohort],
+    )?;
+    let accompanying_terms = InstrumentExecutionTerms::try_new(
+        "00000000-0000-0000-0000-000000000022".parse()?,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        Currency::try_from("USD")?,
+        Denomination::Currency(Currency::try_from("USD")?),
+        Decimal::ONE,
+    )?;
     let mut observations = Vec::new();
     let mut lineage = 20_u8;
     for signal_at in signal_times {
@@ -427,7 +444,11 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
             observations.push(recommendation_observation(
                 subject_terms,
                 signal_at + offset,
-                subject_price,
+                if signal_at == signal_times[0] && offset >= 180 * DAY {
+                    subject_price / 2
+                } else {
+                    subject_price
+                },
                 lineage,
                 10,
             )?);
@@ -440,9 +461,21 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
                 10,
             )?);
             lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
+            observations.push(recommendation_observation(
+                accompanying_terms,
+                signal_at + offset,
+                if offset > RECOMMENDATION_TARGET_HORIZON_NANOS_V1 {
+                    140
+                } else {
+                    100
+                },
+                lineage,
+                10,
+            )?);
+            lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
         }
     }
-    let dataset = BacktestDataset::try_new(BacktestDatasetInput {
+    let mut dataset = BacktestDataset::try_new(BacktestDatasetInput {
         manifest: feature_manifest()?,
         object_graph_digest: Sha256Digest::new([42; 32]),
         point_in_time_content: Sha256Digest::new([43; 32]),
@@ -451,6 +484,7 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         instrument_definition_audit: Sha256Digest::new([46; 32]),
         observations,
     })?;
+    dataset.study_qualification = Some(qualification);
     let folds = signal_times
         .iter()
         .enumerate()
@@ -471,6 +505,10 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
                 fold_index,
                 Timestamp::from_unix_nanos(*signal_at),
                 Timestamp::from_unix_nanos(*signal_at),
+                Timestamp::from_unix_nanos(*signal_at),
+                qualification,
+                Timestamp::from_unix_nanos(*signal_at - 7),
+                Timestamp::from_unix_nanos(*signal_at - 7 + RECOMMENDATION_TARGET_HORIZON_NANOS_V1),
                 Sha256Digest::new([u8::try_from(fold_index + 1)?; 32]),
                 RecommendationSignalInstructionV1::Entry,
             )?)
@@ -481,15 +519,89 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         0,
         Timestamp::from_unix_nanos(signal_times[0] + 1),
         Timestamp::from_unix_nanos(signal_times[0] + 1),
+        Timestamp::from_unix_nanos(signal_times[0] + 1),
+        qualification,
+        Timestamp::from_unix_nanos(signal_times[0] - 7),
+        Timestamp::from_unix_nanos(signal_times[0] - 7 + RECOMMENDATION_TARGET_HORIZON_NANOS_V1),
         Sha256Digest::new([9; 32]),
         RecommendationSignalInstructionV1::NoAction,
     )?);
-    let policy = RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+    let mut actions = Vec::new();
+    for (day, kind) in [
+        (
+            100,
+            CorporateActionKind::Split {
+                numerator: NonZeroU32::new(2).ok_or("split ratio")?,
+                denominator: NonZeroU32::MIN,
+            },
+        ),
+        (
+            200,
+            CorporateActionKind::CashDividend {
+                amount: Money::new(Decimal::ONE, Currency::try_from("USD")?),
+            },
+        ),
+    ] {
+        let at = Timestamp::from_unix_nanos(day * DAY);
+        let identifier = SourceIdentifier::try_from(format!("recommendation-action-{day}"))?;
+        let observation = CorporateActionObservation::new(
+            ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: SourceId::try_from("official-actions")?,
+                    instrument_id: Some(subject_terms.instrument_id()),
+                    venue_id: Some(VenueId::try_from("XNAS")?),
+                    source_identifier: identifier.clone(),
+                    source_timestamp: Some(at),
+                    received_at: Timestamp::from_unix_nanos(cutoff + 1),
+                    ingested_at: Timestamp::from_unix_nanos(cutoff + 1),
+                    quality: DataQuality::OfficialDelayed,
+                    payload_reference: PayloadReference::SourceReference(identifier.clone()),
+                    availability: AvailabilityEvidence::evidenced(
+                        Timestamp::from_unix_nanos(cutoff + 1),
+                        identifier,
+                    ),
+                })?,
+                ResearchTime::new(at, None, RevisionNumber::new(1)?, None)?,
+            )?,
+            kind,
+        )?;
+        actions.push(CorporateActionRecord::new(
+            observation,
+            DatasetManifestRef::try_new_with_schema(
+                DatasetId::try_from("recommendation-actions")?,
+                1,
+                DatasetSchemaRegistry::local().canonical_research_observations()?,
+                Sha256Digest::new([61; 32]),
+            )?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [62; 32]),
+        ));
+    }
+    let corporate_actions = CorporateActionPlan::try_build(
+        CorporateActionPolicy::new(CorporateActionAdjustment::TotalReturn, NonZeroU32::MIN),
+        Timestamp::from_unix_nanos(cutoff + 1),
+        Timestamp::from_unix_nanos(cutoff),
+        actions,
+        CorporateActionLimits::try_new(
+            NonZeroUsize::new(2).ok_or("action count")?,
+            NonZeroUsize::new(64 * 1024).ok_or("action bound")?,
+        )?,
+    )?;
+    let policy_input = RecommendationBacktestPolicyV1Input {
+        study_qualification: qualification,
         subject_instrument_id: subject_terms.instrument_id(),
         benchmark: RecommendationBenchmarkPolicyV1::try_new(
             benchmark_terms.instrument_id(),
             Sha256Digest::new([10; 32]),
         )?,
+        accompanying_benchmark: RecommendationBenchmarkPolicyV1::try_new(
+            "00000000-0000-0000-0000-000000000022".parse()?,
+            Sha256Digest::new([12; 32]),
+        )?,
+        raw_price_evidence_digest: dataset.identity(),
+        corporate_action_content_digest: corporate_actions.content_hash(),
+        corporate_action_audit_digest: corporate_actions.audit_hash(),
+        corporate_action_coverage_starts_at: Timestamp::from_unix_nanos(0),
+        execution_basis: crate::dataset::BacktestExecutionBasis::ObservedQuoteDepth,
         reporting_currency: Currency::try_from("USD")?,
         subject_quantity: QuantityLots::new(1)?,
         benchmark_quantity: QuantityLots::new(1)?,
@@ -497,7 +609,8 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         maximum_exit_lag_nanos: 20,
         execution_assumptions: research_assumptions()?,
         seed: 7,
-    })?;
+    };
+    let policy = RecommendationBacktestPolicyV1::try_new(policy_input)?;
     let limits = RecommendationBacktestLimits::try_new(RecommendationBacktestLimitsInput {
         max_folds: 3,
         max_signals: 8,
@@ -505,7 +618,6 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
         max_total_equity_points: 64,
         max_observation_visits: 1_000,
     })?;
-    let cutoff = signal_times[2] + RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 10;
     let publication = RecommendationBacktestPublicationV1::try_new(
         Timestamp::from_unix_nanos(cutoff),
         Timestamp::from_unix_nanos(cutoff + 1),
@@ -522,11 +634,34 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
     let evidence = RecommendationBacktestKernelV1::run_study(
         &dataset,
         policy,
+        &corporate_actions,
         &complete,
         publication,
         limits,
+        &CancellationToken::new(),
     )?;
     assert_eq!(evidence.results().len(), signals.len());
+    let RecommendationSignalDispositionV1::Completed { subject, .. } =
+        evidence.results()[0].disposition()
+    else {
+        return Err("expected split and dividend outcome".into());
+    };
+    assert_eq!(subject.entry_fill().quantity(), QuantityLots::new(1)?);
+    assert_eq!(subject.exit_fill().quantity(), QuantityLots::new(2)?);
+    let raw_exit = subject
+        .exit_fill()
+        .price()
+        .checked_mul_quantity(
+            subject.exit_fill().quantity(),
+            subject_terms.price_tick(),
+            subject_terms.lot_size(),
+            Currency::try_from("USD")?,
+        )?
+        .checked_sub(subject.exit_fill().fee())?
+        .amount();
+    // The source has no payable-session evidence. Income contributes to wealth, not cash.
+    assert_eq!(subject.exit_proceeds(), raw_exit);
+    assert_eq!(subject.unpaid_entitlement_value(), Decimal::from(2));
     assert_eq!(
         evidence
             .results()
@@ -544,8 +679,13 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
     )));
     assert_eq!(
         evidence.results()[0].target_at().unix_nanos()
-            - signal_times[evidence.results()[0].fold_index()],
+            - evidence.results()[0].target_origin().unix_nanos(),
         RECOMMENDATION_TARGET_HORIZON_NANOS_V1
+    );
+    assert_eq!(
+        evidence.results()[0].signal_at().unix_nanos()
+            - evidence.results()[0].target_origin().unix_nanos(),
+        7,
     );
     let RecommendationAggregateEvidenceV1::Available(aggregate) = evidence.aggregate() else {
         return Err("expected complete recommendation aggregate".into());
@@ -555,18 +695,26 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
     assert!(aggregate.worst_maximum_drawdown() > Decimal::ZERO);
     assert!(aggregate.positive_fold_stability() > Decimal::ZERO);
     assert_eq!(aggregate.positive_fold_stability_ppm(), 1_000_000);
-    assert!(matches!(
-        aggregate.benchmark(),
-        RecommendationBenchmarkAggregateV1::Available { .. }
-    ));
+    assert!(
+        matches!(aggregate.benchmark(), RecommendationBenchmarkAggregateV1::Available {
+        mean_excess_return, ..
+    } if mean_excess_return > Decimal::ZERO)
+    );
+    assert!(
+        matches!(aggregate.accompanying_benchmark(), RecommendationBenchmarkAggregateV1::Available {
+        mean_excess_return, ..
+    } if mean_excess_return < Decimal::ZERO)
+    );
     assert_eq!(
         evidence.digest(),
         RecommendationBacktestKernelV1::run_study(
             &dataset,
             policy,
+            &corporate_actions,
             &complete,
             publication,
             limits,
+            &CancellationToken::new(),
         )?
         .digest()
     );
@@ -582,15 +730,196 @@ fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -
     let truncated_evidence = RecommendationBacktestKernelV1::run_study(
         &dataset,
         policy,
+        &corporate_actions,
         &truncated,
         publication,
         limits,
+        &CancellationToken::new(),
     )?;
     assert!(matches!(
         truncated_evidence.aggregate(),
         RecommendationAggregateEvidenceV1::Unavailable(_)
     ));
     assert_ne!(evidence.digest(), truncated_evidence.digest());
+    // Missing accompanying history must not replace or invalidate the retained primary result.
+    let mut without_accompanying = BacktestDataset::try_new(BacktestDatasetInput {
+        manifest: feature_manifest()?,
+        object_graph_digest: Sha256Digest::new([42; 32]),
+        point_in_time_content: Sha256Digest::new([43; 32]),
+        point_in_time_audit: Sha256Digest::new([44; 32]),
+        instrument_definition_content: Sha256Digest::new([45; 32]),
+        instrument_definition_audit: Sha256Digest::new([46; 32]),
+        observations: dataset
+            .observations
+            .iter()
+            .filter(|row| row.instrument_id() != accompanying_terms.instrument_id())
+            .cloned()
+            .collect(),
+    })?;
+    without_accompanying.study_qualification = Some(qualification);
+    let missing = RecommendationBacktestKernelV1::run_study(
+        &without_accompanying,
+        policy,
+        &corporate_actions,
+        &complete,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    let RecommendationAggregateEvidenceV1::Available(missing_aggregate) = missing.aggregate()
+    else {
+        return Err("missing accompanying comparison changed subject availability".into());
+    };
+    assert_eq!(missing_aggregate.benchmark(), aggregate.benchmark());
+    assert_eq!(
+        missing_aggregate.accompanying_benchmark(),
+        RecommendationBenchmarkAggregateV1::Unavailable
+    );
+    assert_ne!(missing.digest(), evidence.digest());
+
+    // Realized bars are a separate fixture stream. A bar already in progress at the signal
+    // cannot fill that signal, even when its later close and volume appear attractive.
+    let mut daily_dataset = dataset.clone();
+    let mut daily_bars = dataset
+        .observations
+        .iter()
+        .map(|observation| -> Result<_, Box<dyn Error>> {
+            Ok(crate::dataset::BacktestDailyBar {
+                execution_terms: observation.execution_terms,
+                starts_at: observation.decision_at().checked_sub_nanos(5)?,
+                ends_at: observation.decision_at(),
+                available_at: Timestamp::from_unix_nanos(cutoff + 1),
+                close: Money::new(
+                    observation
+                        .mid_price
+                        .ok_or("fixture close")?
+                        .checked_to_decimal(observation.execution_terms.price_tick())?
+                        + if observation.instrument_id() == subject_terms.instrument_id()
+                            && observation.decision_at().unix_nanos() == signal_times[0] + 10
+                        {
+                            Decimal::new(95, 2)
+                        } else {
+                            Decimal::ZERO
+                        },
+                    observation.execution_terms.quote_currency(),
+                ),
+                traded_volume: Decimal::TEN,
+                lineage_digest: observation.lineage_digest,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    daily_bars.push(crate::dataset::BacktestDailyBar {
+        execution_terms: subject_terms,
+        starts_at: Timestamp::from_unix_nanos(signal_times[0] - 1),
+        ends_at: Timestamp::from_unix_nanos(signal_times[0] + 2),
+        available_at: Timestamp::from_unix_nanos(cutoff + 1),
+        close: Money::new(Decimal::from(999), subject_terms.quote_currency()),
+        traded_volume: Decimal::from(999),
+        lineage_digest: Sha256Digest::new([70; 32]),
+    });
+    daily_bars.sort_unstable_by_key(|bar| (bar.ends_at, bar.execution_terms.instrument_id()));
+    daily_dataset.daily_history = Some(crate::dataset::BacktestDailyHistory {
+        nominal_sources: Box::new([]),
+        bars: daily_bars.into_boxed_slice(),
+        digest: Sha256Digest::new([71; 32]),
+        available_at: Timestamp::from_unix_nanos(cutoff + 1),
+    });
+    daily_dataset.identity = Sha256Digest::new([72; 32]);
+    let daily_policy =
+        RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+            execution_basis: crate::dataset::BacktestExecutionBasis::CompletedDailyBar,
+            raw_price_evidence_digest: Sha256Digest::new([71; 32]),
+            ..policy_input
+        })?;
+    let daily = RecommendationBacktestKernelV1::run_study(
+        &daily_dataset,
+        daily_policy,
+        &corporate_actions,
+        &complete,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    let RecommendationSignalDispositionV1::Completed {
+        subject: daily_subject,
+        ..
+    } = daily.results()[0].disposition()
+    else {
+        return Err("expected isolated completed-daily-bar outcome".into());
+    };
+    assert_eq!(
+        daily_subject.entry_fill().executed_at(),
+        Timestamp::from_unix_nanos(signal_times[0] + 10)
+    );
+    assert_eq!(daily_subject.exit_proceeds(), subject.exit_proceeds());
+    // Native100.95 is retained until costs are applied; rounding the source close first
+    // would produce a different adverse execution tick.
+    assert_eq!(daily_subject.entry_fill().price().get(), 102);
+    assert!(daily_subject.entry_fill().price() > subject.entry_fill().price());
+    // An insufficient realized-volume cap cannot fall back to the unrelated quote depth.
+    let history = daily_dataset
+        .daily_history
+        .as_mut()
+        .ok_or("daily fixture")?;
+    let first_bar = history
+        .bars
+        .iter_mut()
+        .find(|bar| {
+            bar.execution_terms.instrument_id() == subject_terms.instrument_id()
+                && bar.ends_at.unix_nanos() == signal_times[0] + 10
+        })
+        .ok_or("first eligible daily fixture")?;
+    first_bar.traded_volume = Decimal::new(5, 1);
+    let insufficient = RecommendationBacktestKernelV1::run_study(
+        &daily_dataset,
+        daily_policy,
+        &corporate_actions,
+        &complete,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        insufficient.results()[0].disposition(),
+        RecommendationSignalDispositionV1::EntryUnfilled { .. }
+    ));
+    // The first otherwise eligible completed bar lands exactly at the original forecast target.
+    // It cannot become an entry merely because decision+maximum lag extends past that target.
+    let mut target_signals = complete.signals().to_vec();
+    target_signals[0] = RecommendationSignalV1::try_new(
+        SourceIdentifier::try_from("entry-at-financial-target")?,
+        0,
+        Timestamp::from_unix_nanos(signal_times[0]),
+        Timestamp::from_unix_nanos(signal_times[0]),
+        Timestamp::from_unix_nanos(signal_times[0]),
+        qualification,
+        Timestamp::from_unix_nanos(signal_times[0] + 10 - RECOMMENDATION_TARGET_HORIZON_NANOS_V1),
+        Timestamp::from_unix_nanos(signal_times[0] + 10),
+        Sha256Digest::new([75; 32]),
+        RecommendationSignalInstructionV1::Entry,
+    )?;
+    let entry_at_target = RecommendationSignalPlanV1::try_new(
+        Sha256Digest::new([74; 32]),
+        RecommendationSignalPlanCompletenessV1::Complete,
+        complete.folds().to_vec(),
+        target_signals,
+    )?;
+    let expired_entry = RecommendationBacktestKernelV1::run_study(
+        &daily_dataset,
+        daily_policy,
+        &corporate_actions,
+        &entry_at_target,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        expired_entry.results()[0].disposition(),
+        RecommendationSignalDispositionV1::EntryUnfilled {
+            gap: crate::RecommendationExecutionGapV1::NoEligibleObservation,
+            ..
+        },
+    ));
     Ok(())
 }
 
@@ -624,7 +953,7 @@ fn recommendation_materialization_issues_sequentially_from_coordinate_local_pit_
             lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
         }
     }
-    let dataset = BacktestDataset::try_new(BacktestDatasetInput {
+    let mut dataset = BacktestDataset::try_new(BacktestDatasetInput {
         manifest: feature_manifest()?,
         object_graph_digest: Sha256Digest::new([51; 32]),
         point_in_time_content: Sha256Digest::new([52; 32]),
@@ -633,12 +962,40 @@ fn recommendation_materialization_issues_sequentially_from_coordinate_local_pit_
         instrument_definition_audit: Sha256Digest::new([55; 32]),
         observations,
     })?;
+    let qualification = crate::dataset::BacktestStudyQualification::try_new(
+        market_squawk_domain::HistoricalStudyBasis::HistoricalAsKnown,
+        Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY),
+        Sha256Digest::new([76; 32]),
+        None,
+        &[market_squawk_domain::HistoricalStudyLimitation::PresentDayFixedCohort],
+    )?;
+    dataset.study_qualification = Some(qualification);
+    let corporate_actions = CorporateActionPlan::try_build(
+        CorporateActionPolicy::new(CorporateActionAdjustment::TotalReturn, NonZeroU32::MIN),
+        Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY),
+        Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY),
+        Vec::new(),
+        CorporateActionLimits::try_new(
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(64 * 1024).ok_or("action bound")?,
+        )?,
+    )?;
     let policy = RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+        study_qualification: qualification,
         subject_instrument_id: subject_terms.instrument_id(),
         benchmark: RecommendationBenchmarkPolicyV1::try_new(
             benchmark_terms.instrument_id(),
             Sha256Digest::new([56; 32]),
         )?,
+        accompanying_benchmark: RecommendationBenchmarkPolicyV1::try_new(
+            "00000000-0000-0000-0000-000000000022".parse()?,
+            Sha256Digest::new([60; 32]),
+        )?,
+        raw_price_evidence_digest: dataset.identity(),
+        corporate_action_content_digest: corporate_actions.content_hash(),
+        corporate_action_audit_digest: corporate_actions.audit_hash(),
+        corporate_action_coverage_starts_at: Timestamp::from_unix_nanos(0),
+        execution_basis: crate::dataset::BacktestExecutionBasis::ObservedQuoteDepth,
         reporting_currency: Currency::try_from("USD")?,
         subject_quantity: QuantityLots::new(1)?,
         benchmark_quantity: QuantityLots::new(1)?,
@@ -687,12 +1044,24 @@ fn recommendation_materialization_issues_sequentially_from_coordinate_local_pit_
                 .checked_add(1)
                 .ok_or(crate::RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
             let day = signal_at.unix_nanos() / DAY;
+            assert_eq!(
+                information.target_origin().unix_nanos(),
+                signal_at.unix_nanos() - 2
+            );
+            assert_eq!(
+                information.target_at().unix_nanos() - information.target_origin().unix_nanos(),
+                RECOMMENDATION_TARGET_HORIZON_NANOS_V1,
+            );
             RecommendationSignalIssuanceV1::try_new(
                 SourceIdentifier::try_from(format!("sequential-signal-{issued_count}")).map_err(
                     |_| crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction,
                 )?,
+                information.study_qualification(),
+                information.source_selection_as_of(),
+                information.target_origin(),
+                information.target_at(),
                 Sha256Digest::new([59; 32]),
-                if matches!(day, 0 | 740 | 1_460) {
+                if matches!(day, 0 | 500 | 740 | 1_200 | 1_460 | 2_000) {
                     RecommendationSignalInstructionV1::Entry
                 } else {
                     RecommendationSignalInstructionV1::NoAction
@@ -710,6 +1079,166 @@ fn recommendation_materialization_issues_sequentially_from_coordinate_local_pit_
             .preauthorized_signal_plan_digest(),
         issuer_identity.bindings_digest()
     );
+    let retained = materialized.encode_persisted(128 * 1024)?;
+    let restored = crate::MaterializedRecommendationSignalPlanV1::restore_persisted(
+        &retained,
+        128 * 1024,
+        &dataset,
+        policy,
+        limits,
+    )?;
+    assert_eq!(restored, materialized);
+    // A forecast producer using the later decision clock preserves a nominal 365-day horizon,
+    // but still names the wrong financial target. It must fail before any outcome is observed.
+    let shifted = RecommendationSignalPlanMaterializerV1::materialize_sequentially(
+        &dataset,
+        policy,
+        Timestamp::from_unix_nanos(0),
+        issuer_identity.clone(),
+        limits,
+        |information| {
+            RecommendationSignalIssuanceV1::try_new(
+                SourceIdentifier::try_from("decision-shifted-target").map_err(|_| {
+                    crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction
+                })?,
+                information.study_qualification(),
+                information.source_selection_as_of(),
+                information.signal_at(),
+                information
+                    .signal_at()
+                    .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
+                    .map_err(|_| {
+                        crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction
+                    })?,
+                Sha256Digest::new([59; 32]),
+                RecommendationSignalInstructionV1::Entry,
+            )
+        },
+    );
+    assert!(matches!(
+        shifted,
+        Err(crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction)
+    ));
+    let retrospective = crate::dataset::BacktestStudyQualification::try_new(
+        market_squawk_domain::HistoricalStudyBasis::RetrospectiveFrozenSnapshot,
+        qualification.snapshot_as_of(),
+        Sha256Digest::new([77; 32]),
+        Some(2),
+        &[
+            market_squawk_domain::HistoricalStudyLimitation::HistoricalRevisionCoverageUnproven,
+            market_squawk_domain::HistoricalStudyLimitation::LaterVintageInputs,
+            market_squawk_domain::HistoricalStudyLimitation::PresentDayFixedCohort,
+            market_squawk_domain::HistoricalStudyLimitation::SimulatedAvailability,
+        ],
+    )?;
+    let first = &materialized.signal_plan().signals()[0];
+    let later_known = RecommendationSignalV1::try_new(
+        SourceIdentifier::try_from("retrospective-original-availability")?,
+        0,
+        first.signal_at(),
+        retrospective.snapshot_as_of(),
+        retrospective.snapshot_as_of(),
+        retrospective,
+        first.target_origin(),
+        first.target_at(),
+        Sha256Digest::new([78; 32]),
+        RecommendationSignalInstructionV1::NoAction,
+    )?;
+    assert!(later_known.available_at() > later_known.signal_at());
+    assert_eq!(later_known.available_at(), retrospective.snapshot_as_of());
+    assert!(
+        RecommendationSignalV1::try_new(
+            SourceIdentifier::try_from("must-not-relabel-historical-availability")?,
+            0,
+            first.signal_at(),
+            retrospective.snapshot_as_of(),
+            retrospective.snapshot_as_of(),
+            qualification,
+            first.target_origin(),
+            first.target_at(),
+            Sha256Digest::new([78; 32]),
+            RecommendationSignalInstructionV1::NoAction,
+        )
+        .is_err()
+    );
+    let mut retrospective_dataset = dataset.clone();
+    retrospective_dataset.study_qualification = Some(retrospective);
+    for observation in retrospective_dataset.observations.iter_mut() {
+        observation.source_selection_as_of = retrospective.snapshot_as_of();
+    }
+    let retrospective_policy =
+        RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+            study_qualification: retrospective,
+            subject_instrument_id: policy.subject_instrument_id(),
+            benchmark: policy.benchmark(),
+            accompanying_benchmark: policy.accompanying_benchmark(),
+            raw_price_evidence_digest: policy.raw_price_evidence_digest(),
+            corporate_action_content_digest: policy.corporate_action_content_digest(),
+            corporate_action_audit_digest: policy.corporate_action_audit_digest(),
+            corporate_action_coverage_starts_at: policy.corporate_action_coverage_starts_at(),
+            execution_basis: policy.execution_basis(),
+            reporting_currency: policy.reporting_currency(),
+            subject_quantity: policy.subject_quantity(),
+            benchmark_quantity: policy.benchmark_quantity(),
+            maximum_entry_lag_nanos: policy.maximum_entry_lag_nanos(),
+            maximum_exit_lag_nanos: policy.maximum_exit_lag_nanos(),
+            execution_assumptions: policy.execution_assumptions(),
+            seed: policy.seed(),
+        })?;
+    let retrospective_plan = RecommendationSignalPlanMaterializerV1::materialize_sequentially(
+        &retrospective_dataset,
+        retrospective_policy,
+        Timestamp::from_unix_nanos(0),
+        issuer_identity.clone(),
+        limits,
+        |information| {
+            RecommendationSignalIssuanceV1::try_new(
+                SourceIdentifier::try_from(format!(
+                    "retrospective-{}",
+                    information.signal_at().unix_nanos()
+                ))
+                .map_err(|_| {
+                    crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction
+                })?,
+                information.study_qualification(),
+                information.source_selection_as_of(),
+                information.target_origin(),
+                information.target_at(),
+                Sha256Digest::new([79; 32]),
+                RecommendationSignalInstructionV1::NoAction,
+            )
+        },
+    )?;
+    assert_eq!(
+        retrospective_plan.paired_observation_count(),
+        materialized.paired_observation_count()
+    );
+    let retrospective_bytes = retrospective_plan.encode_persisted(256 * 1024)?;
+    let restored_retrospective = crate::MaterializedRecommendationSignalPlanV1::restore_persisted(
+        &retrospective_bytes,
+        256 * 1024,
+        &retrospective_dataset,
+        retrospective_policy,
+        limits,
+    )?;
+    assert_eq!(restored_retrospective, retrospective_plan);
+    assert_ne!(retrospective_plan.digest(), materialized.digest());
+    let tampered = std::str::from_utf8(&retained)?.replacen(
+        "\"instruction\":\"Entry\"",
+        "\"instruction\":\"NoAction\"",
+        1,
+    );
+    assert_ne!(tampered.as_bytes(), retained);
+    assert!(
+        crate::MaterializedRecommendationSignalPlanV1::restore_persisted(
+            tampered.as_bytes(),
+            128 * 1024,
+            &dataset,
+            policy,
+            limits,
+        )
+        .is_err()
+    );
     let simulation_cutoff = Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY);
     let publication = RecommendationBacktestPublicationV1::try_new(
         simulation_cutoff,
@@ -721,14 +1250,40 @@ fn recommendation_materialization_issues_sequentially_from_coordinate_local_pit_
     let study = RecommendationBacktestKernelV1::run_materialized_study(
         &dataset,
         policy,
+        &corporate_actions,
         &materialized,
         publication,
         limits,
+        &CancellationToken::new(),
     )?;
     let RecommendationAggregateEvidenceV1::Available(aggregate) = study.aggregate() else {
         return Err("expected complete sequential recommendation study".into());
     };
     assert_eq!(aggregate.observation_count(), 3);
+    assert_eq!(study.results().len(), 110);
+    assert_eq!(
+        study
+            .results()
+            .iter()
+            .filter(|result| matches!(
+                result.disposition(),
+                crate::RecommendationSignalDispositionV1::Censored(_),
+            ))
+            .count(),
+        3
+    );
+    assert_eq!(
+        materialized
+            .signal_plan()
+            .signals()
+            .iter()
+            .filter(|signal| matches!(
+                signal.instruction(),
+                RecommendationSignalInstructionV1::Entry,
+            ))
+            .count(),
+        6
+    );
     Ok(())
 }
 
@@ -1305,8 +1860,52 @@ fn attempt_recovery_rejects_noncanonical_unbound_or_gapped_namespace() -> TestRe
 fn corporate_action_state_is_visible_at_event_time_and_independently_reconciled() -> TestResult {
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let terms = execution_terms()?;
-    let plan = split_plan(terms.instrument_id())?;
-    let request = request(account_id, dataset(terms)?, Some(plan))?;
+    let original = split_plan(terms.instrument_id())?;
+    let make_split = |at, numerator, denominator| -> Result<_, Box<dyn Error>> {
+        let effective = Timestamp::from_unix_nanos(at);
+        let source = SourceIdentifier::try_from(format!("round-trip-split-{at}"))?;
+        let observation = CorporateActionObservation::new(
+            ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: SourceId::try_from("official-actions")?,
+                    instrument_id: Some(terms.instrument_id()),
+                    venue_id: Some(VenueId::try_from("XNAS")?),
+                    source_identifier: source.clone(),
+                    source_timestamp: Some(effective),
+                    received_at: effective,
+                    ingested_at: effective,
+                    quality: DataQuality::OfficialDelayed,
+                    payload_reference: PayloadReference::SourceReference(source.clone()),
+                    availability: AvailabilityEvidence::evidenced(effective, source),
+                })?,
+                ResearchTime::new(effective, None, RevisionNumber::new(1)?, None)?,
+            )?,
+            CorporateActionKind::Split {
+                numerator: NonZeroU32::new(numerator).ok_or("numerator")?,
+                denominator: NonZeroU32::new(denominator).ok_or("denominator")?,
+            },
+        )?;
+        Ok(CorporateActionRecord::new(
+            observation,
+            original.admitted()[0].source_manifest().clone(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [u8::try_from(at)?; 32]),
+        ))
+    };
+    let plan = CorporateActionPlan::try_build(
+        original.policy(),
+        original.knowledge_cutoff(),
+        original.valuation_cutoff(),
+        vec![make_split(25, 3, 1)?, make_split(28, 1, 3)?],
+        CorporateActionLimits::try_new(
+            NonZeroUsize::new(2).ok_or("actions")?,
+            NonZeroUsize::new(64 * 1024).ok_or("bytes")?,
+        )?,
+    )?;
+    let request = request(
+        account_id,
+        dataset_with_depths(terms, [10, 3, 10])?,
+        Some(plan),
+    )?;
     let mut strategy = BuyOnce {
         account_id,
         time_in_force: TimeInForce::Day,
@@ -1320,13 +1919,16 @@ fn corporate_action_state_is_visible_at_event_time_and_independently_reconciled(
         result.accounting_reconciliation(),
         AccountingReconciliation::Independent
     );
-    assert_eq!(strategy.last_position, Decimal::from(4));
+    assert_eq!(result.fills().len(), 1);
+    assert_eq!(result.fills()[0].quantity().get(), 3);
+    // Three units become nine, then exactly three. Dividing 1 by 3 first loses decimal units.
+    assert_eq!(strategy.last_position, Decimal::from(3));
     assert_eq!(
         result
             .portfolio()
             .position(terms.instrument_id())
             .map(|position| position.quantity()),
-        Some(Decimal::from(4))
+        Some(Decimal::from(3))
     );
     Ok(())
 }

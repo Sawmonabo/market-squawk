@@ -118,7 +118,13 @@ function transport(
       }
       return productResult({ activities: [] })
     },
-    analyticalController: async () => analyticalControllerStatus(),
+    analyticalController: async (request) => request.action === "profileOptions"
+      ? { kind: "profile_options", options: {
+          benchmarkChoices: [],
+          modelChoices: [{ token: "recommended", label: "Recommended calibrated forecast" }],
+          fixedSettings: [],
+        } }
+      : analyticalControllerStatus(),
     researchControl: async () =>
       systemResult(null),
     researchExport: async () =>
@@ -145,6 +151,9 @@ function transport(
       query({ query: "paperStatus" }),
     manualPaper: async () =>
       query({ query: "paperStatus" }),
+    recommendationSetup: async () => {
+      throw new Error("Recommendation setup is not configured for this test.")
+    },
     jobControl: async (request) =>
       systemResult({ request }),
     sourceControl: async (_action, _request) =>
@@ -256,6 +265,7 @@ function transport(
   }
   const product: ProductTransport = {
     query: bridge.query,
+    analyticalController: bridge.analyticalController,
     modelProducts: bridge.modelProducts,
     backtestProducts: bridge.backtestProducts,
     datasetPreparation: bridge.datasetPreparation,
@@ -264,13 +274,13 @@ function transport(
     researchExport: bridge.researchExport,
     paperControl: bridge.paperControl,
     manualPaper: bridge.manualPaper,
+    recommendationSetup: bridge.recommendationSetup,
   }
   const system: SystemTransport = {
     bootstrap: bridge.bootstrap,
     bootstrapService: bridge.bootstrapService,
     installation: bridge.installation,
     systemQuery: bridge.systemQuery,
-    analyticalController: bridge.analyticalController,
     researchControl: bridge.researchControl,
     startBacktestFromFile: bridge.startBacktestFromFile,
     modelControl: bridge.modelControl,
@@ -315,6 +325,19 @@ function analyticalControllerStatus(): AnalyticalControllerStatus {
     canValidate: false,
     canActivate: false,
     canRestoreRecommended: false,
+    canEdit: false,
+    analysisScope: "balanced" as const,
+    financialPreferences: {
+      coverage: "stocks_and_etfs" as const,
+      modelChoice: "recommended",
+      allowRetrospectiveStudies: true,
+      fields: [
+        { key: "portfolio_risk_minimum_daily_returns", label: "Minimum portfolio history",
+          group: "Portfolio risk history", value: "252", unit: "daily returns" as const, choices: [] },
+        { key: "portfolio_risk_maximum_daily_returns", label: "Maximum portfolio history",
+          group: "Portfolio risk history", value: "1260", unit: "daily returns" as const, choices: [] },
+      ],
+    },
   }
   return {
     kind: "status",
@@ -327,6 +350,7 @@ function analyticalControllerStatus(): AnalyticalControllerStatus {
       nextAction: "Review saved investment analyses, or try again later.",
     },
     canCreateCustomProfile: true,
+    profileRecoveryNotice: null,
   }
 }
 
@@ -395,6 +419,8 @@ const macroIndicatorDefinitions = [
   ["us-government-yield-30y", "30-year government bond yield", "4.39"],
   ["us-unemployment-rate", "U.S. unemployment rate", "4.2"],
   ["us-residential-electricity-price", "U.S. residential electricity price", "17.47"],
+  ["california-beginning-quarter-employment", "California beginning-of-quarter employment", "17500000"],
+  ["california-annual-personal-income", "California annual personal income", "3400000000000"],
 ] as const
 
 function macroContextResult(cutoffs = {
@@ -402,9 +428,24 @@ function macroContextResult(cutoffs = {
   effectiveDateCutoff: macroEffectiveDateCutoff,
 }): ApplicationResult {
   const knowledgeCutoff = new Date(cutoffs.knowledgeCutoff).toISOString().replace(/\.[0-9]{3}Z$/, ".000000000Z")
+  const [year, month, day] = cutoffs.effectiveDateCutoff.split("-").map(Number)
   return {
     data: {
       availability: "available",
+      investmentContext: {
+        availability: "available",
+        curve: "mixed",
+        effective: {
+          schema_version: 2,
+          coordinate: { precision: "calendar_date", value: { year, month, day } },
+        },
+        threeMonthToTenYearSpreadPercentagePoints: "-0.16",
+        twoYearToTenYearSpreadPercentagePoints: "0.24",
+        governmentYieldReferences: [
+          { maturityYears: 10, annualPercent: "4.12", availableAt: knowledgeCutoff },
+          { maturityYears: 30, annualPercent: "4.39", availableAt: knowledgeCutoff },
+        ],
+      },
       selection: {
         ...cutoffs,
         knowledgeCutoff,
@@ -417,8 +458,8 @@ function macroContextResult(cutoffs = {
         summary: "All requested economic indicators are available for the selected dates.",
       },
       coverage: {
-        requested: 13,
-        observed: 13,
+        requested: macroIndicatorDefinitions.length,
+        observed: macroIndicatorDefinitions.length,
         missing: 0,
         unavailable: 0,
       },
@@ -426,18 +467,18 @@ function macroContextResult(cutoffs = {
         ([indicatorId, label, decimal], index) => ({
           indicatorId,
           label,
-          category: index < 11 ? "interest_rates" : index === 12 ? "energy_prices" : "labor_market",
-          frequency: index < 11 ? "business_daily" : "monthly",
+          category: index < 11 ? "interest_rates" : index === 12 ? "energy_prices" : index === 14 ? "income" : "labor_market",
+          frequency: index < 11 ? "business_daily" : index === 13 ? "quarterly" : index === 14 ? "annual" : "monthly",
           seasonalAdjustment:
-            index < 11 ? "not_applicable" : index === 12 ? "not_supplied" : "seasonally_adjusted",
+            index < 11 ? "not_applicable" : index >= 12 ? "not_supplied" : "seasonally_adjusted",
           unit: {
             code:
-              index < 11 ? "percent_per_year" : index === 12 ? "native_energy_price" : "percent_of_labor_force",
-            label: index < 11 ? "Percent per year" : index === 12 ? "cents per kilowatthour" : "Percent of labor force",
-            symbol: index === 12 ? null : "%",
+              index < 11 ? "percent_per_year" : index === 12 ? "native_energy_price" : index === 13 ? "persons" : index === 14 ? "native_income" : "percent_of_labor_force",
+            label: index < 11 ? "Percent per year" : index === 12 ? "cents per kilowatthour" : index === 13 ? "Persons" : index === 14 ? "Dollars" : "Percent of labor force",
+            symbol: index >= 12 ? null : "%",
           },
-          effectiveDate: index < 11 ? cutoffs.effectiveDateCutoff : index === 12 ? null : "2026-07-01",
-          ...(index === 12 ? { effectivePeriod: "2026-07" } : {}),
+          effectiveDate: index < 11 ? cutoffs.effectiveDateCutoff : index >= 12 ? null : "2026-07-01",
+          ...(index === 12 ? { effectivePeriod: "2026-07" } : index === 13 ? { effectivePeriod: "2026-Q2" } : index === 14 ? { effectivePeriod: "2025" } : {}),
           recorded: { state: "known", date: cutoffs.effectiveDateCutoff },
           availableAt: knowledgeCutoff,
           revision: 1,
@@ -453,8 +494,8 @@ function macroContextResult(cutoffs = {
     },
     metadata: {
       completeness: "complete",
-      returnedItems: 13,
-      availableItems: 13,
+      returnedItems: macroIndicatorDefinitions.length,
+      availableItems: macroIndicatorDefinitions.length,
     },
   }
 }
@@ -677,7 +718,7 @@ describe("Market Squawk desktop boundary", () => {
     )
 
     const macroHeading = await screen.findByRole("heading", {
-      name: "Rates, labor and energy prices",
+      name: "Rates, labor, income and energy prices",
     })
     const macroSection = macroHeading.closest("section")
     expect(macroSection).toBeInstanceOf(HTMLElement)
@@ -714,7 +755,7 @@ describe("Market Squawk desktop boundary", () => {
     })
 
     const refreshedMacro = await screen.findByRole("heading", {
-      name: "Rates, labor and energy prices",
+      name: "Rates, labor, income and energy prices",
     })
     const renderedMacro = refreshedMacro.closest("section")?.textContent ?? ""
     expect(renderedMacro).not.toMatch(

@@ -8,7 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::{KrakenChannel, KrakenConfig, KrakenConfigError, public_subscription_payload};
 use crate::handoff::{
-    KrakenInstrumentBinding, KrakenSubscriptionRequestEvidence, instrument_binding,
+    KrakenInstrumentBinding, KrakenSubscriptionRequestEvidence, instrument_binding_from_coordinates,
 };
 use crate::level3::KrakenL3SecretPayload;
 use crate::messages::PUBLIC_SUBSCRIPTION_REQUEST_ID;
@@ -45,7 +45,7 @@ impl KrakenConfig {
             .map_err(|_| KrakenConfigError::SubscriptionSerialization)?;
         let payload = CapturePayload::try_from_live(wire.as_bytes())
             .map_err(|_| KrakenConfigError::SubscriptionSerialization)?;
-        let instrument_binding = instrument_binding(self.symbol(), self.instrument())
+        let instrument_binding = instrument_binding_from_coordinates(self.native_coordinates())
             .map_err(|_| KrakenConfigError::SubscriptionSerialization)?;
         Ok(KrakenPublicSubscriptionRequest {
             source_id: self.metadata().source_id().clone(),

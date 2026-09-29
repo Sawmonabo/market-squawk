@@ -1,4 +1,5 @@
 import * as React from "react"
+import { Link } from "react-router-dom"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { CircleAlert, FileCheck2, Send, ShieldCheck } from "lucide-react"
 
@@ -22,9 +23,9 @@ import {
   asManualPaperTransport,
   isPositiveLotQuantity,
   parseAcceptedManualPaperDraft,
-  parseGovernedPaperTargets,
+  parseManualPaperTargets,
   parseManualPaperPreview,
-  type GovernedPaperTarget,
+  type ManualPaperTarget,
   type ManualPaperOrderType,
   type ManualPaperSide,
   type ManualPaperPrepare,
@@ -37,7 +38,7 @@ const CONTROL_CLASS =
   "h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 type Draft = {
-  targetIndex: string
+  targetToken: string
   side: ManualPaperSide | ""
   orderType: ManualPaperOrderType | ""
   quantityLots: string
@@ -52,7 +53,9 @@ export function ManualPaperDraftPanel({
   enabled,
   busy,
   onAccepted,
+  analysisActionToken,
 }: {
+  analysisActionToken?: string
   transport: ProductTransport
   scope: ProductScope
   enabled: boolean
@@ -64,18 +67,26 @@ export function ManualPaperDraftPanel({
   const [pending, setPending] = React.useState<ManualPaperPreview | null>(null)
   const [accepted, setAccepted] = React.useState<string | null>(null)
   const targets = useQuery({
-    queryKey: productKeys.operation(scope, "execution", "Execution.GetManualPaperTargets", {}),
+    queryKey: productKeys.operation(
+      scope, "execution", "Execution.GetManualPaperTargets", { analysisActionToken },
+    ),
     enabled: enabled && manualPaper !== null,
     staleTime: 15_000,
     queryFn: async () => {
       if (!manualPaper) throw new Error("Paper drafting is unavailable.")
-      return parseGovernedPaperTargets(await manualPaper.manualPaper({ action: "targets" }))
+      return parseManualPaperTargets(
+        await manualPaper.manualPaper({ action: "targets", analysisActionToken }),
+        analysisActionToken,
+      )
     },
   })
   const prepare = useMutation({
-    mutationFn: async (request: ManualPaperPrepare) => {
+    mutationFn: async ({ request, provenance }: {
+      request: ManualPaperPrepare
+      provenance: ManualPaperTarget["provenance"]
+    }) => {
       if (!manualPaper) throw new Error("Paper drafting is unavailable.")
-      return parseManualPaperPreview(await manualPaper.manualPaper(request))
+      return parseManualPaperPreview(await manualPaper.manualPaper(request), provenance)
     },
     onSuccess: (preview) => setPending(preview),
   })
@@ -95,12 +106,11 @@ export function ManualPaperDraftPanel({
     onError: () => setPending(null),
   })
 
-  const targetIndex = parseSelectedIndex(draft.targetIndex, targets.data?.length ?? 0)
-  const selected = targetIndex === null ? null : targets.data?.[targetIndex] ?? null
+  const selected = targets.data?.find((target) => target.targetToken === draft.targetToken) ?? null
   const orderChoice = selected?.orderChoices.find((choice) => choice.value === draft.orderType)
   const normalized = normalizeDraft(draft, selected)
   const ready =
-    enabled && normalized !== null && !busy && !prepare.isPending && !submit.isPending
+    enabled && normalized !== null && pending === null && !busy && !prepare.isPending && !submit.isPending
 
   return (
     <section
@@ -113,11 +123,11 @@ export function ManualPaperDraftPanel({
             Paper practice
           </p>
           <h2 id="manual-paper-heading" className="mt-1 text-lg font-semibold">
-            Practice an investment plan without real money
+            Practice an investment idea without real money
           </h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Select an active plan and make each choice yourself. Market Squawk supplies only the
-            choices prepared for that plan, then rechecks current conditions and safeguards before
+            Select a plan or saved recommendation and make each choice yourself. Market Squawk supplies only the
+            prepared choices, then rechecks current conditions and safeguards before
             a virtual order can proceed.
           </p>
         </div>
@@ -125,30 +135,35 @@ export function ManualPaperDraftPanel({
       </div>
 
       {!enabled || manualPaper === null ? (
-        <Unavailable />
+        <Unavailable detail={analysisActionToken ? "This saved recommendation needs an available, active paper session. Review the session controls below; trade details and confirmation remain separate." : undefined} />
       ) : targets.isPending ? (
         <Status text="Loading prepared paper choices…" />
       ) : targets.isError ? (
-        <Status text="Prepared paper choices are not available right now. Try again." tone="error" />
+        <div>
+          <Status text="Prepared paper choices are not available right now." tone="error" />
+          <Button className="mt-3" variant="outline" onClick={() => void targets.refetch()} disabled={targets.isFetching}>
+            Try again
+          </Button>
+        </div>
       ) : targets.data?.length === 0 ? (
-        <Unavailable detail="Create an investment plan before preparing a paper trade." />
+        <Unavailable detail={analysisActionToken ? "This saved recommendation is not available for paper practice under current conditions. Return to Opportunities to review it." : "Create an investment plan before preparing a paper trade."} />
       ) : (
         <div className="mt-5 space-y-4">
-          <div className="grid gap-4 lg:grid-cols-2">
-            <Field label="Investment plan" htmlFor="manual-paper-target">
+          <fieldset disabled={busy || prepare.isPending || submit.isPending || pending !== null} className="grid gap-4 lg:grid-cols-2">
+            <Field label={analysisActionToken ? "Saved recommendation" : "Investment plan"} htmlFor="manual-paper-target">
               <select
                 id="manual-paper-target"
                 className={CONTROL_CLASS}
-                value={draft.targetIndex}
+                value={draft.targetToken}
                 onChange={(event) => {
-                  setDraft({ ...emptyDraft(), targetIndex: event.target.value })
+                  setDraft({ ...emptyDraft(), targetToken: event.target.value })
                   setAccepted(null)
                 }}
               >
-                <option value="">Select an investment plan</option>
-                {targets.data.map((target, index) => (
-                  <option key={`${target.investment.name}:${index}`} value={String(index)}>
-                    {investmentLabel(target.investment)}
+                <option value="">{analysisActionToken ? "Select the saved recommendation" : "Select an investment plan"}</option>
+                {targets.data.map((target) => (
+                  <option key={target.targetToken} value={target.targetToken}>
+                    {investmentLabel(target.investment)} · {target.provenance.kind === "generated_proposal" ? "Saved recommendation" : "Investment plan"}
                   </option>
                 ))}
               </select>
@@ -273,7 +288,7 @@ export function ManualPaperDraftPanel({
                 ) : null}
               </>
             ) : null}
-          </div>
+          </fieldset>
 
           {selected ? <TargetEvidence target={selected} /> : null}
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/25 p-3">
@@ -284,10 +299,10 @@ export function ManualPaperDraftPanel({
             <Button
               disabled={!ready}
               onClick={() => {
-                if (normalized) {
+                if (normalized && selected) {
                   prepare.reset()
                   submit.reset()
-                  prepare.mutate(normalized)
+                  prepare.mutate({ request: normalized, provenance: selected.provenance })
                 }
               }}
             >
@@ -340,16 +355,16 @@ export function ManualPaperDraftPanel({
   )
 }
 
-function TargetEvidence({ target }: { target: GovernedPaperTarget }) {
+function TargetEvidence({ target }: { target: ManualPaperTarget }) {
   return (
     <div className="rounded-xl border border-border bg-background/35 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="font-semibold">{investmentLabel(target.investment)}</p>
-          <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">{target.thesis}</p>
+          <Provenance provenance={target.provenance} />
         </div>
         <p className="text-right text-[10px] text-muted-foreground">
-          Review by {formatProductTimestamp(target.reviewDueAt)} · expires{" "}
+          Expires{" "}
           {formatProductTimestamp(target.expiresAt)}
         </p>
       </div>
@@ -375,6 +390,10 @@ function Confirmation({
   return (
     <dl className="grid gap-3 rounded-xl border border-border bg-card/35 p-4 text-xs sm:grid-cols-2">
       <Fact label="Investment" value={investmentLabel(preview.investment)} />
+      <div className="sm:col-span-2">
+        <dt className="text-muted-foreground">Recommendation source</dt>
+        <dd><Provenance provenance={preview.provenance} /></dd>
+      </div>
       <Fact label="Direction" value={preview.direction} />
       <Fact label="Order approach" value={preview.orderApproach} />
       <Fact label="Quantity" value={preview.quantity} />
@@ -401,7 +420,7 @@ function LevelField({
   label: string
   fieldId: string
   value: TargetLevel | ""
-  ladder: GovernedPaperTarget["ladder"]
+  ladder: ManualPaperTarget["ladder"]
   onChange: (value: TargetLevel | "") => void
 }) {
   return (
@@ -485,7 +504,7 @@ function Status({
 
 function normalizeDraft(
   draft: Draft,
-  selected: GovernedPaperTarget | null,
+  selected: ManualPaperTarget | null,
 ): ManualPaperPrepare | null {
   if (!selected || !draft.side || !draft.orderType || !draft.timeInForce) return null
   if (!isPositiveLotQuantity(draft.quantityLots)) return null
@@ -511,7 +530,7 @@ function normalizeDraft(
 
 function emptyDraft(): Draft {
   return {
-    targetIndex: "",
+    targetToken: "",
     side: "",
     orderType: "",
     quantityLots: "",
@@ -521,17 +540,28 @@ function emptyDraft(): Draft {
   }
 }
 
-function parseSelectedIndex(value: string, length: number): number | null {
-  if (!/^\d+$/.test(value)) return null
-  const index = Number(value)
-  return Number.isSafeInteger(index) && index >= 0 && index < length ? index : null
-}
-
-function investmentLabel(investment: GovernedPaperTarget["investment"]): string {
+function investmentLabel(investment: ManualPaperTarget["investment"]): string {
   return investment.symbol ? `${investment.name} (${investment.symbol})` : investment.name
 }
 
 function formatProductTimestamp(value: string): string {
   const date = new Date(value)
   return Number.isNaN(date.valueOf()) ? "Unavailable" : date.toLocaleString()
+}
+
+function Provenance({ provenance }: { provenance: ManualPaperTarget["provenance"] }) {
+  return provenance.kind === "generated_proposal" ? (
+    <div className="mt-2 text-xs leading-5 text-muted-foreground">
+      <p>Saved recommendation: {provenance.recommendation}</p>
+      <p>Published {formatProductTimestamp(provenance.publishedAt)}</p>
+      <Link className="text-primary underline" to={`/opportunities?analysis=${encodeURIComponent(provenance.analysisActionToken)}`}>
+        Review original saved analysis
+      </Link>
+    </div>
+  ) : (
+    <div className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
+      <p>{provenance.thesis}</p>
+      <p>Review by {formatProductTimestamp(provenance.reviewDueAt)}</p>
+    </div>
+  )
 }

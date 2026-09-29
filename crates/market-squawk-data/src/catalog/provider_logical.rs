@@ -1,5 +1,15 @@
 //! Durable provider-neutral evidence for streamed logical publications.
 
+mod original;
+mod partition_artifacts;
+
+pub(crate) use partition_artifacts::partition_inputs_match;
+
+pub(crate) use original::{
+    MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES, original_publication_matches, publish_original,
+};
+pub use original::{ProviderLogicalOriginalReceipt, ProviderLogicalPublicationOrigin};
+
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
@@ -395,10 +405,17 @@ pub(crate) fn retain_sealed_provider_logical_publication_binding(
     transaction: &Transaction<'_>,
     run_id: Uuid,
     binding: &SealedProviderLogicalPublicationBinding,
-    coordinate: ProviderArtifactInputCoordinate,
+    coordinates: &[ProviderArtifactInputCoordinate],
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     let evidence = PersistedProviderLogicalPublicationBinding::try_from_live(binding)?;
+    if coordinates.is_empty()
+        || coordinates.len() != evidence.canonical_partitions.len()
+        || !super::provider_capture::provider_artifact_input_coordinates_are_ordered(coordinates)
+    {
+        return Err(CatalogError::ProviderLogicalMismatch);
+    }
+    let coordinate = coordinates[0];
     let run_source: String = transaction.query_row(
         "SELECT source_id FROM ingest_runs
          WHERE run_id=?1 AND state='reserved' AND operation='persist'",
@@ -442,6 +459,7 @@ pub(crate) fn retain_sealed_provider_logical_publication_binding(
     if inserted != 1 {
         return Err(CatalogError::ProviderLogicalConflict);
     }
+    partition_artifacts::retain(transaction, run_id, evidence.binding_digest, coordinates)?;
     append_audit(
         transaction,
         "provider-logical-publication.retained",
@@ -572,7 +590,7 @@ fn insert_logical_binding(
     Ok(())
 }
 
-fn insert_logical_claim(
+pub(super) fn insert_logical_claim(
     connection: &Connection,
     claim_digest: EvidenceDigest,
     claim: &ResearchObjectClaim,
@@ -630,7 +648,7 @@ fn insert_logical_claim(
     }
 }
 
-fn load_provider_logical_publication_binding(
+pub(super) fn load_provider_logical_publication_binding(
     connection: &Connection,
     binding_digest: EvidenceDigest,
 ) -> Result<Option<PersistedProviderLogicalPublicationBinding>, CatalogError> {
@@ -702,6 +720,11 @@ fn load_provider_logical_publication_binding(
     evidence
         .verify_integrity()
         .map_err(|_| CatalogError::CorruptCatalog)?;
+    partition_artifacts::validate_retained(
+        connection,
+        binding_digest,
+        &evidence.canonical_partitions,
+    )?;
     Ok(Some(evidence))
 }
 

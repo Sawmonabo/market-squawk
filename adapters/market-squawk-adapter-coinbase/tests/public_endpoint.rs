@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/selected.rs"]
+mod selected;
 
 use std::time::Duration;
 
@@ -9,9 +11,9 @@ use market_squawk_adapter_coinbase::{
 };
 use market_squawk_domain::{ConnectionGeneration, LiveEventClass, Timestamp};
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, LiveMarketSource, RawMarketFrame, RawMarketSink, SessionId,
-    SinkError, SourceError,
+    LiveMarketSource, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
 };
+use selected::selected_fixture;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -69,12 +71,11 @@ async fn production_endpoint_smoke_is_opt_in_and_bounded() -> TestResult {
     if std::env::var("MARKET_SQUAWK_NETWORK_TESTS").as_deref() != Ok("1") {
         return Ok(());
     }
-    let source_config = config()?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(
-        source_config.metadata().clone(),
-        Timestamp::from_unix_nanos(1),
-    )?;
+    let fixture = selected_fixture()?;
+    let source_config = fixture.config.clone();
+    let (mut registry, registered) = fixture
+        .catalog
+        .selected_registry(source_config.metadata())?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(identifier("coinbase-public-smoke")?),
@@ -99,7 +100,7 @@ async fn production_endpoint_smoke_is_opt_in_and_bounded() -> TestResult {
         .snapshot
         .ok_or("Coinbase did not publish a bounded level2 frame")?;
     let validated = session.validate_live_frame(&snapshot)?;
-    let decoder_config = config()?;
+    let decoder_config = fixture.config;
     let mut decoder = CoinbaseExchangeDecoder::try_new(&decoder_config)?;
     let decoded = decoder.decode_market_handoff(&validated)?;
     let CoinbaseMarketDecodeOutcome::Market(handoff) = decoded else {

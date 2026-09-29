@@ -167,14 +167,39 @@ pub enum Command {
         command: MarketCommand,
     },
 
-    /// Show the economic and interest-rate backdrop at one optional point in time.
+    /// Show the economic backdrop or select one saved economic series.
     EconomicContext {
+        /// List saved economic series and their exact neutral selection IDs.
+        #[arg(long, conflicts_with = "series_id")]
+        list_series: bool,
+        /// Read the latest observation of a saved economic series by its listed ID.
+        #[arg(long, conflicts_with = "list_series")]
+        series_id: Option<String>,
         /// RFC 3339 instant defining what information was known.
         #[arg(long, requires = "effective_date_cutoff")]
         knowledge_cutoff: Option<String>,
         /// Latest effective date admitted into the context, in YYYY-MM-DD form.
         #[arg(long, requires = "knowledge_cutoff")]
         effective_date_cutoff: Option<String>,
+    },
+
+    /// Read a bounded page of saved economic series history.
+    EconomicSeriesHistory {
+        /// Stable series ID returned by economic-context --list-series.
+        #[arg(long)]
+        series_id: String,
+        /// Inclusive first effective date, in YYYY-MM-DD form.
+        #[arg(long)]
+        start_effective_date: String,
+        /// RFC 3339 instant defining what information was known.
+        #[arg(long, requires = "effective_date_cutoff")]
+        knowledge_cutoff: Option<String>,
+        /// Latest effective date admitted into history, in YYYY-MM-DD form.
+        #[arg(long, requires = "knowledge_cutoff")]
+        effective_date_cutoff: Option<String>,
+        /// Last effective period returned by a prior page.
+        #[arg(long)]
+        after_effective_period: Option<String>,
     },
 
     /// Capture direct Coinbase Exchange data into the local journal.
@@ -233,6 +258,13 @@ pub enum Command {
         /// Portfolio operation.
         #[command(subcommand)]
         command: PortfolioCommand,
+    },
+
+    /// Start and follow the shared complete investment-analysis workflow.
+    Analysis {
+        /// Workflow, saved-result, or explicit account-setup operation.
+        #[command(subcommand)]
+        command: AnalysisCommand,
     },
 
     /// Run and inspect governed research backtests.
@@ -367,6 +399,22 @@ pub enum SourceCommand {
         /// Optional provider filter.
         provider: Option<String>,
     },
+    /// Verify the saved source configuration without starting its runtime.
+    Verify {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Start the saved source configuration after its required verification.
+    Start {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Report explicit provider and instrument coverage.
     Coverage {
         /// Optional provider filter.
@@ -385,13 +433,16 @@ pub enum SourceCommand {
         #[arg(long)]
         confirm: bool,
     },
-    /// List exact provider objects without minting ingestion authority.
+    /// Discover exact provider objects and their single-use ingestion receipts.
     Discover {
         /// Active configured provider identifier.
         provider: String,
         /// Exact provider dataset namespace.
         #[arg(long)]
         dataset: String,
+        /// Explicit confirmation to mint bounded ingestion authority.
+        #[arg(long)]
+        confirm: bool,
     },
     /// Inspect one bounded provider page without persisting it as a research dataset.
     Inspect {
@@ -423,6 +474,31 @@ pub enum SourceCommand {
 /// Unified market-data operation.
 #[derive(Debug, Subcommand)]
 pub enum MarketCommand {
+    /// Acquire reported trading-session information for one product and civil date.
+    GetSessionContext {
+        /// Product whose reported sessions should be acquired.
+        #[arg(long, value_parser = ["equity", "option", "bond", "future", "forex"])]
+        product: String,
+        /// Civil date in YYYY-MM-DD form; no timezone or midnight conversion.
+        #[arg(long)]
+        date: chrono::NaiveDate,
+        /// Authorize acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Reopen an exact saved trading-session reference without acquiring newer information.
+    ReadSessionContext {
+        /// JSON file containing the original returned reference object.
+        reference: PathBuf,
+    },
+    /// Acquire the current-session calendar before freezing an investment analysis cutoff.
+    PrepareInvestmentEvidence {
+        /// JSON request containing the selected investment and resolved financial profile.
+        request: PathBuf,
+        /// Authorize bounded source acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Return provider-neutral current-market summaries selected by Market Squawk.
     Overview {
         /// Continue from an opaque Market page token.
@@ -485,9 +561,12 @@ pub enum IngestCommand {
         provider: String,
         /// Provider object or series identifier.
         object: String,
-        /// Destination dataset identity.
+        /// Exact provider dataset identity returned by discovery.
         #[arg(long)]
         dataset: String,
+        /// Original single-use receipt returned with this exact discovered object.
+        #[arg(long)]
+        discovery_receipt: String,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
@@ -679,6 +758,23 @@ pub enum ForecastCommand {
         /// Opaque forecast token returned by `forecast list`.
         forecast_token: Uuid,
     },
+    /// Acquire completed later history and source evidence for one saved forecast outcome.
+    PrepareOutcome {
+        /// Opaque token of the exact saved forecast.
+        forecast_token: Uuid,
+        /// Explicit confirmation to acquire and retain later source evidence.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Measure and retain a completed forecast outcome from exact source evidence.
+    MeasureOutcome {
+        /// Closed request containing forecastToken, outcomeManifest, asOfUnixNanos and sourceActionReference.
+        #[arg(long)]
+        request: PathBuf,
+        /// Explicit confirmation to retain measured outcome evidence.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Show the realized outcomes for one forecast.
     Outcomes {
         /// Opaque forecast token returned by `forecast list`.
@@ -739,6 +835,16 @@ pub enum PortfolioCommand {
     /// Measure point-in-time portfolio risk.
     Risk {
         /// Confined JSON request file.
+        request: PathBuf,
+    },
+    /// Read portfolio value and historical market-risk inputs for an investment analysis.
+    SelectAnalysisPrerequisites {
+        /// Confined JSON request containing the investment, source cutoff, and resolved profile.
+        request: PathBuf,
+    },
+    /// Reopen the exact saved portfolio and trading-calendar inputs for an investment analysis.
+    ReadAnalysisPrerequisites {
+        /// Confined JSON request containing the saved reference and resolved profile.
         request: PathBuf,
     },
 }
@@ -836,12 +942,38 @@ pub enum BacktestCommand {
 /// Paper-bot lifecycle operation.
 #[derive(Debug, Subcommand)]
 pub enum BotCommand {
+    /// List the virtual-cash, estimated-cost, and reporting-currency choices for a virtual account.
+    AccountPreparation,
+    /// Preview a virtual account using each explicitly selected choice.
+    PrepareAccount {
+        /// Opaque virtual-cash choice returned by `bot account-preparation`.
+        #[arg(long)]
+        cash_choice: String,
+        /// Opaque trading-cost choice returned by `bot account-preparation`.
+        #[arg(long)]
+        cost_choice: String,
+        /// Opaque reporting-currency choice returned by `bot account-preparation`.
+        #[arg(long)]
+        currency_choice: String,
+    },
+    /// Create the confirmed virtual account and leave its paper session stopped.
+    CreateAccount {
+        /// One-use confirmation token returned by `bot prepare-account`.
+        #[arg(long)]
+        confirmation_token: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Report lifecycle, source qualification, risk, and paper state.
     Status,
-    /// List the explicit virtual-cash, cost, and mode choices for a paper session.
+    /// List existing virtual-account settings and available markets and practice modes.
     Preparation,
     /// Prepare one short-lived paper-session confirmation.
     Prepare {
+        /// Opaque market choice returned by `bot preparation`.
+        #[arg(long)]
+        market_choice: String,
         /// Opaque virtual-cash choice returned by `bot preparation`.
         #[arg(long)]
         cash_choice: String,
@@ -882,8 +1014,12 @@ pub enum ExecutionCommand {
     Orders,
     /// List bounded paper fills.
     Fills,
-    /// List the active investment plans eligible for a manual virtual order.
-    Targets,
+    /// List active investment plans or select a saved recommendation for a virtual order.
+    Targets {
+        /// Original saved recommendation returned by investment analysis.
+        #[arg(long)]
+        analysis_action_token: Option<Uuid>,
+    },
     /// Prepare a manual virtual order from an explicit JSON request.
     PrepareManual {
         /// Confined request containing the selected target and every order choice.
@@ -1768,4 +1904,92 @@ impl From<JournalFormatArgument> for JournalFileFormat {
             JournalFormatArgument::Legacy => Self::Legacy,
         }
     }
+}
+
+/// Closed operations over the installed native financial workflow.
+#[derive(Debug, Subcommand)]
+pub enum AnalysisCommand {
+    /// Analyze an admitted investment using the current investment settings.
+    Start {
+        /// Exact market selection returned by market lookup.
+        #[arg(long)] selection_token: String,
+        /// Canonical comparison instrument from analysis profile options; omit for the current default.
+        #[arg(long)] benchmark_instrument_id: Option<Uuid>,
+        /// Authorize the bounded financial analysis sequence; no order is submitted.
+        #[arg(long)] confirm: bool,
+    },
+    /// Find opportunities using the current investment settings and admitted population.
+    Find {
+        /// Canonical comparison instrument from analysis profile options; omit for the current default.
+        #[arg(long)] benchmark_instrument_id: Option<Uuid>,
+        /// Authorize the bounded financial analysis sequence; no order is submitted.
+        #[arg(long)] confirm: bool,
+    },
+    /// Read saved workflow progress and current investment settings.
+    Status,
+    /// Resume one paused workflow with its original retained evidence and request identity.
+    Resume {
+        /// Exact workflow token returned by status.
+        #[arg(long)] workflow_token: String,
+        /// Explicitly authorize continuation.
+        #[arg(long)] confirm: bool,
+    },
+    /// Cancel one workflow and reconcile its exact child jobs.
+    Cancel {
+        /// Exact workflow token returned by status.
+        #[arg(long)] workflow_token: String,
+        /// Explicitly authorize cancellation.
+        #[arg(long)] confirm: bool,
+    },
+    /// Read one bounded page of the original completed opportunity-search coverage.
+    Coverage {
+        /// Exact completed workflow token.
+        #[arg(long)] workflow_token: String,
+        /// JSON file containing the exact nextAfter cursor from the prior page.
+        #[arg(long)] after: Option<PathBuf>,
+    },
+    /// Use one closed Advanced investment-settings command, such as profileOptions or copyRecommended.
+    Profile {
+        /// JSON file containing the existing typed profile command and its current tokens.
+        #[arg(long)] request: PathBuf,
+        /// Explicitly confirm commands that change or validate investment settings.
+        #[arg(long)] confirm: bool,
+    },
+    /// Read, preview, or explicitly confirm recommendation account and allocation setup.
+    Setup {
+        /// Existing setup authority operation.
+        #[command(subcommand)] command: AnalysisSetupCommand,
+    },
+    /// List persisted generated, no-action, and unavailable investment analyses.
+    Results {
+        /// Continue after the exact prior saved-analysis action token.
+        #[arg(long)] after: Option<Uuid>,
+        /// Maximum saved results returned.
+        #[arg(long,default_value_t=100,value_parser=clap::value_parser!(u16).range(1..=1000))] limit: u16,
+    },
+    /// Reopen one exact persisted investment analysis.
+    Show {
+        /// Original saved-analysis action token; also used by explicit paper drafting.
+        #[arg(long)] action_token: Uuid,
+    },
+}
+/// Explicit recommendation setup; every numeric choice comes from the operator.
+#[derive(Debug, Subcommand)]
+pub enum AnalysisSetupCommand {
+    /// Read the current setup and genuine available account choices.
+    Status,
+    /// Preview accountId, expectedRevision, and allocationProfile from a bounded JSON file.
+    Preview {
+        /// Exact setup request, with an explicitly selected account and numeric allocation profile.
+        #[arg(long)] request: PathBuf,
+    },
+    /// Commit only the exact preview that the operator reviewed.
+    Commit {
+        /// Original preview identifier.
+        #[arg(long)] preview_id: Uuid,
+        /// Original preview digest.
+        #[arg(long)] preview_digest: String,
+        /// Explicitly confirm the reviewed setup.
+        #[arg(long)] confirm: bool,
+    },
 }

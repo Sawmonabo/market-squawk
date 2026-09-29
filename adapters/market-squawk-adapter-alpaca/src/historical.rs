@@ -1175,6 +1175,10 @@ fn validate_analytical_batch(
         };
         let context = bar.context();
         let provenance = context.provenance();
+        let period = bar
+            .time_semantics()
+            .timestamped_period()
+            .ok_or(AlpacaError::Protocol)?;
         let Some(effective_at) = context.time().effective().exact_timestamp() else {
             return Err(AlpacaError::Protocol);
         };
@@ -1192,9 +1196,8 @@ fn validate_analytical_batch(
             || bar.interval() != &interval
             || bar.adjustment() != adjustment
             || bar.currency() != authority.currency
-            || bar.time_semantics().timestamp_basis()
-                != dataset.series_semantics().timestamp_basis()
-            || bar.time_semantics().session() != dataset.series_semantics().session()
+            || period.timestamp_basis() != dataset.series_semantics().timestamp_basis()
+            || period.session() != dataset.series_semantics().session()
         {
             return Err(AlpacaError::Protocol);
         }
@@ -1232,13 +1235,16 @@ fn normalize_bar(
     bar_time_authority.validate_current()?;
     let time_semantics = bar_time_authority.resolve(&request)?;
     bar_time_authority.validate_current()?;
-    if time_semantics.period_start() >= time_semantics.period_end_exclusive()
-        || time_semantics.provider_timestamp() != effective_at
-        || time_semantics.timestamp_basis() != dataset.series_semantics().timestamp_basis()
-        || time_semantics.session() != dataset.series_semantics().session()
-        || time_semantics.session().ruleset().as_str().is_empty()
-        || time_semantics.session().evidence().bytes() == [0; 32]
-        || received_at < time_semantics.period_end_exclusive()
+    let period = time_semantics
+        .timestamped_period()
+        .ok_or(AlpacaError::Protocol)?;
+    if period.period_start() >= period.period_end_exclusive()
+        || period.provider_timestamp() != effective_at
+        || period.timestamp_basis() != dataset.series_semantics().timestamp_basis()
+        || period.session() != dataset.series_semantics().session()
+        || period.session().ruleset().as_str().is_empty()
+        || period.session().evidence().bytes() == [0; 32]
+        || received_at < period.period_end_exclusive()
     {
         return Err(AlpacaError::Protocol);
     }

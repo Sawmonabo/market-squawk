@@ -6,6 +6,9 @@
 //! response bytes through capture, decode, current-registry qualification, and display ingress
 //! without refetching or reconstructing authority from archival evidence.
 
+mod streamer;
+pub(crate) use streamer::SchwabStreamerCurrentEvidence;
+
 use std::{
     sync::{Mutex, TryLockError},
     time::{Duration, Instant},
@@ -18,9 +21,9 @@ use market_squawk_adapter_schwab::{
     SchwabMarketDataDelay, SchwabQuote, SchwabRestPayload,
 };
 use market_squawk_domain::{
-    CaptureIntegrityState, ConnectionGeneration, CoverageDelay, ExactPayloadEvidence,
-    InstrumentExecutionTerms, InstrumentId, PriceTicks, QuantityLots, SnapshotApplicability,
-    SourceIdentifier, StreamIntegrityState, Timestamp, VenueId,
+    CaptureIntegrityState, ConnectionGeneration, CoverageDelay, ExactPayloadEvidence, InstrumentId,
+    MarketDataReference, SnapshotApplicability, SourceIdentifier, StreamIntegrityState, Timestamp,
+    VenueId, VenueSymbol,
 };
 use market_squawk_platform::{
     CaptureShutdownStatus, CaptureWriterHandle, RawCaptureControl, RawCapturePublisher,
@@ -28,12 +31,14 @@ use market_squawk_platform::{
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, CaptureGenerationCapabilities,
     ChecksumValidationProfile, ConnectionLiveness, CoverageHealth, CurrentDecodedProviderBatch,
-    CurrentHealthRecording, CurrentHealthReporter, CurrentSourceSession, DecodeOutcome,
-    DecodedProviderBatch, DecoderEvidence, ProviderBookLevel, ProviderChecksumEvidence,
-    ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderObservationPayload,
-    ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
-    ProviderTimestampEvidence, RawFrameFactory, SequenceValidationProfile, SourceHealthSnapshot,
-    SourceMetadata, SourceProtocolProfile, TransportFrameKind, ValidatedSessionDecodeOutcome,
+    CurrentHealthRecording, CurrentHealthReporter, CurrentProviderIdentity,
+    CurrentSourceAuthorityLease, CurrentSourceSession, DecodeOutcome, DecodedProviderBatch,
+    DecoderEvidence, LiveCoverageDeclaration, ProviderBookLevel, ProviderChecksumEvidence,
+    ProviderDecimalLexeme, ProviderNativeInstrumentIdentity, ProviderNormalizedObservation,
+    ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
+    ProviderSnapshotEvidence, ProviderTimestampEvidence, RawFrameFactory,
+    SequenceValidationProfile, SourceHealthSnapshot, SourceMetadata, SourceProtocolProfile,
+    TransportFrameKind, ValidatedSessionDecodeOutcome,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -43,13 +48,13 @@ use super::display_market::{
     DisplayMarketSupervisorMonitor,
 };
 
-/// Exact canonical/provider identity and execution terms admitted for one requested symbol.
+/// Exact canonical/provider reference identity admitted for one requested symbol.
 #[derive(Clone, Debug)]
 pub(crate) struct SchwabRestQuoteCurrentInstrument {
     provider_symbol: ProviderIdentifier,
     source_identifier: SourceIdentifier,
     instrument_id: InstrumentId,
-    execution_terms: InstrumentExecutionTerms,
+    reference: MarketDataReference,
 }
 
 impl SchwabRestQuoteCurrentInstrument {
@@ -57,16 +62,24 @@ impl SchwabRestQuoteCurrentInstrument {
         provider_symbol: ProviderIdentifier,
         source_identifier: SourceIdentifier,
         instrument_id: InstrumentId,
-        execution_terms: InstrumentExecutionTerms,
+        reference: MarketDataReference,
     ) -> Result<Self, SchwabRestQuoteCurrentUnavailable> {
-        if execution_terms.instrument_id() != instrument_id {
+        if reference.instrument_id() != instrument_id
+            || reference
+                .provider_identity()
+                .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?
+                .provider_instrument_id()
+                .as_str()
+                != source_identifier.as_str()
+            || provider_symbol.as_str() != source_identifier.as_str()
+        {
             return Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth);
         }
         Ok(Self {
             provider_symbol,
             source_identifier,
             instrument_id,
-            execution_terms,
+            reference,
         })
     }
 }
@@ -178,10 +191,38 @@ pub(crate) enum SchwabRestQuoteCurrentUnavailable {
 
 /// Object-safe exact-response current publication hook used by the Schwab seal-first sink.
 pub(crate) trait SchwabRestQuoteCurrentBridge: std::fmt::Debug + Send + Sync {
-    fn publish_current(
+    fn qualify_current(
         &self,
         request: SchwabRestQuoteCurrentRequest<'_>,
+    ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable>;
+
+    fn publish_qualified(
+        &self,
+        qualified: SchwabQualifiedCurrent,
+        deadline: Instant,
     ) -> SchwabRestQuoteCurrentPublication;
+}
+
+/// Revocable selected identity and decoded display data retained across durable commit.
+#[derive(Debug)]
+pub(crate) struct SchwabQualifiedCurrent {
+    batches: Vec<CurrentDecodedProviderBatch>,
+    streamer_state: Option<streamer::SchwabStreamerQuoteState>,
+    source_lease: CurrentSourceAuthorityLease,
+    selected_provider_identities: Vec<CurrentProviderIdentity>,
+    observed_at: Timestamp,
+    observations: u64,
+    source_generation: ConnectionGeneration,
+}
+
+impl SchwabQualifiedCurrent {
+    pub(crate) fn source_lease(&self) -> &CurrentSourceAuthorityLease {
+        &self.source_lease
+    }
+
+    pub(crate) fn selected_provider_identities(&self) -> &[CurrentProviderIdentity] {
+        &self.selected_provider_identities
+    }
 }
 
 /// Capabilities moved from the lifecycle/composition owner into one current generation.
@@ -203,6 +244,7 @@ pub(crate) struct SchwabRestQuoteCurrentSessionInput {
     ingress_timeout: Duration,
     display_shutdown_timeout: Duration,
     capture_shutdown_timeout: Duration,
+    streamer_state: streamer::SchwabStreamerQuoteState,
 }
 
 impl SchwabRestQuoteCurrentSessionInput {
@@ -237,6 +279,7 @@ impl SchwabRestQuoteCurrentSessionInput {
             ingress_timeout,
             display_shutdown_timeout,
             capture_shutdown_timeout,
+            streamer_state: streamer::SchwabStreamerQuoteState::default(),
         }
     }
 
@@ -282,10 +325,11 @@ impl SchwabRestQuoteCurrentSessionInput {
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<(), SchwabRestQuoteCurrentUnavailable> {
-        let mut failure = None;
-        let deadline = Instant::now()
-            .checked_add(self.display_shutdown_timeout)
-            .ok_or(SchwabRestQuoteCurrentUnavailable::Deadline)?;
+        let now = Instant::now();
+        let (deadline, mut failure) = now.checked_add(self.display_shutdown_timeout).map_or_else(
+            || (now, Some(SchwabRestQuoteCurrentUnavailable::Deadline)),
+            |deadline| (deadline, None),
+        );
         retain_current_failure(
             &mut failure,
             self.registry
@@ -353,7 +397,13 @@ impl SchwabRestQuoteCurrentSessionBridge {
         generation: ConnectionGeneration,
         venue_id: &VenueId,
         instruments: &[SchwabRestQuoteCurrentInstrument],
-    ) -> Result<Self, SchwabRestQuoteCurrentUnavailable> {
+    ) -> Result<
+        Self,
+        (
+            SchwabRestQuoteCurrentUnavailable,
+            Result<(), SchwabRestQuoteCurrentUnavailable>,
+        ),
+    > {
         if let Err(error) = validate_session_input(
             &input,
             metadata,
@@ -362,36 +412,46 @@ impl SchwabRestQuoteCurrentSessionBridge {
             venue_id,
             instruments,
         ) {
-            return match input.shutdown().await {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(cleanup),
-            };
+            let cleanup = input.shutdown().await;
+            return Err((error, cleanup));
         }
         Ok(Self {
             state: Mutex::new(input),
         })
     }
 
-    /// Returns the advanced generation capabilities after the sole bridge owner is reclaimed.
-    /// The lifecycle owner can then end the session and shut down the registry exactly once.
-    pub(crate) fn into_input(
-        self,
-    ) -> Result<SchwabRestQuoteCurrentSessionInput, SchwabRestQuoteCurrentUnavailable> {
-        self.state
-            .into_inner()
-            .map_err(|_poisoned| SchwabRestQuoteCurrentUnavailable::Poisoned)
-    }
-
     /// Ends the exact registry session, unregisters its display routes, and drains capture.
     pub(crate) async fn shutdown(self) -> Result<(), SchwabRestQuoteCurrentUnavailable> {
-        self.into_input()?.shutdown().await
+        match self.state.into_inner() {
+            Ok(input) => input.shutdown().await,
+            Err(poisoned) => {
+                // Poison is never clean, but it does not release custody of the physical writer.
+                let cleanup = poisoned.into_inner().shutdown().await;
+                cleanup.and(Err(SchwabRestQuoteCurrentUnavailable::Poisoned))
+            }
+        }
     }
 }
 
 impl SchwabRestQuoteCurrentBridge for SchwabRestQuoteCurrentSessionBridge {
-    fn publish_current(
+    fn qualify_current(
         &self,
         request: SchwabRestQuoteCurrentRequest<'_>,
+    ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Err(SchwabRestQuoteCurrentUnavailable::Busy),
+            Err(TryLockError::Poisoned(_poisoned)) => {
+                return Err(SchwabRestQuoteCurrentUnavailable::Poisoned);
+            }
+        };
+        state.qualify(request)
+    }
+
+    fn publish_qualified(
+        &self,
+        qualified: SchwabQualifiedCurrent,
+        deadline: Instant,
     ) -> SchwabRestQuoteCurrentPublication {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
@@ -400,13 +460,13 @@ impl SchwabRestQuoteCurrentBridge for SchwabRestQuoteCurrentSessionBridge {
                     SchwabRestQuoteCurrentUnavailable::Busy,
                 );
             }
-            Err(TryLockError::Poisoned(_poisoned)) => {
+            Err(TryLockError::Poisoned(_)) => {
                 return SchwabRestQuoteCurrentPublication::Unavailable(
                     SchwabRestQuoteCurrentUnavailable::Poisoned,
                 );
             }
         };
-        match state.publish(request) {
+        match state.publish_qualified_batches(qualified, deadline) {
             Ok(publication) => publication,
             Err(reason) => SchwabRestQuoteCurrentPublication::Unavailable(reason),
         }
@@ -414,10 +474,10 @@ impl SchwabRestQuoteCurrentBridge for SchwabRestQuoteCurrentSessionBridge {
 }
 
 impl SchwabRestQuoteCurrentSessionInput {
-    fn publish(
+    fn qualify(
         &mut self,
         request: SchwabRestQuoteCurrentRequest<'_>,
-    ) -> Result<SchwabRestQuoteCurrentPublication, SchwabRestQuoteCurrentUnavailable> {
+    ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable> {
         require_deadline(request.deadline)?;
         validate_request(self, &request)?;
 
@@ -438,8 +498,58 @@ impl SchwabRestQuoteCurrentSessionInput {
         let decoded = decode_quotes(&validated_frame, &request)?;
         require_deadline(request.deadline)?;
         let Some(decoded) = decoded else {
-            return Ok(SchwabRestQuoteCurrentPublication::NoPublishableQuotes);
+            let observed_at = validated_frame.frame().received_at();
+            let live = request
+                .metadata
+                .coverage()
+                .live()
+                .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+            self.record_current_health(
+                request.metadata,
+                live,
+                observed_at,
+                None,
+                request.response.receipt.body_sha256(),
+            )?;
+            return self.qualify_selected(
+                request.venue_id,
+                request
+                    .instruments
+                    .iter()
+                    .map(|instrument| instrument.instrument_id),
+                observed_at,
+                Vec::new(),
+                0,
+            );
         };
+        self.qualify_decoded(
+            request.metadata,
+            request
+                .metadata
+                .coverage()
+                .live()
+                .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?,
+            request.response.receipt.body_sha256(),
+            request.venue_id,
+            request
+                .instruments
+                .iter()
+                .map(|instrument| instrument.instrument_id),
+            decoded,
+            capture_receipt,
+        )
+    }
+
+    fn qualify_decoded(
+        &mut self,
+        metadata: &SourceMetadata,
+        live: &LiveCoverageDeclaration,
+        payload_digest: [u8; 32],
+        venue: &VenueId,
+        instruments: impl Iterator<Item = InstrumentId>,
+        decoded: DecodedQuotes,
+        capture_receipt: market_squawk_sources::CaptureAdmissionReceipt,
+    ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable> {
         let observation_count = u64::try_from(decoded.batch.observations().len())
             .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Allocation)?;
         let validated_at = decoded.batch.evidence().received_at();
@@ -454,10 +564,11 @@ impl SchwabRestQuoteCurrentSessionInput {
             return Err(SchwabRestQuoteCurrentUnavailable::Decode);
         };
         self.record_current_health(
-            request.metadata,
+            metadata,
+            live,
             validated_at,
             decoded.latest_source_at,
-            request.response.receipt.body_sha256(),
+            payload_digest,
         )?;
         let current = self
             .registry
@@ -466,40 +577,119 @@ impl SchwabRestQuoteCurrentSessionInput {
         let batches = current
             .validate_data_outcome_owned(captured)
             .map_err(|_error| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        require_deadline(request.deadline)?;
-        let ingress_deadline = Instant::now()
-            .checked_add(self.ingress_timeout)
-            .map(|candidate| candidate.min(request.deadline))
-            .ok_or(SchwabRestQuoteCurrentUnavailable::Deadline)?;
         let mut prepared = Vec::new();
         prepared
             .try_reserve_exact(batches.len())
             .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Allocation)?;
         for batch in batches {
-            let ingress = display_ingress(&self.display_ingresses, &batch)?;
-            ingress
-                .preflight(&batch, validated_at, ingress_deadline)
-                .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Display)?;
+            display_ingress(&self.display_ingresses, &batch)?;
             prepared.push(batch);
         }
         if observation_count == 0 {
             return Err(SchwabRestQuoteCurrentUnavailable::Decode);
         }
-        for batch in prepared {
+        self.qualify_selected(
+            venue,
+            instruments,
+            validated_at,
+            prepared,
+            observation_count,
+        )
+    }
+
+    fn qualify_selected(
+        &self,
+        venue: &VenueId,
+        instruments: impl Iterator<Item = InstrumentId>,
+        observed_at: Timestamp,
+        batches: Vec<CurrentDecodedProviderBatch>,
+        observations: u64,
+    ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable> {
+        let current = self
+            .registry
+            .validate_current_authority(&self.session)
+            .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+        let source_lease = current
+            .try_current_lease()
+            .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+        let selected_provider_identities = instruments
+            .map(|instrument| {
+                current
+                    .selected_provider_identity(venue, instrument)
+                    .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for identity in &selected_provider_identities {
+            source_lease
+                .validate_provider_identity_at(identity, observed_at)
+                .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+        }
+        Ok(SchwabQualifiedCurrent {
+            batches,
+            streamer_state: None,
+            source_lease,
+            selected_provider_identities,
+            observed_at,
+            observations,
+            source_generation: self.session.generation(),
+        })
+    }
+
+    fn publish_qualified_batches(
+        &mut self,
+        mut qualified: SchwabQualifiedCurrent,
+        deadline: Instant,
+    ) -> Result<SchwabRestQuoteCurrentPublication, SchwabRestQuoteCurrentUnavailable> {
+        require_deadline(deadline)?;
+        if qualified.source_generation != self.session.generation() {
+            return Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth);
+        }
+        for identity in &qualified.selected_provider_identities {
+            qualified
+                .source_lease
+                .validate_provider_identity_at(identity, qualified.observed_at)
+                .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+        }
+        if qualified.batches.is_empty() {
+            // An observational or incomplete quote frame has no display effect. Its retained
+            // field state can advance only after durable commit and identity revalidation.
+            if let Some(streamer_state) = qualified.streamer_state.take() {
+                self.streamer_state = streamer_state;
+            }
+            return Ok(SchwabRestQuoteCurrentPublication::NoPublishableQuotes);
+        }
+        let ingress_deadline = Instant::now()
+            .checked_add(self.ingress_timeout)
+            .map(|candidate| candidate.min(deadline))
+            .ok_or(SchwabRestQuoteCurrentUnavailable::Deadline)?;
+        for batch in &qualified.batches {
+            batch
+                .validate_at(qualified.observed_at)
+                .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+            let ingress = display_ingress(&self.display_ingresses, batch)?;
+            ingress
+                .preflight(batch, qualified.observed_at, ingress_deadline)
+                .map_err(|_| SchwabRestQuoteCurrentUnavailable::Display)?;
+        }
+        for batch in qualified.batches {
             let ingress = display_ingress(&self.display_ingresses, &batch)?;
             ingress
-                .try_publish(batch, validated_at, ingress_deadline)
+                .try_publish(batch, qualified.observed_at, ingress_deadline)
                 .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Display)?;
         }
+        if let Some(streamer_state) = qualified.streamer_state.take() {
+            self.streamer_state = streamer_state;
+        }
         Ok(SchwabRestQuoteCurrentPublication::Published {
-            observations: observation_count,
-            source_generation: self.session.generation(),
+            observations: qualified.observations,
+            source_generation: qualified.source_generation,
         })
     }
 
     fn record_current_health(
         &mut self,
         metadata: &SourceMetadata,
+        live: &LiveCoverageDeclaration,
         observed_at: Timestamp,
         latest_source_at: Option<Timestamp>,
         payload_digest: [u8; 32],
@@ -511,10 +701,6 @@ impl SchwabRestQuoteCurrentSessionInput {
         let coverage_deadline = metadata
             .coverage()
             .inclusive_coverage_deadline()
-            .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        let live = metadata
-            .coverage()
-            .live()
             .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
         let health = SourceHealthSnapshot::try_new(
             &self.session,
@@ -764,7 +950,18 @@ fn decode_quotes(
             .iter()
             .find(|candidate| candidate.provider_symbol.as_str() == quote.symbol().as_str())
             .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        let Some(payload) = quote_payload(quote, instrument.execution_terms)? else {
+        if instrument.reference.instrument_id() != instrument.instrument_id
+            || instrument
+                .reference
+                .provider_identity()
+                .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?
+                .provider_instrument_id()
+                .as_str()
+                != instrument.source_identifier.as_str()
+        {
+            return Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth);
+        }
+        let Some(payload) = quote_payload(quote)? else {
             continue;
         };
         let timestamp = quote_timestamp(quote, protocol)?;
@@ -774,11 +971,22 @@ fn decode_quotes(
         if let ProviderTimestampEvidence::Provided { value, .. } = &timestamp {
             latest_source_at = Some(latest_source_at.map_or(*value, |latest| latest.max(*value)));
         }
+        let provider_identity = instrument
+            .reference
+            .provider_identity()
+            .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+        let native_identity = ProviderNativeInstrumentIdentity::new(
+            provider_identity.source_id().clone(),
+            provider_identity.provider_instrument_id().clone(),
+            VenueSymbol::try_from(quote.symbol().as_str())
+                .map_err(|_| SchwabRestQuoteCurrentUnavailable::Decode)?,
+        );
         observations.push(
             ProviderNormalizedObservation::try_new(
                 instrument.source_identifier.clone(),
                 request.venue_id.clone(),
                 instrument.instrument_id,
+                native_identity,
                 timestamp,
                 ProviderSequenceEvidence::Unsupported {
                     rule: sequence_rule.clone(),
@@ -818,19 +1026,16 @@ fn realtime_delay_conflicts(
 
 fn quote_payload(
     quote: &SchwabQuote,
-    terms: InstrumentExecutionTerms,
 ) -> Result<Option<ProviderObservationPayload>, SchwabRestQuoteCurrentUnavailable> {
     let bid = quote_side(
         quote,
         QuoteComponentField::BidPrice,
         QuoteComponentField::BidSize,
-        terms,
     )?;
     let ask = quote_side(
         quote,
         QuoteComponentField::AskPrice,
         QuoteComponentField::AskSize,
-        terms,
     )?;
     match (bid, ask) {
         (QuoteSide::Abstain, _) | (_, QuoteSide::Abstain) => Ok(None),
@@ -860,7 +1065,6 @@ fn quote_side(
     quote: &SchwabQuote,
     price_name: QuoteComponentField,
     quantity_name: QuoteComponentField,
-    terms: InstrumentExecutionTerms,
 ) -> Result<QuoteSide, SchwabRestQuoteCurrentUnavailable> {
     let price = quote_number(quote, price_name)?;
     let quantity = quote_number(quote, quantity_name)?;
@@ -875,11 +1079,9 @@ fn quote_side(
         .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Decode)?;
     let quantity = ProviderDecimalLexeme::try_new(quantity)
         .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Decode)?;
-    if PriceTicks::try_from_decimal(price.decimal(), terms.price_tick()).is_err()
-        || QuantityLots::try_from_decimal(quantity.decimal(), terms.lot_size())
-            .map(|lots| lots.get() == 0)
-            .unwrap_or(true)
-    {
+    // The provider quantity remains a raw exact source value in this display-only plane.
+    // No lot size, share count, or execution sizing is inferred from it.
+    if quantity.decimal() <= rust_decimal::Decimal::ZERO {
         return Ok(QuoteSide::Abstain);
     }
     Ok(QuoteSide::Level(ProviderBookLevel::new(

@@ -1,6 +1,8 @@
 //! Product composition for the single durable provider-rate authority.
 
+mod schwab_streamer;
 mod tiingo;
+pub(crate) use schwab_streamer::GovernedSchwabStreamer;
 
 pub(crate) use tiingo::DurableTiingoProviderAuthority;
 

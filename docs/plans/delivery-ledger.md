@@ -1,29 +1,57 @@
 # Market Squawk Delivery Ledger
 
-## Current integration and cleanup barrier — 2026-09-23
+## Current integration and cleanup barrier — 2026-09-29
 
-The active target is `feature/v1-installed-product-experience` at pushed
-`18f11e072fd451b242788f121d86becdeaccbc91`. This checkpoint removes
-arbitrary package-size startup rejection and lets a healthy Desktop remain
-available through optional maintenance failure. Focused installer rollback and
-Desktop compilation passed; installed live restart and the final release gate
-remain open. The target checkout still contains substantial uncommitted V1 work.
+The active target is `feature/v1-installed-product-experience`. This combined
+source checkpoint follows pushed base `52f4f4a5167a0eb046aa018d40f64929210dd5e6`;
+its exact commit is recorded in PR #43 delivery evidence. Dependency checkpoint `a7987440`
+incorporates futures-util 0.3.34, async-trait 0.1.92, rust_decimal 1.43.0,
+clap 4.6.7 and uuid 1.26.1. The five corresponding Dependabot PRs are closed
+and their origin branches are absent. Main and release remain untouched.
 
-After the EIA and Coinbase retirements, live inventory is 27 local branches,
-19 origin heads and 10 linked worktrees; all remaining worktrees are dirty.
-The obsolete source worktrees and side branches were removed only after exact
-WIP-backup verification and current-design disposition. The crypto-canonical
-worktree remains because transitive source-run availability needs review;
-Kraken retains unique catalog-selection work. Other dirty worktrees still need
-reconciliation. Five Dependabot PRs remain open. The exact
-per-branch and per-worktree disposition is in
-[`2026-09-23-branch-worktree-reconciliation.md`](../reports/2026-09-23-branch-worktree-reconciliation.md).
-Root owns selective target integration and cleanup after behavior, WIP custody,
-focused checks and pushed checkpoints are proven; `main` and `release` stay
-untouched. Current provider-neutral Census read, installed workflows, live
-restart and whole-app resource evidence are next product barriers. The Census
-checkpoint branch retains unique response-wide semantics until shared restart
-evidence proves or replaces them.
+Fresh inventory is **18 local branches, 14 origin heads and one local
+worktree: the V1 target**. All linked worktrees have been retired. Alpaca and Kraken worktrees were retired after exact
+source and independent-backup comparison; their branch references remain. Census and Schwab checkouts were also removed
+after independently verifying all 26 archived changed files, exact Git state,
+bundled histories and Schwab ignored proof files. Finally, the common-seal
+checkout was removed normally after independently verifying all 255 working
+states and reconstructing all 14 staged versions from the untouched recovery
+backup. Local and remote branch retirement remains separate.
+Seven redundant or obsolete local branch labels were removed during this
+closure wave. The original session and independent recovery backups remain
+intact. The reconciliation report records actual removals separately from
+pending branch disposition.
+
+The source API, native identity callers, current-share generation, chart ranges
+and retained recovery changes coexist in the target working tree. They are
+collected in this coherent source checkpoint, not accepted complete V1 delivery.
+The application library check passed before the final backup artifact change;
+the final backup decoding fix also passed the application library check.
+A subsequent startup correction isolates unavailable retained sources to the
+decision domain. Its focused regression passed with a real durable journal:
+partial/empty results, mutations and backups remain unavailable; writer custody
+is retained, and explicit reopen restores the original saved record. Desktop
+type-checking passed with the pinned Node and pnpm versions.
+Three existing capture/routing cases and seven Census library cases passed. These focused results do not
+prove installed generation, backup/restore, restart or release acceptance.
+
+Current dependency and ownership wave:
+
+| Lane | Owner and scope | Next dependency |
+| --- | --- | --- |
+| Financial generation and recovery | Astra High; current-share generation, decision persistence and source-artifact backup | Source-backed financial generation/restart regression and per-share fundamental valuation |
+| Provider reconciliation | Sol High; completed donor handoff and cleanup receipts | All linked worktrees removed; branch disposition follows the combined checkpoint |
+| Integration | Lead; shared composition, manifests, Git, documentation and serialized checks | Push this combined API/consumer checkpoint; retire superseded branch references |
+
+No new branch or worktree is needed. Only one Cargo command runs at a time,
+with one compiler job. Automatic CI is limited to release-branch pushes; the manual frozen-candidate
+release gate remains available. No full CI/CD or release gate ran. Retained issuer snapshots are stored byte-for-byte in Git, with their staged
+hashes checked against the source catalog. The final unchanged
+candidate still requires complete provider and Desktop/CLI/MCP workflows,
+installed live shutdown/restart, owner-test packages, whole-application RAM
+measurement against 500 MB, and updated PR #43 delivery evidence. Financial
+model per-share support and genuine generated-decision recovery remain open;
+compilation does not substitute for either.
 
 ## 2026-09-16 dependency PR retirement
 
@@ -49,18 +77,154 @@ Exact pre-action PR metadata and diffs, retirement reasons, and post-action veri
 preserved in `.agents/tmp/resume-2026-09-15/support/root-live/branch-cleanup-current/optional-retirement/`.
 This checkpoint records repository housekeeping only, not source integration or product acceptance.
 
-Last updated: 2026-09-23
+Last updated: 2026-09-29
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
 
-## Current execution handoff — 2026-09-08
+## Current integration barrier — 2026-09-16
+
+The active checkout is `feature/v1-installed-product-experience` at pushed commit
+`5024a5dcd390401a51f162aa2a71cf360b4bf2d0`, with substantial uncommitted integration work.
+This checkpoint isolates the query-future compiler fix; PR #43 comment 5706768630 records its scope.
+CI was skipped for this owner-authorized checkpoint. The earlier combined-check audit base was
+`176dc400ffd8d3c2fef1c4a32726e7a536d93f52`.
+The current task, candidate, dependency and retirement queue is
+`.agents/tmp/resume-2026-09-15/support/active-integration-queue-medium/queue.json`.
+Root owns acceptance and shared-file/Git integration; the medium-effort coordinator tracks all
+the current workers and their retained candidates. A frozen handoff is not accepted product delivery.
+
+The current integration now includes saved-forecast measurement/preparation through the installed
+model, CLI and shared tool contracts; exact source error propagation; dataset/Find custody and
+recovery; fiscal hindcast readers; and H.15-backed premium/valuation library consumers. Desktop
+history now retains genuine nominal dates or timestamped periods and rejects mixed precision;
+its recorded-outcome schema includes the actual recording time. These are uncommitted source
+integrations, not complete default/Advanced journeys or accepted financial behavior.
+
+The earlier combined application check, session 73101, passed with exit 0 on 1,887 unchanged
+Rust/manifest/lock inputs. Its predecessor finished with one harmonic bar-count type error;
+explicitly typing the slice count as `usize` resolved it. This also establishes that the previous
+async trait recursion overflow no longer blocks the combined application. Exact working-source
+evidence is in `.agents/tmp/resume-2026-09-15/support/root-live/financial-parent-integration-r4/verification.json`.
+This is compilation evidence, not financial correctness, clean checkpoint, or release approval.
+The existing bounded-query, payable-entitlement/immutable-ledger replay, exact split arithmetic,
+and 365-day recommendation outcome cases each passed (four focused cases total) on 1,185 unchanged
+crate inputs. Evidence: `root-live/ledger-accounting-integration-r1/critical-gates/verification.json`
+under the support directory above. No new test target or full CI gate was introduced.
+
+The subsequent Schwab foundation55, original-calendar portfolio leaves and generation-authority
+joins exposed real integration errors: the first combined check stopped at an unchecked SQLite
+integer parameter; the second reached the application and reported eight private-facade, missing
+API and exhaustive-error mapping errors on 1,778 unchanged inputs. Narrow fixes are applied;
+the next application check reached the newer Find/generation joins and failed with three errors on
+1,782 unchanged inputs. Its digest accessor is corrected; the two missing current-valuation APIs
+are assigned to the existing High financial owner. Evidence: `root-live/schwab-foundation-integration-r1/`
+(`combined-check`, `combined-check-r2`, `sql-bound-fix`, `compile-followon`). Neither failed check
+supersedes the scope of the earlier successful snapshot with a success claim.
+
+Three further existing accounting cases passed on 1,211 unchanged crate/adapter inputs:
+opposing merger lots, incomplete-basis disposition, and return-of-capital settlement separation.
+Evidence: `root-live/ledger-accounting-integration-r1/critical-followon/adjacent-consumers/gates/verification.json`.
+Investment generation now has actual installed construction and dispatch, with the shared exact
+completed-forecast reader. Strict descriptor/schema registration and current Find service dispatch
+are integrated in working source. Native requests now include the existing bounded result limits
+before retaining their recovery hash; the complete workflow driver is still pending. Native
+orchestration and complete historical fiscal sequencing remain open. This is source integration,
+not a callable end-to-end or live installed product claim.
+
+Actual unpaid-entitlement ledger/shadow accounting, harmonic-history production and historical
+recommendation custody compiled together at the earlier check. Current disjoint ownership is:
+High retained registry/startup/OAuth cleanup (five Wave B leaves plus narrow four-child follow-ons),
+High current valuation integration (six paths), and High complete fiscal paging (four paths).
+Medium native request-limit integration has released its two live files and retained the driver-only
+successor separately. A Medium lane reconciles the clean BEA worktree against current requirements;
+that is read-only evidence, not permission to import obsolete code. Root owns remaining application
+parents, manifests, Git and Cargo; the Medium coordinator retains candidate/cleanup custody. Original-calendar
+portfolio reads and Tiingo acquisition coverage are integrated; their complete installed journey
+remains unverified. Controlled materialization persistence,
+installed default/Advanced workflows, live source restart and whole-app memory remain open.
+
+Current Find screening now retains complete population counts, real calendar/profile inputs and
+exact estimated-return ordering. The historical backtest owner now has the genuine async financial
+issuer in place of its former placeholder; original history/action/calendar references are stored
+for physical replay. Recommendation core and codecs retain authenticated requests, both valuation
+and harmonic audits, and outcome/sizing projections in one publication. These additions still need
+installed service production, relevant behavioral verification and clean checkpoint acceptance.
+Desktop saved-screen contracts now pass original calendar/profile references through the native
+bridge; TypeScript checking passed after the changes. Actual Advanced/default UI journeys and
+native Rust verification remain open. No numeric journal-version bump, migration, alternate decoder
+or application-data reset was performed; the sole existing format was updated in place.
+
+A real original-history blocker was corrected without changing HTTP request bounds: the inclusive
+request end now agrees with the exclusive completion boundary in calendar, publication, replay
+and existing V1 schema validation. Genuine Split receipts are separately retained and cannot
+substitute for Raw outcome history. The existing publication/restart case was extended only for
+these uncovered critical paths. Its initial run stopped before publication with
+`MigrationRegistryMismatch`; root synchronized the changed existing schema checksum, verified all
+22 registry entries, and reran the same focused case: the retained log confirms 1 passed, 0 failed.
+The original process exit status was consumed before recovery; it is not invented. Evidence is in
+`.agents/tmp/resume-2026-09-15/support/root-live/history-anchor-integration-r1/`.
+Desktop TypeScript checking passed with exit 0. Both results are focused working-source evidence;
+no full CI or new test target was introduced.
+
+Coinbase continuation, retained shutdown worker ownership, and removal of two unused startup
+paths are now applied across 11 unchanged paths. The existing scripted adapter continuation test
+passed 1/1, including depth updates, deletion, quotes and stale-generation rejection. The earlier composed
+application check failed with the same 71 error headers/primary files and 62 warnings and added
+no Coinbase diagnostics; the later combined application check above now passes. The active startup and dynamic paper hooks remain; publication
+registration and runtime now use the same order-level metadata builder. Evidence is in
+`.agents/tmp/resume-2026-09-15/support/root-live/coinbase-continuation-integration-r1/verification.json`.
+Physical publication, shutdown failure/timeout behavior and installed restart remain unverified.
+These source changes are uncommitted and unaccepted. No whole-app, RAM or release acceptance is
+claimed. No full CI or new branch/worktree was started for this integration wave.
+
+The existing Schwab scripted capture case passed on 1,211 unchanged crate/adapter inputs. It
+checks sealed frames and credential exclusion; it is not a new live provider pull or installed
+restart. Evidence: `root-live/schwab-foundation-integration-r1/critical-adapter/verification.json`.
+The actual StudyInputs endpoint now retains the genuine final close while evaluation remains
+half-open; original folds and target censoring are unchanged. Fiscal continuation will retain every
+eligible source origin using bounded pages, not reduce the population to fit an envelope. These
+latest joins await composed verification; no completion or financial approval is inferred.
+
+Historical cleanup remains incomplete. The H.15 verification and explicitly superseded
+postqualified worktrees were removed earlier. PRs #47/#50/#51 and their exact remote branches are
+now retired as recorded above; four PRs remain open. The clean BEA worktree retains needed unique
+metadata/lifecycle work, while its website and inherited Treasury changes are obsolete or replaced.
+No wholesale branch adoption is approved. Other dirty worktrees and unaccepted candidates retain
+explicit custody. Current-design disposition and verified integration or preservation precede retirement.
+
+## Historical execution handoff — 2026-09-08
 
 The owner resumed the full V1 owner-test goal after the accepted recovery audit. The independent
 backup verified 57/57 checksums at resumption and remains preserved. The dependency and exclusive
 file ownership wave is retained in `.agents/tmp/resume-2026-09-07/wave-1.md`. No main/release merge,
 public release, brokerage execution, or routine CI/CD is authorized by this implementation wave.
+
+Latest pushed checkpoint: `3261e164019baba24b6c4e18b6aa82fe96930bf6`. The owner clarified that
+the separate local setup website must be removed entirely and connection setup must live in
+Desktop Settings → Onboarding. The CLI website-opening command, browser flag/helper and unused
+browser dependency are removed. This supersedes the earlier optional-browser checkpoint
+`39314057`; that intermediate behavior is not the accepted product requirement. The existing
+CLI binary check passed on the clean unchanged final checkpoint (log SHA-256
+`21d18a650734794bd5276c2700984509cd2b10121741fc1c7698e2200f925f38`). The temporary clean
+verification worktree was removed after push. Native setup, removal of the HTTP site and saved
+credential reuse are integrated into the working source. The combined CLI/service Rust check and
+Desktop TypeScript check passed on 1,838 unchanged inputs; these are working-source checks, not
+clean-head release approval. Evidence is in
+`.agents/tmp/resume-2026-09-07/support/root-console-onboarding/{composed-r3,typescript-r2}-verification.json`.
+Root navigation inspection found the current form is mounted under Connections; the owner-required
+Settings → Onboarding placement is assigned as a correction using the same components. Actual setup,
+live publication and installed restart verification remain open.
+
+Treasury's real Fiscal and Daily activation reached the public services but failed before publication.
+Retained bounded response diagnostics identify 28 literal missing Fiscal rates among 5,009 rows,
+and an auxiliary Daily display field that differs from the actual thirty-year yield. The narrow
+working-source fixes preserve missing observations and the genuine yield respectively. Both existing
+all-history raw-seal/recovery cases passed on 1,781 unchanged Rust/dependency inputs, with no new
+test case or CI. Evidence is in `.agents/tmp/resume-2026-09-07/support/root-treasury-source-registration/rate-schema-verification.json`.
+Actual complete publication, typed reads and clean installed restart remain open; the last owned
+service run exited 1 and is stopped. External diagnostic responses are not admitted capture authority.
 
 The owner approved **SPY as the main scorecard, with VTI alongside it** on 2026-09-08. Both comparisons
 must be fixed before historical evaluation; SPY determines the headline comparison and VTI supplies
@@ -143,6 +307,118 @@ comparison policy, not evidence that dual-benchmark production is already comple
   backtest evidence, valuation, persisted decision production and complete default/Advanced
   journeys are still being integrated. Provider leaves continue concurrently; adapter reports
   and focused checks do not establish complete product workflows.
+- Latest Wave 3 affected checks passed on retained WIP: application/PyO3 library check (61135,
+  log `/tmp/market-squawk-wave3-combined-check-r3.log`, SHA-256
+  `0b5633bd4273c81f233222e84081964537f62f9a1182650167a55c4b47a5a9eb`) and native Desktop
+  check (29437). Existing publication recovery passed 1/1, decision generation passed 1/1, and
+  the existing backtesting library passed 14/14 after shared fill/accounting changes. Desktop
+  TypeScript passed. The forecast numerical check preserved exported model bytes and fitted
+  offsets under held-out-only perturbation, and checked the actual MAPIE center against its
+  exported affine representation. This used the production Python module directly; installed
+  Python import and complete live workflows remain unproved. No CI or new routine test target ran.
+- Actual guided backtest integration is still defective: advertised datasets lack its runner's
+  required execution fields, history qualification is lost, action accounting is omitted,
+  baseline/stress behavior differs from the displayed choices, and preview/read budgets disagree.
+  The bounded source audit is `/tmp/market-squawk-guided-backtest-audit.md`; the existing guided
+  route is being repaired through genuine study, raw-history, action and calendar authorities.
+  Canonical investment-reference publication, per-request calendar-backed portfolio risk,
+  energy-context consumption, complete Treasury application verification and full default orchestration are
+  concurrent unfinished integrations. Adapter and compiler success cannot close these items.
+- Pushed Treasury adapter checkpoint `9156b354abde8f298384268003a1dff481574c79` retains the
+  actual replay worker through cancelled or dropped waiters, joins it before releasing ownership,
+  preserves raw verification errors, and retains Fiscal Data's data-bearing terminal page. Root
+  inspected the source changes and reconciled the preserved candidate with the current root.
+  The two existing exact adapter cases passed 1/1 each on 2026-09-08; all 336 recorded adapter and
+  dependency source hashes remained unchanged. Logs: `/tmp/market-squawk-treasury-replay-critical.log`
+  (SHA-256 `1b17e3a6f42f1f90769eacd16c042da52030bca4b7bba6dbaa9ed0cec732ea56`) and
+  `/tmp/market-squawk-treasury-fiscal-critical.log`
+  (SHA-256 `5e6d3b0dfeedaa7f702fb27963fc2508948b0fd02d0bd4ba55fc57b2dcd47aa3`). No new
+  test target, routine CI or provider call ran. The working tree also contains reviewed Treasury
+  application activation/publication/drain wiring and current-schema decoder removal; its
+  combined compilation and actual live installed journey remain pending. Historical review
+  approval is not inferred from these focused checks.
+- Root integrated bounded capture reads and exact original-publication discovery with their
+  actual publication clock, the nine-file portfolio/calendar reference composition, and the
+  shared forecast expectation arithmetic plus authentic historical valuation issuer. These are
+  uncommitted application/data integrations pending the native fiscal interface barrier. A new
+  live decision-publication lane connects the existing atomic saved-analysis authority; a causal
+  harmonic lane connects the existing detector and preserves evaluated-no-pattern separately from
+  unavailable evidence. Neither lane is complete merely because its read projection already exists.
+- Current application integration now compiles after reconciling genuine price dates versus native
+  fiscal periods in forecast, screening, valuation, backtest and dataset consumers. Model admission
+  and restart retain the actual training product contract. The forecast descriptor uses the same
+  model-owned request decoder as execution, replacing its duplicated validators. Normalized source
+  error handling is shared by ingestion and market reads; cancellation and limits remain typed.
+  Check r5 passed with 1,685 unchanged recorded inputs: `/tmp/market-squawk-app-integration-r5.log`,
+  SHA-256 `07606cd4f4498023d22307a934724a8cfa524a131d7ebea5c265c26b8e11db5e`.
+  The 1,699 application warnings and remaining disconnected workflow/provider candidates still
+  require integration review. The existing forecast receipt case was updated to the current request
+  contract, with no new case; its focused check passed 1/1 with unchanged inputs. Native Desktop
+  compilation passed with 1,930 unchanged inputs, and pinned-toolchain TypeScript checking passed
+  with 233 unchanged inputs. The existing job cancellation/publication case also passed after its
+  critical extension for unknown write acknowledgment. Exact logs, hashes and candidate ownership
+  are recorded in the wave document. Root then applied the 25-file product training and original-job
+  recovery integration, including preservation of artifacts after uncertain durable publication.
+  Application library check r2 passed with 1,688 unchanged inputs; the existing exact saved-model
+  index replay case also passed 1/1 on that same input set. Native fiscal workflow consumers and
+  actual installed training remain open. No CI ran. These changes are WIP, not accepted release evidence.
+- Pushed checkpoint `0ceb23c6431eb96020db1f6b5adf3beea37bf90c` preserves uncertain job
+  publication for reconciliation. Its existing cancellation/publication case passed 1/1 on a clean
+  detached checkout with 1,733 unchanged inputs; log SHA-256
+  `b7defdd61ece7ee50d9b6238038528d2c6dc6b7dcb283ddff41620b8fae6fb82`.
+  The clean verification worktree was removed after push; all larger live WIP remains preserved.
+- Pushed checkpoint `0dafb8e27a30be3661e57368cf386fb6b0a7a743` supports genuine monthly
+  coordinates and scale-preserving decimal results in the existing finite output validator. The
+  existing closed-schema case passed on a clean unchanged checkout; verification evidence is in
+  `support/root-startup-schema-repair/services-checkpoint-verification.json`. The full production
+  descriptor check also passed on current WIP. Root applied early contract validation before
+  persistent application startup. Actual isolated CLI/service startup, genuine authentication,
+  neutral economic-context read, clean shutdown and same-workspace restart passed; fixed-cutoff
+  economic content matched and correctly reported zero imported indicators. These are debug
+  executable/service results, not the final installed owner package.
+- The earlier parallel usage-limit error was temporary. Existing Treasury, Schwab, data, market
+  history/actions, jobs, backtest, fiscal and Desktop lanes resumed after the owner reported reset.
+  Their current source responses verify execution; historical error status is not a current limit.
+  The dependency/file-ownership record is `restart-closure-wave-2026-09-08.md` in the support root.
+  Pending work includes Schwab,
+  remaining provider publication/replay, real default dataset/training/fiscal jobs, complete
+  forecasting/valuation/harmonics/backtests/recommendations/paper and Desktop/CLI/MCP journeys.
+  No agent report or interrupted run establishes completion. The dependency/ownership record and
+  exact before/after source inventories remain in `.agents/tmp/resume-2026-09-07/`.
+- Running the actual current CLI exposed invalid response schemas before startup. The first
+  correction compiled with 1,804 unchanged inputs; a fresh startup then identified the portfolio
+  prerequisite descriptor, and source inspection found two unsupported macro formats. Root is
+  finished those concrete contract repairs and passed the existing production-descriptor check.
+  The first failed initialization's workspace remains preserved. Supported installed-workspace
+  recovery passed without resetting state. Treasury retained import and exact-session cancellation
+  are now integrated in WIP. The existing recovery case exposed a normal-stack overflow; the
+  production fix boxes the one large compensation future while retaining its original ownership.
+  The same existing case then passed 1/1 on the normal stack with 1,804 unchanged inputs, log
+  SHA-256 `d1a93ab4270979d94e774001c72de3b71ebee25de902bfe06b45dbd23361cbd8`.
+- Latest pushed checkpoint `884bf21b1db5b905eaf2d16eee7dc05190f557e0` registers the actual
+  source metadata before retaining a first history-import checkpoint. A genuine Treasury Fiscal
+  activation exposed the prior source-registration ordering failure. The existing data recovery
+  case now exercises first registration itself; it passed 1/1 on the clean exact checkpoint with
+  1,755 unchanged inputs, log SHA-256
+  `15b4cdc9eac04bdfabbe473e55bb57b8aaa6b19ef88e14da376d59595f10f6be`.
+  The clean verification worktree was removed after push; unique WIP remains preserved.
+  Support: `.agents/tmp/resume-2026-09-07/support/root-treasury-source-registration/`.
+- The current CLI/service build passed with 1,804 unchanged inputs, log SHA-256
+  `31a011fd70bd99e385c9cd10caab7fcb1465974280080687738f9d52ef992c9b`.
+  Actual Fiscal and Daily Treasury setup acknowledged retained import, then both failed before
+  publication with `Extraction(Source(InvalidProtocolState))`. This is not data-pull completion.
+  No raw response pages were retained; the source owner is preserving the real failure stage and
+  cause instead of guessing a parser change. The failed generation's shutdown reported incomplete
+  source cleanup and is not recorded as clean shutdown. Complete installed source restart remains open.
+- The owner requested a dedicated in-console connection setup lane after root's verification CLI
+  opened a local browser portal. Current Desktop Manage setup still delegates all providers to that
+  portal and rejects native onboarding mutations; credential bundle import only stores credentials
+  or setup intent. This is an incomplete implementation of the approved permanent-shell setup.
+  The explicit dependency/file-ownership brief is
+  `.agents/tmp/resume-2026-09-07/console-onboarding-brief-2026-09-08.md`.
+  The lane reuses the installed service, existing saved sessions and protected credential import,
+  keeps ordinary onboarding in Settings/Connections, and makes browser fallback explicit.
+  External official-provider login remains distinct from Market Squawk's local setup UI.
 - Quarter 4 remediation and the unchanged final owner-test/package/installed-restart/resource
   gate remain open. Measure the complete installed process tree against 500,000,000 bytes under
   heavy use with all capabilities retained; feasibility remains unproven. No hardware increase

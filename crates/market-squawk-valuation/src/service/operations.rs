@@ -5,7 +5,10 @@ use super::recovery::recover_audit;
 use super::*;
 
 impl FairValueService {
-    /// Opens and semantically reconstructs complete fair-value state from the local catalog.
+    /// Opens pure classification state that contains no model-artifact-dependent inputs.
+    ///
+    /// Installed product recovery uses [`Self::open_with_forecast_resolver`] so every retained
+    /// forecast can be authenticated against its actual controlled artifacts and source parents.
     ///
     /// # Errors
     ///
@@ -19,6 +22,35 @@ impl FairValueService {
             .fair_value_snapshot(limits.catalog_limits)
             .map_err(|_| FairValueError::Persistence)?;
         let recovered = persistence::recover(&snapshot)?;
+        Self::from_recovered_snapshot(catalog, limits, snapshot, recovered)
+    }
+
+    /// Reconstructs complete installed state, reopening actual forecast artifacts and sources.
+    pub async fn open_with_forecast_resolver(
+        catalog: FairValueCatalogCapability,
+        limits: FairValueLimits,
+        resolver: &dyn crate::evidence::ForecastValuationResolver,
+        recovery_at: Timestamp,
+    ) -> Result<Self, FairValueError> {
+        let snapshot = catalog
+            .fair_value_snapshot(limits.catalog_limits)
+            .map_err(|_| FairValueError::Persistence)?;
+        let recovered = persistence::recover_with_forecasts(
+            &snapshot,
+            resolver,
+            recovery_at,
+            limits.max_retained_bytes,
+        )
+        .await?;
+        Self::from_recovered_snapshot(catalog, limits, snapshot, recovered)
+    }
+
+    fn from_recovered_snapshot(
+        catalog: FairValueCatalogCapability,
+        limits: FairValueLimits,
+        snapshot: FairValueCatalogSnapshot,
+        recovered: persistence::RecoveredState,
+    ) -> Result<Self, FairValueError> {
         let record_ids = snapshot
             .records()
             .iter()
@@ -241,7 +273,14 @@ impl FairValueService {
             .measurements
             .get(&decision.measurement_id())
             .ok_or(FairValueError::MeasurementNotFound)?;
-        if approved_at < measurement.prepared_at() {
+        if approved_at < measurement.prepared_at()
+            || measurement.inputs().iter().any(|input| {
+                input
+                    .evidence()
+                    .derived_exclusive_expiry()
+                    .is_some_and(|expiry| approved_at >= expiry || expires_at > expiry)
+            })
+        {
             return Err(FairValueError::InvalidApprovalWindow);
         }
         if measurement.prepared_by() == &approved_by {
@@ -490,11 +529,26 @@ impl FairValueService {
             .approvals
             .get(&approval_id)
             .ok_or(FairValueError::ApprovalNotFound)?;
-        Ok(super::queries::approval_status_at(
+        let status = super::queries::approval_status_at(
             approval,
             self.revocations.get(&approval_id).map(AsRef::as_ref),
             at,
-        ))
+        );
+        if status == ApprovalStatus::Active {
+            let measurement = self
+                .measurements
+                .get(&approval.measurement_id())
+                .ok_or(FairValueError::CorruptPersistence)?;
+            if measurement.inputs().iter().any(|input| {
+                input
+                    .evidence()
+                    .derived_exclusive_expiry()
+                    .is_some_and(|expiry| at >= expiry)
+            }) {
+                return Ok(ApprovalStatus::Expired);
+            }
+        }
+        Ok(status)
     }
 
     /// Returns one immutable measurement by content identity.

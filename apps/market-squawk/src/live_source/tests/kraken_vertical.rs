@@ -15,8 +15,8 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{
-    AccountId, AggressorSide, BasisPoints, ChecksumCapability, ClientOrderId, ConnectionGeneration,
-    Currency, DataQuality, InstrumentExecutionTerms, InstrumentId, Money, OrderId, OrderReasonCode,
+    AccountId, AggressorSide, BasisPoints, ClientOrderId, ConnectionGeneration, Currency,
+    DataQuality, InstrumentExecutionTerms, InstrumentId, Money, OrderId, OrderReasonCode,
     OrderSide, OrderType, PriceTicks, QuantityLots, RuleVersion, SourceId, SourceIdentifier,
     StrategyId, TimeInForce, Timestamp, TradingStatus,
 };
@@ -84,40 +84,13 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     ));
 
     let config = kraken_config(temporary.path())?;
-    let source_config = config.kraken().ok_or("Kraken source profile missing")?;
-    let profiles =
-        super::super::kraken::ProductionKrakenProfileSet::try_from_config(source_config)?;
-    let book_metadata = profiles.book().metadata().clone();
-    let trade_metadata = profiles.trades().metadata().clone();
-    assert_eq!(
-        book_metadata.capabilities().checksum(),
-        ChecksumCapability::Provided
-    );
-    assert_eq!(
-        trade_metadata.capabilities().checksum(),
-        ChecksumCapability::Unsupported
-    );
-    assert_eq!(
-        book_metadata
-            .coverage()
-            .live()
-            .ok_or("Kraken book coverage missing")?
-            .provider_channel()
-            .as_source_identifier()
-            .as_str(),
-        "book-v2"
-    );
-    assert_eq!(
-        trade_metadata
-            .coverage()
-            .live()
-            .ok_or("Kraken trade coverage missing")?
-            .provider_channel()
-            .as_source_identifier()
-            .as_str(),
-        "trade-v2"
-    );
-    let definition = source_config.definition().clone();
+    let definition = config
+        .kraken()
+        .ok_or("Kraken source profile missing")?
+        .definition()
+        .clone();
+    let book_source = SourceId::try_from("kraken-public-book-v2")?;
+    let trade_source = SourceId::try_from("kraken-public-trades-v2")?;
     let invocations = Arc::new(AtomicUsize::new(0));
     let composition = local_kraken_paper_bot_with_strategy_for_test(
         config,
@@ -127,7 +100,9 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
             invocations: Arc::clone(&invocations),
         }),
     )?;
-    let calendar = composition.day_session_calendar_for_test();
+    let calendar = composition
+        .day_session_calendar_for_test()
+        .ok_or("Kraken session policy missing")?;
     assert_eq!(
         calendar.calendar_id().as_str(),
         "kraken-continuous-calendar"
@@ -144,9 +119,11 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     let runtime = composition.start(cancellation.clone()).await?;
 
     let initial = wait_for_kraken_snapshot(
-        runtime.snapshots(),
-        book_metadata.source_id(),
-        trade_metadata.source_id(),
+        runtime
+            .snapshots()
+            .ok_or("Kraken production fixture has no initial snapshot reader")?,
+        &book_source,
+        &trade_source,
     )
     .await?;
     assert_eq!(initial.connection_generation, ConnectionGeneration::new(1)?);
@@ -164,23 +141,17 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
         .send(())
         .map_err(|_| "Kraken recovery trigger receiver closed")?;
     let observed = wait_for_kraken_snapshot(
-        runtime.snapshots(),
-        book_metadata.source_id(),
-        trade_metadata.source_id(),
+        runtime
+            .snapshots()
+            .ok_or("Kraken production fixture has no recovery snapshot reader")?,
+        &book_source,
+        &trade_source,
     )
     .await?;
     wait_for_source_health(&runtime, true).await?;
     assert!(runtime.source_is_healthy());
-    assert_eq!(
-        book_metadata.quality_ceiling(),
-        DataQuality::DirectUnverified
-    );
-    assert_eq!(
-        trade_metadata.quality_ceiling(),
-        DataQuality::DirectUnverified
-    );
-    assert_eq!(observed.source, *book_metadata.source_id());
-    assert_eq!(observed.trade_source, *trade_metadata.source_id());
+    assert_eq!(observed.source, book_source);
+    assert_eq!(observed.trade_source, trade_source);
     assert_eq!(observed.instrument, definition.instrument_id());
     assert_eq!(
         observed.connection_generation,
@@ -295,9 +266,11 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
         .start(restart_cancellation.clone())
         .await?;
     let restart_observed = wait_for_kraken_snapshot(
-        restarted.snapshots(),
-        book_metadata.source_id(),
-        trade_metadata.source_id(),
+        restarted
+            .snapshots()
+            .ok_or("Restarted Kraken production fixture has no snapshot reader")?,
+        &book_source,
+        &trade_source,
     )
     .await?;
     assert_eq!(
@@ -975,6 +948,16 @@ fn kraken_config_with_ack_timeout(
             "evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
             "evidence_version":"reviewed-2026-08-14",
+            "effective_from_unix_nanos":1700000000000000000,
+            "effective_until_unix_nanos":1900000000000000000
+          }},
+          "reference_authorization":{{
+            "mode":"public_interface",
+            "provider":"kraken",
+            "basis":"market-squawk-reviewed-kraken-instrument-reference",
+            "evidence_sha256":"9b4544298835999a3457f48dbd03e4061fce3d82b98bfc82129b6adbc20ae9be",
+            "evidence_reference":"https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument",
+            "evidence_version":"reviewed-2026-09-23",
             "effective_from_unix_nanos":1700000000000000000,
             "effective_until_unix_nanos":1900000000000000000
           }},

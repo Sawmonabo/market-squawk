@@ -5,13 +5,19 @@ use std::num::NonZeroU64;
 
 use market_squawk_analytics::{FeatureInputSchemaDigest, FeatureKey, FeatureSemanticDigest};
 use market_squawk_data::{
-    CatalogEndpointIdentity, ComponentKind, DatasetBuildSpecDigest, DatasetManifestRef,
-    FeatureLabelComponentSpec, Sha256Digest, UniverseId,
+    CatalogEndpointIdentity, ChronologicalSplitPolicy, ComponentKind, DatasetBuildSpecDigest,
+    DatasetManifestRef, DatasetStudyPolicy, FeatureLabelComponentSpec, Sha256Digest, UniverseId,
 };
-use market_squawk_domain::{ModelId, Timestamp};
+use market_squawk_domain::{CalendarDate, ModelId, ResearchTemporalCoordinate, Timestamp};
 use thiserror::Error;
 
-use crate::{CalibrationBand, CalibrationMethod, CalibrationWindow, ForecastOutputBinding};
+use crate::{
+    CalibrationBand, CalibrationCoverageEvaluation, CalibrationMethod, CalibrationWindow,
+    ForecastOutputBinding,
+};
+
+mod study;
+pub(crate) use study::{TrainingPeriodWire, TrainingSplitWire, TrainingStudyWire, study_matches};
 
 /// Maximum features consumed by one native model.
 pub const MAX_MODEL_FEATURES: usize = 1_024;
@@ -30,6 +36,7 @@ pub struct ForecastCalibrationArtifacts {
     residuals_hash: Sha256Digest,
     residuals_size_bytes: u64,
     bands: [CalibrationBand; 3],
+    coverage_evaluation: Option<CalibrationCoverageEvaluation>,
     dependence_assumptions: Box<str>,
 }
 
@@ -46,6 +53,7 @@ impl ForecastCalibrationArtifacts {
         residuals_hash: Sha256Digest,
         residuals_size_bytes: u64,
         bands: [CalibrationBand; 3],
+        coverage_evaluation: Option<CalibrationCoverageEvaluation>,
         dependence_assumptions: String,
     ) -> Self {
         Self {
@@ -56,6 +64,7 @@ impl ForecastCalibrationArtifacts {
             residuals_hash,
             residuals_size_bytes,
             bands,
+            coverage_evaluation,
             dependence_assumptions: dependence_assumptions.into_boxed_str(),
         }
     }
@@ -100,6 +109,14 @@ impl ForecastCalibrationArtifacts {
     #[must_use]
     pub const fn bands(&self) -> &[CalibrationBand; 3] {
         &self.bands
+    }
+
+    /// Returns untouched coverage only after the actual evaluation window ends.
+    #[must_use]
+    pub fn coverage_evaluation(&self, as_of: Timestamp) -> Option<&CalibrationCoverageEvaluation> {
+        self.coverage_evaluation
+            .as_ref()
+            .filter(|evaluation| evaluation.window().ends_by(as_of))
     }
 
     /// Bounded dependence and coverage interpretation.
@@ -249,6 +266,9 @@ pub struct TrainingDatasetIdentity {
     selection_digest: Sha256Digest,
     selection_as_of: Timestamp,
     selected_component_rows: NonZeroU64,
+    split_policy: ChronologicalSplitPolicy,
+    study_policy: Option<DatasetStudyPolicy>,
+    source_snapshot_digest: Option<Sha256Digest>,
 }
 
 impl TrainingDatasetIdentity {
@@ -271,12 +291,18 @@ impl TrainingDatasetIdentity {
         selection_digest: Sha256Digest,
         selection_as_of: Timestamp,
         selected_component_rows: NonZeroU64,
+        split_policy: ChronologicalSplitPolicy,
+        study_policy: Option<DatasetStudyPolicy>,
+        source_snapshot_digest: Option<Sha256Digest>,
     ) -> Result<Self, ModelMetadataError> {
         if manifest.content_hash().bytes() == [0; 32]
             || universe_digest.bytes() == [0; 32]
             || policy_digest.bytes() == [0; 32]
             || export_digest.bytes() == [0; 32]
             || selection_digest.bytes() == [0; 32]
+            || study_policy.is_some() != source_snapshot_digest.is_some()
+            || source_snapshot_digest.is_some_and(|digest| digest.bytes() == [0; 32])
+            || study_policy.is_some_and(|policy| policy.snapshot_as_of() > selection_as_of)
         {
             return Err(ModelMetadataError::ReservedDigest);
         }
@@ -290,6 +316,9 @@ impl TrainingDatasetIdentity {
             selection_digest,
             selection_as_of,
             selected_component_rows,
+            split_policy,
+            study_policy,
+            source_snapshot_digest,
         })
     }
 
@@ -347,6 +376,24 @@ impl TrainingDatasetIdentity {
         self.selected_component_rows
     }
 
+    /// Native-revalidated partition boundaries in the declared study basis.
+    #[must_use]
+    pub const fn split_policy(&self) -> ChronologicalSplitPolicy {
+        self.split_policy
+    }
+
+    /// Exact admitted source-clock qualification, absent only for generic data.
+    #[must_use]
+    pub const fn study_policy(&self) -> Option<&DatasetStudyPolicy> {
+        self.study_policy.as_ref()
+    }
+
+    /// Exact retained parent generations and actual source snapshot cutoff.
+    #[must_use]
+    pub const fn source_snapshot_digest(&self) -> Option<Sha256Digest> {
+        self.source_snapshot_digest
+    }
+
     pub(crate) fn retained_bytes(&self) -> Option<usize> {
         size_of::<Self>()
             .checked_add(self.manifest.dataset_id().as_str().len())?
@@ -354,11 +401,16 @@ impl TrainingDatasetIdentity {
     }
 }
 
-/// Closed-open training observation interval represented by exact UTC nanoseconds.
+/// Closed-open training observation interval retaining its original temporal precision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrainingPeriod {
-    start: Timestamp,
-    end: Timestamp,
+    bounds: TrainingPeriodBounds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrainingPeriodBounds {
+    ExactTime(Timestamp, Timestamp),
+    FiscalDates(CalendarDate, CalendarDate),
 }
 
 impl TrainingPeriod {
@@ -371,19 +423,86 @@ impl TrainingPeriod {
         if end <= start {
             return Err(ModelMetadataError::InvalidTrainingPeriod);
         }
-        Ok(Self { start, end })
+        Ok(Self {
+            bounds: TrainingPeriodBounds::ExactTime(start, end),
+        })
+    }
+
+    /// Constructs a native fiscal date interval without assigning a time of day.
+    pub fn try_fiscal(start: CalendarDate, end: CalendarDate) -> Result<Self, ModelMetadataError> {
+        if end <= start {
+            return Err(ModelMetadataError::InvalidTrainingPeriod);
+        }
+        Ok(Self {
+            bounds: TrainingPeriodBounds::FiscalDates(start, end),
+        })
     }
 
     /// Returns the inclusive training start.
     #[must_use]
-    pub const fn start(self) -> Timestamp {
-        self.start
+    pub const fn start(self) -> Option<Timestamp> {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(start, _) => Some(start),
+            _ => None,
+        }
     }
 
     /// Returns the exclusive training end.
     #[must_use]
-    pub const fn end(self) -> Timestamp {
-        self.end
+    pub const fn end(self) -> Option<Timestamp> {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(_, end) => Some(end),
+            _ => None,
+        }
+    }
+
+    /// Original calendar-date bounds only for a native fiscal interval.
+    pub const fn fiscal_bounds(self) -> Option<[CalendarDate; 2]> {
+        match self.bounds {
+            TrainingPeriodBounds::FiscalDates(start, end) => Some([start, end]),
+            _ => None,
+        }
+    }
+
+    /// Inclusive start with its source precision.
+    pub fn start_coordinate(self) -> ResearchTemporalCoordinate {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(start, _) => ResearchTemporalCoordinate::exact(start),
+            TrainingPeriodBounds::FiscalDates(start, _) => {
+                ResearchTemporalCoordinate::calendar_date(start)
+            }
+        }
+    }
+
+    /// Exclusive end with its source precision.
+    pub fn end_coordinate(self) -> ResearchTemporalCoordinate {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(_, end) => ResearchTemporalCoordinate::exact(end),
+            TrainingPeriodBounds::FiscalDates(_, end) => {
+                ResearchTemporalCoordinate::calendar_date(end)
+            }
+        }
+    }
+
+    /// Whether the interval has ended by an actual clock instant.
+    pub fn ends_by(self, as_of: Timestamp) -> bool {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(_, end) => end <= as_of,
+            TrainingPeriodBounds::FiscalDates(_, end) => {
+                as_of.utc_calendar_date().is_ok_and(|date| end <= date)
+            }
+        }
+    }
+
+    /// Compares retained precision; an actual instant may be projected to its real UTC date.
+    pub fn ends_before_coordinate(self, cutoff: &ResearchTemporalCoordinate) -> bool {
+        if let Some(timestamp) = cutoff.exact_timestamp() {
+            return self.ends_by(timestamp);
+        }
+        match (self.fiscal_bounds(), cutoff.calendar_date_value()) {
+            (Some([_, end]), Some(date)) => end <= date,
+            _ => false,
+        }
     }
 }
 
@@ -622,6 +741,7 @@ pub struct ModelMetadata {
     artifact_hash: Sha256Digest,
     training_run_hash: Sha256Digest,
     forecast_calibration: Option<ForecastCalibrationArtifacts>,
+    probability_calibration: Option<crate::ProbabilityCalibrationArtifacts>,
     format: ModelFormat,
     format_version: u32,
     output_binding: ForecastOutputBinding,
@@ -671,6 +791,7 @@ impl ModelMetadata {
             artifact_hash,
             training_run_hash: expectations.training_run_hash,
             forecast_calibration: None,
+            probability_calibration: None,
             format,
             format_version,
             output_binding: expectations.output_binding.clone(),
@@ -700,6 +821,19 @@ impl ModelMetadata {
     ) -> Self {
         self.forecast_calibration = calibration;
         self
+    }
+
+    pub(crate) fn with_probability_calibration(
+        mut self,
+        calibration: Option<crate::ProbabilityCalibrationArtifacts>,
+    ) -> Self {
+        self.probability_calibration = calibration;
+        self
+    }
+
+    /// Original held-out binary calibration and untouched evaluation evidence.
+    pub const fn probability_calibration(&self) -> Option<&crate::ProbabilityCalibrationArtifacts> {
+        self.probability_calibration.as_ref()
     }
 
     /// Returns the stable model identity.

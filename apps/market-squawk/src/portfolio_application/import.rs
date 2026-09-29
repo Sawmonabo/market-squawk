@@ -6,8 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use market_squawk_adapter_portfolio::{
-    AccountObservation, HoldingObservation, PortfolioExtractionSource, PortfolioImport,
-    PortfolioImportLimits, PortfolioTransaction,
+    PortfolioExtractionSource, PortfolioImport, PortfolioImportLimits,
 };
 use market_squawk_data::{
     CorporateActionLimits, DatasetId, DatasetManifestRef, Sha256Digest, extraction_batch_digest,
@@ -35,8 +34,9 @@ use super::backup::{
     RetainedPortfolioBackupSnapshot, TransactionBackupEnvelope, authority_revision, decode_pair,
 };
 use super::model::{
-    AccountHistory, PortfolioReadImage, PublicationEntry, PublicationManifest, PublishedRevision,
-    SourceKey,
+    AccountHistory, AccountObservation, HoldingObservation, PortfolioReadImage,
+    PortfolioTransaction, PublicationEntry, PublicationKind, PublicationManifest,
+    PublishedRevision, SourceKey,
 };
 use super::read;
 use super::{PortfolioApplicationLimits, PortfolioApplicationServiceError, Runtime, ensure_live};
@@ -318,12 +318,10 @@ impl ImportAuthority {
             limits,
             portfolio_limits,
         };
+        let mut retained_original_bytes = 0usize;
         let mut seen_publications = BTreeSet::new();
         for entry in &manifest.entries {
-            let canonical_reference = format!(
-                "{IMMUTABLE_IMPORT_NAMESPACE}/{}.json",
-                hex(&entry.artifact_sha256)
-            );
+            let canonical_reference = publication_reference(entry.kind, entry.artifact_sha256);
             if entry.artifact_reference != canonical_reference
                 || !seen_publications.insert((entry.account_id, entry.artifact_sha256))
             {
@@ -336,6 +334,49 @@ impl ImportAuthority {
             )?;
             if Sha256::digest(&bytes).as_slice() != entry.artifact_sha256 {
                 return Err(PortfolioApplicationServiceError::CorruptPublication);
+            }
+            retained_original_bytes = retained_original_bytes
+                .checked_add(bytes.len())
+                .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
+            if retained_original_bytes > limits.max_retained_bytes {
+                return Err(PortfolioApplicationServiceError::ResourceExhausted);
+            }
+            if entry.kind == PublicationKind::NativePaper {
+                if entry.governance_receipt_reference.is_some()
+                    || entry.governance_receipt_sha256.is_some()
+                {
+                    return Err(PortfolioApplicationServiceError::CorruptPublication);
+                }
+                let (receipt, replay, plan) = super::paper::NativeReceipt::decode(&bytes, limits)?;
+                let prior = authority
+                    .accounts
+                    .get(&entry.account_id)
+                    .and_then(|history| history.revisions.last());
+                if receipt.account != entry.account_id
+                    || receipt.prior_revision != prior.map(|old| old.token().bytes())
+                {
+                    return Err(PortfolioApplicationServiceError::CorruptPublication);
+                }
+                let revision = super::paper::build_native_revision(
+                    &replay,
+                    receipt.account,
+                    plan.as_ref(),
+                    prior,
+                    receipt.as_of,
+                    portfolio_limits,
+                    entry.artifact_sha256,
+                )?;
+                if revision.token().bytes() != receipt.revision {
+                    return Err(PortfolioApplicationServiceError::CorruptPublication);
+                }
+                authority
+                    .accounts
+                    .entry(entry.account_id)
+                    .or_default()
+                    .revisions
+                    .push(revision);
+                authority.manifest.entries.push(entry.clone());
+                continue;
             }
             let governance_receipt = match (
                 entry.governance_receipt_reference.as_deref(),
@@ -369,6 +410,118 @@ impl ImportAuthority {
         let image =
             PortfolioReadImage::try_from_accounts(authority.accounts.clone(), authority.limits)?;
         Ok((authority, image))
+    }
+
+    pub(super) fn publish_native_paper(
+        &mut self,
+        artifacts: &ArtifactRoot,
+        account: AccountId,
+        replay: &market_squawk_adapter_paper::PaperPortfolioReplay,
+        plan: Option<&market_squawk_data::CorporateActionPlan>,
+        as_of: Timestamp,
+        ensure_current: impl Fn() -> Result<(), PortfolioApplicationServiceError>,
+    ) -> Result<
+        (
+            market_squawk_portfolio::PortfolioRevision,
+            PortfolioReadImage,
+        ),
+        PortfolioApplicationServiceError,
+    > {
+        ensure_current()?;
+        replay
+            .verify_action_plan(plan)
+            .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        let prior = self
+            .accounts
+            .get(&account)
+            .and_then(|history| history.revisions.last());
+        if let Some(previous) = prior {
+            let native = previous
+                .native_paper
+                .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+            if native.origin_sha256 != super::paper::original_origin_digest(replay)? {
+                return Err(PortfolioApplicationServiceError::CorruptPublication);
+            }
+            if native.sequence == replay.snapshot().sequence()
+                && native.configuration_digest == replay.snapshot().configuration_digest()
+                && native.checkpoint_digest == replay.checkpoint_digest()
+            {
+                return Ok((
+                    previous.core.clone(),
+                    PortfolioReadImage::try_from_accounts(self.accounts.clone(), self.limits)?,
+                ));
+            }
+        }
+        let mut revision = super::paper::build_native_revision(
+            replay,
+            account,
+            plan,
+            prior,
+            as_of,
+            self.portfolio_limits,
+            [0; 32],
+        )?;
+        let receipt = super::paper::NativeReceipt {
+            account,
+            as_of,
+            prior_revision: prior.map(|old| old.token().bytes()),
+            revision: revision.token().bytes(),
+        };
+        let bytes = receipt.encode(replay, plan, self.limits.max_artifact_bytes)?;
+        let artifact_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        revision.artifact_sha256 = artifact_sha256;
+        if revision.transactions.len() > self.limits.max_result_items
+            || revision.holdings.len() > self.limits.max_result_items
+        {
+            return Err(PortfolioApplicationServiceError::ResourceExhausted);
+        }
+        let mut retained_bytes = bytes.len();
+        for entry in &self.manifest.entries {
+            retained_bytes = retained_bytes
+                .checked_add(
+                    read_artifact(
+                        artifacts,
+                        &entry.artifact_reference,
+                        self.limits.max_artifact_bytes,
+                    )?
+                    .len(),
+                )
+                .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
+            if retained_bytes > self.limits.max_retained_bytes {
+                return Err(PortfolioApplicationServiceError::ResourceExhausted);
+            }
+        }
+        if retained_bytes > self.limits.max_retained_bytes {
+            return Err(PortfolioApplicationServiceError::ResourceExhausted);
+        }
+        let mut accounts = self.accounts.clone();
+        let core = revision.core.clone();
+        accounts
+            .entry(account)
+            .or_default()
+            .revisions
+            .push(revision);
+        let image = PortfolioReadImage::try_from_accounts(accounts.clone(), self.limits)?;
+        let reference = publication_reference(PublicationKind::NativePaper, artifact_sha256);
+        let mut manifest = self.manifest.clone();
+        manifest.entries.push(PublicationEntry {
+            kind: PublicationKind::NativePaper,
+            account_id: account,
+            artifact_reference: reference.clone(),
+            artifact_sha256,
+            governance_receipt_reference: None,
+            governance_receipt_sha256: None,
+        });
+        let encoded = manifest.encode()?;
+        ensure_current()?;
+        persist_immutable(artifacts, &reference, &bytes)?;
+        ensure_current()?;
+        self.publication
+            .store(&encoded)
+            .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        self.accounts = accounts;
+        self.manifest = manifest;
+        Ok((core, image))
     }
 
     pub(super) fn backup_snapshot(
@@ -521,6 +674,7 @@ impl ImportAuthority {
         let image = PortfolioReadImage::try_from_accounts(candidate_accounts.clone(), self.limits)?;
         let mut candidate_manifest = self.manifest.clone();
         candidate_manifest.entries.push(PublicationEntry {
+            kind: PublicationKind::Imported,
             account_id: request.account_id,
             artifact_reference: canonical_reference.clone(),
             artifact_sha256,
@@ -1127,6 +1281,7 @@ impl ImportAuthority {
             hex(&receipt_sha256)
         );
         candidate_manifest.entries.push(PublicationEntry {
+            kind: PublicationKind::Imported,
             account_id,
             artifact_reference: canonical_reference.clone(),
             artifact_sha256,
@@ -1252,10 +1407,14 @@ impl ImportAuthority {
             .accounts
             .get(&account_id)
             .and_then(|history| history.revisions.last());
+        if prior.is_some_and(|revision| revision.native_paper.is_some()) {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
         let account = imported
             .accounts()
             .first()
             .cloned()
+            .map(AccountObservation::from)
             .or_else(|| prior.map(|revision| revision.account.clone()))
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
         let holdings = merge_holdings(prior, imported.holdings());
@@ -1300,6 +1459,7 @@ impl ImportAuthority {
             effective_at: maximum_effective(batch)?,
             available_at: maximum_conservative_availability(batch),
             artifact_sha256,
+            native_paper: None,
         })
     }
 
@@ -1386,10 +1546,14 @@ impl ImportAuthority {
             .get(&account_id)
             .and_then(|history| history.revisions.last());
         validate_account_binding(account_id, &imported)?;
+        if prior.is_some_and(|revision| revision.native_paper.is_some()) {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
         let account = imported
             .accounts()
             .first()
             .cloned()
+            .map(AccountObservation::from)
             .or_else(|| prior.map(|revision| revision.account.clone()))
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
         if account.account_id() != account_id {
@@ -1431,6 +1595,7 @@ impl ImportAuthority {
             effective_at,
             available_at,
             artifact_sha256,
+            native_paper: None,
         })
     }
 }
@@ -1572,10 +1737,13 @@ fn validate_backup_inventory(
     let mut expected_imports = BTreeSet::new();
     let mut expected_governance = BTreeSet::new();
     for entry in &manifest.entries {
-        let expected_reference = format!(
-            "{IMMUTABLE_IMPORT_NAMESPACE}/{}.json",
-            hex(&entry.artifact_sha256)
-        );
+        let expected_reference = publication_reference(entry.kind, entry.artifact_sha256);
+        if entry.kind == PublicationKind::NativePaper
+            && (entry.governance_receipt_reference.is_some()
+                || entry.governance_receipt_sha256.is_some())
+        {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
         if entry.artifact_reference != expected_reference
             || imports
                 .get(entry.artifact_reference.as_str())
@@ -1773,7 +1941,7 @@ fn validate_account_binding(
 
 fn merge_holdings(
     prior: Option<&PublishedRevision>,
-    imported: &[HoldingObservation],
+    imported: &[market_squawk_adapter_portfolio::HoldingObservation],
 ) -> Vec<HoldingObservation> {
     let mut holdings = prior.map_or_else(Vec::new, |revision| revision.holdings.clone());
     for holding in imported {
@@ -1781,9 +1949,9 @@ fn merge_holdings(
             existing.account_id() == holding.account_id()
                 && existing.instrument_id() == holding.instrument_id()
         }) {
-            holdings[index] = holding.clone();
+            holdings[index] = holding.into();
         } else {
-            holdings.push(holding.clone());
+            holdings.push(holding.into());
         }
     }
     holdings.sort_unstable_by_key(HoldingObservation::instrument_id);
@@ -1792,7 +1960,7 @@ fn merge_holdings(
 
 fn merge_transactions(
     prior: Option<&PublishedRevision>,
-    imported: &[PortfolioTransaction],
+    imported: &[market_squawk_adapter_portfolio::PortfolioTransaction],
 ) -> Vec<PortfolioTransaction> {
     let mut transactions = prior.map_or_else(Vec::new, |revision| revision.transactions.clone());
     for transaction in imported {
@@ -1800,9 +1968,9 @@ fn merge_transactions(
             existing.account_id() == transaction.account_id()
                 && existing.broker_transaction_id() == transaction.broker_transaction_id()
         }) {
-            transactions[index] = transaction.clone();
+            transactions[index] = transaction.into();
         } else {
-            transactions.push(transaction.clone());
+            transactions.push(transaction.into());
         }
     }
     transactions.sort_unstable_by(|left, right| {
@@ -2708,7 +2876,7 @@ fn source_namespace(key: &SourceKey) -> String {
     hex(&digest.finalize().into())
 }
 
-fn read_artifact(
+pub(super) fn read_artifact(
     artifacts: &ArtifactRoot,
     reference: &str,
     maximum_bytes: usize,
@@ -2798,4 +2966,13 @@ pub(super) fn hex(bytes: &[u8; 32]) -> String {
         value.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     value
+}
+
+fn publication_reference(kind: PublicationKind, digest: [u8; 32]) -> String {
+    match kind {
+        PublicationKind::Imported => format!("{IMMUTABLE_IMPORT_NAMESPACE}/{}.json", hex(&digest)),
+        PublicationKind::NativePaper => {
+            format!("{}/{}.bin", super::paper::NATIVE_NAMESPACE, hex(&digest))
+        }
+    }
 }

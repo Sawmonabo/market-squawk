@@ -1452,10 +1452,19 @@ impl ParquetObjectStore {
                     .ok_or(ParquetStoreError::SizeOverflow)
             })
         })?;
-        let structural = usize::try_from(object.row_count())
+        let field_count = builder.schema().fields().len();
+        let row_structure = usize::try_from(object.row_count())
             .ok()
-            .and_then(|rows| rows.checked_mul(builder.schema().fields().len()))
+            .and_then(|rows| rows.checked_mul(field_count))
             .and_then(|cells| cells.checked_mul(std::mem::size_of::<u64>()))
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let batch_structure = field_count
+            .checked_mul(std::mem::size_of::<arrow::array::ArrayRef>())
+            .and_then(|columns| columns.checked_add(std::mem::size_of::<RecordBatch>()))
+            .and_then(|per_batch| per_batch.checked_mul(row_groups.len()))
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let structural = row_structure
+            .checked_add(batch_structure)
             .ok_or(ParquetStoreError::SizeOverflow)?;
         let estimated_peak = retained_bytes
             .checked_add(object_estimate)
@@ -1464,8 +1473,11 @@ impl ParquetObjectStore {
         if estimated_peak > max_retained_bytes {
             return Err(ParquetStoreError::ReadLimitExceeded);
         }
+        *retained_bytes = retained_bytes
+            .checked_add(structural)
+            .ok_or(ParquetStoreError::SizeOverflow)?;
         batches
-            .try_reserve(row_groups.len())
+            .try_reserve_exact(row_groups.len())
             .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
         let schema = Arc::clone(builder.schema());
         let reader = builder

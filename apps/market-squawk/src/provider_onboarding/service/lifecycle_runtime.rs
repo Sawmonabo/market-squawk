@@ -339,6 +339,11 @@ impl ProviderOnboardingService {
             }
             for session_id in &session_ids {
                 let resumed = self.catalog.resume_provider_onboarding(*session_id)?;
+                if runtime_admissions.unavailable(resumed.lifecycle().surface_id()) {
+                    // The provider lifecycle cannot be trusted. Keep its exact catalog and
+                    // credential records intact for recovery, but admit no runtime from them.
+                    continue;
+                }
                 let profile = self.profiles.get(resumed.lifecycle().surface_id().as_str());
                 let exact_capability = profile.and_then(|profile| {
                     profile.capability_at(

@@ -1,6 +1,7 @@
 import * as React from "react"
 import { CheckCircle2, KeyRound, LoaderCircle } from "lucide-react"
-import { MacroSelectionFields, macroSelection } from "./macro-selection-fields"
+import { BeaSelectionFields, beaSelection } from "./macro-selection-fields"
+import { CensusSelectionFields, censusConfiguration } from "./census-selection-fields"
 import { messageFrom } from "@/app/product-context"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -637,7 +638,8 @@ function ActivationForm({ kind, pending, saved, onSubmit }: {
       try {
         const data = new FormData(event.currentTarget)
         const request: Record<string, unknown> = { kind }
-        if (kind === "bea" || kind === "census") request.selection = macroSelection(kind, data)
+        if (kind === "bea") request.selection = beaSelection(data)
+        if (kind === "census") request.configuration = censusConfiguration(data)
         if (kind === "sec") request.cik = field(data, "cik")
         if (kind === "treasury_fiscal") request.page_size = Number(field(data, "pageSize"))
         if (kind === "eia_electricity_price") {
@@ -674,7 +676,8 @@ function ActivationForm({ kind, pending, saved, onSubmit }: {
     {formError ? <p role="alert" className="text-sm text-red-400">
       {formError}
     </p> : null}
-    {kind === "bea" || kind === "census" ? <MacroSelectionFields provider={kind} /> : null}
+    {kind === "bea" ? <BeaSelectionFields /> : null}
+    {kind === "census" ? <CensusSelectionFields /> : null}
     {kind === "sec" ? <Field
       name="cik"
       label="Company CIK (10 digits)"

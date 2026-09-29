@@ -30,9 +30,9 @@ use market_squawk_sources::{
 use tokio_util::sync::CancellationToken;
 
 use crate::provider_activation::{
-    MarketInstrumentBinding, MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
+    MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
     MarketReferenceIdentityResolution, SchwabMarketDataAccountActivation,
-    SchwabMarketDataActivationError,
+    SchwabMarketDataActivationError, SchwabQuoteReferenceBinding,
 };
 use crate::provider_onboarding::SchwabOAuthPublicationEpoch;
 
@@ -107,33 +107,30 @@ pub(crate) struct SchwabRestQuoteRuntimeBounds {
     pub(crate) token: AccessTokenAdmission,
 }
 
-/// Accepted canonical identity and exact revision-bound economics for one requested symbol.
+/// Accepted canonical identity and exact revision-bound reference for one requested symbol.
 #[derive(Clone, Debug)]
 pub(crate) struct SchwabRestQuoteInstrumentBinding {
-    binding: MarketInstrumentBinding,
+    binding: SchwabQuoteReferenceBinding,
     identity_approval: Option<MarketReferenceIdentityApprovalV1>,
 }
 
 impl SchwabRestQuoteInstrumentBinding {
     pub(crate) fn try_new(
-        binding: MarketInstrumentBinding,
+        binding: SchwabQuoteReferenceBinding,
         source_id: &SourceId,
     ) -> Result<Self, SchwabRestQuoteRuntimeError> {
         Self::try_new_with_identity_approval(binding, None, source_id)
     }
 
     fn try_new_with_identity_approval(
-        binding: MarketInstrumentBinding,
+        binding: SchwabQuoteReferenceBinding,
         identity_approval: Option<MarketReferenceIdentityApprovalV1>,
         source_id: &SourceId,
     ) -> Result<Self, SchwabRestQuoteRuntimeError> {
-        let provider_identity = binding
-            .provider_identity()
-            .ok_or(SchwabRestQuoteRuntimeError::CanonicalIdentity)?;
-        if binding.provider_symbol_is_provisional()
-            || provider_identity.source_id() != source_id
+        let provider_identity = binding.provider_identity();
+        if source_id.as_str() != "schwab-trader-api"
+            || provider_identity.source_id().as_str() != "schwab-trader-api-instruments"
             || provider_identity.instrument_id() != binding.instrument_id()
-            || binding.execution_terms().instrument_id() != binding.instrument_id()
             || ProviderIdentifier::try_new(binding.provider_symbol().to_owned()).is_err()
         {
             return Err(SchwabRestQuoteRuntimeError::CanonicalIdentity);
@@ -144,7 +141,7 @@ impl SchwabRestQuoteInstrumentBinding {
         })
     }
 
-    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+    pub(crate) fn instrument_id(&self) -> InstrumentId {
         self.binding.instrument_id()
     }
 
@@ -152,7 +149,7 @@ impl SchwabRestQuoteInstrumentBinding {
         self.binding.provider_symbol()
     }
 
-    pub(crate) const fn binding(&self) -> &MarketInstrumentBinding {
+    pub(crate) const fn binding(&self) -> &SchwabQuoteReferenceBinding {
         &self.binding
     }
 
@@ -162,7 +159,7 @@ impl SchwabRestQuoteInstrumentBinding {
 
     pub(crate) fn try_all(
         bindings: Vec<(
-            MarketInstrumentBinding,
+            SchwabQuoteReferenceBinding,
             Option<MarketReferenceIdentityApprovalV1>,
         )>,
         source_id: &SourceId,
@@ -411,7 +408,7 @@ fn pressure_threshold(limit: usize) -> Result<u64, SchwabRestQuoteRuntimeError> 
 
 /// Sole production owner of one callable Schwab REST quote generation.
 pub(crate) struct SchwabRestQuoteProducer {
-    activation: SchwabMarketDataAccountActivation,
+    activation: Arc<SchwabMarketDataAccountActivation>,
     connection_generation: ConnectionGeneration,
     evidence: SchwabRestQuoteSourceEvidence,
     bindings: Arc<[SchwabRestQuoteInstrumentBinding]>,
@@ -463,7 +460,7 @@ impl SchwabRestQuoteProducer {
         reason = "authority, source evidence, finite bounds, shared rate, and sink are independent"
     )]
     pub(crate) fn try_production(
-        activation: SchwabMarketDataAccountActivation,
+        activation: Arc<SchwabMarketDataAccountActivation>,
         provider_rate: &ProviderRateAuthority,
         connection_generation: ConnectionGeneration,
         evidence: SchwabRestQuoteSourceEvidence,
@@ -613,22 +610,25 @@ impl SchwabRestQuoteProducer {
             }
         };
         let operation_cancellation = cancellation.child_token();
-        let outcome = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                operation_cancellation.cancel();
-                return Err(SchwabRestQuoteRuntimeError::Cancelled);
+        let outcome = {
+            let native =
+                self.executor
+                    .execute(request.request(), &token, operation_cancellation.clone());
+            tokio::pin!(native);
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    operation_cancellation.cancel();
+                    native.as_mut().await
+                }
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    operation_cancellation.cancel();
+                    native.as_mut().await
+                }
+                result = native.as_mut() => result,
             }
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                operation_cancellation.cancel();
-                return Err(SchwabRestQuoteRuntimeError::Deadline);
-            }
-            result = self.executor.execute(
-                request.request(),
-                &token,
-                operation_cancellation.clone(),
-            ) => result,
         };
+        drop(token);
         let outcome = outcome?;
         let capacity = outcome.capacity_observation()?;
         let (outcome, accounting, receipt) = classify_quote_outcome(outcome)?;
@@ -650,8 +650,6 @@ impl SchwabRestQuoteProducer {
         } else {
             budget_control_failure(self.budget.apply_refusal(0))
         };
-        permit.release();
-
         let source_id = self.evidence.metadata().source_id().clone();
         let batch = SchwabRestQuoteBatch {
             outcome,
@@ -666,7 +664,9 @@ impl SchwabRestQuoteProducer {
         // cancellation or deadline here would drop raw evidence before the application sealer
         // could retain it. The caller's terminal state is reported only after the sink returns its
         // raw-seal receipt.
-        let publication = self.sink.publish(batch).await?;
+        let publication = self.sink.publish(batch).await;
+        permit.release();
+        let publication = publication?;
         if publication.source_id != source_id
             || publication.connection_generation != generation
             || publication.requested != accounting.requested

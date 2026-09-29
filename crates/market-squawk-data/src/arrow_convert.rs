@@ -1501,6 +1501,15 @@ impl ResearchArrowBatch {
         batch: RecordBatch,
         max_additional_bytes: usize,
     ) -> Result<(Vec<ResearchObservation>, usize), ArrowConversionError> {
+        Self::decode_query_projection_with_control(batch, max_additional_bytes, None)
+            .map(|(observations, retained, _working)| (observations, retained))
+    }
+
+    fn decode_query_projection_with_control(
+        batch: RecordBatch,
+        max_additional_bytes: usize,
+        mut control: Option<&mut ArrowOperationControl<'_>>,
+    ) -> Result<(Vec<ResearchObservation>, usize, usize), ArrowConversionError> {
         let registry = DatasetSchemaRegistry::local();
         let schema_ref = registry.canonical_research_observations()?;
         let comparison_schema = registry.resolve(&schema_ref)?;
@@ -1508,19 +1517,20 @@ impl ResearchArrowBatch {
             return Err(ArrowConversionError::InvalidSchema);
         }
         if batch.num_rows() == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, 0));
         }
         let candidate = Self { schema_ref, batch };
-        let (working_bytes, observation_bytes) = candidate.decode_admission(None)?;
+        let (working_bytes, observation_bytes) =
+            candidate.decode_admission(control.as_deref_mut())?;
         if working_bytes > max_additional_bytes {
             return Err(ArrowConversionError::RetainedLimitExceeded {
                 required_bytes: working_bytes,
                 limit_bytes: max_additional_bytes,
             });
         }
-        let observations = candidate.decode_payloads(None)?;
-        let request_digests = candidate.decode_request_digests(None)?;
-        let row_lineages = candidate.decode_row_lineages(None)?;
+        let observations = candidate.decode_payloads(control.as_deref_mut())?;
+        let request_digests = candidate.decode_request_digests(control.as_deref_mut())?;
+        let row_lineages = candidate.decode_row_lineages(control.as_deref_mut())?;
         let producer_dataset = row_lineages
             .first()
             .map(RowLineage::dataset)
@@ -1542,12 +1552,149 @@ impl ResearchArrowBatch {
             request_digests,
             row_lineages,
             &observations,
-            None,
+            control.as_deref_mut(),
         )?;
         if rebuilt.batch.columns() != candidate.batch.columns() {
             return Err(ArrowConversionError::ProjectionMismatch);
         }
-        Ok((observations, observation_bytes))
+        if let Some(control) = control {
+            control.checkpoint_now()?;
+        }
+        Ok((observations, observation_bytes, working_bytes))
+    }
+
+    /// Validates the original extraction coordinate of one row selected by a fixed pinned query.
+    /// The stored payload digest and the original extraction-record digest remain distinct after
+    /// durable revision assignment. No provider coordinate is manufactured for local-only rows.
+    pub(crate) fn selected_provider_capture_coordinate(
+        lineage_bytes: &[u8],
+        request_digest: &[u8],
+        observation: &ResearchObservation,
+        payload: &[u8],
+    ) -> Result<Option<ProviderCaptureRowCoordinate>, ArrowConversionError> {
+        if lineage_bytes.len() > market_squawk_sources::MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+            return Err(ArrowConversionError::ExtractionBindingMismatch);
+        }
+        let lineage: RowLineage = decode_json(lineage_bytes, None)?;
+        let request_digest = request_digest
+            .try_into()
+            .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?;
+        validate_row_lineage(
+            &lineage,
+            lineage.dataset(),
+            request_digest,
+            observation,
+            payload,
+            None,
+        )?;
+        let RowLineage::Extraction(lineage) = lineage else {
+            return Ok(None);
+        };
+        let Some(capture) = lineage.provider_capture else {
+            return Ok(None);
+        };
+        Ok(Some(ProviderCaptureRowCoordinate {
+            binding_digest: capture.binding_digest,
+            capture_observation_digest: capture.capture_observation_digest,
+            canonical_row_ordinal: capture.canonical_row_ordinal,
+            canonical_row_digest: lineage.record_evidence.content_digest(),
+            observation_digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(payload).into(),
+            ),
+            native_semantic_digest: capture.native_semantic_digest,
+            capture_page_ordinal: capture.capture_page_ordinal,
+            segment_ordinal: capture.segment_ordinal,
+            physical_frame_ordinal: capture.physical_frame_ordinal,
+            page_body_digest: capture.page_body_digest,
+        }))
+    }
+
+    /// Decodes only rows carrying one exact retained provider capture binding. Every selected
+    /// row is joined to the original canonical/native/page coordinate before it is returned.
+    /// Callers must reconcile the complete returned ordinal set across all query batches.
+    pub fn decode_query_capture_binding_rows_bounded(
+        batch: RecordBatch,
+        binding: &crate::PersistedProviderCaptureBindingEvidence,
+        max_additional_bytes: usize,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<(Vec<(u32, ResearchObservation)>, usize), ArrowConversionError> {
+        let mut operation = ArrowOperationControl::new(control);
+        operation.checkpoint_now()?;
+        let (observations, observation_bytes, working_bytes) =
+            Self::decode_query_projection_with_control(
+                batch.clone(),
+                max_additional_bytes,
+                Some(&mut operation),
+            )?;
+        let coordinate_bytes = observations
+            .len()
+            .checked_mul(size_of::<(u32, ResearchObservation)>())
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        let peak = working_bytes
+            .checked_add(coordinate_bytes)
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        if peak > max_additional_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes: peak,
+                limit_bytes: max_additional_bytes,
+            });
+        }
+        let retained = observation_bytes
+            .checked_add(coordinate_bytes)
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        if retained > max_additional_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes: retained,
+                limit_bytes: max_additional_bytes,
+            });
+        }
+        let lineages = batch
+            .column_by_name("extraction_lineage_json")
+            .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(observations.len())
+            .map_err(|_| ArrowConversionError::AllocationFailure)?;
+        for (ordinal, (observation, lineage)) in observations.into_iter().zip(lineages).enumerate()
+        {
+            operation.checkpoint_row(ordinal)?;
+            let lineage: RowLineage =
+                serde_json::from_slice(lineage.ok_or(ArrowConversionError::InvalidSchema)?)
+                    .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?;
+            let RowLineage::Extraction(lineage) = lineage else {
+                continue;
+            };
+            let Some(capture) = lineage.provider_capture else {
+                continue;
+            };
+            if capture.binding_digest != binding.binding_digest() {
+                continue;
+            }
+            let row = binding
+                .rows()
+                .get(
+                    usize::try_from(capture.canonical_row_ordinal)
+                        .map_err(|_| ArrowConversionError::ExtractionBindingMismatch)?,
+                )
+                .ok_or(ArrowConversionError::ExtractionBindingMismatch)?;
+            if lineage.source_id != *binding.capture().source_id()
+                || lineage.metadata_revision != *binding.capture().metadata_revision()
+                || lineage.record_evidence.content_digest() != row.canonical_row_digest()
+                || capture.capture_observation_digest != binding.capture().observation_digest()
+                || capture.native_semantic_digest != row.native_semantic_digest()
+                || capture.capture_page_ordinal != row.capture_page_ordinal()
+                || capture.segment_ordinal != row.segment_ordinal()
+                || capture.physical_frame_ordinal != row.physical_frame_ordinal()
+                || capture.page_body_digest != row.page_body_digest()
+            {
+                return Err(ArrowConversionError::ExtractionBindingMismatch);
+            }
+            selected.push((capture.canonical_row_ordinal, observation));
+        }
+        operation.checkpoint_now()?;
+        Ok((selected, retained))
     }
 
     fn validate_and_decode_record_batch(
@@ -2339,8 +2486,10 @@ fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
         ResearchObservation::Macro(value) => value.context(),
         ResearchObservation::MarketBar(value) => value.context(),
         ResearchObservation::FundNav(value) => value.context(),
+        ResearchObservation::MarketCalendar(value) => value.context(),
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
+        ResearchObservation::CorporateActionSource(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
         ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),

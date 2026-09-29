@@ -282,8 +282,9 @@ pub enum ObservationFamilyKey {
         feed: SourceIdentifier,
         interval: SourceIdentifier,
         adjustment: MarketBarAdjustment,
-        timestamp_basis: BarTimestampBasis,
-        session: MarketBarSessionEvidence,
+        timestamp_basis: Option<BarTimestampBasis>,
+        session: Option<MarketBarSessionEvidence>,
+        nominal_ruleset: Option<SourceIdentifier>,
         effective: ResearchTemporalCoordinate,
     },
     FundNav {
@@ -296,6 +297,13 @@ pub enum ObservationFamilyKey {
         valuation_basis: FundNavValuationBasis,
         currency: Currency,
     },
+    MarketCalendar {
+        source_id: SourceId,
+        venue_id: Option<VenueId>,
+        scope: market_squawk_domain::MarketCalendarScope,
+        coverage: bool,
+        effective: ResearchTemporalCoordinate,
+    },
     PortfolioPosition {
         source_id: SourceId,
         instrument_id: InstrumentId,
@@ -307,6 +315,10 @@ pub enum ObservationFamilyKey {
         instrument_id: Option<InstrumentId>,
         account_id: SourceIdentifier,
         source_record_id: SourceIdentifier,
+    },
+    CorporateActionSource {
+        source_id: SourceId,
+        source_record: SourceIdentifier,
     },
     CorporateAction {
         source_id: SourceId,
@@ -370,7 +382,11 @@ impl ObservationFamilyKey {
                 interval: value.interval().clone(),
                 adjustment: value.adjustment(),
                 timestamp_basis: value.time_semantics().timestamp_basis(),
-                session: value.time_semantics().session().clone(),
+                session: value.time_semantics().session().cloned(),
+                nominal_ruleset: value
+                    .time_semantics()
+                    .nominal_daily_date()
+                    .map(|date| date.ruleset().clone()),
                 effective,
             }),
             ResearchObservation::FundNav(value) => Ok(Self::FundNav {
@@ -383,6 +399,16 @@ impl ObservationFamilyKey {
                 valuation_basis: value.valuation_basis(),
                 currency: value.currency(),
             }),
+            ResearchObservation::MarketCalendar(value) => Ok(Self::MarketCalendar {
+                source_id,
+                venue_id: provenance.venue_id().cloned(),
+                scope: value.scope().clone(),
+                coverage: matches!(
+                    value.payload(),
+                    market_squawk_domain::MarketCalendarPayload::Coverage { .. }
+                ),
+                effective,
+            }),
             ResearchObservation::PortfolioPosition(value) => Ok(Self::PortfolioPosition {
                 source_id,
                 instrument_id: required_instrument()?,
@@ -394,6 +420,10 @@ impl ObservationFamilyKey {
                 instrument_id: provenance.instrument_id(),
                 account_id: value.account_id().clone(),
                 source_record_id: value.source_record_id().clone(),
+            }),
+            ResearchObservation::CorporateActionSource(_) => Ok(Self::CorporateActionSource {
+                source_id,
+                source_record: provenance.source_identifier().clone(),
             }),
             ResearchObservation::CorporateAction(_) => Ok(Self::CorporateAction {
                 source_id,
@@ -426,8 +456,10 @@ impl fmt::Display for ObservationFamilyKey {
             Self::Macro { .. } => "macro",
             Self::MarketBar { .. } => "market_bar",
             Self::FundNav { .. } => "fund_nav",
+            Self::MarketCalendar { .. } => "market_calendar",
             Self::PortfolioPosition { .. } => "portfolio_position",
             Self::Transaction { .. } => "transaction",
+            Self::CorporateActionSource { .. } => "corporate_action_source",
             Self::CorporateAction { .. } => "corporate_action",
             Self::UniverseMembership { .. } => "universe_membership",
             Self::AlternativeData { .. } => "alternative_data",
@@ -442,8 +474,10 @@ pub(super) const fn observation_context(observation: &ResearchObservation) -> &R
         ResearchObservation::Macro(value) => value.context(),
         ResearchObservation::MarketBar(value) => value.context(),
         ResearchObservation::FundNav(value) => value.context(),
+        ResearchObservation::MarketCalendar(value) => value.context(),
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
+        ResearchObservation::CorporateActionSource(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
         ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),

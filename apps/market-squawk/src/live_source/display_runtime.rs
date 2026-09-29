@@ -1,6 +1,8 @@
 //! Display-only production source composition for authenticated U.S. market data.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use crate::application::{AlpacaPublicationRuntime,AlpacaPublicationRuntimeInput};
+use super::super::sink::{AlpacaCapturedPublicationIngress,ProductionCapturedPublicationIngress};
 
 use market_squawk_adapter_alpaca::{
     AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig,
@@ -20,8 +22,11 @@ use super::{
     DisplayMarketReadAdmission, DisplayMarketRouteIdentity,
 };
 use crate::live_source::{
+    ProductionCatalogSelection,
     provider::{ProductionProviderError, ProductionSourceProfile},
-    supervisor::{ProductionSourceSupervisor, ProductionSupervisorError},
+    supervisor::{
+        ProductionSourceSupervisor, ProductionSupervisorError, ProductionSupervisorRunOutcome,
+    },
 };
 
 /// Owned display-only source runtime with exact-generation cleanup and no execution authority.
@@ -29,8 +34,26 @@ use crate::live_source::{
 pub(crate) struct ProductionDisplaySourceRuntime {
     // Drop cancellation is declared first so the supervisor cannot outlive its owner uncancelled.
     supervisor_cancellation: DisplaySupervisorCancellation,
-    supervisor: tokio::task::JoinHandle<Result<(), ProductionSupervisorError>>,
-    source_shutdown: Duration,
+    supervisor: tokio::task::JoinHandle<ProductionSupervisorRunOutcome>,
+    publication: AlpacaPublicationRuntime,
+    supervisor_result: Option<Result<(), ProductionDisplaySourceRuntimeError>>,
+    shutdown_result: Option<Result<(), ProductionDisplaySourceRuntimeError>>,
+}
+
+/// Startup cause stays separate from the original supervisor's cleanup result.
+#[derive(Debug)]
+pub(crate) struct ProductionDisplaySourceStartFailure {
+    pub(crate) cause: ProductionDisplaySourceRuntimeError,
+    pub(crate) cleanup: Result<(), ProductionDisplaySourceRuntimeError>,
+}
+
+impl ProductionDisplaySourceStartFailure {
+    fn before_owner(error: impl Into<ProductionDisplaySourceRuntimeError>) -> Self {
+        Self {
+            cause: error.into(),
+            cleanup: Ok(()),
+        }
+    }
 }
 
 impl ProductionDisplaySourceRuntime {
@@ -44,25 +67,35 @@ impl ProductionDisplaySourceRuntime {
         directory: DisplayMarketDirectory,
         source: AlpacaIexLiveConfig,
         credentials: Arc<AlpacaCredentials>,
+        publication: AlpacaPublicationRuntimeInput,
         actor_limits: DisplayMarketActorLimits,
         read_admission: DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
+        catalog: ProductionCatalogSelection,
+        deadline: std::time::Instant,
+        caller_cancellation: &CancellationToken,
         cancellation: CancellationToken,
-    ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
+    ) -> Result<Self, ProductionDisplaySourceStartFailure> {
         let routes = display_routes(
             source.metadata(),
             source.mappings().iter().map(|mapping| mapping.instrument()),
             DisplayTopology::PartialVenue,
-        )?;
-        let profile = ProductionSourceProfile::alpaca_iex(source, credentials)?;
+        )
+        .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
+        let profile = ProductionSourceProfile::alpaca_iex(source, credentials, publication.references())
+            .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
         Self::start(
             app_config,
             directory,
             profile,
+            publication,
             routes,
             actor_limits,
             read_admission,
             provider_rate,
+            catalog,
+            deadline,
+            caller_cancellation,
             cancellation,
         )
         .await
@@ -78,25 +111,35 @@ impl ProductionDisplaySourceRuntime {
         directory: DisplayMarketDirectory,
         source: AlpacaOptionsLiveConfig,
         credentials: Arc<AlpacaCredentials>,
+        publication: AlpacaPublicationRuntimeInput,
         actor_limits: DisplayMarketActorLimits,
         read_admission: DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
+        catalog: ProductionCatalogSelection,
+        deadline: std::time::Instant,
+        caller_cancellation: &CancellationToken,
         cancellation: CancellationToken,
-    ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
+    ) -> Result<Self, ProductionDisplaySourceStartFailure> {
         let routes = display_routes(
             source.metadata(),
             source.mappings().iter().map(|mapping| mapping.instrument()),
             DisplayTopology::SingleVenue,
-        )?;
-        let profile = ProductionSourceProfile::alpaca_options(source, credentials)?;
+        )
+        .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
+        let profile = ProductionSourceProfile::alpaca_options(source, credentials, publication.references())
+            .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
         Self::start(
             app_config,
             directory,
             profile,
+            publication,
             routes,
             actor_limits,
             read_admission,
             provider_rate,
+            catalog,
+            deadline,
+            caller_cancellation,
             cancellation,
         )
         .await
@@ -106,17 +149,26 @@ impl ProductionDisplaySourceRuntime {
         app_config: AppConfig,
         directory: DisplayMarketDirectory,
         profile: ProductionSourceProfile,
+        publication: AlpacaPublicationRuntimeInput,
         routes: Vec<DisplayMarketRouteIdentity>,
         actor_limits: DisplayMarketActorLimits,
         read_admission: DisplayMarketReadAdmission,
         provider_rate: ProviderRateAuthority,
+        catalog: ProductionCatalogSelection,
+        deadline: std::time::Instant,
+        caller_cancellation: &CancellationToken,
         cancellation: CancellationToken,
-    ) -> Result<Self, ProductionDisplaySourceRuntimeError> {
-        let paths = LocalPaths::prepare(app_config.data_dir())?;
+    ) -> Result<Self, ProductionDisplaySourceStartFailure> {
+        let paths = LocalPaths::prepare(app_config.data_dir())
+            .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
         let capture_process =
             initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
                 app_config.capture_destination_registry_memory_ceiling_bytes(),
-            ))?;
+            ))
+            .map_err(ProductionDisplaySourceStartFailure::before_owner)?;
+        let (publication_ingress, publication_receiver) = AlpacaCapturedPublicationIngress::try_channel(
+            app_config.capture_queue_capacity(), app_config.capture_memory_ceiling_bytes().get(),
+        ).map_err(|_| ProductionDisplaySourceStartFailure::before_owner(ProductionDisplaySourceRuntimeError::Allocation))?;
         let supervisor = ProductionSourceSupervisor::try_new_display_with_provider_rate(
             &app_config,
             profile,
@@ -127,47 +179,113 @@ impl ProductionDisplaySourceRuntime {
             actor_limits,
             read_admission,
             provider_rate,
-        )?;
-        let source_shutdown = app_config.source_shutdown();
+            &catalog,
+            deadline,
+            caller_cancellation,
+        )
+        .map_err(|(cause, cleanup)| ProductionDisplaySourceStartFailure {
+            cause: ProductionDisplaySourceRuntimeError::Supervisor(cause),
+            cleanup: cleanup.map_err(ProductionDisplaySourceRuntimeError::Supervisor),
+        })?;
+        let supervisor = supervisor.with_publication(ProductionCapturedPublicationIngress::Alpaca(publication_ingress));
+        let mut publication = AlpacaPublicationRuntime::start(
+            publication, publication_receiver, app_config.source_shutdown().max(app_config.capture_shutdown()), cancellation.clone(),
+        );
         let (startup_sender, startup_receiver) = oneshot::channel();
         let supervisor_cancellation = cancellation.clone();
         let mut supervisor_task = tokio::spawn(async move {
             supervisor
-                .run(supervisor_cancellation, startup_sender)
+                .run_with_cleanup(supervisor_cancellation, startup_sender)
                 .await
         });
-        tokio::select! {
+        let failure = tokio::select! {
             startup = startup_receiver => match startup {
-                Ok(()) => Ok(Self {
+                Ok(()) => return Ok(Self {
                     supervisor_cancellation: DisplaySupervisorCancellation::new(cancellation),
-                    supervisor: supervisor_task,
-                    source_shutdown,
+                    supervisor: supervisor_task, publication, supervisor_result: None,
+                    shutdown_result: None,
                 }),
-                Err(_closed) => Err(map_startup_outcome(supervisor_task.await)),
+                Err(_closed) => map_startup_outcome(supervisor_task.await),
             },
-            outcome = &mut supervisor_task => Err(map_startup_outcome(outcome)),
-        }
+            outcome = &mut supervisor_task => map_startup_outcome(outcome),
+        };
+        publication.begin_shutdown();
+        let cleanup = publication.finish_retained_shutdown().await;
+        Err(ProductionDisplaySourceStartFailure {
+            cause: failure.cause,
+            cleanup: failure.cleanup.and(cleanup.map_err(|_| ProductionDisplaySourceRuntimeError::Publication)),
+        })
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.publication.begin_shutdown();
+        self.supervisor_cancellation.cancel();
     }
 
     /// Reports whether this child supervisor still owns a source generation.
     pub(crate) fn is_healthy(&self) -> bool {
-        !self.supervisor_cancellation.token.is_cancelled() && !self.supervisor.is_finished()
+        !self.supervisor_cancellation.token.is_cancelled() && !self.supervisor.is_finished() && self.publication.is_healthy()
     }
 
-    /// Cancels, unregisters, and reaps this source without shutting down the shared directory.
-    pub(crate) async fn shutdown(mut self) -> Result<(), ProductionDisplaySourceRuntimeError> {
+    /// Retains the exact child and joined outcome when a shutdown waiter is interrupted.
+    pub(crate) async fn finish_shutdown_before(
+        &mut self,
+        deadline: std::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), market_squawk_services::ServiceError> {
+        use market_squawk_services::ServiceError;
+        self.publication.begin_shutdown();
         self.supervisor_cancellation.cancel();
-        match tokio::time::timeout(self.source_shutdown, &mut self.supervisor).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(error))) => Err(ProductionDisplaySourceRuntimeError::Supervisor(error)),
-            Ok(Err(error)) => Err(ProductionDisplaySourceRuntimeError::SupervisorTask(error)),
-            Err(_elapsed) => {
-                self.supervisor.abort();
-                let _aborted = self.supervisor.await;
-                Err(ProductionDisplaySourceRuntimeError::SupervisorShutdownDeadline)
+        if let Some(result) = &self.shutdown_result {
+            return result
+                .as_ref()
+                .map(|()| ())
+                .map_err(|_| ServiceError::Unavailable);
+        }
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ServiceError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(ServiceError::DeadlineExceeded)
             }
+            result = self.finish_retained_shutdown() => result,
         }
     }
+
+    /// Joins under retained startup custody; ordinary waiters use the bounded finish method.
+    pub(crate) async fn finish_retained_shutdown(
+        &mut self,
+    ) -> Result<(), market_squawk_services::ServiceError> {
+        use market_squawk_services::ServiceError;
+        self.publication.begin_shutdown();
+        self.supervisor_cancellation.cancel();
+        if let Some(result) = &self.shutdown_result {
+            return result
+                .as_ref()
+                .map(|()| ())
+                .map_err(|_| ServiceError::Unavailable);
+        }
+        if self.supervisor_result.is_none() {
+            let outcome = (&mut self.supervisor).await;
+            self.supervisor_result = Some(display_cleanup_outcome(outcome));
+        }
+        let publication_result = self.publication.finish_retained_shutdown().await;
+        let result = self.supervisor_result.take().ok_or(ProductionDisplaySourceRuntimeError::Publication)
+            .and_then(|result| result)
+            .and(publication_result.map_err(|_| ProductionDisplaySourceRuntimeError::Publication));
+        let status = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::error!(%error, "retained account child cleanup failed");
+                Err(ServiceError::Unavailable)
+            }
+        };
+        // No await separates joining the child from retaining its terminal outcome.
+        self.shutdown_result = Some(result);
+        status
+    }
+
+
 }
 
 fn display_routes(
@@ -207,12 +325,38 @@ enum DisplayTopology {
 }
 
 fn map_startup_outcome(
-    outcome: Result<Result<(), ProductionSupervisorError>, tokio::task::JoinError>,
-) -> ProductionDisplaySourceRuntimeError {
+    outcome: Result<ProductionSupervisorRunOutcome, tokio::task::JoinError>,
+) -> ProductionDisplaySourceStartFailure {
     match outcome {
-        Ok(Ok(())) => ProductionDisplaySourceRuntimeError::SupervisorExitedBeforeStartup,
-        Ok(Err(error)) => ProductionDisplaySourceRuntimeError::Supervisor(error),
-        Err(error) => ProductionDisplaySourceRuntimeError::SupervisorTask(error),
+        Ok(outcome) => ProductionDisplaySourceStartFailure {
+            cause: outcome.run.err().map_or(
+                ProductionDisplaySourceRuntimeError::SupervisorExitedBeforeStartup,
+                ProductionDisplaySourceRuntimeError::Supervisor,
+            ),
+            cleanup: outcome
+                .cleanup
+                .map_err(ProductionDisplaySourceRuntimeError::Supervisor),
+        },
+        Err(error) => ProductionDisplaySourceStartFailure {
+            cause: ProductionDisplaySourceRuntimeError::SupervisorExitedBeforeStartup,
+            cleanup: Err(ProductionDisplaySourceRuntimeError::SupervisorTask(error)),
+        },
+    }
+}
+
+fn display_cleanup_outcome(
+    outcome: Result<ProductionSupervisorRunOutcome, tokio::task::JoinError>,
+) -> Result<(), ProductionDisplaySourceRuntimeError> {
+    match outcome {
+        Ok(outcome) => {
+            if let Err(error) = outcome.run {
+                tracing::warn!(%error, "display source ended before original cleanup");
+            }
+            outcome
+                .cleanup
+                .map_err(ProductionDisplaySourceRuntimeError::Supervisor)
+        }
+        Err(error) => Err(ProductionDisplaySourceRuntimeError::SupervisorTask(error)),
     }
 }
 
@@ -240,6 +384,8 @@ impl Drop for DisplaySupervisorCancellation {
 /// Display-only source startup or bounded shutdown failure.
 #[derive(Debug, Error)]
 pub(crate) enum ProductionDisplaySourceRuntimeError {
+    #[error("Alpaca durable publication worker failed")]
+    Publication,
     #[error("display source route allocation failed")]
     Allocation,
     #[error("display source metadata has an incompatible coverage topology")]
@@ -248,8 +394,6 @@ pub(crate) enum ProductionDisplaySourceRuntimeError {
     DuplicateRoute,
     #[error("display source supervisor exited before first qualified data readiness")]
     SupervisorExitedBeforeStartup,
-    #[error("display source supervisor exceeded its shutdown deadline")]
-    SupervisorShutdownDeadline,
     #[error(transparent)]
     DisplayDirectory(#[from] DisplayMarketDirectoryError),
     #[error(transparent)]

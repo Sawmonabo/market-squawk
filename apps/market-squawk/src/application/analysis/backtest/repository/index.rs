@@ -11,6 +11,7 @@ use super::super::{
     BacktestScope, GovernedBacktestCommand, GovernedBacktestDiscoveryEntry,
     GovernedBacktestDiscoveryPage, GovernedBacktestDiscoveryQuery, GovernedBacktestRecord,
 };
+use super::recommendation::StoredRecommendationTerminalV1;
 use super::{
     GovernedBacktestRepositoryLimits, ProductionGovernedBacktestRepositoryError, strictly_ordered,
 };
@@ -21,12 +22,40 @@ const TERMINAL_INDEX_SCHEMA_VERSION: u16 = 1;
 #[derive(Clone)]
 pub(super) struct TerminalIndex {
     pub(super) entries: Vec<StoredTerminal>,
+    pub(super) recommendation_entries: Vec<StoredRecommendationTerminalV1>,
 }
 
 impl TerminalIndex {
+    pub(super) fn backup_artifacts(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<market_squawk_services::ArtifactReference>, ServiceError> {
+        let mut all = std::collections::BTreeMap::new();
+        for terminal in &self.recommendation_entries {
+            for reference in terminal.backup_artifacts()? {
+                if let Some(existing) = all.get(reference.id()) {
+                    if existing != &reference {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                } else {
+                    if all.len() >= maximum {
+                        return Err(ServiceError::ResourceExhausted);
+                    }
+                    all.insert(reference.id().to_owned(), reference);
+                }
+            }
+        }
+        Ok(all.into_values().collect())
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.recommendation_entries.is_empty()
+    }
+
     pub(super) const fn empty() -> Self {
         Self {
             entries: Vec::new(),
+            recommendation_entries: Vec::new(),
         }
     }
 
@@ -40,7 +69,7 @@ impl TerminalIndex {
         let wire: TerminalIndexWire = serde_json::from_slice(bytes)
             .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?;
         if wire.schema_version != TERMINAL_INDEX_SCHEMA_VERSION
-            || wire.entries.len() > limits.maximum_terminals
+            || wire.entries.len() + wire.recommendation_entries.len() > limits.maximum_terminals
         {
             return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
         }
@@ -77,7 +106,22 @@ impl TerminalIndex {
         {
             return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
         }
-        let index = Self { entries };
+        for entry in &wire.recommendation_entries {
+            entry
+                .validate(limits.maximum_index_bytes)
+                .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?;
+        }
+        if wire
+            .recommendation_entries
+            .windows(2)
+            .any(|pair| pair[0].evidence_digest() >= pair[1].evidence_digest())
+        {
+            return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
+        }
+        let index = Self {
+            entries,
+            recommendation_entries: wire.recommendation_entries,
+        };
         if index
             .encode(limits)
             .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?
@@ -92,7 +136,7 @@ impl TerminalIndex {
         &self,
         limits: GovernedBacktestRepositoryLimits,
     ) -> Result<Vec<u8>, ProductionGovernedBacktestRepositoryError> {
-        if self.entries.len() > limits.maximum_terminals {
+        if self.entries.len() + self.recommendation_entries.len() > limits.maximum_terminals {
             return Err(ProductionGovernedBacktestRepositoryError::ResourceExhausted);
         }
         let mut entries = Vec::new();
@@ -111,6 +155,7 @@ impl TerminalIndex {
         let bytes = serde_json::to_vec(&TerminalIndexView {
             schema_version: TERMINAL_INDEX_SCHEMA_VERSION,
             entries,
+            recommendation_entries: &self.recommendation_entries,
         })
         .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?;
         if bytes.len() > limits.maximum_index_bytes
@@ -202,6 +247,8 @@ impl PartialEq for StoredTerminal {
 struct TerminalIndexView<'a> {
     schema_version: u16,
     entries: Vec<TerminalEntryView<'a>>,
+    #[serde(skip_serializing_if = "<[StoredRecommendationTerminalV1]>::is_empty")]
+    recommendation_entries: &'a [StoredRecommendationTerminalV1],
 }
 
 #[derive(Serialize)]
@@ -219,6 +266,8 @@ struct TerminalEntryView<'a> {
 struct TerminalIndexWire {
     schema_version: u16,
     entries: Vec<TerminalEntryWire>,
+    #[serde(default)]
+    recommendation_entries: Vec<StoredRecommendationTerminalV1>,
 }
 
 #[derive(Deserialize)]
@@ -231,9 +280,9 @@ struct TerminalEntryWire {
     record: Value,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CommandWire {
+pub(super) struct CommandWire {
     strategy_id: SourceIdentifier,
     input_id: SourceIdentifier,
     instruments: Vec<InstrumentId>,
@@ -244,7 +293,7 @@ struct CommandWire {
 }
 
 impl CommandWire {
-    fn from_command(command: &GovernedBacktestCommand) -> Self {
+    pub(super) fn from_command(command: &GovernedBacktestCommand) -> Self {
         let time_ranges = command.scope().time_ranges();
         Self {
             strategy_id: command.strategy_id().clone(),
@@ -267,7 +316,7 @@ impl CommandWire {
         }
     }
 
-    fn into_command(
+    pub(super) fn into_command(
         self,
     ) -> Result<GovernedBacktestCommand, ProductionGovernedBacktestRepositoryError> {
         if !strictly_ordered(&self.instruments) || !strictly_ordered(&self.sources) {
@@ -297,7 +346,7 @@ impl CommandWire {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TimeRangeWire {
     starts_at_unix_nanos: i64,

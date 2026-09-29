@@ -37,6 +37,10 @@ pub(crate) enum ProviderCatalogRelation {
     MarketEventSelectionIndex,
     DirectProviderCaptureBinding,
     DirectProviderPublicationBinding,
+    LogicalOriginal,
+    LogicalOriginalObject,
+    CaptureOriginal,
+    LogicalPartitionArtifact,
 }
 
 impl ProviderCatalogRelation {
@@ -54,6 +58,10 @@ impl ProviderCatalogRelation {
             Self::MarketEventSelectionIndex => 10,
             Self::DirectProviderCaptureBinding => 11,
             Self::DirectProviderPublicationBinding => 12,
+            Self::LogicalOriginal => 13,
+            Self::LogicalOriginalObject => 14,
+            Self::CaptureOriginal => 15,
+            Self::LogicalPartitionArtifact => 16,
         }
     }
 
@@ -75,6 +83,10 @@ impl ProviderCatalogRelation {
             Self::MarketEventSelectionIndex => "provider_market_event_selection_index",
             Self::DirectProviderCaptureBinding => "ingest_run_provider_capture_bindings",
             Self::DirectProviderPublicationBinding => "ingest_run_provider_publication_bindings",
+            Self::LogicalOriginal => "provider_logical_originals",
+            Self::LogicalOriginalObject => "provider_logical_original_objects",
+            Self::CaptureOriginal => "provider_capture_originals",
+            Self::LogicalPartitionArtifact => "ingest_run_provider_logical_partition_artifacts",
         }
     }
 
@@ -96,6 +108,10 @@ impl ProviderCatalogRelation {
             "provider_market_event_selection_index" => Self::MarketEventSelectionIndex,
             "ingest_run_provider_capture_bindings" => Self::DirectProviderCaptureBinding,
             "ingest_run_provider_publication_bindings" => Self::DirectProviderPublicationBinding,
+            "provider_logical_originals" => Self::LogicalOriginal,
+            "provider_logical_original_objects" => Self::LogicalOriginalObject,
+            "provider_capture_originals" => Self::CaptureOriginal,
+            "ingest_run_provider_logical_partition_artifacts" => Self::LogicalPartitionArtifact,
             _ => return None,
         })
     }

@@ -213,6 +213,14 @@ impl PortfolioLedger {
         Ok(Some(current.transaction.revision))
     }
 
+    /// Releases older full materializations after their immutable publication owner has retained
+    /// any readers. The exact latest predecessor and complete active transaction lineage remain.
+    pub fn retain_latest_materialization(&mut self) {
+        if self.history.len() > 1 {
+            self.history.drain(..self.history.len() - 1);
+        }
+    }
+
     /// Returns immutable published revision history in publication order.
     pub fn history(&self) -> &[PortfolioRevision] {
         &self.history
@@ -233,7 +241,7 @@ impl PortfolioLedger {
                 entry.account_id != self.account_id || entry.occurred_at > evidence.as_of
             })
             || plan.is_some_and(|candidate| {
-                candidate.knowledge_cutoff() > evidence.as_of
+                candidate.knowledge_cutoff() > evidence.knowledge_cutoff
                     || candidate.valuation_cutoff() > evidence.as_of
             })
         {

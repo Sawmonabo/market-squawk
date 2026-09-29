@@ -15,7 +15,7 @@ mod settings;
 mod source_data_backup;
 mod update;
 mod update_journal;
-mod workspace_backup;
+pub(super) mod workspace_backup;
 mod workspace_restore;
 
 pub(crate) use backup::ManagedBackupRepository;

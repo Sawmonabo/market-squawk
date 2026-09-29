@@ -27,7 +27,6 @@ mod reaper;
 pub(crate) use reaper::await_contained_processes;
 use reaper::{PROCESS_CLEANUP_DEADLINE, ProcessCleanupReservation, ProcessExecutionReservation};
 
-const MAXIMUM_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 const MAXIMUM_ARGUMENTS: usize = 128;
 const MAXIMUM_ARGUMENT_BYTES: usize = 16 * 1024;
 const STDOUT_FRAME_CHANNEL_CAPACITY: usize = 8;
@@ -41,9 +40,6 @@ pub enum ProcessProgramError {
     /// Program bytes did not match the admitted SHA-256 evidence.
     #[error("worker program digest does not match admission")]
     DigestMismatch,
-    /// Program bytes exceeded the hard admission ceiling.
-    #[error("worker program exceeds the byte ceiling")]
-    ProgramTooLarge,
     /// Program I/O was unavailable.
     #[error("worker program is unavailable")]
     Unavailable,
@@ -81,9 +77,6 @@ impl AdmittedProcessProgram {
                 return Err(ProcessProgramError::InvalidProgram);
             }
         }
-        if metadata.len() > MAXIMUM_PROGRAM_BYTES {
-            return Err(ProcessProgramError::ProgramTooLarge);
-        }
         let canonical = path
             .canonicalize()
             .map_err(|_| ProcessProgramError::Unavailable)?;
@@ -114,10 +107,10 @@ impl AdmittedProcessProgram {
 fn hash_file(path: &Path, expected_len: u64) -> Result<EvidenceDigest, ProcessProgramError> {
     let file = File::open(path).map_err(|_| ProcessProgramError::Unavailable)?;
     let mut hasher = Sha256::new();
-    let copied = std::io::copy(&mut file.take(MAXIMUM_PROGRAM_BYTES + 1), &mut hasher)
+    let copied = std::io::copy(&mut file.take(expected_len.saturating_add(1)), &mut hasher)
         .map_err(|_| ProcessProgramError::Unavailable)?;
-    if copied != expected_len || copied > MAXIMUM_PROGRAM_BYTES {
-        return Err(ProcessProgramError::ProgramTooLarge);
+    if copied != expected_len {
+        return Err(ProcessProgramError::DigestMismatch);
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,

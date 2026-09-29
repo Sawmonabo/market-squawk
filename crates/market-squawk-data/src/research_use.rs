@@ -9,6 +9,9 @@ mod identity;
 mod model;
 mod permit;
 mod persistence;
+pub(crate) use persistence::{
+    RetainedSourceUseGrant, SourceGrantSelection, select_source_use_grant, source_use_frontier,
+};
 mod publication;
 mod traversal;
 

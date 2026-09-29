@@ -10,12 +10,27 @@ use crate::{
     SourceIdentifier,
 };
 
+#[path = "research/corporate_action_source.rs"]
+mod corporate_action_source;
+pub use corporate_action_source::{
+    CorporateActionEconomicQueryContract, CorporateActionEconomicSourceScope, CorporateActionEconomicTerms,
+    CorporateActionEventInstrumentIdentity, CorporateActionQueryInstrumentIdentity,
+    CorporateActionSourceCategory, CorporateActionSourceDates, CorporateActionSourceDisposition,
+    CorporateActionSourceError, CorporateActionSourceObservation,
+    CorporateActionSourceObservationInput, CorporateActionSourcePayload,
+    CorporateActionSourceQueryContract, CorporateActionSourceScope,
+};
+
 #[path = "research/fund_holdings.rs"]
 mod fund_holdings;
 #[path = "research/fund_nav.rs"]
 mod fund_nav;
 #[path = "research/fundamental_context.rs"]
 mod fundamental_context;
+#[path = "research/intraday_candle.rs"]
+mod intraday_candle;
+#[path = "research/market_calendar.rs"]
+mod market_calendar;
 #[path = "research/observations.rs"]
 mod observations;
 #[path = "research/portfolio_transactions.rs"]
@@ -48,11 +63,25 @@ pub use fundamental_context::{
     FundamentalFactContextInput, FundamentalPeriod, FundamentalRestatementStatus,
     FundamentalRevisionOrder,
 };
+pub use intraday_candle::{
+    CandleTimestampBasis, IntradayCandleFinality, IntradayCandleObservation,
+    IntradayCandleObservationInput, MAX_INTRADAY_CANDLE_INTERVAL_SECONDS, MarketSnapshotError,
+    MarketSnapshotVolume, MarketSnapshotVolumeUnit, MarketSourceText,
+};
+pub use market_calendar::{
+    MARKET_CALENDAR_DATE_MEMBERSHIP_DOMAIN, MAX_MARKET_CALENDAR_DAYS,
+    MAX_MARKET_CALENDAR_INTERVALS, MarketCalendarBoundary, MarketCalendarCompleteness,
+    MarketCalendarDateScope, MarketCalendarDay, MarketCalendarDayInput, MarketCalendarDayStatus,
+    MarketCalendarField, MarketCalendarInterval, MarketCalendarMetadata, MarketCalendarObservation,
+    MarketCalendarObservationError, MarketCalendarObservationInput, MarketCalendarPayload,
+    MarketCalendarScope, MarketCalendarSessionPresence, MarketCalendarSessionRole,
+};
 pub use observations::{
     AlternativeDataObservation, BarTimeSemantics, BarTimestampBasis, CorporateActionObservation,
     FilingObservation, FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue,
     MarketBarAdjustment, MarketBarObservation, MarketBarSessionEvidence, MarketBarSessionKind,
-    PositionObservation, TransactionObservation, UniverseMembershipObservation,
+    NominalDailyDate, PositionObservation, TimestampedBarPeriod, TransactionObservation,
+    UniverseMembershipObservation,
 };
 pub use portfolio_transactions::{
     NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
@@ -68,6 +97,33 @@ pub use xbrl::{
     XbrlRelationshipEvidence, XbrlSign, XbrlTaxonomySet, XbrlTaxonomyStatus, XbrlText,
     XbrlTypedMemberValidation, XbrlUnitExpression, XbrlXmlEvent,
 };
+
+/// Knowledge basis of a producer-qualified historical study.
+///
+/// This declaration does not itself establish source availability or admit a study. The
+/// dataset and analytical authorities bind it to retained inputs and actual source clocks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalStudyBasis {
+    /// Inputs were evidenced as available at each historical decision coordinate.
+    HistoricalAsKnown,
+    /// Simulated decisions use an immutable later-acquired snapshot with disclosed limitations.
+    RetrospectiveFrozenSnapshot,
+}
+
+/// A retained qualification on what a historical study can establish.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalStudyLimitation {
+    /// The retained sources do not establish complete historical revision coverage.
+    HistoricalRevisionCoverageUnproven,
+    /// Inputs may contain revisions or information from after the simulated decision.
+    LaterVintageInputs,
+    /// The study evaluates a predeclared present-day cohort, not a historical market universe.
+    PresentDayFixedCohort,
+    /// Decision-time availability is a simulation assumption, not source evidence.
+    SimulatedAvailability,
+}
 
 /// Direction of a nonzero portfolio position.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -98,12 +154,16 @@ pub enum ResearchObservation {
     MarketBar(MarketBarObservation),
     /// Exact daily net asset value for one resolved fund/share class.
     FundNav(FundNavObservation),
+    /// Source calendar coverage and its exact dated native session rows.
+    MarketCalendar(MarketCalendarObservation),
     /// Account position as of an effective time.
     PortfolioPosition(PositionObservation),
     /// Source transaction record.
     Transaction(TransactionObservation),
     /// Corporate action obtained through research ingestion.
     CorporateAction(CorporateActionObservation),
+    /// Source query summary or returned action disposition; independent of economic admission.
+    CorporateActionSource(CorporateActionSourceObservation),
     /// Source-authored historical instrument-universe membership.
     UniverseMembership(UniverseMembershipObservation),
     /// User-owned, licensed, or public alternative dataset observation.
@@ -193,6 +253,7 @@ impl ResearchObservation {
                 revision_evidence: value.revision_evidence().clone(),
             })
             .map(Self::FundNav),
+            Self::MarketCalendar(value) => Ok(Self::MarketCalendar(value.with_revision(revision))),
             Self::PortfolioPosition(value) => PositionObservation::new(
                 value.context().with_revision(revision),
                 value.account_id().clone(),
@@ -206,6 +267,9 @@ impl ResearchObservation {
                 value.transaction_type().clone(),
                 value.source_record_id().clone(),
             ))),
+            Self::CorporateActionSource(value) => {
+                Ok(Self::CorporateActionSource(value.with_revision(revision)))
+            }
             Self::CorporateAction(value) => CorporateActionObservation::new(
                 value.context().with_revision(revision),
                 value.action().clone(),
@@ -243,14 +307,18 @@ pub enum ResearchError {
     InvalidMacroValueState,
     /// Fundamental source context is internally inconsistent or disagrees with PIT evidence.
     FundamentalContext(FundamentalContextError),
-    /// A market bar lacks an exact effective timestamp.
-    MarketBarRequiresExactEffectiveTime,
+    /// A market bar effective coordinate disagrees with its source time precision or value.
+    MarketBarEffectiveCoordinateMismatch,
+    /// A nominal daily bar has missing or mismatched exact native payload evidence.
+    InvalidNominalDailyDateEvidence,
     /// A market-bar aggregation period is empty or reversed.
     InvalidMarketBarTimeRange,
     /// Market-bar session evidence carries no usable exact identity.
     InvalidMarketBarSessionEvidence,
     /// Canonical effective/provenance time disagrees with the declared provider boundary.
     MarketBarProviderTimestampMismatch,
+    /// A market bar lacks conservative source availability evidence.
+    MarketBarRequiresConservativeAvailability,
     /// Conservative point-in-time availability does not establish completed-bar knowledge.
     MarketBarUnavailableBeforeCompletion,
     /// A market bar price is zero or negative.
@@ -306,9 +374,11 @@ impl fmt::Display for ResearchError {
             Self::InvalidMacroValueState => formatter
                 .write_str("macro observation requires exactly one observed or missing value"),
             Self::FundamentalContext(error) => error.fmt(formatter),
-            Self::MarketBarRequiresExactEffectiveTime => {
-                formatter.write_str("market bar requires an exact effective timestamp")
-            }
+            Self::MarketBarEffectiveCoordinateMismatch => formatter.write_str(
+                "market bar effective coordinate must preserve its source time semantics",
+            ),
+            Self::InvalidNominalDailyDateEvidence => formatter
+                .write_str("nominal daily date requires matching nonzero native payload evidence"),
             Self::InvalidMarketBarTimeRange => {
                 formatter.write_str("market bar aggregation period must have a positive duration")
             }
@@ -318,6 +388,8 @@ impl fmt::Display for ResearchError {
             Self::MarketBarProviderTimestampMismatch => formatter.write_str(
                 "market bar effective and source timestamps must equal the provider boundary",
             ),
+            Self::MarketBarRequiresConservativeAvailability => formatter
+                .write_str("market bar requires conservative point-in-time availability evidence"),
             Self::MarketBarUnavailableBeforeCompletion => formatter.write_str(
                 "market bar availability must conservatively establish period completion",
             ),

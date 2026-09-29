@@ -71,7 +71,7 @@ impl JobRunner for ScenarioJobRunner {
             .await
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         JobRecoveryDisposition::MarkInterrupted
     }
 }

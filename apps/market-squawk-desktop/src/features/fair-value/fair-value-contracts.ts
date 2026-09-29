@@ -12,6 +12,7 @@ const amountSchema = z
       "per_instrument_unit",
       "reporting_entity_total",
       "position_total",
+      "total_common_equity",
     ]),
   })
   .strict()

@@ -1,3 +1,4 @@
+mod corporate_actions;
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
@@ -425,6 +426,7 @@ pub enum TiingoHttpSourceError {
 
 /// Credential-bearing, request-serialized Tiingo Starter HTTP source.
 pub struct TiingoHttpSource {
+    history_operation: Arc<tokio::sync::Mutex<()>>,
     requests: TiingoRequestBuilder,
     transport: Arc<dyn TiingoTransport>,
     budget: SharedProviderBudget,
@@ -461,6 +463,19 @@ impl fmt::Debug for TiingoHttpSource {
 }
 
 impl TiingoHttpSource {
+    /// Serializes original history custody and checkpoint progression for this installed source.
+    pub async fn acquire_history_operation(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, TiingoProviderAuthorityError> {
+        tokio::select! { biased;
+            _=cancellation.cancelled()=>Err(TiingoProviderAuthorityError::Unavailable),
+            _=tokio::time::sleep_until(deadline.into())=>Err(TiingoProviderAuthorityError::Unavailable),
+            owner=Arc::clone(&self.history_operation).lock_owned()=>Ok(owner),
+        }
+    }
+
     /// Returns sanitized shared provider/account availability without reserving or charging a
     /// request and without exposing the credential, client, declaration, or durable store.
     pub fn provider_rate_availability(
@@ -562,6 +577,7 @@ impl TiingoHttpSource {
             TiingoSchemaCircuitState::Open(change) => Some(change),
         };
         Ok(Self {
+            history_operation: Arc::new(tokio::sync::Mutex::new(())),
             requests: TiingoRequestBuilder::new(client, token),
             transport,
             budget,
@@ -1220,6 +1236,14 @@ impl TiingoHttpSource {
             http.received_at,
         )?;
         let dataset = match request.endpoint() {
+            TiingoEndpointFamily::CorporateActionDistributions => {
+                SourceIdentifier::try_from("tiingo-corporate-action-distributions")
+                    .map_err(|_| ProviderCaptureError::ReceiptBindingMismatch)?
+            }
+            TiingoEndpointFamily::CorporateActionSplits => {
+                SourceIdentifier::try_from("tiingo-corporate-action-splits")
+                    .map_err(|_| ProviderCaptureError::ReceiptBindingMismatch)?
+            }
             TiingoEndpointFamily::Metadata => self.metadata_dataset.clone(),
             TiingoEndpointFamily::LatestDailyPrices => self.latest_dataset.clone(),
             TiingoEndpointFamily::HistoricalDailyPrices => self.history_dataset.clone(),

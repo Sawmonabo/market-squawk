@@ -26,6 +26,7 @@ use crate::strategy::BacktestStrategy;
 
 mod accounting;
 
+pub(crate) use accounting::RecommendationAccounting;
 use accounting::{ShadowPortfolio, reconcile};
 
 /// Exact initial account state supplied to Task 16 reconciliation.
@@ -467,6 +468,9 @@ impl BacktestEngine {
         strategy: &mut dyn BacktestStrategy,
         cancellation: &CancellationToken,
     ) -> Result<BacktestRun, BacktestError> {
+        if request.dataset.daily_history.is_some() {
+            return Err(BacktestError::InvalidDataset);
+        }
         let mut clock = EventTimeClock::default();
         let mut simulator = ResearchFillSimulator::new(request.assumptions, request.seed);
         let mut pending = Vec::<PendingIntent>::new();

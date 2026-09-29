@@ -7,11 +7,14 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use market_squawk_data::{
-    ArrowConversionError, FundLatestUnavailableReason, FundPointInTimeOutcome, IngestError,
-    PointInTimeLimits, PointInTimeRevisionMode, PointInTimeRevisionState, SecFundJobFamily,
+    AnalyticalFundNavReadLimit, AnalyticalReadError, ArrowConversionError, CanonicalFundNavOutput,
+    CanonicalFundNavReadRequest, DatasetManifestRef, FundLatestUnavailableReason,
+    FundNavDateSelection, FundNavSelectionPolicy, FundPointInTimeOutcome, IngestError,
+    ManifestCatalogError, ParquetStoreError, PointInTimeLimits, PointInTimeRevisionMode,
+    PointInTimeRevisionState, QueryError, QueryLimits, SecFundJobFamily,
     SecFundPointInTimeReadOutcome, SecFundPointInTimeReadRequest, SecResearchDisposition,
     SecResearchFamily, SecResearchIdentityOutcome, SecResearchIdentityReadRequest,
     SecResearchIdentitySelection, SecResearchReadError,
@@ -37,7 +40,8 @@ use super::{
         project_company_product,
     },
     fund_product::{
-        FundProductProjectionError, FundProductReadSet, FundProductResult, project_fund_product,
+        FundNavProductRead, FundProductProjectionError, FundProductReadSet, FundProductResult,
+        project_fund_product,
     },
 };
 use crate::ResearchService;
@@ -49,6 +53,10 @@ const MAX_COMPANY_RESEARCH_RESULT_ROWS: usize = 65_536;
 const MAX_COMPANY_RESEARCH_RETAINED_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMPANY_RESEARCH_OBJECT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FUND_RESEARCH_RECORDS: usize = 65_536;
+const MAX_FUND_NAV_RESULT_ROWS: u32 = 8;
+const MAX_FUND_NAV_QUERY_ROWS: u64 = 1_024;
+const MAX_FUND_NAV_QUERY_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_FUND_NAV_QUERY_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
 const COMPANY_RESEARCH_FAMILY_COUNT: usize = 3;
 
 /// Product-level point-in-time revision policy.
@@ -352,9 +360,8 @@ impl CompanyResearchReadCapability {
 
 /// Fixed product projection over canonical company and fund point-in-time reads.
 ///
-/// Private restart evidence never crosses this capability. Daily NAV remains unavailable until
-/// startup composition supplies an immutable canonical NAV generation selector; market price is
-/// never substituted.
+/// Private restart evidence never crosses this capability. Daily NAV uses the canonical
+/// latest-date selector independently of the two report families; market price is never substituted.
 #[derive(Clone, Debug)]
 pub(crate) struct ResearchProductReadCapability {
     canonical: CompanyResearchReadCapability,
@@ -452,20 +459,32 @@ impl ResearchProductReadCapability {
             .read_fund(annual_request, deadline, cancellation.child_token())
             .await
             .map_err(ResearchProductReadError::Canonical)?;
+        let nav = self
+            .read_fund_nav(
+                fund_instrument_id,
+                knowledge_at,
+                None,
+                deadline,
+                cancellation.child_token(),
+            )
+            .await?;
         let identity =
             self.read_identity(fund_instrument_id, knowledge_at, deadline, &cancellation)?;
         let (holding_identities, holding_evidence) =
             self.read_holding_identities(&portfolio, knowledge_at, deadline, &cancellation)?;
         let product = project_fund_product(
             FundProductReadSet::new(&portfolio, &annual),
-            None,
+            nav.as_ref()
+                .map(|read| FundNavProductRead::new(read.output())),
             product_identity(&identity)?,
             holding_identities,
         )
         .map_err(ResearchProductReadError::FundProjection)?;
+        check_operation(deadline, &cancellation).map_err(ResearchProductReadError::Canonical)?;
         Ok(FundProductRead {
             portfolio,
             annual,
+            nav,
             identity,
             holding_evidence,
             product,
@@ -488,12 +507,27 @@ impl ResearchProductReadCapability {
             .verify_fund_restart(&expected.annual, deadline, cancellation.child_token())
             .await
             .map_err(ResearchProductReadError::Canonical)?;
+        let request = expected.portfolio.request();
+        let nav = self
+            .read_fund_nav(
+                request.fund_instrument_id(),
+                request.knowledge_at(),
+                expected
+                    .nav
+                    .as_ref()
+                    .map(|read| read.selection().pinned().manifest()),
+                deadline,
+                cancellation.child_token(),
+            )
+            .await?;
+        verify_fund_nav_replay(expected.nav.as_ref(), nav.as_ref())?;
         let identity = self.verify_identity_restart(&expected.identity, deadline, &cancellation)?;
         let (holding_identities, holding_evidence) =
             self.verify_holding_identities(&expected.holding_evidence, deadline, &cancellation)?;
         let product = project_fund_product(
             FundProductReadSet::new(&portfolio, &annual),
-            None,
+            nav.as_ref()
+                .map(|read| FundNavProductRead::new(read.output())),
             product_identity(&identity)?,
             holding_identities,
         )
@@ -501,13 +535,73 @@ impl ResearchProductReadCapability {
         if product != expected.product {
             return Err(ResearchProductReadError::RestartConflict);
         }
+        check_operation(deadline, &cancellation).map_err(ResearchProductReadError::Canonical)?;
         Ok(FundProductRead {
             portfolio,
             annual,
+            nav,
             identity,
             holding_evidence,
             product,
         })
+    }
+
+    async fn read_fund_nav(
+        &self,
+        instrument_id: InstrumentId,
+        knowledge_cutoff: Timestamp,
+        exact_manifest: Option<&DatasetManifestRef>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CanonicalFundNavOutput>, ResearchProductReadError> {
+        check_operation(deadline, &cancellation).map_err(ResearchProductReadError::Canonical)?;
+        let limit = AnalyticalFundNavReadLimit::try_new(MAX_FUND_NAV_RESULT_ROWS)
+            .map_err(map_fund_nav_data_error)
+            .map_err(ResearchProductReadError::Canonical)?;
+        let request = match exact_manifest {
+            Some(manifest) => CanonicalFundNavReadRequest::try_exact(
+                instrument_id,
+                knowledge_cutoff,
+                FundNavDateSelection::Latest,
+                PointInTimeRevisionMode::LatestKnown,
+                limit,
+                FundNavSelectionPolicy::CANONICAL_V1,
+                manifest.clone(),
+            ),
+            None => CanonicalFundNavReadRequest::try_latest(
+                instrument_id,
+                knowledge_cutoff,
+                FundNavDateSelection::Latest,
+                PointInTimeRevisionMode::LatestKnown,
+                limit,
+                FundNavSelectionPolicy::CANONICAL_V1,
+            ),
+        }
+        .map_err(AnalyticalReadError::Manifest)
+        .map_err(map_fund_nav_data_error)
+        .map_err(ResearchProductReadError::Canonical)?;
+        // Keep these semantic query bounds identical during exact reopen. The separate absolute
+        // deadline still bounds every catalog/query operation and cancellation remains inherited.
+        let limits = QueryLimits::try_new_with_inline_bytes(
+            MAX_FUND_NAV_QUERY_ROWS,
+            MAX_FUND_NAV_QUERY_BYTES,
+            MAX_FUND_NAV_QUERY_BYTES,
+            MAX_FUND_NAV_QUERY_MEMORY_BYTES,
+            4,
+            2_048,
+            4_096,
+            Duration::from_secs(30),
+        )
+        .map_err(AnalyticalReadError::Query)
+        .map_err(map_fund_nav_data_error)
+        .map_err(ResearchProductReadError::Canonical)?;
+        self.canonical
+            .research
+            .analytical_reader()
+            .read_canonical_fund_nav(request, limits, deadline, cancellation)
+            .await
+            .map_err(map_fund_nav_data_error)
+            .map_err(ResearchProductReadError::Canonical)
     }
 
     fn read_identity(
@@ -608,6 +702,43 @@ type FundHoldingIdentityReads = (
     Box<[Option<InstrumentContextRead>]>,
 );
 
+fn verify_fund_nav_replay(
+    expected: Option<&CanonicalFundNavOutput>,
+    replayed: Option<&CanonicalFundNavOutput>,
+) -> Result<(), ResearchProductReadError> {
+    let (expected, replayed) = match (expected, replayed) {
+        (None, None) => return Ok(()),
+        (Some(expected), Some(replayed)) => (expected, replayed),
+        _ => return Err(ResearchProductReadError::RestartConflict),
+    };
+    let expected_selection = expected.selection();
+    let replayed_selection = replayed.selection();
+    let expected = expected.output();
+    let replayed = replayed.output();
+    let expected_query = expected.output();
+    let replayed_query = replayed.output();
+    // A latest lookup and an exact reopen have different selection-request digests. Compare the
+    // complete immutable selection, query and typed result instead of allowing a latest fallback.
+    if expected_selection.pinned().manifest() != replayed_selection.pinned().manifest()
+        || expected_selection.receipt() != replayed_selection.receipt()
+        || expected_selection.policy_digest() != replayed_selection.policy_digest()
+        || expected_selection.analytical_request() != replayed_selection.analytical_request()
+        || expected.request() != replayed.request()
+        || expected.source_id() != replayed.source_id()
+        || expected_query.manifest() != replayed_query.manifest()
+        || expected_query.object_graph_digest() != replayed_query.object_graph_digest()
+        || expected_query.query_identity() != replayed_query.query_identity()
+        || expected_query.result_digest() != replayed_query.result_digest()
+        || expected.candidate_count() != replayed.candidate_count()
+        || expected.selected_count() != replayed.selected_count()
+        || expected.returned_count() != replayed.returned_count()
+        || expected.observations() != replayed.observations()
+    {
+        return Err(ResearchProductReadError::RestartConflict);
+    }
+    Ok(())
+}
+
 fn product_identity(
     read: &InstrumentContextRead,
 ) -> Result<ResearchProductIdentity, ResearchProductReadError> {
@@ -654,6 +785,7 @@ impl fmt::Debug for CompanyProductRead {
 pub(crate) struct FundProductRead {
     portfolio: FundResearchRead,
     annual: FundResearchRead,
+    nav: Option<CanonicalFundNavOutput>,
     identity: InstrumentContextRead,
     holding_evidence: Box<[Option<InstrumentContextRead>]>,
     product: FundProductResult,
@@ -1651,6 +1783,47 @@ fn map_fund_data_error(error: IngestError) -> CanonicalResearchReadError {
             | ArrowConversionError::RecordLimitExceeded { .. },
         ) => CanonicalResearchReadError::ResourceExhausted,
         IngestError::ReplayConflict => CanonicalResearchReadError::RestartConflict,
+        _ => CanonicalResearchReadError::EvidenceConflict,
+    }
+}
+
+fn map_fund_nav_data_error(error: AnalyticalReadError) -> CanonicalResearchReadError {
+    match error {
+        AnalyticalReadError::Manifest(ManifestCatalogError::Cancelled)
+        | AnalyticalReadError::Query(QueryError::Cancelled)
+        | AnalyticalReadError::Parquet(ParquetStoreError::Cancelled) => {
+            CanonicalResearchReadError::Cancelled
+        }
+        AnalyticalReadError::Manifest(ManifestCatalogError::DeadlineExceeded)
+        | AnalyticalReadError::Query(QueryError::DeadlineExceeded)
+        | AnalyticalReadError::Parquet(
+            ParquetStoreError::ReadDeadlineExceeded | ParquetStoreError::RecoveryDeadlineExceeded,
+        ) => CanonicalResearchReadError::DeadlineExceeded,
+        AnalyticalReadError::Manifest(ManifestCatalogError::LockPoisoned) => {
+            CanonicalResearchReadError::AuthorityUnavailable
+        }
+        AnalyticalReadError::Manifest(
+            ManifestCatalogError::ObjectLimitExceeded { .. }
+            | ManifestCatalogError::CaptureInputLimitExceeded { .. }
+            | ManifestCatalogError::FundNavInputLimitExceeded { .. }
+            | ManifestCatalogError::CountOverflow
+            | ManifestCatalogError::AllocationContract,
+        )
+        | AnalyticalReadError::Query(
+            QueryError::RowLimitExceeded { .. }
+            | QueryError::ByteLimitExceeded { .. }
+            | QueryError::MemoryLimitExceeded { .. }
+            | QueryError::SizeOverflow
+            | QueryError::BlockingTaskLimitExceeded
+            | QueryError::ReaderMemoryBoundExceeded,
+        )
+        | AnalyticalReadError::Parquet(
+            ParquetStoreError::StagingLimitExceeded
+            | ParquetStoreError::ReadLimitExceeded
+            | ParquetStoreError::SizeOverflow
+            | ParquetStoreError::BlockingTaskLimitExceeded
+            | ParquetStoreError::RecoveryScanLimit,
+        ) => CanonicalResearchReadError::ResourceExhausted,
         _ => CanonicalResearchReadError::EvidenceConflict,
     }
 }

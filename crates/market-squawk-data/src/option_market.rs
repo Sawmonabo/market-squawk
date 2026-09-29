@@ -14,8 +14,8 @@ use market_squawk_domain::{
     OptionContractTermsInput, OptionExerciseStyle, OptionExpirationClass,
     OptionExpirationObservation, OptionExpirationObservationInput, OptionKind,
     OptionSettlementKind, OptionSnapshotObservation, OptionSnapshotObservationInput,
-    OptionUnderlyingObservation, ProviderChannel, ProviderInstrumentId, ProviderProduct,
-    QuantityLots, SourceId, SourceIdentifier, Timestamp, VenueId,
+    OptionUnderlyingObservation, ProviderChannel, ProviderInstrumentId, ProviderProduct, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS, OptionExpirationRange, OptionMarketBatchDisposition,
@@ -813,6 +813,7 @@ fn provider_option_schema_fingerprint() -> EvidenceDigest {
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/provider-option-market/schema/v1");
     digest.update(PROVIDER_OPTION_MARKET_SCHEMA_VERSION.to_be_bytes());
+    digest.update(b"native-option-contract-count-u64-v1");
     EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
 }
 
@@ -1032,11 +1033,11 @@ fn decode_completeness(payload: &[u8]) -> Result<OptionMarketCompleteness, Arrow
 struct SnapshotWire {
     terms: TermsWire,
     bid_price: ComponentWire<Money>,
-    bid_size: ComponentWire<QuantityLots>,
+    bid_size: ComponentWire<u64>,
     ask_price: ComponentWire<Money>,
-    ask_size: ComponentWire<QuantityLots>,
+    ask_size: ComponentWire<u64>,
     last_price: ComponentWire<Money>,
-    last_size: ComponentWire<QuantityLots>,
+    last_size: ComponentWire<u64>,
     mark_price: ComponentWire<Money>,
     trade_conditions: ComponentWire<Box<[SourceIdentifier]>>,
     volume: ComponentWire<u64>,

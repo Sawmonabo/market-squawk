@@ -169,8 +169,7 @@ pub(crate) fn parse_csv_selected_partitions(
     bytes: &[u8],
     limits: BoardParseLimits,
     original_observation_count: u64,
-    selected_series: &str,
-    dates: &[market_squawk_domain::CalendarDate; 11],
+    selected_rows: &[(&str, market_squawk_domain::CalendarDate)],
     rows_per_partition: u32,
     control: &dyn market_squawk_platform::ResearchObjectControl,
 ) -> Result<SelectedBoardCsv, BoardAdapterError> {
@@ -181,7 +180,11 @@ pub(crate) fn parse_csv_selected_partitions(
     };
     checkpoint()?;
     if contract.format() != BoardFileFormat::DdpCsvSeriesColumnV1
-        || dates.windows(2).any(|pair| pair[0] >= pair[1])
+        || !(1..=11).contains(&selected_rows.len())
+        || selected_rows
+            .iter()
+            .enumerate()
+            .any(|(index, row)| selected_rows[..index].contains(row))
         || rows_per_partition == 0
     {
         return Err(BoardAdapterError::InvalidContract);
@@ -201,10 +204,15 @@ pub(crate) fn parse_csv_selected_partitions(
     {
         return Err(BoardAdapterError::StructuralLimitExceeded);
     }
-    let selected_series_index = expected
+    let selected_series_indices = selected_rows
         .iter()
-        .position(|series| series.unique_id() == selected_series)
-        .ok_or(BoardAdapterError::SeriesMismatch)?;
+        .map(|(identifier, _)| {
+            expected
+                .iter()
+                .position(|series| series.unique_id() == *identifier)
+                .ok_or(BoardAdapterError::SeriesMismatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let row_count = original_observation_count / expected.len() as u64;
     let mut reader = ReaderBuilder::new()
         .has_headers(false)
@@ -228,7 +236,7 @@ pub(crate) fn parse_csv_selected_partitions(
     offsets
         .try_reserve_exact(row_count as usize)
         .map_err(|_| BoardAdapterError::AllocationFailed)?;
-    let mut selected_rows = [None; 11];
+    let mut selected_offsets = vec![None; selected_rows.len()];
     let mut previous_period = None;
     loop {
         checkpoint()?;
@@ -254,8 +262,10 @@ pub(crate) fn parse_csv_selected_partitions(
         let crate::BoardPeriodValue::CalendarDate { date } = period.value() else {
             return Err(BoardAdapterError::FormatMismatch);
         };
-        if let Ok(index) = dates.binary_search(date) {
-            selected_rows[index] = Some(offsets.len() as u64);
+        for (index, (_, selected_date)) in selected_rows.iter().enumerate() {
+            if selected_date == date {
+                selected_offsets[index] = Some(offsets.len() as u64);
+            }
         }
         offsets.push(
             record
@@ -265,14 +275,14 @@ pub(crate) fn parse_csv_selected_partitions(
         );
         previous_period = Some(period);
     }
-    if offsets.len() as u64 != row_count || selected_rows.iter().any(Option::is_none) {
+    if offsets.len() as u64 != row_count || selected_offsets.iter().any(Option::is_none) {
         return Err(BoardAdapterError::SeriesMismatch);
     }
     let partition_size = u64::from(rows_per_partition);
     let mut partitions = BTreeSet::new();
-    for row in selected_rows {
-        let ordinal = selected_series_index as u64 * row_count
-            + row.ok_or(BoardAdapterError::SeriesMismatch)?;
+    for (series_index, row) in selected_series_indices.into_iter().zip(selected_offsets) {
+        let ordinal =
+            series_index as u64 * row_count + row.ok_or(BoardAdapterError::SeriesMismatch)?;
         partitions.insert(ordinal / partition_size);
     }
     let mut columns = vec![Vec::new(); expected.len()];

@@ -895,11 +895,11 @@ impl ResearchQueryEngine {
 
 fn feature_monetary_sql(table_name: &str, row: usize) -> String {
     format!(
-        "SELECT example_id, instrument_id, cutoff_at, component_kind, component_name, \
+        "SELECT example_id, instrument_id, source_selection_as_of, component_kind, component_name, \
          component_version, value_decimal_mantissa, value_decimal_scale, unit, currency, \
          lineage_sha256 FROM {table_name} WHERE component_kind = 1 \
          AND value_decimal_mantissa IS NOT NULL AND value_decimal_scale IS NOT NULL \
-         AND currency IS NOT NULL ORDER BY example_id, instrument_id, cutoff_at, \
+         AND currency IS NOT NULL ORDER BY example_id, instrument_id, source_selection_as_of, \
          component_name, component_version, lineage_sha256 LIMIT 1 OFFSET {row}"
     )
 }

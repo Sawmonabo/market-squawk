@@ -3,6 +3,9 @@
 pub(super) mod candidate;
 mod common;
 mod dossier;
+mod harmonic_history;
+pub(crate) use harmonic_history::{decode_harmonic_history_audit, encode_harmonic_history_audit};
+mod valuation_audit;
 mod proposal;
 mod published_analysis;
 mod recommendation;
@@ -25,6 +28,7 @@ use self::candidate::ExecutionWire;
 use self::common::revision_key;
 use self::dossier::DossierWire;
 use self::proposal::InvestmentProposalWire;
+pub use self::proposal::RecommendationPolicyParametersWire;
 use self::published_analysis::PreparedPublishedInvestmentAnalysisWire;
 use self::recommendation::{
     InvestmentAnalysisPublicationWire, InvestmentOutcomeProjectionWire,
@@ -65,6 +69,36 @@ impl EncodedRecord {
             payload,
         })
     }
+}
+
+pub(super) fn current_find_custody(
+    record: &super::current_find::CurrentFindCustodyRecord,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    record.validate()?;
+    EncodedRecord::try_new(
+        KIND_SCREEN_JOB_INPUT,
+        record.key(),
+        WireRecord::CurrentFindCustody(Box::new(record.clone())),
+    )
+}
+
+pub(super) fn decode_current_find_custody(
+    key: &str,
+    payload: &[u8],
+) -> Result<super::current_find::CurrentFindCustodyRecord, DecisionApplicationError> {
+    let envelope: WireEnvelope = serde_json::from_slice(payload)
+        .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+    if envelope.version != WIRE_VERSION {
+        return Err(DecisionApplicationError::InvalidPersistentState);
+    }
+    let WireRecord::CurrentFindCustody(record) = envelope.record else {
+        return Err(DecisionApplicationError::InvalidPersistentState);
+    };
+    record.validate()?;
+    if record.key() != key || current_find_custody(&record)?.payload != payload {
+        return Err(DecisionApplicationError::InvalidPersistentState);
+    }
+    Ok(*record)
 }
 
 pub(super) fn screen(screen: &SavedScreen) -> Result<EncodedRecord, DecisionApplicationError> {
@@ -143,7 +177,7 @@ pub(super) fn investment_proposal(
     if decision.evidence().selected_candidate().is_some() {
         return Err(DecisionApplicationError::InvalidPersistentState);
     }
-    let wire = InvestmentProposalWire::from(decision);
+    let wire = InvestmentProposalWire::try_from(decision)?;
     EncodedRecord::try_new(
         KIND_INVESTMENT_PROPOSAL,
         wire.key()?,
@@ -165,7 +199,7 @@ pub(super) fn investment_analysis_publication(
 pub(super) fn prepared_published_investment_analysis(
     bundle: &PreparedPublishedInvestmentAnalysis,
 ) -> Result<EncodedRecord, DecisionApplicationError> {
-    let wire = PreparedPublishedInvestmentAnalysisWire::from(bundle);
+    let wire = PreparedPublishedInvestmentAnalysisWire::try_from(bundle)?;
     EncodedRecord::try_new(
         KIND_INVESTMENT_PROPOSAL,
         wire.key()?,
@@ -204,6 +238,17 @@ pub(super) fn recommendation_outcome_status(
         wire.key(),
         WireRecord::RecommendationOutcomeStatus(wire),
     )
+}
+
+/// Structural journal validation while source-dependent semantic recovery is deferred.
+/// This grants no decision authority; the complete source replay must still succeed on reopen.
+pub(super) fn validate_record_envelope(kind: i64, payload: &[u8]) -> Result<(), DecisionApplicationError> {
+    let envelope: WireEnvelope = serde_json::from_slice(payload)
+        .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+    if envelope.version != WIRE_VERSION || envelope.record.kind() != kind || encode(&envelope)? != payload {
+        return Err(DecisionApplicationError::InvalidPersistentState);
+    }
+    Ok(())
 }
 
 fn encode(value: &impl Serialize) -> Result<Vec<u8>, DecisionApplicationError> {

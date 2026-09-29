@@ -4,8 +4,9 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
-    DecodedProviderBatch, DecoderEvidence, ProviderBookSide, ProviderOrderEvent,
-    ProviderOrderEventKind, SegmentedHttpResponseCapture,
+    DecodedProviderBatch, DecoderEvidence, ProviderBookSide, ProviderIdentitySelectionEvidence,
+    ProviderOrderEvent, ProviderOrderEventKind, SegmentedHttpResponseCapture,
+    SegmentedHttpResponseReceipt,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -37,6 +38,13 @@ pub enum CoinbaseMarketChannel {
 pub enum CoinbaseMarketContinuity {
     /// Advanced Trade supplied an envelope cursor, but this profile does not prove contiguity.
     ProviderCursorUnverified { terminal: u64 },
+    /// Same current capture generation continued from the preceding admitted frame.
+    /// This is provider continuity, never a claim of durable publication.
+    CapturedContiguous {
+        snapshot: SequenceNumber,
+        predecessor: SequenceNumber,
+        terminal: SequenceNumber,
+    },
     /// Direct replay proved every successor from the exact REST snapshot through `terminal`.
     SnapshotContiguous {
         snapshot: SequenceNumber,
@@ -49,7 +57,8 @@ impl CoinbaseMarketContinuity {
     pub const fn terminal(self) -> u64 {
         match self {
             Self::ProviderCursorUnverified { terminal } => terminal,
-            Self::SnapshotContiguous { terminal, .. } => terminal.get(),
+            Self::SnapshotContiguous { terminal, .. }
+            | Self::CapturedContiguous { terminal, .. } => terminal.get(),
         }
     }
 }
@@ -248,6 +257,51 @@ impl CoinbaseDirectInitialMarketLineage {
     }
 }
 
+/// Exact captured successor anchored to the original snapshot and preceding admitted frame.
+/// Construction is adapter-private. The receipt is a current capture witness, not a physical
+/// seal, canonical commit, or permission to publish a durable successor.
+#[derive(Debug)]
+pub struct CoinbaseDirectSuccessorMarketLineage {
+    snapshot: SegmentedHttpResponseReceipt,
+    predecessor: DecoderEvidence,
+    frames: Vec<CoinbaseDirectReplayFrame>,
+}
+
+impl CoinbaseDirectSuccessorMarketLineage {
+    pub(crate) fn new(
+        snapshot: SegmentedHttpResponseReceipt,
+        predecessor: DecoderEvidence,
+        frames: Vec<CoinbaseDirectReplayFrame>,
+    ) -> Self {
+        Self {
+            snapshot,
+            predecessor,
+            frames,
+        }
+    }
+    /// Returns the original segmented response identity without retaining its body again.
+    pub const fn snapshot(&self) -> &SegmentedHttpResponseReceipt {
+        &self.snapshot
+    }
+    /// Returns the exact previous frame, rather than a caller-authored sequence assertion.
+    pub const fn predecessor(&self) -> &DecoderEvidence {
+        &self.predecessor
+    }
+    /// Returns the exact contiguous raw successor frames.
+    pub fn frames(&self) -> &[CoinbaseDirectReplayFrame] {
+        &self.frames
+    }
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SegmentedHttpResponseReceipt,
+        DecoderEvidence,
+        Vec<CoinbaseDirectReplayFrame>,
+    ) {
+        (self.snapshot, self.predecessor, self.frames)
+    }
+}
+
 /// Closed raw lineage carried by one Coinbase market handoff.
 #[derive(Debug)]
 pub enum CoinbaseMarketRawLineage {
@@ -255,12 +309,18 @@ pub enum CoinbaseMarketRawLineage {
     AdvancedTrade(CapturePayload),
     /// Exact Direct level-3 snapshot plus all admitted post-cutoff replay frames.
     DirectInitial(CoinbaseDirectInitialMarketLineage),
+    /// Contiguous captured successors; durable predecessor validation remains application owned.
+    DirectSuccessor(CoinbaseDirectSuccessorMarketLineage),
 }
 
 impl CoinbaseMarketRawLineage {
     fn terminal_payload(&self) -> Option<&CapturePayload> {
         match self {
             Self::AdvancedTrade(payload) => Some(payload),
+            Self::DirectSuccessor(lineage) => lineage
+                .frames
+                .last()
+                .map(CoinbaseDirectReplayFrame::raw_payload),
             Self::DirectInitial(lineage) => lineage
                 .replay
                 .last()
@@ -296,6 +356,7 @@ pub struct CoinbaseMarketHandoffEvidence {
     product: ProviderProduct,
     configured_instrument: InstrumentId,
     venue: VenueId,
+    selected_public_identity: Option<ProviderIdentitySelectionEvidence>,
     request_set_digest: EvidenceDigest,
     subscription_digest: EvidenceDigest,
     subscription_acknowledgement: Option<ExactPayloadEvidence>,
@@ -343,6 +404,11 @@ impl CoinbaseMarketHandoffEvidence {
     /// Returns the exact venue identity.
     pub const fn venue(&self) -> &VenueId {
         &self.venue
+    }
+
+    /// Catalog-selected native coordinates and revision retained for the public feed.
+    pub const fn selected_public_identity(&self) -> Option<&ProviderIdentitySelectionEvidence> {
+        self.selected_public_identity.as_ref()
     }
 
     /// Returns SHA-256 over the selected secret-free request set.
@@ -447,6 +513,49 @@ impl CoinbaseMarketHandoff {
             {
                 validate_direct_initial(lineage, decoder, snapshot, terminal, &input)?;
             }
+            (
+                CoinbaseMarketRawLineage::DirectSuccessor(lineage),
+                CoinbaseMarketFeed::ExchangeDirectFull,
+                CoinbaseMarketChannel::Full,
+                CoinbaseMarketContinuity::CapturedContiguous {
+                    snapshot,
+                    predecessor,
+                    terminal,
+                },
+            ) if input.native_input_depth == Some(MarketDepth::OrderLevel)
+                && ((event_class == LiveEventClass::BookDelta
+                    && output_depth == Some(MarketDepth::PriceLevel))
+                    || (event_class == LiveEventClass::Quote && output_depth.is_none()))
+                && input.subscription_acknowledgement.is_some()
+                && input.snapshot_provider_at.is_some() =>
+            {
+                validate_direct_frames(
+                    &lineage.snapshot,
+                    &lineage.frames,
+                    decoder,
+                    predecessor,
+                    terminal,
+                    &input,
+                )?;
+                lineage
+                    .predecessor
+                    .currentness_lease()
+                    .validate_current()
+                    .map_err(|_| CoinbaseMarketHandoffError::StaleAuthority)?;
+                if predecessor < snapshot
+                    || !lineage
+                        .predecessor
+                        .binding()
+                        .shares_allocation_with(decoder.binding())
+                    || !lineage
+                        .predecessor
+                        .currentness_lease()
+                        .shares_authority_with(decoder.currentness_lease())
+                    || lineage.predecessor.frame_id().get() >= decoder.frame_id().get()
+                {
+                    return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
+                }
+            }
             _ => return Err(CoinbaseMarketHandoffError::ProfileMismatch),
         }
 
@@ -460,6 +569,7 @@ impl CoinbaseMarketHandoff {
                 product: input.product,
                 configured_instrument: input.configured_instrument,
                 venue: input.venue,
+                selected_public_identity: None,
                 request_set_digest: input.request_set_digest,
                 subscription_digest: input.subscription_digest,
                 subscription_acknowledgement: input.subscription_acknowledgement,
@@ -470,6 +580,46 @@ impl CoinbaseMarketHandoff {
             raw_lineage,
             typed_batch,
         })
+    }
+
+    /// Retains the pre-startup catalog selection beside the exact public frame. Current identity
+    /// and source authority are still supplied by the live registry at admission and publication.
+    pub(crate) fn bind_selected_public_identity(
+        &mut self,
+        selected: ProviderIdentitySelectionEvidence,
+    ) -> Result<(), CoinbaseMarketHandoffError> {
+        let native = &selected.native;
+        let at = self.typed_batch.evidence().received_at();
+        if self.evidence.feed != CoinbaseMarketFeed::AdvancedTradePublic
+            || self.evidence.selected_public_identity.is_some()
+            || native.venue != self.evidence.venue
+            || native.instrument != self.evidence.configured_instrument
+            || native.provider_instrument_id.as_str()
+                != self.evidence.product.as_source_identifier().as_str()
+            || native.venue_symbol.as_str() != self.evidence.product.as_source_identifier().as_str()
+            || native.knowledge_at > at
+            || native.effective_at > at
+            || selected.definition_validity.starts_at() > at
+            || selected
+                .definition_validity
+                .ends_at()
+                .is_some_and(|end| at >= end)
+            || selected.provider_validity.starts_at() > at
+            || selected
+                .provider_validity
+                .ends_at()
+                .is_some_and(|end| at >= end)
+            || self.typed_batch.observations().iter().any(|observation| {
+                observation.native_identity().namespace() != &native.namespace
+                    || observation.native_identity().provider_instrument_id()
+                        != &native.provider_instrument_id
+                    || observation.native_identity().venue_symbol() != &native.venue_symbol
+            })
+        {
+            return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
+        }
+        self.evidence.selected_public_identity = Some(selected);
+        Ok(())
     }
 
     /// Returns the validated provider evidence.
@@ -571,7 +721,24 @@ fn validate_direct_initial(
     terminal: SequenceNumber,
     input: &CoinbaseMarketHandoffInput,
 ) -> Result<(), CoinbaseMarketHandoffError> {
-    let receipt = lineage.snapshot.receipt();
+    validate_direct_frames(
+        lineage.snapshot.receipt(),
+        &lineage.replay,
+        terminal_decoder,
+        snapshot,
+        terminal,
+        input,
+    )
+}
+
+fn validate_direct_frames(
+    receipt: &SegmentedHttpResponseReceipt,
+    frames: &[CoinbaseDirectReplayFrame],
+    terminal_decoder: &DecoderEvidence,
+    predecessor: SequenceNumber,
+    terminal: SequenceNumber,
+    input: &CoinbaseMarketHandoffInput,
+) -> Result<(), CoinbaseMarketHandoffError> {
     receipt
         .currentness_lease()
         .validate_current()
@@ -586,11 +753,11 @@ fn validate_direct_initial(
     {
         return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
     }
-    let expected_first = snapshot
+    let expected_first = predecessor
         .checked_next()
         .map_err(|_error| CoinbaseMarketHandoffError::EvidenceMismatch)?;
     let mut previous = None;
-    for frame in &lineage.replay {
+    for frame in frames {
         frame
             .decoder_evidence()
             .currentness_lease()
@@ -599,13 +766,21 @@ fn validate_direct_initial(
         let expected = previous
             .map_or(Ok(expected_first), SequenceNumber::checked_next)
             .map_err(|_error| CoinbaseMarketHandoffError::EvidenceMismatch)?;
-        if frame.sequence() != expected {
+        if frame.sequence() != expected
+            || !frame
+                .decoder_evidence()
+                .binding()
+                .shares_allocation_with(receipt.binding())
+            || !frame
+                .decoder_evidence()
+                .currentness_lease()
+                .shares_authority_with(receipt.currentness_lease())
+        {
             return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
         }
         previous = Some(frame.sequence());
     }
-    let last = lineage
-        .replay
+    let last = frames
         .last()
         .ok_or(CoinbaseMarketHandoffError::EvidenceMismatch)?;
     if last.sequence() != terminal

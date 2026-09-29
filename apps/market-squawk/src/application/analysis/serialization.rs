@@ -120,6 +120,7 @@ fn feature_parameter_value(value: FeatureParameterValue) -> Value {
 fn feature_time_semantics(value: FeatureTimeSemantics) -> Value {
     match value {
         FeatureTimeSemantics::EventTime => json!({"kind": "event_time"}),
+        FeatureTimeSemantics::NativeFinancialPeriod => json!({"kind": "native_financial_period"}),
         FeatureTimeSemantics::TrailingWindow { duration_nanos } => {
             json!({"kind": "trailing_window", "durationNanos": duration_nanos.get()})
         }
@@ -241,5 +242,6 @@ const fn feature_data_type_name(value: FeatureDataType) -> &'static str {
         FeatureDataType::MonetaryValue => "monetary_value",
         FeatureDataType::StatisticalLocation => "statistical_location",
         FeatureDataType::StatisticalDispersion => "statistical_dispersion",
+        FeatureDataType::FinancialPeriodEvidence => "financial_period_evidence",
     }
 }

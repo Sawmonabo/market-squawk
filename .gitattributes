@@ -1,3 +1,6 @@
 * text=auto eol=lf
 *.mej binary
 *.msj binary
+
+# Retained issuer evidence is hashed byte-for-byte by the catalog.
+crates/market-squawk-data/src/catalog/market_data_instruments/issuer_reference/* binary

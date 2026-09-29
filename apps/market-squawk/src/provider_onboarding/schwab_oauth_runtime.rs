@@ -77,6 +77,14 @@ pub(crate) enum SchwabOAuthBrowserError {
 pub(crate) type SchwabOAuthMarketDrainFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), SchwabOAuthMarketDrainError>> + Send + 'a>>;
 
+/// Explicit owner intent; absence of a current token receipt cannot identify process shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchwabOAuthMarketDrainPurpose {
+    ProcessShutdown,
+    Unlink,
+    CredentialReplacement,
+}
+
 /// Application capability that drains every callable Schwab market-data generation.
 ///
 /// The implementation must stop REST admission, Streamer reconnect/subscription admission, and
@@ -88,6 +96,7 @@ pub(crate) trait SchwabOAuthMarketDrain: fmt::Debug + Send + Sync {
         &self,
         session_id: Uuid,
         current: Option<SchwabOAuthAuthorityReceipt>,
+        purpose: SchwabOAuthMarketDrainPurpose,
         cancellation: CancellationToken,
     ) -> SchwabOAuthMarketDrainFuture<'_>;
 }
@@ -185,6 +194,7 @@ pub(crate) struct SchwabOAuthRuntime {
     browser: Arc<dyn SchwabOAuthBrowser>,
     market_drain: Arc<dyn SchwabOAuthMarketDrain>,
     sessions: Mutex<BTreeMap<Uuid, SchwabOAuthSession>>,
+    credential_replacement: Mutex<Option<PendingCredentialReplacement>>,
     accepting: AtomicBool,
     in_flight: std::sync::atomic::AtomicUsize,
     in_flight_changed: Notify,
@@ -212,6 +222,7 @@ impl SchwabOAuthRuntime {
             browser,
             market_drain,
             sessions: Mutex::new(BTreeMap::new()),
+            credential_replacement: Mutex::new(None),
             accepting: AtomicBool::new(true),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             in_flight_changed: Notify::new(),
@@ -303,100 +314,63 @@ impl SchwabOAuthRuntime {
         self.begin_shutdown();
         let deadline = TokioInstant::from_std(deadline);
         self.wait_for_operations(deadline).await?;
-        let mut first_error: Option<SchwabOAuthRuntimeError> = None;
-        let mut exchanges = Vec::new();
-        {
-            let mut sessions = tokio::time::timeout_at(deadline, self.sessions.lock())
-                .await
-                .map_err(|_elapsed| SchwabOAuthRuntimeError::ShutdownDeadline)?;
-            for (session_id, session) in sessions.iter_mut() {
-                if let Some(exchange) = session.exchange.take() {
-                    exchanges.push((*session_id, exchange));
+        let mut sessions = tokio::time::timeout_at(deadline, self.sessions.lock())
+            .await
+            .map_err(|_| SchwabOAuthRuntimeError::ShutdownDeadline)?;
+        self.finish_credential_replacement(&mut sessions, Some(deadline))
+            .await?;
+        let mut first_error = None;
+        let mut market_sessions = Vec::new();
+        // Exchange and receiver tasks do not acquire the session-map lock.
+        for (session_id, session) in sessions.iter_mut() {
+            session.market_epoch.cancel();
+            market_sessions.push(*session_id);
+            if let Some(exchange) = session.exchange.as_mut() {
+                match tokio::time::timeout_at(deadline, exchange.join()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Err(_) => return Err(SchwabOAuthRuntimeError::ShutdownStillDraining),
+                }
+            }
+            if let Some(pending) = session.pending.as_mut() {
+                pending.cancellation.cancel();
+                match tokio::time::timeout_at(deadline, pending.join()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        // Receiver-only abort is allowed, but the handle stays owned until joined.
+                        pending.aborted = true;
+                        pending.task.abort();
+                        return Err(SchwabOAuthRuntimeError::ShutdownStillDraining);
+                    }
                 }
             }
         }
-        for (session_id, mut exchange) in exchanges {
-            match tokio::time::timeout_at(deadline, &mut exchange.task).await {
-                Ok(Ok(Ok(_receipt))) => {}
-                Ok(Ok(Err(error))) => {
-                    if first_error.is_none() {
-                        first_error = Some(error.into());
-                    }
+        drop(sessions);
+        for session_id in market_sessions {
+            let drain_cancellation = CancellationToken::new();
+            let drain = self.market_drain.drain(
+                session_id,
+                None,
+                SchwabOAuthMarketDrainPurpose::ProcessShutdown,
+                drain_cancellation.clone(),
+            );
+            match tokio::time::timeout_at(deadline, drain).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error.into());
                 }
-                Ok(Err(_join)) => {
-                    if first_error.is_none() {
-                        first_error = Some(SchwabOAuthRuntimeError::ExchangeTask);
-                    }
-                }
-                Err(_elapsed) => {
-                    let mut sessions = self.sessions.lock().await;
-                    let session = sessions
-                        .get_mut(&session_id)
-                        .ok_or(SchwabOAuthRuntimeError::InvalidState)?;
-                    if session.exchange.replace(exchange).is_some() {
-                        return Err(SchwabOAuthRuntimeError::InvalidState);
-                    }
+                Err(_) => {
+                    drain_cancellation.cancel();
                     return Err(SchwabOAuthRuntimeError::ShutdownStillDraining);
                 }
             }
         }
-        let mut sessions = tokio::time::timeout_at(deadline, self.sessions.lock())
-            .await
-            .map_err(|_elapsed| SchwabOAuthRuntimeError::ShutdownDeadline)?;
-        let mut pending = Vec::new();
-        let mut market_sessions = Vec::new();
-        for (session_id, session) in sessions.iter_mut() {
-            session.market_epoch.cancel();
-            market_sessions.push(*session_id);
-            if let Some(callback) = session.pending.take() {
-                callback.cancellation.cancel();
-                pending.push(callback.task);
-            }
-        }
-        drop(sessions);
-
-        let mut deadline_exceeded = false;
-        for session_id in market_sessions {
-            let drain_cancellation = CancellationToken::new();
-            let drain = self
-                .market_drain
-                .drain(session_id, None, drain_cancellation.clone());
-            match tokio::time::timeout_at(deadline, drain).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    if first_error.is_none() {
-                        first_error = Some(error.into());
-                    }
-                }
-                Err(_elapsed) => {
-                    drain_cancellation.cancel();
-                    deadline_exceeded = true;
-                    break;
-                }
-            }
-        }
-        for mut task in pending {
-            match tokio::time::timeout_at(deadline, &mut task).await {
-                Ok(Ok(_outcome)) => {}
-                Ok(Err(_join)) => {
-                    if first_error.is_none() {
-                        first_error = Some(SchwabOAuthRuntimeError::CallbackTask);
-                    }
-                }
-                Err(_elapsed) => {
-                    deadline_exceeded = true;
-                    task.abort();
-                    let _ = task.await;
-                }
-            }
-        }
-        if deadline_exceeded {
-            Err(SchwabOAuthRuntimeError::ShutdownDeadline)
-        } else if let Some(error) = first_error {
-            Err(error)
-        } else {
-            Ok(())
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn begin(
@@ -461,6 +435,8 @@ impl SchwabOAuthRuntime {
         session.pending = Some(PendingAuthorization {
             cancellation: callback_cancellation,
             task: callback_task,
+            joined: None,
+            aborted: false,
         });
 
         let browser_cancellation = self.shutdown.child_token();
@@ -474,10 +450,11 @@ impl SchwabOAuthRuntime {
         if let Err(error) = opened {
             let pending = session
                 .pending
-                .take()
+                .as_mut()
                 .ok_or(SchwabOAuthRuntimeError::InvalidState)?;
             pending.cancellation.cancel();
-            let _ = pending.task.await;
+            pending.join().await?;
+            session.pending.take();
             return Err(error.into());
         }
         Ok(SchwabOAuthLifecycleView::new(
@@ -509,11 +486,17 @@ impl SchwabOAuthRuntime {
                 SchwabOAuthLifecycleAction::Continue,
             ));
         }
-        if let Some(exchange) = session.exchange.take() {
+        if let Some(exchange) = session.exchange.as_mut() {
+            exchange.join().await?;
+            let mut exchange = session
+                .exchange
+                .take()
+                .ok_or(SchwabOAuthRuntimeError::InvalidState)?;
             let receipt = exchange
-                .task
-                .await
-                .map_err(|_join| SchwabOAuthRuntimeError::ExchangeTask)??;
+                .joined
+                .take()
+                .ok_or(SchwabOAuthRuntimeError::InvalidState)?
+                .map_err(|_| SchwabOAuthRuntimeError::ExchangeTask)??;
             session
                 .market_epoch
                 .observe_status(SchwabOAuthAuthorityStatus::Active(receipt))?;
@@ -533,14 +516,21 @@ impl SchwabOAuthRuntime {
                 None,
             ));
         }
-        let pending = session
+        session
+            .pending
+            .as_mut()
+            .ok_or(SchwabOAuthRuntimeError::InvalidState)?
+            .join()
+            .await?;
+        let mut pending = session
             .pending
             .take()
             .ok_or(SchwabOAuthRuntimeError::InvalidState)?;
         let outcome = pending
-            .task
-            .await
-            .map_err(|_join| SchwabOAuthRuntimeError::CallbackTask)??;
+            .joined
+            .take()
+            .ok_or(SchwabOAuthRuntimeError::InvalidState)?
+            .map_err(|_| SchwabOAuthRuntimeError::CallbackTask)??;
         match outcome {
             CallbackOutcome::Authorized(callback) => {
                 if cancellation.is_cancelled() || self.shutdown.is_cancelled() {
@@ -553,6 +543,7 @@ impl SchwabOAuthRuntime {
                 let authority = Arc::clone(&session.authority);
                 let issued_at_unix_seconds = unix_seconds()?;
                 session.exchange = Some(PendingTokenExchange {
+                    joined: None,
                     task: tokio::spawn(async move {
                         authority
                             .complete_authorization(
@@ -594,12 +585,10 @@ impl SchwabOAuthRuntime {
                 SchwabOAuthLifecycleAction::Cancel,
             ));
         }
-        if let Some(pending) = session.pending.take() {
+        if let Some(pending) = session.pending.as_mut() {
             pending.cancellation.cancel();
-            let _discarded_callback = pending
-                .task
-                .await
-                .map_err(|_join| SchwabOAuthRuntimeError::CallbackTask)?;
+            pending.join().await?;
+            session.pending.take();
             return Ok(SchwabOAuthLifecycleView::new(
                 session_id,
                 SchwabOAuthLifecycleAction::Cancel,
@@ -642,18 +631,13 @@ impl SchwabOAuthRuntime {
                 SchwabOAuthLifecycleAction::Unlink,
             ));
         }
-        if let Some(exchange) = session.exchange.take() {
-            exchange
-                .task
-                .await
-                .map_err(|_join| SchwabOAuthRuntimeError::ExchangeTask)??;
+        if let Some(exchange) = session.exchange.as_mut() {
+            exchange.join().await?;
         }
-        if let Some(pending) = session.pending.take() {
+        if let Some(pending) = session.pending.as_mut() {
             pending.cancellation.cancel();
-            let _discarded_callback = pending
-                .task
-                .await
-                .map_err(|_join| SchwabOAuthRuntimeError::CallbackTask)?;
+            pending.join().await?;
+            session.pending.take();
         }
         let status = session.status().await?;
         let receipt = match status {
@@ -663,7 +647,12 @@ impl SchwabOAuthRuntime {
         };
         session.market_epoch.cancel();
         self.market_drain
-            .drain(session_id, receipt, cancellation)
+            .drain(
+                session_id,
+                receipt,
+                SchwabOAuthMarketDrainPurpose::Unlink,
+                cancellation,
+            )
             .await?;
         session
             .authority
@@ -688,6 +677,7 @@ impl SchwabOAuthRuntime {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<&'a mut SchwabOAuthSession, SchwabOAuthRuntimeError> {
+        self.finish_credential_replacement(sessions, None).await?;
         if session_id.is_nil() {
             return Err(SchwabOAuthRuntimeError::InvalidSession);
         }
@@ -767,94 +757,121 @@ impl SchwabOAuthRuntime {
             current.bootstrap.application_secret_reference().clone(),
             replacement_lease.application_secret_reference().clone(),
         )?;
-        let mut current = sessions
-            .remove(&session_id)
+        let current = sessions
+            .get_mut(&session_id)
             .ok_or(SchwabOAuthRuntimeError::InvalidState)?;
-        if let Some(exchange) = current.exchange.take() {
-            match exchange.task.await {
-                Ok(Ok(_receipt)) => {}
-                Ok(Err(error)) => {
-                    sessions.insert(session_id, current);
-                    return Err(error.into());
-                }
-                Err(_join) => {
-                    sessions.insert(session_id, current);
-                    return Err(SchwabOAuthRuntimeError::ExchangeTask);
-                }
-            }
+        if let Some(exchange) = current.exchange.as_mut() {
+            exchange.join().await?;
         }
-        if let Some(pending) = current.pending.take() {
+        if let Some(pending) = current.pending.as_mut() {
             pending.cancellation.cancel();
-            if pending.task.await.is_err() {
-                sessions.insert(session_id, current);
-                return Err(SchwabOAuthRuntimeError::CallbackTask);
-            }
+            pending.join().await?;
         }
-        let status = match current.status().await {
-            Ok(status) => status,
-            Err(error) => {
-                sessions.insert(session_id, current);
-                return Err(error);
-            }
-        };
+        let status = current.status().await?;
         let receipt = match status {
             SchwabOAuthAuthorityStatus::Active(receipt) => Some(receipt),
             SchwabOAuthAuthorityStatus::AwaitingAuthorization
             | SchwabOAuthAuthorityStatus::ReauthorizationRequired => None,
         };
         current.market_epoch.cancel();
-        if let Err(error) = self
-            .market_drain
-            .drain(session_id, receipt, cancellation)
-            .await
-        {
-            sessions.insert(session_id, current);
-            return Err(error.into());
+        self.market_drain
+            .drain(
+                session_id,
+                receipt,
+                SchwabOAuthMarketDrainPurpose::CredentialReplacement,
+                cancellation,
+            )
+            .await?;
+        let mut retained = self.credential_replacement.lock().await;
+        if retained.is_some() {
+            return Err(SchwabOAuthRuntimeError::InvalidState);
         }
-        let authority = match Arc::try_unwrap(current.authority) {
-            Ok(authority) => authority,
-            Err(authority) => {
-                current.authority = authority;
-                sessions.insert(session_id, current);
-                return Err(SchwabOAuthRuntimeError::MarketAuthorityRetained);
-            }
-        };
-        let replacement_result = authority
-            .replace_application_credential(replacement, SchwabOAuthInteraction::Foreground)
-            .await;
-        match replacement_result {
-            Ok(authority) => {
-                sessions.insert(
-                    session_id,
-                    SchwabOAuthSession {
-                        bootstrap: replacement_lease,
-                        authority: Arc::new(authority),
-                        pending: None,
-                        exchange: None,
-                        market_epoch: Arc::new(SchwabOAuthMarketEpochAuthority::new(
+        let current = sessions
+            .remove(&session_id)
+            .ok_or(SchwabOAuthRuntimeError::InvalidState)?;
+        let lifecycle = self.shutdown.clone();
+        // Removal, spawning, and retaining the actual task have no intervening await.
+        *retained = Some(PendingCredentialReplacement {
+            task: tokio::spawn(async move {
+                let mut current = current;
+                let authority = match Arc::try_unwrap(current.authority) {
+                    Ok(authority) => authority,
+                    Err(authority) => {
+                        current.authority = authority;
+                        return (
                             session_id,
-                            self.shutdown.child_token(),
-                        )),
-                    },
-                );
-                Ok(())
-            }
-            Err(failure) => {
-                let (authority, binding, error) = failure.into_parts();
-                current.authority = Arc::new(authority);
+                            current,
+                            Err(SchwabOAuthRuntimeError::MarketAuthorityRetained),
+                        );
+                    }
+                };
+                let outcome = authority
+                    .replace_application_credential(replacement, SchwabOAuthInteraction::Foreground)
+                    .await;
+                let result = match outcome {
+                    Ok(authority) => {
+                        current.authority = Arc::new(authority);
+                        current.bootstrap = replacement_lease;
+                        current.pending = None;
+                        current.exchange = None;
+                        Ok(())
+                    }
+                    Err(failure) => {
+                        let (authority, binding, error) = failure.into_parts();
+                        current.authority = Arc::new(authority);
+                        if binding == SchwabApplicationCredentialReplacementBinding::Replacement {
+                            current.bootstrap = replacement_lease;
+                        }
+                        Err(error.into())
+                    }
+                };
                 current.market_epoch = Arc::new(SchwabOAuthMarketEpochAuthority::new(
                     session_id,
-                    self.shutdown.child_token(),
+                    lifecycle.child_token(),
                 ));
-                match binding {
-                    SchwabApplicationCredentialReplacementBinding::Replacement => {
-                        current.bootstrap = replacement_lease;
-                    }
-                    SchwabApplicationCredentialReplacementBinding::Previous
-                    | SchwabApplicationCredentialReplacementBinding::Indeterminate => {}
-                }
-                sessions.insert(session_id, current);
-                Err(error.into())
+                (session_id, current, result)
+            }),
+            failed: false,
+        });
+        drop(retained);
+        self.finish_credential_replacement(sessions, None).await
+    }
+
+    async fn finish_credential_replacement(
+        &self,
+        sessions: &mut BTreeMap<Uuid, SchwabOAuthSession>,
+        deadline: Option<TokioInstant>,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        let mut retained = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, self.credential_replacement.lock())
+                .await
+                .map_err(|_| SchwabOAuthRuntimeError::ShutdownStillDraining)?
+        } else {
+            self.credential_replacement.lock().await
+        };
+        let Some(pending) = retained.as_mut() else {
+            return Ok(());
+        };
+        if pending.failed {
+            return Err(SchwabOAuthRuntimeError::ExchangeTask);
+        }
+        let joined = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, &mut pending.task)
+                .await
+                .map_err(|_| SchwabOAuthRuntimeError::ShutdownStillDraining)?
+        } else {
+            (&mut pending.task).await
+        };
+        match joined {
+            Ok((session_id, session, result)) => {
+                // The actual returned authority is restored before the operation result escapes.
+                sessions.insert(session_id, session);
+                *retained = None;
+                result
+            }
+            Err(_) => {
+                pending.failed = true;
+                Err(SchwabOAuthRuntimeError::ExchangeTask)
             }
         }
     }
@@ -1173,13 +1190,55 @@ impl fmt::Debug for SchwabOAuthSession {
     }
 }
 
+struct PendingCredentialReplacement {
+    task: JoinHandle<(
+        Uuid,
+        SchwabOAuthSession,
+        Result<(), SchwabOAuthRuntimeError>,
+    )>,
+    failed: bool,
+}
+
 struct PendingAuthorization {
     cancellation: CancellationToken,
     task: JoinHandle<Result<CallbackOutcome, OAuthLoopbackError>>,
+    joined: Option<Result<Result<CallbackOutcome, OAuthLoopbackError>, tokio::task::JoinError>>,
+    aborted: bool,
 }
 
 struct PendingTokenExchange {
     task: JoinHandle<Result<SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityError>>,
+    joined: Option<
+        Result<
+            Result<SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityError>,
+            tokio::task::JoinError,
+        >,
+    >,
+}
+
+impl PendingAuthorization {
+    async fn join(&mut self) -> Result<(), SchwabOAuthRuntimeError> {
+        if self.joined.is_none() {
+            self.joined = Some((&mut self.task).await);
+        }
+        match self.joined.as_ref() {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(error)) if self.aborted && error.is_cancelled() => Ok(()),
+            _ => Err(SchwabOAuthRuntimeError::CallbackTask),
+        }
+    }
+}
+
+impl PendingTokenExchange {
+    async fn join(&mut self) -> Result<(), SchwabOAuthRuntimeError> {
+        if self.joined.is_none() {
+            self.joined = Some((&mut self.task).await);
+        }
+        match self.joined.as_ref() {
+            Some(Ok(Ok(_))) => Ok(()),
+            _ => Err(SchwabOAuthRuntimeError::ExchangeTask),
+        }
+    }
 }
 
 impl fmt::Debug for PendingTokenExchange {
@@ -1245,6 +1304,14 @@ impl SchwabOAuthMarketAuthority {
         self.issued_receipt
     }
 
+    /// Retains only secret-free validation of this session's reconciled OAuth epoch.
+    pub(crate) fn receipt_currentness(&self) -> SchwabOAuthReceiptCurrentness {
+        SchwabOAuthReceiptCurrentness {
+            session_id: self.session_id,
+            currentness: Arc::clone(&self.currentness),
+        }
+    }
+
     /// Returns the exact current receipt after durable authority reconciliation.
     pub(crate) async fn current_receipt(
         &self,
@@ -1288,18 +1355,6 @@ impl SchwabOAuthMarketAuthority {
         Ok((token, epoch))
     }
 
-    /// Synchronously validates an exact reconciled receipt for durable precommit.
-    ///
-    /// Callers must also retain the attempt epoch that was minted with the response. The shared
-    /// generation check closes revocation and rotation races; the epoch's owned barrier prevents
-    /// a later acquisition from rotating that generation before precommit.
-    pub(crate) fn validate_current_receipt(
-        &self,
-        receipt: SchwabOAuthAuthorityReceipt,
-    ) -> Result<(), SchwabOAuthRuntimeError> {
-        self.currentness.validate_current_receipt(receipt)
-    }
-
     async fn reconciled_receipt(
         &self,
     ) -> Result<(SchwabOAuthAuthorityReceipt, CancellationToken), SchwabOAuthRuntimeError> {
@@ -1330,6 +1385,39 @@ impl SchwabOAuthMarketAuthority {
                 Err(SchwabOAuthRuntimeError::ReauthorizationRequired)
             }
         }
+    }
+}
+
+/// Secret-free validation of an already reconciled OAuth market session.
+///
+/// Publication holds this capability plus the response's non-cloneable attempt epoch. It has no
+/// protected-store or token-source handle and cannot acquire, refresh, or clone a bearer token.
+#[derive(Clone)]
+pub(crate) struct SchwabOAuthReceiptCurrentness {
+    session_id: Uuid,
+    currentness: Arc<SchwabOAuthMarketEpochAuthority>,
+}
+
+impl SchwabOAuthReceiptCurrentness {
+    pub(crate) const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub(crate) fn validate_current_receipt(
+        &self,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        self.currentness.validate_current_receipt(receipt)
+    }
+}
+
+impl fmt::Debug for SchwabOAuthReceiptCurrentness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabOAuthReceiptCurrentness")
+            .field("session_id", &self.session_id)
+            .field("revoked", &self.currentness.is_cancelled())
+            .finish_non_exhaustive()
     }
 }
 

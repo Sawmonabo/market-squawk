@@ -8,29 +8,55 @@ use std::fmt;
 
 use market_squawk_modeling::ForecastVintageId;
 
+mod forecast_chart;
+pub use forecast_chart::SavedForecastChartEvidence;
+mod benchmark_comparison;
+pub use benchmark_comparison::SavedBenchmarkComparisonEvidence;
 mod authority;
 mod digest;
 mod evidence;
+mod harmonic_history;
+pub use harmonic_history::{
+    HarmonicHistoryAudit, HarmonicHistoryAuditInput, HarmonicHistoryDisposition,
+    HarmonicHistoryGeometry, HarmonicHistoryPivot,
+};
 mod output;
 mod policy;
+mod probabilities;
+pub use probabilities::{
+    InvestmentProbabilityEvidence, ProbabilityCalibrationSummary, ProbabilityEventEvidence,
+    ProbabilityEventKind, ProbabilityForecastEvidence, ProbabilityForecastEvidenceRecord,
+    ProbabilityForecastReference, ProbabilityReliabilityEvidence, ProbabilityUnavailableReason,
+};
 
-pub use authority::InvestmentProposalAuthority;
+pub use authority::{
+    InvestmentProposalAuthority, RecommendationAlphaDecision, RecommendationAlphaEvaluation,
+};
 pub use evidence::{
-    CostAdjustedPitBacktestEvidence, ForecastCalibrationSummary, ForecastPriceRanges,
-    InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput, LiquidityEvidence,
-    MarketReferenceAdjustmentBasis, MarketReferenceEvidence, MarketReferencePriceKind,
-    PortfolioPositionState, PortfolioRiskEvidence, PriceForecastEvidence, ProposalEvidenceWindow,
-    ValuationEvidence,
+    ChronologicalOutOfSampleEvidence, CostAdjustedBacktestEvidence, CurrentShareDecisionProjection,
+    CurrentShareMarketAdmission,
+    FinancialModelEvidence, FinancialModelValueRange, ForecastCalibrationSummary,
+    ForecastPriceRanges, HarmonicPatternEvidenceReceipt, InvestmentAnalysisEvidence,
+    InvestmentAnalysisEvidenceInput, LiquidityEvidence, MarketReferenceAdjustmentBasis,
+    MarketReferenceEvidence, MarketReferencePriceKind, PortfolioPositionState,
+    PortfolioRiskEvidence, PriceForecastEvidence, ProposalEvidenceWindow,
+    RecommendationStudyQualification, ValuationEvidence, ValuationEvidenceProvenance,
+};
+pub use market_squawk_valuation::{
+    FinancialModelMacroAssumptions, MacroRateMaturity, MacroRateReferenceEvidence,
 };
 pub use output::{
     GeneratedInvestmentProposal, GeneratedPriceLadder, InvestmentProposalDecision,
-    NoActionInvestmentProposal, NoActionReason, ProposalExecutionEligibility, ProposalInvalidator,
-    ProposalUnavailableReason, RecommendationAction, UnavailableInvestmentAnalysis,
+    NoActionInvestmentProposal, NoActionReason, OriginalShareActionOverlay,
+    ProposalExecutionEligibility, ProposalInvalidator, ProposalUnavailableReason,
+    RecommendationAction, UnavailableInvestmentAnalysis,
 };
 pub use policy::{
     ActionSpecificCostAvailability, ProposalTimeBenchmarkAvailability, RecommendationConfidence,
     RecommendationConfidenceComponent, RecommendationConfidenceComponentKind,
-    RecommendationConfidenceMeaning, RecommendationPolicy,
+    RecommendationConfidenceComponentValue, RecommendationConfidenceMeaning,
+    RecommendationConfidenceUnavailableReason, RecommendationPolicy,
+    RecommendationPolicyParameters,
 };
 
 /// Parts per million used by forecast calibration and policy-weighted reliability contracts.
@@ -183,8 +209,14 @@ pub enum RecommendationEvidenceKind {
     PriceForecast,
     /// Independently governed valuation measurement.
     Valuation,
+    /// Evidence-closed financial model with exact inputs, assumptions, scenarios, and sensitivity.
+    FinancialModel,
     /// Cost-adjusted, point-in-time backtest result.
     Backtest,
+    /// Chronological independent out-of-sample study.
+    OutOfSample,
+    /// Optional causal harmonic-pattern evidence.
+    HarmonicPattern,
     /// Current market-liquidity assessment.
     Liquidity,
     /// Current account and portfolio-risk assessment.

@@ -13,6 +13,7 @@ const NANOSECOND_UTC_TIMESTAMP_PATTERN: &str =
 const CALENDAR_DATE_PATTERN: &str = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
 const CALENDAR_MONTH_PATTERN: &str = "^[0-9]{4}-(?:0[1-9]|1[0-2])$";
 const CALENDAR_QUARTER_PATTERN: &str = "^[0-9]{4}-Q[1-4]$";
+const CALENDAR_YEAR_PATTERN: &str = "^[0-9]{4}$";
 const SCALED_DECIMAL_PATTERN: &str = r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$";
 const CANONICAL_DECIMAL_PATTERN: &str = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
 const NON_WHITESPACE_PATTERN: &str = "\\S";
@@ -25,6 +26,16 @@ const UNSIGNED_INTEGER_PATTERN: &str = "^(?:0|[1-9][0-9]*)$";
 const INTEGER_PATTERN: &str = "^(?:0|-?[1-9][0-9]*)$";
 const MEDIA_TYPE_PATTERN: &str = "^[A-Za-z0-9/.+\\-]+$";
 const ARTIFACT_ID_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9_-]*$";
+const ANALYTICAL_TOKEN_PATTERNS: &[(&str, &str)] = &[
+    ("^profile_[0-9a-f]{32}$", "profile_"),
+    ("^state_[0-9a-f]{32}$", "state_"),
+    ("^validation_[0-9a-f]{32}$", "validation_"),
+    ("^activation_[0-9a-f]{32}$", "activation_"),
+    ("^history_[0-9a-f]{32}$", "history_"),
+    ("^workflow_[0-9a-f]{32}$", "workflow_"),
+];
+const MARKET_SELECTION_TOKEN_PATTERN: &str =
+    "^market_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
 const MAXIMUM_POSITIONAL_ITEMS: usize = 256;
 
 pub(crate) fn validate_data_schema(schema: &Value) -> bool {
@@ -287,6 +298,7 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                 | CALENDAR_DATE_PATTERN
                 | CALENDAR_MONTH_PATTERN
                 | CALENDAR_QUARTER_PATTERN
+                | CALENDAR_YEAR_PATTERN
                 | SCALED_DECIMAL_PATTERN
                 | CANONICAL_DECIMAL_PATTERN
                 | NON_WHITESPACE_PATTERN
@@ -299,7 +311,8 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                 | INTEGER_PATTERN
                 | MEDIA_TYPE_PATTERN
                 | ARTIFACT_ID_PATTERN
-        ),
+                | MARKET_SELECTION_TOKEN_PATTERN
+        ) || analytical_token_prefix(pattern).is_some(),
         Some(_) => false,
     }
 }
@@ -448,10 +461,21 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
         Some(UPPERCASE_CURRENCY_PATTERN) => {
             value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())
         }
+        Some(pattern) if analytical_token_prefix(pattern).is_some() => {
+            analytical_token_prefix(pattern)
+                .and_then(|prefix| value.strip_prefix(prefix))
+                .is_some_and(|suffix| lowercase_hex_matches(suffix, 32))
+        }
+        Some(MARKET_SELECTION_TOKEN_PATTERN) => value.strip_prefix("market_").is_some_and(|suffix| {
+            uuid::Uuid::parse_str(suffix).is_ok_and(|id| id.hyphenated().to_string() == suffix)
+        }),
         Some(LOWERCASE_SHA256_PATTERN) => lowercase_hex_matches(value, 64),
         Some(LOWERCASE_IEEE754_HEX_PATTERN) => lowercase_hex_matches(value, 16),
         Some(NANOSECOND_UTC_TIMESTAMP_PATTERN) => nanosecond_utc_timestamp_matches(value),
         Some(CALENDAR_DATE_PATTERN) => calendar_date_matches(value),
+        Some(CALENDAR_YEAR_PATTERN) => {
+            value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit())
+        }
         Some(CALENDAR_MONTH_PATTERN) => {
             let bytes = value.as_bytes();
             bytes.len() == 7
@@ -487,6 +511,10 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
         }
         Some(_) => false,
     }
+}
+
+fn analytical_token_prefix(pattern: &str) -> Option<&'static str> {
+    ANALYTICAL_TOKEN_PATTERNS.iter().find_map(|(expected, prefix)| (*expected == pattern).then_some(*prefix))
 }
 
 fn lowercase_hex_matches(value: &str, length: usize) -> bool {
@@ -653,8 +681,10 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 #[cfg(test)]
 mod tests {
     use super::{
+        ANALYTICAL_TOKEN_PATTERNS, MARKET_SELECTION_TOKEN_PATTERN,
         ARTIFACT_ID_PATTERN, CALENDAR_DATE_PATTERN, CALENDAR_MONTH_PATTERN, CALENDAR_QUARTER_PATTERN,
         CANONICAL_DECIMAL_PATTERN,
+        CALENDAR_YEAR_PATTERN,
         FORMATTED_PERCENTAGE_PATTERN, INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN,
         NON_WHITESPACE_PATTERN, OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN,
         POSITIVE_DECIMAL_PATTERN, SCALED_DECIMAL_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data,
@@ -747,6 +777,7 @@ mod tests {
             (ARTIFACT_ID_PATTERN, "source_recipe-1", "../source_recipe-1"),
             (CALENDAR_MONTH_PATTERN, "2026-09", "2026-13"),
             (CALENDAR_QUARTER_PATTERN, "2026-Q2", "2026-Q5"),
+            (CALENDAR_YEAR_PATTERN, "2026", "2026-01"),
             (SCALED_DECIMAL_PATTERN, "-1.50", "01.0"),
             (NON_WHITESPACE_PATTERN, "Investment", "   "),
             (POSITIVE_DECIMAL_PATTERN, "0.25", "-0.25"),
@@ -763,6 +794,21 @@ mod tests {
             assert!(validate_data(&schema, &json!(accepted)));
             assert!(!validate_data(&schema, &json!(rejected)));
         }
+
+        // The workflow's exact opaque prefixes are admitted without accepting arbitrary regexes.
+        for (pattern, prefix) in ANALYTICAL_TOKEN_PATTERNS {
+            let schema = json!({"type":"string", "pattern":pattern});
+            assert!(validate_data_schema(&schema));
+            assert!(validate_data(&schema, &json!(format!("{prefix}0123456789abcdef0123456789abcdef"))));
+            assert!(!validate_data(&schema, &json!(format!("{prefix}0123456789ABCDEF0123456789abcdef"))));
+            assert!(!validate_data(&schema, &json!(format!("{prefix}0123456789abcdef0123456789abcde"))));
+            assert!(!validate_data(&schema, &json!(format!("other_{prefix}0123456789abcdef0123456789abcdef"))));
+        }
+        let market_token = json!({"type":"string", "pattern":MARKET_SELECTION_TOKEN_PATTERN});
+        assert!(validate_data_schema(&market_token));
+        assert!(validate_data(&market_token, &json!("market_c127919d-6540-47f8-9f6b-902523578cb5")));
+        assert!(!validate_data(&market_token, &json!("market_C127919D-6540-47F8-9F6B-902523578CB5")));
+        assert!(!validate_data(&market_token, &json!("market_c127919d654047f89f6b902523578cb5")));
 
         let unsigned_schema = json!({"type": "string", "pattern": UNSIGNED_INTEGER_PATTERN});
         assert!(validate_data_schema(&unsigned_schema));

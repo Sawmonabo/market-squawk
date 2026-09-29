@@ -4,17 +4,20 @@ import type { ApplicationResult } from "@/lib/schemas"
 
 import { exactDecimalSchema, marketHistoryTokenSchema, productInstantSchema } from "./market-product"
 
+export const marketHistoryTimeSchema = z.discriminatedUnion("precision", [
+  z.object({ precision: z.literal("timestamped_period"), startsAt: productInstantSchema, endsAt: productInstantSchema })
+    .strict().refine((time) => time.startsAt < time.endsAt, { message: "A price period must end after it starts." }),
+  z.object({ precision: z.literal("nominal_date"), date: z.iso.date() }).strict(),
+])
+
 const barSchema = z.object({
-  startsAt: productInstantSchema,
-  endsAt: productInstantSchema,
+  time: marketHistoryTimeSchema,
   open: exactDecimalSchema,
   high: exactDecimalSchema,
   low: exactDecimalSchema,
   close: exactDecimalSchema,
   volume: exactDecimalSchema,
-}).strict().refine((bar) => bar.startsAt < bar.endsAt, {
-  message: "A price period must end after it starts.",
-})
+}).strict()
 
 export const marketHistoryResultSchema = z.object({
   data: z.object({
@@ -28,14 +31,26 @@ export const marketHistoryResultSchema = z.object({
   if ((result.data === null) === (result.unavailableReason === null)) {
     context.addIssue({ code: "custom", message: "Price history must be available or unavailable." })
   }
-  result.data?.bars.forEach((bar, index, bars) => {
-    if (index > 0 && bars[index - 1]!.endsAt > bar.startsAt) {
+  const precision = result.data?.bars[0]?.time.precision
+  let previousPeriod: string | undefined
+  let previousDate: string | undefined
+  result.data?.bars.forEach((bar, index) => {
+    if (bar.time.precision !== precision) {
+      context.addIssue({ code: "custom", path: ["data", "bars", index, "time"], message: "Price history must use one time precision." })
+    }
+    const overlaps = bar.time.precision === "timestamped_period"
+      ? previousPeriod !== undefined && previousPeriod > bar.time.startsAt
+      : previousDate !== undefined && previousDate >= bar.time.date
+    if (overlaps) {
       context.addIssue({ code: "custom", path: ["data", "bars", index], message: "Price periods overlap." })
     }
+    if (bar.time.precision === "timestamped_period") previousPeriod = bar.time.endsAt
+    else previousDate = bar.time.date
   })
 })
 
 export type MarketHistoryResult = z.infer<typeof marketHistoryResultSchema>
+export type MarketHistoryBar = z.infer<typeof barSchema>
 
 export function parseMarketHistoryResult(result: ApplicationResult, historyToken: string): MarketHistoryResult {
   const parsed = marketHistoryResultSchema.parse(result.data)

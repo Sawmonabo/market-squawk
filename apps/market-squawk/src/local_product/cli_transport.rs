@@ -24,7 +24,7 @@ use crate::application::{
     setup::{SetupGoal, SetupPlanSelection, SetupStarterPlan},
 };
 use crate::cli::{
-    BacktestCommand, BackupOperationsCommand, BackupRetentionCommand, BotCommand, Command,
+    AnalysisCommand, AnalysisSetupCommand, BacktestCommand, BackupOperationsCommand, BackupRetentionCommand, BotCommand, Command,
     DatasetCommand, ExecutionCommand, FairValueCommand, FeatureCommand, ForecastCommand,
     IngestCommand, JobCommand, LogDomainArgument, LogOperationsCommand, LogQueryArguments,
     LogSeverityArgument, MarketCommand, ModelCommand, OperationsCommand,
@@ -70,6 +70,9 @@ impl CliProductResult {
 /// CLI admission, filesystem-boundary, or application-operation failure.
 #[derive(Debug, Error)]
 pub enum CliProductError {
+    /// Actionable failure from the shared financial workflow.
+    #[error("{0}")]
+    Workflow(String),
     /// Bounded foreground unlock input could not be read or admitted.
     #[error(transparent)]
     UnlockInput(#[from] crate::cli::CliUnlockInputError),
@@ -181,9 +184,16 @@ async fn execute(
         Command::Source { command } => source(authority, command).await,
         Command::Market { command } => market(authority, command).await,
         Command::EconomicContext {
+            list_series,
+            series_id,
             knowledge_cutoff,
             effective_date_cutoff,
-        } => economic_context(authority, knowledge_cutoff, effective_date_cutoff).await,
+        } => economic_context(authority, list_series, series_id, knowledge_cutoff, effective_date_cutoff).await,
+        Command::EconomicSeriesHistory {
+            series_id, start_effective_date, knowledge_cutoff,
+            effective_date_cutoff, after_effective_period,
+        } => economic_series_history(authority, series_id, start_effective_date,
+            knowledge_cutoff, effective_date_cutoff, after_effective_period).await,
         Command::Ingest { command } => ingest(authority, command).await,
         Command::Dataset { command } => dataset(authority, command).await,
         Command::Query { command } => query(authority, command).await,
@@ -192,6 +202,7 @@ async fn execute(
         Command::Forecast { command } => forecast(authority, command).await,
         Command::Portfolio { command } => portfolio(authority, command).await,
         Command::Backtest { command } => backtest(authority, command).await,
+        Command::Analysis { command } => analysis_workflow(authority, command).await,
         Command::Bot { command } => bot(authority, command).await,
         Command::Execution { command } => execution(authority, command).await,
         Command::FairValue { command } => fair_value(authority, command).await,
@@ -210,8 +221,72 @@ async fn execute(
     }
 }
 
+async fn analysis_workflow(authority:CliAuthority<'_>,command:AnalysisCommand)->Result<CliProductResult,CliProductError> {
+    let (operation,mut arguments,summary)=match command {
+        AnalysisCommand::Setup {command} => match command {
+            AnalysisSetupCommand::Status => ("Portfolio.GetRecommendationSetup",Map::new(),"recommendation setup read"),
+            AnalysisSetupCommand::Preview {request} => ("Portfolio.PreviewRecommendationSetup",read_json_object(&request)?,"recommendation setup previewed"),
+            AnalysisSetupCommand::Commit {preview_id,preview_digest,confirm} => {
+                require_confirmation(confirm)?;
+                ("Portfolio.CommitRecommendationSetup",json_object(json!({"previewId":preview_id,"previewDigest":preview_digest,"confirm":true}))?,"recommendation setup confirmed")
+            }
+        },
+        AnalysisCommand::Results {after,limit} => {
+            let mut arguments=json_object(json!({"limit":limit}))?;
+            if let Some(after)=after{arguments.insert("afterActionToken".into(),json!(after));}
+            ("Decision.ListInvestmentAnalyses",arguments,"saved investment analyses read")
+        }
+        AnalysisCommand::Show {action_token} => ("Decision.GetInvestmentAnalysis",json_object(json!({"actionToken":action_token}))?,"saved investment analysis reopened"),
+        command => {
+            let (request,confirmed)=match command {
+                AnalysisCommand::Start {selection_token,benchmark_instrument_id,confirm} => {
+                    let mut request=json!({"action":"analyzeInvestment","selectionToken":selection_token});
+                    if let Some(benchmark)=benchmark_instrument_id {request["benchmarkInstrumentId"]=json!(benchmark);}
+                    (request,confirm)
+                },
+                AnalysisCommand::Find {benchmark_instrument_id,confirm} => {
+                    let mut request=json!({"action":"findOpportunities"});
+                    if let Some(benchmark)=benchmark_instrument_id {request["benchmarkInstrumentId"]=json!(benchmark);}
+                    (request,confirm)
+                },
+                AnalysisCommand::Status => (json!({"action":"status"}),false),
+                AnalysisCommand::Resume {workflow_token,confirm} => (json!({"action":"resumeWorkflow","workflowToken":workflow_token}),confirm),
+                AnalysisCommand::Cancel {workflow_token,confirm} => (json!({"action":"cancelWorkflow","workflowToken":workflow_token}),confirm),
+                AnalysisCommand::Coverage {workflow_token,after} => {
+                    let after=after.as_deref().map(read_json_object).transpose()?;
+                    (json!({"action":"workflowCoverage","workflowToken":workflow_token,"after":after}),false)
+                }
+                AnalysisCommand::Profile {request,confirm} => {
+                    let request=Value::Object(read_json_object(&request)?);
+                    match request.get("action").and_then(Value::as_str) {
+                        Some("profileOptions"|"copyRecommended"|"updateProfile"|"validateProfile"|"compareWithRecommended"|"activateProfile"|"restoreRecommended"|"history")=>{},
+                        _=>return Err(CliProductError::RequestShape),
+                    }
+                    (request,confirm)
+                }
+                _=>return Err(CliProductError::WrongCommand),
+            };
+            let admitted:crate::application::analytical_workflow::AnalyticalControllerCommand=serde_json::from_value(request.clone()).map_err(|_|CliProductError::RequestShape)?;
+            let update=admitted.requires_confirmation();
+            if update{require_confirmation(confirmed)?;}
+            let mut arguments=json_object(json!({"request":request}))?;
+            if update {arguments.insert("confirm".into(),Value::Bool(true));}
+            (if update{"Analysis.UpdateWorkflow"}else{"Analysis.ReadWorkflow"},arguments,if update{"investment workflow command accepted"}else{"investment workflow read"})
+        }
+    };
+    require_installed(authority,operation)?;
+    let result=invoke(authority,operation,&mut arguments,None,summary).await?;
+    if result.value().pointer("/data/kind").and_then(Value::as_str)==Some("unavailable") {
+        let message=result.value().pointer("/data/message").and_then(Value::as_str).filter(|s|s.len()<=2048).ok_or(CliProductError::RequestShape)?;
+        return Err(CliProductError::Workflow(message.to_owned()));
+    }
+    Ok(result)
+}
+
 async fn economic_context(
     authority: CliAuthority<'_>,
+    list_series: bool,
+    series_id: Option<String>,
     knowledge_cutoff: Option<String>,
     effective_date_cutoff: Option<String>,
 ) -> Result<CliProductResult, CliProductError> {
@@ -223,14 +298,45 @@ async fn economic_context(
         }))?,
         (Some(_), None) | (None, Some(_)) => return Err(CliProductError::RequestShape),
     };
-    invoke(
-        authority,
-        "Macro.GetContext",
-        &mut arguments,
-        Some(13),
-        "economic context read",
-    )
-    .await
+    let (operation, maximum_items, summary) = match (list_series, series_id) {
+        (false, None) => (
+            "Macro.GetContext",
+            crate::application::MACRO_CONTEXT_INDICATOR_COUNT,
+            "economic context read",
+        ),
+        (true, None) => ("Macro.ListSeries", 64, "saved economic series listed"),
+        (false, Some(series_id)) if !series_id.is_empty() && series_id.len() <= 512 => {
+            arguments.insert("seriesId".into(), Value::String(series_id));
+            ("Macro.GetLatestSeriesObservation", 1, "latest saved economic observation read")
+        }
+        _ => return Err(CliProductError::RequestShape),
+    };
+    invoke(authority, operation, &mut arguments, Some(maximum_items), summary).await
+}
+
+async fn economic_series_history(
+    authority: CliAuthority<'_>,
+    series_id: String,
+    start_effective_date: String,
+    knowledge_cutoff: Option<String>,
+    effective_date_cutoff: Option<String>,
+    after_effective_period: Option<String>,
+) -> Result<CliProductResult, CliProductError> {
+    if series_id.is_empty() || series_id.len() > 512 { return Err(CliProductError::RequestShape); }
+    let mut arguments = match (knowledge_cutoff, effective_date_cutoff) {
+        (None, None) => Map::new(),
+        (Some(knowledge_cutoff), Some(effective_date_cutoff)) => json_object(json!({
+            "knowledgeCutoff": knowledge_cutoff,
+            "effectiveDateCutoff": effective_date_cutoff,
+        }))?,
+        _ => return Err(CliProductError::RequestShape),
+    };
+    arguments.insert("seriesId".into(), Value::String(series_id));
+    arguments.insert("startEffectiveDate".into(), Value::String(start_effective_date));
+    if let Some(after) = after_effective_period {
+        arguments.insert("afterEffectivePeriod".into(), Value::String(after));
+    }
+    invoke(authority, "Macro.GetSeriesHistory", &mut arguments, Some(32), "saved economic history read").await
 }
 
 async fn market(
@@ -238,16 +344,56 @@ async fn market(
     command: MarketCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
+        MarketCommand::GetSessionContext { product, date, confirm } => {
+            require_confirmation(confirm)?;
+            require_installed(authority, "Market.GetSessionContext")?;
+            let mut arguments = json_object(json!({
+                "product": product,
+                "date": date.to_string(),
+                "confirm": true,
+            }))?;
+            invoke(
+                authority,
+                "Market.GetSessionContext",
+                &mut arguments,
+                Some(64),
+                "reported trading sessions acquired",
+            ).await
+        }
+        MarketCommand::ReadSessionContext { reference } => {
+            require_installed(authority, "Market.ReadSessionContext")?;
+            let reference = read_json_object(&reference)?;
+            let mut arguments = json_object(json!({"reference": reference}))?;
+            invoke(
+                authority,
+                "Market.ReadSessionContext",
+                &mut arguments,
+                Some(64),
+                "saved trading sessions read",
+            ).await
+        }
+        MarketCommand::PrepareInvestmentEvidence { request, confirm } => {
+            require_confirmation(confirm)?;
+            require_installed(authority, "Market.PrepareInvestmentEvidence")?;
+            let mut arguments = read_json_object(&request)?;
+            arguments.insert("confirm".to_owned(), Value::Bool(true));
+            invoke_without_result_limits(
+                authority,
+                "Market.PrepareInvestmentEvidence",
+                Value::Object(arguments),
+                "current-session evidence preparation completed",
+            )
+            .await
+        }
         MarketCommand::Overview { page_token } => {
             let mut arguments = Map::new();
             if let Some(token) = page_token {
                 arguments.insert("pageToken".to_owned(), json!(token));
             }
-            invoke(
+            invoke_without_result_limits(
                 authority,
                 "Market.GetOverview",
-                &mut arguments,
-                None,
+                Value::Object(arguments),
                 "market overview read",
             )
             .await
@@ -257,33 +403,30 @@ async fn market(
             if let Some(token) = page_token {
                 arguments.insert("pageToken".to_owned(), json!(token));
             }
-            invoke(
+            invoke_without_result_limits(
                 authority,
                 "Market.SearchUniverse",
-                &mut arguments,
-                None,
+                Value::Object(arguments),
                 "market search",
             )
             .await
         }
         MarketCommand::Select { selection_token } => {
-            let mut arguments = json_object(json!({"selectionToken": selection_token}))?;
-            invoke(
+            let arguments = json_object(json!({"selectionToken": selection_token}))?;
+            invoke_without_result_limits(
                 authority,
                 "Market.GetInstrument",
-                &mut arguments,
-                None,
+                Value::Object(arguments),
                 "market investment read",
             )
             .await
         }
         MarketCommand::History { history_token } => {
-            let mut arguments = json_object(json!({"historyToken": history_token}))?;
-            invoke(
+            let arguments = json_object(json!({"historyToken": history_token}))?;
+            invoke_without_result_limits(
                 authority,
                 "Market.GetHistory",
-                &mut arguments,
-                None,
+                Value::Object(arguments),
                 "market history read",
             )
             .await
@@ -312,6 +455,12 @@ async fn source(
             source_filter(provider),
             "source status read",
         ),
+        SourceCommand::Verify { provider, confirm } => {
+            return source_lifecycle(authority, &provider, "Source.Verify", "verify", confirm).await;
+        }
+        SourceCommand::Start { provider, confirm } => {
+            return source_lifecycle(authority, &provider, "Source.Start", "start", confirm).await;
+        }
         SourceCommand::Coverage { provider } => (
             "Source.GetCoverage",
             source_filter(provider),
@@ -322,14 +471,15 @@ async fn source(
             source_filter(provider),
             "source health read",
         ),
-        SourceCommand::Discover { provider, dataset } => (
-            "Source.ListObjects",
+        SourceCommand::Discover { provider, dataset, confirm } => (
+            "Source.Discover",
             json_object(json!({
                 "provider": provider,
                 "dataset": dataset,
+                "confirm": confirm,
                 "sourceCoverage": [provider],
             }))?,
-            "source objects discovered",
+            "source objects and ingestion receipts discovered",
         ),
         SourceCommand::Inspect {
             provider,
@@ -387,6 +537,108 @@ async fn source(
         }
     };
     invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn source_lifecycle(
+    authority: CliAuthority<'_>,
+    provider: &str,
+    operation: &'static str,
+    action: &str,
+    confirm: bool,
+) -> Result<CliProductResult, CliProductError> {
+    require_confirmation(confirm)?;
+    let CliAuthority::Installed(client) = authority else {
+        return Err(CliProductError::InstalledServiceRequired { operation });
+    };
+    // The provider doctor owns a 60-second deadline, in addition to credential admission.
+    // Reuse the setup transport allowance without extending the provider's own bounds.
+    let client = client.with_transport_timeout(Duration::from_secs(120))?;
+    let authority = CliAuthority::Installed(&client);
+    let status = invoke(
+        authority,
+        "Source.GetStatus",
+        &mut source_filter(Some(provider.to_owned())),
+        Some(1),
+        "source status read",
+    )
+    .await?;
+    let rows = status
+        .value()
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or(CliProductError::RuntimeRequest)?;
+    let [row] = rows.as_slice() else {
+        return Err(CliProductError::RuntimeRequest);
+    };
+    let lifecycle = row
+        .get("lifecycle")
+        .and_then(Value::as_object)
+        .ok_or(CliProductError::RuntimeRequest)?;
+    if lifecycle.get("provider").and_then(Value::as_str) != Some(provider) {
+        return Err(CliProductError::RuntimeRequest);
+    }
+    let revision = lifecycle
+        .get("stateRevision")
+        .and_then(Value::as_str)
+        .ok_or(CliProductError::RuntimeRequest)?;
+    if revision
+        .parse::<u64>()
+        .ok()
+        .is_none_or(|value| value == 0 || value.to_string() != revision)
+    {
+        return Err(CliProductError::RuntimeRequest);
+    }
+    let mut arguments = json_object(json!({
+        "provider": provider,
+        "sourceCoverage": [provider],
+        "expectedStateRevision": revision,
+        "confirm": true,
+    }))?;
+    match (
+        lifecycle.get("configurationSessionId"),
+        lifecycle.get("publicConfigurationSha256"),
+    ) {
+        (Some(Value::Null), Some(Value::Null)) => {}
+        (Some(Value::String(session)), Some(Value::String(digest))) => {
+            let session_id =
+                uuid::Uuid::parse_str(session).map_err(|_| CliProductError::RuntimeRequest)?;
+            if session_id.is_nil() || session_id.to_string() != *session {
+                return Err(CliProductError::RuntimeRequest);
+            }
+            lowercase_sha256(digest)?;
+            arguments.insert("onboardingSessionId".to_owned(), json!(session));
+            arguments.insert("publicConfigurationSha256".to_owned(), json!(digest));
+        }
+        _ => return Err(CliProductError::RuntimeRequest),
+    }
+    // Carry the observed revision exactly. A concurrent change must fail the existing CAS;
+    // this command never rereads and retries a mutation against a replacement configuration.
+    let result = invoke(
+        authority,
+        operation,
+        &mut arguments,
+        Some(1),
+        "source lifecycle applied",
+    )
+    .await?;
+    let receipt = result
+        .value()
+        .get("data")
+        .ok_or(CliProductError::RuntimeRequest)?;
+    if receipt.get("provider").and_then(Value::as_str) != Some(provider)
+        || receipt.get("action").and_then(Value::as_str) != Some(action)
+    {
+        return Err(CliProductError::RuntimeRequest);
+    }
+    if !matches!(
+        receipt.get("disposition").and_then(Value::as_str),
+        Some("applied" | "replay")
+    ) {
+        return Err(CliProductError::Application(
+            market_squawk_services::ServiceError::Unavailable,
+        ));
+    }
+    Ok(result)
 }
 
 async fn unlock_provider_credentials(
@@ -545,24 +797,9 @@ async fn ingest(
             provider,
             object,
             dataset,
+            discovery_receipt,
             confirm,
         } => {
-            let mut discovery_arguments = json_object(json!({
-                "provider": provider,
-                "dataset": dataset,
-                "confirm": confirm,
-                "sourceCoverage": [provider],
-            }))?;
-            let discovery = invoke(
-                authority,
-                "Source.Discover",
-                &mut discovery_arguments,
-                None,
-                "source ingestion authority minted",
-            )
-            .await?;
-            let discovery_receipt =
-                exact_discovery_receipt(&discovery, &provider, &dataset, &object)?;
             let mut arguments = json_object(json!({
                 "provider": provider,
                 "object": object,
@@ -596,58 +833,6 @@ async fn ingest(
             .await
         }
     }
-}
-
-fn exact_discovery_receipt(
-    discovery: &CliProductResult,
-    provider: &str,
-    dataset: &str,
-    object: &str,
-) -> Result<String, CliProductError> {
-    let data = discovery
-        .value()
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or(CliProductError::Application(
-            market_squawk_services::ServiceError::InvalidResult,
-        ))?;
-    if data.get("profile").and_then(Value::as_str) != Some(provider)
-        || data
-            .get("request")
-            .and_then(Value::as_object)
-            .and_then(|request| request.get("dataset"))
-            .and_then(Value::as_str)
-            != Some(dataset)
-    {
-        return Err(CliProductError::Application(
-            market_squawk_services::ServiceError::InvalidResult,
-        ));
-    }
-    let objects =
-        data.get("objects")
-            .and_then(Value::as_array)
-            .ok_or(CliProductError::Application(
-                market_squawk_services::ServiceError::InvalidResult,
-            ))?;
-    let mut matches = objects.iter().filter(|candidate| {
-        candidate.get("object_id").and_then(Value::as_str) == Some(object)
-            && candidate.get("dataset").and_then(Value::as_str) == Some(dataset)
-    });
-    let selected = matches.next().ok_or(CliProductError::Application(
-        market_squawk_services::ServiceError::NotFound,
-    ))?;
-    if matches.next().is_some() {
-        return Err(CliProductError::Application(
-            market_squawk_services::ServiceError::InvalidResult,
-        ));
-    }
-    selected
-        .get("discovery_receipt")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or(CliProductError::Application(
-            market_squawk_services::ServiceError::InvalidResult,
-        ))
 }
 
 async fn dataset(
@@ -948,6 +1133,27 @@ async fn forecast(
             json_object(json!({"forecastToken": forecast_token}))?,
             "forecast read",
         ),
+        ForecastCommand::PrepareOutcome {
+            forecast_token,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Model.PrepareForecastOutcome",
+                json_object(json!({"forecastToken":forecast_token,"confirm":true}))?,
+                "forecast outcome source preparation completed",
+            )
+        }
+        ForecastCommand::MeasureOutcome { request, confirm } => {
+            require_confirmation(confirm)?;
+            let mut arguments = read_json_object(&request)?;
+            arguments.insert("confirm".to_owned(), Value::Bool(true));
+            (
+                "Model.MeasureForecastOutcome",
+                arguments,
+                "forecast outcome measurement completed",
+            )
+        }
         ForecastCommand::Outcomes { forecast_token } => (
             "Model.GetForecastOutcomes",
             json_object(json!({"forecastToken": forecast_token}))?,
@@ -1017,6 +1223,22 @@ async fn portfolio(
             read_json_object(&request)?,
             "portfolio risk calculated",
         ),
+        PortfolioCommand::SelectAnalysisPrerequisites { request } => {
+            require_installed(authority, "Portfolio.SelectAnalysisPrerequisites")?;
+            (
+                "Portfolio.SelectAnalysisPrerequisites",
+                read_json_object(&request)?,
+                "portfolio analysis prerequisites calculated",
+            )
+        }
+        PortfolioCommand::ReadAnalysisPrerequisites { request } => {
+            require_installed(authority, "Portfolio.ReadAnalysisPrerequisites")?;
+            (
+                "Portfolio.ReadAnalysisPrerequisites",
+                read_json_object(&request)?,
+                "saved portfolio analysis prerequisites reopened",
+            )
+        }
     };
     invoke(authority, operation, &mut arguments, None, summary).await
 }
@@ -1164,6 +1386,53 @@ async fn bot(
     command: BotCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
+        BotCommand::AccountPreparation => {
+            let mut arguments = Map::new();
+            invoke(
+                authority,
+                "Bot.GetAccountPreparation",
+                &mut arguments,
+                None,
+                "virtual account choices read",
+            )
+            .await
+        }
+        BotCommand::PrepareAccount {
+            cash_choice,
+            cost_choice,
+            currency_choice,
+        } => {
+            let mut arguments = json_object(json!({
+                "cashChoice": cash_choice,
+                "costChoice": cost_choice,
+                "currencyChoice": currency_choice,
+            }))?;
+            invoke(
+                authority,
+                "Bot.PrepareAccount",
+                &mut arguments,
+                None,
+                "virtual account prepared",
+            )
+            .await
+        }
+        BotCommand::CreateAccount {
+            confirmation_token,
+            confirm,
+        } => {
+            let mut arguments = json_object(json!({
+                "confirmationToken": confirmation_token,
+                "confirm": confirm,
+            }))?;
+            invoke(
+                authority,
+                "Bot.CreateAccount",
+                &mut arguments,
+                None,
+                "virtual account created",
+            )
+            .await
+        }
         BotCommand::Status => {
             let mut arguments = Map::new();
             invoke(
@@ -1187,11 +1456,13 @@ async fn bot(
             .await
         }
         BotCommand::Prepare {
+            market_choice,
             cash_choice,
             cost_choice,
             mode_choice,
         } => {
             let mut arguments = json_object(json!({
+                "marketChoice": market_choice,
                 "cashChoice": cash_choice,
                 "costChoice": cost_choice,
                 "modeChoice": mode_choice,
@@ -1266,11 +1537,13 @@ async fn execution(
     let (operation, mut arguments, summary) = match command {
         ExecutionCommand::Orders => ("Execution.GetOrders", Map::new(), "paper orders listed"),
         ExecutionCommand::Fills => ("Execution.GetFills", Map::new(), "paper fills listed"),
-        ExecutionCommand::Targets => (
-            "Execution.GetManualPaperTargets",
-            Map::new(),
-            "paper target choices listed",
-        ),
+        ExecutionCommand::Targets { analysis_action_token } => {
+            let mut arguments = Map::new();
+            if let Some(token) = analysis_action_token {
+                arguments.insert("analysisActionToken".to_owned(), json!(token));
+            }
+            ("Execution.GetManualPaperTargets", arguments, "paper investment choices listed")
+        }
         ExecutionCommand::PrepareManual { request } => (
             "Execution.PrepareManualPaperDraft",
             read_json_object(&request)?,
@@ -2157,7 +2430,7 @@ async fn invoke_without_result_limits(
                     context.request_id().clone(),
                     operation,
                     arguments,
-                    if operation == "Source.Onboarding.ApplyStaged" {
+                    if matches!(operation, "Source.Onboarding.ApplyStaged" | "Source.Verify") {
                         Duration::from_secs(120)
                     } else {
                         CLI_INSTALLED_REQUEST_TIMEOUT
@@ -2234,7 +2507,10 @@ fn request_context(origin: Option<RequestOrigin>) -> Result<RequestContext, CliP
 fn local_paper_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "Bot.GetStartPreparation"
+        "Bot.GetAccountPreparation"
+            | "Bot.PrepareAccount"
+            | "Bot.CreateAccount"
+            | "Bot.GetStartPreparation"
             | "Bot.PrepareStart"
             | "Bot.Start"
             | "Execution.GetManualPaperTargets"

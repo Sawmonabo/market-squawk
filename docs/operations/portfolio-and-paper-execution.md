@@ -221,9 +221,10 @@ The service starts the runtime only after provider, lifecycle, audit, checkpoint
 and central-risk checks pass. The returned lifecycle/job/receipt evidence is the source of truth;
 `--seconds` requests a bounded interval and Ctrl-C requests the owned client's bounded stop path.
 
-To run the authenticated Direct path, first complete
-`source setup coinbase.exchange-direct-market-data --confirm` and retain the resulting active
-session UUID. Then start the paper runtime with that exact authority:
+To run the authenticated Direct path, first select Coinbase Exchange Direct in
+**Settings → Connections → Set up connections**. Verify or resume its saved credential; enter a
+new credential only when requested. Retain the resulting active session UUID, then start the paper
+runtime with that exact authority:
 
 ```bash
 market-squawk --output json bot start \
@@ -235,7 +236,7 @@ market-squawk --output json bot start \
   --confirm
 ```
 
-The setup portal accepts one versioned secret envelope containing the View-only Exchange
+The native credential form produces the versioned secret envelope for the View-only Exchange
 `api_key`, `passphrase`, and `signing_secret`; secret values are never command-line arguments or
 status output. The Direct run does not persist or export market observations under the current
 scoped rights.

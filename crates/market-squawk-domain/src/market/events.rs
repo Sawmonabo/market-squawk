@@ -1,5 +1,9 @@
 //! Validated payloads carried by [`super::MarketEvent`].
 
+use std::fmt;
+use std::marker::PhantomData;
+
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
@@ -9,6 +13,53 @@ use super::{
     validate_book_depth, validate_market_provenance,
 };
 use crate::{PriceTicks, QuantityLots};
+
+const MAX_BOOK_SNAPSHOT_LEVELS_PER_SIDE: usize = 4_096;
+const MAX_BOOK_DELTA_CHANGES: usize = 4_096;
+
+struct BoundedBookEntries<T, const MAX: usize>(Vec<T>);
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedBookEntries<T, MAX> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntriesVisitor<T, const MAX: usize>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>, const MAX: usize> Visitor<'de> for EntriesVisitor<T, MAX> {
+            type Value = BoundedBookEntries<T, MAX>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "at most {MAX} book entries")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(sequence.size_hint().unwrap_or_default().min(MAX))
+                    .map_err(serde::de::Error::custom)?;
+                while entries.len() < MAX {
+                    let Some(entry) = sequence.next_element()? else {
+                        return Ok(BoundedBookEntries(entries));
+                    };
+                    if entries.len() == entries.capacity() {
+                        let next_capacity = entries.capacity().max(1).saturating_mul(2).min(MAX);
+                        entries
+                            .try_reserve_exact(next_capacity - entries.len())
+                            .map_err(serde::de::Error::custom)?;
+                    }
+                    entries.push(entry);
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                Ok(BoundedBookEntries(entries))
+            }
+        }
+
+        deserializer.deserialize_seq(EntriesVisitor(PhantomData))
+    }
+}
 
 /// Executed trade payload.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -171,6 +222,9 @@ pub struct BookSnapshotEvent {
 }
 
 impl BookSnapshotEvent {
+    /// Maximum retained levels on each side of one snapshot.
+    pub const MAX_LEVELS_PER_SIDE: usize = MAX_BOOK_SNAPSHOT_LEVELS_PER_SIDE;
+
     /// Constructs an uncrossed snapshot in strict best-to-worst side order.
     pub fn new(
         provenance: LiveProvenance,
@@ -179,6 +233,13 @@ impl BookSnapshotEvent {
         asks: Vec<BookLevel>,
         sequence: Option<SequenceNumber>,
     ) -> Result<Self, MarketEventError> {
+        if bids.len() > Self::MAX_LEVELS_PER_SIDE
+            || asks.len() > Self::MAX_LEVELS_PER_SIDE
+            || bids.capacity() > Self::MAX_LEVELS_PER_SIDE
+            || asks.capacity() > Self::MAX_LEVELS_PER_SIDE
+        {
+            return Err(MarketEventError::BookSnapshotLevelLimitExceeded);
+        }
         validate_market_provenance(&provenance, true, crate::LiveEventClass::BookSnapshot)?;
         validate_book_depth(&provenance, depth)?;
         validate_book(&bids, &asks)?;
@@ -222,8 +283,8 @@ impl BookSnapshotEvent {
 struct BookSnapshotEventWire {
     provenance: LiveProvenance,
     depth: MarketDepth,
-    bids: Vec<BookLevel>,
-    asks: Vec<BookLevel>,
+    bids: BoundedBookEntries<BookLevel, MAX_BOOK_SNAPSHOT_LEVELS_PER_SIDE>,
+    asks: BoundedBookEntries<BookLevel, MAX_BOOK_SNAPSHOT_LEVELS_PER_SIDE>,
     sequence: Option<SequenceNumber>,
 }
 
@@ -236,8 +297,8 @@ impl<'de> Deserialize<'de> for BookSnapshotEvent {
         Self::new(
             wire.provenance,
             wire.depth,
-            wire.bids,
-            wire.asks,
+            wire.bids.0,
+            wire.asks.0,
             wire.sequence,
         )
         .map_err(serde::de::Error::custom)
@@ -254,6 +315,9 @@ pub struct BookDeltaEvent {
 }
 
 impl BookDeltaEvent {
+    /// Maximum retained changes in one atomic delta.
+    pub const MAX_CHANGES: usize = MAX_BOOK_DELTA_CHANGES;
+
     /// Constructs one atomic nonempty provider delta.
     pub fn new(
         provenance: LiveProvenance,
@@ -261,6 +325,9 @@ impl BookDeltaEvent {
         changes: Vec<BookChange>,
         sequence: Option<SequenceNumber>,
     ) -> Result<Self, MarketEventError> {
+        if changes.len() > Self::MAX_CHANGES || changes.capacity() > Self::MAX_CHANGES {
+            return Err(MarketEventError::BookDeltaChangeLimitExceeded);
+        }
         validate_market_provenance(&provenance, true, crate::LiveEventClass::BookDelta)?;
         validate_book_depth(&provenance, depth)?;
         if changes.is_empty() {
@@ -300,7 +367,7 @@ impl BookDeltaEvent {
 struct BookDeltaEventWire {
     provenance: LiveProvenance,
     depth: MarketDepth,
-    changes: Vec<BookChange>,
+    changes: BoundedBookEntries<BookChange, MAX_BOOK_DELTA_CHANGES>,
     sequence: Option<SequenceNumber>,
 }
 
@@ -310,7 +377,7 @@ impl<'de> Deserialize<'de> for BookDeltaEvent {
         D: Deserializer<'de>,
     {
         let wire = BookDeltaEventWire::deserialize(deserializer)?;
-        Self::new(wire.provenance, wire.depth, wire.changes, wire.sequence)
+        Self::new(wire.provenance, wire.depth, wire.changes.0, wire.sequence)
             .map_err(serde::de::Error::custom)
     }
 }

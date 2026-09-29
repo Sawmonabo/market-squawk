@@ -89,6 +89,17 @@ pub(crate) fn select_market_source(
         &eligible,
         &rejected,
         selected_at,
+        true,
+    )?;
+    let source_evidence_digest = selection_receipt_digest(
+        policy.revision(),
+        policy.digest(),
+        policy.maximum_candidates(),
+        &request,
+        &eligible,
+        &rejected,
+        selected_at,
+        false,
     )?;
     Ok(MarketSelectionReceipt::new(
         policy.revision(),
@@ -99,6 +110,7 @@ pub(crate) fn select_market_source(
         rejected,
         selected_at,
         selection_digest,
+        source_evidence_digest,
     ))
 }
 
@@ -215,16 +227,22 @@ fn evaluate_source_state(
             state: rights.state(),
         });
     } else {
-        if rights.decided_at() > as_of {
+        if rights.decided_at() > request.authorization_at() {
             reasons.push(CandidateRejectionReason::RightsObservedAfterSelection);
         }
         if !rights.permitted_operations().contains(request.operation()) {
             reasons.push(CandidateRejectionReason::RightsOperationDenied);
         }
-        if rights.effective_from().is_none_or(|from| as_of < from) {
+        if rights
+            .effective_from()
+            .is_none_or(|from| request.authorization_at() < from)
+        {
             reasons.push(CandidateRejectionReason::RightsNotEffective);
         }
-        if rights.effective_until().is_some_and(|until| as_of > until) {
+        if rights
+            .effective_until()
+            .is_some_and(|until| request.authorization_at() > until)
+        {
             reasons.push(CandidateRejectionReason::RightsExpired);
         }
     }

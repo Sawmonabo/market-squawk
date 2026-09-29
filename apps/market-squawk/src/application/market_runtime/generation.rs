@@ -19,7 +19,7 @@ use crate::{
 use super::configuration::PreparedMarketProviderConfigurationRequest;
 
 const GROUP_GENERATION_DOMAIN: &[u8] = b"market-squawk/market-runtime-group-generation/v2\0";
-const LIVE_SURFACE_GENERATION_DOMAIN: &[u8] = b"market-squawk/live-market-surface-generation/v1\0";
+const LIVE_SURFACE_GENERATION_DOMAIN: &[u8] = b"market-squawk/live-market-surface-generation/v2\0";
 
 /// Lifecycle identity for either one source connection or one independently supervised group.
 ///
@@ -114,7 +114,7 @@ impl MarketRuntimeTopology {
             .any(|pair| metadata[pair[0]].source_id() == metadata[pair[1]].source_id())
             || source_indexes
                 .iter()
-                .any(|index| metadata[*index].coverage().live().is_none())
+                .any(|index| metadata[*index].coverage().live_channels().is_empty())
         {
             return Err(ServiceError::Unavailable);
         }
@@ -338,7 +338,10 @@ impl MarketRuntimeGroupGeneration {
         });
         for source_index in source_indexes {
             let source = &metadata[source_index];
-            let live = source.coverage().live().ok_or(ServiceError::Unavailable)?;
+            let channels = source.coverage().live_channels();
+            if channels.is_empty() {
+                return Err(ServiceError::Unavailable);
+            }
             update_text(&mut hasher, source.source_id().as_str())?;
             update_text(
                 &mut hasher,
@@ -352,14 +355,19 @@ impl MarketRuntimeGroupGeneration {
                     .content_digest(),
             );
             update_text(&mut hasher, source.provider().as_str())?;
-            update_text(
-                &mut hasher,
-                live.provider_product().as_source_identifier().as_str(),
-            )?;
-            update_text(
-                &mut hasher,
-                live.provider_channel().as_source_identifier().as_str(),
-            )?;
+            let channel_count = u64::try_from(channels.len())
+                .map_err(|_| ServiceError::InvalidRequest)?;
+            hasher.update(channel_count.to_be_bytes());
+            for live in channels {
+                update_text(
+                    &mut hasher,
+                    live.provider_product().as_source_identifier().as_str(),
+                )?;
+                update_text(
+                    &mut hasher,
+                    live.provider_channel().as_source_identifier().as_str(),
+                )?;
+            }
         }
 
         let route_count = u64::try_from(routes.len()).map_err(|_| ServiceError::InvalidRequest)?;

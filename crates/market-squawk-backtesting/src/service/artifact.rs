@@ -52,10 +52,42 @@ struct PortfolioWire {
     market_value: String,
     gross_exposure: String,
     marked_equity: String,
-    realized_gain: String,
-    realized_loss: String,
+    receivable_value: String,
+    cash_entitlements: Vec<CashEntitlementWire>,
+    realized_gain: BasisWire,
+    realized_loss: BasisWire,
     fees: String,
     positions: Vec<PositionWire>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum BasisWire {
+    Complete { amount: String, currency: String },
+    Incomplete,
+}
+impl From<market_squawk_portfolio::BasisMeasurement> for BasisWire {
+    fn from(value: market_squawk_portfolio::BasisMeasurement) -> Self {
+        match value {
+            market_squawk_portfolio::BasisMeasurement::Complete(value) => Self::Complete {
+                amount: value.amount().to_string(),
+                currency: value.currency().as_str().to_owned(),
+            },
+            market_squawk_portfolio::BasisMeasurement::Incomplete => Self::Incomplete,
+        }
+    }
+}
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CashEntitlementWire {
+    action_evidence: String,
+    instrument_id: String,
+    entitled_at_unix_nanos: i64,
+    amount: String,
+    currency: String,
+    payable_date: Option<String>,
+    simulated_settlement_at_unix_nanos: Option<i64>,
+    settled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,8 +160,25 @@ pub(super) fn encode(
             market_value: portfolio.market_value().amount().to_string(),
             gross_exposure: portfolio.gross_exposure().amount().to_string(),
             marked_equity: portfolio.marked_equity().amount().to_string(),
-            realized_gain: portfolio.realized_gain().amount().to_string(),
-            realized_loss: portfolio.realized_loss().amount().to_string(),
+            receivable_value: portfolio.receivable_value().amount().to_string(),
+            cash_entitlements: portfolio
+                .cash_entitlements()
+                .iter()
+                .map(|value| CashEntitlementWire {
+                    action_evidence: hex(value.action_evidence().bytes()),
+                    instrument_id: value.instrument().as_uuid().to_string(),
+                    entitled_at_unix_nanos: value.entitled_at().unix_nanos(),
+                    amount: value.amount().amount().to_string(),
+                    currency: value.amount().currency().as_str().to_owned(),
+                    payable_date: value.payable_date().map(|date| date.to_string()),
+                    simulated_settlement_at_unix_nanos: value
+                        .simulated_settlement_at()
+                        .map(|at| at.unix_nanos()),
+                    settled: value.settled(),
+                })
+                .collect(),
+            realized_gain: portfolio.realized_gain().into(),
+            realized_loss: portfolio.realized_loss().into(),
             fees: portfolio.fees().amount().to_string(),
             positions,
         },

@@ -11,8 +11,8 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::DateTime;
-use market_squawk_data::{DatasetManifestRef, Sha256Digest};
-use market_squawk_domain::{InstrumentId, ModelId, Timestamp};
+use market_squawk_data::{AnalyticalReadCapability, DatasetManifestRef, Sha256Digest};
+use market_squawk_domain::{InstrumentId, ModelId, ResearchTemporalCoordinate, Timestamp};
 use market_squawk_modeling::{
     BundleId, CalibrationEvidence, CalibrationMethod, FeatureNormalizer, ForecastCentralStatistic,
     ForecastHorizon, ForecastMeasurement, ForecastOutputBinding, ForecastTargetMeaning,
@@ -42,12 +42,22 @@ use super::{
 pub mod backup;
 pub mod forecast;
 pub mod forecast_preparation;
+pub(crate) mod outcome_measurement;
+mod outcome_preparation;
 mod read_image;
 pub mod runtime;
 
 pub use forecast::{
     ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
 };
+pub(crate) use forecast::{
+    ForecastJobExecutor, ForecastJobOutput, ForecastPrecommitAuthority,
+    ForecastRecoveryCoordinates, ForecastStudyRuntimeReference, HistoricalPriceForecast,
+    SelectedForecastDistribution, SelectedForecastDistributionPoint, SelectedForecastRuntime,
+    financial_analysis_evidence, financial_coordinate_index, financial_feature_values,
+    forecast_recovery_coordinates, reopen_financial_input,
+};
+pub(crate) use forecast_preparation::PreparedForecastJobInput;
 
 use read_image::{ModelReadImage, ModelReadImageState};
 
@@ -62,11 +72,43 @@ const MAXIMUM_EVALUATION_RECORDS: usize = 100_000;
 pub struct ModelDomainService {
     read_image: Arc<ModelReadImageState>,
     forecasts: Option<Arc<ForecastApplicationService>>,
+    forecast_analytical: Option<AnalyticalReadCapability>,
+    forecast_source_actions: Option<super::research::corporate_actions::SourceAppliedCorporateActionReadCapability>,
+    forecast_outcome_preparation: Option<super::research::corporate_actions::SourceActionPreparationCapability>,
+    forecast_calendar:
+        Option<crate::application::market_calendar::ForecastSessionReadCapability>,
     evaluations: Mutex<EvaluationStore>,
     lifecycle: Arc<DomainLifecycle>,
 }
 
 impl ModelDomainService {
+    /// Binds the existing source/calendar read owners before this service is shared.
+    pub(crate) fn with_source_action_reads(
+        mut self,
+        source_actions: super::research::corporate_actions::SourceAppliedCorporateActionReadCapability,
+    ) -> Self {
+        self.forecast_source_actions = Some(source_actions);
+        self
+    }
+
+    /// Binds later-history acquisition through the installed source owner.
+    pub(crate) fn with_outcome_preparation(
+        mut self,
+        source: super::research::corporate_actions::SourceActionPreparationCapability,
+    ) -> Self {
+        self.forecast_outcome_preparation = Some(source);
+        self
+    }
+
+    /// Attaches the existing calendar source owner for exact current forecast cohort replay.
+    pub(crate) fn with_forecast_calendar(
+        mut self,
+        calendar: crate::application::market_calendar::CompletedMarketSessionReadCapability,
+    ) -> Self {
+        self.forecast_calendar = Some(crate::application::market_calendar::ForecastSessionReadCapability::Current(calendar));
+        self
+    }
+
     /// Binds every retained bundle to exactly one admitted inference backend.
     ///
     /// # Errors
@@ -83,6 +125,7 @@ impl ModelDomainService {
             Arc::new(ModelReadImageState::new(image)),
             maximum_evaluation_records,
             None,
+            None,
         )
     }
 
@@ -95,7 +138,12 @@ impl ModelDomainService {
         snapshot: runtime::ModelRuntimeSnapshot,
         maximum_evaluation_records: NonZeroUsize,
     ) -> Result<Self, ModelDomainServiceError> {
-        Self::try_from_read_image(snapshot.into_read_image(), maximum_evaluation_records, None)
+        Self::try_from_read_image(
+            snapshot.into_read_image(),
+            maximum_evaluation_records,
+            None,
+            None,
+        )
     }
 
     /// Binds an installed runtime snapshot and its sole durable forecast publication authority.
@@ -103,11 +151,13 @@ impl ModelDomainService {
         snapshot: runtime::ModelRuntimeSnapshot,
         maximum_evaluation_records: NonZeroUsize,
         forecasts: Arc<ForecastApplicationService>,
+        analytical: AnalyticalReadCapability,
     ) -> Result<Self, ModelDomainServiceError> {
         Self::try_from_read_image(
             snapshot.into_read_image(),
             maximum_evaluation_records,
             Some(forecasts),
+            Some(analytical),
         )
     }
 
@@ -115,6 +165,7 @@ impl ModelDomainService {
         read_image: Arc<ModelReadImageState>,
         maximum_evaluation_records: NonZeroUsize,
         forecasts: Option<Arc<ForecastApplicationService>>,
+        forecast_analytical: Option<AnalyticalReadCapability>,
     ) -> Result<Self, ModelDomainServiceError> {
         if maximum_evaluation_records.get() > MAXIMUM_EVALUATION_RECORDS {
             return Err(ModelDomainServiceError::EvaluationCapacity);
@@ -122,6 +173,10 @@ impl ModelDomainService {
         Ok(Self {
             read_image,
             forecasts,
+            forecast_analytical,
+            forecast_calendar: None,
+            forecast_source_actions: None,
+            forecast_outcome_preparation: None,
             evaluations: Mutex::new(EvaluationStore::new(maximum_evaluation_records)),
             lifecycle: DomainLifecycle::new(),
         })
@@ -293,7 +348,7 @@ impl ModelDomainService {
         .await
         .map_err(map_forecast_selection_error)?;
         ensure_request_live(context, &self.lifecycle)?;
-        one_result(latest_valid_forecast_value(&selected), request, context)
+        one_result(latest_valid_forecast_value(&selected)?, request, context)
     }
 }
 
@@ -326,12 +381,21 @@ impl ApplicationDomainService for ModelDomainService {
             return Err(ServiceError::InvalidRequest);
         }
         let _call = DomainLifecycle::enter(&self.lifecycle, &context)?;
-        let forecast_commit = request.name() == forecast::GENERATE_FORECAST;
+        let forecast_commit = matches!(
+            request.name(),
+            forecast::GENERATE_FORECAST | outcome_measurement::MEASURE_FORECAST_OUTCOME
+        );
         let result = match request.name() {
             GET_METADATA => self.metadata(&request, &context),
             LIST_BUNDLES => self.bundles(&request, &context),
             EVALUATE => self.infer(&request, &context, true),
             PREDICT => self.infer(&request, &context, false),
+            outcome_preparation::PREPARE_FORECAST_OUTCOME => {
+                self.prepare_forecast_outcome(&request, &context).await
+            }
+            outcome_measurement::MEASURE_FORECAST_OUTCOME => {
+                self.measure_forecast_outcome(&request, &context).await
+            }
             forecast::GENERATE_FORECAST => self.generate_forecast(&request, &context).await,
             forecast::GET_FORECAST => self.get_forecast(&request, &context).await,
             forecast::SELECT_LATEST_VALID_FORECAST => {
@@ -562,7 +626,17 @@ fn one_result(
     .map_err(Into::into)
 }
 
-fn latest_valid_forecast_value(selected: &forecast::LatestValidForecast) -> Value {
+fn latest_valid_forecast_value(
+    selected: &forecast::LatestValidForecast,
+) -> Result<Value, ServiceError> {
+    if let Some(distribution) = selected.selected_distribution()
+        && matches!(
+            distribution.native_output().output_binding().measurement(),
+            ForecastMeasurement::FinancialAmount { .. }
+        )
+    {
+        return selected_financial_forecast_value(selected, distribution);
+    }
     let evidence = match selected.price_evidence() {
         forecast::ForecastPriceEvidence::Available(price) => json!({
             "vintageId": digest_value(price.vintage_id()),
@@ -572,7 +646,7 @@ fn latest_valid_forecast_value(selected: &forecast::LatestValidForecast) -> Valu
             "forecastArtifact": forecast_artifact_value(price.forecast_artifact()),
             "freshness": forecast_freshness_value(
                 selected.selection_receipt().as_of_unix_nanos(),
-                price.observed_through().unix_nanos(),
+                Some(price.observed_through().unix_nanos()),
                 price.available_at().unix_nanos(),
                 price.created_at().unix_nanos(),
                 price.expires_at().unix_nanos(),
@@ -583,7 +657,12 @@ fn latest_valid_forecast_value(selected: &forecast::LatestValidForecast) -> Valu
                 .copied()
                 .map(selected_price_point_value)
                 .collect::<Vec<_>>(),
-            "calibration": price.calibration().map(calibration_evidence_value),
+            "calibration": price.calibration().map(calibration_evidence_value).transpose()?,
+            "coverageEvaluation": price.model_metadata().forecast_calibration()
+                .and_then(|artifacts| artifacts.coverage_evaluation(Timestamp::from_unix_nanos(
+                    selected.selection_receipt().as_of_unix_nanos(),
+                )))
+                .map(calibration_coverage_evaluation_value).transpose()?,
         }),
         forecast::ForecastPriceEvidence::Unavailable(unavailable) => json!({
             "vintageId": digest_value(unavailable.vintage_id()),
@@ -604,14 +683,113 @@ fn latest_valid_forecast_value(selected: &forecast::LatestValidForecast) -> Valu
             "reason": forecast_price_unavailable_reason(unavailable.reason()),
         }),
     };
-    json!({
+    Ok(json!({
         "status": match selected.price_evidence() {
             forecast::ForecastPriceEvidence::Available(_) => "available",
             forecast::ForecastPriceEvidence::Unavailable(_) => "unavailable",
         },
         "evidence": evidence,
         "selectionReceipt": forecast_selection_receipt_value(selected.selection_receipt()),
-    })
+    }))
+}
+
+fn selected_financial_forecast_value(
+    selected: &forecast::LatestValidForecast,
+    distribution: &SelectedForecastDistribution,
+) -> Result<Value, ServiceError> {
+    let output = distribution.native_output();
+    let target = output
+        .financial_target()
+        .ok_or(ServiceError::InvalidResult)?;
+    let epoch = distribution
+        .serving_binding()
+        .financial_epoch()
+        .ok_or(ServiceError::InvalidResult)?;
+    let calibration = selected
+        .model_metadata()
+        .forecast_calibration()
+        .ok_or(ServiceError::InvalidResult)?;
+    if epoch.financial_period() != Some(target) {
+        return Err(ServiceError::InvalidResult);
+    }
+    let input_epoch_json = String::from_utf8(
+        epoch
+            .canonical_bytes()
+            .map_err(|_| ServiceError::InvalidResult)?,
+    )
+    .map_err(|_| ServiceError::InvalidResult)?;
+    let horizon = target
+        .target_horizon()
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let market_squawk_data::DatasetTargetHorizon::FiscalPeriods {
+        cadence,
+        periods_ahead,
+    } = horizon
+    else {
+        return Err(ServiceError::InvalidResult);
+    };
+    Ok(json!({
+        "status": "available",
+        "evidence": {
+            "vintageId": digest_value(distribution.vintage_id()),
+            "instrumentId": output.instrument_id().to_string(),
+            "outputBinding": forecast_output_binding_value(output.output_binding(), output.output_binding().identity()),
+            "model": selected_forecast_model_value(selected.model_metadata()),
+            "forecastArtifact": forecast_artifact_value(selected.forecast_artifact()),
+            "freshness": forecast_freshness_value(
+                selected.selection_receipt().as_of_unix_nanos(),
+                output.observed_through().map(Timestamp::unix_nanos),
+                output.available_at().unix_nanos(),
+                output.published_at().unix_nanos(),
+                output.expires_at().unix_nanos(),
+            ),
+            "targetAtUnixNanos": output.target_at().map(|time| time.unix_nanos().to_string()),
+            "financialTarget": {
+                "cadence": cadence,
+                "periodsAhead": periods_ahead.get(),
+                "observedOrdinal": target.observed_ordinal(),
+                "targetOrdinal": target.target_ordinal(),
+                "observedPeriod": target.observed_period(),
+                "targetPeriod": target.target_period(),
+                "sourceSelectionSha256": encode_hex(target.source_selection_digest().bytes()),
+                "identityReceiptSha256": encode_hex(target.identity_receipt_digest().bytes()),
+            },
+            "calibrationCutoff": model_temporal_coordinate_value(output.calibration_cutoff())?,
+            "central": forecast_value(output.central()),
+            "distribution": {
+                "identitySha256": digest_value(distribution.identity()),
+                "nativeOutputSha256": digest_value(output.identity()),
+                "residualDistributionSha256": digest_value(distribution.residual_distribution_identity()),
+                "points": distribution.points().iter().map(|point| json!({
+                    "value": forecast_value(point.value()),
+                    "probabilityPpm": point.probability_ppm().get(),
+                })).collect::<Vec<_>>(),
+                "semantics": "empirical_validation_residual_distribution",
+            },
+            "financialInput": {
+                "inputEpochJson": input_epoch_json,
+                "servingFeatureSha256": digest_value(distribution.serving_binding().feature_sha256()),
+            },
+            "calibrationFit": {
+                "method": calibration_method_name(calibration.method()),
+                "window": calibration_window_value(calibration.window())?,
+                "policyArtifact": {
+                    "sha256": digest_value(calibration.policy_hash()),
+                    "byteCount": calibration.policy_size_bytes().to_string(),
+                },
+                "residualArtifact": {
+                    "sha256": digest_value(calibration.residuals_hash()),
+                    "byteCount": calibration.residuals_size_bytes().to_string(),
+                },
+                "dependenceAssumptions": calibration.dependence_assumptions(),
+                "semantics": "fitted_interval_policy_not_evaluation",
+            },
+            "coverageEvaluation": calibration.coverage_evaluation(Timestamp::from_unix_nanos(
+                selected.selection_receipt().as_of_unix_nanos(),
+            )).map(calibration_coverage_evaluation_value).transpose()?,
+        },
+        "selectionReceipt": forecast_selection_receipt_value(selected.selection_receipt()),
+    }))
 }
 
 fn available_forecast_output_binding_value(price: &forecast::SelectedPriceForecast) -> Value {
@@ -632,30 +810,79 @@ fn forecast_output_binding_value(
     binding: &ForecastOutputBinding,
     output_binding_identity: Sha256Digest,
 ) -> Value {
-    let (measurement, currency) = match binding.measurement() {
-        ForecastMeasurement::Price { currency } => ("price", Some(currency.as_str().to_owned())),
-        ForecastMeasurement::Return => ("return", None),
-        ForecastMeasurement::Probability => ("probability", None),
-        ForecastMeasurement::OtherRegression => ("other_regression", None),
+    let (measurement, currency, financial_amount) = match binding.measurement() {
+        ForecastMeasurement::Price { currency } => {
+            ("price", Some(currency.as_str().to_owned()), None)
+        }
+        ForecastMeasurement::FinancialAmount {
+            currency,
+            role,
+            basis,
+            share_convention,
+        } => (
+            "financial_amount",
+            Some(currency.as_str().to_owned()),
+            Some(json!({
+                "role": role, "basis": basis, "shareConvention": share_convention,
+            })),
+        ),
+        ForecastMeasurement::Return => ("return", None, None),
+        ForecastMeasurement::Probability => ("probability", None, None),
+        ForecastMeasurement::OtherRegression => ("other_regression", None, None),
     };
-    let (target, terminal_horizon_nanos) = match binding.target() {
-        ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos } => (
+    let (target, terminal_horizon_nanos, origin_basis) = match binding.target() {
+        ForecastTargetMeaning::FixedHorizonTerminal {
+            horizon_nanos,
+            origin_basis,
+        } => (
             "fixed_horizon_terminal",
             Some(horizon_nanos.get().to_string()),
+            Some(match origin_basis {
+                market_squawk_data::FixedHorizonOriginBasis::ExactEffectiveTimestamp => {
+                    "exact_effective_timestamp"
+                }
+                market_squawk_data::FixedHorizonOriginBasis::CompletedBarClose => {
+                    "completed_bar_close"
+                }
+                market_squawk_data::FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar => "named_session_close_for_nominal_daily_bar",
+            }),
         ),
-        ForecastTargetMeaning::Unsupported => ("unsupported", None),
+        ForecastTargetMeaning::FixedHorizonEvent { horizon_nanos, origin_basis, .. } => (
+            "fixed_horizon_event", Some(horizon_nanos.get().to_string()), Some(match origin_basis {
+                market_squawk_data::FixedHorizonOriginBasis::ExactEffectiveTimestamp => "exact_effective_timestamp",
+                market_squawk_data::FixedHorizonOriginBasis::CompletedBarClose => "completed_bar_close",
+                market_squawk_data::FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar => "named_session_close_for_nominal_daily_bar",
+            })),
+        ForecastTargetMeaning::FinancialPeriod { .. } => ("financial_period", None, None),
+        ForecastTargetMeaning::Unsupported => ("unsupported", None, None),
     };
-    json!({
+    let fiscal_horizon = match binding.target() {
+        ForecastTargetMeaning::FinancialPeriod {
+            cadence,
+            periods_ahead,
+        } => Some(json!({
+            "cadence": cadence, "periodsAhead": periods_ahead.get(),
+        })),
+        _ => None,
+    };
+    let mut value = json!({
         "identitySha256": digest_value(output_binding_identity),
         "measurement": measurement,
         "currency": currency,
+        "financialAmount": financial_amount,
         "centralStatistic": match binding.central_statistic() {
             ForecastCentralStatistic::ModelEstimatedConditionalMean => "model_estimated_conditional_mean",
             ForecastCentralStatistic::Unavailable => "unavailable",
         },
         "target": target,
         "terminalHorizonNanos": terminal_horizon_nanos,
-    })
+        "originBasis": origin_basis,
+        "fiscalHorizon": fiscal_horizon,
+    });
+    if let ForecastTargetMeaning::FixedHorizonEvent { horizon_nanos, origin_basis, event } = binding.target() {
+        value["event"] = forecast::event_product_value(horizon_nanos, origin_basis, event);
+    }
+    value
 }
 
 fn selected_forecast_model_value(metadata: &ModelMetadata) -> Value {
@@ -680,14 +907,14 @@ fn forecast_artifact_value(artifact: &ArtifactReference) -> Value {
 
 fn forecast_freshness_value(
     as_of_unix_nanos: i64,
-    observed_through_unix_nanos: i64,
+    observed_through_unix_nanos: Option<i64>,
     available_at_unix_nanos: i64,
     created_at_unix_nanos: i64,
     expires_at_unix_nanos: i64,
 ) -> Value {
     json!({
         "asOfUnixNanos": as_of_unix_nanos.to_string(),
-        "observedThroughUnixNanos": observed_through_unix_nanos.to_string(),
+        "observedThroughUnixNanos": observed_through_unix_nanos.map(|value| value.to_string()),
         "availableAtUnixNanos": available_at_unix_nanos.to_string(),
         "createdAtUnixNanos": created_at_unix_nanos.to_string(),
         "expiresAtUnixNanos": expires_at_unix_nanos.to_string(),
@@ -731,20 +958,58 @@ fn forecast_value(value: ForecastValue) -> Value {
     })
 }
 
-fn calibration_evidence_value(calibration: &CalibrationEvidence) -> Value {
-    let window = calibration.window();
-    json!({
+fn model_temporal_coordinate_value(
+    coordinate: &ResearchTemporalCoordinate,
+) -> Result<Value, ServiceError> {
+    if let Some(timestamp) = coordinate.exact_timestamp() {
+        Ok(json!({"kind": "exact_time", "unixNanos": timestamp.unix_nanos().to_string()}))
+    } else if let Some(date) = coordinate.calendar_date_value() {
+        Ok(json!({"kind": "fiscal_date", "date": date}))
+    } else {
+        Err(ServiceError::InvalidResult)
+    }
+}
+
+fn model_period_value(
+    start: Option<Timestamp>,
+    end: Option<Timestamp>,
+    fiscal_bounds: Option<[market_squawk_domain::CalendarDate; 2]>,
+) -> Result<Value, ServiceError> {
+    match (start, end, fiscal_bounds) {
+        (None, None, Some([start, end])) if start < end => {
+            Ok(json!({"kind": "fiscal_dates", "start": start, "end": end}))
+        }
+        (Some(start), Some(end), None) if start < end => Ok(json!({
+            "kind": "exact_time",
+            "startUnixNanos": start.unix_nanos().to_string(),
+            "endUnixNanos": end.unix_nanos().to_string(),
+        })),
+        _ => Err(ServiceError::InvalidResult),
+    }
+}
+
+fn calibration_window_value(
+    window: market_squawk_modeling::CalibrationWindow,
+) -> Result<Value, ServiceError> {
+    Ok(json!({
+        "period": model_period_value(window.start(), window.end(), window.fiscal_bounds())?,
+        "observationCount": window.observations().get().to_string(),
+    }))
+}
+
+const fn calibration_method_name(method: CalibrationMethod) -> &'static str {
+    match method {
+        CalibrationMethod::MapieEnbpi => "mapie_enbpi",
+        CalibrationMethod::MapieAci => "mapie_aci",
+        CalibrationMethod::ResidualQuantile => "residual_quantile",
+    }
+}
+
+fn calibration_evidence_value(calibration: &CalibrationEvidence) -> Result<Value, ServiceError> {
+    Ok(json!({
         "identitySha256": digest_value(calibration.identity()),
-        "method": match calibration.method() {
-            CalibrationMethod::MapieEnbpi => "mapie_enbpi",
-            CalibrationMethod::MapieAci => "mapie_aci",
-            CalibrationMethod::ResidualQuantile => "residual_quantile",
-        },
-        "window": {
-            "startUnixNanos": window.start().unix_nanos().to_string(),
-            "endUnixNanos": window.end().unix_nanos().to_string(),
-            "observationCount": window.observations().get().to_string(),
-        },
+        "method": calibration_method_name(calibration.method()),
+        "window": calibration_window_value(calibration.window())?,
         "policyArtifact": {
             "sha256": digest_value(calibration.policy_hash()),
             "byteCount": calibration.policy_size_bytes().to_string(),
@@ -760,13 +1025,32 @@ fn calibration_evidence_value(calibration: &CalibrationEvidence) -> Value {
                 "targetCoverageBasisPoints": band.coverage().basis_points(),
                 "lowerOffsetIeee754Hex": format!("{:016x}", band.lower_offset().to_bits()),
                 "upperOffsetIeee754Hex": format!("{:016x}", band.upper_offset().to_bits()),
-                "realizedCoveredCount": band.realized().covered().to_string(),
-                "realizedObservationCount": band.realized().total().get().to_string(),
             }))
             .collect::<Vec<_>>(),
         "dependenceAssumptions": calibration.dependence_assumptions(),
-        "semantics": "empirical_marginal_coverage_not_scenario_probability",
-    })
+        "semantics": "fitted_interval_policy_not_evaluation",
+    }))
+}
+
+fn calibration_coverage_evaluation_value(
+    evaluation: &market_squawk_modeling::CalibrationCoverageEvaluation,
+) -> Result<Value, ServiceError> {
+    let coverage = [5_000_u16, 8_000, 9_500]
+        .into_iter()
+        .zip(evaluation.realized())
+        .map(|(coverage, realized)| {
+            json!({
+                "targetCoverageBasisPoints": coverage,
+                "realizedCoveredCount": realized.covered().to_string(),
+                "realizedObservationCount": realized.total().get().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "window": calibration_window_value(evaluation.window())?,
+        "coverage": coverage,
+        "semantics": "held_out_empirical_coverage_not_profit_probability",
+    }))
 }
 
 fn forecast_selection_receipt_value(receipt: &forecast::ForecastSelectionReceipt) -> Value {
@@ -786,7 +1070,7 @@ fn forecast_selection_receipt_value(receipt: &forecast::ForecastSelectionReceipt
         "selectedCreatedAtUnixNanos": receipt.selected_created_at_unix_nanos().to_string(),
         "selectedObservedThroughUnixNanos": receipt
             .selected_observed_through_unix_nanos()
-            .to_string(),
+            .map(|value| value.to_string()),
         "selectedAvailableAtUnixNanos": receipt.selected_available_at_unix_nanos().to_string(),
         "selectedExpiresAtUnixNanos": receipt.selected_expires_at_unix_nanos().to_string(),
         "selectedTerminalTargetAtUnixNanos": receipt
@@ -816,6 +1100,9 @@ const fn forecast_price_unavailable_reason(
     reason: forecast::ForecastPriceUnavailableReason,
 ) -> &'static str {
     match reason {
+        forecast::ForecastPriceUnavailableReason::FinancialAmountMeasurement => {
+            "financial_amount_measurement"
+        }
         forecast::ForecastPriceUnavailableReason::ReturnMeasurement => "return_measurement",
         forecast::ForecastPriceUnavailableReason::ProbabilityMeasurement => {
             "probability_measurement"
@@ -832,8 +1119,9 @@ const fn forecast_price_unavailable_reason(
     }
 }
 
-fn map_forecast_selection_error(error: ForecastApplicationError) -> ServiceError {
+pub(crate) fn map_forecast_selection_error(error: ForecastApplicationError) -> ServiceError {
     match error {
+        ForecastApplicationError::CurrentInputRead(error) => error,
         ForecastApplicationError::InvalidLimits | ForecastApplicationError::InvalidRecord => {
             ServiceError::InvalidRequest
         }
@@ -1072,37 +1360,66 @@ fn forecast_model_evidence_projection_inner(
     let split_counts = &training.trial.split_counts;
     let forecast = training.trial.forecast.as_ref();
     let out_of_sample_observations = split_counts.test;
-    let selected_step_matches_output = selected_horizon.is_none_or(|selected| {
-        matches!(
-            metadata.output_binding().target(),
-            ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos }
-                if horizon_nanos == selected.step_nanos()
-        )
-    });
-    let horizon_alignment = match (forecast, selected_horizon) {
-        (Some(evidence), Some(selected))
-            if evidence.rolling_splits > 0
-                && selected_step_matches_output
-                && evidence
-                    .horizons
-                    .binary_search(&u32::from(selected.points().get()))
-                    .is_ok() =>
+    let selected_step_matches_output =
+        selected_horizon.is_none_or(|selected| match metadata.output_binding().target() {
+            ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos, .. }
+            | ForecastTargetMeaning::FixedHorizonEvent { horizon_nanos, .. } => {
+                Some(horizon_nanos) == selected.step_nanos()
+            }
+            ForecastTargetMeaning::FinancialPeriod {
+                cadence,
+                periods_ahead,
+            } => selected.fiscal_periods() == Some((cadence, periods_ahead)),
+            ForecastTargetMeaning::Unsupported => false,
+        });
+    let direct_terminal = direct_terminal_evidence(bundle, forecast);
+    let event_evidence = matches!(
+        metadata.output_binding().target(),
+        ForecastTargetMeaning::FixedHorizonEvent { .. }
+    ) && metadata.probability_calibration().is_some();
+    let horizon_alignment = if direct_terminal || event_evidence {
+        if selected_step_matches_output
+            && selected_horizon.is_none_or(|selected| selected.points().get() == 1)
         {
             ForecastModelEvidenceState::Sufficient
-        }
-        (Some(evidence), Some(_))
-            if evidence.rolling_splits > 0 && !evidence.horizons.is_empty() =>
-        {
+        } else {
             ForecastModelEvidenceState::Limited
         }
-        (Some(evidence), None) if evidence.rolling_splits > 0 && !evidence.horizons.is_empty() => {
-            ForecastModelEvidenceState::Sufficient
+    } else if matches!(
+        metadata.output_binding().target(),
+        ForecastTargetMeaning::FinancialPeriod { .. }
+    ) {
+        // An Advanced row-index schedule does not prove a native fiscal target.
+        ForecastModelEvidenceState::Unavailable
+    } else {
+        match (forecast, selected_horizon) {
+            (Some(evidence), Some(selected))
+                if evidence.rolling_splits > 0
+                    && selected_step_matches_output
+                    && evidence
+                        .horizons
+                        .binary_search(&u32::from(selected.points().get()))
+                        .is_ok() =>
+            {
+                ForecastModelEvidenceState::Sufficient
+            }
+            (Some(evidence), Some(_))
+                if evidence.rolling_splits > 0 && !evidence.horizons.is_empty() =>
+            {
+                ForecastModelEvidenceState::Limited
+            }
+            (Some(evidence), None)
+                if evidence.rolling_splits > 0 && !evidence.horizons.is_empty() =>
+            {
+                ForecastModelEvidenceState::Sufficient
+            }
+            (Some(_), _) => ForecastModelEvidenceState::Limited,
+            (None, _) => ForecastModelEvidenceState::Unavailable,
         }
-        (Some(_), _) => ForecastModelEvidenceState::Limited,
-        (None, _) => ForecastModelEvidenceState::Unavailable,
     };
-    let point_in_time_bound =
-        metadata.dataset().selection_as_of() >= metadata.training_period().end();
+    let point_in_time_bound = metadata
+        .training_period()
+        .ends_by(metadata.dataset().selection_as_of());
     let forecast_evidence_complete = horizon_alignment == ForecastModelEvidenceState::Sufficient;
     let held_out_evidence_complete = split_counts.validation > 0
         && out_of_sample_observations > 0
@@ -1130,9 +1447,9 @@ fn forecast_model_evidence_projection_inner(
     } else {
         ForecastModelEvidenceState::Unavailable
     };
-    let calibration = if forecast.is_none() {
+    let calibration = if forecast.is_none() && !direct_terminal && !event_evidence {
         ForecastModelCalibrationState::Unavailable
-    } else if metadata.forecast_calibration().is_some() {
+    } else if metadata.forecast_calibration().is_some() || event_evidence {
         ForecastModelCalibrationState::Calibrated
     } else {
         ForecastModelCalibrationState::Limited
@@ -1159,6 +1476,28 @@ fn forecast_model_evidence_projection_inner(
     })
 }
 
+fn direct_terminal_evidence(
+    bundle: &ModelBundle,
+    forecast: Option<&ForecastScheduleEvidenceWire>,
+) -> bool {
+    let metadata = bundle.metadata();
+    let binding = metadata.output_binding();
+    let native_financial = matches!(
+        binding.measurement(),
+        ForecastMeasurement::FinancialAmount { .. }
+    ) && matches!(
+        binding.target(),
+        ForecastTargetMeaning::FinancialPeriod { .. }
+    ) && binding.central_statistic()
+        == ForecastCentralStatistic::ModelEstimatedConditionalMean
+        && bundle.forecast_residual_distribution().is_some();
+    forecast.is_none()
+        && (binding.expected_arithmetic_return_horizon_nanos().is_some() || native_financial)
+        && binding.estimator()
+            == market_squawk_modeling::ForecastEstimatorProfile::SealedDirectLeastSquaresV1
+        && metadata.forecast_calibration().is_some()
+}
+
 const fn model_evidence_interpretation(
     state: ForecastModelEvidenceState,
     horizon_alignment: ForecastModelEvidenceState,
@@ -1166,7 +1505,7 @@ const fn model_evidence_interpretation(
 ) -> &'static str {
     match (state, horizon_alignment, selection_bound) {
         (ForecastModelEvidenceState::Sufficient, ForecastModelEvidenceState::Sufficient, _) => {
-            "The model uses point-in-time information and has held-out, horizon-matched evaluation. Calibration is shown separately and does not mean the forecast is certain."
+            "The model retains its source-knowledge cutoff and has held-out, horizon-matched evaluation. Calibration is shown separately and does not mean the forecast is certain."
         }
         (ForecastModelEvidenceState::Limited, ForecastModelEvidenceState::Limited, true) => {
             "The model's retained evaluation does not match the selected forecast horizon and policy. Use this forecast only as supporting research; Market Squawk suggests no action when required evidence is missing."
@@ -1193,13 +1532,21 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
         .map_err(|_error| ServiceError::InvalidResult)?;
     let split_counts = &training.trial.split_counts;
     let forecast = training.trial.forecast.as_ref();
+    let direct_terminal = direct_terminal_evidence(bundle, forecast);
+    let event_evidence = matches!(
+        metadata.output_binding().target(),
+        ForecastTargetMeaning::FixedHorizonEvent { .. }
+    ) && metadata.probability_calibration().is_some();
     let out_of_sample_observations = split_counts.test;
     let rolling_out_of_sample_folds = forecast.map_or(0, |evidence| evidence.rolling_splits);
-    let evaluated_horizons = forecast.map_or(0, |evidence| evidence.horizons.len());
-    let point_in_time_bound =
-        metadata.dataset().selection_as_of() >= metadata.training_period().end();
+    let evaluated_horizons = forecast.map_or(usize::from(direct_terminal || event_evidence), |evidence| {
+        evidence.horizons.len()
+    });
+    let point_in_time_bound = metadata
+        .training_period()
+        .ends_by(metadata.dataset().selection_as_of());
     let forecast_evidence_complete =
-        forecast.is_none() || (rolling_out_of_sample_folds > 0 && evaluated_horizons > 0);
+        product_evidence.horizon_alignment() == ForecastModelEvidenceState::Sufficient;
     let mut limitations = metadata
         .limitations()
         .iter()
@@ -1236,7 +1583,7 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
         .collect::<Result<Vec<_>, ServiceError>>()?;
     let coverage = vec![
         json!({
-            "label": "Point-in-time training cutoff",
+            "label": "Source-knowledge training cutoff",
             "state": if point_in_time_bound { "evaluated" } else { "unavailable" },
             "interpretation": if point_in_time_bound {
                 "The retained selection cutoff is at or after the complete training observation window."
@@ -1254,15 +1601,19 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
             }
         }),
         json!({
-            "label": "Horizon-aligned rolling evaluation",
-            "state": if forecast.is_none() {
+            "label": if direct_terminal || event_evidence { "Target-matched held-out evaluation" } else { "Horizon-aligned rolling evaluation" },
+            "state": if (direct_terminal || event_evidence) && forecast_evidence_complete {
+                "evaluated"
+            } else if forecast.is_none() {
                 "limited"
             } else if forecast_evidence_complete {
                 "evaluated"
             } else {
                 "unavailable"
             },
-            "interpretation": if forecast.is_none() {
+            "interpretation": if (direct_terminal || event_evidence) && forecast_evidence_complete {
+                "The admitted direct model retains held-out evaluation for its exact output target. No rolling folds are inferred."
+            } else if forecast.is_none() {
                 "This model is not admitted as a forecast model, so no forecast-horizon evaluation is claimed."
             } else if forecast_evidence_complete {
                 "The model was evaluated across rolling historical periods for these forecast horizons."
@@ -1281,8 +1632,8 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
         "intendedUse": metadata.intended_use(),
         "evidenceState": product_evidence.overall().as_str(),
         "training": {
-            "observedFromUnixNanos": metadata.training_period().start().unix_nanos().to_string(),
-            "observedThroughUnixNanos": metadata.training_period().end().unix_nanos().to_string(),
+            "period": model_period_value(metadata.training_period().start(), metadata.training_period().end(), metadata.training_period().fiscal_bounds())?,
+            "studyBasis": metadata.dataset().study_policy().map(|policy| policy.basis()),
             "availableAtUnixNanos": metadata.dataset().selection_as_of().unix_nanos().to_string(),
             "trainingObservations": split_counts.train,
             "validationObservations": split_counts.validation,
@@ -1412,11 +1763,9 @@ fn model_metadata_value(
         "formatVersion": metadata.format_version(),
         "features": features,
         "trainingDataset": training_dataset_value(dataset),
+        "outputBinding": forecast_output_binding_value(metadata.output_binding(), metadata.output_binding().identity()),
         "universeId": metadata.universe_id().as_str(),
-        "trainingPeriod": {
-            "startUnixNanos": metadata.training_period().start().unix_nanos(),
-            "endUnixNanos": metadata.training_period().end().unix_nanos()
-        },
+        "trainingPeriod": model_period_value(metadata.training_period().start(), metadata.training_period().end(), metadata.training_period().fiscal_bounds())?,
         "label": {
             "name": metadata.label().name(),
             "version": metadata.label().version().get(),
@@ -1467,17 +1816,19 @@ fn runtime_health_value(backend_generations: usize, registry_generations: usize)
 fn training_evidence_value(bundle: &ModelBundle) -> Result<Value, ServiceError> {
     let wire: TrainingRunEvidenceWire = serde_json::from_slice(bundle.training_run_bytes())
         .map_err(|_| ServiceError::InvalidResult)?;
+    let direct_terminal = direct_terminal_evidence(bundle, wire.trial.forecast.as_ref());
+    let event_evidence = bundle.metadata().probability_calibration().is_some();
     let splits = wire.trial.split_counts;
     let forecast = wire.trial.forecast.map(|forecast| {
         json!({
             "strategy": forecast.strategy,
             "horizons": forecast.horizons,
-            "observedCutoffUnixNanos": forecast.observed_cutoff_unix_nanos,
+            "observedCutoffUnixNanos": forecast.observed_cutoff_unix_nanos.to_string(),
             "rollingSplits": forecast.rolling_splits,
             "selectionHash": forecast.selection_sha256
         })
     });
-    let horizon_status = if forecast.is_some() {
+    let horizon_status = if forecast.is_some() || direct_terminal || event_evidence {
         "recorded"
     } else {
         "not_applicable"
@@ -1494,11 +1845,14 @@ fn training_evidence_value(bundle: &ModelBundle) -> Result<Value, ServiceError> 
             "splitHash": wire.trial.split_sha256
         },
         "forecastSchedule": forecast,
+        "directTarget": (direct_terminal || event_evidence).then(|| forecast_output_binding_value(
+            bundle.metadata().output_binding(), bundle.metadata().output_binding().identity(),
+        )),
         "cohortEvidence": [
             {
                 "dimension": "horizon",
                 "status": horizon_status,
-                "reason": if horizon_status == "recorded" { "Bound forecast horizons and rolling temporal splits are retained in the admitted training run." } else { "This admitted bundle is not a forecast model." }
+                "reason": if direct_terminal || event_evidence { "The exact direct output target and held-out calibration are retained in the admitted training run; no rolling schedule is inferred." } else if horizon_status == "recorded" { "Bound forecast horizons and rolling temporal splits are retained in the admitted training run." } else { "This admitted bundle is not a forecast model." }
             },
             {
                 "dimension": "regime",
@@ -1586,6 +1940,18 @@ fn validation_metrics_value(metadata: &ModelMetadata) -> Value {
 }
 
 fn training_dataset_value(dataset: &TrainingDatasetIdentity) -> Value {
+    let split = dataset.split_policy();
+    let split_policy = if let Some([train, validation, test]) = split.fiscal_boundaries() {
+        json!({"kind": "fiscal_dates", "trainEnd": train, "validationEnd": validation, "testEnd": test})
+    } else {
+        let bounds = split.timestamp_boundaries();
+        json!({
+            "kind": "exact_time",
+            "trainEndUnixNanos": bounds.map(|times| times[0].unix_nanos().to_string()),
+            "validationEndUnixNanos": bounds.map(|times| times[1].unix_nanos().to_string()),
+            "testEndUnixNanos": bounds.map(|times| times[2].unix_nanos().to_string()),
+        })
+    };
     json!({
         "manifest": manifest_value(dataset.manifest()),
         "buildSpecDigest": encode_hex(dataset.build_spec_digest().digest().bytes()),
@@ -1594,8 +1960,25 @@ fn training_dataset_value(dataset: &TrainingDatasetIdentity) -> Value {
         "catalogIdentity": encode_hex(dataset.catalog_identity().bytes()),
         "exportDigest": digest_value(dataset.export_digest()),
         "selectionDigest": digest_value(dataset.selection_digest()),
-        "selectionAsOfUnixNanos": dataset.selection_as_of().unix_nanos(),
-        "selectedComponentRows": dataset.selected_component_rows().get()
+        "selectionAsOfUnixNanos": dataset.selection_as_of().unix_nanos().to_string(),
+        "selectedComponentRows": dataset.selected_component_rows().get(),
+        "splitPolicy": split_policy,
+        "study": dataset.study_policy().map(|policy| json!({
+            "basis": policy.basis(),
+            "purpose": policy.purpose(),
+            "snapshotAsOfUnixNanos": policy.snapshot_as_of().unix_nanos().to_string(),
+            "decisionLagNanos": policy.decision_lag().map(|lag| lag.as_nanos().to_string()),
+            "targetHorizon": match policy.target_horizon() {
+                market_squawk_data::DatasetTargetHorizon::ExactElapsed(duration) => json!({
+                    "kind": "exact_elapsed", "nanos": duration.as_nanos().to_string(),
+                }),
+                market_squawk_data::DatasetTargetHorizon::FiscalPeriods { cadence, periods_ahead } => json!({
+                    "kind": "fiscal_periods", "cadence": cadence, "periodsAhead": periods_ahead.get(),
+                }),
+            },
+            "sourceSnapshotSha256": dataset.source_snapshot_digest().map(digest_value),
+            "limitations": policy.limitations(),
+        })),
     })
 }
 

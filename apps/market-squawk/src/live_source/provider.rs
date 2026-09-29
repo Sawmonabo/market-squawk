@@ -13,8 +13,9 @@ use market_squawk_adapter_coinbase::{
 use market_squawk_adapter_kraken::{
     KrakenConfig, KrakenMarketDecodeHandoff, KrakenSocketHandoffConsumer, KrakenSource,
 };
+use market_squawk_domain::{MarketDataReference, Timestamp};
 use market_squawk_sources::{
-    DecodeInternalError, DecodeOutcome, LiveMarketSource, LiveSourceGeneration, MarketDecoder,
+    DecodeInternalError, LiveMarketSource, LiveSourceGeneration,
     RawMarketSink, SourceError, SourceMetadata, SourceMetadataProvider, ValidatedRawMarketFrame,
 };
 use thiserror::Error;
@@ -117,6 +118,7 @@ impl ProductionSourceProfile {
     pub(super) fn alpaca_iex(
         config: AlpacaIexLiveConfig,
         credentials: Arc<AlpacaCredentials>,
+        references: Arc<[MarketDataReference]>,
     ) -> Result<Self, ProductionProviderError> {
         let mut products = Vec::new();
         products
@@ -143,6 +145,7 @@ impl ProductionSourceProfile {
             connector: ProductionConnectorProfile::AlpacaIex {
                 config: Box::new(config),
                 credentials,
+                references,
             },
             subscription_products: products.into_boxed_slice(),
             control_message_capacity: AUTHENTICATED_CONTROL_MESSAGE_CAPACITY,
@@ -159,6 +162,7 @@ impl ProductionSourceProfile {
     pub(super) fn alpaca_options(
         config: AlpacaOptionsLiveConfig,
         credentials: Arc<AlpacaCredentials>,
+        references: Arc<[MarketDataReference]>,
     ) -> Result<Self, ProductionProviderError> {
         let mut products = Vec::new();
         products
@@ -183,6 +187,7 @@ impl ProductionSourceProfile {
             connector: ProductionConnectorProfile::AlpacaOptions {
                 config: Box::new(config),
                 credentials,
+                references,
             },
             subscription_products: products.into_boxed_slice(),
             control_message_capacity: AUTHENTICATED_CONTROL_MESSAGE_CAPACITY,
@@ -322,10 +327,12 @@ enum ProductionConnectorProfile {
     AlpacaIex {
         config: Box<AlpacaIexLiveConfig>,
         credentials: Arc<AlpacaCredentials>,
+        references: Arc<[MarketDataReference]>,
     },
     AlpacaOptions {
         config: Box<AlpacaOptionsLiveConfig>,
         credentials: Arc<AlpacaCredentials>,
+        references: Arc<[MarketDataReference]>,
     },
 }
 
@@ -376,27 +383,21 @@ impl ProductionConnectorProfile {
                     },
                 ))
             }
-            Self::AlpacaIex {
-                config,
-                credentials,
-            } => Ok((
-                ProductionLiveSource::AlpacaIex(AlpacaIexLiveSource::try_new(
-                    config.as_ref().clone(),
-                    generation,
-                    Arc::clone(credentials),
-                )?),
-                ProductionMarketDecoder::AlpacaIex(AlpacaIexDecoder::try_new(config)?),
-            )),
-            Self::AlpacaOptions {
-                config,
-                credentials,
-            } => Ok((
+            Self::AlpacaIex { config, credentials, references } => {
+                let (source, decoder) = AlpacaIexLiveSource::try_new_with_publication_handoff(
+                    config.as_ref().clone(), generation, Arc::clone(credentials),
+                )?;
+                Ok((ProductionLiveSource::AlpacaIex(source), ProductionMarketDecoder::AlpacaIex {
+                    decoder, references: Arc::clone(references),
+                }))
+            },
+            Self::AlpacaOptions { config, credentials, references } => Ok((
                 ProductionLiveSource::AlpacaOptions(AlpacaOptionsLiveSource::try_new(
                     config.as_ref().clone(),
                     generation,
                     Arc::clone(credentials),
                 )?),
-                ProductionMarketDecoder::AlpacaOptions(AlpacaOptionsDecoder::try_new(config)?),
+                ProductionMarketDecoder::AlpacaOptions { decoder: AlpacaOptionsDecoder::try_new(config)?, references: Arc::clone(references) },
             )),
         }
     }
@@ -410,8 +411,8 @@ pub(super) enum ProductionMarketDecoder {
         handoff: KrakenSocketHandoffConsumer,
         publication_config: KrakenConfig,
     },
-    AlpacaIex(AlpacaIexDecoder),
-    AlpacaOptions(AlpacaOptionsDecoder),
+    AlpacaIex { decoder: AlpacaIexDecoder, references: Arc<[MarketDataReference]> },
+    AlpacaOptions { decoder: AlpacaOptionsDecoder, references: Arc<[MarketDataReference]> },
 }
 
 impl SourceMetadataProvider for ProductionMarketDecoder {
@@ -419,8 +420,8 @@ impl SourceMetadataProvider for ProductionMarketDecoder {
         match self {
             Self::Coinbase(decoder) => decoder.metadata(),
             Self::Kraken { handoff, .. } => handoff.metadata(),
-            Self::AlpacaIex(decoder) => decoder.metadata(),
-            Self::AlpacaOptions(decoder) => decoder.metadata(),
+            Self::AlpacaIex { decoder, .. } => decoder.metadata(),
+            Self::AlpacaOptions { decoder, .. } => decoder.metadata(),
         }
     }
 }
@@ -431,13 +432,14 @@ pub(super) enum ProductionDecodeOutcome {
         handoff: KrakenMarketDecodeHandoff,
         publication_config: KrakenConfig,
     },
-    Standard(DecodeOutcome),
+    Alpaca(market_squawk_adapter_alpaca::AlpacaMarketDecodeHandoff),
 }
 
 impl ProductionMarketDecoder {
     pub(super) fn decode(
         &mut self,
         frame: &ValidatedRawMarketFrame<'_>,
+        ingested_at: Timestamp,
     ) -> Result<ProductionDecodeOutcome, DecodeInternalError> {
         match self {
             Self::Coinbase(decoder) => decoder
@@ -452,12 +454,10 @@ impl ProductionMarketDecoder {
                     handoff,
                     publication_config: publication_config.clone(),
                 }),
-            Self::AlpacaIex(decoder) => {
-                decoder.decode(frame).map(ProductionDecodeOutcome::Standard)
-            }
-            Self::AlpacaOptions(decoder) => {
-                decoder.decode(frame).map(ProductionDecodeOutcome::Standard)
-            }
+            Self::AlpacaIex { decoder, references } => decoder
+                .decode_for_publication(frame, references, ingested_at).map(ProductionDecodeOutcome::Alpaca),
+            Self::AlpacaOptions { decoder, references } => decoder
+                .decode_for_publication(frame, references, ingested_at).map(ProductionDecodeOutcome::Alpaca),
         }
     }
 }

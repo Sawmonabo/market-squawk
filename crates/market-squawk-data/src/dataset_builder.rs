@@ -19,12 +19,41 @@ mod admission;
 mod build;
 #[path = "dataset_builder/canonical.rs"]
 mod canonical;
+#[path = "dataset_builder/epoch.rs"]
+pub(crate) mod epoch;
+pub use epoch::{
+    FeatureDatasetInputEpoch, ForecastBasisHistory, ForecastBasisHistoryRow, ForecastBasisOhlc,
+    ForecastCurrentShareConversion, ShareConversionRounding,
+};
 #[path = "dataset_builder/export.rs"]
 mod export;
+#[path = "dataset_builder/financial.rs"]
+pub(crate) mod financial;
+pub use financial::{
+    FinancialAmountBasis, FinancialAmountRole, FinancialAmountSelection, FinancialDatasetSeries,
+    FinancialFiscalTargetBinding, FinancialPeriodRowReference, FinancialSeriesLimits,
+    FinancialShareConvention,
+};
+#[path = "dataset_builder/nominal_daily.rs"]
+mod nominal_daily;
+pub use nominal_daily::{
+    MarketBarHistoryIdentityQualification, NamedSessionDailyOrigin, NominalDailyCurrentSource,
+};
 #[path = "dataset_builder/model.rs"]
 mod model;
+#[path = "dataset_builder/probability.rs"]
+mod probability;
+pub use probability::{
+    ProbabilityCostOutcomeAttestation, ProbabilityCostPolicyV1, ProbabilityEventTarget,
+    ProbabilityExecutionBasisV1, ProbabilityLiquidityPriorityV1, ProbabilityRoundTripConventionV1,
+};
 #[path = "dataset_builder/production.rs"]
 mod production;
+#[path = "dataset_builder/study.rs"]
+pub(crate) mod study;
+pub use study::{DatasetBuildPurpose, DatasetStudyPolicy, DatasetTargetHorizon};
+#[path = "dataset_builder/timestamp_history.rs"]
+mod timestamp_history;
 
 pub(crate) use admission::FeatureDatasetProductionReceiptExpectation;
 pub use admission::{
@@ -35,11 +64,13 @@ pub use export::{FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES};
 
 pub use model::{
     ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
-    ComponentSelector, ComponentValue, CorporateActionSensitivity, DatasetBuildInputs,
+    ComponentSelector, ComponentValue, CorporateActionSensitivity,
+    CurrentPopulationInputUnavailable, CurrentPopulationInputUnavailableReason, DatasetBuildInputs,
     DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetExample,
-    DatasetOutputAuthorization, DatasetSplit, DatasetSplitCounts, FEATURE_LABEL_PROBABILITY_UNIT,
-    FEATURE_LABEL_RETURN_UNIT, FeatureLabelComponentInput, FeatureLabelComponentSpec,
-    FeatureLabelDataset, FeatureLabelMeasurement, FeatureLabelMeasurementBinding,
+    DatasetOutputAuthorization, DatasetPopulationBasis, DatasetPriceInputOrigin, DatasetSplit,
+    DatasetSplitCounts, FEATURE_LABEL_PROBABILITY_UNIT, FEATURE_LABEL_RETURN_UNIT,
+    FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset,
+    FeatureLabelMeasurement, FeatureLabelMeasurementBinding, FixedHorizonOriginBasis,
     MissingValuePolicy,
 };
 pub use production::{
@@ -276,6 +307,8 @@ pub enum DatasetBuildError {
     /// Historical-universe construction failed closed.
     #[error("historical-universe construction failed: {0}")]
     Universe(#[from] crate::UniverseError),
+    #[error("current population admission failed: {0}")]
+    CurrentPopulation(#[from] crate::CurrentPopulationError),
     /// Corporate-action planning failed closed.
     #[error("corporate-action planning failed: {0}")]
     CorporateAction(#[from] crate::CorporateActionError),

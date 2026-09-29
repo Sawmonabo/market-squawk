@@ -9,6 +9,11 @@ mod audit;
 #[cfg(feature = "release-evidence")]
 mod benchmark_support;
 mod defaults;
+pub(crate) mod equity;
+mod virtual_routes;
+pub(crate) use virtual_routes::VirtualEquityRoute;
+mod portfolio;
+pub(crate) use portfolio::build_paper_revision;
 mod supervisor;
 
 use audit::ProductionAuditService;
@@ -72,8 +77,9 @@ struct ProductionPaperRecovery {
 }
 
 pub(crate) use defaults::{
+    LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES, local_paper_account_configuration,
     PaperStrategyMode, local_coinbase_direct_live_market_with_activation,
-    local_coinbase_direct_paper_bot_on_existing_market_with_strategy_mode,
+    local_coinbase_direct_paper_bot_on_existing_market_with_strategy_mode, local_equity_paper_bot,
     local_live_market_with_provider_rate,
     local_paper_bot_on_existing_public_market_with_strategy_mode, manual_paper_account_id,
     manual_paper_reason_code, manual_paper_strategy_id,
@@ -90,6 +96,7 @@ pub struct ProductionPaperBotExecutionConfig {
     pub account_coordinator: AccountCoordinatorConfig,
     pub accounts: Vec<AccountBootstrap>,
     pub portfolio: PortfolioReadCapability,
+    pub(crate) portfolio_publication: Option<portfolio::PaperPortfolioPublication>,
     pub risk_limits: RiskLimits,
     pub risk_service: RiskServiceConfig,
     pub execution_audit: ExecutionAuditConfig,
@@ -176,7 +183,8 @@ impl ProductionPaperBotRoute {
 #[derive(Debug)]
 pub struct ProductionPaperBotComposition {
     source: PaperBotSourceComposition,
-    runtime_config: LiveRuntimeConfig,
+    runtime_config: Option<LiveRuntimeConfig>,
+    maximum_virtual_hook_bytes: usize,
     execution: ProductionPaperBotExecutionConfig,
     strategies: Vec<ProductionPaperBotRoute>,
     manual_paper_routes: Vec<ManualPaperRoute>,
@@ -186,8 +194,35 @@ pub struct ProductionPaperBotComposition {
 enum PaperBotSourceComposition {
     Production(Box<ProductionLiveSourceComposition>),
     ExistingLive(Vec<LiveRouteConfig>),
+    VirtualEquity(Vec<Arc<VirtualEquityRoute>>),
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark(Vec<LiveRouteConfig>),
+}
+
+impl ProductionPaperBotComposition {
+    /// Binds execution publications to the workspace's canonical portfolio before admission.
+    pub(crate) fn with_canonical_portfolio(
+        mut self,
+        publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
+    ) -> anyhow::Result<Self> {
+        self.execution.portfolio = self.execution
+            .portfolio_publication
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("paper portfolio publication is unavailable"))?
+            .bind_canonical(publisher, self.execution.paper.clone())?;
+        Ok(self)
+    }
+
+    /// Retains the existing source owner for strict original action reopening after restart.
+    pub(crate) fn with_source_action_reader(
+        mut self,
+        reader: Arc<crate::application::SourceAppliedCorporateActionReadCapability>,
+    ) -> Self {
+        if let Some(publication) = &mut self.execution.portfolio_publication {
+            publication.sources = Some(reader);
+        }
+        self
+    }
 }
 
 impl PaperBotSourceComposition {
@@ -195,6 +230,7 @@ impl PaperBotSourceComposition {
         match self {
             Self::Production(source) => source.routes(),
             Self::ExistingLive(routes) => routes,
+            Self::VirtualEquity(_) => &[],
             #[cfg(feature = "release-evidence")]
             Self::ReleaseBenchmark(routes) => routes,
         }
@@ -205,7 +241,7 @@ impl PaperBotSourceComposition {
         {
             match self {
                 Self::Production(source) => Some(source),
-                Self::ExistingLive(_) => None,
+                Self::ExistingLive(_) | Self::VirtualEquity(_) => None,
                 Self::ReleaseBenchmark(_) => None,
             }
         }
@@ -213,7 +249,7 @@ impl PaperBotSourceComposition {
         {
             match self {
                 Self::Production(source) => Some(source),
-                Self::ExistingLive(_) => None,
+                Self::ExistingLive(_) | Self::VirtualEquity(_) => None,
             }
         }
     }
@@ -224,7 +260,7 @@ impl PaperBotSourceComposition {
         {
             match self {
                 Self::Production(source) => Some(source),
-                Self::ExistingLive(_) => None,
+                Self::ExistingLive(_) | Self::VirtualEquity(_) => None,
                 Self::ReleaseBenchmark(_) => None,
             }
         }
@@ -232,7 +268,7 @@ impl PaperBotSourceComposition {
         {
             match self {
                 Self::Production(source) => Some(source),
-                Self::ExistingLive(_) => None,
+                Self::ExistingLive(_) | Self::VirtualEquity(_) => None,
             }
         }
     }
@@ -241,6 +277,7 @@ impl PaperBotSourceComposition {
 enum PaperBotStartMode {
     Production(Option<Vec<RouteQualifiedMarketExport>>),
     ExistingLive(LiveSnapshotReader),
+    VirtualEquity,
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark(Arc<benchmark_support::ReleaseBenchmarkObserver>),
 }
@@ -302,15 +339,17 @@ impl ProductionPaperBotComposition {
         execution: ProductionPaperBotExecutionConfig,
         strategies: Vec<ProductionPaperBotRoute>,
     ) -> Result<Self, ProductionPaperBotCompositionError> {
-        validate_strategy_routes(source.routes(), &strategies)?;
-        let manual_paper_routes = manual_paper_routes(source.routes(), &strategies)?;
+        let routes = source.execution_routes();
+        validate_strategy_routes(&routes, &strategies)?;
+        let manual_paper_routes = manual_paper_routes(&routes, &strategies)?;
         if execution.paper_control_timeout.is_zero() {
             return Err(ProductionPaperBotCompositionError::ZeroPaperControlTimeout);
         }
         validate_canonical_accounts(&execution.accounts, &execution.paper_accounts)?;
         Ok(Self {
             source,
-            runtime_config,
+            runtime_config: Some(runtime_config),
+            maximum_virtual_hook_bytes: 0,
             execution,
             strategies,
             manual_paper_routes,
@@ -323,16 +362,19 @@ impl ProductionPaperBotComposition {
     }
 
     /// Returns the admitted conservative retained-byte charge ceiling for one source message.
-    pub const fn maximum_message_bytes(&self) -> NonZeroU32 {
-        self.runtime_config.maximum_message_bytes()
+    pub const fn maximum_message_bytes(&self) -> Option<NonZeroU32> {
+        match &self.runtime_config {
+            Some(config) => Some(config.maximum_message_bytes()),
+            None => None,
+        }
     }
 
     /// Returns the exact paper-market calendar retained by this test composition.
     #[cfg(all(test, debug_assertions))]
     pub(crate) const fn day_session_calendar_for_test(
         &self,
-    ) -> &market_squawk_adapter_paper::PaperVenueSessionCalendar {
-        &self.execution.paper.input().day_session_calendar
+    ) -> Option<&market_squawk_adapter_paper::PaperVenueSessionCalendar> {
+        self.execution.paper.input().session_policy.calendar()
     }
 
     #[cfg(all(test, debug_assertions))]
@@ -426,10 +468,18 @@ impl ProductionPaperBotComposition {
         let Self {
             source,
             runtime_config,
+            maximum_virtual_hook_bytes,
             execution,
             strategies,
             manual_paper_routes,
         } = self;
+        if matches!(&source, PaperBotSourceComposition::VirtualEquity(_))
+            != matches!(&mode, PaperBotStartMode::VirtualEquity)
+            || (!matches!(&source, PaperBotSourceComposition::VirtualEquity(_))
+                && runtime_config.is_none())
+        {
+            return Err(ProductionPaperBotStartError::InvalidRecoveryOwnership);
+        }
         let risk_limits = execution.risk_limits.snapshot();
         let startup_deadline = tokio::time::Instant::now()
             .checked_add(execution.paper_control_timeout)
@@ -437,7 +487,13 @@ impl ProductionPaperBotComposition {
         let (execution_audit, execution_audit_reader) =
             ExecutionAuditWriter::try_new(execution.execution_audit)
                 .map_err(ProductionPaperBotStartError::ExecutionAudit)?;
-        let task_capacity = NonZeroUsize::new(PRODUCTION_EXECUTION_TASK_CAPACITY)
+        let virtual_route_count = match &source {
+            PaperBotSourceComposition::VirtualEquity(routes) => routes.len(),
+            _ => 0,
+        };
+        let task_capacity = PRODUCTION_EXECUTION_TASK_CAPACITY
+            .checked_add(virtual_route_count)
+            .and_then(NonZeroUsize::new)
             .ok_or(ProductionPaperBotStartError::Allocation)?;
         let task_reaper = ExecutionTaskReaper::try_new(task_capacity)
             .map_err(ProductionPaperBotStartError::TaskOwnership)?;
@@ -645,7 +701,7 @@ impl ProductionPaperBotComposition {
                     let recovered_order_ownership = !recovery.orders.is_empty();
                     (
                         ExecutionDispatcher::try_start_with_recovery(
-                            paper_adapter as Arc<dyn ExecutionAdapter>,
+                            Arc::clone(&paper_adapter) as Arc<dyn ExecutionAdapter>,
                             Arc::clone(&accounts),
                             execution_audit.clone(),
                             execution.dispatcher,
@@ -659,7 +715,7 @@ impl ProductionPaperBotComposition {
                 }
                 Some((_recovery, _runtime_sequence)) => (
                     ExecutionDispatcher::try_start(
-                        paper_adapter as Arc<dyn ExecutionAdapter>,
+                        Arc::clone(&paper_adapter) as Arc<dyn ExecutionAdapter>,
                         Arc::clone(&accounts),
                         execution_audit.clone(),
                         execution.dispatcher,
@@ -670,7 +726,7 @@ impl ProductionPaperBotComposition {
                 ),
                 None => (
                     ExecutionDispatcher::try_start(
-                        paper_adapter as Arc<dyn ExecutionAdapter>,
+                        Arc::clone(&paper_adapter) as Arc<dyn ExecutionAdapter>,
                         Arc::clone(&accounts),
                         execution_audit.clone(),
                         execution.dispatcher,
@@ -780,10 +836,12 @@ impl ProductionPaperBotComposition {
             Arc::clone(&dispatcher),
             accounts.reconciliation_fence(),
             &task_reaper,
+            Arc::clone(&paper_adapter),
+            execution.portfolio_publication,
+            execution.paper_control_timeout,
         ) {
             Ok(supervisor) => supervisor,
-            Err(error) => {
-                let startup = ProductionPaperBotStartError::TaskOwnership(error);
+            Err(startup) => {
                 drop(execution_audit);
                 let rollback = rollback_execution_with_audit(
                     Some(dispatcher),
@@ -797,10 +855,78 @@ impl ProductionPaperBotComposition {
                 return Err(with_rollback(startup, rollback));
             }
         };
+        if let PaperBotSourceComposition::VirtualEquity(routes) = &source {
+            let started = virtual_routes::start_routes(
+                routes,
+                strategies,
+                &accounts,
+                &execution.portfolio,
+                &execution.risk_limits,
+                execution_audit.clone(),
+                execution.risk_service,
+                &dispatcher,
+                &paper_market,
+                &task_reaper,
+                maximum_virtual_hook_bytes,
+                execution.paper_control_timeout,
+                &cancellation,
+            )
+            .await;
+            let live = match started {
+                Ok(live) => live,
+                Err(error) => {
+                    let rollback = rollback_execution_with_audit(
+                        Some(dispatcher),
+                        Some(supervisor),
+                        paper,
+                        task_reaper,
+                        execution.paper_control_timeout,
+                        audit_service,
+                    )
+                    .await;
+                    return Err(with_rollback(error, rollback));
+                }
+            };
+            return Ok(StartedPaperBotRuntime {
+                runtime: ProductionPaperBotRuntime {
+                    live: PaperBotLiveRuntime::VirtualEquity(live),
+                    dispatcher,
+                    accounts,
+                    account_ids,
+                    supervisor,
+                    paper,
+                    checkpoint_repository,
+                    task_reaper,
+                    paper_control_timeout: execution.paper_control_timeout,
+                    risk_limits,
+                    execution_audit_read_view,
+                    audit_service,
+                    manual_paper_routes,
+                },
+                pending_action_hooks: None,
+                #[cfg(feature = "release-evidence")]
+                benchmark_producer: None,
+            });
+        }
+        let Some(runtime_config) = runtime_config else {
+            let rollback = rollback_execution_with_audit(
+                Some(dispatcher),
+                Some(supervisor),
+                paper,
+                task_reaper,
+                execution.paper_control_timeout,
+                audit_service,
+            )
+            .await;
+            return Err(with_rollback(
+                ProductionPaperBotStartError::InvalidRecoveryOwnership,
+                rollback,
+            ));
+        };
         #[cfg(feature = "release-evidence")]
         let benchmark_observer = match &mode {
             PaperBotStartMode::Production(_) => None,
-            PaperBotStartMode::ExistingLive(_) => None,
+            PaperBotStartMode::ExistingLive(_) | PaperBotStartMode::VirtualEquity => None,
             PaperBotStartMode::ReleaseBenchmark(observer) => Some(Arc::clone(observer)),
         };
         let mut action_hooks = Vec::new();
@@ -1041,6 +1167,7 @@ impl PreparedProductionPaperBotRuntime {
 enum PaperBotLiveRuntime {
     Production(ProductionLiveSourceRuntime),
     Existing(LiveSnapshotReader),
+    VirtualEquity(virtual_routes::VirtualEquityRuntime),
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark(benchmark_support::ReleaseBenchmarkLiveRuntime),
 }
@@ -1088,33 +1215,77 @@ impl PaperBotLiveRuntime {
         match self {
             Self::Production(runtime) => runtime.is_healthy(),
             Self::Existing(_) => true,
+            Self::VirtualEquity(runtime) => runtime.is_healthy(),
             #[cfg(feature = "release-evidence")]
             Self::ReleaseBenchmark(_) => true,
         }
     }
 
-    fn snapshots(&self) -> LiveSnapshotReader {
+    fn snapshots(&self) -> Option<LiveSnapshotReader> {
         match self {
-            Self::Production(runtime) => runtime.snapshots(),
-            Self::Existing(reader) => reader.clone(),
+            Self::Production(runtime) => Some(runtime.snapshots()),
+            Self::Existing(reader) => Some(reader.clone()),
+            Self::VirtualEquity(_) => None,
             #[cfg(feature = "release-evidence")]
-            Self::ReleaseBenchmark(runtime) => runtime.snapshots(),
+            Self::ReleaseBenchmark(runtime) => Some(runtime.snapshots()),
         }
     }
 
-    async fn shutdown(self) -> Result<(), ProductionLiveSourceRuntimeError> {
+    async fn shutdown(self) -> Result<(), ProductionPaperSourceShutdownError> {
         match self {
-            Self::Production(runtime) => runtime.shutdown().await,
+            Self::Production(runtime) => runtime
+                .shutdown()
+                .await
+                .map_err(ProductionPaperSourceShutdownError::Native),
             Self::Existing(_reader) => Ok(()),
+            Self::VirtualEquity(runtime) => runtime
+                .shutdown()
+                .await
+                .map_err(ProductionPaperSourceShutdownError::VirtualEquity),
             #[cfg(feature = "release-evidence")]
-            Self::ReleaseBenchmark(runtime) => runtime.shutdown().await,
+            Self::ReleaseBenchmark(runtime) => runtime
+                .shutdown()
+                .await
+                .map_err(ProductionPaperSourceShutdownError::Native),
         }
     }
 }
 
 impl ProductionPaperBotRuntime {
+    pub(crate) async fn reconcile_source_actions(
+        &self,
+        source: crate::application::SourceAppliedCorporateActionPlan,
+        expected_sequence: u64,
+        control: PaperControlContext,
+    ) -> Result<PaperExecutionSnapshot, PaperControlError> {
+        let reference = source.reference().map_err(|_| {
+            PaperControlError::CorporateAction(
+                market_squawk_adapter_paper::PaperLedgerError::InvalidActionEvidence,
+            )
+        })?;
+        let bytes = serde_json::to_vec(&reference).map_err(|_| {
+            PaperControlError::CorporateAction(
+                market_squawk_adapter_paper::PaperLedgerError::InvalidActionEvidence,
+            )
+        })?;
+        if bytes.len() > 64 * 1024 {
+            return Err(PaperControlError::CorporateAction(
+                market_squawk_adapter_paper::PaperLedgerError::Capacity,
+            ));
+        }
+        let plan = source.into_covered_accounting_plan().map_err(|_| {
+            PaperControlError::CorporateAction(
+                market_squawk_adapter_paper::PaperLedgerError::InvalidActionEvidence,
+            )
+        })?;
+        self.paper
+            .adapter()
+            .reconcile_corporate_actions(plan, bytes, expected_sequence, control)
+            .await
+    }
+
     /// Returns authority-free immutable market snapshots.
-    pub fn snapshots(&self) -> LiveSnapshotReader {
+    pub fn snapshots(&self) -> Option<LiveSnapshotReader> {
         self.live.snapshots()
     }
 
@@ -1397,7 +1568,7 @@ impl From<ExecutionDispatchError> for ProductionPaperControlError {
 /// Fully inspected shutdown result, including durable drain of both audit streams.
 #[derive(Debug)]
 pub struct ProductionPaperBotShutdown {
-    source_and_live: Result<(), ProductionLiveSourceRuntimeError>,
+    source_and_live: Result<(), ProductionPaperSourceShutdownError>,
     supervisor: PaperFinancialSupervisorShutdown,
     dispatcher_quiesce: ExecutionDispatcherQuiesce,
     checkpoint: Result<ProductionPaperCheckpointEvidence, ProductionPaperCheckpointError>,
@@ -1434,7 +1605,13 @@ impl ProductionPaperBotShutdown {
             && self.audit.is_complete()
     }
 
-    pub const fn source_and_live(&self) -> &Result<(), ProductionLiveSourceRuntimeError> {
+    /// Resumes only the retained audit writer after admission saturation or join timeout.
+    /// Every original financial checkpoint, execution and reconciliation result stays unchanged.
+    pub(crate) async fn resume_audit(&mut self, deadline: tokio::time::Instant) {
+        self.audit.resume_after_timeout(deadline).await;
+    }
+
+    pub const fn source_and_live(&self) -> &Result<(), ProductionPaperSourceShutdownError> {
         &self.source_and_live
     }
 
@@ -1479,6 +1656,14 @@ impl ProductionPaperBotShutdown {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum ProductionPaperSourceShutdownError {
+    #[error(transparent)]
+    Native(ProductionLiveSourceRuntimeError),
+    #[error("virtual equity source shutdown failed: {0}")]
+    VirtualEquity(market_squawk_services::ServiceError),
+}
+
 /// Production paper-bot validation failure before any worker or network activity starts.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ProductionPaperBotCompositionError {
@@ -1501,6 +1686,8 @@ pub enum ProductionPaperBotCompositionError {
 /// Production paper-bot startup failure with inspected rollback when workers had started.
 #[derive(Debug, Error)]
 pub enum ProductionPaperBotStartError {
+    #[error("paper portfolio publisher could not bind its financial reconciliation fence")]
+    PortfolioPublication,
     #[error(transparent)]
     Accounts(AccountCoordinatorError),
     #[error(transparent)]
@@ -1541,6 +1728,11 @@ pub enum ProductionPaperBotStartError {
     Allocation,
     #[error(transparent)]
     Source(ProductionLiveSourceRuntimeError),
+    #[error("virtual equity startup failed and a started route did not drain")]
+    VirtualRouteRollback {
+        startup: Box<ProductionPaperBotStartError>,
+        cleanup: market_squawk_services::ServiceError,
+    },
     #[error("production paper-bot startup failed and worker rollback was incomplete")]
     Rollback {
         startup: Box<ProductionPaperBotStartError>,
@@ -1654,7 +1846,7 @@ impl ProductionPaperCheckpointEvidence {
 }
 
 fn validate_strategy_routes(
-    routes: &[LiveRouteConfig],
+    routes: &[virtual_routes::PaperExecutionRoute],
     strategies: &[ProductionPaperBotRoute],
 ) -> Result<(), ProductionPaperBotCompositionError> {
     if routes.len() != strategies.len()
@@ -1678,7 +1870,7 @@ fn validate_strategy_routes(
 }
 
 fn manual_paper_routes(
-    routes: &[LiveRouteConfig],
+    routes: &[virtual_routes::PaperExecutionRoute],
     strategies: &[ProductionPaperBotRoute],
 ) -> Result<Vec<ManualPaperRoute>, ProductionPaperBotCompositionError> {
     let count = strategies
@@ -1708,7 +1900,7 @@ fn manual_paper_routes(
             .ok_or(ProductionPaperBotCompositionError::ManualIngressRouteMismatch)?;
         manual_routes.push(ManualPaperRoute {
             route: route.route().clone(),
-            execution_terms: route.definition().execution_terms(),
+            execution_terms: route.terms,
             ingress: ingress.clone(),
         });
     }

@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+pub(crate) use tiingo::PublishedCurrentOrdinaryActions;
 
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
@@ -57,6 +58,7 @@ mod alpaca_historical;
 mod bea;
 mod bls;
 mod bls_live;
+mod board_full_history;
 mod census;
 mod crypto_market;
 mod eia;
@@ -64,6 +66,7 @@ mod fred;
 mod iex_hist;
 mod official_options_reference;
 mod provider_runtime;
+mod schwab_instrument_reference;
 mod schwab_market;
 mod sec_fund;
 mod sec_fundamentals;
@@ -71,9 +74,12 @@ mod sec_live;
 mod selection;
 mod tiingo;
 mod treasury;
+pub(crate) use board_full_history::BoardFullHistoryApplicationError;
 mod yahoo_enrichment;
 
 pub(crate) use alpaca_historical::{
+    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError, AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
+    AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector, AlpacaOptionMarketPointInTimeSelector,
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
     AlpacaHistoricalSourceSlotError,
@@ -101,7 +107,7 @@ pub(crate) use census::{
     CENSUS_QUARTERLY_POINT_IN_TIME_OPERATION, CensusLiveComposition, CensusMacroApplicationClosure,
     CensusMacroApplicationError, CensusPublicationReceipt, CensusQuarterlyPointInTimeRequest,
     CensusQuarterlyRestartReceipt, CensusRegisteredSource, CensusRestartSelector,
-    CensusSealFirstExtractionLimits,
+    CensusSealFirstExtractionLimits, open_selected_census_plan, verify_selected_census_row,
 };
 pub(crate) use crypto_market::{
     CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketPublicationClosure,
@@ -139,12 +145,13 @@ pub use provider_runtime::ResearchProviderRuntimeGeneration;
 pub(crate) use provider_runtime::{
     CryptoMarketPublicationAuthority, ResearchProviderPublicationOperation,
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
-    SchwabRestQuotePublicationPackage,
+    SchwabRestQuotePublicationPackage, SchwabStreamerPublicationPackage,
 };
 use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
 pub(crate) use schwab_market::{
     SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
     SchwabRestQuotePostSealFailure, SchwabRestQuoteSourceHealthOutcome,
+    SchwabStreamerApplicationOutcome, SchwabStreamerGenerationAuthority,
 };
 pub(crate) use sec_fund::{
     SEC_NCEN_FUND_POINT_IN_TIME_OPERATION, SEC_NPORT_FUND_POINT_IN_TIME_OPERATION,
@@ -159,8 +166,9 @@ pub use selection::{
 };
 pub(crate) use tiingo::{
     TIINGO_EOD_MARKET_BAR_POINT_IN_TIME_OPERATION, TIINGO_FUND_NAV_POINT_IN_TIME_OPERATION,
-    TiingoEodApplicationOutcome, TiingoEodRestartSelector, TiingoFundNavApplicationOutcome,
-    TiingoFundNavRestartSelector, TiingoLatestApplicationError,
+    TiingoCompletedEodActionRead, TiingoCompletedEodHistoryReference, TiingoEodApplicationOutcome,
+    TiingoEodHistoryPublicationReceipt, TiingoEodRestartSelector, TiingoFundNavApplicationOutcome,
+    TiingoFundNavRestartSelector, TiingoHistoryApplicationError, TiingoLatestApplicationError,
 };
 pub(crate) use treasury::{
     TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
@@ -328,6 +336,7 @@ impl ResearchRightsAuthority {
         if basis.digest().bytes() == [0; 32]
             || parent_authorization_evidence.bytes() == [0; 32]
             || authorization_evidence.bytes() == [0; 32]
+            || parent_authorization_evidence == authorization_evidence
             || exact_subjects.is_empty()
             || exact_subjects.len() != subject_count
             || permitted_operations.is_empty()
@@ -628,6 +637,7 @@ fn map_managed_capture_error(error: ResearchServiceError) -> ExtractionSourceErr
 pub struct ManagedDiscovery {
     batch: DiscoveryBatch,
     capture_material: Option<ProviderCaptureMaterial>,
+    bea: Option<bea::BeaRetainedDiscovery>,
 }
 
 /// Source-neutral extraction failure plus an optional closed protocol reason for internal logs.
@@ -660,6 +670,7 @@ impl ManagedDiscovery {
         Self {
             batch,
             capture_material: None,
+            bea: None,
         }
     }
 
@@ -683,6 +694,7 @@ impl ManagedDiscovery {
         Ok(Self {
             batch,
             capture_material: Some(capture_material),
+            bea: None,
         })
     }
 }
@@ -1159,14 +1171,19 @@ struct RegisteredExtractionSource {
 #[derive(Clone)]
 enum RegisteredTypedSourceCapability {
     None,
+    BoardFullHistory(Arc<market_squawk_adapter_federal_reserve::BoardSource>),
     TreasuryAllHistory(Arc<market_squawk_adapter_treasury::TreasurySource>),
+    BeaRegional(Arc<BeaRegisteredSource>),
 }
 
 impl RegisteredTypedSourceCapability {
     const fn same_kind(&self, candidate: &Self) -> bool {
         matches!(
             (self, candidate),
-            (Self::None, Self::None) | (Self::TreasuryAllHistory(_), Self::TreasuryAllHistory(_))
+            (Self::None, Self::None)
+                | (Self::TreasuryAllHistory(_), Self::TreasuryAllHistory(_))
+                | (Self::BoardFullHistory(_), Self::BoardFullHistory(_))
+                | (Self::BeaRegional(_), Self::BeaRegional(_))
         )
     }
 }
@@ -1189,6 +1206,23 @@ impl RegisteredSourceCapability {
         Self {
             erased: source,
             typed: RegisteredTypedSourceCapability::None,
+        }
+    }
+
+    fn board(source: Arc<market_squawk_adapter_federal_reserve::BoardSource>) -> Self {
+        let erased: Arc<dyn ManagedResearchExtractionSource> = source.clone();
+        Self {
+            erased,
+            typed: RegisteredTypedSourceCapability::BoardFullHistory(source),
+        }
+    }
+
+    fn bea(source: BeaRegisteredSource) -> Self {
+        let source = Arc::new(source);
+        let erased: Arc<dyn ManagedResearchExtractionSource> = source.clone();
+        Self {
+            erased,
+            typed: RegisteredTypedSourceCapability::BeaRegional(source),
         }
     }
 
@@ -1356,6 +1390,9 @@ impl ProviderMacroOperationAuthority {
             .research
             .ingest(ingest, self.cancellation.clone())
             .await?;
+        let original_binding_digest = committed
+            .original_binding_for_reobservation(binding_digest)
+            .unwrap_or(binding_digest);
         // The commit is already durable. Revalidate its creating inputs under the original read
         // controls; an interrupted read cannot undo that commit or select a later generation.
         let restart = self
@@ -1371,7 +1408,7 @@ impl ProviderMacroOperationAuthority {
                         expected_implementation,
                     )
                     .and_then(|(restart, _)| {
-                        if restart.binding_digest != binding_digest
+                        if restart.binding_digest != original_binding_digest
                             || restart.metadata_revision != expected_revision
                             || restart.provider_dataset != expected_dataset
                             || restart.record_count != expected_records
@@ -1590,6 +1627,66 @@ const fn macro_native_implementation_name(
 }
 
 impl ProductionResearchIngestCoordinator {
+    /// Reopens one original binding in the existing bounded capture worker.
+    pub(crate) async fn provider_capture_binding_evidence(
+        &self,
+        manifest: &DatasetManifestRef,
+        binding_digest: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PersistedProviderCaptureBindingEvidence, ResearchServiceError> {
+        self.research
+            .read_provider_capture_generation(
+                manifest.clone(),
+                deadline,
+                cancellation,
+                move |generation, _, _, _, _| {
+                    if generation.objects().len() != 1
+                        || generation.objects()[0].inputs().len() != 1
+                    {
+                        return Err(ResearchServiceError::IngestAuthorityMismatch);
+                    }
+                    let binding = generation.objects()[0].inputs()[0].binding();
+                    if binding.binding_digest() != binding_digest {
+                        return Err(ResearchServiceError::IngestAuthorityMismatch);
+                    }
+                    Ok(binding.clone())
+                },
+            )
+            .await
+    }
+
+    /// Reuses the existing catalog's canonical reference reader for source publication.
+    pub(crate) fn market_data_instruments(
+        &self,
+    ) -> market_squawk_data::MarketDataInstrumentReadCapability {
+        self.research.market_data_instruments()
+    }
+
+    /// Shares the existing research custody owner with the account reference preflight.
+    pub(crate) fn research_service(&self) -> Arc<ResearchService> {
+        Arc::clone(&self.research)
+    }
+
+    /// Uses the existing research journal for original public reference custody.
+    pub(crate) fn provider_capture_store(&self) -> Arc<SealedResearchJournalStore> {
+        self.research.provider_capture_store()
+    }
+
+    /// Reads the installed execution terms used by live route processors.
+    pub(crate) fn instrument_definitions(
+        &self,
+    ) -> market_squawk_data::InstrumentDefinitionReadCapability {
+        self.research.instrument_definitions()
+    }
+
+    /// Reuses the sole catalog writer for accepted provider-native reference acquisition.
+    pub(crate) fn market_data_instrument_synchronization(
+        &self,
+    ) -> market_squawk_data::MarketDataInstrumentSynchronizationCapability {
+        self.research.market_data_instrument_synchronization()
+    }
+
     /// Finite lifetime for one retained Treasury all-history acquisition, including replay.
     /// Individual HTTP requests retain their independent transport and provider-rate bounds.
     pub(crate) const TREASURY_ALL_HISTORY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -1629,7 +1726,7 @@ impl ProductionResearchIngestCoordinator {
             generation,
             provider_dataset,
             context,
-            self.limits.operation_duration,
+            operation_deadline(context, self.limits.operation_duration)?,
         )
         .await
         .map(|(operation, _capability)| operation)
@@ -1648,7 +1745,7 @@ impl ProductionResearchIngestCoordinator {
                 generation,
                 provider_dataset,
                 context,
-                Self::TREASURY_ALL_HISTORY_TIMEOUT,
+                operation_deadline(context, Self::TREASURY_ALL_HISTORY_TIMEOUT)?,
             )
             .await?;
         let RegisteredTypedSourceCapability::TreasuryAllHistory(source) = capability else {
@@ -1753,7 +1850,7 @@ impl ProductionResearchIngestCoordinator {
         generation: &ResearchProviderRuntimeGeneration,
         provider_dataset: &SourceIdentifier,
         context: &RequestContext,
-        maximum_duration: Duration,
+        operation_deadline: Instant,
     ) -> Result<
         (
             ProviderMacroOperationAuthority,
@@ -1762,7 +1859,12 @@ impl ProductionResearchIngestCoordinator {
         ServiceError,
     > {
         let call = DomainLifecycle::enter(&self.lifecycle, context)?;
-        let operation_deadline = operation_deadline(context, maximum_duration)?;
+        if operation_deadline > context.deadline() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if Instant::now() >= operation_deadline {
+            return Err(ServiceError::DeadlineExceeded);
+        }
         let (extraction, rights, admission, typed_capability) = {
             let authority = self
                 .authority
@@ -2223,6 +2325,7 @@ impl ProductionResearchIngestCoordinator {
             &prepared.admission,
             discovery.batch,
             discovery.capture_material,
+            discovery.bea,
             self.limits.discovery_receipt_retention,
             observed_monotonic,
             observed_wall,
@@ -2261,18 +2364,24 @@ impl ProductionResearchIngestCoordinator {
         let deadline = wall_deadline(operation_deadline, operation)?;
         let request = DiscoveryRequest::try_new(dataset.clone(), None, max_results, deadline)
             .map_err(|_error| ServiceError::InvalidRequest)?;
-        let discovery = await_extraction(
-            prepared.source.discover_managed(
-                prepared.authority.clone(),
-                request,
-                operation.clone(),
-            ),
-            context,
-            operation,
-            &prepared.admission,
-            operation_deadline,
-        )
-        .await?;
+        let discovery =
+            if let Some(source) = self.registered_bea_source(profile, Some(&prepared.admission))? {
+                self.discover_bea_registered(source, request, context, operation_deadline)
+                    .await?
+            } else {
+                await_extraction(
+                    prepared.source.discover_managed(
+                        prepared.authority.clone(),
+                        request,
+                        operation.clone(),
+                    ),
+                    context,
+                    operation,
+                    &prepared.admission,
+                    operation_deadline,
+                )
+                .await?
+            };
         ensure_operation_live(operation_deadline, operation)?;
         prepared
             .admission
@@ -2449,7 +2558,11 @@ impl ProductionResearchIngestCoordinator {
             object,
             admission,
             capture_material,
+            bea,
         } = prepared;
+        if bea.is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
         self.extract_prepared_object(
             PreparedExtraction {
                 source,
@@ -2852,6 +2965,20 @@ impl ProductionResearchIngestCoordinator {
         let dataset = required_identifier(request, "dataset")?;
         let object_id = required_identifier(request, "object")?;
         let receipt = required_string(request, "discoveryReceipt")?;
+        if let Some(source) = self.registered_bea_source(&profile, None)? {
+            return self
+                .ingest_bea_selected(
+                    source,
+                    receipt,
+                    &dataset,
+                    &object_id,
+                    context,
+                    limits,
+                    additional,
+                    operation_deadline,
+                )
+                .await;
+        }
         let operation = self.lifecycle.shutdown_token().child_token();
         let extracted = self
             .extract_selected(
@@ -3461,11 +3588,24 @@ fn classify_ingest_error(error: IngestError) -> ProviderOperationFailureClass {
         IngestError::PublicationAuthorityRevoked | IngestError::AuthorityTransitionRejected => {
             ProviderOperationFailureClass::PublicationAuthority
         }
-        IngestError::Parquet(_)
+        error @ (IngestError::Parquet(_)
         | IngestError::Manifest(_)
         | IngestError::Catalog(_)
-        | IngestError::SecFundJob(_)
-        | IngestError::ListingReference(_) => ProviderOperationFailureClass::StorageUnavailable,
+        | IngestError::MarketDataInstrumentReference(_)
+        | IngestError::ResearchUse(_)
+        | IngestError::ListingReference(_)) => {
+            match super::map_durable_market_ingest_error(error) {
+                ServiceError::Unavailable => ProviderOperationFailureClass::StorageUnavailable,
+                error => {
+                    ProviderOperationDiagnostic::from_service(
+                        ProviderOperationPhase::RawSeal,
+                        error,
+                    )
+                    .failure
+                }
+            }
+        }
+        IngestError::SecFundJob(_) => ProviderOperationFailureClass::StorageUnavailable,
         IngestError::ProviderCaptureRequired
         | IngestError::ProviderCapture(_)
         | IngestError::SealedProviderCapture(_)

@@ -655,7 +655,11 @@ impl RawCaptureRecord {
         &self.payload
     }
 
-    pub(crate) fn checked_retained_bytes(&self) -> Result<usize, CaptureRetainedSizeError> {
+    /// Returns the complete checked retained allocation, including the exact owned payload backing.
+    ///
+    /// Shared allocations are conservatively charged in full to each owning request.
+    /// Returns an error if the complete retained-size formula overflows.
+    pub fn checked_retained_bytes(&self) -> Result<usize, CaptureRetainedSizeError> {
         std::mem::size_of::<Self>()
             .checked_add(self.checked_dynamic_retained_bytes()?)
             .ok_or(CaptureRetainedSizeError::Overflow {

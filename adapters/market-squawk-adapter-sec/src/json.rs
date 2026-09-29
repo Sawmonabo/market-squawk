@@ -50,6 +50,13 @@ impl RetainedJsonBudget {
         }
     }
 
+    pub(crate) fn admitted_bytes(&self) -> Result<usize, SecParserError> {
+        self.state
+            .lock()
+            .map(|state| state.admitted)
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)
+    }
+
     pub(crate) fn admit_bytes(&self, bytes: usize) -> Result<(), SecParserError> {
         let mut state = self
             .state
@@ -268,6 +275,52 @@ impl SecParserLimits {
 
     pub(crate) const fn string_bytes(self) -> usize {
         self.max_string_bytes
+    }
+
+    pub(crate) const fn intersect(self, other: Self) -> Result<Self, SecParserError> {
+        Self::try_new(
+            if self.max_decoded_bytes < other.max_decoded_bytes {
+                self.max_decoded_bytes
+            } else {
+                other.max_decoded_bytes
+            },
+            if self.max_records < other.max_records {
+                self.max_records
+            } else {
+                other.max_records
+            },
+            if self.max_depth < other.max_depth {
+                self.max_depth
+            } else {
+                other.max_depth
+            },
+            if self.max_string_bytes < other.max_string_bytes {
+                self.max_string_bytes
+            } else {
+                other.max_string_bytes
+            },
+            if self.max_total_string_bytes < other.max_total_string_bytes {
+                self.max_total_string_bytes
+            } else {
+                other.max_total_string_bytes
+            },
+            if self.max_retained_output_bytes < other.max_retained_output_bytes {
+                self.max_retained_output_bytes
+            } else {
+                other.max_retained_output_bytes
+            },
+        )
+    }
+
+    pub(crate) fn with_retained_bytes(self, maximum: usize) -> Result<Self, SecParserError> {
+        Self::try_new(
+            self.max_decoded_bytes,
+            self.max_records,
+            self.max_depth,
+            self.max_string_bytes.min(maximum),
+            self.max_total_string_bytes.min(maximum),
+            self.max_retained_output_bytes.min(maximum),
+        )
     }
 }
 

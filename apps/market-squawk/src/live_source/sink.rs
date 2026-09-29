@@ -2,6 +2,9 @@
 
 #[path = "coinbase_publication.rs"]
 mod coinbase_publication;
+#[path = "alpaca_publication.rs"]
+mod alpaca_publication;
+pub(crate) use alpaca_publication::{AlpacaCapturedPublicationIngress, AlpacaCapturedPublicationReceiver};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -91,6 +94,7 @@ pub(super) enum ProductionCapturedPublicationIngress {
     None,
     Coinbase(CoinbaseCapturedPublicationIngress),
     Kraken(KrakenCapturedPublicationIngress),
+    Alpaca(AlpacaCapturedPublicationIngress),
 }
 
 impl ProductionCapturedPublicationIngress {
@@ -112,6 +116,10 @@ pub(super) struct ProductionRawMarketSink<'a> {
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
     pending_data: PendingDataBuffer,
+    pending_raw_capture: Option<(
+        RawMarketFrame,
+        market_squawk_sources::CaptureAdmissionReceipt,
+    )>,
     output: QualifiedSourceOutput,
     startup_readiness: Option<oneshot::Sender<()>>,
     startup_ready: bool,
@@ -186,8 +194,9 @@ impl<'a> ProductionRawMarketSink<'a> {
         )
     }
 
-    pub(super) fn try_new_display(
+    pub(super) fn try_new_display_with_publication(
         input: ProductionDisplayMarketSinkInput<'a>,
+        publication: ProductionCapturedPublicationIngress,
     ) -> Result<Self, ProductionSinkConstructionError> {
         let metadata = input.decoder.metadata().clone();
         let startup_readiness_policy = input.startup_readiness_policy;
@@ -202,21 +211,12 @@ impl<'a> ProductionRawMarketSink<'a> {
             input.session,
             input.health_reporter,
             Some(input.decoder),
-            ProductionCapturedPublicationIngress::none(),
+            publication,
             metadata,
             input.subscription,
             output,
             startup_readiness_policy,
         )
-    }
-
-    pub(super) fn try_new_display_with_startup_readiness(
-        input: ProductionDisplayMarketSinkInput<'a>,
-        startup_readiness: oneshot::Sender<()>,
-    ) -> Result<Self, ProductionSinkConstructionError> {
-        let mut sink = Self::try_new_display(input)?;
-        sink.startup_readiness = Some(startup_readiness);
-        Ok(sink)
     }
 
     #[allow(
@@ -248,6 +248,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             generation: GenerationIdentity::from_session(session),
             subscription,
             pending_data,
+            pending_raw_capture: None,
             output,
             startup_readiness: None,
             startup_ready: false,
@@ -291,7 +292,15 @@ impl<'a> ProductionRawMarketSink<'a> {
     }
 
     fn process_frame(&mut self, frame: RawMarketFrame) -> Result<(), ProductionSinkFailure> {
-        let mut receipt = self.capture_frame(&frame)?;
+        let receipt = self.capture_frame(&frame)?;
+        self.process_captured_frame(frame, receipt)
+    }
+
+    fn process_captured_frame(
+        &mut self,
+        frame: RawMarketFrame,
+        mut receipt: market_squawk_sources::CaptureAdmissionReceipt,
+    ) -> Result<(), ProductionSinkFailure> {
         let validated_frame = self
             .session
             .validate_live_frame(&frame)
@@ -300,7 +309,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             .decoder
             .as_mut()
             .ok_or(ProductionSinkFailure::MissingDecoder)?
-            .decode(&validated_frame)
+            .decode(&validated_frame, system_timestamp().map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?)
             .map_err(ProductionSinkFailure::Decode)?;
         match outcome {
             ProductionDecodeOutcome::Kraken {
@@ -342,8 +351,28 @@ impl<'a> ProductionRawMarketSink<'a> {
                 }
                 self.process_captured_outcome(outcome, receipt)
             }
-            ProductionDecodeOutcome::Standard(outcome)
-            | ProductionDecodeOutcome::Coinbase(CoinbaseMarketDecodeOutcome::Other(outcome)) => {
+            ProductionDecodeOutcome::Alpaca(handoff) => {
+                let (outcome, prepared) = handoff.into_parts();
+                if let Some(prepared) = prepared {
+                    let material = receipt.try_issue_provider_event_microbatch_material(
+                        &frame, prepared.dataset().clone(), prepared.stream_identity().clone(),
+                    ).map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
+                    let (rejoin, seal_request) = prepared.into_pending_publication(&validated_frame, material)
+                        .map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
+                    let ProductionCapturedPublicationIngress::Alpaca(publication) = &self.publication else {
+                        return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+                    };
+                    let observed_at = system_timestamp().map_err(|_| ProductionSinkFailure::AlpacaPublicationMaterial)?;
+                    publication.try_submit(rejoin, seal_request, observed_at)
+                        .map_err(|error| match error {
+                            alpaca_publication::AlpacaPublicationQueueError::Closed => ProductionSinkFailure::AlpacaPublicationWorkerClosed,
+                            alpaca_publication::AlpacaPublicationQueueError::Full => ProductionSinkFailure::PublicationBackpressure,
+                            alpaca_publication::AlpacaPublicationQueueError::Bounds => ProductionSinkFailure::AlpacaPublicationMaterial,
+                        })?;
+                }
+                self.process_captured_outcome(outcome, receipt)
+            }
+            ProductionDecodeOutcome::Coinbase(CoinbaseMarketDecodeOutcome::Other(outcome)) => {
                 self.process_captured_outcome(outcome, receipt)
             }
             ProductionDecodeOutcome::Coinbase(CoinbaseMarketDecodeOutcome::Market(handoff)) => {
@@ -674,7 +703,9 @@ impl<'a> ProductionRawMarketSink<'a> {
         let batches = current
             .validate_data_outcome_owned(data)
             .map_err(ProductionSinkFailure::Registry)?;
-        let valid_until = self.output.try_publish(batches, received_at)?;
+        // Buffered data becomes available only after its genuine acknowledgement qualifies
+        // health. Keep the captured receipt and source timestamps inside each batch unchanged.
+        let valid_until = self.output.try_publish(batches, health_observed_at)?;
         if requires_rebind {
             self.health_rebind_at = Some(rebind_at(
                 health_observed_at,
@@ -1173,7 +1204,40 @@ impl RawMarketSink for ProductionRawMarketSink<'_> {
         if let Some(failure) = self.terminal {
             return Err(failure.as_sink_error());
         }
+        if self.pending_raw_capture.is_some() {
+            return Err(self.fail(ProductionSinkFailure::CaptureHandoffMismatch));
+        }
         self.process_frame(frame)
+            .map_err(|failure| self.fail(failure))
+    }
+
+    fn try_capture_for_publication(&mut self, frame: &RawMarketFrame) -> Result<(), SinkError> {
+        if self.pending_raw_capture.is_some() {
+            return Err(self.fail(ProductionSinkFailure::CaptureHandoffMismatch));
+        }
+        // Raw admission precedes terminal/output/currentness checks. It remains bounded by the
+        // same healthy capture generation and queue, and the owner drains it on every shutdown.
+        let receipt = self
+            .capture_frame(frame)
+            .map_err(|failure| self.fail(failure))?;
+        self.pending_raw_capture = Some((frame.clone(), receipt));
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        Ok(())
+    }
+
+    fn try_publish_captured(&mut self, frame: RawMarketFrame) -> Result<(), SinkError> {
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        let Some((captured, receipt)) = self.pending_raw_capture.take() else {
+            return Err(self.fail(ProductionSinkFailure::CaptureHandoffMismatch));
+        };
+        if !captured.binding().shares_allocation_with(frame.binding()) || captured != frame {
+            return Err(self.fail(ProductionSinkFailure::CaptureHandoffMismatch));
+        }
+        self.process_captured_frame(frame, receipt)
             .map_err(|failure| self.fail(failure))
     }
 
@@ -1235,6 +1299,8 @@ pub enum RouteActivationFailure {
 pub enum ProductionSinkFailure {
     #[error("raw capture publication failed")]
     Capture(CapturePublishError),
+    #[error("raw capture continuation is missing, duplicated or transplanted")]
+    CaptureHandoffMismatch,
     #[error("source authority validation failed: {0}")]
     Registry(RegistryError),
     #[error("decoder implementation failed")]
@@ -1297,6 +1363,10 @@ pub enum ProductionSinkFailure {
     CoinbasePublicationMaterial,
     #[error("exact Kraken capture material could not be issued")]
     KrakenPublicationMaterial,
+    #[error("Alpaca captured publication material is invalid")]
+    AlpacaPublicationMaterial,
+    #[error("Alpaca publication worker is closed")]
+    AlpacaPublicationWorkerClosed,
     #[error("durable-publication ingress does not match the decoded source topology")]
     PublicationTopologyMismatch,
     #[error("bounded durable-publication ingress is unavailable")]
@@ -1326,6 +1396,7 @@ impl ProductionSinkFailure {
                 | SubscriptionFailure::AuditAccountingInvariant,
             )
             | Self::Capture(_)
+            | Self::CaptureHandoffMismatch
             | Self::Registry(_)
             | Self::Decode(_)
             | Self::MissingDecoder
@@ -1347,6 +1418,8 @@ impl ProductionSinkFailure {
             | Self::StartupObserverDropped
             | Self::DuplicateActiveRequestBudget
             | Self::CoinbasePublicationMaterial
+            | Self::AlpacaPublicationMaterial
+            | Self::AlpacaPublicationWorkerClosed
             | Self::KrakenPublicationMaterial
             | Self::PublicationTopologyMismatch
             | Self::PublicationBackpressure => false,
@@ -1372,6 +1445,7 @@ impl ProductionSinkFailure {
             )
             | Self::ActivationWorkerClosed => SinkError::Closed,
             Self::Capture(_)
+            | Self::CaptureHandoffMismatch
             | Self::Registry(_)
             | Self::Decode(_)
             | Self::MissingDecoder
@@ -1397,6 +1471,8 @@ impl ProductionSinkFailure {
             | Self::StartupObserverDropped
             | Self::DuplicateActiveRequestBudget
             | Self::CoinbasePublicationMaterial
+            | Self::AlpacaPublicationMaterial
+            | Self::AlpacaPublicationWorkerClosed
             | Self::KrakenPublicationMaterial
             | Self::PublicationTopologyMismatch
             | Self::PublicationBackpressure => SinkError::CaptureIncomplete,

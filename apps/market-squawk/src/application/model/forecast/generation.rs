@@ -3,11 +3,13 @@
 use std::{
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use market_squawk_data::{
-    DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry, Sha256Digest,
+    AnalyticalReadCapability, DatasetId, DatasetManifestRef, DatasetSchemaRef,
+    DatasetSchemaRegistry, FeatureDatasetInputCoordinate, FeatureDatasetInputEpochOutput,
+    FeatureDatasetProductContract, ForecastFeatureValue, QueryLimits, Sha256Digest,
 };
 use market_squawk_domain::{
     Currency, DataQuality, InstrumentId, ModelId, SchemaVersion, SourceId, Timestamp,
@@ -17,8 +19,8 @@ use market_squawk_modeling::{
     ForecastRequest, ForecastValue, ModelFeatureValue, ModelInput, ResearchForecastBackend,
 };
 use market_squawk_services::{
-    ArtifactError, ArtifactPublicationContext, RequestContext, ServiceError, ServiceLimits,
-    ToolResultMetadata, TypedToolRequest, TypedToolResult,
+    ArtifactError, ArtifactPublicationContext, RequestContext, ServiceDomain, ServiceError,
+    ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -29,10 +31,13 @@ use super::super::{
     forecast_model_evidence_projection_for_horizon, one_result,
 };
 use super::{
-    ForecastAnalysisEvidence, ForecastApplicationError, ForecastCollection,
-    ForecastProductIdentity, ForecastProductTarget, ForecastServingEvidence,
+    ForecastAnalysisEvidence, ForecastApplicationError, ForecastCollection, ForecastJobOutput,
+    ForecastPrecommitAuthority, ForecastProductIdentity, ForecastProductTarget,
+    ForecastServingEvidence,
 };
-use crate::application::domain_support::{admitted_result_limits, ensure_request_live};
+use crate::application::domain_support::{
+    DomainLifecycle, admitted_result_limits, ensure_request_live,
+};
 
 const MAXIMUM_FORECAST_VALIDITY_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
@@ -42,6 +47,17 @@ impl ModelDomainService {
         request: &TypedToolRequest,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
+        self.generate_forecast_with_precommit(request, context, None)
+            .await
+            .map(|output| output.result)
+    }
+
+    async fn generate_forecast_with_precommit(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        precommit: Option<&dyn ForecastPrecommitAuthority>,
+    ) -> Result<ForecastJobOutput, ServiceError> {
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         let model_id = admitted_model_id(request.arguments())?;
         let parsed = ParsedForecastRequest::try_from(
@@ -51,6 +67,14 @@ impl ModelDomainService {
                 .and_then(Value::as_object)
                 .ok_or(ServiceError::InvalidRequest)?,
         )?;
+        let request_hash = parsed.request_hash(model_id)?;
+        // An exact durable retry must remain recoverable even after its model leaves the runtime.
+        if let Some(result) = self
+            .replay_forecast_with_hash(request_hash, request, context, precommit)
+            .await?
+        {
+            return Ok(result);
+        }
         let image = self.read_image.load();
         let backend = image
             .backends
@@ -81,6 +105,102 @@ impl ModelDomainService {
         {
             return Err(ServiceError::InvalidRequest);
         }
+        let financial_output = if parsed.horizon.fiscal_periods().is_some() {
+            let analytical = self
+                .forecast_analytical
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?;
+            let output = reopen_financial_input(
+                analytical,
+                parsed.serving_evidence.manifest(),
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await?;
+            let index = financial_coordinate_index(&output, &parsed.serving_evidence)?;
+            let actual = ForecastServingEvidence::from_financial_output(&output, index)
+                .map_err(|_| ServiceError::InvalidResult)?;
+            if actual != parsed.serving_evidence {
+                return Err(ServiceError::InvalidRequest);
+            }
+            if financial_analysis_evidence(metadata, output.dataset())? != parsed.analysis_evidence
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let coordinate = output
+                .coordinate(index)
+                .ok_or(ServiceError::InvalidResult)?;
+            let actual_values = financial_feature_values(metadata, coordinate)?;
+            if parsed.inputs.len() != 1
+                || parsed.inputs[0].len() != actual_values.len()
+                || parsed.inputs[0]
+                    .iter()
+                    .zip(&actual_values)
+                    .any(|(left, right)| left.to_bits() != right.to_bits())
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            Some((output, index))
+        } else {
+            None
+        };
+        if let Some(current) = parsed.serving_evidence.current_price_input() {
+            let analytical = self
+                .forecast_analytical
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?;
+            let output = super::current_input::reopen_current_price_input(
+                analytical,
+                parsed.serving_evidence.manifest(),
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await?;
+            let index =
+                super::current_input::current_price_coordinate_index(&output, &current.example_id)?;
+            let coordinate = output
+                .coordinate(index)
+                .ok_or(ServiceError::InvalidResult)?;
+            let cohort = super::current_input::current_price_cohort_reference(current)?;
+            super::current_input::current_price_session_origin(
+                self.forecast_calendar.as_ref(),
+                cohort.as_ref(),
+                coordinate,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await?;
+            let actual =
+                ForecastServingEvidence::from_current_price_output(&output, index, cohort.as_ref())
+                    .map_err(invalid)?;
+            let values = super::current_input::current_price_feature_values(metadata, coordinate)?;
+            let epoch = coordinate.epoch();
+            let observed = super::current_input::current_price_observed_point(
+                coordinate,
+                *values.first().ok_or(ServiceError::InvalidResult)?,
+            )?;
+            if actual != parsed.serving_evidence
+                || epoch.instrument_id() != parsed.instrument_id
+                || epoch.source_selection_as_of() != parsed.available_at
+                || epoch.target_origin() != parsed.observed_cutoff
+                || parsed.inputs.len() != 1
+                || parsed.inputs[0].len() != values.len()
+                || parsed.inputs[0]
+                    .iter()
+                    .zip(&values)
+                    .any(|(left, right)| left.to_bits() != right.to_bits())
+                || if matches!(
+                    metadata.output_binding().target(),
+                    market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }
+                ) {
+                    !parsed.observed_history.is_empty()
+                } else {
+                    parsed.observed_history.as_ref() != [observed].as_slice()
+                }
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
         let mut rows = Vec::new();
         rows.try_reserve_exact(parsed.inputs.len())
             .map_err(|_error| ServiceError::ResourceExhausted)?;
@@ -105,16 +225,44 @@ impl ModelDomainService {
                 ModelInput::try_new(metadata, values).map_err(|_error| ServiceError::InvalidRequest)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let forecast_request = ForecastRequest::try_new_with_observed_history(
-            parsed.instrument_id,
-            parsed.observed_cutoff,
-            parsed.available_at,
-            parsed.horizon,
-            parsed.decimal_scale,
-            &parsed.observed_history,
-            &inputs,
-        )
-        .map_err(|_error| ServiceError::InvalidRequest)?;
+        let forecast_request = match &financial_output {
+            Some((output, index)) => ForecastRequest::try_for_financial_coordinate(
+                output
+                    .coordinate(*index)
+                    .ok_or(ServiceError::InvalidResult)?,
+                parsed.decimal_scale,
+                &inputs,
+            ),
+            None if matches!(
+                metadata.output_binding().target(),
+                market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }
+            ) =>
+            {
+                if !parsed.observed_history.is_empty()
+                    || parsed.serving_evidence.current_price_input().is_none()
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                ForecastRequest::try_new(
+                    parsed.instrument_id,
+                    parsed.observed_cutoff.ok_or(ServiceError::InvalidRequest)?,
+                    parsed.available_at,
+                    parsed.horizon,
+                    parsed.decimal_scale,
+                    &inputs,
+                )
+            }
+            None => ForecastRequest::try_new_with_observed_history(
+                parsed.instrument_id,
+                parsed.observed_cutoff.ok_or(ServiceError::InvalidRequest)?,
+                parsed.available_at,
+                parsed.horizon,
+                parsed.decimal_scale,
+                &parsed.observed_history,
+                &inputs,
+            ),
+        }
+        .map_err(|_| ServiceError::InvalidRequest)?;
         let calibration = metadata
             .forecast_calibration()
             .map(|value| {
@@ -138,12 +286,19 @@ impl ModelDomainService {
         let created_at = wall_now()?;
         let validity =
             i64::try_from(parsed.validity_nanos).map_err(|_error| ServiceError::InvalidRequest)?;
-        let expires_at = created_at
+        let validity_end = created_at
             .checked_add_nanos(validity)
-            .map_err(|_error| ServiceError::InvalidRequest)?;
-        let content = forecasts
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        let expires_at = path
+            .points()
+            .first()
+            .ok_or(ServiceError::InvalidResult)?
+            .target_at()
+            .map_or(validity_end, |target| target.min(validity_end));
+        let result_limits = admitted_result_limits(request, context)?;
+        forecasts
             .publish_vintage(
-                parsed.request_hash(model_id)?,
+                request_hash,
                 path,
                 parsed.product_identity.clone(),
                 parsed.model_evidence.clone(),
@@ -152,10 +307,57 @@ impl ModelDomainService {
                 created_at,
                 expires_at,
                 ArtifactPublicationContext::new(context.cancellation().clone(), context.deadline()),
+                precommit,
+                |content, artifact| {
+                    let result = TypedToolResult::try_new(
+                        content,
+                        1,
+                        ToolResultMetadata::complete_not_applicable(),
+                        result_limits,
+                    )
+                    .map_err(|_| ForecastApplicationError::Capacity)?;
+                    Ok(ForecastJobOutput { result, artifact })
+                },
+            )
+            .await
+            .map_err(map_forecast_error)
+    }
+
+    async fn replay_forecast_with_hash(
+        &self,
+        request_hash: Sha256Digest,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        precommit: Option<&dyn ForecastPrecommitAuthority>,
+    ) -> Result<Option<ForecastJobOutput>, ServiceError> {
+        let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        let Some(existing) = forecasts.vintage_for_request(request_hash).await else {
+            return Ok(None);
+        };
+        let artifact = forecasts
+            .read_vintage_artifact(
+                &existing,
+                &ArtifactPublicationContext::new(
+                    context.cancellation().clone(),
+                    context.deadline(),
+                ),
             )
             .await
             .map_err(map_forecast_error)?;
-        one_result(content, request, context)
+        super::outcome::validate_event_for_read(self, existing.product_token().map_err(map_forecast_error)?, context)
+            .await.map_err(map_forecast_error)?;
+        let content = forecasts
+            .get_forecast_by_identity(&existing.vintage_id)
+            .await
+            .map_err(map_forecast_error)?;
+        let result = one_result(content, request, context)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        if let Some(precommit) = precommit {
+            precommit.validate_precommit().map_err(map_forecast_error)?;
+            precommit.commit_succeeded();
+        }
+        Ok(Some(ForecastJobOutput { result, artifact }))
     }
 
     pub(in crate::application::model) async fn get_forecast(
@@ -165,6 +367,8 @@ impl ModelDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         let vintage = admitted_vintage_id(request.arguments())?;
+        let token = Uuid::parse_str(vintage).map_err(|_| ServiceError::InvalidRequest)?;
+        super::outcome::validate_event_for_read(self, token, context).await.map_err(map_forecast_error)?;
         one_result(
             forecasts
                 .get_forecast(vintage)
@@ -200,6 +404,8 @@ impl ModelDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
         let vintage = admitted_vintage_id(request.arguments())?;
+        let token = Uuid::parse_str(vintage).map_err(|_| ServiceError::InvalidRequest)?;
+        super::outcome::validate_event_for_read(self, token, context).await.map_err(map_forecast_error)?;
         let limits = admitted_result_limits(request, context)?;
         let maximum =
             NonZeroUsize::new(limits.maximum_result_items()).ok_or(ServiceError::InvalidRequest)?;
@@ -211,6 +417,133 @@ impl ModelDomainService {
             limits,
         )
     }
+}
+
+#[async_trait::async_trait]
+impl super::ForecastJobExecutor for ModelDomainService {
+    async fn recover_forecast_job_output(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<Option<ForecastJobOutput>, ServiceError> {
+        let coordinates = forecast_recovery_coordinates(request)?;
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        self.replay_forecast_with_hash(coordinates.request_hash, request, context, None)
+            .await
+    }
+
+    async fn replay_forecast_for_job(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        precommit: &dyn ForecastPrecommitAuthority,
+    ) -> Result<Option<ForecastJobOutput>, ServiceError> {
+        let coordinates = forecast_recovery_coordinates(request)?;
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        self.replay_forecast_with_hash(coordinates.request_hash, request, context, Some(precommit))
+            .await
+    }
+
+    async fn generate_forecast_for_job(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        precommit: &dyn ForecastPrecommitAuthority,
+    ) -> Result<ForecastJobOutput, ServiceError> {
+        if request.contract().domain() != ServiceDomain::Model
+            || request.name() != super::GENERATE_FORECAST
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        self.generate_forecast_with_precommit(request, context, Some(precommit))
+            .await
+    }
+
+    async fn read_forecast_job_result(
+        &self,
+        request: &TypedToolRequest,
+        artifact: &market_squawk_services::ArtifactReference,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let coordinates = forecast_recovery_coordinates(request)?;
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let forecasts = self.forecasts.as_ref().ok_or(ServiceError::Unavailable)?;
+        let vintage = forecasts
+            .vintage_for_artifact(artifact)
+            .await
+            .map_err(map_forecast_error)?;
+        if vintage.request_hash != super::persistence::hex(coordinates.request_hash.bytes()) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        forecasts
+            .read_vintage_artifact(
+                &vintage,
+                &ArtifactPublicationContext::new(
+                    context.cancellation().clone(),
+                    context.deadline(),
+                ),
+            )
+            .await
+            .map_err(map_forecast_error)?;
+        let content = forecasts
+            .get_forecast_by_identity(&vintage.vintage_id)
+            .await
+            .map_err(map_forecast_error)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        TypedToolResult::try_new(
+            content,
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            admitted_result_limits(request, context)?,
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// Exact typed immutable coordinates decoded by the same terminal request parser.
+pub(crate) struct ForecastRecoveryCoordinates {
+    pub(crate) model_id: ModelId,
+    pub(crate) bundle_id: BundleId,
+    pub(crate) bundle_version: NonZeroU64,
+    pub(crate) instrument_id: InstrumentId,
+    pub(crate) horizon: ForecastHorizon,
+    pub(crate) validity_nanos: NonZeroU64,
+    pub(crate) request_hash: Sha256Digest,
+    pub(crate) analysis_evidence: ForecastAnalysisEvidence,
+    pub(crate) serving_evidence: ForecastServingEvidence,
+}
+
+/// Exposes checked recovery coordinates without a second request decoder or a latest lookup.
+pub(crate) fn forecast_recovery_coordinates(
+    request: &TypedToolRequest,
+) -> Result<ForecastRecoveryCoordinates, ServiceError> {
+    if request.contract().domain() != ServiceDomain::Model
+        || request.name() != super::GENERATE_FORECAST
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let model_id = admitted_model_id(request.arguments())?;
+    let parsed = ParsedForecastRequest::try_from(
+        request
+            .arguments()
+            .get("request")
+            .and_then(Value::as_object)
+            .ok_or(ServiceError::InvalidRequest)?,
+    )?;
+    let request_hash = parsed.request_hash(model_id)?;
+    Ok(ForecastRecoveryCoordinates {
+        model_id,
+        bundle_id: parsed.bundle_id,
+        bundle_version: parsed.bundle_version,
+        instrument_id: parsed.instrument_id,
+        horizon: parsed.horizon,
+        validity_nanos: NonZeroU64::new(parsed.validity_nanos)
+            .ok_or(ServiceError::InvalidRequest)?,
+        request_hash,
+        analysis_evidence: parsed.analysis_evidence,
+        serving_evidence: parsed.serving_evidence,
+    })
 }
 
 fn collection_result(
@@ -232,7 +565,7 @@ struct ParsedForecastRequest {
     model_evidence: ForecastModelEvidenceProjection,
     bundle_id: BundleId,
     bundle_version: NonZeroU64,
-    observed_cutoff: Timestamp,
+    observed_cutoff: Option<Timestamp>,
     available_at: Timestamp,
     horizon: ForecastHorizon,
     decimal_scale: u8,
@@ -299,43 +632,31 @@ impl ParsedForecastRequest {
         digest.update(self.bundle_id.as_str().as_bytes());
         digest.update([0]);
         digest.update(self.bundle_version.get().to_be_bytes());
-        digest.update(self.observed_cutoff.unix_nanos().to_be_bytes());
+        hash_bytes(
+            &mut digest,
+            &serde_json::to_vec(&self.observed_cutoff.map(|time| time.unix_nanos()))
+                .map_err(invalid)?,
+        )?;
         digest.update(self.available_at.unix_nanos().to_be_bytes());
         digest.update(self.horizon.points().get().to_be_bytes());
-        digest.update(self.horizon.step_nanos().get().to_be_bytes());
+        hash_bytes(
+            &mut digest,
+            &serde_json::to_vec(&(self.horizon.step_nanos(), self.horizon.fiscal_periods()))
+                .map_err(invalid)?,
+        )?;
         digest.update([self.decimal_scale]);
         digest.update(self.validity_nanos.to_be_bytes());
         hash_manifest(&mut digest, self.analysis_evidence.manifest())?;
         digest.update(self.analysis_evidence.production_identity_sha256().bytes());
         digest.update(self.analysis_evidence.production_receipt_sha256().bytes());
         digest.update(self.analysis_evidence.pairing_sha256().bytes());
-        hash_manifest(&mut digest, self.serving_evidence.manifest())?;
         hash_bytes(
             &mut digest,
-            self.serving_evidence.source_id().as_str().as_bytes(),
+            &serde_json::to_vec(&super::persistence::serving_evidence_record(
+                &self.serving_evidence,
+            ))
+            .map_err(invalid)?,
         )?;
-        digest.update(self.serving_evidence.object_graph_sha256().bytes());
-        digest.update(self.serving_evidence.selection_sha256().bytes());
-        digest.update(self.serving_evidence.result_sha256().bytes());
-        digest.update(
-            self.serving_evidence
-                .knowledge_cutoff()
-                .unix_nanos()
-                .to_be_bytes(),
-        );
-        digest.update(
-            self.serving_evidence
-                .prior_observed_at()
-                .unix_nanos()
-                .to_be_bytes(),
-        );
-        digest.update(
-            self.serving_evidence
-                .observed_through()
-                .unix_nanos()
-                .to_be_bytes(),
-        );
-        digest.update(self.serving_evidence.feature_sha256().bytes());
         for point in &self.observed_history {
             digest.update(point.observed_at().unix_nanos().to_be_bytes());
             digest.update(point.available_at().unix_nanos().to_be_bytes());
@@ -356,11 +677,16 @@ impl ParsedForecastRequest {
     }
 }
 
+/// Applies the same closed request decoder at descriptor admission and forecast execution.
+pub(crate) fn validate_forecast_request(input: &Map<String, Value>) -> Result<(), ServiceError> {
+    ParsedForecastRequest::try_from(input).map(|_| ())
+}
+
 impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
     type Error = ServiceError;
 
     fn try_from(input: &Map<String, Value>) -> Result<Self, Self::Error> {
-        const FIELDS: [&str; 15] = [
+        const FIELDS: [&str; 16] = [
             "instrumentId",
             "productIdentity",
             "modelEvidence",
@@ -370,6 +696,7 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
             "availableAtUnixNanos",
             "horizonPoints",
             "horizonStepNanos",
+            "fiscalHorizon",
             "decimalScale",
             "validityNanos",
             "observedHistory",
@@ -393,16 +720,41 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
         let bundle_version = unsigned(input, "bundleVersion")
             .and_then(NonZeroU64::new)
             .ok_or(ServiceError::InvalidRequest)?;
-        let observed_cutoff = timestamp(input, "observedThroughUnixNanos")?;
+        let observed_cutoff = match input.get("observedThroughUnixNanos") {
+            Some(Value::Null) => None,
+            Some(_) => Some(timestamp(input, "observedThroughUnixNanos")?),
+            None => return Err(ServiceError::InvalidRequest),
+        };
         let available_at = timestamp(input, "availableAtUnixNanos")?;
         let horizon_points = unsigned(input, "horizonPoints")
             .and_then(|value| u16::try_from(value).ok())
             .and_then(NonZeroU16::new)
             .ok_or(ServiceError::InvalidRequest)?;
-        let horizon_step = unsigned(input, "horizonStepNanos")
-            .and_then(NonZeroU64::new)
-            .ok_or(ServiceError::InvalidRequest)?;
-        let horizon = ForecastHorizon::try_new(horizon_points, horizon_step).map_err(invalid)?;
+        let horizon = match input.get("fiscalHorizon") {
+            Some(Value::Null) if observed_cutoff.is_some() => {
+                let step = unsigned(input, "horizonStepNanos")
+                    .and_then(NonZeroU64::new)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                ForecastHorizon::try_new(horizon_points, step).map_err(invalid)?
+            }
+            Some(value)
+                if observed_cutoff.is_none()
+                    && horizon_points.get() == 1
+                    && input.get("horizonStepNanos").is_some_and(Value::is_null) =>
+            {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct FiscalHorizon {
+                    cadence: market_squawk_domain::FundamentalCadence,
+                    periods_ahead: NonZeroU16,
+                }
+                let fiscal: FiscalHorizon =
+                    serde_json::from_value(value.clone()).map_err(invalid)?;
+                ForecastHorizon::try_fiscal(fiscal.cadence, fiscal.periods_ahead)
+                    .map_err(invalid)?
+            }
+            _ => return Err(ServiceError::InvalidRequest),
+        };
         let model_evidence = parse_model_evidence(
             input
                 .get("modelEvidence")
@@ -421,8 +773,8 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
             .get("observedHistory")
             .and_then(Value::as_array)
             .filter(|values| {
-                !values.is_empty()
-                    && values.len() <= market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+                values.len() <= market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+                    && (horizon.fiscal_periods().is_none() || values.is_empty())
             })
             .ok_or(ServiceError::InvalidRequest)?;
         let mut observed = Vec::new();
@@ -476,7 +828,12 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
         if serving_evidence.observed_through() != observed_cutoff
             || available_at > serving_evidence.knowledge_cutoff()
             || product_identity.knowledge_at() != serving_evidence.knowledge_cutoff()
-            || product_identity.effective_at() != observed_cutoff
+            || observed_cutoff.is_some_and(|cutoff| product_identity.effective_at() != cutoff)
+            || (serving_evidence.financial_input().is_some() != horizon.fiscal_periods().is_some())
+            || serving_evidence.origin_bar().is_some_and(|bar| {
+                bar.context().provenance().instrument_id() != Some(instrument_id)
+                    || bar.currency() != product_identity.quote_currency()
+            })
         {
             return Err(ServiceError::InvalidRequest);
         }
@@ -539,8 +896,12 @@ fn parse_product_identity(
 fn parse_serving_evidence(
     input: &Map<String, Value>,
 ) -> Result<ForecastServingEvidence, ServiceError> {
-    const FIELDS: [&str; 9] = [
+    const FIELDS: [&str; 13] = [
+        "currentPriceInput",
+        "financialInput",
+        "originBar",
         "manifest",
+        "parentManifests",
         "sourceId",
         "objectGraphSha256",
         "selectionSha256",
@@ -553,6 +914,45 @@ fn parse_serving_evidence(
     if input.len() != FIELDS.len() || input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
         return Err(ServiceError::InvalidRequest);
     }
+    if input
+        .get("currentPriceInput")
+        .is_some_and(|value| !value.is_null())
+    {
+        let mut record_fields = input.clone();
+        for key in ["knowledgeCutoffUnixNanos", "observedThroughUnixNanos"] {
+            record_fields.insert(
+                key.to_owned(),
+                Value::from(timestamp(input, key)?.unix_nanos()),
+            );
+        }
+        let record = serde_json::from_value(Value::Object(record_fields)).map_err(invalid)?;
+        return ForecastServingEvidence::from_current_price_record(record).map_err(invalid);
+    }
+    if input
+        .get("financialInput")
+        .is_some_and(|value| !value.is_null())
+    {
+        let mut record_fields = input.clone();
+        record_fields.insert(
+            "knowledgeCutoffUnixNanos".to_owned(),
+            Value::from(timestamp(input, "knowledgeCutoffUnixNanos")?.unix_nanos()),
+        );
+        let record = serde_json::from_value(Value::Object(record_fields)).map_err(invalid)?;
+        return ForecastServingEvidence::from_financial_record(record).map_err(invalid);
+    }
+    let parents = input
+        .get("parentManifests")
+        .and_then(Value::as_array)
+        .filter(|parents| {
+            !parents.is_empty()
+                && parents.len() <= market_squawk_modeling::MAX_FORECAST_SERVING_PARENTS
+        })
+        .ok_or(ServiceError::InvalidRequest)?
+        .iter()
+        .map(|parent| {
+            parse_analysis_manifest(parent.as_object().ok_or(ServiceError::InvalidRequest)?)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     ForecastServingEvidence::try_new(
         parse_analysis_manifest(
             input
@@ -569,6 +969,18 @@ fn parse_serving_evidence(
         timestamp(input, "observedThroughUnixNanos")?,
         digest(input, "featureSha256")?,
     )
+    .and_then(|evidence| {
+        evidence.with_origin_bar(
+            serde_json::from_value(
+                input
+                    .get("originBar")
+                    .cloned()
+                    .ok_or(ForecastApplicationError::InvalidRecord)?,
+            )
+            .map_err(|_| ForecastApplicationError::InvalidRecord)?,
+        )
+    })
+    .and_then(|evidence| evidence.with_parent_manifests(parents))
     .map_err(|_| ServiceError::InvalidRequest)
 }
 
@@ -804,6 +1216,7 @@ fn wall_now() -> Result<Timestamp, ServiceError> {
 
 fn map_forecast_error(error: ForecastApplicationError) -> ServiceError {
     match error {
+        ForecastApplicationError::CurrentInputRead(error) => error,
         ForecastApplicationError::InvalidLimits | ForecastApplicationError::InvalidRecord => {
             ServiceError::InvalidRequest
         }
@@ -880,4 +1293,145 @@ const fn quality_tag(quality: DataQuality) -> u8 {
 
 fn invalid<T>(_error: T) -> ServiceError {
     ServiceError::InvalidRequest
+}
+
+/// Reuses the existing immutable feature-only query for native monetary serving and recovery.
+pub(crate) async fn reopen_financial_input(
+    analytical: &AnalyticalReadCapability,
+    manifest: &DatasetManifestRef,
+    deadline: Instant,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<FeatureDatasetInputEpochOutput, ServiceError> {
+    let limits = QueryLimits::try_new_with_inline_bytes(
+        4096,
+        32 * 1024 * 1024,
+        64 * 1024 * 1024,
+        64 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(30),
+    )
+    .map_err(|_| ServiceError::InvalidRequest)?;
+    analytical
+        .feature_dataset_input_epochs(
+            FeatureDatasetProductContract::FinancialAmountFiscalPeriodsStudyInputsV1,
+            manifest,
+            limits,
+            deadline,
+            cancellation,
+        )
+        .await
+        .map_err(|_| ServiceError::Unavailable)
+}
+
+pub(crate) fn financial_coordinate_index(
+    output: &FeatureDatasetInputEpochOutput,
+    serving: &ForecastServingEvidence,
+) -> Result<usize, ServiceError> {
+    let input = serving
+        .financial_input()
+        .ok_or(ServiceError::InvalidRequest)?;
+    let mut indices = output
+        .epochs()
+        .iter()
+        .enumerate()
+        .filter(|(_, epoch)| epoch.example_id() == input.example_id);
+    let (index, _) = indices.next().ok_or(ServiceError::NotFound)?;
+    if indices.next().is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(index)
+}
+
+pub(crate) fn financial_feature_values(
+    metadata: &market_squawk_modeling::ModelMetadata,
+    coordinate: FeatureDatasetInputCoordinate<'_>,
+) -> Result<Vec<f64>, ServiceError> {
+    let epoch = coordinate.epoch();
+    if epoch.financial_period().is_none() || coordinate.rows().len() != metadata.features().len() {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(metadata.features().len())
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    for binding in metadata.features() {
+        let mut rows = coordinate.rows().iter().filter(|row| {
+            row.example_id() == epoch.example_id()
+                && row.instrument_id() == epoch.instrument_id()
+                && row.source_selection_as_of() == epoch.source_selection_as_of()
+                && row.decision_coordinate() == epoch.decision_coordinate()
+                && row.label_selection_as_of().is_none()
+                && row.target_coordinate_kind() == 4
+                && row.observed_effective_at().is_none()
+                && row.label_effective_at().is_none()
+                && row.component_kind() == 1
+                && row.component_name() == binding.key().name()
+                && row.component_version() == binding.key().version().get()
+        });
+        let row = rows.next().ok_or(ServiceError::Unavailable)?;
+        if rows.next().is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let value = match row.value() {
+            ForecastFeatureValue::Float(value) => *value,
+            ForecastFeatureValue::Decimal { mantissa, scale } => {
+                *mantissa as f64 / 10_f64.powi(i32::from(*scale))
+            }
+            ForecastFeatureValue::Missing => return Err(ServiceError::Unavailable),
+        };
+        if !value.is_finite() {
+            return Err(ServiceError::InvalidResult);
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// Binds the actual selected model training generation to one independently admitted native input.
+pub(crate) fn financial_analysis_evidence(
+    metadata: &market_squawk_modeling::ModelMetadata,
+    input: &market_squawk_data::AnalyticalFeatureDataset,
+) -> Result<ForecastAnalysisEvidence, ServiceError> {
+    if input.product_contract()
+        != FeatureDatasetProductContract::FinancialAmountFiscalPeriodsStudyInputsV1
+        || !matches!(
+            metadata.output_binding().measurement(),
+            market_squawk_modeling::ForecastMeasurement::FinancialAmount { .. }
+        )
+        || !matches!(
+            metadata.output_binding().target(),
+            market_squawk_modeling::ForecastTargetMeaning::FinancialPeriod { .. }
+        )
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let receipt = input.production_receipt();
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/native-fiscal-training-serving-pairing/v1\0");
+    for identity in [
+        metadata.metadata_hash(),
+        metadata.training_run_hash(),
+        metadata.output_binding().identity(),
+        metadata.dataset().export_digest(),
+        metadata.dataset().selection_digest(),
+        input.universe_digest(),
+    ] {
+        digest.update(identity.bytes());
+    }
+    for manifest in [metadata.dataset().manifest(), input.generation().manifest()] {
+        let record =
+            market_squawk_modeling::ForecastArtifactManifestRecord::from_manifest(manifest);
+        hash_bytes(&mut digest, &serde_json::to_vec(&record).map_err(invalid)?)?;
+    }
+    digest.update(receipt.production_identity().bytes());
+    digest.update(receipt.receipt_sha256().bytes());
+    ForecastAnalysisEvidence::try_new(
+        input.generation().manifest().clone(),
+        Sha256Digest::new(receipt.production_identity().bytes()),
+        Sha256Digest::new(receipt.receipt_sha256().bytes()),
+        Sha256Digest::new(digest.finalize().into()),
+    )
+    .map_err(invalid)
 }

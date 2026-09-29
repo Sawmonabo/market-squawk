@@ -9,12 +9,19 @@ use std::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use market_squawk_adapter_kraken::{
     KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth, KrakenMetadataError,
-    KrakenMetadataInput, KrakenSocketHandoffConsumer, KrakenSource,
+    KrakenMetadataInput, KrakenReferenceSelectionEvidence, KrakenSocketHandoffConsumer,
+    KrakenSource,
+};
+use market_squawk_data::{
+    MarketDataInstrumentCatalogError, MarketDataInstrumentRecord,
+    MarketDataProviderIdentitySelection,
 };
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, MetadataRevision,
-    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+    MarketDataInstrumentDefinition, MetadataRevision, ProviderIdentityKey, ProviderIdentityRecord,
+    RevisionBoundPayloadEvidence, VenueId, VenueMapping,
 };
+use market_squawk_domain::{IdentityError, SourceId, SourceIdentifier, Timestamp};
 use market_squawk_live::{
     LiveSnapshotReader, RouteSnapshot, ShardKey, SnapshotCompleteness, StreamPhaseSnapshot,
     StreamSnapshot,
@@ -50,10 +57,38 @@ const BACKOFF_JITTER_BASIS_POINTS: u16 = 2_000;
 const MAX_CLOCK_SKEW_NANOS: u64 = 1_000_000_000;
 const CURRENTNESS_OBSERVATION_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Complete immutable Kraken provider profile derived from strict local configuration.
+/// Code-owned public budget available before the catalog-selected live profile exists.
+pub(super) fn reference_budget(
+    config: &KrakenSourceConfig,
+) -> Result<ProviderBudgetPolicy, ProductionKrakenProfileError> {
+    let attestation = config.authorization();
+    if attestation.provider().as_str() != "kraken" {
+        return Err(ProductionKrakenProfileError::AuthorizationMismatch);
+    }
+    let authorization = AuthorizationGrant::new(
+        AuthorizationMode::PublicInterface,
+        attestation.basis().clone(),
+        attestation.evidence().clone(),
+        attestation.effective_interval(),
+    );
+    Ok(ProviderBudgetPolicy::try_new(
+        BudgetScope::for_authorization(attestation.provider().clone(), &authorization)?,
+        nonzero_u32(REQUESTS_PER_WINDOW)?,
+        nonzero_u64(REQUEST_WINDOW_NANOS)?,
+        nonzero_u16(MAX_CONCURRENT_REQUESTS)?,
+        BackoffPolicy::try_new(
+            nonzero_u64(INITIAL_BACKOFF_NANOS)?,
+            nonzero_u64(MAXIMUM_BACKOFF_NANOS)?,
+            BACKOFF_JITTER_BASIS_POINTS,
+        )?,
+    )?)
+}
+
+/// Complete immutable Kraken profile bound to an opaque catalog identity selection.
 #[derive(Debug)]
 pub(super) struct ProductionKrakenProfile {
     adapter_config: KrakenConfig,
+    reference_selection: MarketDataProviderIdentitySelection,
 }
 
 /// Exact pair of independently governed public Kraken channels used by the installed runtime.
@@ -69,24 +104,24 @@ pub(super) struct ProductionKrakenProfileSet {
 }
 
 impl ProductionKrakenProfileSet {
-    pub(super) fn try_from_at(
+    pub(super) fn try_from_selection(
         config: &KrakenSourceConfig,
-        at: Timestamp,
+        record: &MarketDataInstrumentRecord,
+        selection: &MarketDataProviderIdentitySelection,
     ) -> Result<Self, ProductionKrakenProfileError> {
+        let selected = SelectedKrakenReference::try_new(config, record, selection)?;
         Ok(Self {
-            book: ProductionKrakenProfile::try_for_channel(
+            book: ProductionKrakenProfile::try_for_selected_channel(
                 config,
-                at,
+                &selected,
                 KrakenChannel::Book(KrakenDepth::Ten),
             )?,
-            trades: ProductionKrakenProfile::try_for_channel(config, at, KrakenChannel::Trades)?,
+            trades: ProductionKrakenProfile::try_for_selected_channel(
+                config,
+                &selected,
+                KrakenChannel::Trades,
+            )?,
         })
-    }
-
-    pub(super) fn try_from_config(
-        config: &KrakenSourceConfig,
-    ) -> Result<Self, ProductionKrakenProfileError> {
-        Self::try_from_at(config, system_timestamp()?)
     }
 
     pub(super) fn into_channels(self) -> [ProductionKrakenProfile; 2] {
@@ -109,18 +144,17 @@ impl ProductionKrakenProfile {
         self.adapter_config.clone()
     }
 
-    pub(super) fn try_from_at(
-        config: &KrakenSourceConfig,
-        at: Timestamp,
-    ) -> Result<Self, ProductionKrakenProfileError> {
-        Self::try_for_channel(config, at, KrakenChannel::Book(KrakenDepth::Ten))
+    pub(super) const fn reference_selection(&self) -> &MarketDataProviderIdentitySelection {
+        &self.reference_selection
     }
 
-    fn try_for_channel(
+    fn try_for_selected_channel(
         config: &KrakenSourceConfig,
-        at: Timestamp,
+        selected: &SelectedKrakenReference<'_>,
         channel: KrakenChannel,
     ) -> Result<Self, ProductionKrakenProfileError> {
+        let definition = selected.definition;
+        let at = selected.selected_at;
         let attestation = config.authorization();
         if attestation.provider().as_str() != "kraken" {
             return Err(ProductionKrakenProfileError::AuthorizationMismatch);
@@ -128,7 +162,14 @@ impl ProductionKrakenProfile {
         if !attestation.is_effective_at(at) {
             return Err(ProductionKrakenProfileError::AuthorizationNotEffective);
         }
-        let evidence_input = KrakenProfileEvidence::try_for_channel(config, channel)?;
+        let evidence_input = KrakenProfileEvidence::try_for_channel(
+            config,
+            definition.instrument_id(),
+            selected.provider_identity,
+            selected.venue_mapping,
+            &selected.reference_evidence,
+            channel,
+        )?;
         let encoded = serde_json::to_vec(&evidence_input)
             .map_err(|_error| ProductionKrakenProfileError::EvidenceSerialization)?;
         let mut hasher = Sha256::new();
@@ -146,17 +187,7 @@ impl ProductionKrakenProfile {
             attestation.evidence().clone(),
             effective,
         );
-        let budget = ProviderBudgetPolicy::try_new(
-            BudgetScope::for_authorization(attestation.provider().clone(), &authorization)?,
-            nonzero_u32(REQUESTS_PER_WINDOW)?,
-            nonzero_u64(REQUEST_WINDOW_NANOS)?,
-            nonzero_u16(MAX_CONCURRENT_REQUESTS)?,
-            BackoffPolicy::try_new(
-                nonzero_u64(INITIAL_BACKOFF_NANOS)?,
-                nonzero_u64(MAXIMUM_BACKOFF_NANOS)?,
-                BACKOFF_JITTER_BASIS_POINTS,
-            )?,
-        )?;
+        let budget = reference_budget(config)?;
         let freshness_nanos = duration_nanos(config.freshness())?;
         let freshness = FreshnessPolicy::try_new(
             freshness_nanos,
@@ -176,7 +207,7 @@ impl ProductionKrakenProfile {
                 authorization,
                 profile_evidence,
                 effective,
-                config.definition().instrument_id(),
+                definition.instrument_id(),
                 freshness,
                 budget,
             ),
@@ -186,28 +217,35 @@ impl ProductionKrakenProfile {
                 authorization,
                 profile_evidence,
                 effective,
-                config.definition().instrument_id(),
+                definition.instrument_id(),
                 freshness,
                 budget,
             ),
         };
         let metadata = metadata_input.try_build()?;
         let adapter_config = match channel {
-            KrakenChannel::Book(depth) => KrakenConfig::try_new(
+            KrakenChannel::Book(depth) => KrakenConfig::try_new_selected(
                 metadata,
-                config.symbol(),
-                config.definition().instrument_id(),
+                definition,
+                &selected.provider_identity_key,
+                &selected.reference_evidence,
+                at,
                 depth,
                 config.max_frame_bytes(),
             )?,
-            KrakenChannel::Trades => KrakenConfig::try_trades(
+            KrakenChannel::Trades => KrakenConfig::try_trades_selected(
                 metadata,
-                config.symbol(),
-                config.definition().instrument_id(),
+                definition,
+                &selected.provider_identity_key,
+                &selected.reference_evidence,
+                at,
                 config.max_frame_bytes(),
             )?,
         };
-        Ok(Self { adapter_config })
+        Ok(Self {
+            adapter_config,
+            reference_selection: selected.selection.clone(),
+        })
     }
 
     pub(super) fn metadata(&self) -> &SourceMetadata {
@@ -241,19 +279,104 @@ impl ProductionKrakenProfile {
         self,
         endpoint: &str,
     ) -> Result<Self, ProductionKrakenProfileError> {
-        let Self { adapter_config } = self;
+        let Self {
+            adapter_config,
+            reference_selection,
+        } = self;
         Ok(Self {
             adapter_config: adapter_config.with_local_endpoint_for_test(endpoint)?,
+            reference_selection,
         })
     }
 }
 
-impl TryFrom<&KrakenSourceConfig> for ProductionKrakenProfile {
-    type Error = ProductionKrakenProfileError;
+struct SelectedKrakenReference<'a> {
+    selection: &'a MarketDataProviderIdentitySelection,
+    definition: &'a MarketDataInstrumentDefinition,
+    provider_identity: &'a ProviderIdentityRecord,
+    venue_mapping: &'a VenueMapping,
+    provider_identity_key: ProviderIdentityKey,
+    reference_evidence: KrakenReferenceSelectionEvidence,
+    selected_at: Timestamp,
+}
 
-    fn try_from(config: &KrakenSourceConfig) -> Result<Self, Self::Error> {
-        Self::try_from_at(config, system_timestamp()?)
+impl<'a> SelectedKrakenReference<'a> {
+    fn try_new(
+        config: &KrakenSourceConfig,
+        record: &'a MarketDataInstrumentRecord,
+        selection: &'a MarketDataProviderIdentitySelection,
+    ) -> Result<Self, ProductionKrakenProfileError> {
+        let query = selection.query();
+        let exact = selection.exact_receipt()?;
+        let provider = SourceId::try_from(super::crypto_reference::KRAKEN_NAMESPACE)?;
+        let venue = VenueId::try_from("kraken")?;
+        let definition = record.definition();
+
+        if query.source_id() != &provider
+            || exact.instrument_id() != definition.instrument_id()
+            || exact.instrument_id() != config.definition().instrument_id()
+            || definition.asset_class() != market_squawk_domain::AssetClass::Crypto
+            || definition.asset_class() != config.definition().asset_class()
+            || definition.quote_currency() != config.definition().quote_currency()
+            || record.revision_digest() != exact.definition_revision_digest()
+            || record.revision_sequence() != exact.definition_revision_sequence()
+            || record.published_at() != exact.definition_published_at()
+            || definition.reference_revision() != exact.definition_reference_revision()
+            || definition.reference_payload_evidence().content_digest()
+                != exact.definition_reference_payload_digest()
+            || !interval_contains(definition.effective_interval(), query.effective_at())
+        {
+            return Err(ProductionKrakenProfileError::NativeIdentity);
+        }
+
+        let provider_identity = definition
+            .provider_identity_at(
+                query.source_id(),
+                query.provider_instrument_id(),
+                query.effective_at(),
+            )
+            .ok_or(ProductionKrakenProfileError::NativeIdentity)?;
+        if provider_identity.metadata_revision() != exact.provider_identity_revision()
+            || provider_identity.evidence().content_digest()
+                != exact.provider_identity_payload_digest()
+            || provider_identity.validity() != exact.provider_identity_validity()
+        {
+            return Err(ProductionKrakenProfileError::NativeIdentity);
+        }
+
+        let venue_mapping = definition
+            .venue_mappings()
+            .iter()
+            .find(|mapping| mapping.venue_id() == &venue)
+            .filter(|mapping| mapping.venue_symbol().as_str() == config.symbol())
+            .ok_or(ProductionKrakenProfileError::NativeIdentity)?;
+        let provider_identity_key = ProviderIdentityKey::new(
+            query.source_id().clone(),
+            query.provider_instrument_id().clone(),
+        );
+        let reference_evidence = KrakenReferenceSelectionEvidence::try_new(
+            exact.definition_reference_revision().clone(),
+            exact.definition_reference_payload_digest(),
+            exact.definition_revision_digest(),
+            exact.definition_revision_sequence(),
+            exact.definition_published_at(),
+            definition.effective_interval(),
+            selection.selection_digest(),
+        )?;
+        Ok(Self {
+            selection,
+            definition,
+            provider_identity,
+            venue_mapping,
+            provider_identity_key,
+            reference_evidence,
+            selected_at: query.effective_at(),
+        })
     }
+}
+
+fn interval_contains(interval: EffectiveInterval, at: Timestamp) -> bool {
+    at >= interval.starts_at() && interval.ends_at().is_none_or(|end| at < end)
 }
 
 #[derive(Serialize)]
@@ -262,7 +385,20 @@ struct KrakenProfileEvidence<'a> {
     channel: &'static str,
     endpoint: &'a str,
     symbol: &'a str,
-    definition: &'a market_squawk_domain::InstrumentDefinition,
+    instrument_id: market_squawk_domain::InstrumentId,
+    provider_identity_source: &'a str,
+    provider_instrument_id: &'a str,
+    provider_identity_revision: &'a str,
+    provider_identity_digest: EvidenceDigest,
+    provider_identity_validity: EffectiveInterval,
+    venue: &'a str,
+    venue_symbol: &'a str,
+    reference_revision: &'a str,
+    reference_payload_digest: EvidenceDigest,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_published_at: Timestamp,
+    definition_validity: EffectiveInterval,
     depth: Option<usize>,
     snapshot: bool,
     freshness_nanos: u64,
@@ -273,17 +409,13 @@ struct KrakenProfileEvidence<'a> {
     authorization: &'a KrakenAuthorizationAttestation,
 }
 
-impl<'a> TryFrom<&'a KrakenSourceConfig> for KrakenProfileEvidence<'a> {
-    type Error = ProductionKrakenProfileError;
-
-    fn try_from(config: &'a KrakenSourceConfig) -> Result<Self, Self::Error> {
-        Self::try_for_channel(config, KrakenChannel::Book(KrakenDepth::Ten))
-    }
-}
-
 impl<'a> KrakenProfileEvidence<'a> {
     fn try_for_channel(
         config: &'a KrakenSourceConfig,
+        instrument_id: market_squawk_domain::InstrumentId,
+        provider_identity: &'a ProviderIdentityRecord,
+        venue_mapping: &'a market_squawk_domain::VenueMapping,
+        reference_selection: &'a KrakenReferenceSelectionEvidence,
         channel: KrakenChannel,
     ) -> Result<Self, ProductionKrakenProfileError> {
         let controls = config.control_limits();
@@ -300,7 +432,26 @@ impl<'a> KrakenProfileEvidence<'a> {
             channel: channel_name,
             endpoint: config.endpoint(),
             symbol: config.symbol(),
-            definition: config.definition(),
+            instrument_id,
+            provider_identity_source: provider_identity.source_id().as_str(),
+            provider_instrument_id: provider_identity.provider_instrument_id().as_str(),
+            provider_identity_revision: provider_identity
+                .metadata_revision()
+                .as_source_identifier()
+                .as_str(),
+            provider_identity_digest: provider_identity.evidence().content_digest(),
+            provider_identity_validity: provider_identity.validity(),
+            venue: venue_mapping.venue_id().as_str(),
+            venue_symbol: venue_mapping.venue_symbol().as_str(),
+            reference_revision: reference_selection
+                .reference_revision()
+                .as_source_identifier()
+                .as_str(),
+            reference_payload_digest: reference_selection.reference_payload_digest(),
+            definition_revision_digest: reference_selection.definition_revision_digest(),
+            definition_revision_sequence: reference_selection.definition_revision_sequence(),
+            definition_published_at: reference_selection.definition_published_at(),
+            definition_validity: reference_selection.definition_validity(),
             depth,
             snapshot: true,
             freshness_nanos: duration_nanos(config.freshness())?,
@@ -479,6 +630,14 @@ fn trade_stream_is_current(expected: &ShardKey, stream: &StreamSnapshot, at: Tim
 struct KrakenPublicSupervisorTask {
     channel: KrakenPublicChannel,
     task: JoinHandle<Result<(), ProductionSupervisorError>>,
+    cancellation: CancellationToken,
+}
+
+impl Drop for KrakenPublicSupervisorTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
+    }
 }
 
 /// Atomic owner for the independently governed public Kraken book and trade supervisors.
@@ -525,6 +684,7 @@ impl KrakenPublicSupervisorSet {
             let terminal_cancellation = cancellation.clone();
             tasks.push(KrakenPublicSupervisorTask {
                 channel,
+                cancellation: cancellation.clone(),
                 task: tokio::spawn(async move {
                     let outcome = supervisor.run(run_cancellation, ready).await;
                     // Either channel leaving its run loop makes the pair non-current. Cancel the
@@ -683,21 +843,32 @@ async fn reap_tasks(
             }),
             None => {
                 owned.task.abort();
-                let _aborted = owned.task.await;
+                let _aborted = (&mut owned.task).await;
                 Some(KrakenPublicSupervisorSetError::ShutdownDeadline)
             }
         };
-        if first_error.is_none() {
-            first_error = error;
+        if let Some(error) = error
+            && first_error.as_ref().is_none_or(|first| {
+                matches!(
+                    first,
+                    KrakenPublicSupervisorSetError::Supervisor {
+                        source: ProductionSupervisorError::CatalogSelectionStale,
+                        ..
+                    }
+                )
+            })
+        {
+            // A sibling cleanup failure cannot be hidden by a stale catalog selection.
+            first_error = Some(error);
         }
     }
     first_error
 }
 
 async fn abort_tasks(tasks: &mut Vec<KrakenPublicSupervisorTask>) {
-    while let Some(owned) = tasks.pop() {
+    while let Some(mut owned) = tasks.pop() {
         owned.task.abort();
-        let _aborted = owned.task.await;
+        let _aborted = (&mut owned.task).await;
     }
 }
 
@@ -768,8 +939,18 @@ fn nonzero_u64(value: u64) -> Result<NonZeroU64, ProductionKrakenProfileError> {
 /// Kraken production-profile validation failure.
 #[derive(Debug, Error)]
 pub enum ProductionKrakenProfileError {
+    #[error("a digest-verified durable Kraken reference selection is required")]
+    ReferenceSelectionRequired,
+    #[error("Kraken catalog identity selection is invalid")]
+    Catalog(#[from] MarketDataInstrumentCatalogError),
+    #[error("Kraken production profile allocation failed")]
+    Allocation,
     #[error("Kraken production profile identity is invalid")]
     Identity(#[from] IdentityError),
+    #[error("Kraken production native identity assertion is invalid")]
+    NativeIdentity,
+    #[error("Kraken production instrument definition is invalid")]
+    Instrument(#[from] market_squawk_domain::InstrumentError),
     #[error("Kraken source metadata is invalid")]
     Metadata(#[from] KrakenMetadataError),
     #[error("Kraken adapter configuration is invalid")]
@@ -790,4 +971,55 @@ pub enum ProductionKrakenProfileError {
     NetworkPolicy(#[from] market_squawk_sources::NetworkPolicyError),
     #[error("Kraken source policy is invalid")]
     SourcePolicy(#[from] market_squawk_sources::SourceMetadataError),
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_channel_cannot_hide_sibling_cleanup_failure() -> anyhow::Result<()> {
+        let (stale_finished, stale_observed) = oneshot::channel();
+        let (cleanup_finished, mut cleanup_observed) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let mut tasks = vec![
+            KrakenPublicSupervisorTask {
+                channel: KrakenPublicChannel::Trades,
+                cancellation: cancellation.clone(),
+                task: tokio::spawn(async move {
+                    assert!(
+                        stale_observed.await.is_ok(),
+                        "stale channel must finish first"
+                    );
+                    assert!(
+                        cleanup_finished.send(()).is_ok(),
+                        "cleanup observer remains live"
+                    );
+                    Err(ProductionSupervisorError::SourceCleanupIncomplete)
+                }),
+            },
+            KrakenPublicSupervisorTask {
+                channel: KrakenPublicChannel::Book,
+                cancellation,
+                task: tokio::spawn(async move {
+                    assert!(
+                        stale_finished.send(()).is_ok(),
+                        "sibling retains cleanup ownership"
+                    );
+                    Err(ProductionSupervisorError::CatalogSelectionStale)
+                }),
+            },
+        ];
+        let result = reap_tasks(&mut tasks, cleanup_deadline(Duration::from_secs(1))?).await;
+        assert!(matches!(
+            result,
+            Some(KrakenPublicSupervisorSetError::Supervisor {
+                channel: KrakenPublicChannel::Trades,
+                source: ProductionSupervisorError::SourceCleanupIncomplete,
+            })
+        ));
+        assert!(tasks.is_empty());
+        assert_eq!(cleanup_observed.try_recv(), Ok(()));
+        Ok(())
+    }
 }

@@ -13,8 +13,8 @@ use std::{
 };
 
 use market_squawk_adapter_bea::{
-    BeaDatasetContract, BeaDatasetIdentity, BeaError, BeaParameterIdentity, BeaParseLimits,
-    BeaSource, BeaSourceConfig, BeaSourceError, BeaUserId,
+    BeaDatasetContract, BeaDatasetIdentity, BeaDoctorRefreshDisposition, BeaError,
+    BeaParameterIdentity, BeaParseLimits, BeaSource, BeaSourceConfig, BeaSourceError, BeaUserId,
 };
 use market_squawk_data::{
     AnalyticalMacroSeriesAllowlist, ProviderMacroPlanRestartSelector, QueryError, QueryLimits,
@@ -24,31 +24,29 @@ use market_squawk_services::RequestContext;
 use market_squawk_sources::{AuthorizationMode, SourceMetadata};
 use tokio_util::sync::CancellationToken;
 
-use super::{ProviderAdapterActivation, provider_research_rights, runtime_generation};
+use super::{
+    BeaAdapterActivation, ProviderAdapterActivation, provider_research_rights, runtime_generation,
+};
 use crate::application::{
     BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaLivePublicationError, BeaMacroApplicationError,
-    BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
+    BeaMacroCapabilityState, BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
     BeaRegionalLiveComposition, BeaRegionalLiveOutcome, BeaRegionalLiveRequest,
-    BeaRegionalLiveRuntime, ResearchIngestCompositionError, ResearchProviderRuntimeGeneration,
+    BeaRegionalLiveRuntime, BeaRegisteredSource, ResearchIngestCompositionError,
+    ResearchProviderRuntimeGeneration, ResearchProviderRuntimeReplacement, ResearchRightsAuthority,
 };
 use crate::{ProviderActivationLease, ProviderOnboardingError};
 
-pub(super) const BEA_SURFACE: &str = "bea.api-data";
+pub(crate) const BEA_SURFACE: &str = "bea.api-data";
 
 const REGIONAL_DATASET: &str = "Regional";
-const BEA_SOURCE_ID: &str = "us-bea";
+pub(crate) const BEA_SOURCE_ID: &str = "us-bea";
 const REGIONAL_TABLE: &str = "SAINC1";
-const REGIONAL_LINE_CODE: &str = "3";
-const REGIONAL_GEO_FIPS: &str = "DE";
+const REGIONAL_PERSONAL_INCOME_LINE_CODE: &str = "1";
+const REGIONAL_POPULATION_LINE_CODE: &str = "2";
+const REGIONAL_PER_CAPITA_INCOME_LINE_CODE: &str = "3";
+const REGIONAL_GEO_FIPS: &str = "STATE";
 const REGIONAL_YEAR_SCOPE: &str = "LAST5";
 const BEA_ANNUAL_PERIOD_SCHEME: &str = "bea-annual";
-
-// `GeoFips=DE` returns Delaware state and its regional descendants. The immutable publication
-// retains that complete bounded provider response. This identifier selects only the state row
-// (`GeoFips=10000`) for the fixed product read. It is the adapter's period-independent canonical
-// identity for Regional / SAINC1 / CAINC1-3 / Delaware under canonical-series schema v1.
-const DELAWARE_PER_CAPITA_INCOME_SERIES: &str =
-    "bea-series:2de222290053ee1046f475d708a1b0d617d7d6011f880b47ac5cb7bdeb455790";
 
 const MAXIMUM_PROVIDER_ROWS: u32 = 4_096;
 const MAXIMUM_CANONICAL_BYTES: u64 = 16 * 1_024 * 1_024;
@@ -66,14 +64,16 @@ const QUERY_DURATION: Duration = Duration::from_secs(10);
 /// Closed lifecycle state for the fixed BEA Regional research product.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BeaProductAvailability {
-    /// The code-owned product is selected but no protected runtime is retained.
-    Desired,
-    /// The exact protected runtime is current and can perform its first bounded publication.
+    /// Credentials or a saved selection may exist, but activation/proof must be resumed.
+    ProbeRequired,
+    /// The exact protected runtime is current, but no durable product proof has completed yet.
     Configured,
+    /// The current product has completed immutable restart and typed-read proof.
+    Available,
+    /// A proven product remains callable with explicitly reduced current capability.
+    Degraded,
     /// The retained runtime no longer matches onboarding or shared runtime authority.
     Unavailable,
-    /// At least one exact immutable generation completed restart verification and a typed PIT read.
-    Ready,
 }
 
 /// Closed reason a previously configured BEA product is unavailable.
@@ -124,7 +124,10 @@ impl BeaConfiguredEvidence {
 pub(crate) struct BeaReadyEvidence {
     configured: BeaConfiguredEvidence,
     restart_selector: ProviderMacroPlanRestartSelector,
-    selection_digest: EvidenceDigest,
+    doctor_refresh: BeaDoctorRefreshDisposition,
+    published_series: usize,
+    series_allowlists: Vec<AnalyticalMacroSeriesAllowlist>,
+    selection_digests: Vec<EvidenceDigest>,
     selected_observations: usize,
 }
 
@@ -137,8 +140,20 @@ impl BeaReadyEvidence {
         &self.restart_selector
     }
 
-    pub(crate) const fn selection_digest(&self) -> EvidenceDigest {
-        self.selection_digest
+    pub(crate) fn series_allowlists(&self) -> &[AnalyticalMacroSeriesAllowlist] {
+        &self.series_allowlists
+    }
+
+    pub(crate) const fn doctor_refresh(&self) -> BeaDoctorRefreshDisposition {
+        self.doctor_refresh
+    }
+
+    pub(crate) const fn published_series(&self) -> usize {
+        self.published_series
+    }
+
+    pub(crate) fn selection_digests(&self) -> &[EvidenceDigest] {
+        &self.selection_digests
     }
 
     pub(crate) const fn selected_observations(&self) -> usize {
@@ -158,9 +173,9 @@ pub(crate) struct BeaProductStatus {
 }
 
 impl BeaProductStatus {
-    fn desired() -> Self {
+    fn probe_required() -> Self {
         Self {
-            availability: BeaProductAvailability::Desired,
+            availability: BeaProductAvailability::ProbeRequired,
             operation: BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION,
             configured: None,
             ready: None,
@@ -272,6 +287,7 @@ impl BeaRegionalRestartRead {
     /// contacting BEA. The shared reader revalidates the selector against the immutable catalog.
     pub(crate) fn try_new(
         restart_selector: ProviderMacroPlanRestartSelector,
+        series_allowlist: AnalyticalMacroSeriesAllowlist,
         knowledge_cutoff: Timestamp,
         effective_period_cutoff: ResearchPeriod,
         deadline: Instant,
@@ -288,7 +304,7 @@ impl BeaRegionalRestartRead {
         Ok(Self {
             request: BeaProviderPeriodLatestKnownRequest::try_new(
                 restart_selector,
-                fixed_series_allowlist()?,
+                series_allowlist,
                 knowledge_cutoff,
                 effective_period_cutoff,
             )?,
@@ -430,7 +446,7 @@ impl BeaProductActivation {
         };
         BeaProductStatus {
             availability: if ready.is_some() {
-                BeaProductAvailability::Ready
+                BeaProductAvailability::Available
             } else {
                 availability
             },
@@ -461,30 +477,48 @@ impl BeaProductActivation {
             seal_deadline,
             NonZeroU32::new(MAXIMUM_PROVIDER_ROWS).ok_or(BeaProductError::InvalidOperation)?,
             NonZeroU64::new(MAXIMUM_CANONICAL_BYTES).ok_or(BeaProductError::InvalidOperation)?,
-            fixed_series_allowlist()?,
             knowledge_cutoff,
             effective_period_cutoff,
             fixed_query_limits()?,
             query_deadline,
         );
         let outcome = self.runtime.publish_and_read(live_request, context).await?;
-        let restart_selector = outcome.read().restart_selector().clone();
-        let output = outcome.read().output();
+        let restart_selector = outcome.publication().restart_selector();
         if outcome.source_binding_digest() != self.configured.source_binding_digest
             || outcome.publication_digest() != restart_selector.publication_digest()
             || restart_selector.source_id() != &self.configured.source_id
             || restart_selector.source_generation_digest() != self.configured.source_binding_digest
-            || output.source_id() != &self.configured.source_id
-            || output.period_scheme().as_str() != BEA_ANNUAL_PERIOD_SCHEME
-            || output.observations().is_empty()
+            || outcome.reads().is_empty()
+            || outcome.reads().len() != outcome.series_allowlists().len()
         {
+            return Err(BeaProductError::InvalidReadResult);
+        }
+        let mut selected_observations = 0_usize;
+        let mut selection_digests = Vec::new();
+        for read in outcome.reads() {
+            let output = read.output();
+            if read.restart_selector() != &restart_selector
+                || output.source_id() != &self.configured.source_id
+                || output.period_scheme().as_str() != BEA_ANNUAL_PERIOD_SCHEME
+            {
+                return Err(BeaProductError::InvalidReadResult);
+            }
+            selected_observations = selected_observations
+                .checked_add(output.observations().len())
+                .ok_or(BeaProductError::InvalidReadResult)?;
+            selection_digests.push(output.selection_digest());
+        }
+        if selected_observations == 0 {
             return Err(BeaProductError::InvalidReadResult);
         }
         let ready = BeaReadyEvidence {
             configured: self.configured.clone(),
             restart_selector,
-            selection_digest: output.selection_digest(),
-            selected_observations: output.observations().len(),
+            doctor_refresh: outcome.doctor_refresh(),
+            published_series: outcome.published_series(),
+            series_allowlists: outcome.series_allowlists().to_vec(),
+            selection_digests,
+            selected_observations,
         };
         *self
             .ready
@@ -499,30 +533,16 @@ impl ProviderAdapterActivation {
     pub(crate) async fn prepare_bea_regional(
         &self,
         lease: ProviderActivationLease,
-        metadata: SourceMetadata,
+        spec: BeaAdapterActivation,
         cancellation: CancellationToken,
     ) -> Result<Arc<BeaProductActivation>, BeaProductError> {
-        if cancellation.is_cancelled()
-            || lease.surface_id().as_str() != BEA_SURFACE
-            || lease.generation().is_none()
-            || lease.secret_reference().is_none()
-            || metadata.source_id().as_str() != BEA_SOURCE_ID
-            || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
-        {
-            return Err(BeaProductError::InvalidOperation);
-        }
-        let rights = provider_research_rights(&lease, metadata.source_id())
-            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
-        let generation = runtime_generation(&lease, metadata.clone(), rights.clone())
-            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
-        self.bind_authorization_subject(&metadata)
-            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        let (rights, generation) = self.bea_regional_authority(&lease, &spec, &cancellation)?;
         if let Some(current) = self
             .bea
             .read()
             .map_err(|_| BeaProductError::Unavailable)?
             .as_ref()
-            .filter(|current| current.matches(&lease, &metadata))
+            .filter(|current| current.matches(&lease, &spec.metadata))
             .cloned()
             && matches!(
                 self.research
@@ -532,38 +552,9 @@ impl ProviderAdapterActivation {
         {
             return Ok(current);
         }
-
-        let secret = self
-            .onboarding
-            .read_secret_for_activation_request(&lease, cancellation)
+        let (activation, registered_source) = self
+            .build_bea_regional_candidate(lease.clone(), spec, generation.clone(), cancellation)
             .await?;
-        let user_id = BeaUserId::try_new(secret.expose_secret().to_owned())?;
-        let generation_digest = generation.generation_digest()?;
-        let contract = fixed_regional_contract()?;
-        let provider_dataset = contract.dataset_id().clone();
-        let config = BeaSourceConfig::try_new(vec![contract], fixed_parse_limits()?)?;
-        let source = BeaSource::try_new(metadata.clone(), user_id, config, generation_digest)?;
-        let configured = BeaConfiguredEvidence {
-            source_id: metadata.source_id().clone(),
-            provider_dataset,
-            runtime_generation_digest: generation_digest,
-            source_binding_digest: source.source_binding().binding_digest(),
-            quota_declaration_digest: source.quota_declaration().declaration_digest(),
-        };
-        let composition = BeaRegionalLiveComposition::try_new(
-            Arc::clone(&self.research),
-            source,
-            generation.clone(),
-        )?;
-        let (registered_source, runtime) = composition.into_parts();
-        let activation = Arc::new(BeaProductActivation {
-            lease: lease.clone(),
-            metadata,
-            generation: generation.clone(),
-            runtime,
-            configured,
-            ready: RwLock::new(None),
-        });
 
         let onboarding = self.onboarding.try_acquire_runtime_mutation_authority()?;
         onboarding.require_active(&lease)?;
@@ -580,10 +571,137 @@ impl ProviderAdapterActivation {
             }
             return Err(BeaProductError::Unavailable);
         }
-        self.research_mutation
-            .register_provider_source(generation, registered_source, rights)?;
+        self.research_mutation.register_bea_provider_source(
+            generation,
+            registered_source,
+            rights,
+        )?;
         *retained = Some(Arc::clone(&activation));
         Ok(activation)
+    }
+
+    /// Constructs a non-callable replacement candidate while the exact predecessor remains owned
+    /// by the serialized research runtime transaction.
+    pub(super) async fn prepare_bea_regional_replacement(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BeaAdapterActivation,
+        expected: ResearchProviderRuntimeGeneration,
+        candidate: ResearchProviderRuntimeGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<
+        (
+            ResearchProviderRuntimeReplacement,
+            Arc<BeaProductActivation>,
+        ),
+        BeaProductError,
+    > {
+        let (rights, derived_candidate) =
+            self.bea_regional_authority(&lease, &spec, &cancellation)?;
+        if candidate != derived_candidate || expected.profile() != candidate.profile() {
+            return Err(BeaProductError::AuthorityUnavailable);
+        }
+        if !self
+            .bea
+            .read()
+            .map_err(|_| BeaProductError::Unavailable)?
+            .as_ref()
+            .is_some_and(|current| current.generation() == &expected)
+        {
+            return Err(BeaProductError::Unavailable);
+        }
+        let (activation, registered_source) = self
+            .build_bea_regional_candidate(lease.clone(), spec, candidate.clone(), cancellation)
+            .await?;
+        self.require_runtime_replacement_authority(&lease, &expected)
+            .await
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        let replacement = self.research_mutation.prepare_bea_provider_replacement(
+            expected,
+            candidate,
+            registered_source,
+            rights,
+        )?;
+        Ok((replacement, activation))
+    }
+
+    fn bea_regional_authority(
+        &self,
+        lease: &ProviderActivationLease,
+        spec: &BeaAdapterActivation,
+        cancellation: &CancellationToken,
+    ) -> Result<(ResearchRightsAuthority, ResearchProviderRuntimeGeneration), BeaProductError> {
+        if cancellation.is_cancelled() {
+            return Err(BeaProductError::Cancelled);
+        }
+        if lease.surface_id().as_str() != BEA_SURFACE
+            || lease.generation().is_none()
+            || lease.secret_reference().is_none()
+            || spec.metadata.source_id().as_str() != BEA_SOURCE_ID
+            || spec.metadata.authorization().mode() != AuthorizationMode::UserAuthorized
+        {
+            return Err(BeaProductError::InvalidOperation);
+        }
+        if fixed_regional_source_config()?
+            .contracts()
+            .iter()
+            .all(|contract| contract.dataset_id() != spec.provider_dataset_identifier())
+        {
+            return Err(BeaProductError::InvalidOperation);
+        }
+        let rights = provider_research_rights(lease, spec.metadata.source_id())
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        let generation = runtime_generation(lease, spec.metadata.clone(), rights.clone())
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        self.bind_authorization_subject(&spec.metadata)
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        Ok((rights, generation))
+    }
+
+    async fn build_bea_regional_candidate(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BeaAdapterActivation,
+        generation: ResearchProviderRuntimeGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<(Arc<BeaProductActivation>, BeaRegisteredSource), BeaProductError> {
+        let provider_dataset = spec.provider_dataset_identifier().clone();
+        let secret = self
+            .onboarding
+            .read_secret_for_activation_request(&lease, cancellation)
+            .await?;
+        let user_id = BeaUserId::try_new(secret.expose_secret().to_owned())?;
+        let generation_digest = generation.generation_digest()?;
+        let source = BeaSource::try_new(
+            spec.metadata.clone(),
+            user_id,
+            selected_regional_source_config(&provider_dataset)?,
+            generation_digest,
+        )?;
+        let configured = BeaConfiguredEvidence {
+            source_id: spec.metadata.source_id().clone(),
+            provider_dataset,
+            runtime_generation_digest: generation_digest,
+            source_binding_digest: source.source_binding().binding_digest(),
+            quota_declaration_digest: source.quota_declaration().declaration_digest(),
+        };
+        let composition = BeaRegionalLiveComposition::try_new(
+            Arc::clone(&self.research),
+            source,
+            generation.clone(),
+        )?;
+        let (registered_source, runtime) = composition.into_parts();
+        Ok((
+            Arc::new(BeaProductActivation {
+                lease,
+                metadata: spec.metadata,
+                generation,
+                runtime,
+                configured,
+                ready: RwLock::new(None),
+            }),
+            registered_source,
+        ))
     }
 
     /// Returns only exact current BEA product state and non-secret durable evidence.
@@ -598,7 +716,7 @@ impl ProviderAdapterActivation {
             }
         };
         let Some(activation) = activation else {
-            return BeaProductStatus::desired();
+            return BeaProductStatus::probe_required();
         };
         match self
             .onboarding
@@ -626,7 +744,7 @@ impl ProviderAdapterActivation {
         }
     }
 
-    /// Executes the only live BEA product operation after revalidating its protected lease.
+    /// Executes the selected BEA Regional product operation after revalidating its protected lease.
     pub(crate) async fn execute_bea_regional(
         &self,
         request: BeaRegionalProductRequest,
@@ -651,13 +769,35 @@ impl ProviderAdapterActivation {
         drop(onboarding);
         activation.publish_and_read(request, context).await
     }
+
+    /// Reopens one caller-pinned immutable BEA generation without loading a credential or making
+    /// a provider request. This is the process-restart read path for Desktop, CLI, and MCP
+    /// composition once those shared surfaces register the fixed operation.
+    pub(crate) async fn read_bea_regional_restart(
+        &self,
+        request: BeaRegionalRestartRead,
+        cancellation: CancellationToken,
+    ) -> Result<BeaRegionalRestartOutput, BeaProductError> {
+        let (request, limits, deadline, completion) = request.into_parts();
+        let state = self
+            .research
+            .read_bea_provider_period_latest_known(request, limits, deadline, cancellation)
+            .await?;
+        let read = match state {
+            BeaMacroCapabilityState::Available(read) => read,
+            BeaMacroCapabilityState::SetupRequired(_) | BeaMacroCapabilityState::Unavailable(_) => {
+                return Err(BeaProductError::InvalidReadResult);
+            }
+        };
+        completion.complete(read)
+    }
 }
 
-fn fixed_regional_contract() -> Result<BeaDatasetContract, BeaProductError> {
+fn regional_state_income_contract(line_code: &str) -> Result<BeaDatasetContract, BeaProductError> {
     let mut parameters = BTreeMap::new();
     for (name, value) in [
         ("GeoFips", REGIONAL_GEO_FIPS),
-        ("LineCode", REGIONAL_LINE_CODE),
+        ("LineCode", line_code),
         ("TableName", REGIONAL_TABLE),
         ("Year", REGIONAL_YEAR_SCOPE),
     ] {
@@ -670,6 +810,37 @@ fn fixed_regional_contract() -> Result<BeaDatasetContract, BeaProductError> {
     )?)
 }
 
+/// Returns the bounded Settings-selectable BEA Regional state-income universe.
+///
+/// Each exact table/line/geography/period contract is metadata-admitted before `GetData`. This is
+/// intentionally a selected Regional profile, not a claim that every BEA dataset is supported.
+pub(crate) fn fixed_regional_source_config() -> Result<BeaSourceConfig, BeaProductError> {
+    let mut contracts = Vec::new();
+    for line_code in [
+        REGIONAL_PERSONAL_INCOME_LINE_CODE,
+        REGIONAL_POPULATION_LINE_CODE,
+        REGIONAL_PER_CAPITA_INCOME_LINE_CODE,
+    ] {
+        contracts.push(regional_state_income_contract(line_code)?);
+    }
+    Ok(BeaSourceConfig::try_new(contracts, fixed_parse_limits()?)?)
+}
+
+pub(crate) fn selected_regional_source_config(
+    provider_dataset: &SourceIdentifier,
+) -> Result<BeaSourceConfig, BeaProductError> {
+    let contract = fixed_regional_source_config()?
+        .contracts()
+        .iter()
+        .find(|contract| contract.dataset_id() == provider_dataset)
+        .cloned()
+        .ok_or(BeaProductError::InvalidOperation)?;
+    Ok(BeaSourceConfig::try_new(
+        vec![contract],
+        fixed_parse_limits()?,
+    )?)
+}
+
 fn fixed_parse_limits() -> Result<BeaParseLimits, BeaProductError> {
     Ok(BeaParseLimits::try_new(
         usize::try_from(MAXIMUM_PROVIDER_ROWS).map_err(|_| BeaProductError::InvalidOperation)?,
@@ -679,12 +850,6 @@ fn fixed_parse_limits() -> Result<BeaParseLimits, BeaProductError> {
         MAXIMUM_DIMENSIONS,
         MAXIMUM_NOTES,
     )?)
-}
-
-fn fixed_series_allowlist() -> Result<AnalyticalMacroSeriesAllowlist, BeaProductError> {
-    Ok(AnalyticalMacroSeriesAllowlist::try_from_code_owned(&[
-        DELAWARE_PER_CAPITA_INCOME_SERIES,
-    ])?)
 }
 
 fn fixed_query_limits() -> Result<QueryLimits, BeaProductError> {
@@ -701,7 +866,9 @@ fn fixed_query_limits() -> Result<QueryLimits, BeaProductError> {
 
 /// Closed BEA product failure. Provider credential material is absent from every variant.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BeaProductError {
+pub enum BeaProductError {
+    #[error("BEA activation was cancelled")]
+    Cancelled,
     #[error("BEA Regional setup is required")]
     SetupRequired,
     #[error("the exact BEA Regional runtime is unavailable")]
@@ -726,4 +893,47 @@ pub(crate) enum BeaProductError {
     Query(#[from] QueryError),
     #[error(transparent)]
     Onboarding(#[from] ProviderOnboardingError),
+}
+
+impl BeaProductError {
+    pub(crate) fn into_portal_error(self) -> crate::ProviderPortalActivationError {
+        use crate::ProviderPortalActivationError;
+        use market_squawk_services::ServiceError;
+
+        let error = match self {
+            Self::Cancelled | Self::Onboarding(ProviderOnboardingError::OperationCancelled) => {
+                ServiceError::Cancelled
+            }
+            Self::Onboarding(ProviderOnboardingError::ProbeDeadlineExceeded) => {
+                ServiceError::DeadlineExceeded
+            }
+            Self::Onboarding(ProviderOnboardingError::Clock)
+            | Self::Composition(ResearchIngestCompositionError::TrustedTimeUnavailable) => {
+                ServiceError::Internal
+            }
+            Self::Source(error) => BeaMacroApplicationError::Adapter(error).into_service_error(),
+            Self::Adapter(error) => {
+                BeaMacroApplicationError::Adapter(error.into()).into_service_error()
+            }
+            Self::Live(error) => error.into_service_error(),
+            Self::Application(error) => error.into_service_error(),
+            Self::Query(error) => BeaMacroApplicationError::AnalyticalRead(
+                market_squawk_data::AnalyticalReadError::Query(error),
+            )
+            .into_service_error(),
+            Self::InvalidOperation => return ProviderPortalActivationError::InvalidRequest,
+            Self::SetupRequired
+            | Self::Unavailable
+            | Self::AuthorityUnavailable
+            | Self::InvalidReadResult
+            | Self::Composition(_)
+            | Self::Onboarding(_) => return ProviderPortalActivationError::Unavailable,
+        };
+        match error {
+            ServiceError::Cancelled => ProviderPortalActivationError::Cancelled,
+            ServiceError::DeadlineExceeded => ProviderPortalActivationError::DeadlineExceeded,
+            ServiceError::Internal => ProviderPortalActivationError::Internal,
+            _ => ProviderPortalActivationError::Unavailable,
+        }
+    }
 }

@@ -1,7 +1,7 @@
 # Security and Trust Boundaries
 
 Market Squawk is self-hosted, but local does not mean trusted. Provider responses, imported files,
-model artifacts, desktop/CLI/MCP requests, browser-originated onboarding requests, persisted state,
+model artifacts, desktop/CLI/MCP requests, provider OAuth callbacks, persisted state,
 and execution intent all cross explicit validation or authority boundaries before they can affect
 durable state or an order adapter.
 
@@ -41,7 +41,7 @@ It does not claim:
 - that an ordinary local process can defend against a fully compromised operating-system account,
   kernel, compiler, or hardware;
 - that a digest alone establishes who authored content;
-- that loopback binding replaces host/origin/session/CSRF and request-bound checks;
+- that loopback binding replaces authentication, host/origin, and request-bound checks;
 - that an archived `DirectVerified` value is a bearer credential; or
 - that a fair-value classification, market-depth level, or healthy connection grants execution
   authority.
@@ -89,7 +89,6 @@ flowchart LR
         Desktop["Bundled WebView and closed Tauri bridge"]
         CLI["CLI transport"]
         MCP["Named MCP stdio relay and<br/>authenticated loopback MCP route"]
-        Portal["Ephemeral IPv4 loopback onboarding portal"]
         Parser["Source decoders and extraction parsers"]
         ModelAdmission["Controlled model and runtime admission"]
     end
@@ -121,7 +120,6 @@ flowchart LR
     Operator -->|typed arguments| CLI
     DesktopUser -->|local interaction| Desktop
     Client -->|bounded stdio frame and named credential| MCP
-    Operator -->|host, origin, session, CSRF, bounded body| Portal
     Providers -->|untrusted bounded bytes| Parser
     Files -->|untrusted bounded bytes| Parser
     Files -->|untrusted bundle/runtime bytes| ModelAdmission
@@ -130,8 +128,6 @@ flowchart LR
     Desktop -->|confirmed provider workflow| Onboarding
     Desktop -->|confirmed provider workflow| Activation
     MCP -->|authenticated bounded operation| App
-    Portal -->|session and credential request| Onboarding
-    Portal -->|verified activation request| Activation
     Onboarding -->|generation-bound credential operation| Secrets
     Activation -->|provider-specific activation| Source
     Parser -->|validated candidate plus evidence| Source
@@ -193,7 +189,7 @@ Credential material is not ordinary configuration:
 - Creation, read, replacement, and deletion use exact generations. Replacement does not silently
   erase the current generation before the candidate is known.
 - The reviewed `LocalProduct` composes the operating-system keyring first and a code-owned,
-  initially locked encrypted-file fallback. Only an explicit foreground loopback-portal operation
+  initially locked encrypted-file fallback. Only an explicit foreground native Settings operation
   can submit the fallback unlock; configuration, environment, command arguments, disk, and
   background restart cannot.
 - A new secret can use the unlocked fallback only after the primary backend proves unavailable or
@@ -206,10 +202,14 @@ Credential material is not ordinary configuration:
   when cancellation or expiry is observed, the result is `IndeterminateCompletion`, not a false
   rollback claim.
 
-The onboarding portal binds only an ephemeral IPv4 loopback port. It additionally validates host
-and origin, uses independently generated session and CSRF tokens, limits lifetime, connections,
-requests, body sizes, and request duration, and cancels in-flight work on shutdown. Loopback is one
-control, not the sole control.
+Native onboarding requires the exact installed Desktop client and current workspace before the
+existing service can touch session, credential, or activation authority. Selected credential-file
+input is identity-checked and staged by the native picker; file values never enter the WebView.
+Private staged activation separately admits only the exact installed CLI client and four closed
+secret-free action classes. Ordinary MCP mutation access cannot inherit either authority.
+
+There is no local setup website. Provider OAuth retains its bounded callback transport only for
+its actual authorization protocol; callback traffic cannot invoke generic setup or secret import.
 
 ## Source and parser authority
 
@@ -300,10 +300,11 @@ operation is defined by a closed descriptor and admitted before dispatch to a do
 Services own their financial, persistence, and authority invariants; presentations own rendering,
 framing, and their stricter local limits.
 
-The desktop loads bundled assets under a strict CSP. Its window capability grants five closed
-commands: bootstrap, read-only application invocation, confirmed provider onboarding, exact
-official-provider page opening, and validated protected-setup opening. Credential fields remain
-write-only presentation state and are cleared after submission.
+The desktop loads bundled assets under a strict CSP. Its window capability grants closed
+presentation commands for typed reads and confirmed actions, including native provider onboarding
+and explicit official-provider page opening. Credential fields remain write-only presentation
+state and are cleared after submission. Saved credentials are resolved only by the installed owner
+and are never returned to the Desktop.
 
 The production MCP route:
 

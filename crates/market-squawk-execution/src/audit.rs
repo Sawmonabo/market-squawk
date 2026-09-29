@@ -4,10 +4,10 @@ use std::mem::size_of;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
+use crate::virtual_paper::ExecutionAuthority;
 use market_squawk_domain::{
     AccountId, ApprovalId, InstrumentId, ModelId, OrderId, StrategyId, Timestamp,
 };
-use market_squawk_live::ConsumedLiveAuthority;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -97,14 +97,14 @@ pub(crate) struct ExecutionAuditContext {
 /// Cohesive optional evidence captured while risk constructs one audit context.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExecutionAuditEvidence<'evidence> {
-    authority: Option<&'evidence ConsumedLiveAuthority>,
+    authority: Option<&'evidence ExecutionAuthority>,
     execution_price_bound: Option<ExecutionPriceBound>,
     portfolio: Option<&'evidence crate::PortfolioRiskBinding>,
 }
 
 impl<'evidence> ExecutionAuditEvidence<'evidence> {
     pub(crate) const fn new(
-        authority: Option<&'evidence ConsumedLiveAuthority>,
+        authority: Option<&'evidence ExecutionAuthority>,
         execution_price_bound: Option<ExecutionPriceBound>,
         portfolio: Option<&'evidence crate::PortfolioRiskBinding>,
     ) -> Self {

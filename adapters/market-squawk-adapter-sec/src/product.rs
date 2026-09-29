@@ -452,6 +452,24 @@ impl SecResearchDataset {
         ))
     }
 
+    pub(crate) fn checked_dynamic_retained_bytes(&self) -> Option<usize> {
+        let filing = match &self.filing_xbrl {
+            Some(value) => value.checked_dynamic_retained_bytes()?,
+            None => 0,
+        };
+        let taxonomy = match &self.xbrl_taxonomy {
+            Some(value) => value.checked_dynamic_retained_bytes()?,
+            None => 0,
+        };
+        self.cik
+            .capacity()
+            .checked_add(self.dataset.retained_bytes())?
+            .checked_add(self.initial_provider_locator.retained_bytes())?
+            .checked_add(self.source_object_id.retained_bytes())?
+            .checked_add(filing)?
+            .checked_add(taxonomy)
+    }
+
     /// Returns a storage-safe analytical identity for the exact filing-XBRL coordinate set.
     pub fn analytical_dataset_identifier(&self) -> Result<SourceIdentifier, SecClientError> {
         if self.kind != SecResearchDatasetKind::FilingXbrl {

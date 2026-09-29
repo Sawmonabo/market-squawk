@@ -134,7 +134,7 @@ impl JobRunner for UpdateJobRunner {
         self.inner.run(context).await
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         // Activation and rollback may cross process boundaries. Durable update journals remain
         // authoritative, while an orphaned job requires explicit reconciliation and re-admission.
         JobRecoveryDisposition::MarkInterrupted

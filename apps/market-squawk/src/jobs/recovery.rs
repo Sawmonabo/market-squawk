@@ -154,7 +154,7 @@ impl JobRunner for RecoveryJobRunner {
         self.inner.run(context).await
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         // Workspace generations and program selectors are reconciled from their own durable
         // journals. The job never replays an interrupted mutation from an in-memory approval.
         JobRecoveryDisposition::MarkInterrupted

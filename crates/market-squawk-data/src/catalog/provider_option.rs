@@ -1,14 +1,18 @@
 //! Durable value-only evidence for sealed provider option-market publications.
 
+use super::provider_capture::{ProviderMetadataCaptureEvidence, metadata};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, InstrumentId, Timestamp};
 use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchRawClaim};
 use market_squawk_sources::{
+    MAX_OPTION_REFERENCE_DEPENDENCIES, MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
     MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
     MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES, MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS,
     OptionMarketBatchDisposition, OptionMarketBatchKind, PROVIDER_OPTION_MARKET_SCHEMA_VERSION,
-    ProviderCaptureSetReceipt, SealedProviderOptionMarketBinding,
+    ProviderCaptureSetReceipt, ProviderOptionContractReferenceRow,
+    SealedProviderOptionMarketBinding,
 };
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -111,6 +115,40 @@ impl PersistedProviderOptionMarketNativeLineage {
     }
 }
 
+/// Persisted exact original-reference dependency of one option generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedOptionContractReferenceDependency {
+    metadata: ProviderMetadataCaptureEvidence,
+    rows: Vec<ProviderOptionContractReferenceRow>,
+}
+impl PersistedOptionContractReferenceDependency {
+    /// Returns the original reference capture, including the original observation cutoff.
+    pub const fn capture(&self) -> &ProviderCaptureSetReceipt {
+        &self.metadata.capture
+    }
+    /// Returns the exact physical original claim for controlled restart reopening.
+    pub const fn physical(
+        &self,
+    ) -> &super::provider_capture::PersistedProviderCapturePhysicalClaim {
+        &self.metadata.physical
+    }
+    /// Returns the digest of the retained original physical dependency.
+    pub const fn dependency_digest(&self) -> EvidenceDigest {
+        self.metadata.digest
+    }
+    /// Returns canonical term-to-original native row associations.
+    pub fn rows(&self) -> &[ProviderOptionContractReferenceRow] {
+        &self.rows
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OptionReferenceDependencyWire {
+    dependency_digest: String,
+    rows: Vec<ProviderOptionContractReferenceRow>,
+}
+
 /// Historical option publication evidence that cannot recreate live publication authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedProviderOptionMarketBindingEvidence {
@@ -137,9 +175,15 @@ pub struct PersistedProviderOptionMarketBindingEvidence {
     rows: Vec<PersistedProviderOptionMarketBindingRow>,
     raw_claim_digest: EvidenceDigest,
     physical_claim: SealedResearchJournalSegmentClaim,
+    reference_dependencies: Vec<PersistedOptionContractReferenceDependency>,
 }
 
 impl PersistedProviderOptionMarketBindingEvidence {
+    /// Returns original reference captures consumed atomically with this exact generation.
+    pub fn reference_dependencies(&self) -> &[PersistedOptionContractReferenceDependency] {
+        &self.reference_dependencies
+    }
+
     pub const fn binding_digest(&self) -> EvidenceDigest {
         self.binding_digest
     }
@@ -227,6 +271,7 @@ impl PersistedProviderOptionMarketBindingEvidence {
         {
             return Err(CatalogError::ProviderEventMismatch);
         }
+        validate_option_reference_closure(self)?;
         let expected_schema = option_schema_fingerprint();
         if self.canonical_schema_fingerprint != expected_schema
             || self.native_lineage.schema_version == 0
@@ -335,6 +380,16 @@ impl PreparedProviderOptionMarketBinding {
         }
         let content = batch.content_identity();
         let native_schema = native.schema();
+        let mut reference_dependencies = Vec::new();
+        reference_dependencies
+            .try_reserve_exact(binding.reference_dependencies().len())
+            .map_err(|_| CatalogError::Allocation)?;
+        for dependency in binding.reference_dependencies() {
+            reference_dependencies.push(PersistedOptionContractReferenceDependency {
+                metadata: ProviderMetadataCaptureEvidence::from_receipt(dependency.capture())?,
+                rows: dependency.rows().to_vec(),
+            });
+        }
         let evidence = PersistedProviderOptionMarketBindingEvidence {
             binding_digest: binding.evidence_digest().evidence(),
             capture: binding.persisted_receipt().capture().clone(),
@@ -368,6 +423,7 @@ impl PreparedProviderOptionMarketBinding {
             rows,
             raw_claim_digest: raw_claim_digest(claim_json.as_bytes()),
             physical_claim: claim,
+            reference_dependencies,
         };
         evidence.verify_integrity()?;
         Ok(Self { evidence })
@@ -427,6 +483,7 @@ pub(crate) fn retain_prepared_provider_option_market_binding(
     prepared: &PreparedProviderOptionMarketBinding,
     coordinate: ProviderArtifactInputCoordinate,
     recorded_at: Timestamp,
+    analytical_dataset: &market_squawk_domain::SourceIdentifier,
 ) -> Result<(), CatalogError> {
     let evidence = &prepared.evidence;
     evidence.verify_integrity()?;
@@ -444,6 +501,16 @@ pub(crate) fn retain_prepared_provider_option_market_binding(
         &evidence.physical_claim,
         recorded_at,
     )?;
+    super::provider_capture::original::validate_option_dependencies(
+        connection,
+        evidence,
+        recorded_at,
+        Some(analytical_dataset.as_str()),
+        false,
+    )?;
+    for dependency in &evidence.reference_dependencies {
+        metadata::retain(connection, &dependency.metadata, recorded_at)?;
+    }
     insert_option_binding(connection, evidence, recorded_at)?;
     let used: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM ingest_run_provider_publication_bindings
@@ -474,6 +541,7 @@ pub(crate) fn retain_prepared_provider_option_market_binding(
     if inserted != 1 {
         return Err(CatalogError::ProviderEventConflict);
     }
+    super::provider_capture::original::consume_option_dependencies(connection, evidence)?;
     append_audit(
         connection,
         "provider-option-market-publication.retained",
@@ -481,9 +549,8 @@ pub(crate) fn retain_prepared_provider_option_market_binding(
         evidence.binding_digest.bytes(),
         recorded_at,
     )?;
-    let retained =
-        load_provider_option_market_binding_evidence(connection, evidence.binding_digest)?
-            .ok_or(CatalogError::ProviderEventConflict)?;
+    let retained = load_provider_option_market_binding_value(connection, evidence.binding_digest)?
+        .ok_or(CatalogError::ProviderEventConflict)?;
     if retained != *evidence {
         return Err(CatalogError::ProviderEventConflict);
     }
@@ -503,9 +570,9 @@ fn insert_option_binding(
           completeness_json, completeness_digest, filter_json, filter_digest,
           underlying_instrument_id,
           available_at_ns, received_at_ns, ingested_at_ns, disposition, row_mapping_digest,
-          recorded_at_ns)
+          recorded_at_ns, reference_dependencies_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             evidence.binding_digest.bytes().as_slice(),
             OPTION_BINDING_FORMAT_VERSION,
@@ -532,6 +599,7 @@ fn insert_option_binding(
             disposition_name(evidence.disposition),
             evidence.row_mapping_digest.bytes().as_slice(),
             recorded_at.unix_nanos(),
+            encode_option_reference_closure(&evidence.reference_dependencies)?,
         ],
     )?;
     let native = &evidence.native_lineage;
@@ -578,6 +646,23 @@ fn insert_option_binding(
 }
 
 fn load_provider_option_market_binding_evidence(
+    connection: &Connection,
+    binding_digest: EvidenceDigest,
+) -> Result<Option<PersistedProviderOptionMarketBindingEvidence>, CatalogError> {
+    let value = load_provider_option_market_binding_value(connection, binding_digest)?;
+    if let Some(evidence) = &value {
+        super::provider_capture::original::validate_option_dependencies(
+            connection,
+            evidence,
+            evidence.ingested_at,
+            None,
+            true,
+        )?;
+    }
+    Ok(value)
+}
+
+fn load_provider_option_market_binding_value(
     connection: &Connection,
     binding_digest: EvidenceDigest,
 ) -> Result<Option<PersistedProviderOptionMarketBindingEvidence>, CatalogError> {
@@ -792,6 +877,20 @@ fn load_provider_option_market_binding_evidence(
             source_sequence: parse_source_sequence(source_sequence),
         });
     }
+    let reference_json: Option<String> = connection.query_row(
+        "SELECT CASE WHEN length(CAST(reference_dependencies_json AS BLOB))<=?2
+         THEN reference_dependencies_json ELSE NULL END FROM provider_option_market_bindings
+         WHERE option_binding_digest=?1",
+        params![
+            binding_digest.bytes(),
+            MAX_OPTION_REFERENCE_DEPENDENCY_BYTES as i64
+        ],
+        |row| row.get(0),
+    )?;
+    let reference_dependencies = decode_option_reference_closure(
+        connection,
+        &reference_json.ok_or(CatalogError::ResultByteLimitExceeded)?,
+    )?;
     let underlying_uuid =
         uuid::Uuid::from_slice(&underlying).map_err(|_| CatalogError::CorruptCatalog)?;
     let evidence = PersistedProviderOptionMarketBindingEvidence {
@@ -829,9 +928,129 @@ fn load_provider_option_market_binding_evidence(
         rows,
         raw_claim_digest: parse_digest(1, &raw_claim_digest_bytes)?,
         physical_claim,
+        reference_dependencies,
     };
     evidence.verify_integrity()?;
     Ok(Some(evidence))
+}
+
+fn encode_option_reference_closure(
+    dependencies: &[PersistedOptionContractReferenceDependency],
+) -> Result<String, CatalogError> {
+    if dependencies.len() > MAX_OPTION_REFERENCE_DEPENDENCIES {
+        return Err(CatalogError::ResultByteLimitExceeded);
+    }
+    let wire: Vec<_> = dependencies
+        .iter()
+        .map(|dependency| OptionReferenceDependencyWire {
+            dependency_digest: lower_hex(dependency.metadata.digest.bytes()),
+            rows: dependency.rows.clone(),
+        })
+        .collect();
+    let json = serde_json::to_string(&wire)?;
+    if json.len() > MAX_OPTION_REFERENCE_DEPENDENCY_BYTES {
+        return Err(CatalogError::ResultByteLimitExceeded);
+    }
+    Ok(json)
+}
+fn decode_option_reference_closure(
+    connection: &Connection,
+    json: &str,
+) -> Result<Vec<PersistedOptionContractReferenceDependency>, CatalogError> {
+    if json.len() > MAX_OPTION_REFERENCE_DEPENDENCY_BYTES {
+        return Err(CatalogError::ResultByteLimitExceeded);
+    }
+    let wire: Vec<OptionReferenceDependencyWire> = serde_json::from_str(json)?;
+    if wire.len() > MAX_OPTION_REFERENCE_DEPENDENCIES {
+        return Err(CatalogError::ResultByteLimitExceeded);
+    }
+    let mut dependencies = Vec::new();
+    dependencies
+        .try_reserve_exact(wire.len())
+        .map_err(|_| CatalogError::Allocation)?;
+    for entry in wire {
+        if entry.dependency_digest.len() != 64
+            || !entry
+                .dependency_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, value) in bytes.iter_mut().enumerate() {
+            *value = u8::from_str_radix(&entry.dependency_digest[index * 2..index * 2 + 2], 16)
+                .map_err(|_| CatalogError::CorruptCatalog)?;
+        }
+        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, bytes);
+        dependencies.push(PersistedOptionContractReferenceDependency {
+            metadata: metadata::load(connection, digest)?.ok_or(CatalogError::CorruptCatalog)?,
+            rows: entry.rows,
+        });
+    }
+    Ok(dependencies)
+}
+fn validate_option_reference_closure(
+    evidence: &PersistedProviderOptionMarketBindingEvidence,
+) -> Result<(), CatalogError> {
+    if evidence.reference_dependencies.len() > MAX_OPTION_REFERENCE_DEPENDENCIES
+        || (evidence.native_lineage.implementation == "alpaca_indicative_options_v1"
+            && evidence.reference_dependencies.is_empty())
+    {
+        return Err(CatalogError::ProviderCaptureMismatch);
+    }
+    if evidence.reference_dependencies.is_empty() {
+        return Ok(());
+    }
+    if evidence.publication_kind != OptionMarketBatchKind::Snapshots {
+        return Err(CatalogError::ProviderCaptureMismatch);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut captures = std::collections::BTreeSet::new();
+    let mut previous_at = None;
+    for dependency in &evidence.reference_dependencies {
+        dependency.metadata.validate()?;
+        let capture = &dependency.metadata.capture;
+        let at = capture.pages()[0].received_at();
+        if capture.pages().len() != 1
+            || dependency.rows.len() > 1_000
+            || capture.terminal()
+                != market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse
+            || capture.source_id() != evidence.capture.source_id()
+            || capture.metadata_revision() != evidence.capture.metadata_revision()
+            || at > evidence.capture.pages()[0].received_at()
+            || previous_at.is_some_and(|previous| previous > at)
+            || !captures.insert(capture.observation_digest().bytes())
+        {
+            return Err(CatalogError::ProviderCaptureMismatch);
+        }
+        previous_at = Some(at);
+        let mut native = std::collections::BTreeSet::new();
+        for row in &dependency.rows {
+            if row.source_row_ordinal() >= 1_000
+                || row.canonical_row_ordinal() as usize >= evidence.canonical_row_count
+                || !seen.insert(row.canonical_row_ordinal())
+                || !native.insert(row.source_row_ordinal())
+                || row.terms_digest().algorithm() != DigestAlgorithm::Sha256
+                || row.terms_digest().bytes() == [0; 32]
+            {
+                return Err(CatalogError::ProviderCaptureMismatch);
+            }
+        }
+    }
+    if seen.len() != evidence.canonical_row_count {
+        return Err(CatalogError::ProviderCaptureMismatch);
+    }
+    encode_option_reference_closure(&evidence.reference_dependencies)?;
+    Ok(())
+}
+fn lower_hex(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(&mut value, "{byte:02x}");
+    }
+    value
 }
 
 fn option_native_digest(
@@ -889,6 +1108,23 @@ fn option_binding_digest(
             None => digest.update([0]),
         }
     }
+    hash_length(&mut digest, evidence.reference_dependencies.len())?;
+    for dependency in &evidence.reference_dependencies {
+        hash_digest(
+            &mut digest,
+            dependency.metadata.physical.sealed_capture_receipt_digest(),
+        );
+        hash_digest(
+            &mut digest,
+            dependency.metadata.capture.observation_digest(),
+        );
+        hash_length(&mut digest, dependency.rows.len())?;
+        for row in &dependency.rows {
+            digest.update(row.canonical_row_ordinal().to_be_bytes());
+            digest.update(row.source_row_ordinal().to_be_bytes());
+            hash_digest(&mut digest, row.terms_digest());
+        }
+    }
     Ok(finalize(digest))
 }
 
@@ -921,6 +1157,7 @@ fn option_schema_fingerprint() -> EvidenceDigest {
     let mut digest = Sha256::new();
     digest.update(OPTION_MARKET_SCHEMA_DOMAIN);
     digest.update(PROVIDER_OPTION_MARKET_SCHEMA_VERSION.to_be_bytes());
+    digest.update(b"native-option-contract-count-u64-v1");
     finalize(digest)
 }
 

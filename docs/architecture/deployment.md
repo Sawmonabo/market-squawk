@@ -69,11 +69,11 @@ not own a catalog, model, source connection, job, paper controller, or workspace
 without stopping the service. Production live capture or paper work remains service-owned until
 cancellation and bounded shutdown complete.
 
-The desktop loads only bundled application assets and opens official provider pages in the system
-browser. Providers whose supported workflow uses the protected browser fallback start the same
-ephemeral HTTP server used by the CLI on an operating-system-selected IPv4 loopback port. The
-listener has a bounded lifetime, request count, connection count, per-request deadline, body size,
-session token, Host/Origin enforcement, and CSRF token. It never binds a non-loopback address.
+The desktop loads bundled application assets and performs provider onboarding in Settings through
+its private installed-client service authority. Saved credentials and recipes are reused. There is
+no separate localhost setup website. An explicit official account link or required provider OAuth
+handoff can open the system browser; the bounded OAuth callback transport serves only the
+provider authorization protocol.
 
 ## Process and network view
 
@@ -102,7 +102,6 @@ flowchart LR
         end
         CliMain["market-squawk CLI client"]
         Relays["Named MCP stdio relays"]
-        Loopback["Ephemeral loopback portal task"]
         Capture["capture helper process"]
         Onnx["ONNX worker process"]
         Keyring["Operating-system keyring"]
@@ -128,9 +127,7 @@ flowchart LR
     Bridge -->|"private typed request"| Runtime
     CliMain -->|"private typed request"| Runtime
     Relays -->|"separate credentialed MCP request"| Runtime
-    Browser <-->|"HTTP on 127.0.0.1 only"| Loopback
-    ServiceMain -->|"bounded setup owner"| Loopback
-    ServiceMain -->|"exact official URL"| Browser
+    Bridge -->|"explicit official provider URL"| Browser
     Python <-->|"admitted exports and candidates"| Artifacts
     ServiceMain <-->|"configured provider interfaces"| Coinbase
     ServiceMain <-->|"configured provider interfaces"| Kraken
@@ -150,7 +147,7 @@ The service is the only process that opens mutable workspace authority. Desktop 
 separate private application credentials; Claude Code and Codex use separate MCP credentials. MCP
 uses Streamable HTTP only on the service's loopback listener, while the named stdio relay is the
 client compatibility transport. Tauri retains window-scoped IPC, helper IPC is private to the
-service, and the onboarding portal is a separate ephemeral loopback listener. Source endpoints are
+service, and provider OAuth retains its own bounded callback transport only where required. Source endpoints are
 selected through immutable adapter metadata and validated configuration. Local structured logs and
 explicit provider operations account for the product's operational output and network activity.
 
@@ -331,7 +328,7 @@ configuration retains the origin of each value and redacts secret references fro
 The reviewed `LocalProduct` composes `PreferredSecretStore` with the OS keyring as primary and a
 code-owned encrypted-file fallback rooted under `control/secrets/provider-credentials/`. The
 fallback starts locked in every process and accepts its bounded unlock only through the foreground
-loopback portal. It becomes eligible only when the primary cannot provide its exact lifecycle;
+Settings connection flow. It becomes eligible only when the primary cannot provide its exact lifecycle;
 retained references never migrate between backends. Provider release availability and clean-machine
 onboarding acceptance remain tracked in the [delivery ledger](../plans/delivery-ledger.md).
 
@@ -397,7 +394,7 @@ Production live startup adds a stricter sequence:
 Shutdown is ownership-driven:
 
 1. stop accepting new application, MCP, and job work;
-2. cancel provider and portal admission;
+2. cancel provider setup and activation admission;
 3. invalidate live and execution authority before queues drain;
 4. stop source producers, finish route workers, flush or terminate capture under deadline;
 5. reconcile and checkpoint paper/execution state;
@@ -439,10 +436,11 @@ manifest/object state is not a valid application backup procedure.
   identities, bounded reads, no-clobber publication, and explicit locks.
 - Secrets reside in the OS keyring for the current composition. The catalog and artifacts retain
   only opaque references and non-secret evidence.
-- Loopback does not remove web risks. The portal verifies peer address, Host, Origin, session,
-  expiry, CSRF, request count, connection count, timeout, and body limits.
-- The desktop WebView loads bundled assets under a strict CSP and receives only the five
-  window-scoped presentation commands; business authority remains in the Rust application.
+- Native onboarding requires the exact installed Desktop client and active workspace. Protected
+  staged activation separately requires the exact CLI client; ordinary MCP tools cannot inherit
+  those private operations. OAuth callback admission remains provider-specific and bounded.
+- The desktop WebView loads bundled assets under a strict CSP and receives only closed
+  window-scoped presentation commands; business authority remains in the installed Rust service.
 - Helper executables and model artifacts are admitted by exact identity before use.
 - Provider access uses explicit endpoints, TLS policy, timeouts, response-size limits, shared
   budgets, and health transitions.
@@ -491,7 +489,7 @@ must be produced on documented hardware by the final release evidence lane descr
 - [Application lifecycle](../../apps/market-squawk/src/application.rs)
 - [Production source supervisor](../../apps/market-squawk/src/live_source/supervisor.rs)
 - [Capture helper configuration](../../crates/market-squawk-platform/src/capture/process_journal/config.rs)
-- [Provider onboarding portal](../../apps/market-squawk/src/provider_onboarding/portal.rs)
+- [Installed provider onboarding](../../apps/market-squawk/src/service/provider_setup.rs)
 - [ONNX helper admission](../../apps/market-squawk/src/local_product/executable.rs)
 - [Tauri packaging research](../research/2026-07-28-tauri-packaging-and-runtime-boundaries.md)
 

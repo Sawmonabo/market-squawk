@@ -1,4 +1,6 @@
 import * as React from "react"
+import { useSearchParams } from "react-router-dom"
+import { admittedAnalysisActionToken } from "@/features/opportunities/contracts"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   Activity,
@@ -38,6 +40,7 @@ import {
   type PaperControlAvailability,
   PaperConfirmationDialog,
   PaperControlPanel,
+  CreatePaperAccountControls,
   paperActionCompleted,
 } from "./paper-controls"
 
@@ -79,6 +82,11 @@ function ReadyPaperExecution({
   transport: ProductTransport
 }) {
   const queryClient = useQueryClient()
+  const [searchParams] = useSearchParams()
+  const requestedAnalysis = searchParams.get("analysis")
+  const analysisActionToken = admittedAnalysisActionToken(requestedAnalysis)
+  const invalidAnalysis = requestedAnalysis !== null &&
+    (analysisActionToken === null || searchParams.getAll("analysis").length !== 1)
   const [pendingAction, setPendingAction] = React.useState<PaperControlIntent | null>(null)
   const [controlMessage, setControlMessage] = React.useState<string | null>(null)
   const [controlResult, setControlResult] = React.useState<PaperControlResult | null>(null)
@@ -186,6 +194,18 @@ function ReadyPaperExecution({
         </Button>
       }
     >
+      <CreatePaperAccountControls
+        transport={transport}
+        scope={bootstrap.productSessionToken}
+        enabled={capabilities.has("bot_account_preparation")
+          && capabilities.has("bot_prepare_account") && capabilities.has("bot_create_account")}
+        onCreated={async (message) => {
+          setControlMessage(message)
+          await Promise.all(["bot", "portfolio"].map((domain) =>
+            queryClient.invalidateQueries({ queryKey: productKeys.domain(bootstrap.productSessionToken, domain) }),
+          ))
+        }}
+      />
       {missingCoreCapabilities.length > 0 ? <PaperSetupNotice /> : null}
       {status.isLoading && orders.isLoading && fills.isLoading ? (
         <PaperGridLoading />
@@ -207,7 +227,11 @@ function ReadyPaperExecution({
           <SessionSummary status={status.data?.value} />
           <AccountEvidence status={status.data?.value} />
           <SafetyEvidence status={status.data?.value} />
-          <ManualPaperDraftPanel
+          {invalidAnalysis ? (
+            <Notice text="This saved recommendation could not be opened. Return to Opportunities and choose the original saved analysis." />
+          ) : <ManualPaperDraftPanel
+            key={`${bootstrap.productSessionToken}:${analysisActionToken ?? "plans"}`}
+            analysisActionToken={analysisActionToken ?? undefined}
             transport={transport}
             scope={bootstrap.productSessionToken}
             enabled={
@@ -224,7 +248,7 @@ function ReadyPaperExecution({
                 }),
               ])
             }}
-          />
+          />}
           <PaperControlPanel
             status={status.data?.value}
             availability={controlAvailability}

@@ -1,5 +1,27 @@
 //! Immutable repository-owned definitions for non-execution market-data discovery.
 
+mod alpaca_asset_reference;
+mod current_population;
+mod issuer_reference;
+mod live_generation;
+mod native_reference;
+mod option_reference;
+pub use alpaca_asset_reference::AlpacaAssetReferenceAdmission;
+pub use current_population::{
+    CurrentListedPopulation, CurrentListedPopulationAdmission, CurrentListedPopulationMember,
+    CurrentListedPopulationPartition, CurrentListedPopulationScope,
+    CurrentListedPopulationSourceScope, CurrentPopulationError, CurrentPopulationExclusion,
+    CurrentPopulationExclusionReason, DatasetPopulationPartition, DatasetPopulationSourceUse,
+    MAX_CURRENT_LISTED_POPULATION_MEMBERS,
+};
+pub use issuer_reference::OfficialIssuerInstrumentReference;
+use live_generation::LiveProviderIdentityGeneration;
+pub(super) use live_generation::LiveProviderIdentityGenerations;
+pub use native_reference::{
+    AcceptedNativeReferenceCapture, NativeReferenceSourceCoordinate, RetainedNativeReferenceCapture,
+};
+pub use option_reference::AlpacaOptionReferenceAdmission;
+
 use std::collections::BTreeSet;
 use std::fmt;
 use std::mem::size_of;
@@ -7,9 +29,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use market_squawk_domain::{
-    AssignmentVerification, DigestAlgorithm, EffectiveInterval, EvidenceDigest, InstrumentId,
-    MarketDataInstrumentDefinition, MetadataRevision, ProviderInstrumentId, SourceId, Timestamp,
-    VenueId,
+    AssetClass, AssignmentVerification, Currency, DigestAlgorithm, EffectiveInterval,
+    EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier, ExternalIdentifierRecord,
+    IdentifierEntitlement, InstrumentId, MarketDataDisplayName, MarketDataInstrumentDefinition,
+    MarketDataInstrumentDefinitionInput, MetadataRevision, ProviderIdentityEvidence,
+    ProviderIdentityLocator, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId, Timestamp, VenueId, VenueMapping,
+    VenueSymbol,
 };
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
@@ -17,7 +43,20 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::CatalogAuthority;
+use super::provider_capture::{
+    ProviderMacroPlanCompletionCapture, retain_provider_macro_plan_completion_capture,
+};
 use super::storage::{ResultBudget, append_audit, sha256, trusted_catalog_now};
+use crate::rights::SourceRightsDecision;
+use crate::{
+    IngestPrecommitAuthority, ListingReferenceReadCapability, ListingReferenceRecord,
+    RightsDecisionInput, SourceOperation,
+};
+use market_squawk_sources::{
+    CatalogProviderIdentityAuthority, CurrentCatalogProviderIdentity,
+    ProviderIdentitySelectionEvidence, ProviderNativeIdentityRequest, ProviderWholeCaptureToken,
+    RegistryError, SourceMetadata,
+};
 
 /// Maximum definitions accepted in one atomic synchronization.
 pub const MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS: usize = 65_536;
@@ -80,6 +119,69 @@ impl MarketDataInstrumentSynchronization {
     }
 }
 
+/// Caller-observed current catalog position used to guard a read/merge/write publication.
+///
+/// This is a compare-and-set precondition, not identity or publication authority. Every submitted
+/// definition must have exactly one expectation, and all expectations are checked in the same
+/// transaction before any definition is inserted or a replay is accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataInstrumentCurrentExpectation {
+    instrument_id: InstrumentId,
+    position: Option<(EvidenceDigest, u32)>,
+}
+
+impl MarketDataInstrumentCurrentExpectation {
+    /// Requires that this canonical instrument still has no current catalog definition.
+    pub const fn absent(instrument_id: InstrumentId) -> Self {
+        Self {
+            instrument_id,
+            position: None,
+        }
+    }
+
+    /// Requires the exact digest and sequence read before the caller merged new assertions.
+    pub fn from_record(record: &MarketDataInstrumentRecord) -> Self {
+        Self {
+            instrument_id: record.definition().instrument_id(),
+            position: Some((record.revision_digest(), record.revision_sequence())),
+        }
+    }
+}
+
+/// Source-proven normalization submitted to the existing canonical identity authority.
+///
+/// The one-use capture token is consumed at publication. No canonical instrument ID can be
+/// supplied for creation; an existing record is only an exact compare-and-set expectation.
+#[derive(Debug)]
+pub struct MarketDataInstrumentSourceReferenceInput {
+    /// Exact already registered provider source metadata.
+    pub source: SourceMetadata,
+    /// Existing scoped owner authorization bound to the exact captured body.
+    pub rights: RightsDecisionInput,
+    /// Original nonduplicable whole-capture publication token.
+    pub capture: ProviderWholeCaptureToken,
+    /// Genuine current official listing record; its generation is revalidated at commit.
+    pub official_listing: ListingReferenceRecord,
+    /// Exact current definition for enrichment; absence requires genuine creation.
+    pub expected_current: Option<MarketDataInstrumentRecord>,
+    /// Exact captured body and independently reconstructed source-reference revision.
+    pub reference_evidence: RevisionBoundPayloadEvidence,
+    /// Open interval beginning at authentic local capture receipt time.
+    pub effective_interval: EffectiveInterval,
+    /// Source-authored display text under the same actual scoped terms.
+    pub display_name: MarketDataDisplayName,
+    /// Currency established by the exact issuer document evidence.
+    pub quote_currency: Currency,
+    /// Exact issuer document with a content-hash-pinned locator.
+    pub quote_currency_evidence: ExactPayloadEvidence,
+    /// Exact issuer security/listing corroboration with a content-hash-pinned locator.
+    pub issuer_identity_evidence: ExactPayloadEvidence,
+    /// Exactly one assigned CUSIP and one ticker from the authentic provider response.
+    pub identifiers: [ExternalIdentifierRecord; 2],
+    /// Exact source-native identity agreeing with the selected official listing symbol.
+    pub provider_instrument_id: ProviderInstrumentId,
+}
+
 /// Durable result of one atomic synchronization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketDataInstrumentSynchronizationReceipt {
@@ -105,7 +207,7 @@ impl MarketDataInstrumentSynchronizationReceipt {
         self.inserted
     }
 
-    /// Returns exact-current replays that performed no catalog mutation.
+    /// Returns exact-current replays that performed no definition mutation.
     pub const fn replayed(&self) -> usize {
         self.replayed
     }
@@ -121,6 +223,63 @@ pub struct MarketDataInstrumentRecord {
 }
 
 impl MarketDataInstrumentRecord {
+    /// Conservative owned retention: native vector elements plus measured serialized strings.
+    /// Serialization writes only to a counter; it does not allocate a second JSON body.
+    pub fn retained_bytes(&self) -> Result<usize, MarketDataInstrumentCatalogError> {
+        let mut counter = DefinitionByteCounter(0);
+        serde_json::to_writer(&mut counter, self.definition())?;
+        let definition = self.definition();
+        let mut bytes = size_of::<Self>()
+            .checked_add(
+                counter
+                    .0
+                    .checked_mul(2)
+                    .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?,
+            )
+            .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+        for additional in [
+            definition
+                .venue_mappings()
+                .len()
+                .checked_mul(size_of::<VenueMapping>()),
+            definition
+                .identifiers()
+                .len()
+                .checked_mul(size_of::<ExternalIdentifierRecord>()),
+            definition
+                .provider_identities()
+                .len()
+                .checked_mul(2 * size_of::<ProviderIdentityRecord>()),
+        ] {
+            bytes = bytes
+                .checked_add(
+                    additional.ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?,
+                )
+                .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+        }
+        for record in definition.provider_identities() {
+            for additional in [
+                record
+                    .observation_timestamps()
+                    .len()
+                    .checked_mul(2 * size_of::<Timestamp>()),
+                record
+                    .evidence()
+                    .locators()
+                    .len()
+                    .checked_mul(2 * size_of::<ProviderIdentityLocator>()),
+            ] {
+                bytes = bytes
+                    .checked_add(
+                        additional
+                            .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?,
+                    )
+                    .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Returns the complete definition; execution terms and eligibility are absent by type.
     pub const fn definition(&self) -> &MarketDataInstrumentDefinition {
         &self.definition
@@ -272,6 +431,75 @@ impl MarketDataInstrumentPopulationSelection {
     /// Returns the SHA-256 receipt binding query, disposition, records, and exclusions.
     pub const fn receipt_digest(&self) -> EvidenceDigest {
         self.receipt_digest
+    }
+}
+
+/// Opaque continuation of the complete admitted canonical catalog at exact clocks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataInstrumentEnumerationCursor {
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    last_instrument_id: InstrumentId,
+}
+
+/// One bounded page of all canonical identities known at the requested cutoff.
+///
+/// This is complete catalog membership, not proof of an entire exchange or investment universe.
+/// Known identities without an effective definition remain explicit exclusions. No live route,
+/// price, outcome, ticker search or provider credential participates in enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataInstrumentEnumerationPage {
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    population: Option<MarketDataInstrumentPopulationSelection>,
+    requested_cursor: Option<MarketDataInstrumentEnumerationCursor>,
+    next_cursor: Option<MarketDataInstrumentEnumerationCursor>,
+    receipt_digest: EvidenceDigest,
+    retained_bytes: usize,
+}
+
+impl MarketDataInstrumentEnumerationPage {
+    /// Returns the inclusive original catalog publication cutoff.
+    pub const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+    /// Returns the exact economic definition coordinate.
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+    /// Returns every requested identity, including explicitly unavailable definitions.
+    pub fn instrument_ids(&self) -> &[InstrumentId] {
+        self.population
+            .as_ref()
+            .map_or(&[], |value| value.query().instrument_ids())
+    }
+    /// Returns the exact verified definitions in canonical UUID order.
+    pub fn records(&self) -> &[MarketDataInstrumentRecord] {
+        self.population
+            .as_ref()
+            .map_or(&[], MarketDataInstrumentPopulationSelection::records)
+    }
+    /// Returns every known identity with no definition effective at the selected coordinate.
+    pub fn exclusions(&self) -> &[MarketDataInstrumentPopulationExclusion] {
+        self.population
+            .as_ref()
+            .map_or(&[], MarketDataInstrumentPopulationSelection::exclusions)
+    }
+    /// Returns continuation only when another known canonical identity exists.
+    pub const fn next_cursor(&self) -> Option<&MarketDataInstrumentEnumerationCursor> {
+        self.next_cursor.as_ref()
+    }
+    /// Whether all identities after the incoming cursor were returned.
+    pub const fn complete(&self) -> bool {
+        self.next_cursor.is_none()
+    }
+    /// Binds clocks, incoming/outgoing positions, exact page members and exclusions.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+    /// Conservative decoded retention bound, including native definition allocation.
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -528,6 +756,336 @@ impl MarketDataProviderIdentitySelection {
     }
 }
 
+/// Private catalog-owned live token; public definitions and receipts cannot construct it.
+#[derive(Debug)]
+struct CurrentMarketDataProviderIdentity {
+    selection: MarketDataProviderIdentitySelection,
+    evidence: ProviderIdentitySelectionEvidence,
+    generation: LiveProviderIdentityGeneration,
+    selected_at: Timestamp,
+    retained_bytes: usize,
+}
+
+impl CurrentCatalogProviderIdentity for CurrentMarketDataProviderIdentity {
+    fn evidence(&self) -> &ProviderIdentitySelectionEvidence {
+        &self.evidence
+    }
+
+    fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
+        self.generation.validate()?;
+        if self.selection.selection_digest() != self.evidence.selection_digest
+            || at < self.selected_at
+            || !interval_contains(self.evidence.definition_validity, at)
+            || !interval_contains(self.evidence.provider_validity, at)
+        {
+            return Err(RegistryError::StaleHandle);
+        }
+        Ok(())
+    }
+
+    fn retained_bytes(&self) -> Result<usize, RegistryError> {
+        Ok(self.retained_bytes)
+    }
+}
+
+impl CatalogProviderIdentityAuthority for MarketDataInstrumentReadCapability {
+    fn select_current(
+        &self,
+        request: &ProviderNativeIdentityRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<dyn CurrentCatalogProviderIdentity>, RegistryError> {
+        self.select_current_native_identity(request, deadline, cancellation)
+            .map(|identity| Arc::new(identity) as Arc<dyn CurrentCatalogProviderIdentity>)
+            .map_err(provider_identity_registry_error)
+    }
+}
+
+fn provider_identity_registry_error(error: MarketDataInstrumentCatalogError) -> RegistryError {
+    use MarketDataInstrumentCatalogError as Error;
+    match error {
+        Error::Cancelled => RegistryError::ProviderIdentitySelectionCancelled,
+        Error::DeadlineExceeded => RegistryError::ProviderIdentitySelectionDeadlineExceeded,
+        Error::AuthorityUnavailable => RegistryError::ProviderIdentityAuthorityUnavailable,
+        Error::Storage(error) => provider_identity_storage_error(&error),
+        Error::SourceAuthority(error) => match error {
+            super::CatalogError::AuthorityClockRollback => RegistryError::DurableWallRollback,
+            super::CatalogError::AuthorityBusy
+            | super::CatalogError::WriterAlreadyOpen
+            | super::CatalogError::WriterRegistryUnavailable => {
+                RegistryError::ProviderIdentityAuthorityUnavailable
+            }
+            super::CatalogError::Sqlite(error) => provider_identity_storage_error(&error),
+            super::CatalogError::Io(_) => RegistryError::AuthorityPersistence,
+            super::CatalogError::RightsDenied(_)
+            | super::CatalogError::RightsNotAdmitted
+            | super::CatalogError::InvalidRightsCapability => {
+                RegistryError::ProviderIdentityAuthorizationRejected
+            }
+            _ => RegistryError::InvalidAuthorityState,
+        },
+        Error::CorruptCatalog | Error::Serialization(_) => RegistryError::InvalidAuthorityState,
+        Error::ResultByteLimitExceeded => RegistryError::RetainedSizeOverflow,
+        Error::RevisionLimitExceeded => RegistryError::RevisionHistoryExhausted,
+        Error::StaleRevision | Error::ReferencePositionConflict => RegistryError::StaleHandle,
+        Error::PublicationAuthority(_) | Error::ListingAuthority(_) => {
+            RegistryError::ProviderIdentityAuthorizationRejected
+        }
+        Error::BlockingIo(_) => RegistryError::AuthorityPersistence,
+        Error::InvalidInput
+        | Error::InvalidPopulationQuery
+        | Error::PartialBatch { .. }
+        | Error::BatchLimitExceeded { .. }
+        | Error::DuplicateInstrumentId
+        | Error::EqualTimeRevisionConflict
+        | Error::InvalidLimit
+        | Error::SourceIdentityConflict => RegistryError::LiveScopeNotCovered,
+    }
+}
+
+fn provider_identity_storage_error(error: &rusqlite::Error) -> RegistryError {
+    use rusqlite::ErrorCode;
+    match error.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
+            RegistryError::ProviderIdentityAuthorityUnavailable
+        }
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => {
+            RegistryError::InvalidAuthorityState
+        }
+        Some(ErrorCode::PermissionDenied | ErrorCode::AuthorizationForStatementDenied) => {
+            RegistryError::ProviderIdentityAuthorizationRejected
+        }
+        Some(ErrorCode::OutOfMemory | ErrorCode::TooBig) => RegistryError::RetainedSizeOverflow,
+        _ => RegistryError::AuthorityPersistence,
+    }
+}
+
+impl MarketDataInstrumentReadCapability {
+    fn select_current_native_identity(
+        &self,
+        request: &ProviderNativeIdentityRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CurrentMarketDataProviderIdentity, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        let catalog = self.authority.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                MarketDataInstrumentCatalogError::AuthorityUnavailable
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                MarketDataInstrumentCatalogError::SourceAuthority(
+                    super::CatalogError::AuthorityLockPoisoned,
+                )
+            }
+        })?;
+        let connection = &catalog.catalog().connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let result = (|| {
+            let transaction = connection.unchecked_transaction()?;
+            let now = trusted_catalog_now(&transaction)?;
+            if request.knowledge_at > now {
+                return Err(MarketDataInstrumentCatalogError::InvalidInput);
+            }
+            let query = MarketDataProviderIdentityQuery::try_new(
+                request.namespace.clone(),
+                request.provider_instrument_id.clone(),
+                request.knowledge_at,
+                request.effective_at,
+            )?;
+            let selection = MarketDataProviderIdentitySelection::from_resolution(
+                catalog.resolve_market_data_provider_identity_in_catalog(
+                    query,
+                    deadline,
+                    cancellation,
+                )?,
+            )
+            .ok_or(MarketDataInstrumentCatalogError::SourceIdentityConflict)?;
+            let record = catalog.selected_provider_record_in_catalog(&selection)?;
+            let evidence = native_identity_evidence(&selection, &record, request)?;
+            catalog.require_current_provider_identity_in_catalog(
+                &evidence,
+                now,
+                deadline,
+                cancellation,
+            )?;
+            let generation = catalog.provider_identity_generation.select(request)?;
+            // Charge all retained fields and watched counter allocations conservatively.
+            let exact = selection.exact_receipt()?;
+            let mut retained_bytes = size_of::<CurrentMarketDataProviderIdentity>()
+                .checked_add(generation.retained_allocation_bytes())
+                .and_then(|size| size.checked_add(evidence.dynamic_retained_bytes()?))
+                .and_then(|size| size.checked_add(selection.query().source_id().retained_bytes()))
+                .and_then(|size| {
+                    size.checked_add(selection.query().provider_instrument_id().retained_bytes())
+                })
+                .and_then(|size| {
+                    size.checked_add(
+                        exact
+                            .definition_reference_revision()
+                            .as_source_identifier()
+                            .retained_bytes(),
+                    )
+                })
+                .and_then(|size| {
+                    size.checked_add(
+                        exact
+                            .provider_identity_revision()
+                            .as_source_identifier()
+                            .retained_bytes(),
+                    )
+                })
+                .and_then(|size| {
+                    size.checked_add(
+                        exact
+                            .matching_venues()
+                            .len()
+                            .checked_mul(size_of::<VenueId>())?,
+                    )
+                })
+                .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            for venue in exact.matching_venues() {
+                retained_bytes = retained_bytes
+                    .checked_add(venue.retained_bytes())
+                    .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            }
+            check_operation(deadline, cancellation)?;
+            transaction.commit()?;
+            Ok(CurrentMarketDataProviderIdentity {
+                selection,
+                evidence,
+                generation,
+                selected_at: now,
+                retained_bytes,
+            })
+        })();
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
+}
+
+impl CatalogAuthority {
+    fn selected_provider_record_in_catalog(
+        &self,
+        selection: &MarketDataProviderIdentitySelection,
+    ) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+        let exact = selection.exact_receipt()?;
+        let row = self.catalog().connection.query_row(
+            &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_revisions AS revisions WHERE revisions.revision_digest=?1"),
+            [exact.definition_revision_digest().bytes()], decode_stored_row)?;
+        charge_row(&row, &mut ResultBudget::new(self.catalog().result_bytes))?;
+        let record = rebuild_record(row)?;
+        if record.definition().instrument_id() != exact.instrument_id()
+            || record.revision_sequence() != exact.definition_revision_sequence()
+            || record.published_at() != exact.definition_published_at()
+        {
+            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+        }
+        Ok(record)
+    }
+
+    /// Transaction-local replay of persisted evidence. No mutex reentry or progress-handler
+    /// replacement; the caller owns the catalog lock and the bounded transaction.
+    pub(crate) fn verify_provider_identity_evidence_in_catalog(
+        &self,
+        evidence: &ProviderIdentitySelectionEvidence,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataProviderIdentitySelection, MarketDataInstrumentCatalogError> {
+        let request = &evidence.native;
+        let query = MarketDataProviderIdentityQuery::try_new(
+            request.namespace.clone(),
+            request.provider_instrument_id.clone(),
+            request.knowledge_at,
+            request.effective_at,
+        )?;
+        let selection = MarketDataProviderIdentitySelection::from_resolution(
+            self.resolve_market_data_provider_identity_in_catalog(query, deadline, cancellation)?,
+        )
+        .ok_or(MarketDataInstrumentCatalogError::SourceIdentityConflict)?;
+        let record = self.selected_provider_record_in_catalog(&selection)?;
+        if native_identity_evidence(&selection, &record, request)? != *evidence {
+            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+        }
+        Ok(selection)
+    }
+
+    /// Existing publication transactions call this with their trusted commit time while holding
+    /// the catalog mutex. Historical restart reads use the replay method above instead.
+    pub(crate) fn require_current_provider_identity_in_catalog(
+        &self,
+        evidence: &ProviderIdentitySelectionEvidence,
+        at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), MarketDataInstrumentCatalogError> {
+        if evidence.native.knowledge_at > at
+            || !interval_contains(evidence.definition_validity, at)
+            || !interval_contains(evidence.provider_validity, at)
+        {
+            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+        }
+        let selected =
+            self.verify_provider_identity_evidence_in_catalog(evidence, deadline, cancellation)?;
+        let record = self.selected_provider_record_in_catalog(&selected)?;
+        require_current_market_data_instrument(self, &record, deadline, cancellation)?;
+        let fresh = self.resolve_market_data_provider_identity_in_catalog(
+            MarketDataProviderIdentityQuery::try_new(
+                evidence.native.namespace.clone(),
+                evidence.native.provider_instrument_id.clone(),
+                at,
+                at,
+            )?,
+            deadline,
+            cancellation,
+        )?;
+        match fresh.outcome() {
+            MarketDataProviderIdentityResolutionOutcome::Exact(exact)
+                if exact == selected.exact_receipt()? =>
+            {
+                Ok(())
+            }
+            _ => Err(MarketDataInstrumentCatalogError::ReferencePositionConflict),
+        }
+    }
+}
+
+fn native_identity_evidence(
+    selection: &MarketDataProviderIdentitySelection,
+    record: &MarketDataInstrumentRecord,
+    request: &ProviderNativeIdentityRequest,
+) -> Result<ProviderIdentitySelectionEvidence, MarketDataInstrumentCatalogError> {
+    let exact = selection.exact_receipt()?;
+    // The source registry proves the feed-route venue from its own metadata. That route need
+    // not be a canonical trading venue (for example Schwab's logical feed, or an index).
+    // A byte-exact selected provider ID already proves its native symbol. An independent symbol
+    // still requires the definition's exact venue mapping; no guessed or normalized alias passes.
+    let provider_symbol_matches =
+        request.venue_symbol.as_str() == selection.query().provider_instrument_id().as_str();
+    let canonical_venue_symbol_matches =
+        record.definition().venue_mappings().iter().any(|mapping| {
+            mapping.venue_id() == &request.venue && mapping.venue_symbol() == &request.venue_symbol
+        });
+    if request.instrument != exact.instrument_id()
+        || (!provider_symbol_matches && !canonical_venue_symbol_matches)
+    {
+        return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
+    }
+    Ok(ProviderIdentitySelectionEvidence {
+        native: request.clone(),
+        definition_digest: exact.definition_revision_digest(),
+        definition_sequence: exact.definition_revision_sequence(),
+        reference_revision: exact.definition_reference_revision().clone(),
+        reference_payload_digest: exact.definition_reference_payload_digest(),
+        definition_published_at: exact.definition_published_at(),
+        definition_validity: record.definition().effective_interval(),
+        provider_revision: exact.provider_identity_revision().clone(),
+        provider_payload_digest: exact.provider_identity_payload_digest(),
+        provider_validity: exact.provider_identity_validity(),
+        resolution_digest: selection.resolution_receipt_digest(),
+        selection_digest: selection.selection_digest(),
+    })
+}
+
 /// Current reference field responsible for a search match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarketDataInstrumentMatchKind {
@@ -622,7 +1180,40 @@ impl MarketDataInstrumentSynchronizationCapability {
         Self { authority }
     }
 
-    /// Atomically appends changed definitions and no-ops exact-current replays.
+    /// Resolves one genuine source reference and atomically creates or enriches its identity.
+    ///
+    /// Run this synchronous publication in the existing supervised blocking owner. The retained
+    /// precommit authority must validate catalog state through its borrowed-catalog method.
+    pub fn publish_source_reference(
+        &self,
+        input: MarketDataInstrumentSourceReferenceInput,
+        precommit: &dyn IngestPrecommitAuthority,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        precommit
+            .validate_precommit()
+            .map_err(reference_precommit_error)?;
+        let listing = ListingReferenceReadCapability::new(
+            Arc::clone(&self.authority),
+            input.official_listing.generation().dataset().clone(),
+            input.official_listing.generation().source_id().clone(),
+        );
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .publish_market_data_source_reference(
+                input,
+                &listing,
+                precommit,
+                deadline,
+                cancellation,
+            )
+    }
+
+    /// Atomically publishes complete authoritative definitions and no-ops exact-current replays.
+    /// Read/merge/write producers must use `synchronize_if_current` to preserve concurrent changes.
     pub fn synchronize(
         &self,
         synchronization: MarketDataInstrumentSynchronization,
@@ -633,7 +1224,43 @@ impl MarketDataInstrumentSynchronizationCapability {
         self.authority
             .try_lock()
             .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
-            .synchronize_market_data_instruments(synchronization, deadline, cancellation)
+            .synchronize_market_data_instruments(
+                synchronization,
+                None,
+                None,
+                deadline,
+                cancellation,
+            )
+    }
+
+    /// Atomically publishes a read/merge/write batch only if every caller-observed position holds.
+    ///
+    /// Missing, duplicate, extra or mismatched expectation identities are invalid input. A changed
+    /// current digest/sequence or changed absence returns `ReferencePositionConflict` before any
+    /// mutation, including when the submitted definition would otherwise be an exact replay.
+    /// Callers must reread and remerge after a conflict; retrying the stale batch is not a merge.
+    pub fn synchronize_if_current(
+        &self,
+        synchronization: MarketDataInstrumentSynchronization,
+        mut expected_current: Vec<MarketDataInstrumentCurrentExpectation>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentSynchronizationReceipt, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        if expected_current.len() != synchronization.definitions.len() {
+            return Err(MarketDataInstrumentCatalogError::InvalidInput);
+        }
+        expected_current.sort_unstable_by_key(|expected| expected.instrument_id);
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .synchronize_market_data_instruments(
+                synchronization,
+                Some(&expected_current),
+                None,
+                deadline,
+                cancellation,
+            )
     }
 }
 
@@ -675,6 +1302,56 @@ impl MarketDataInstrumentReadCapability {
             .latest_market_data_instrument(instrument_id, deadline, cancellation)
     }
 
+    /// Revalidates a retained definition against the already borrowed publication catalog.
+    ///
+    /// This fixed indexed read never reenters the writer mutex or replaces an outer SQL progress
+    /// handler. It disables busy waiting for the read and restores the connection policy afterward.
+    pub fn require_current_in_catalog(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &MarketDataInstrumentRecord,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), MarketDataInstrumentCatalogError> {
+        require_current_market_data_instrument(catalog, expected, deadline, cancellation)
+    }
+
+    /// Replays an original provider selection on the already borrowed publication catalog.
+    /// Historical selections retain their exact effective/knowledge clocks. This does not demand
+    /// today's definition and never replaces the caller's active SQL progress handler.
+    pub fn verify_provider_identity_selection_in_catalog(
+        &self,
+        catalog: &CatalogAuthority,
+        expected: &MarketDataProviderIdentitySelection,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        expected.verify_integrity()?;
+        let connection = &catalog.catalog().connection;
+        let busy_millis: u32 =
+            connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
+        let result = catalog
+            .resolve_market_data_provider_identity_in_catalog(
+                expected.query().clone(),
+                deadline,
+                cancellation,
+            )
+            .and_then(|replay| {
+                if replay == expected.resolution {
+                    Ok(())
+                } else {
+                    Err(MarketDataInstrumentCatalogError::ReferencePositionConflict)
+                }
+            });
+        let cleanup =
+            connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy_millis)));
+        check_operation(deadline, cancellation)?;
+        cleanup?;
+        result
+    }
+
     /// Atomically pins one exact, bounded stable-identity set at independent knowledge/effective
     /// coordinates.
     ///
@@ -693,6 +1370,42 @@ impl MarketDataInstrumentReadCapability {
             .try_lock()
             .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
             .pin_market_data_instrument_population(query, deadline, cancellation)
+    }
+
+    /// Enumerates the actual admitted canonical catalog without a caller-authored identity set.
+    ///
+    /// Follow every opaque cursor at the same clocks for complete population evidence. Each page
+    /// is limited to the existing 256-member population bound; callers must also bound total work.
+    pub fn enumerate_as_of(
+        &self,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+        after: Option<&MarketDataInstrumentEnumerationCursor>,
+        maximum_rows: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentEnumerationPage, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        if effective_at > knowledge_at
+            || maximum_rows == 0
+            || maximum_rows > MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS
+            || after.is_some_and(|cursor| {
+                cursor.knowledge_at != knowledge_at || cursor.effective_at != effective_at
+            })
+        {
+            return Err(MarketDataInstrumentCatalogError::InvalidInput);
+        }
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .enumerate_market_data_instruments(
+                knowledge_at,
+                effective_at,
+                after,
+                maximum_rows,
+                deadline,
+                cancellation,
+            )
     }
 
     /// Searches external identifiers, admitted display names, venue symbols, and accepted provider
@@ -835,6 +1548,27 @@ impl MarketDataInstrumentReadCapability {
             .read_selected_provider_definition(selection, deadline, cancellation)
     }
 
+    /// Returns replayable value evidence for one exact selected native route. This does not
+    /// grant current source authority; the live registry selects and validates it independently.
+    pub fn selected_provider_identity_evidence(
+        &self,
+        selection: &MarketDataProviderIdentitySelection,
+        request: &ProviderNativeIdentityRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderIdentitySelectionEvidence, MarketDataInstrumentCatalogError> {
+        let query = selection.query();
+        if query.source_id() != &request.namespace
+            || query.provider_instrument_id() != &request.provider_instrument_id
+            || query.knowledge_at() != request.knowledge_at
+            || query.effective_at() != request.effective_at
+        {
+            return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
+        }
+        let record = self.read_selected_provider_definition(selection, deadline, cancellation)?;
+        native_identity_evidence(selection, &record, request)
+    }
+
     /// Replays a source-qualified provider identity read and rejects any evidence/currentness
     /// drift after process restart.
     pub fn verify_provider_identity_restart(
@@ -870,6 +1604,38 @@ impl MarketDataInstrumentReadCapability {
         }
         Ok(replay)
     }
+}
+
+fn require_current_market_data_instrument(
+    catalog: &CatalogAuthority,
+    expected: &MarketDataInstrumentRecord,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), MarketDataInstrumentCatalogError> {
+    check_operation(deadline, cancellation)?;
+    let connection = &catalog.catalog().connection;
+    let busy_millis: u32 = connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+    connection.busy_timeout(std::time::Duration::ZERO)?;
+    let result = (|| {
+        let row = connection.query_row(
+                &format!("SELECT {STORED_COLUMNS} FROM market_data_instrument_current AS current_
+                    JOIN market_data_instrument_revisions AS revisions ON revisions.revision_digest=current_.revision_digest
+                    WHERE current_.instrument_id=?1 LIMIT 1"),
+                [expected.definition().instrument_id().to_string()], decode_stored_row,
+            ).optional()?;
+        let Some(row) = row else {
+            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+        };
+        charge_row(&row, &mut ResultBudget::new(catalog.catalog().result_bytes))?;
+        if rebuild_record(row)? != *expected {
+            return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+        }
+        Ok(())
+    })();
+    let cleanup = connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy_millis)));
+    check_operation(deadline, cancellation)?;
+    cleanup?;
+    result
 }
 
 fn validate_search(
@@ -934,6 +1700,24 @@ pub enum MarketDataInstrumentCatalogError {
     /// Durable bytes or relational state failed verification.
     #[error("market-data instrument catalog content is corrupt")]
     CorruptCatalog,
+    /// Assigned identity and listing or provider claims identify conflicting securities.
+    #[error("market-data source reference identity is ambiguous or conflicting")]
+    SourceIdentityConflict,
+    /// The exact definition expected by the producer changed before publication.
+    #[error("market-data source reference expected current definition changed")]
+    ReferencePositionConflict,
+    /// Source or scoped rights validation failed.
+    #[error("market-data source reference authority validation failed")]
+    SourceAuthority(#[from] super::CatalogError),
+    /// The authentic official listing generation no longer remains current and permitted.
+    #[error("market-data official listing reference is unavailable")]
+    ListingAuthority(#[from] crate::ListingReferenceError),
+    /// The retained account/source authority was revoked at the commit boundary.
+    #[error("market-data source reference publication authority was revoked")]
+    PublicationAuthority(#[source] Box<crate::IngestError>),
+    /// Existing supervised blocking admission or execution failed.
+    #[error("market-data source reference blocking operation failed")]
+    BlockingIo(#[from] crate::ParquetStoreError),
     /// Canonical definition serialization failed.
     #[error("market-data instrument serialization failed")]
     Serialization(#[from] serde_json::Error),
@@ -992,9 +1776,258 @@ struct StoredDefinitionRow {
 }
 
 impl CatalogAuthority {
+    fn publish_market_data_source_reference(
+        &self,
+        input: MarketDataInstrumentSourceReferenceInput,
+        listing_reader: &ListingReferenceReadCapability,
+        precommit: &dyn IngestPrecommitAuthority,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        let (cusip, ticker, received_at) = validate_source_reference_input(&input)?;
+        let rights = SourceRightsDecision::try_new(input.rights.clone())
+            .map_err(super::CatalogError::from)?;
+        let capture = ProviderMacroPlanCompletionCapture::try_from_live(input.capture)?;
+        let connection = &self.catalog().connection;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
+        let result = (|| {
+            install_progress_handler(connection, deadline, cancellation)?;
+            precommit
+                .validate_catalog_precommit(self)
+                .map_err(reference_precommit_error)?;
+            listing_reader.require_current_in_catalog(
+                self,
+                input.official_listing.generation(),
+                deadline,
+                cancellation,
+            )?;
+            if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {
+                return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
+            }
+            let transaction = connection.unchecked_transaction()?;
+            let published_at = trusted_catalog_now(&transaction)?;
+            if !input.source.is_effective_at(published_at) || received_at > published_at {
+                return Err(MarketDataInstrumentCatalogError::InvalidInput);
+            }
+            for operation in [SourceOperation::Persist, SourceOperation::Display] {
+                let request = crate::IngestIdentity::try_new(
+                    input.source.source_id().clone(),
+                    rights.payload_digest(),
+                    operation,
+                    "market-data-source-reference",
+                )
+                .map_err(super::CatalogError::from)?;
+                rights
+                    .authorize_at(&request, published_at)
+                    .map_err(super::CatalogError::from)?;
+            }
+            let mut budget = ResultBudget::new(self.catalog().result_bytes);
+            let current = resolve_reference_identity(
+                &transaction,
+                &cusip,
+                &ticker,
+                &input.official_listing,
+                input.source.source_id(),
+                &input.provider_instrument_id,
+                received_at,
+                &mut budget,
+            )?;
+            if current.as_ref() != input.expected_current.as_ref() {
+                return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+            }
+            let instrument_id = current
+                .as_ref()
+                .map(|record| record.definition().instrument_id())
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    InstrumentId::try_from(uuid::Uuid::new_v4())
+                        .map_err(|_| MarketDataInstrumentCatalogError::InvalidInput)
+                })?;
+            let asset_class = if input.official_listing.is_etf() {
+                AssetClass::Fund
+            } else {
+                AssetClass::Equity
+            };
+            if current.as_ref().is_some_and(|record| {
+                record.definition().asset_class() != asset_class
+                    || record.definition().quote_currency() != input.quote_currency
+            }) {
+                return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
+            }
+            let mut mappings = current.as_ref().map_or_else(Vec::new, |record| {
+                record.definition().venue_mappings().to_vec()
+            });
+            mappings.retain(|mapping| mapping.venue_id() != input.official_listing.listing_venue());
+            mappings.push(VenueMapping::new(
+                input.official_listing.listing_venue().clone(),
+                VenueSymbol::try_from(ticker.as_str())
+                    .map_err(|_| MarketDataInstrumentCatalogError::InvalidInput)?,
+            ));
+            let mut provider_identities = current.as_ref().map_or_else(Vec::new, |record| {
+                record.definition().provider_identities().to_vec()
+            });
+            provider_identities.retain(|identity| {
+                !(identity.source_id() == input.source.source_id()
+                    && identity.provider_instrument_id() == &input.provider_instrument_id)
+            });
+            let document_locators = [
+                &input.quote_currency_evidence,
+                &input.issuer_identity_evidence,
+            ]
+            .into_iter()
+            .map(|evidence| {
+                let locator = evidence
+                    .version_pinned_locator()
+                    .ok_or(MarketDataInstrumentCatalogError::InvalidInput)?;
+                Ok(ProviderIdentityLocator::new(
+                    locator.reference().clone(),
+                    locator.version().clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, MarketDataInstrumentCatalogError>>()?;
+            let provider_evidence = ProviderIdentityEvidence::try_with_locators(
+                input.reference_evidence.payload_evidence().content_digest(),
+                document_locators,
+            )
+            .map_err(|_| MarketDataInstrumentCatalogError::InvalidInput)?;
+            provider_identities.push(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id,
+                source_id: input.source.source_id().clone(),
+                provider_instrument_id: input.provider_instrument_id,
+                evidence: provider_evidence,
+                source_timestamp: None,
+                observed_at: received_at,
+                metadata_revision: input.reference_evidence.metadata_revision().clone(),
+                validity: input.effective_interval,
+                supersedes: None,
+            }));
+            let mut identifiers = current.as_ref().map_or_else(Vec::new, |record| {
+                record.definition().identifiers().to_vec()
+            });
+            identifiers.retain(|identifier| {
+                !matches!(
+                    identifier.identifier(),
+                    ExternalIdentifier::Cusip(_) | ExternalIdentifier::Ticker(_)
+                )
+            });
+            identifiers.extend(input.identifiers);
+            let definition =
+                MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+                    instrument_id,
+                    reference_evidence: input.reference_evidence,
+                    effective_interval: input.effective_interval,
+                    asset_class,
+                    display_name: Some(input.display_name),
+                    quote_currency: input.quote_currency,
+                    quote_currency_evidence: input.quote_currency_evidence,
+                    venue_mappings: mappings,
+                    provider_identities,
+                    identifiers,
+                })
+                .map_err(|_| MarketDataInstrumentCatalogError::InvalidInput)?;
+            let mut prepared = prepare_definitions(vec![definition].into_boxed_slice())?;
+            let prepared = prepared
+                .pop()
+                .ok_or(MarketDataInstrumentCatalogError::InvalidInput)?;
+            if prepared.json.len() > self.catalog().result_bytes.max_record_bytes() {
+                return Err(MarketDataInstrumentCatalogError::ResultByteLimitExceeded);
+            }
+            let plan = plan_publication(&transaction, &prepared)?;
+            check_operation(deadline, cancellation)?;
+            precommit
+                .validate_catalog_precommit(self)
+                .map_err(reference_precommit_error)?;
+            listing_reader.require_current_in_catalog(
+                self,
+                input.official_listing.generation(),
+                deadline,
+                cancellation,
+            )?;
+            let commit_at = trusted_catalog_now(&transaction)?;
+            rights
+                .validate_at(commit_at)
+                .map_err(super::CatalogError::from)?;
+            if !input.source.is_effective_at(commit_at) {
+                return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
+            }
+            super::storage::persist_rights(&transaction, &rights, commit_at)?;
+            retain_provider_macro_plan_completion_capture(&transaction, &capture, commit_at)?;
+            let (sequence, original_published_at) = match plan {
+                PublicationPlan::Replay => {
+                    let current =
+                        current.ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
+                    (current.revision_sequence(), current.published_at())
+                }
+                PublicationPlan::Insert {
+                    sequence,
+                    previous,
+                    identity_is_new,
+                } => {
+                    insert_definition(
+                        &transaction,
+                        &self.provider_identity_generation,
+                        &prepared,
+                        sequence,
+                        previous,
+                        identity_is_new,
+                        commit_at,
+                    )?;
+                    (sequence, commit_at)
+                }
+            };
+            let mut audit = Sha256::new();
+            audit.update(b"market-squawk/source-reference-publication/v1");
+            audit.update(prepared.digest);
+            audit.update(capture.capture().observation_digest().bytes());
+            audit.update(capture.sealed_capture_receipt_digest().bytes());
+            audit.update(
+                input
+                    .official_listing
+                    .generation()
+                    .generation_digest()
+                    .bytes(),
+            );
+            audit.update(
+                input
+                    .official_listing
+                    .record_payload_evidence()
+                    .content_digest()
+                    .bytes(),
+            );
+            audit.update(rights.fingerprint());
+            append_audit(
+                &transaction,
+                "market-data-instrument.source-reference-published",
+                &instrument_id.to_string(),
+                audit.finalize().into(),
+                commit_at,
+            )?;
+            check_operation(deadline, cancellation)?;
+            precommit
+                .validate_catalog_precommit(self)
+                .map_err(reference_precommit_error)?;
+            transaction.commit()?;
+            Ok(MarketDataInstrumentRecord {
+                definition: prepared.definition,
+                revision_digest: digest(prepared.digest),
+                revision_sequence: sequence,
+                published_at: original_published_at,
+            })
+        })();
+        let progress_cleanup = clear_progress_handler(connection);
+        let busy_cleanup = connection.busy_timeout(self.catalog().busy_timeout);
+        let result = classify_operation(result, deadline, cancellation);
+        progress_cleanup?;
+        busy_cleanup?;
+        result
+    }
+
     fn synchronize_market_data_instruments(
         &self,
         synchronization: MarketDataInstrumentSynchronization,
+        expected_current: Option<&[MarketDataInstrumentCurrentExpectation]>,
+        native_captures: Option<&[AcceptedNativeReferenceCapture]>,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketDataInstrumentSynchronizationReceipt, MarketDataInstrumentCatalogError> {
@@ -1005,11 +2038,31 @@ impl CatalogAuthority {
             return Err(MarketDataInstrumentCatalogError::ResultByteLimitExceeded);
         }
         prepared.sort_by_key(|definition| definition.definition.instrument_id());
+        if let Some(expected) = expected_current {
+            if expected.len() != prepared.len()
+                || expected
+                    .iter()
+                    .zip(&prepared)
+                    .any(|(expected, definition)| {
+                        expected.instrument_id != definition.definition.instrument_id()
+                    })
+            {
+                return Err(MarketDataInstrumentCatalogError::InvalidInput);
+            }
+        }
         let batch_digest = batch_digest(&prepared);
         let connection = &self.catalog().connection;
         install_progress_handler(connection, deadline, cancellation)?;
         let result = (|| {
             let transaction = connection.unchecked_transaction()?;
+            // Check every caller's read position before planning even exact replays. The sole
+            // catalog lock and this transaction remain held through all publication and commit.
+            if let Some(expected) = expected_current {
+                for expected in expected {
+                    check_operation(deadline, cancellation)?;
+                    require_expected_market_data_position(&transaction, expected)?;
+                }
+            }
             let mut plans = Vec::new();
             plans
                 .try_reserve_exact(prepared.len())
@@ -1022,7 +2075,7 @@ impl CatalogAuthority {
                 .iter()
                 .filter(|plan| matches!(plan, PublicationPlan::Insert { .. }))
                 .count();
-            if inserted == 0 {
+            if inserted == 0 && native_captures.is_none() {
                 return Ok(MarketDataInstrumentSynchronizationReceipt {
                     batch_digest: digest(batch_digest),
                     submitted: prepared.len(),
@@ -1042,6 +2095,7 @@ impl CatalogAuthority {
                 {
                     insert_definition(
                         &transaction,
+                        &self.provider_identity_generation,
                         definition,
                         *sequence,
                         *previous,
@@ -1049,6 +2103,18 @@ impl CatalogAuthority {
                         published_at,
                     )?;
                 }
+            }
+            if let Some(captures) = native_captures {
+                native_reference::retain_references(
+                    &transaction,
+                    &prepared,
+                    &plans,
+                    captures,
+                    published_at,
+                    self.catalog().result_bytes.max_record_bytes(),
+                    deadline,
+                    cancellation,
+                )?;
             }
             check_operation(deadline, cancellation)?;
             append_audit(
@@ -1115,6 +2181,179 @@ impl CatalogAuthority {
         })();
         clear_progress_handler(connection)?;
         classify_operation(result, deadline, cancellation)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded population clocks and cursor remain explicit"
+    )]
+    fn enumerate_market_data_instruments(
+        &self,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+        after: Option<&MarketDataInstrumentEnumerationCursor>,
+        maximum_rows: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentEnumerationPage, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        let connection = &self.catalog().connection;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
+        let result = (|| {
+            install_progress_handler(connection, deadline, cancellation)?;
+            let transaction = connection.unchecked_transaction()?;
+            if let Some(cursor) = after {
+                let exists: bool = transaction.query_row(
+                    POPULATION_KNOWN_SQL,
+                    params![
+                        cursor.last_instrument_id.to_string(),
+                        knowledge_at.unix_nanos()
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+                }
+            }
+            let mut statement = transaction.prepare(
+                "SELECT current_.instrument_id FROM market_data_instrument_current AS current_
+                 WHERE (?2 IS NULL OR current_.instrument_id>?2)
+                   AND EXISTS(SELECT 1 FROM market_data_instrument_revisions AS revisions
+                       WHERE revisions.instrument_id=current_.instrument_id AND revisions.published_at_ns<=?1)
+                 ORDER BY current_.instrument_id LIMIT ?3",
+            )?;
+            let mut rows = statement.query(params![
+                knowledge_at.unix_nanos(),
+                after.map(|cursor| cursor.last_instrument_id.to_string()),
+                i64::try_from(maximum_rows.saturating_add(1))
+                    .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?
+            ])?;
+            let mut ids = Vec::new();
+            ids.try_reserve_exact(maximum_rows + 1)
+                .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            while let Some(row) = rows.next()? {
+                check_operation(deadline, cancellation)?;
+                let raw: String = row.get(0)?;
+                let id = raw
+                    .parse::<InstrumentId>()
+                    .map_err(|_| MarketDataInstrumentCatalogError::CorruptCatalog)?;
+                if id.to_string() != raw {
+                    return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+                }
+                ids.push(id);
+            }
+            drop(rows);
+            drop(statement);
+            let has_more = ids.len() > maximum_rows;
+            ids.truncate(maximum_rows);
+            let next_cursor = has_more.then(|| MarketDataInstrumentEnumerationCursor {
+                knowledge_at,
+                effective_at,
+                last_instrument_id: ids[ids.len() - 1],
+            });
+            let mut retained_bytes = std::mem::size_of::<MarketDataInstrumentEnumerationPage>();
+            let population = if ids.is_empty() {
+                None
+            } else {
+                let query =
+                    MarketDataInstrumentPopulationQuery::try_new(ids, knowledge_at, effective_at)?;
+                let mut budget = ResultBudget::new(self.catalog().result_bytes);
+                let mut records = Vec::new();
+                let mut exclusions = Vec::new();
+                records
+                    .try_reserve_exact(query.instrument_ids().len())
+                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                exclusions
+                    .try_reserve_exact(query.instrument_ids().len())
+                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                for id in query.instrument_ids() {
+                    check_operation(deadline, cancellation)?;
+                    match select_population_member(
+                        &transaction,
+                        *id,
+                        knowledge_at,
+                        effective_at,
+                        &mut budget,
+                    )? {
+                        PopulationMember::Record(record) => {
+                            let charged = record.retained_bytes()?;
+                            retained_bytes = retained_bytes
+                                .checked_add(charged)
+                                .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                            if retained_bytes > self.catalog().result_bytes.max_result_bytes() {
+                                return Err(
+                                    MarketDataInstrumentCatalogError::ResultByteLimitExceeded,
+                                );
+                            }
+                            records.push(record);
+                        }
+                        PopulationMember::Excluded(reason) => {
+                            exclusions.push(MarketDataInstrumentPopulationExclusion {
+                                instrument_id: *id,
+                                reason,
+                            })
+                        }
+                    }
+                }
+                retained_bytes = retained_bytes
+                    .checked_add(
+                        query.instrument_ids().len()
+                            * (size_of::<InstrumentId>()
+                                + size_of::<MarketDataInstrumentPopulationExclusion>()),
+                    )
+                    .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                let disposition = if exclusions.is_empty() {
+                    MarketDataInstrumentPopulationDisposition::Complete
+                } else {
+                    MarketDataInstrumentPopulationDisposition::Unavailable
+                };
+                let receipt_digest = population_receipt_digest(
+                    query.query_digest(),
+                    disposition,
+                    &records,
+                    &exclusions,
+                );
+                Some(MarketDataInstrumentPopulationSelection {
+                    query,
+                    disposition,
+                    records: records.into_boxed_slice(),
+                    exclusions: exclusions.into_boxed_slice(),
+                    receipt_digest,
+                })
+            };
+            let mut hash = Sha256::new();
+            hash.update(b"market-squawk/canonical-catalog-enumeration/v1\0");
+            hash.update(knowledge_at.unix_nanos().to_be_bytes());
+            hash.update(effective_at.unix_nanos().to_be_bytes());
+            hash.update((maximum_rows as u64).to_be_bytes());
+            for cursor in [after, next_cursor.as_ref()] {
+                hash.update([u8::from(cursor.is_some())]);
+                if let Some(cursor) = cursor {
+                    hash.update(cursor.last_instrument_id.as_uuid().as_bytes());
+                }
+            }
+            hash.update([u8::from(population.is_some())]);
+            if let Some(population) = &population {
+                hash.update(population.receipt_digest().bytes());
+            }
+            let receipt_digest = digest(hash.finalize().into());
+            transaction.commit()?;
+            Ok(MarketDataInstrumentEnumerationPage {
+                knowledge_at,
+                effective_at,
+                population,
+                requested_cursor: after.cloned(),
+                next_cursor,
+                receipt_digest,
+                retained_bytes,
+            })
+        })();
+        let progress_cleanup = clear_progress_handler(connection);
+        let busy_cleanup = connection.busy_timeout(self.catalog().busy_timeout);
+        let result = classify_operation(result, deadline, cancellation);
+        progress_cleanup?;
+        busy_cleanup?;
+        result
     }
 
     fn pin_market_data_instrument_population(
@@ -1190,10 +2429,24 @@ impl CatalogAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
-        const MAX_RETAINED_EXACT_MATCHES: usize = 2;
         check_operation(deadline, cancellation)?;
         let connection = &self.catalog().connection;
         install_progress_handler(connection, deadline, cancellation)?;
+        let result =
+            self.resolve_market_data_provider_identity_in_catalog(query, deadline, cancellation);
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
+
+    fn resolve_market_data_provider_identity_in_catalog(
+        &self,
+        query: MarketDataProviderIdentityQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
+        const MAX_RETAINED_EXACT_MATCHES: usize = 2;
+        check_operation(deadline, cancellation)?;
+        let connection = &self.catalog().connection;
         let result = (|| {
             let retrieval_limit = i64::try_from(MAX_RETAINED_EXACT_MATCHES.saturating_add(1))
                 .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?;
@@ -1302,7 +2555,6 @@ impl CatalogAuthority {
                 receipt_digest,
             })
         })();
-        clear_progress_handler(connection)?;
         classify_operation(result, deadline, cancellation)
     }
 
@@ -1499,6 +2751,199 @@ impl CatalogAuthority {
     }
 }
 
+fn reference_precommit_error(error: crate::IngestError) -> MarketDataInstrumentCatalogError {
+    match error {
+        crate::IngestError::Cancelled => MarketDataInstrumentCatalogError::Cancelled,
+        crate::IngestError::DeadlineExceeded => MarketDataInstrumentCatalogError::DeadlineExceeded,
+        error => MarketDataInstrumentCatalogError::PublicationAuthority(Box::new(error)),
+    }
+}
+
+fn validate_source_reference_input(
+    input: &MarketDataInstrumentSourceReferenceInput,
+) -> Result<(String, String, Timestamp), MarketDataInstrumentCatalogError> {
+    let sealed = input.capture.persisted_receipt();
+    let mut revision = Sha256::new();
+    revision.update(b"market-squawk/source-reference-revision/v1\0");
+    for digest in [
+        sealed.receipt_digest(),
+        input.official_listing.generation().generation_digest(),
+        input
+            .official_listing
+            .record_payload_evidence()
+            .content_digest(),
+        input.quote_currency_evidence.content_digest(),
+        input.issuer_identity_evidence.content_digest(),
+    ] {
+        if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
+            return Err(MarketDataInstrumentCatalogError::InvalidInput);
+        }
+        revision.update(digest.bytes());
+    }
+    let revision_hex = revision
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if input
+        .reference_evidence
+        .metadata_revision()
+        .as_source_identifier()
+        .as_str()
+        != format!("source-reference-sha256:{revision_hex}")
+        || input
+            .quote_currency_evidence
+            .version_pinned_locator()
+            .is_none()
+        || input
+            .issuer_identity_evidence
+            .version_pinned_locator()
+            .is_none()
+    {
+        return Err(MarketDataInstrumentCatalogError::InvalidInput);
+    }
+    for evidence in [
+        &input.quote_currency_evidence,
+        &input.issuer_identity_evidence,
+    ] {
+        let digest_hex = evidence
+            .content_digest()
+            .bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if evidence
+            .version_pinned_locator()
+            .is_none_or(|locator| locator.version().as_str() != format!("sha256:{digest_hex}"))
+        {
+            return Err(MarketDataInstrumentCatalogError::InvalidInput);
+        }
+    }
+    let capture = sealed.capture();
+    let [page] = capture.pages() else {
+        return Err(MarketDataInstrumentCatalogError::InvalidInput);
+    };
+    if capture.total_body_bytes() > 8 * 1024 * 1024
+        || capture.source_id() != input.source.source_id()
+        || capture.metadata_revision() != input.source.revision()
+        || page.http_status() != 200
+        || !matches!(&input.rights.basis, crate::RightsBasis::ReviewedTerms(_))
+        || input.rights.source_id != *input.source.source_id()
+        || input.rights.payload_digest != page.body_digest()
+        || input.rights.retrieved_at != page.received_at()
+        || input.reference_evidence.payload_evidence().content_digest() != page.body_digest()
+        || input.effective_interval.starts_at() != page.received_at()
+        || input.effective_interval.ends_at().is_some()
+        || input.official_listing.is_test_issue()
+        || input.official_listing.source_file().available_at() > page.received_at()
+        || input.official_listing.generation().published_at() > page.received_at()
+        || input.display_name.source_id() != input.source.source_id()
+        || input.display_name.source_evidence().content_digest() != page.body_digest()
+        || input
+            .display_name
+            .rights_policy()
+            .terms_reference()
+            .as_str()
+            != input.rights.basis.reference()
+    {
+        return Err(MarketDataInstrumentCatalogError::InvalidInput);
+    }
+    let mut cusip = None;
+    let mut ticker = None;
+    for identifier in &input.identifiers {
+        if identifier.assignment_verification() != AssignmentVerification::VerifiedAssigned
+            || identifier.rights_policy().entitlement()
+                == IdentifierEntitlement::UnknownOrRestricted
+            || identifier.rights_policy().terms_reference().as_str()
+                != input.rights.basis.reference()
+            || identifier.source_id() != input.source.source_id()
+            || identifier.source_evidence().content_digest() != page.body_digest()
+            || identifier.observed_at() != page.received_at()
+            || identifier.source_timestamp().is_some()
+            || identifier.validity() != input.effective_interval
+        {
+            return Err(MarketDataInstrumentCatalogError::InvalidInput);
+        }
+        match identifier.identifier() {
+            ExternalIdentifier::Cusip(value) if cusip.is_none() => cusip = Some(value.to_string()),
+            ExternalIdentifier::Ticker(value) if ticker.is_none() => {
+                ticker = Some(value.to_string())
+            }
+            _ => return Err(MarketDataInstrumentCatalogError::InvalidInput),
+        }
+    }
+    let cusip = cusip.ok_or(MarketDataInstrumentCatalogError::InvalidInput)?;
+    let ticker = ticker.ok_or(MarketDataInstrumentCatalogError::InvalidInput)?;
+    if input.official_listing.provider_symbol() != ticker
+        || input.provider_instrument_id.as_str() != ticker
+    {
+        return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict);
+    }
+    Ok((cusip, ticker, page.received_at()))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "exact source identities and the caller budget remain explicit"
+)]
+fn resolve_reference_identity(
+    transaction: &Transaction<'_>,
+    cusip: &str,
+    ticker: &str,
+    listing: &ListingReferenceRecord,
+    source_id: &SourceId,
+    provider_id: &ProviderInstrumentId,
+    effective_at: Timestamp,
+    budget: &mut ResultBudget,
+) -> Result<Option<MarketDataInstrumentRecord>, MarketDataInstrumentCatalogError> {
+    let sql = format!("SELECT DISTINCT {STORED_COLUMNS}
+        FROM market_data_instrument_current AS current_
+        JOIN market_data_instrument_revisions AS revisions ON revisions.revision_digest=current_.revision_digest
+        JOIN market_data_instrument_search_terms AS terms ON terms.revision_digest=current_.revision_digest
+        WHERE (terms.term_kind='external_identifier' AND terms.normalized_term=?1)
+           OR (terms.term_kind='venue_symbol' AND terms.normalized_term=?2 AND EXISTS (
+                SELECT 1 FROM json_each(revisions.definition_json, '$.venue_mappings') AS venue
+                WHERE json_extract(venue.value, '$.venue_id')=?3 AND json_extract(venue.value, '$.venue_symbol')=?4))
+           OR (terms.term_kind='provider_symbol' AND terms.source_id=?5 AND terms.display_term=?6)
+        ORDER BY revisions.instrument_id LIMIT 3");
+    let mut statement = transaction.prepare(&sql)?;
+    let rows = statement.query_map(
+        params![
+            normalize(cusip),
+            normalize(ticker),
+            listing.listing_venue().as_str(),
+            ticker,
+            source_id.as_str(),
+            provider_id.as_str()
+        ],
+        decode_stored_row,
+    )?;
+    let mut selected = None;
+    for row in rows {
+        let row = row?;
+        charge_row(&row, budget)?;
+        let record = rebuild_record(row)?;
+        let definition = record.definition();
+        let cusip_matches = definition.identifiers().iter().any(|identifier|
+            matches!(identifier.identifier(), ExternalIdentifier::Cusip(value) if value.as_str() == cusip)
+            && identifier.assignment_verification() == AssignmentVerification::VerifiedAssigned
+            && interval_contains(identifier.validity(), effective_at));
+        let listing_matches = definition.venue_mappings().iter().any(|mapping| {
+            mapping.venue_id() == listing.listing_venue()
+                && mapping.venue_symbol().as_str() == ticker
+        });
+        if selected.is_some() || !interval_contains(definition.effective_interval(), effective_at)
+            || !(cusip_matches || listing_matches)
+            || definition.identifiers().iter().any(|identifier|
+                matches!(identifier.identifier(), ExternalIdentifier::Cusip(value) if value.as_str() != cusip)
+                && identifier.assignment_verification() == AssignmentVerification::VerifiedAssigned
+                && interval_contains(identifier.validity(), effective_at))
+        { return Err(MarketDataInstrumentCatalogError::SourceIdentityConflict); }
+        selected = Some(record);
+    }
+    Ok(selected)
+}
+
 enum PopulationMember {
     Record(MarketDataInstrumentRecord),
     Excluded(MarketDataInstrumentPopulationExclusionReason),
@@ -1579,6 +3024,39 @@ fn prepare_definitions(
         });
     }
     Ok(prepared)
+}
+
+fn require_expected_market_data_position(
+    transaction: &Transaction<'_>,
+    expected: &MarketDataInstrumentCurrentExpectation,
+) -> Result<(), MarketDataInstrumentCatalogError> {
+    let current = transaction
+        .query_row(
+            "SELECT revisions.revision_digest, revisions.revision_sequence
+         FROM market_data_instrument_current AS current_
+         JOIN market_data_instrument_revisions AS revisions
+           ON revisions.revision_digest=current_.revision_digest
+         WHERE current_.instrument_id=?1",
+            [expected.instrument_id.to_string()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let current = current
+        .map(|(bytes, sequence)| {
+            let bytes: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| MarketDataInstrumentCatalogError::CorruptCatalog)?;
+            let sequence = u32::try_from(sequence)
+                .ok()
+                .filter(|sequence| (1..=MAX_REVISIONS_PER_INSTRUMENT).contains(sequence))
+                .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
+            Ok::<_, MarketDataInstrumentCatalogError>((digest(bytes), sequence))
+        })
+        .transpose()?;
+    if current != expected.position {
+        return Err(MarketDataInstrumentCatalogError::ReferencePositionConflict);
+    }
+    Ok(())
 }
 
 fn plan_publication(
@@ -1670,12 +3148,17 @@ fn plan_publication(
 
 fn insert_definition(
     transaction: &Transaction<'_>,
+    live_generation: &LiveProviderIdentityGenerations,
     prepared: &PreparedDefinition,
     sequence: u32,
     previous: Option<[u8; 32]>,
     identity_is_new: bool,
     published_at: Timestamp,
 ) -> Result<(), MarketDataInstrumentCatalogError> {
+    // Revoke only this instrument and any watched native collision before the first SQL write.
+    // Failed SQL can revoke affected handles conservatively; unrelated sources stay current.
+    // The sole catalog mutex serializes mutation with selection and durable precommit reads.
+    live_generation.invalidate(&prepared.definition)?;
     let definition = &prepared.definition;
     let instrument_id = definition.instrument_id().to_string();
     if identity_is_new {
@@ -1856,7 +3339,7 @@ fn push_term(
 }
 
 fn load_record_by_digest(
-    transaction: &Transaction<'_>,
+    transaction: &rusqlite::Connection,
     digest: [u8; 32],
 ) -> Result<Option<MarketDataInstrumentRecord>, MarketDataInstrumentCatalogError> {
     let row = transaction
@@ -2409,3 +3892,17 @@ FROM ranked
 WHERE match_position=1
 ORDER BY match_rank, instrument_id
 LIMIT ?5";
+
+struct DefinitionByteCounter(usize);
+impl std::io::Write for DefinitionByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("definition size overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

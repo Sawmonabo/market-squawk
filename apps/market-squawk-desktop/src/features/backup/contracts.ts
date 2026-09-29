@@ -99,10 +99,15 @@ export const programRollbackPreviewSchema = previewReferenceSchema.extend({
   }),
 })
 
+const jobUnsignedIntegerSchema = losslessIntegerSchema.refine(
+  (value) => /^(?:0|[1-9]\d{0,19})$/.test(value) && BigInt(value) <= 18_446_744_073_709_551_615n,
+  "Expected a canonical unsigned job integer.",
+)
+
 export const jobReceiptSchema = z.object({
   jobId: z.string().uuid(),
-  generation: losslessIntegerSchema,
-  sequence: losslessIntegerSchema,
+  generation: jobUnsignedIntegerSchema.refine((value) => value !== "0", "Expected a positive job generation."),
+  sequence: jobUnsignedIntegerSchema,
   state: z.enum([
     "queued",
     "preparing",

@@ -1,5 +1,8 @@
 //! Capability-confined durable checkpoint publication and opaque persistence receipts.
 
+mod backup;
+pub use backup::{PaperCheckpointBackup, PaperCheckpointBackupLease, PaperPortfolioReplay};
+
 use std::io::{Read as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
@@ -27,16 +30,9 @@ const CURRENT_MANIFEST_PATH: &str = "paper-checkpoints/v1/current.json";
 const RUN_DIRTY_PATH: &str = "paper-checkpoints/v1/run-dirty.json";
 const CHECKPOINT_NAMESPACE: &str = "paper-checkpoints";
 const REPOSITORY_LOCK_PATH: &str = "paper-checkpoints/.repository.lock";
-const LEGACY_REPOSITORY_LOCK_PATH: &str = ".market-squawk-paper-checkpoints.lock";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const RUN_DIRTY_SCHEMA_VERSION: u32 = 1;
 const MAXIMUM_RUN_DIRTY_BYTES: usize = 4 * 1024;
-
-#[derive(Debug)]
-struct RepositoryWriterLocks {
-    _legacy: std::fs::File,
-    _current: std::fs::File,
-}
 
 /// Single-writer durable publisher bound to one artifact root and paper configuration.
 #[derive(Debug)]
@@ -46,9 +42,10 @@ pub struct PaperCheckpointRepository {
     maximum_bytes: NonZeroUsize,
     repository_id: [u8; 32],
     generation: u64,
+    configuration_history: [u8; 32],
     recovery: Option<PaperCheckpointRecovery>,
     dirty_authority: Option<[u8; 32]>,
-    _writer_locks: RepositoryWriterLocks,
+    _writer_lock: std::fs::File,
 }
 
 impl PaperCheckpointRepository {
@@ -59,7 +56,7 @@ impl PaperCheckpointRepository {
         maximum_bytes: NonZeroUsize,
     ) -> Result<Self, PaperCheckpointRepositoryError> {
         let directory = root.try_clone_directory()?;
-        let writer_locks = acquire_repository_writer(&directory)?;
+        let writer_lock = acquire_repository_writer(&directory)?;
         cleanup_stale_staging(&directory)?;
         reject_unclean_run(&directory)?;
         if let Some(recovered) = read_current_manifest(&directory, &config, maximum_bytes.get())? {
@@ -69,12 +66,13 @@ impl PaperCheckpointRepository {
                 maximum_bytes,
                 repository_id: recovered.repository_id,
                 generation: recovered.generation.get(),
+                configuration_history: recovered.configuration_history,
                 recovery: Some(PaperCheckpointRecovery {
                     checkpoint: recovered.checkpoint,
                     accounts: recovered.accounts,
                 }),
                 dirty_authority: None,
-                _writer_locks: writer_locks,
+                _writer_lock: writer_lock,
             });
         }
         let mut nonce = [0_u8; 32];
@@ -94,10 +92,131 @@ impl PaperCheckpointRepository {
             maximum_bytes,
             repository_id,
             generation: 0,
+            configuration_history: [0; 32],
             recovery: None,
             dirty_authority: None,
-            _writer_locks: writer_locks,
+            _writer_lock: writer_lock,
         })
+    }
+
+    /// Creates or reopens the sole original cash-only ledger through this repository's writer.
+    /// No worker, market/session evidence, execution receipt or order authority is created.
+    pub fn initialize_cash_account(
+        &mut self,
+        account_id: AccountId,
+        cash: Money,
+        opened_at: Timestamp,
+    ) -> Result<PaperPortfolioReplay, PaperCheckpointRepositoryError> {
+        if self.config.input().session_policy.calendar().is_some()
+            || cash.currency() != self.config.input().reporting_currency
+            || cash.amount() <= rust_decimal::Decimal::ZERO
+            || self.dirty_authority.is_some()
+        {
+            return Err(PaperCheckpointRepositoryError::ConfigurationMismatch);
+        }
+        if self.recovery.is_none() {
+            if self.generation != 0 {
+                return Err(PaperCheckpointRepositoryError::AuthorityChanged);
+            }
+            let zero = Money::new(rust_decimal::Decimal::ZERO, cash.currency());
+            let mut ledger = crate::PaperLedger::try_new(
+                self.config.ledger_config(),
+                [crate::PaperAccountBootstrap {
+                    account_id,
+                    revision: NonZeroU64::MIN,
+                    eligible: true,
+                    cash: vec![cash],
+                    capital: cash,
+                    peak_capital: cash,
+                    gross_exposure: zero,
+                    realized_pnl: zero,
+                    realized_loss: zero,
+                    positions: Vec::new(),
+                    position_cost_basis: Vec::new(),
+                }],
+            )
+            .map_err(PaperCheckpointError::Ledger)?;
+            ledger
+                .retain_action_origin(opened_at)
+                .map_err(PaperCheckpointError::Ledger)?;
+            let checkpoint = PaperExecutionCheckpoint {
+                schema_version: PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION,
+                configuration_digest: self.config.digest(),
+                complete: true,
+                sequence: 0,
+                reconciliation_required: false,
+                orders: Default::default(),
+                fills: Vec::new(),
+                archived_orders: Default::default(),
+                archived_fills: Vec::new(),
+                durable_sequence: 0,
+                accepted_repository_id: [0; 32],
+                accepted_repository_generation: 0,
+                reconciled_orders: Default::default(),
+                acknowledged_reconciliation_batches: Vec::new(),
+                ledger,
+                idempotency: Default::default(),
+            };
+            let replay = checkpoint
+                .reconciled_accounts_for_recovery()?
+                .into_iter()
+                .map(|state| {
+                    PaperAccountReplaySnapshot::from_reconciled_state(
+                        state,
+                        AccountIdempotencyBootstrap::empty(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.persist_with_replay(&checkpoint, &replay)?;
+            let directory = self.root.try_clone_directory()?;
+            let recovered =
+                read_current_manifest(&directory, &self.config, self.maximum_bytes.get())?
+                    .ok_or(PaperCheckpointRepositoryError::PartialState)?;
+            self.recovery = Some(PaperCheckpointRecovery {
+                checkpoint: recovered.checkpoint,
+                accounts: recovered.accounts,
+            });
+        }
+        let checkpoint = &self
+            .recovery
+            .as_ref()
+            .ok_or(PaperCheckpointRepositoryError::PartialState)?
+            .checkpoint;
+        let replay =
+            PaperPortfolioReplay::capture(checkpoint, &self.config, self.maximum_bytes.get())?;
+        let (_, original) = replay
+            .snapshot()
+            .original_accounts()
+            .ok_or(PaperCheckpointRepositoryError::InvalidReplay)?;
+        if original.len() != 1 || original[0].account_id != account_id || original[0].cash != [cash]
+        {
+            return Err(PaperCheckpointRepositoryError::ConfigurationMismatch);
+        }
+        Ok(replay)
+    }
+
+    /// Returns the original user-funded cash assumption, never the current settled balance.
+    pub fn original_account_cash(
+        &self,
+        account: AccountId,
+    ) -> Result<Money, PaperCheckpointRepositoryError> {
+        let checkpoint = &self
+            .recovery
+            .as_ref()
+            .ok_or(PaperCheckpointRepositoryError::PartialState)?
+            .checkpoint;
+        let (_, accounts) = checkpoint
+            .ledger
+            .action_origin_snapshot()
+            .ok_or(PaperCheckpointRepositoryError::InvalidReplay)?;
+        let original = accounts
+            .iter()
+            .find(|item| item.account_id == account)
+            .ok_or(PaperCheckpointRepositoryError::InvalidReplay)?;
+        if original.cash.len() != 1 {
+            return Err(PaperCheckpointRepositoryError::InvalidReplay);
+        }
+        Ok(original.cash[0])
     }
 
     /// Transfers the exact current checkpoint and replay fence discovered at repository open.
@@ -222,13 +341,35 @@ impl PaperCheckpointRepository {
         &mut self,
         checkpoint: &PaperExecutionCheckpoint,
         account_replay: &[PaperAccountReplaySnapshot],
+        publication_checkpoint: F,
+    ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError>
+    where
+        F: FnMut(PaperCheckpointPublicationPoint) -> Result<(), PaperCheckpointRepositoryError>,
+    {
+        let configuration = self.config.clone();
+        self.persist_with_configuration(
+            checkpoint,
+            account_replay,
+            &configuration,
+            self.configuration_history,
+            publication_checkpoint,
+        )
+    }
+
+    // The stopped owner advances calendar policy while current authority still uses self.config.
+    fn persist_with_configuration<F>(
+        &mut self,
+        checkpoint: &PaperExecutionCheckpoint,
+        account_replay: &[PaperAccountReplaySnapshot],
+        configuration: &PaperExecutionConfig,
+        configuration_history: [u8; 32],
         mut publication_checkpoint: F,
     ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError>
     where
         F: FnMut(PaperCheckpointPublicationPoint) -> Result<(), PaperCheckpointRepositoryError>,
     {
         if checkpoint.schema_version() != PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
-            || checkpoint.configuration_digest() != self.config.digest()
+            || checkpoint.configuration_digest() != configuration.digest()
             || !checkpoint.complete()
         {
             return Err(PaperCheckpointRepositoryError::ConfigurationMismatch);
@@ -302,21 +443,22 @@ impl PaperCheckpointRepository {
             return Err(PaperCheckpointRepositoryError::VerificationFailed);
         }
         let decoded =
-            PaperExecutionCheckpoint::decode(self.config.clone(), &persisted, maximum_bytes)?;
+            PaperExecutionCheckpoint::decode(configuration.clone(), &persisted, maximum_bytes)?;
         if decoded != *checkpoint {
             return Err(PaperCheckpointRepositoryError::VerificationFailed);
         }
 
-        let manifest = CurrentManifestWire::try_new(
+        let mut manifest = CurrentManifestWire::try_new(
             self.repository_id,
             generation,
-            self.config.digest(),
+            configuration,
             checkpoint,
             recovery_digest,
             artifact_digest,
             artifact_reference.clone(),
             account_replay,
         )?;
+        manifest.configuration_history = configuration_history;
         // Burn the generation before the atomic current-name replacement. If a later durability
         // or read-back barrier fails, this process can never reissue that generation for different
         // bytes; reopening recovers the manifest generation that actually became current.
@@ -332,7 +474,7 @@ impl PaperCheckpointRepository {
         Ok(PaperCheckpointReceipt {
             repository_id: self.repository_id,
             generation,
-            configuration_digest: self.config.digest(),
+            configuration_digest: configuration.digest(),
             sequence: checkpoint.sequence(),
             recovery_digest,
             artifact_digest,
@@ -359,7 +501,8 @@ impl PaperCheckpointRepository {
         match read_current_manifest(directory, &self.config, self.maximum_bytes.get())? {
             Some(current)
                 if current.repository_id == self.repository_id
-                    && current.generation.get() == self.generation =>
+                    && current.generation.get() == self.generation
+                    && current.configuration_history == self.configuration_history =>
             {
                 Ok(())
             }
@@ -487,6 +630,8 @@ struct CurrentManifestWire {
     repository_id: [u8; 32],
     generation: NonZeroU64,
     configuration_digest: [u8; 32],
+    configuration: backup::ConfigWire,
+    configuration_history: [u8; 32],
     sequence: u64,
     recovery_digest: [u8; 32],
     artifact_digest: [u8; 32],
@@ -549,7 +694,7 @@ impl CurrentManifestWire {
     fn try_new(
         repository_id: [u8; 32],
         generation: NonZeroU64,
-        configuration_digest: [u8; 32],
+        configuration: &PaperExecutionConfig,
         checkpoint: &PaperExecutionCheckpoint,
         recovery_digest: [u8; 32],
         artifact_digest: [u8; 32],
@@ -604,7 +749,9 @@ impl CurrentManifestWire {
             schema_version: MANIFEST_SCHEMA_VERSION,
             repository_id,
             generation,
-            configuration_digest,
+            configuration_digest: configuration.digest(),
+            configuration: backup::ConfigWire::from_config(configuration),
+            configuration_history: [0; 32],
             sequence: checkpoint.sequence(),
             recovery_digest,
             artifact_digest,
@@ -615,6 +762,7 @@ impl CurrentManifestWire {
 }
 
 struct OpenedRecovery {
+    configuration_history: [u8; 32],
     repository_id: [u8; 32],
     generation: NonZeroU64,
     checkpoint: PaperExecutionCheckpoint,
@@ -720,8 +868,38 @@ fn read_current_manifest(
     if <[u8; 32]>::from(Sha256::digest(&persisted)) != manifest.artifact_digest {
         return Err(PaperCheckpointRepositoryError::VerificationFailed);
     }
+    backup::read_configuration_history(directory, manifest.configuration_history, maximum_bytes)?;
+    decode_manifest_content(config, manifest, &persisted, maximum_bytes).map(Some)
+}
+
+fn decode_manifest_content(
+    config: &PaperExecutionConfig,
+    manifest: CurrentManifestWire,
+    persisted: &[u8],
+    maximum_bytes: usize,
+) -> Result<OpenedRecovery, PaperCheckpointRepositoryError> {
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION
+        || manifest.configuration.to_config()?.digest() != config.digest()
+        || manifest.configuration_digest != config.digest()
+        || manifest.repository_id == [0; 32]
+        || manifest.artifact_digest == [0; 32]
+        || manifest.recovery_digest == [0; 32]
+        || <[u8; 32]>::from(Sha256::digest(persisted)) != manifest.artifact_digest
+    {
+        return Err(PaperCheckpointRepositoryError::InvalidManifest);
+    }
+    let digest_hex = hex_bytes(&manifest.artifact_digest)?;
+    if manifest.artifact_reference
+        != format!(
+            "{CHECKPOINT_OBJECT_ROOT}/{}/{}.json",
+            &digest_hex[..2],
+            digest_hex
+        )
+    {
+        return Err(PaperCheckpointRepositoryError::InvalidManifest);
+    }
     let mut checkpoint =
-        PaperExecutionCheckpoint::decode(config.clone(), &persisted, maximum_bytes)?;
+        PaperExecutionCheckpoint::decode(config.clone(), persisted, maximum_bytes)?;
     if checkpoint.sequence() != manifest.sequence
         || checkpoint.configuration_digest() != manifest.configuration_digest
         || checkpoint.recovery_input_digest()? != manifest.recovery_digest
@@ -770,12 +948,13 @@ fn read_current_manifest(
     {
         return Err(PaperCheckpointRepositoryError::InvalidReplay);
     }
-    Ok(Some(OpenedRecovery {
+    Ok(OpenedRecovery {
+        configuration_history: manifest.configuration_history,
         repository_id: manifest.repository_id,
         generation: manifest.generation,
         checkpoint,
         accounts: accounts.into_boxed_slice(),
-    }))
+    })
 }
 
 fn reject_unclean_run(directory: &Dir) -> Result<(), PaperCheckpointRepositoryError> {
@@ -868,17 +1047,9 @@ fn publish_current_manifest(
 
 fn acquire_repository_writer(
     directory: &Dir,
-) -> Result<RepositoryWriterLocks, PaperCheckpointRepositoryError> {
-    // Retain the legacy lock for the complete writer lifetime. Older Market Squawk binaries know
-    // only this root-level name, so deleting it would let an old and new writer mutate the same
-    // checkpoint namespace concurrently.
-    let legacy = open_and_lock_repository_writer(directory, LEGACY_REPOSITORY_LOCK_PATH, true)?;
+) -> Result<std::fs::File, PaperCheckpointRepositoryError> {
     ensure_checkpoint_namespace(directory)?;
-    let current = open_and_lock_repository_writer(directory, REPOSITORY_LOCK_PATH, true)?;
-    Ok(RepositoryWriterLocks {
-        _legacy: legacy,
-        _current: current,
-    })
+    open_and_lock_repository_writer(directory, REPOSITORY_LOCK_PATH, true)
 }
 
 fn open_and_lock_repository_writer(
@@ -1356,6 +1527,12 @@ pub enum PaperCheckpointRepositoryError {
     UnstabilizedCheckpoint,
     #[error("paper checkpoint configuration does not match the bound repository")]
     ConfigurationMismatch,
+    #[error("paper session advancement requires a non-overlapping later session from the same venue calendar policy")]
+    InvalidSessionAdvance,
+    #[error("retained DAY orders require all 4096 calendar session slots; original order/archive retention must be resolved before session advancement")]
+    SessionRetentionCapacity,
+    #[error("retained paper audit configuration history exceeds the repository byte bound; audit retention must be resolved before session advancement")]
+    ConfigurationHistoryCapacity,
     #[error("quarantined paper state cannot be published as a clean recovery checkpoint")]
     QuarantinedCheckpoint,
     #[error("paper checkpoint repository bounded allocation failed")]
@@ -1862,7 +2039,7 @@ mod tests {
     use super::read_bounded_regular;
     use super::{
         CHECKPOINT_OBJECT_ROOT, CURRENT_MANIFEST_PATH, CurrentManifestWire,
-        LEGACY_REPOSITORY_LOCK_PATH, PaperAccountReplaySnapshot, PaperCheckpointPublicationPoint,
+        PaperAccountReplaySnapshot, PaperCheckpointPublicationPoint,
         PaperCheckpointReceipt, PaperCheckpointRepository, PaperCheckpointRepositoryError,
         REPOSITORY_LOCK_PATH, hex_bytes,
     };
@@ -1870,6 +2047,7 @@ mod tests {
     use crate::{
         FeeSchedule, PaperAccountBootstrap, PaperExecutionCheckpoint, PaperExecutionConfig,
         PaperExecutionConfigInput, PaperExposureValuation, PaperLedger, PaperOrderLifecycle,
+        PaperPortfolioReplay,
         PaperVenueSession, PaperVenueSessionCalendar,
     };
 
@@ -1918,7 +2096,163 @@ mod tests {
             let recovered = repository.persist_with_replay(&checkpoint, &replay)?;
             assert_eq!(recovered.artifact_digest(), receipt.artifact_digest());
             assert_eq!(recovered.artifact_reference(), receipt.artifact_reference());
+            drop(repository);
+            let mut reopened = PaperCheckpointRepository::open_stopped(
+                paths.artifacts()?.clone(),
+                NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?,
+            )?
+            .ok_or("persisted checkpoint missing")?;
+            assert_eq!(
+                reopened.original_config().digest(),
+                checkpoint.configuration_digest()
+            );
+            assert_eq!(
+                reopened
+                    .take_recovery()
+                    .ok_or("recovery missing")?
+                    .checkpoint()
+                    .sequence(),
+                checkpoint.sequence()
+            );
         }
+        // The same durable owner initializes real virtual cash without admitting a worker.
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("cash-only"))?;
+        let maximum = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+        let (active, fixture) = checkpoint_fixture()?;
+        let account = fixture.reconciled_accounts_for_recovery()?[0].account_id();
+        let cash = Money::new(
+            rust_decimal::Decimal::new(25_000, 0),
+            active.input().reporting_currency,
+        );
+        let mut input = active.input().clone();
+        input.session_policy = crate::PaperExecutionSessionPolicy::AccountOnly;
+        input.maximum_mark_age_nanos = 7;
+        let dormant = PaperExecutionConfig::try_new(input)?;
+        let mut repository = PaperCheckpointRepository::try_new(
+            paths.artifacts()?.clone(),
+            dormant.clone(),
+            maximum,
+        )?;
+        let opened_at = Timestamp::from_unix_nanos(42);
+        let original = repository.initialize_cash_account(account, cash, opened_at)?;
+        assert_eq!(original.available_cash(account, cash.currency())?, cash);
+        assert_eq!(original.snapshot().cash()[0].balance(), cash);
+        assert_eq!(
+            original
+                .snapshot()
+                .original_accounts()
+                .ok_or("origin absent")?
+                .0,
+            opened_at
+        );
+        assert!(original.snapshot().orders().is_empty());
+        assert!(original.snapshot().fills().is_empty());
+        assert!(repository.initialize_cash_account(account,
+            Money::new(cash.amount() + rust_decimal::Decimal::ONE, cash.currency()),
+            Timestamp::from_unix_nanos(98)).is_err());
+        let again =
+            repository.initialize_cash_account(account, cash, Timestamp::from_unix_nanos(99))?;
+        assert_eq!(
+            again.encode(maximum.get())?,
+            original.encode(maximum.get())?
+        );
+        let checkpoint = repository
+            .recovery
+            .as_ref()
+            .ok_or("cash recovery absent")?
+            .checkpoint
+            .clone();
+        let mut forged = checkpoint.clone();
+        forged.sequence = 1;
+        assert!(
+            PaperExecutionCheckpoint::decode(
+                dormant.clone(),
+                &forged.encode(maximum.get())?,
+                maximum.get()
+            )
+            .is_err()
+        );
+        let (_, accounts) = original
+            .snapshot()
+            .original_accounts()
+            .ok_or("origin absent")?;
+        assert!(matches!(
+            crate::PaperExecutionRuntime::try_start(
+                dormant.clone(),
+                accounts.to_vec(),
+                &repository,
+                market_squawk_execution::ExecutionTaskReaper::try_new(NonZeroUsize::MIN)?,
+            ),
+            Err(crate::PaperStartError::InvalidCheckpoint)
+        ));
+        assert!(matches!(crate::PaperExecutionRuntime::try_start_from_checkpoint(
+            dormant.clone(), checkpoint.clone(), &repository,
+            market_squawk_execution::ExecutionTaskReaper::try_new(NonZeroUsize::MIN)?,
+        ), Err(crate::PaperStartError::InvalidCheckpoint)));
+        drop(repository);
+        let mut reopened =
+            PaperCheckpointRepository::open_stopped(paths.artifacts()?.clone(), maximum)?
+                .ok_or("cash account absent")?;
+        let replay =
+            reopened.initialize_cash_account(account, cash, Timestamp::from_unix_nanos(100))?;
+        assert_eq!(
+            replay.encode(maximum.get())?,
+            original.encode(maximum.get())?
+        );
+        drop(reopened);
+        let lease = PaperCheckpointRepository::retain_stopped_backup(paths.artifacts()?, maximum)?;
+        let backup = lease.checkpoint().ok_or("cash backup absent")?;
+        let restore_paths = LocalPaths::prepare(directory.path().join("restored-cash"))?;
+        let mut restored = PaperCheckpointRepository::restore_fresh(
+            restore_paths.artifacts()?.clone(),
+            maximum,
+            backup.manifest_bytes(),
+            backup.checkpoint_bytes(),
+            backup.configuration_history_bytes(),
+        )?;
+        let restored_cash =
+            restored.initialize_cash_account(account, cash, Timestamp::from_unix_nanos(101))?;
+        assert_eq!(
+            restored_cash.encode(maximum.get())?,
+            original.encode(maximum.get())?
+        );
+        let admitted = active
+            .input()
+            .session_policy
+            .calendar()
+            .ok_or("fixture session absent")?
+            .clone();
+        assert_eq!(&admitted, active.input().session_policy.calendar().ok_or("fixture session absent")?);
+        let advanced = restored.bind_execution_policy(active.clone())?;
+        assert_eq!(advanced.original_config().input().maximum_mark_age_nanos, active.input().maximum_mark_age_nanos);
+        assert_eq!(advanced.original_account_cash(account)?, cash);
+        let advanced_checkpoint = &advanced
+            .recovery
+            .as_ref()
+            .ok_or("advanced recovery absent")?
+            .checkpoint;
+        let advanced_replay = PaperPortfolioReplay::capture(
+            advanced_checkpoint,
+            advanced.original_config(),
+            maximum.get(),
+        )?;
+        assert_eq!(
+            advanced_replay.snapshot().original_accounts(),
+            original.snapshot().original_accounts()
+        );
+        assert_eq!(
+            advanced_replay.available_cash(account, cash.currency())?,
+            cash
+        );
+        assert!(
+            advanced
+                .original_config()
+                .input()
+                .session_policy
+                .calendar()
+                .is_some()
+        );
         Ok(())
     }
 
@@ -2004,22 +2338,11 @@ mod tests {
         let paths = LocalPaths::prepare(directory.path().join("data"))?;
         let (config, _) = checkpoint_fixture()?;
         let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
-        std::fs::write(
-            paths.artifacts()?.root().join(LEGACY_REPOSITORY_LOCK_PATH),
-            [],
-        )?;
         let repository = PaperCheckpointRepository::try_new(
             paths.artifacts()?.clone(),
             config.clone(),
             maximum_bytes,
         )?;
-        assert!(
-            paths
-                .artifacts()?
-                .root()
-                .join(LEGACY_REPOSITORY_LOCK_PATH)
-                .is_file()
-        );
         assert!(
             paths
                 .artifacts()?
@@ -2038,11 +2361,11 @@ mod tests {
         ));
 
         drop(repository);
-        let legacy = std::fs::OpenOptions::new()
+        let competing_writer = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(paths.artifacts()?.root().join(LEGACY_REPOSITORY_LOCK_PATH))?;
-        legacy.try_lock_exclusive()?;
+            .open(paths.artifacts()?.root().join(REPOSITORY_LOCK_PATH))?;
+        competing_writer.try_lock_exclusive()?;
         assert!(matches!(
             PaperCheckpointRepository::try_new(
                 paths.artifacts()?.clone(),
@@ -2051,7 +2374,7 @@ mod tests {
             ),
             Err(PaperCheckpointRepositoryError::RepositoryAlreadyOwned)
         ));
-        drop(legacy);
+        drop(competing_writer);
         let _reopened =
             PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
         Ok(())
@@ -2098,16 +2421,75 @@ mod tests {
     fn every_manifest_advance_preserves_the_explicit_replay_image() -> TestResult {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path().join("data"))?;
-        let (config, checkpoint) = checkpoint_fixture()?;
+        let (fixture_config, mut checkpoint) = checkpoint_fixture()?;
+        let session_calendar = |name: &str, open: i64, close: i64| {
+            PaperVenueSessionCalendar::try_new(
+                SourceIdentifier::try_from("original-policy")?,
+                RuleVersion::new(1)?,
+                VenueId::try_from("paper")?,
+                "UTC",
+                vec![PaperVenueSession::try_new(
+                    SourceIdentifier::try_from(name)?,
+                    Timestamp::from_unix_nanos(open),
+                    Timestamp::from_unix_nanos(close),
+                )?],
+            )
+            .map_err(Box::<dyn std::error::Error>::from)
+        };
+        let mut input = fixture_config.input().clone();
+        input.session_policy = crate::PaperExecutionSessionPolicy::Venue(session_calendar(
+            "original-session",
+            0,
+            100,
+        )?);
+        let config = PaperExecutionConfig::try_new(input)?;
+        checkpoint.configuration_digest = config.digest();
+        let target = OrderTargetReference::try_new("proposal.original", NonZeroU64::MIN, [13; 32])?;
+        let mut order = archived_order(Some(target))?;
+        order.time_in_force = TimeInForce::Day;
+        let account_id = order.account_id;
+        let instrument_id = order.terms.instrument_id();
+        let order_id = order.order_id;
+        checkpoint.sequence = 1;
+        checkpoint.durable_sequence = 1;
+        checkpoint.reconciled_orders.insert(order_id);
+        checkpoint.archived_orders.insert(order_id, order.clone());
+        let usd = Currency::try_from("USD")?;
+        checkpoint.ledger = PaperLedger::try_new(
+            config.ledger_config(),
+            [PaperAccountBootstrap {
+                account_id,
+                revision: NonZeroU64::MIN,
+                eligible: true,
+                cash: vec![Money::new(Decimal::new(900, 0), usd)],
+                capital: Money::new(Decimal::new(1_000, 0), usd),
+                peak_capital: Money::new(Decimal::new(1_000, 0), usd),
+                gross_exposure: Money::new(Decimal::new(100, 0), usd),
+                realized_loss: Money::new(Decimal::ZERO, usd),
+                realized_pnl: Money::new(Decimal::ZERO, usd),
+                positions: vec![(instrument_id, 1)],
+                position_cost_basis: vec![(instrument_id, Money::new(Decimal::new(100, 0), usd))],
+            }],
+        )?;
+        checkpoint
+            .ledger
+            .retain_action_origin(Timestamp::from_unix_nanos(1))?;
+        checkpoint.ledger.mark_checkpoint_fixture(
+            order.terms,
+            Timestamp::from_unix_nanos(30),
+            PriceTicks::new(10_000),
+            PriceTicks::new(10_001),
+        )?;
         let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
         let mut repository = PaperCheckpointRepository::try_new(
             paths.artifacts()?.clone(),
             config.clone(),
             maximum_bytes,
         )?;
-        let state = checkpoint.reconciled_accounts_for_recovery()?[0].clone();
+        let state = checkpoint.reconciled_accounts_for_recovery()
+            .map_err(|error| format!("marked recovery fixture: {error}"))?[0].clone();
         let replay = [PaperAccountReplaySnapshot::from_reconciled_state(
-            state,
+            state.clone(),
             AccountIdempotencyBootstrap::try_new(
                 NonZeroU64::new(7).ok_or("zero replay revision")?,
                 vec![AccountIdempotencyTombstone::new(
@@ -2118,18 +2500,153 @@ mod tests {
                 )],
             )?,
         )];
-
         repository.persist_with_replay(&checkpoint, &replay)?;
         repository.persist_with_replay(&checkpoint, &replay)?;
+        let repository_id = repository.binding_identity();
         drop(repository);
-
-        let mut reopened =
-            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
-        let recovered = reopened.take_recovery().ok_or("missing recovery")?;
+        let reopen = || -> Result<PaperCheckpointRepository, Box<dyn std::error::Error>> {
+            PaperCheckpointRepository::open_stopped(paths.artifacts()?.clone(), maximum_bytes)?
+                .ok_or_else(|| "missing recovery".into())
+        };
+        let repository: PaperCheckpointRepository = reopen()?;
+        assert!(matches!(
+            repository.advance_session(session_calendar("overlap", 50, 150)?),
+            Err(PaperCheckpointRepositoryError::InvalidSessionAdvance)
+        ));
+        let mut repository: PaperCheckpointRepository = reopen()?;
+        let mut pending = order.clone();
+        pending.lifecycle = PaperOrderLifecycle::try_new(pending.quantity)?;
+        pending.lifecycle.accept(1)?;
+        repository
+            .recovery
+            .as_mut()
+            .ok_or("missing recovery")?
+            .checkpoint
+            .orders
+            .insert(order_id, pending);
+        assert!(matches!(
+            repository.advance_session(session_calendar("next-session", 200, 300)?),
+            Err(PaperCheckpointRepositoryError::UnstabilizedCheckpoint)
+        ));
+        let mut repository: PaperCheckpointRepository = reopen()?;
+        repository = repository.advance_session(session_calendar("next-session", 200, 300)?)?;
+        let intermediate_config = repository.original_config().clone();
+        repository = repository.advance_session(session_calendar("later-session", 400, 500)?)?;
+        // The unused intermediate day leaves active policy, while its exact audit policy is
+        // retained in immutable history. The original DAY order's session remains unchanged.
+        let generation = repository.generation;
+        assert_eq!(repository.binding_identity(), repository_id);
+        assert_eq!(
+            repository
+                .original_config()
+                .input()
+                .session_policy
+                .calendar()
+                .ok_or("missing session")?
+                .sessions()
+                .len(),
+            2
+        );
+        assert_eq!(
+            repository
+                .original_config()
+                .input()
+                .session_policy
+                .calendar()
+                .ok_or("missing session")?
+                .sessions()[0],
+            config
+                .input()
+                .session_policy
+                .calendar()
+                .ok_or("missing session")?
+                .sessions()[0]
+        );
+        let recovered = repository.recovery.as_ref().ok_or("missing recovery")?;
         assert_eq!(recovered.accounts().len(), replay.len());
+        assert_eq!(recovered.accounts()[0].state(), &state);
         assert_eq!(
             recovered.accounts()[0].idempotency(),
             replay[0].idempotency()
+        );
+        assert_eq!(recovered.checkpoint.ledger, checkpoint.ledger);
+        assert_eq!(
+            recovered.checkpoint.archived_orders.get(&order_id),
+            Some(&order)
+        );
+        let mut expected = checkpoint.clone();
+        expected.configuration_digest = repository.original_config().digest();
+        expected.bind_current_manifest(
+            repository_id,
+            NonZeroU64::new(generation).ok_or("zero generation")?,
+        );
+        assert_eq!(recovered.checkpoint(), &expected);
+        repository = repository.advance_session(session_calendar("same-session", 400, 500)?)?;
+        assert_eq!(repository.generation, generation);
+        drop(repository);
+        let lease =
+            PaperCheckpointRepository::retain_stopped_backup(paths.artifacts()?, maximum_bytes)?;
+        lease.revalidate()?;
+        let backup = lease.checkpoint().ok_or("missing backup")?;
+        let history: serde_json::Value =
+            serde_json::from_slice(backup.configuration_history_bytes())?;
+        let objects: Vec<Vec<u8>> = serde_json::from_value(history["objects"].clone())?;
+        assert_eq!(objects.len(), 2);
+        let intermediate: serde_json::Value = serde_json::from_slice(&objects[0])?;
+        assert_eq!(
+            intermediate["configuration"],
+            serde_json::to_value(super::backup::ConfigWire::from_config(&intermediate_config))?
+        );
+        let historical: serde_json::Value = serde_json::from_slice(&objects[1])?;
+        let historical_digest: [u8; 32] =
+            serde_json::from_value(historical["configuration_digest"].clone())?;
+        assert_eq!(historical_digest, config.digest());
+        assert_eq!(
+            historical["configuration"],
+            serde_json::to_value(super::backup::ConfigWire::from_config(&config))?
+        );
+        let mut damaged_objects = objects.clone();
+        damaged_objects[1][0] ^= 1;
+        let damaged_history = serde_json::to_vec(&serde_json::json!({"objects": damaged_objects}))?;
+        assert!(
+            PaperCheckpointRepository::backup_source_reference(
+                maximum_bytes,
+                backup.manifest_bytes(),
+                backup.checkpoint_bytes(),
+                &damaged_history,
+            )
+            .is_err()
+        );
+        let restored_paths = LocalPaths::prepare(directory.path().join("restored"))?;
+        let mut restored = PaperCheckpointRepository::restore_fresh(
+            restored_paths.artifacts()?.clone(),
+            maximum_bytes,
+            backup.manifest_bytes(),
+            backup.checkpoint_bytes(),
+            backup.configuration_history_bytes(),
+        )?;
+        assert_eq!(restored.binding_identity(), repository_id);
+        assert_eq!(restored.generation, generation);
+        let recovered = restored
+            .take_recovery()
+            .ok_or("missing restored recovery")?;
+        assert_eq!(recovered.checkpoint(), &expected);
+        assert_eq!(recovered.accounts()[0].state(), &state);
+        assert_eq!(
+            recovered.accounts()[0].idempotency(),
+            replay[0].idempotency()
+        );
+        drop(restored);
+        let restored_lease = PaperCheckpointRepository::retain_stopped_backup(
+            restored_paths.artifacts()?,
+            maximum_bytes,
+        )?;
+        assert_eq!(
+            restored_lease
+                .checkpoint()
+                .ok_or("missing restored backup")?
+                .configuration_history_bytes(),
+            backup.configuration_history_bytes()
         );
         Ok(())
     }
@@ -2212,7 +2729,7 @@ mod tests {
         let legacy_manifest = CurrentManifestWire::try_new(
             legacy_repository_id,
             legacy_generation,
-            config.digest(),
+            &config,
             &legacy_checkpoint,
             legacy_digest,
             legacy_digest,
@@ -2226,31 +2743,14 @@ mod tests {
             legacy_root.join(CURRENT_MANIFEST_PATH),
             serde_json::to_vec(&legacy_manifest)?,
         )?;
-        let mut legacy_repository = PaperCheckpointRepository::try_new(
-            legacy_paths.artifacts()?.clone(),
-            config.clone(),
-            maximum_bytes,
-        )?;
-        let migrated = legacy_repository
-            .take_recovery()
-            .ok_or("missing migrated version-10 recovery")?;
-        assert_eq!(
-            migrated.checkpoint().schema_version(),
-            PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
-        );
-        assert_eq!(
-            migrated.checkpoint().configuration_digest(),
-            config.digest()
-        );
         assert!(
-            migrated
-                .checkpoint()
-                .orders
-                .values()
-                .chain(migrated.checkpoint().archived_orders.values())
-                .all(|order| order.target_reference.is_none())
+            PaperCheckpointRepository::try_new(
+                legacy_paths.artifacts()?.clone(),
+                config.clone(),
+                maximum_bytes,
+            )
+            .is_err()
         );
-        drop(legacy_repository);
 
         let target_reference = OrderTargetReference::try_new(
             "target.recovery-alpha",
@@ -2347,6 +2847,7 @@ mod tests {
         let mut lifecycle = PaperOrderLifecycle::try_new(quantity)?;
         lifecycle.reject(1)?;
         Ok(PaperOrder {
+            virtual_paper: false,
             approval_id: ApprovalId::from_str("40000000-0000-0000-0000-000000000089")?,
             order_id: OrderId::from_str("20000000-0000-0000-0000-000000000089")?,
             client_order_id: ClientOrderId::try_from("recovered-target-order")?,
@@ -2445,7 +2946,7 @@ mod tests {
             maximum_latency_nanos: 0,
             cancel_latency_nanos: 0,
             maximum_mark_age_nanos: 1_000_000_000,
-            day_session_calendar: calendar,
+            session_policy: crate::PaperExecutionSessionPolicy::Venue(calendar),
             maximum_participation_basis_points: 10_000,
             impact_basis_points_per_level: 0,
             reporting_currency: usd,

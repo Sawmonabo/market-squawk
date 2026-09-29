@@ -416,12 +416,52 @@ mod coordinator_tests {
     #[test]
     fn dropping_every_external_handle_preserves_refusal_disabled_and_terminal_state() -> TestResult
     {
-        let refusal_policy = resolved_policy("drop-reset-refusal-state", 2)?;
+        let refusal_policy = resolved_policy("drop-reset-refusal-state", 4)?;
         let refusal = register_fresh(refusal_policy.clone())?;
+        let mut transport = match refusal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        let request_lease = transport.active_lease();
+        assert!(request_lease.is_current());
+        transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        assert!(!request_lease.is_current());
+        let transport_lease = transport.active_lease();
+        let concurrent = match refusal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("upgrade retained request slot: {other:?}").into()),
+        };
+        assert!(transport_lease.is_current());
+        assert!(matches!(
+            refusal.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+        ));
+        assert!(transport_lease.is_current());
+        drop(concurrent);
+        drop(transport);
+        assert!(!transport_lease.is_current());
+        assert!(!request_lease.is_current());
+
+        let mut refused_transport = match refusal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        refused_transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        let refused_lease = refused_transport.active_lease();
+        assert!(refused_lease.is_current());
         let deadline = match refusal.apply_refusal(0) {
             BudgetDecision::WaitUntil(deadline) => deadline,
             other => return Err(format!("unexpected refusal decision: {other:?}").into()),
         };
+        assert!(!refused_lease.is_current());
+        drop(refused_transport);
+        drop(refused_lease);
+        drop(transport_lease);
+        drop(request_lease);
         let refusal_allocation = Arc::downgrade(&refusal.allocation);
         drop(refusal);
         let refusal_restored = register_fresh(refusal_policy)?;
@@ -437,10 +477,22 @@ mod coordinator_tests {
 
         let disabled_policy = resolved_policy("drop-reset-disabled-state", 2)?;
         let disabled = register_fresh(disabled_policy.clone())?;
+        let mut disabled_transport = match disabled.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        disabled_transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        let disabled_lease = disabled_transport.active_lease();
+        assert!(disabled_lease.is_current());
         assert!(matches!(
             disabled.disable(),
             BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
         ));
+        assert!(!disabled_lease.is_current());
+        drop(disabled_transport);
+        drop(disabled_lease);
         drop(disabled);
         let disabled_restored = register_fresh(disabled_policy)?;
         assert!(matches!(
@@ -450,6 +502,15 @@ mod coordinator_tests {
 
         let terminal_policy = resolved_policy("drop-reset-terminal-state", 2)?;
         let terminal = register_fresh(terminal_policy.clone())?;
+        let mut terminal_transport = match terminal.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("unexpected upgrade dispatch: {other:?}").into()),
+        };
+        terminal_transport
+            .complete_transport_handshake()
+            .map_err(|reason| format!("upgrade completion failed: {reason:?}"))?;
+        let terminal_lease = terminal_transport.active_lease();
+        assert!(terminal_lease.is_current());
         terminal
             .allocation
             .availability_generation
@@ -458,6 +519,9 @@ mod coordinator_tests {
             terminal.disable(),
             BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         ));
+        assert!(!terminal_lease.is_current());
+        drop(terminal_transport);
+        drop(terminal_lease);
         drop(terminal);
         let terminal_restored = register_fresh(terminal_policy)?;
         assert!(matches!(

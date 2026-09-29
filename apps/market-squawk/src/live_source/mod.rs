@@ -1,12 +1,15 @@
 //! Private production live-source composition.
 
 mod composition;
+pub(crate) mod crypto_reference;
+pub(crate) mod crypto_reference_transport;
 mod direct;
 pub(crate) mod display_market;
 mod instruments;
 mod kraken;
 mod kraken_level3;
 mod kraken_publication;
+pub(crate) use sink::{AlpacaCapturedPublicationIngress, AlpacaCapturedPublicationReceiver};
 pub(crate) mod order_level;
 mod provider;
 #[cfg(feature = "release-evidence")]
@@ -27,15 +30,16 @@ pub use direct::{
     CoinbaseDirectLiveRuntime, CoinbaseDirectOutputFailure, CoinbaseDirectProductRuntimeError,
     CoinbaseDirectSupervisorError,
 };
-pub(crate) use kraken_level3::KrakenLevel3LiveRuntime;
+pub(crate) use kraken_level3::{KrakenLevel3LiveRuntime, KrakenLevel3RuntimeError};
+pub(crate) use instruments::ProductionCatalogSelection;
 pub use provider::ProductionSourceProvider;
 #[cfg(feature = "release-evidence")]
 pub(crate) use release_support::{CoinbaseReleaseEvidence, run_coinbase_release_evidence};
 pub(crate) use schwab_rest::{
-    SchwabRestQuoteCurrentBridge, SchwabRestQuoteCurrentEvidence, SchwabRestQuoteCurrentInstrument,
+    SchwabQualifiedCurrent, SchwabRestQuoteCurrentBridge, SchwabRestQuoteCurrentEvidence, SchwabRestQuoteCurrentInstrument,
     SchwabRestQuoteCurrentPublication, SchwabRestQuoteCurrentRequest,
     SchwabRestQuoteCurrentSessionBridge, SchwabRestQuoteCurrentSessionInput,
-    SchwabRestQuoteCurrentUnavailable,
+    SchwabRestQuoteCurrentUnavailable, SchwabStreamerCurrentEvidence,
 };
 pub use supervisor::ProductionSupervisorError;
 

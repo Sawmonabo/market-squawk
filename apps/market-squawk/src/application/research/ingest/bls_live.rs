@@ -311,19 +311,32 @@ impl BlsLiveRuntime {
             )
             .await?;
         operation.ensure_live()?;
-        let BlsMacroCapabilityState::Available(read) = state else {
-            return Err(BlsLivePublicationError::ReadUnavailable);
-        };
-        if read.restart_selector().manifest() != publication.receipt().manifest()
-            || read.source_id() != self.generation.metadata().source_id()
-        {
-            return Err(BlsLivePublicationError::RestartMismatch);
+        match &state {
+            BlsMacroCapabilityState::Available(read) => {
+                if read.restart_selector().manifest() != publication.receipt().manifest()
+                    || read.source_id() != self.generation.metadata().source_id()
+                {
+                    return Err(BlsLivePublicationError::RestartMismatch);
+                }
+            }
+            BlsMacroCapabilityState::IncompleteAtCutoff { request, reopened } => {
+                if request.restart_selector().manifest() != publication.receipt().manifest()
+                    || reopened.manifest() != publication.receipt().manifest()
+                    || request.restart_selector().source_id()
+                        != self.generation.metadata().source_id()
+                {
+                    return Err(BlsLivePublicationError::RestartMismatch);
+                }
+            }
+            BlsMacroCapabilityState::Unavailable(_) => {
+                return Err(BlsLivePublicationError::ReadUnavailable);
+            }
         }
         Ok(BlsLiveOutcome {
             activation_plan_digest: self.source.activation_plan()?.plan_digest(),
             publication_digest,
             publication,
-            read,
+            state,
         })
     }
 }
@@ -346,7 +359,7 @@ pub(crate) struct BlsLiveOutcome {
     activation_plan_digest: EvidenceDigest,
     publication_digest: EvidenceDigest,
     publication: BlsMacroPlanPublication,
-    read: BlsProviderPeriodLatestKnownDto,
+    state: BlsMacroCapabilityState,
 }
 
 impl BlsLiveOutcome {
@@ -367,8 +380,13 @@ impl BlsLiveOutcome {
     }
 
     /// Returns the exact manifest-bound provider-period PIT output.
-    pub(crate) const fn read(&self) -> &BlsProviderPeriodLatestKnownDto {
-        &self.read
+    pub(crate) const fn read(&self) -> Option<&BlsProviderPeriodLatestKnownDto> {
+        self.state.available()
+    }
+
+    /// Preserves explicit incomplete-at-cutoff evidence after a successful durable publication.
+    pub(crate) const fn state(&self) -> &BlsMacroCapabilityState {
+        &self.state
     }
 }
 
@@ -826,15 +844,16 @@ mod tests {
                 &request_context(operation_deadline)?,
             )
             .await?;
-        assert_eq!(outcome.read().output().observations().len(), 1);
+        let read = outcome.read().ok_or("published BLS read unavailable")?;
+        assert_eq!(read.output().observations().len(), 1);
         if let Some(fixture) = fixture {
             assert_eq!(fixture.counters()?.attempts, 2);
             assert_eq!(fixture.counters()?.completed, 2);
             assert_eq!(fixture.counters()?.remaining, 0);
         }
-        let restart_selector = outcome.read().restart_selector().clone();
+        let restart_selector = read.restart_selector().clone();
         let manifest = outcome.publication().receipt().manifest().clone();
-        let selection_digest = outcome.read().output().selection_digest();
+        let selection_digest = read.output().selection_digest();
 
         drop(outcome);
         drop(runtime);
@@ -844,6 +863,11 @@ mod tests {
         drop(research);
 
         let reopened = Arc::new(open_research(&paths)?);
+        let recovered_selector = reopened
+            .analytical()
+            .recover_provider_macro_plan_selector(&manifest)?;
+        assert_eq!(recovered_selector, restart_selector);
+        let restart_selector = recovered_selector;
         let closure = BlsMacroApplicationClosure::new(reopened);
         let reopened = closure
             .read_provider_period_latest_known(

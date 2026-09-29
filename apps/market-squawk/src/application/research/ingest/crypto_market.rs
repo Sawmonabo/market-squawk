@@ -31,7 +31,7 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     AssetClass, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, LiveEventClass,
-    SourceId, SourceIdentifier, Timestamp, VenueId,
+    ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_services::ServiceError;
@@ -150,6 +150,7 @@ impl CryptoMarketPublicationClosure {
         handoff: CoinbaseMarketHandoff,
         context: CoinbaseMarketPublicationContext,
         qualification: CoinbaseMarketQualificationOutcome,
+        native_selections: Option<Vec<market_squawk_sources::ProviderIdentitySelectionEvidence>>,
         analytical_dataset: DatasetId,
         idempotency_key: impl Into<String>,
         observed_at: Timestamp,
@@ -185,6 +186,10 @@ impl CryptoMarketPublicationClosure {
                 Ok(CoinbaseMarketApplicationOutcome::SealedRaw(raw))
             }
             CoinbaseSealedMarketPublication::Published(binding) => {
+                let binding = bind_committed_native_selections(
+                    binding,
+                    native_selections.ok_or(CryptoMarketPublicationError::AuthorityInvalid)?,
+                )?;
                 let prepared = self.validate_publication_binding(&binding, surface)?;
                 let publication_digest = provider_market_event_publication_digest(&binding)?;
                 if publication_digest != prepared.publication_digest
@@ -276,7 +281,10 @@ impl CryptoMarketPublicationClosure {
         self.validate_current_authority(observed_at)?;
         self.validate_source_binding(material.source_id(), material.metadata_revision())?;
         precommit_authority.validate_precommit()?;
+        let (native_selections, precommit_authority) =
+            committed_publication_authority(&rows, observed_at, precommit_authority)?;
         let binding = material.try_publish_committed(rows)?;
+        let binding = bind_committed_native_selections(binding, native_selections)?;
         let prepared = self
             .validate_publication_binding(&binding, CryptoMarketSurface::CoinbaseAdvancedTrade)?;
         let publication_digest = provider_market_event_publication_digest(&binding)?;
@@ -388,8 +396,11 @@ impl CryptoMarketPublicationClosure {
             observed_at,
         )?;
         precommit_authority.validate_precommit()?;
+        let (native_selections, precommit_authority) =
+            committed_publication_authority(&rows, observed_at, precommit_authority)?;
         let binding =
             material.try_publish_qualified(KrakenQualifiedMarketPublication::try_new(rows)?)?;
+        let binding = bind_committed_native_selections(binding, native_selections)?;
         let prepared =
             self.validate_publication_binding(&binding, CryptoMarketSurface::KrakenSpot)?;
         let publication_digest = provider_market_event_publication_digest(&binding)?;
@@ -455,6 +466,12 @@ impl CryptoMarketPublicationClosure {
                     .seal_event_microbatch(material, precommit_authority, cancellation, deadline)
                     .await?;
                 Ok(CoinbaseMarketSealedTokens::AdvancedTrade(token))
+            }
+            CoinbaseMarketSealMaterial::ExchangeDirectSuccessor(material) => {
+                let token = self
+                    .seal_event_microbatch(material, precommit_authority, cancellation, deadline)
+                    .await?;
+                Ok(CoinbaseMarketSealedTokens::ExchangeDirectSuccessor(token))
             }
             CoinbaseMarketSealMaterial::ExchangeDirect { snapshot, replay } => {
                 let snapshot = self
@@ -579,11 +596,21 @@ impl CryptoMarketPublicationClosure {
         surface: CryptoMarketSurface,
     ) -> Result<PreparedMarketEventPublication, CryptoMarketPublicationError> {
         let expected_implementation = surface.native_implementation();
-        let expected_kind = surface.publication_kind();
+        let expected_kind = match (surface, binding) {
+            (
+                CryptoMarketSurface::CoinbaseExchangeDirect,
+                SealedProviderPublicationBinding::EventMicrobatch(_),
+            ) => ProviderMarketEventPublicationKind::EventMicrobatch,
+            _ => surface.publication_kind(),
+        };
         let publication_digest = provider_market_event_publication_digest(binding)?;
         let (provider_dataset, sealed_receipts, event_count) = match (surface, binding) {
             (
                 CryptoMarketSurface::CoinbaseAdvancedTrade,
+                SealedProviderPublicationBinding::EventMicrobatch(event),
+            )
+            | (
+                CryptoMarketSurface::CoinbaseExchangeDirect,
                 SealedProviderPublicationBinding::EventMicrobatch(event),
             )
             | (
@@ -831,6 +858,74 @@ impl MarketEventPointInTimeSelector {
         selection
             .map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection))
             .transpose()
+    }
+
+    /// Reads one exact source-declared screener cohort through the ordinary immutable selector.
+    #[allow(clippy::too_many_arguments, reason = "closed cohort identity and PIT bounds stay explicit")]
+    pub(crate) async fn select_cohort_latest(
+        &self,
+        cohort_key: SourceIdentifier,
+        venue_id: VenueId,
+        product: ProviderProduct,
+        channel: ProviderChannel,
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
+        maximum_candidates: usize,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<MarketEventPointInTimeReceipt>, MarketEventReadError> {
+        let request = ProviderMarketEventPointInTimeRequest::try_cohort_latest(
+            self.analytical_dataset.clone(),
+            cohort_key,
+            venue_id,
+            self.source_surface.clone(),
+            product,
+            channel,
+            as_of_cutoff,
+            knowledge_cutoff,
+            effective_time_basis,
+            maximum_candidates,
+        )?;
+        let store = self.research.provider_capture_store();
+        let selection = self.research.analytical()
+            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation).await?;
+        selection.map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection)).transpose()
+    }
+
+    /// Reads one exact source-declared screener cohort through the ordinary immutable selector.
+    #[allow(clippy::too_many_arguments, reason = "closed cohort identity and PIT bounds stay explicit")]
+    pub(crate) async fn select_cohort_exact(
+        &self,
+        cohort_key: SourceIdentifier,
+        venue_id: VenueId,
+        product: ProviderProduct,
+        channel: ProviderChannel,
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
+        maximum_candidates: usize,
+        exact_manifest: DatasetManifestRef,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<MarketEventPointInTimeReceipt>, MarketEventReadError> {
+        let request = ProviderMarketEventPointInTimeRequest::try_cohort_exact(
+            self.analytical_dataset.clone(),
+            cohort_key,
+            venue_id,
+            self.source_surface.clone(),
+            product,
+            channel,
+            as_of_cutoff,
+            knowledge_cutoff,
+            effective_time_basis,
+            maximum_candidates,
+            exact_manifest,
+        )?;
+        let store = self.research.provider_capture_store();
+        let selection = self.research.analytical()
+            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation).await?;
+        selection.map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection)).transpose()
     }
 
     /// Reopens the original selection's exact manifest and rejects any request, source, row,
@@ -1375,6 +1470,104 @@ pub(crate) enum CryptoMarketPublicationError {
     Service(#[from] ServiceError),
     #[error(transparent)]
     MarketEventRead(#[from] MarketEventReadError),
+}
+
+/// Retains process authority after the adapter consumes its one-use committed rows.
+#[derive(Debug)]
+struct CommittedNativePublicationAuthority {
+    inner: Arc<dyn IngestPrecommitAuthority>,
+    observed_at: Timestamp,
+    rows: Vec<(
+        market_squawk_sources::CurrentProviderIdentity,
+        market_squawk_sources::CurrentSourceAuthorityLease,
+    )>,
+}
+
+impl CommittedNativePublicationAuthority {
+    fn validate_rows(&self) -> Result<(), IngestError> {
+        for (identity, source) in &self.rows {
+            source
+                .validate_provider_identity_at(identity, self.observed_at)
+                .map_err(|_| IngestError::PublicationAuthorityRevoked)?;
+        }
+        Ok(())
+    }
+}
+
+impl IngestPrecommitAuthority for CommittedNativePublicationAuthority {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        self.inner.validate_precommit()?;
+        self.validate_rows()
+    }
+
+    fn validate_catalog_precommit(
+        &self,
+        catalog: &market_squawk_data::CatalogAuthority,
+    ) -> Result<(), IngestError> {
+        self.inner.validate_catalog_precommit(catalog)?;
+        self.validate_rows()
+    }
+}
+
+fn committed_publication_authority(
+    rows: &[market_squawk_live::CommittedResearchMarketObservation],
+    observed_at: Timestamp,
+    inner: Arc<dyn IngestPrecommitAuthority>,
+) -> Result<
+    (
+        Vec<market_squawk_sources::ProviderIdentitySelectionEvidence>,
+        Arc<dyn IngestPrecommitAuthority>,
+    ),
+    CryptoMarketPublicationError,
+> {
+    if rows.is_empty() || rows.len() > market_squawk_sources::MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS
+    {
+        return Err(CryptoMarketPublicationError::AuthorityInvalid);
+    }
+    let mut selections = Vec::new();
+    let mut authorities = Vec::new();
+    selections
+        .try_reserve_exact(rows.len())
+        .map_err(|_| CryptoMarketPublicationError::AuthorityInvalid)?;
+    authorities
+        .try_reserve_exact(rows.len())
+        .map_err(|_| CryptoMarketPublicationError::AuthorityInvalid)?;
+    for row in rows {
+        row.validate_at(observed_at)
+            .map_err(|_| CryptoMarketPublicationError::AuthorityInvalid)?;
+        selections.push(row.native_identity_selection().clone());
+        authorities.push((
+            row.provider_identity().clone(),
+            row.source_authority().clone(),
+        ));
+    }
+    Ok((
+        selections,
+        Arc::new(CommittedNativePublicationAuthority {
+            inner,
+            observed_at,
+            rows: authorities,
+        }),
+    ))
+}
+
+fn bind_committed_native_selections(
+    binding: SealedProviderPublicationBinding,
+    selections: Vec<market_squawk_sources::ProviderIdentitySelectionEvidence>,
+) -> Result<SealedProviderPublicationBinding, CryptoMarketPublicationError> {
+    match binding {
+        SealedProviderPublicationBinding::EventMicrobatch(event) => {
+            Ok(SealedProviderPublicationBinding::EventMicrobatch(
+                event.with_provider_identities(selections.into_iter().map(Some).collect())?,
+            ))
+        }
+        SealedProviderPublicationBinding::CompositeResponseEvent(composite) => {
+            Ok(SealedProviderPublicationBinding::CompositeResponseEvent(
+                composite.with_provider_identities(selections.into_iter().map(Some).collect())?,
+            ))
+        }
+        _ => Err(CryptoMarketPublicationError::FamilyMismatch),
+    }
 }
 
 #[cfg(test)]

@@ -37,6 +37,16 @@ evidence_version = "reviewed-2026-08-08"
 effective_from_unix_nanos = 1700000000000000000
 effective_until_unix_nanos = 1900000000000000000
 
+[coinbase.reference_authorization]
+mode = "public_interface"
+provider = "coinbase-exchange"
+basis = "market-squawk-reviewed-coinbase-product-reference"
+evidence_sha256 = "6d6be28e5a9484c6bbfa75041b382cdaf2bbe387237d1cc4168aa02b59d58bd7"
+evidence_reference = "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product"
+evidence_version = "reviewed-2026-09-23"
+effective_from_unix_nanos = 1700000000000000000
+effective_until_unix_nanos = 1900000000000000000
+
 [[coinbase.instruments]]
 product = "BTC-USD"
 instrument_id = "4c74ab95-53b9-42ad-9b66-0ed403b88fed"
@@ -71,6 +81,16 @@ fn coinbase_config_json(max_frame_bytes: usize) -> String {
     "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
     "evidence_version":"reviewed-2026-08-08",
+    "effective_from_unix_nanos":1700000000000000000,
+    "effective_until_unix_nanos":1900000000000000000
+  }},
+  "reference_authorization":{{
+    "mode":"public_interface",
+    "provider":"coinbase-exchange",
+    "basis":"market-squawk-reviewed-coinbase-product-reference",
+    "evidence_sha256":"6d6be28e5a9484c6bbfa75041b382cdaf2bbe387237d1cc4168aa02b59d58bd7",
+    "evidence_reference":"https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product",
+    "evidence_version":"reviewed-2026-09-23",
     "effective_from_unix_nanos":1700000000000000000,
     "effective_until_unix_nanos":1900000000000000000
   }},
@@ -109,6 +129,16 @@ fn kraken_config_json(endpoint: &str) -> String {
     "evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
     "evidence_version":"reviewed-2026-08-14",
+    "effective_from_unix_nanos":1700000000000000000,
+    "effective_until_unix_nanos":1900000000000000000
+  }},
+  "reference_authorization":{{
+    "mode":"public_interface",
+    "provider":"kraken",
+    "basis":"market-squawk-reviewed-kraken-instrument-reference",
+    "evidence_sha256":"9b4544298835999a3457f48dbd03e4061fce3d82b98bfc82129b6adbc20ae9be",
+    "evidence_reference":"https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument",
+    "evidence_version":"reviewed-2026-09-23",
     "effective_from_unix_nanos":1700000000000000000,
     "effective_until_unix_nanos":1900000000000000000
   }},

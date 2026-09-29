@@ -218,6 +218,17 @@ impl DecisionAuthority {
         self.repository.append_investment_proposal(decision)
     }
 
+    /// Replays a persisted proposal after exact saved-identity recomputation.
+    ///
+    /// Durable adapters use this only while rebuilding verified journal records. It does not
+    /// grant recovered valuation evidence the source authority required by fresh append.
+    pub fn replay_investment_proposal(
+        &mut self,
+        decision: InvestmentProposalDecision,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository.replay_investment_proposal(decision)
+    }
+
     /// Appends one immutable analytical-profile/workflow publication binding.
     pub fn append_investment_analysis_publication(
         &mut self,
@@ -245,13 +256,25 @@ impl DecisionAuthority {
             .commit_staged_published_investment_analysis(staged)
     }
 
-    /// Appends one selected-candidate analysis bundle during canonical recovery.
+    /// Appends one analysis bundle with fresh recommendation-source admission.
     pub fn append_prepared_published_investment_analysis(
         &mut self,
         bundle: PreparedPublishedInvestmentAnalysis,
     ) -> Result<AppendOutcome, DecisionRepositoryError> {
         self.repository
             .append_prepared_published_investment_analysis(bundle)
+    }
+
+    /// Replays a persisted analysis bundle with exact decision and publication validation.
+    ///
+    /// This recovery-only adapter retains candidate-parent, workflow, sizing, and uniqueness
+    /// checks without treating recovered valuation projections as fresh source evidence.
+    pub fn replay_prepared_published_investment_analysis(
+        &mut self,
+        bundle: PreparedPublishedInvestmentAnalysis,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        self.repository
+            .replay_prepared_published_investment_analysis(bundle)
     }
 
     /// Appends one immutable proposal-bound outcome projection.

@@ -275,7 +275,7 @@ impl ProductionAuditService {
     }
 
     pub(super) async fn shutdown(
-        self,
+        mut self,
         deadline: tokio::time::Instant,
         producers_complete: bool,
     ) -> ProductionAuditShutdown {
@@ -285,6 +285,18 @@ impl ProductionAuditService {
                 self,
             );
         }
+        let status = self.finish_shutdown(deadline).await;
+        if self.worker.is_some() {
+            ProductionAuditShutdown::with_owner(status, self)
+        } else {
+            ProductionAuditShutdown::new(status)
+        }
+    }
+
+    async fn finish_shutdown(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> ProductionAuditShutdownStatus {
         if self
             .worker
             .as_ref()
@@ -294,35 +306,33 @@ impl ProductionAuditService {
         }
         match self.control.try_send(AuditControl::Stop) {
             Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => self.join_worker(deadline).await,
-            Err(mpsc::TrySendError::Full(_)) => ProductionAuditShutdown::with_owner(
-                ProductionAuditShutdownStatus::ControlSaturated,
-                self,
-            ),
+            Err(mpsc::TrySendError::Full(_)) => ProductionAuditShutdownStatus::ControlSaturated,
         }
     }
 
-    async fn join_worker(mut self, deadline: tokio::time::Instant) -> ProductionAuditShutdown {
-        let Some(worker) = self.worker.take() else {
-            return ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Panicked);
-        };
-        while !worker.is_finished() {
+    async fn join_worker(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> ProductionAuditShutdownStatus {
+        // Keep the actual thread handle owned across every await. If a waiter is cancelled,
+        // the retained service can still stop and join this same writer.
+        while self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
             if tokio::time::Instant::now() >= deadline {
-                self.worker = Some(worker);
-                return ProductionAuditShutdown::with_owner(
-                    ProductionAuditShutdownStatus::DeadlineExceeded,
-                    self,
-                );
+                return ProductionAuditShutdownStatus::DeadlineExceeded;
             }
             tokio::time::sleep(IDLE_POLL_INTERVAL).await;
         }
+        let Some(worker) = self.worker.take() else {
+            return ProductionAuditShutdownStatus::Panicked;
+        };
         match worker.join() {
-            Ok(Ok(evidence)) => {
-                ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Complete(evidence))
-            }
-            Ok(Err(error)) => {
-                ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Failed(error))
-            }
-            Err(_) => ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Panicked),
+            Ok(Ok(evidence)) => ProductionAuditShutdownStatus::Complete(evidence),
+            Ok(Err(error)) => ProductionAuditShutdownStatus::Failed(error),
+            Err(_) => ProductionAuditShutdownStatus::Panicked,
         }
     }
 }
@@ -730,6 +740,37 @@ impl ProductionAuditShutdown {
         }
     }
 
+    /// Only admission saturation or an unfinished join can be resumed without changing producer facts.
+    pub(crate) fn can_resume(&self) -> bool {
+        self.owner.is_some()
+            && matches!(
+                self.status,
+                ProductionAuditShutdownStatus::DeadlineExceeded
+                    | ProductionAuditShutdownStatus::ControlSaturated
+            )
+    }
+
+    pub(super) async fn resume_after_timeout(&mut self, deadline: tokio::time::Instant) {
+        if !self.can_resume() {
+            return;
+        }
+        let join_only = matches!(self.status, ProductionAuditShutdownStatus::DeadlineExceeded);
+        let Some(owner) = self.owner.as_mut() else {
+            return;
+        };
+        // A previous join timeout already sent Stop. Retain and join that same operation;
+        // only prior admission saturation requires another attempt to send the command.
+        let status = if join_only {
+            owner.join_worker(deadline).await
+        } else {
+            owner.finish_shutdown(deadline).await
+        };
+        if owner.worker.is_none() {
+            self.owner = None;
+        }
+        self.status = status;
+    }
+
     pub const fn is_complete(&self) -> bool {
         matches!(self.status, ProductionAuditShutdownStatus::Complete(_)) && self.owner.is_none()
     }
@@ -897,6 +938,75 @@ mod tests {
         let shutdown = service.shutdown(tokio::time::Instant::now(), true).await;
 
         assert!(shutdown.is_complete());
+        assert_eq!(shutdown.evidence(), Some(expected));
+
+        // This owner is declared before the release guard, so unwinding releases the real
+        // thread before the audit owner's synchronous Drop attempts its bounded join.
+        let mut retained: Option<ProductionAuditShutdown>;
+        let (release, wait) = mpsc::channel::<()>();
+        let (control, commands) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _released_or_disconnected = wait.recv();
+            drop(commands);
+            Ok(expected)
+        });
+        let original_thread = worker.thread().id();
+        let service = ProductionAuditService {
+            control,
+            worker: Some(worker),
+            drop_deadline: Duration::from_secs(1),
+            execution_read_view: ProductionExecutionAuditReadView::try_new()?,
+        };
+        let mut pending = Box::pin(
+            service.shutdown(tokio::time::Instant::now() + Duration::from_millis(5), true),
+        );
+        // Also declared after the consuming shutdown future: a panic during its first wait
+        // disconnects the gate before that future drops its still-owned audit service.
+        let release_guard = release;
+        retained = Some(pending.as_mut().await);
+        let shutdown = retained
+            .as_mut()
+            .ok_or(ProductionExecutionAuditReadError::Unavailable)?;
+        assert!(matches!(
+            shutdown.status(),
+            ProductionAuditShutdownStatus::DeadlineExceeded
+        ));
+        assert_eq!(
+            shutdown
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.worker.as_ref())
+                .map(|worker| worker.thread().id()),
+            Some(original_thread)
+        );
+        assert!(!shutdown.is_complete());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                shutdown
+                    .resume_after_timeout(tokio::time::Instant::now() + Duration::from_secs(1),)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            shutdown
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.worker.as_ref())
+                .map(|worker| worker.thread().id()),
+            Some(original_thread)
+        );
+        assert!(matches!(
+            shutdown.status(),
+            ProductionAuditShutdownStatus::DeadlineExceeded
+        ));
+        drop(release_guard);
+        shutdown
+            .resume_after_timeout(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(shutdown.is_complete());
+        assert!(shutdown.owner.is_none());
         assert_eq!(shutdown.evidence(), Some(expected));
         Ok(())
     }

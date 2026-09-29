@@ -33,9 +33,9 @@ use crate::auth::BeaSensitiveBody;
 use crate::source::bea_api_endpoint_rule;
 use crate::transport::{BeaHttpResponse, BeaSensitiveHeader, BeaTransport, system_timestamp};
 use crate::{
-    BeaAuthorizedRequest, BeaDatasetContract, BeaDatasetIdentity, BeaObservationValue,
-    BeaParseLimits, BeaRequiredSharedSettlement, BeaSource, BeaSourceConfig, BeaSourceError,
-    BeaUserId,
+    BeaAuthorizedRequest, BeaCompleteness, BeaDatasetContract, BeaDatasetIdentity, BeaDoctorRefreshDisposition,
+    BeaObservationValue, BeaParseLimits, BeaRequiredSharedSettlement, BeaSource, BeaSourceConfig,
+    BeaSourceError, BeaUserId,
 };
 
 const USER_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -135,6 +135,10 @@ impl BeaTransport for ScriptedTransport {
 async fn metadata_first_transport_retains_exact_capture_material_and_completeness() -> TestResult {
     let dataset = BeaDatasetIdentity::try_new("Regional")?;
     let mut parameters = BTreeMap::new();
+    parameters.insert(
+        crate::BeaParameterIdentity::try_new("GeoFips")?,
+        "STATE".to_owned(),
+    );
     parameters.insert(
         crate::BeaParameterIdentity::try_new("TableName")?,
         "SAINC1".to_owned(),
@@ -239,7 +243,7 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .is_some_and(BeaSensitiveHeader::is_zeroized)
     );
     let mut scripted_responses = upstream_responses.clone();
-    scripted_responses.extend(upstream_responses.iter().cloned());
+    scripted_responses.extend(upstream_responses.iter().take(4).cloned());
     let transport = Arc::new(ScriptedTransport {
         responses: Mutex::new(VecDeque::from(scripted_responses)),
     });
@@ -286,63 +290,21 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             CancellationToken::new(),
         )
         .await?;
-    let acquisition = run.acquisition();
-
-    assert_eq!(acquisition.metadata().pages().len(), 3);
-    assert_eq!(acquisition.data().page().observations().len(), 1);
-    assert_eq!(
-        acquisition.data().request().query().supplied_parameters(),
-        &BTreeMap::from([(
-            crate::BeaParameterIdentity::try_new("TableName")?,
-            "SAINC1".to_owned(),
-        )])
-    );
-    assert_eq!(
-        acquisition.data().page().observations()[0]
-            .identity()
-            .table(),
-        Some("SAINC1")
-    );
-    assert!(matches!(
-        acquisition.data().page().observations()[0].value(),
-        BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional)
-    ));
-    for (captured, upstream) in acquisition
-        .metadata()
-        .pages()
-        .iter()
-        .zip(upstream_responses.iter())
-    {
+    assert_eq!(run.metadata().pages().len(), 4);
+    for (captured, upstream) in run.metadata().pages().iter().zip(&upstream_responses) {
         assert_secret_free_capture(captured.page().receipt(), captured.material(), upstream)?;
+        assert_eq!(captured.page().receipt().requested_rows(), None);
     }
-    let data_material = acquisition.data().material();
-    assert_secret_free_capture(
-        acquisition.data().page().receipt(),
-        data_material,
-        upstream_responses.last().ok_or("missing data response")?,
-    )?;
-    assert_eq!(data_material.receipt().pages().len(), 1);
-    assert_eq!(data_material.records().len(), 1);
-    assert_eq!(
-        u64::try_from(data_material.records()[0].payload().len())?,
-        data_material.receipt().total_body_bytes()
-    );
     assert_eq!(source.telemetry().requests(), 4);
     assert_eq!(source.telemetry().successful_responses(), 4);
-    assert_eq!(source.telemetry().returned_rows(), 1);
+    assert_eq!(source.telemetry().returned_rows(), 0);
     assert_eq!(run.receipt().request_count(), 4);
-    assert_eq!(run.receipt().returned_rows(), 1);
-    let provider_production_time = acquisition
-        .data()
-        .page()
-        .production_time()
-        .ok_or("missing provider production time")?
-        .timestamp();
-    let received_at = data_material.receipt().pages()[0].received_at();
-    assert!(provider_production_time <= received_at);
+    assert_eq!(run.receipt().metadata_rows(), 5);
+    // Metadata responses have no expected cardinality; the configured count belongs to GetData.
+    assert_eq!(run.receipt().missing_metadata_rows(), None);
     assert_eq!(
-        run.receipt().source_production_time(),
-        Some(provider_production_time)
+        run.receipt().metadata_completeness(),
+        BeaCompleteness::ExpectedCountUnknown
     );
     assert!(!format!("{source:?}").contains(USER_ID));
     assert!(!format!("{run:?}").contains(USER_ID));
@@ -351,6 +313,11 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     let store = paths.sealed_research_journal_store()?;
     let admission = Arc::new(
         pending_doctor.try_rejoin(source.source_binding(), doctor_seal_request.seal(&store)?)?,
+    );
+    assert_eq!(admission.missing_metadata_rows(), None);
+    assert_eq!(
+        admission.metadata_completeness(),
+        BeaCompleteness::ExpectedCountUnknown
     );
     source.activate_doctor(Arc::clone(&admission))?;
     assert_eq!(
@@ -381,6 +348,54 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             CancellationToken::new(),
         )
         .await?;
+    assert_eq!(discovery.data().page().observations().len(), 1);
+    let data_receipt = discovery.data().page().receipt();
+    assert_eq!(data_receipt.requested_rows(), Some(1));
+    assert_eq!(data_receipt.missing_rows(), Some(0));
+    assert_eq!(data_receipt.completeness(), BeaCompleteness::Complete);
+    assert_eq!(
+        discovery.data().request().query().supplied_parameters(),
+        &BTreeMap::from([
+            (
+                crate::BeaParameterIdentity::try_new("GeoFips")?,
+                "STATE".to_owned(),
+            ),
+            (
+                crate::BeaParameterIdentity::try_new("TableName")?,
+                "SAINC1".to_owned(),
+            ),
+        ])
+    );
+    assert_eq!(
+        discovery.data().page().observations()[0].identity().table(),
+        Some("SAINC1")
+    );
+    assert!(matches!(
+        discovery.data().page().observations()[0].value(),
+        BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional)
+    ));
+    let data_material = discovery.data().material();
+    assert_secret_free_capture(
+        discovery.data().page().receipt(),
+        data_material,
+        upstream_responses.last().ok_or("missing data response")?,
+    )?;
+    assert_eq!(data_material.receipt().pages().len(), 1);
+    assert_eq!(data_material.records().len(), 1);
+    assert_eq!(
+        u64::try_from(data_material.records()[0].payload().len())?,
+        data_material.receipt().total_body_bytes()
+    );
+    let provider_production_time = discovery
+        .data()
+        .page()
+        .production_time()
+        .ok_or("missing provider production time")?
+        .timestamp();
+    assert!(provider_production_time <= data_material.receipt().pages()[0].received_at());
+    assert_eq!(source.telemetry().requests(), 5);
+    assert_eq!(source.telemetry().successful_responses(), 5);
+    assert_eq!(source.telemetry().returned_rows(), 1);
     let (pending_discovery, discovery_seal_request) = discovery.into_sealing_parts()?;
     let sealed_discovery = pending_discovery.try_rejoin(discovery_seal_request.seal(&store)?)?;
     let discovered_object = sealed_discovery
@@ -395,10 +410,9 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         NonZeroU64::new(2 * 1024 * 1024).ok_or("extraction byte bound")?,
         deadline,
     )?;
-    let expected_object_id = extraction_request.object().object_id().clone();
-    let discovery_capture_identity = extraction_request.object().capture_identity();
+    let expected_request = extraction_request.clone();
     let requests_before_extraction = source.telemetry().requests();
-    assert_eq!(requests_before_extraction, 8);
+    assert_eq!(requests_before_extraction, 5);
     let candidate = source.extract_sealed_discovery(
         authority.clone(),
         extraction_request,
@@ -415,15 +429,9 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     );
     let handoff = candidate.into_shared_publication_parts();
     let source_batch = handoff.batch();
-    assert_eq!(
-        source_batch.request().object().object_id(),
-        &expected_object_id
-    );
-    assert_ne!(
-        source_batch.request().object().capture_identity(),
-        discovery_capture_identity
-    );
-    let provider_content_evidence = source_batch.request().object().evidence().content_digest();
+    // Discovery and normalization reuse the same sealed data response and original request bounds.
+    assert_eq!(source_batch.request(), &expected_request);
+    let provider_content_evidence = expected_request.object().evidence().content_digest();
     let native_sidecar: serde_json::Value = serde_json::from_slice(
         handoff
             .native_lineage()
@@ -434,12 +442,16 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     assert_eq!(native_sidecar["family"], "bea.dataset-observations");
     assert_eq!(native_sidecar["dataset"], "Regional");
     assert_eq!(native_sidecar["provider_method"], "GetData");
-    assert_eq!(native_sidecar["parameters"][0]["name"], "TableName");
-    assert_eq!(native_sidecar["parameters"][0]["value"], "SAINC1");
+    assert_eq!(native_sidecar["parameters"][0]["name"], "GeoFips");
+    assert_eq!(native_sidecar["parameters"][0]["value"], "STATE");
+    assert_eq!(native_sidecar["parameters"][1]["name"], "TableName");
+    assert_eq!(native_sidecar["parameters"][1]["value"], "SAINC1");
     assert_eq!(
         native_sidecar["dimensions"].as_array().map(Vec::len),
         Some(4)
     );
+    assert_eq!(native_sidecar["expected_rows"], 1);
+    assert_eq!(native_sidecar["missing_rows"], 0);
     assert_eq!(native_sidecar["completeness"], "complete");
     assert_eq!(native_sidecar["returned_rows"], 1);
     assert!(native_sidecar["production_time_unix_nanos"].is_i64());
@@ -468,18 +480,17 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .content_digest(),
         provider_content_evidence
     );
-    let (coordinates, revision_plan, sealed_capture_binding) = handoff.into_parts();
+    let (coordinates, revision_plan, sealed_capture_binding, metadata_capture) =
+        handoff.into_parts();
+    assert_eq!(&metadata_capture, admission.sealed_capture());
     let batch = sealed_capture_binding.batch();
     let native_lineage = sealed_capture_binding.native_lineage();
-    assert_eq!(
-        sealed_capture_binding
-            .persisted_segment_receipt(0)
-            .ok_or("missing sealed BEA discovery graph")?
-            .capture()
-            .request_graph_components()
-            .len(),
-        4
-    );
+    let data_capture = sealed_capture_binding
+        .persisted_segment_receipt(0)
+        .ok_or("missing sealed BEA observation response")?
+        .capture();
+    assert!(data_capture.request_graph_components().is_empty());
+    assert_eq!(data_capture.pages().len(), 1);
     assert_eq!(
         coordinates.acquisition_capture_receipt_digest(),
         sealed_capture_binding.sealed_capture_receipt_digest()
@@ -495,6 +506,36 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         native_lineage,
     )?;
     assert_eq!(revision_batch.input_len(), 1);
+    let refreshed_run = source
+        .doctor(
+            &authority,
+            &provider_dataset,
+            deadline,
+            CancellationToken::new(),
+        )
+        .await?;
+    let (pending_refreshed, refreshed_seal_request) = refreshed_run.into_sealing_parts()?;
+    let refreshed = Arc::new(pending_refreshed.try_rejoin(
+        source.source_binding(),
+        refreshed_seal_request.seal(&store)?,
+    )?);
+    assert!(refreshed.verified_at() > admission.verified_at());
+    assert!(refreshed.expires_at() > admission.expires_at());
+    assert_eq!(
+        source.activate_doctor(Arc::clone(&refreshed))?,
+        BeaDoctorRefreshDisposition::RefreshedEvidence
+    );
+    assert!(matches!(
+        source.activate_doctor(Arc::clone(&admission)),
+        Err(BeaSourceError::StaleDoctorAdmission)
+    ));
+    assert_eq!(
+        source
+            .current_doctor_admission(&provider_dataset, refreshed.verified_at())?
+            .ok_or("missing monotonic BEA doctor admission")?
+            .admission_digest(),
+        refreshed.admission_digest()
+    );
     assert!(
         transport
             .responses
@@ -679,13 +720,34 @@ fn responses() -> Result<Vec<Bytes>, serde_json::Error> {
                     {"ParameterName": "DATASETNAME", "ParameterValue": "REGIONAL"},
                     {"ParameterName": "RESULTFORMAT", "ParameterValue": "JSON"}
                 ]},
-                "Results": {"Parameter": [{
-                    "ParameterName": "TableName",
-                    "ParameterDataType": "string",
-                    "ParameterDescription": "Regional table",
-                    "ParameterIsRequiredFlag": "1",
-                    "MultipleAcceptedFlag": "0"
-                }]}
+                "Results": {"Parameter": [
+                    {
+                        "ParameterName": "GeoFips",
+                        "ParameterDataType": "string",
+                        "ParameterDescription": "Regional geography",
+                        "ParameterIsRequiredFlag": "1",
+                        "MultipleAcceptedFlag": "0"
+                    },
+                    {
+                        "ParameterName": "TableName",
+                        "ParameterDataType": "string",
+                        "ParameterDescription": "Regional table",
+                        "ParameterIsRequiredFlag": "1",
+                        "MultipleAcceptedFlag": "0"
+                    }
+                ]}
+            }
+        }),
+        json!({
+            "BEAAPI": {
+                "Request": {"RequestParam": [
+                    {"ParameterName": "USERID", "ParameterValue": USER_ID},
+                    {"ParameterName": "METHOD", "ParameterValue": "GETPARAMETERVALUES"},
+                    {"ParameterName": "DATASETNAME", "ParameterValue": "REGIONAL"},
+                    {"ParameterName": "PARAMETERNAME", "ParameterValue": "GEOFIPS"},
+                    {"ParameterName": "RESULTFORMAT", "ParameterValue": "JSON"}
+                ]},
+                "Results": {"ParamValue": [{"Key": "06000", "Desc": "California"}]}
             }
         }),
         json!({
@@ -706,6 +768,7 @@ fn responses() -> Result<Vec<Bytes>, serde_json::Error> {
                     {"ParameterName": "USERID", "ParameterValue": USER_ID},
                     {"ParameterName": "METHOD", "ParameterValue": "GETDATA"},
                     {"ParameterName": "DATASETNAME", "ParameterValue": "REGIONAL"},
+                    {"ParameterName": "GEOFIPS", "ParameterValue": "STATE"},
                     {"ParameterName": "TABLENAME", "ParameterValue": "SAINC1"},
                     {"ParameterName": "RESULTFORMAT", "ParameterValue": "JSON"}
                 ]},

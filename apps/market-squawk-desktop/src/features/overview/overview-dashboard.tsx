@@ -7,18 +7,25 @@ import {
   Sparkles,
 } from "lucide-react"
 import { Link } from "react-router-dom"
+import type { ReactNode } from "react"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import type { MarketProductRow } from "@/features/markets/market-product"
+import { AnalysisLaunch } from "@/features/opportunities/analysis-launch"
 import {
   parseInvestmentAnalysis,
   type InvestmentAnalysis,
   type InvestmentAnalysisLocator,
 } from "@/features/opportunities/contracts"
-import { formatUnixNanos } from "@/features/opportunities/format"
+import {
+  EvidenceReliabilityDetails,
+  PricePatternDetails,
+  StudyQualificationDetails,
+  formatProductTimestamp,
+} from "@/features/opportunities/investment-brief"
 import { formatMoney } from "@/lib/formatters"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -37,6 +44,15 @@ export function OverviewDashboard({
 
   return (
     <div className="space-y-5">
+      <section className="rounded-xl border border-border bg-card/45 p-5" aria-labelledby="home-find-title">
+        <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Investment discovery</p>
+        <h2 id="home-find-title" className="mt-1 text-lg font-semibold">Find opportunities</h2>
+        <p className="mb-4 mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
+          Search the available investments using your saved analysis settings. Results include reasons,
+          risks, price ranges, and a clear explanation when there is not enough evidence to act.
+        </p>
+        <AnalysisLaunch transport={transport} scope={scope} />
+      </section>
       <DecisionSummary
         analyses={queries.analyses}
         transport={transport}
@@ -170,8 +186,8 @@ function DecisionCard({
         {displayed.recommendation.summary}
       </p>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-2">
-        <Fact label="Horizon ends" value={formatUnixNanos(displayed.horizon.endsAt)} />
-        <Fact label="Review by" value={formatUnixNanos(displayed.horizon.expiresAt)} />
+        <Fact label="Horizon ends" value={formatProductTimestamp(displayed.horizon.endsAt)} />
+        <Fact label="Review by" value={formatProductTimestamp(displayed.horizon.expiresAt)} />
       </dl>
 
       {analysis.isPending ? (
@@ -227,7 +243,11 @@ function DecisionEvidence({ analysis }: { analysis: InvestmentAnalysis }) {
           />
           <Fact
             label="Out-of-sample evidence"
-            value={analysis.evidenceSummary.outOfSample.summary}
+            value={<>
+              <p>{analysis.evidenceSummary.outOfSample.summary}</p>
+              {analysis.evidenceSummary.outOfSample.state === "available" ? <StudyQualificationDetails
+                qualification={analysis.evidenceSummary.outOfSample.studyQualification} /> : null}
+            </>}
           />
           <Fact
             label="Calibration"
@@ -236,18 +256,19 @@ function DecisionEvidence({ analysis }: { analysis: InvestmentAnalysis }) {
           <Fact label="Costs" value={analysis.evidenceSummary.costs.summary} />
           <Fact
             label="Uncertainty"
-            value={analysis.evidenceSummary.uncertainty.summary}
+            value={<EvidenceReliabilityDetails uncertainty={analysis.evidenceSummary.uncertainty} />}
           />
+          <Fact label="Price patterns" value={<PricePatternDetails evidence={analysis.analyticalEvidence.pricePattern} />} />
           <Fact
             label="Historical test"
-            value={
-              analysis.evidenceSummary.historicalTest?.summary ??
-              "No suitable historical test is available."
-            }
+            value={analysis.evidenceSummary.historicalTest ? <>
+              <p>{analysis.evidenceSummary.historicalTest.summary}</p>
+              <StudyQualificationDetails qualification={analysis.evidenceSummary.historicalTest.studyQualification} />
+            </> : "No suitable historical test is available."}
           />
           <Fact
             label="Information current through"
-            value={formatUnixNanos(analysis.horizon.informationCurrentThrough)}
+            value={formatProductTimestamp(analysis.horizon.informationCurrentThrough)}
           />
         </dl>
       </details>
@@ -300,7 +321,7 @@ function PriceContext({ analysis }: { analysis: InvestmentAnalysis }) {
             <Fact label="Upside range" value={formatRange(scenarios.upside)} />
             <Fact
               label="Range horizon"
-              value={formatUnixNanos(scenarios.endsAt)}
+              value={formatProductTimestamp(scenarios.endsAt)}
             />
           </>
         ) : null}
@@ -526,7 +547,7 @@ function ProductList({
   )
 }
 
-function Fact({ label, value }: { label: string; value: string }) {
+function Fact({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div>
       <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</dt>

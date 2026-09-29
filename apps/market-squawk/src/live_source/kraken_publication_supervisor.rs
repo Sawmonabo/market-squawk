@@ -51,6 +51,10 @@ impl KrakenPublicationSupervisor {
         if committed_rows.is_empty() {
             return Err(KrakenPublicationSupervisorError::InvalidTopology);
         }
+        let mut committed_tasks = Vec::new();
+        committed_tasks
+            .try_reserve_exact(committed_rows.len())
+            .map_err(|_| KrakenPublicationSupervisorError::Allocation)?;
         let (pending, committed) =
             CryptoPendingFrameIngress::try_new(limits, cancellation.clone())?;
         let (book, trades, book_durable_writer, trade_durable_writer) = package.into_parts();
@@ -81,10 +85,6 @@ impl KrakenPublicationSupervisor {
             outcome
         });
 
-        let mut committed_tasks = Vec::new();
-        committed_tasks
-            .try_reserve_exact(committed_rows.len())
-            .map_err(|_| KrakenPublicationSupervisorError::Allocation)?;
         for mut receiver in committed_rows {
             let committed_ingress = committed.clone();
             let committed_cancellation = cancellation.clone();
@@ -123,52 +123,67 @@ impl KrakenPublicationSupervisor {
         deadline: Instant,
     ) -> Result<(), KrakenPublicationSupervisorError> {
         self.cancellation.cancel();
-        let mut expiry = self
+        let expiry = self
             .expiry
-            .take()
+            .as_mut()
             .ok_or(KrakenPublicationSupervisorError::PublicationWorkerOwnership)?;
-        let mut raw = self
+        let raw = self
             .raw
-            .take()
+            .as_mut()
             .ok_or(KrakenPublicationSupervisorError::PublicationWorkerOwnership)?;
-        let mut committed = std::mem::take(&mut self.committed);
-        if committed.is_empty() {
+        if self.committed.is_empty() {
             return Err(KrakenPublicationSupervisorError::PublicationWorkerOwnership);
         }
-        let joined = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-            (&mut expiry)
+        let mut first_error =
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut *expiry)
                 .await
-                .map_err(KrakenPublicationSupervisorError::Task)?;
-            (&mut raw)
-                .await
-                .map_err(KrakenPublicationSupervisorError::Task)??;
-            for task in &mut committed {
-                task.await
-                    .map_err(KrakenPublicationSupervisorError::Task)??;
-            }
-            Ok::<(), KrakenPublicationSupervisorError>(())
-        })
-        .await;
-        match joined {
-            Ok(outcome) => outcome?,
-            Err(_elapsed) => {
-                expiry.abort();
-                raw.abort();
-                for task in &committed {
-                    task.abort();
+            {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(KrakenPublicationSupervisorError::Task(error)),
+                Err(_elapsed) => {
+                    expiry.abort();
+                    let _joined = expiry.await;
+                    Some(KrakenPublicationSupervisorError::ShutdownDeadline)
                 }
-                let _expiry = expiry.await;
-                let _raw = raw.await;
-                for task in committed {
-                    let _committed = task.await;
-                }
-                return Err(KrakenPublicationSupervisorError::ShutdownDeadline);
-            }
+            };
+        retain_first_error(&mut first_error, join_publication_task(raw, deadline).await);
+        for task in &mut self.committed {
+            retain_first_error(
+                &mut first_error,
+                join_publication_task(task, deadline).await,
+            );
         }
+        self.expiry.take();
+        self.raw.take();
+        self.committed.clear();
         // Dropping these exact-generation packages occurs only after all publication users join.
         self.book.take();
         self.trades.take();
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+async fn join_publication_task(
+    task: &mut JoinHandle<Result<(), KrakenPublicationSupervisorError>>,
+    deadline: Instant,
+) -> Option<KrakenPublicationSupervisorError> {
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut *task).await {
+        Ok(Ok(outcome)) => outcome.err(),
+        Ok(Err(error)) => Some(KrakenPublicationSupervisorError::Task(error)),
+        Err(_elapsed) => {
+            task.abort();
+            let _joined = task.await;
+            Some(KrakenPublicationSupervisorError::ShutdownDeadline)
+        }
+    }
+}
+
+fn retain_first_error(
+    first: &mut Option<KrakenPublicationSupervisorError>,
+    outcome: Option<KrakenPublicationSupervisorError>,
+) {
+    if first.is_none() {
+        *first = outcome;
     }
 }
 
@@ -206,13 +221,16 @@ async fn run_raw_worker(
     let mut book_open = true;
     let mut trades_open = true;
     let mut inflight = FuturesUnordered::new();
+    let mut first_error = None;
     while book_open || trades_open || !inflight.is_empty() {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => break,
             outcome = inflight.next(), if !inflight.is_empty() => {
-                if let Some(outcome) = outcome {
-                    outcome?;
+                if let Some(Err(error)) = outcome {
+                    first_error = Some(error);
+                    cancellation.cancel();
+                    break;
                 }
             },
             input = book_receiver.recv(), if book_open && inflight.len() < maximum_inflight.get() => {
@@ -247,7 +265,12 @@ async fn run_raw_worker(
     trade_receiver.close();
     while let Ok(_discarded) = book_receiver.try_recv() {}
     while let Ok(_discarded) = trade_receiver.try_recv() {}
-    Ok(())
+    // Sealing/commit work already admitted into this owner retains its authority until it settles.
+    // The outer supervisor enforces the same bounded shutdown deadline over the complete drain.
+    while let Some(outcome) = inflight.next().await {
+        retain_first_error(&mut first_error, outcome.err());
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn publish_raw(

@@ -21,13 +21,12 @@ mod resources;
 pub use process::run_onnx_worker_process;
 use protocol::{WorkerInitialization, response_loop};
 
-const MAX_WORKER_PROGRAM_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GENERATION_STARTUP: Duration = Duration::from_secs(15);
 const MAX_GENERATION_CLEANUP_OWNERS: usize = 16;
 const RESPONSE_QUEUE_CAPACITY: usize = 1;
 const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const CLEANUP_WAIT_RETRY: Duration = Duration::from_millis(10);
-const WORKER_RUNTIME_REVISION: u32 = 2;
+const WORKER_RUNTIME_REVISION: u32 = 3;
 
 static ACTIVE_GENERATION_CLEANUP_OWNERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -52,7 +51,7 @@ impl OnnxWorkerProgram {
     ///
     /// # Errors
     ///
-    /// Rejects a symlink, non-file, oversized, unreadable, changed, or digest-mismatched helper.
+    /// Rejects a symlink, non-file, unreadable, changed, or digest-mismatched helper.
     pub fn admit(
         executable: impl AsRef<Path>,
         expected_digest: [u8; 32],
@@ -75,10 +74,10 @@ impl OnnxWorkerProgram {
         let metadata = source
             .metadata()
             .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_WORKER_PROGRAM_BYTES {
+        if !metadata.is_file() || metadata.len() == 0 {
             return Err(OnnxWorkerProgramError::Invalid);
         }
-        let actual_digest = hash_open_file(&mut source, MAX_WORKER_PROGRAM_BYTES)
+        let actual_digest = hash_open_file(&mut source)
             .map_err(|_| OnnxWorkerProgramError::Changed)?;
         if actual_digest != expected_digest
             || source
@@ -110,15 +109,18 @@ impl OnnxWorkerProgram {
             .create_new(true)
             .open(&sealed_path)
             .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
-        io::copy(&mut source.take(MAX_WORKER_PROGRAM_BYTES + 1), &mut sealed)
+        let copied = io::copy(&mut source.take(metadata.len().saturating_add(1)), &mut sealed)
             .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        if copied != metadata.len() {
+            return Err(OnnxWorkerProgramError::Changed);
+        }
         sealed
             .sync_all()
             .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
         set_worker_permissions(&sealed_path)?;
         let mut sealed =
             File::open(&sealed_path).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
-        if hash_open_file(&mut sealed, MAX_WORKER_PROGRAM_BYTES)
+        if hash_open_file(&mut sealed)
             .map_err(|_| OnnxWorkerProgramError::Changed)?
             != expected_digest
         {
@@ -148,7 +150,7 @@ impl OnnxWorkerProgram {
 
     fn verify(&self) -> Result<(), WorkerError> {
         let mut executable = File::open(&self.inner.executable).map_err(|_| WorkerError::Load)?;
-        let digest = hash_open_file(&mut executable, MAX_WORKER_PROGRAM_BYTES)
+        let digest = hash_open_file(&mut executable)
             .map_err(|_| WorkerError::Load)?;
         (digest == self.inner.digest)
             .then_some(())
@@ -910,7 +912,7 @@ fn worker_runtime_semantics_digest(
     bind_runtime_bytes(
         &mut digest,
         b"namespace",
-        b"market-squawk/onnx-worker-runtime/v2",
+        b"market-squawk/onnx-worker-runtime/v3",
     );
     bind_runtime_u128(
         &mut digest,
@@ -934,10 +936,6 @@ fn worker_runtime_semantics_digest(
         &resources::semantics_digest(),
     );
     for (name, value) in [
-        (
-            b"maximum-worker-program-bytes".as_slice(),
-            u128::from(MAX_WORKER_PROGRAM_BYTES),
-        ),
         (
             b"maximum-generation-startup-nanoseconds".as_slice(),
             MAX_GENERATION_STARTUP.as_nanos(),
@@ -995,13 +993,13 @@ fn bind_runtime_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
     digest.update(value);
 }
 
-fn hash_open_file(file: &mut File, limit: u64) -> io::Result<[u8; 32]> {
+fn hash_open_file(file: &mut File) -> io::Result<[u8; 32]> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
+    if !metadata.is_file() || metadata.len() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bounded file size",
+            "invalid file size",
         ));
     }
     let mut digest = Sha256::new();
@@ -1014,8 +1012,8 @@ fn hash_open_file(file: &mut File, limit: u64) -> io::Result<[u8; 32]> {
         }
         total = total
             .checked_add(u64::try_from(read).map_err(io::Error::other)?)
-            .filter(|value| *value <= limit)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bounded file size"))?;
+            .filter(|value| *value <= metadata.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file changed"))?;
         digest.update(&buffer[..read]);
     }
     if total != metadata.len() || file.metadata()?.len() != metadata.len() {

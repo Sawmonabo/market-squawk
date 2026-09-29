@@ -38,6 +38,8 @@ use crate::{
 pub struct CatalogAuthority {
     catalog: Catalog,
     rights_registrar: RightsRegistrar,
+    pub(super) provider_identity_generation:
+        super::market_data_instruments::LiveProviderIdentityGenerations,
 }
 
 impl CatalogAuthority {
@@ -59,9 +61,14 @@ impl CatalogAuthority {
         let rights_registrar = RightsRegistrar {
             catalog_id: catalog.catalog_id,
         };
+        let provider_identity_generation =
+            super::market_data_instruments::LiveProviderIdentityGenerations::new(
+                catalog.result_bytes.max_result_bytes(),
+            );
         Self {
             catalog,
             rights_registrar,
+            provider_identity_generation,
         }
     }
 

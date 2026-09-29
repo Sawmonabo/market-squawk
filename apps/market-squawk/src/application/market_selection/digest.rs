@@ -13,7 +13,7 @@ use super::{
     SourceCandidate,
 };
 
-const RECEIPT_DIGEST_DOMAIN: &[u8] = b"market-squawk/market-selection-receipt/v2";
+const RECEIPT_DIGEST_DOMAIN: &[u8] = b"market-squawk/market-selection-receipt/v4";
 const ALL_OPERATIONS: [MarketOperation; 10] = [
     MarketOperation::ReferenceLookup,
     MarketOperation::SnapshotDisplay,
@@ -26,12 +26,13 @@ const ALL_OPERATIONS: [MarketOperation; 10] = [
     MarketOperation::PaperDecision,
     MarketOperation::AutomatedExecution,
 ];
-const ALL_TIMINGS: [ObservationTiming; 5] = [
+const ALL_TIMINGS: [ObservationTiming; 6] = [
     ObservationTiming::RealTime,
     ObservationTiming::Delayed,
     ObservationTiming::EndOfDay,
     ObservationTiming::Historical,
     ObservationTiming::Stored,
+    ObservationTiming::Unknown,
 ];
 const ALL_DEPTHS: [Option<MarketDepth>; 4] = [
     None,
@@ -67,22 +68,24 @@ pub(super) fn selection_receipt_digest(
     eligible: &[EligibleCandidate],
     rejected: &[RejectedCandidate],
     selected_at: market_squawk_domain::Timestamp,
+    include_authorization_audit: bool,
 ) -> Result<EvidenceDigest, MarketSelectionError> {
     let mut digest = Sha256::new();
     hash_bytes(&mut digest, RECEIPT_DIGEST_DOMAIN)?;
+    hash_bool(&mut digest, include_authorization_audit)?;
     hash_u32(&mut digest, policy_revision)?;
     hash_evidence_digest(&mut digest, policy_digest)?;
     hash_count(&mut digest, policy_candidate_limit)?;
-    hash_request(&mut digest, request)?;
+    hash_request(&mut digest, request, include_authorization_audit)?;
     hash_timestamp(&mut digest, selected_at)?;
 
     hash_count(&mut digest, eligible.len())?;
     for candidate in eligible {
-        hash_eligible(&mut digest, candidate)?;
+        hash_eligible(&mut digest, candidate, include_authorization_audit)?;
     }
     hash_count(&mut digest, rejected.len())?;
     for candidate in rejected {
-        hash_rejected(&mut digest, candidate)?;
+        hash_rejected(&mut digest, candidate, include_authorization_audit)?;
     }
 
     match eligible.first() {
@@ -101,6 +104,7 @@ pub(super) fn selection_receipt_digest(
 fn hash_request(
     digest: &mut Sha256,
     request: &MarketSelectionRequest,
+    include_authorization_audit: bool,
 ) -> Result<(), MarketSelectionError> {
     hash_tag(digest, asset_class_tag(request.asset_class()))?;
     hash_tag(digest, operation_tag(request.operation()))?;
@@ -110,6 +114,9 @@ fn hash_request(
     hash_tag(digest, coverage_tag(request.coverage()))?;
     let freshness = request.freshness();
     hash_timestamp(digest, freshness.as_of())?;
+    if include_authorization_audit {
+        hash_timestamp(digest, request.authorization_at())?;
+    }
     hash_tag(digest, freshness_basis_tag(freshness.basis()))?;
     hash_u64(digest, freshness.maximum_age_nanos())?;
     hash_tag(digest, priority_tag(request.priority()))?;
@@ -134,8 +141,9 @@ fn hash_request(
 fn hash_eligible(
     digest: &mut Sha256,
     eligible: &EligibleCandidate,
+    include_authorization_audit: bool,
 ) -> Result<(), MarketSelectionError> {
-    hash_candidate(digest, eligible.candidate())?;
+    hash_candidate(digest, eligible.candidate(), include_authorization_audit)?;
     hash_u64(digest, eligible.freshness_age_nanos())?;
     hash_optional_downgrade(digest, eligible.downgrade())
 }
@@ -143,8 +151,9 @@ fn hash_eligible(
 fn hash_rejected(
     digest: &mut Sha256,
     rejected: &RejectedCandidate,
+    include_authorization_audit: bool,
 ) -> Result<(), MarketSelectionError> {
-    hash_candidate(digest, rejected.candidate())?;
+    hash_candidate(digest, rejected.candidate(), include_authorization_audit)?;
     hash_count(digest, rejected.reasons().len())?;
     for reason in rejected.reasons() {
         hash_rejection_reason(digest, *reason)?;
@@ -155,6 +164,7 @@ fn hash_rejected(
 fn hash_candidate(
     digest: &mut Sha256,
     candidate: &SourceCandidate,
+    include_authorization_audit: bool,
 ) -> Result<(), MarketSelectionError> {
     hash_identity(digest, candidate.identity())?;
     let capabilities = candidate.capabilities();
@@ -182,12 +192,14 @@ fn hash_candidate(
     hash_optional_timestamp(digest, budget.reset_at())?;
     hash_timestamp(digest, budget.observed_at())?;
     let rights = admission.rights();
-    hash_text(digest, rights.decision_id().as_str())?;
     hash_tag(digest, rights_tag(rights.state()))?;
     hash_operation_set(digest, rights.permitted_operations())?;
-    hash_timestamp(digest, rights.decided_at())?;
-    hash_optional_timestamp(digest, rights.effective_from())?;
-    hash_optional_timestamp(digest, rights.effective_until())?;
+    if include_authorization_audit {
+        hash_text(digest, rights.decision_id().as_str())?;
+        hash_timestamp(digest, rights.decided_at())?;
+        hash_optional_timestamp(digest, rights.effective_from())?;
+        hash_optional_timestamp(digest, rights.effective_until())?;
+    }
     let integrity = admission.integrity();
     hash_tag(digest, integrity_tag(integrity.state()))?;
     hash_optional_u64(digest, integrity.generation().map(|value| value.get()))?;
@@ -490,6 +502,7 @@ const fn timing_tag(value: ObservationTiming) -> u8 {
         ObservationTiming::EndOfDay => 3,
         ObservationTiming::Historical => 4,
         ObservationTiming::Stored => 5,
+        ObservationTiming::Unknown => 6,
     }
 }
 

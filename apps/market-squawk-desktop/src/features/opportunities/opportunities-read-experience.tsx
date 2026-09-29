@@ -1,11 +1,10 @@
-import { useMemo, useState } from "react"
+import { useMemo } from "react"
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
 import {
   ChevronRight,
   CircleAlert,
   History,
   RefreshCw,
-  Search,
 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 
@@ -14,11 +13,11 @@ import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { useAnalyticalProductProjection } from "@/features/advanced/use-analytical-profile"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
+  admittedAnalysisActionToken,
   admittedSavedScreenId,
   parseInvestmentAnalysis,
   parseInvestmentAnalysisPage,
@@ -31,9 +30,11 @@ import {
   BriefError,
   BriefLoading,
   InvestmentBrief,
+  formatProductTimestamp,
   locatorOutcomeLabel,
 } from "./investment-brief"
-import { formatUnixNanos } from "./format"
+import { AnalysisActivity } from "./analysis-activity"
+import { AnalysisLaunch } from "./analysis-launch"
 
 const ANALYSIS_PAGE_LIMIT = 24
 
@@ -46,8 +47,9 @@ export function OpportunitiesReadExperience({
   scope: ProductScope
   readAvailable: boolean
 }) {
-  const [selectedActionToken, setSelectedActionToken] = useState<string | null>(null)
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedAnalysis = searchParams.get("analysis")
+  const selectedActionToken = admittedAnalysisActionToken(requestedAnalysis)
   const product = useProduct()
   const requestedScreenValue = searchParams.get("screenId")
   const requestedScreenId = admittedSavedScreenId(requestedScreenValue)
@@ -73,7 +75,6 @@ export function OpportunitiesReadExperience({
       requestedScreenId !== null &&
       screenReadAvailable,
   })
-  const profile = useAnalyticalProductProjection(transport, scope)
   const analyses = useInfiniteQuery({
     queryKey: productKeys.operation(
       scope,
@@ -108,9 +109,6 @@ export function OpportunitiesReadExperience({
   )
   const repeatedIdentity =
     new Set(history.map((analysis) => analysis.actionToken)).size !== history.length
-  const selectedIsRetained =
-    selectedActionToken !== null &&
-    history.some((analysis) => analysis.actionToken === selectedActionToken)
   const selected = useQuery({
     queryKey: productKeys.operation(
       scope,
@@ -131,7 +129,7 @@ export function OpportunitiesReadExperience({
         actionToken,
       )
     },
-    enabled: readAvailable && selectedIsRetained && !repeatedIdentity,
+    enabled: readAvailable && selectedActionToken !== null,
   })
   const trackRecordAvailable =
     product.status === "ready" &&
@@ -159,8 +157,7 @@ export function OpportunitiesReadExperience({
     },
     enabled:
       trackRecordAvailable &&
-      trackRecordActionToken !== null &&
-      !repeatedIdentity,
+      trackRecordActionToken !== null,
   })
 
   return (
@@ -177,31 +174,16 @@ export function OpportunitiesReadExperience({
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Opportunities</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Review investment analyses already saved by Market Squawk. History is shown in the
-            order it was created; this page does not rank investments or claim that a new search
-            has run.
+            Find opportunities with your current investment settings, or review saved analyses.
+            Completed searches retain their saved ordering; history is shown in creation order.
           </p>
         </div>
         <div className="max-w-sm rounded-lg border border-border bg-card/45 p-3">
-          <Button
-            type="button"
-            disabled
-            aria-describedby="find-opportunities-readiness"
-            className="w-full sm:w-auto"
-          >
-            <Search aria-hidden="true" />
-            Find opportunities
-          </Button>
-          <p
-            id="find-opportunities-readiness"
-            className="mt-2 text-xs leading-5 text-muted-foreground"
-          >
-            {profile.data
-              ? `${profile.data.label} settings are active. ${profile.data.nextAction}`
-              : "Review saved investment analyses, or try again later."}
-          </p>
+          <AnalysisLaunch transport={transport} scope={scope} />
         </div>
       </header>
+
+      <AnalysisActivity transport={transport} scope={scope} />
 
       {requestedScreenValue !== null ? (
         <SelectedSavedScreen
@@ -212,6 +194,48 @@ export function OpportunitiesReadExperience({
           screen={selectedScreen.data ?? null}
           onRetry={() => void selectedScreen.refetch()}
         />
+      ) : null}
+
+      {readAvailable ? (
+        <div className="mt-8">
+          {requestedAnalysis !== null && selectedActionToken === null ? (
+            <Alert variant="destructive">
+              <CircleAlert aria-hidden="true" />
+              <AlertTitle>This investment brief could not be opened</AlertTitle>
+              <AlertDescription>Choose a saved analysis from your history.</AlertDescription>
+            </Alert>
+          ) : selectedActionToken === null ? (
+            <SelectBriefPrompt />
+          ) : selected.isPending ? (
+            <BriefLoading />
+          ) : selected.isError ? (
+            <BriefError onRetry={() => void selected.refetch()} />
+          ) : (
+            <InvestmentBrief
+              analysis={selected.data}
+              transport={transport}
+              scope={scope}
+              trackRecord={trackRecord.data ?? null}
+              trackRecordPending={
+                trackRecordAvailable &&
+                trackRecordActionToken !== null &&
+                trackRecord.isPending
+              }
+              trackRecordUnavailable={
+                !trackRecordAvailable ||
+                trackRecordActionToken === null ||
+                trackRecord.isError
+              }
+              refreshing={selected.isFetching || trackRecord.isFetching}
+              onRefresh={() => {
+                void selected.refetch()
+                if (trackRecordActionToken !== null && trackRecordAvailable) {
+                  void trackRecord.refetch()
+                }
+              }}
+            />
+          )}
+        </div>
       ) : null}
 
       {!readAvailable ? (
@@ -282,7 +306,11 @@ export function OpportunitiesReadExperience({
                     key={analysis.actionToken}
                     analysis={analysis}
                     selected={analysis.actionToken === selectedActionToken}
-                    onSelect={() => setSelectedActionToken(analysis.actionToken)}
+                    onSelect={() => setSearchParams((current) => {
+                      const next = new URLSearchParams(current)
+                      next.set("analysis", analysis.actionToken)
+                      return next
+                    })}
                   />
                 ))}
               </div>
@@ -316,39 +344,7 @@ export function OpportunitiesReadExperience({
         </section>
       )}
 
-      {readAvailable && !repeatedIdentity ? (
-        <div className="mt-8">
-          {!selectedIsRetained ? (
-            <SelectBriefPrompt />
-          ) : selected.isPending ? (
-            <BriefLoading />
-          ) : selected.isError ? (
-            <BriefError onRetry={() => void selected.refetch()} />
-          ) : (
-            <InvestmentBrief
-              analysis={selected.data}
-              trackRecord={trackRecord.data ?? null}
-              trackRecordPending={
-                trackRecordAvailable &&
-                trackRecordActionToken !== null &&
-                trackRecord.isPending
-              }
-              trackRecordUnavailable={
-                !trackRecordAvailable ||
-                trackRecordActionToken === null ||
-                trackRecord.isError
-              }
-              refreshing={selected.isFetching || trackRecord.isFetching}
-              onRefresh={() => {
-                void selected.refetch()
-                if (trackRecordActionToken !== null && trackRecordAvailable) {
-                  void trackRecord.refetch()
-                }
-              }}
-            />
-          )}
-        </div>
-      ) : null}
+
     </>
   )
 }
@@ -468,10 +464,10 @@ function AnalysisHistoryCard({
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-3">
         <CardFact
           label="Information current through"
-          value={formatUnixNanos(analysis.horizon.informationCurrentThrough)}
+          value={formatProductTimestamp(analysis.horizon.informationCurrentThrough)}
         />
-        <CardFact label="Horizon" value={formatUnixNanos(analysis.horizon.endsAt)} />
-        <CardFact label="Expires" value={formatUnixNanos(analysis.horizon.expiresAt)} />
+        <CardFact label="Horizon" value={formatProductTimestamp(analysis.horizon.endsAt)} />
+        <CardFact label="Expires" value={formatProductTimestamp(analysis.horizon.expiresAt)} />
       </dl>
       <div className="mt-4 flex items-center justify-end gap-1 text-xs font-medium text-primary">
         Open brief

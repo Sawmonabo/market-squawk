@@ -5,14 +5,14 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     ProviderCaptureMaterial, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
-    ProviderWholeCaptureToken, RejoinedProviderCapture, SealedProviderCaptureMaterial,
+    RejoinedProviderCapture, SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    BeaCompleteness, BeaDatasetAcquisition, BeaMethod, BeaProviderQuotaDeclaration,
-    BeaSealedAcquisitionReceipt, BeaSourceBinding, BeaSourceError,
+    BeaCompleteness, BeaMetadataBundle, BeaMetadataEvidenceBundle, BeaMethod,
+    BeaProviderQuotaDeclaration, BeaSourceBinding, BeaSourceError,
 };
 
 /// Code-owned lifetime of one successful in-process BEA doctor admission.
@@ -108,7 +108,7 @@ impl BeaDoctorPageEvidence {
     }
 }
 
-/// Secret-free evidence that the complete metadata-first official BEA journey succeeded.
+/// Secret-free evidence that the bounded official BEA metadata admission succeeded.
 ///
 /// This receipt alone is diagnostic. It becomes runtime-admissible only through
 /// [`Self::bind_sealed`], which requires the actual shared physical request-graph receipt.
@@ -122,36 +122,37 @@ pub struct BeaDoctorReceipt {
     pages: Vec<BeaDoctorPageEvidence>,
     request_count: u32,
     total_response_bytes: u64,
-    returned_rows: u64,
-    missing_rows: Option<u64>,
-    data_completeness: BeaCompleteness,
-    source_production_time: Option<Timestamp>,
+    metadata_rows: u64,
+    missing_metadata_rows: Option<u64>,
+    metadata_completeness: BeaCompleteness,
     verified_at: Timestamp,
     receipt_digest: EvidenceDigest,
 }
 
 impl BeaDoctorReceipt {
-    /// Builds a complete receipt from already validated official acquisition evidence.
-    pub(crate) fn try_from_acquisition(
+    /// Builds a complete receipt from the exact validated metadata admission sequence.
+    pub(crate) fn try_from_metadata(
         binding: &BeaSourceBinding,
         quota: &BeaProviderQuotaDeclaration,
         dataset_id: SourceIdentifier,
         analytical_dataset_id: SourceIdentifier,
-        acquisition: &BeaDatasetAcquisition,
+        metadata: &BeaMetadataBundle,
         verified_at: Timestamp,
     ) -> Result<Self, BeaDoctorError> {
         if quota.declaration_digest() != binding.quota_declaration_digest()
-            || acquisition.metadata().dataset_id() != &dataset_id
-            || acquisition.data().page().receipt().completeness() == BeaCompleteness::Partial
+            || metadata.dataset_id() != &dataset_id
         {
             return Err(BeaDoctorError::InvalidAuthority);
         }
-        let expected_pages = acquisition.metadata().pages().len().saturating_add(1);
+        let expected_pages = metadata.pages().len();
+        if expected_pages < 2 {
+            return Err(BeaDoctorError::InvalidEvidence);
+        }
         let mut pages = Vec::new();
         pages
             .try_reserve_exact(expected_pages)
             .map_err(|_| BeaDoctorError::InvalidEvidence)?;
-        for captured in acquisition.metadata().pages() {
+        for captured in metadata.pages() {
             pages.push(page_evidence(
                 captured.telemetry().method(),
                 captured.telemetry(),
@@ -159,23 +160,7 @@ impl BeaDoctorReceipt {
                 captured.material(),
             )?);
         }
-        pages.push(page_evidence(
-            acquisition.data().telemetry().method(),
-            acquisition.data().telemetry(),
-            acquisition.data().page().receipt(),
-            acquisition.data().material(),
-        )?);
-        if pages.len() != expected_pages
-            || pages.iter().any(|page| page.received_at > verified_at)
-            || acquisition
-                .data()
-                .page()
-                .production_time()
-                .is_some_and(|production| {
-                    pages
-                        .last()
-                        .is_none_or(|page| production.timestamp() > page.received_at)
-                })
+        if pages.len() != expected_pages || pages.iter().any(|page| page.received_at > verified_at)
         {
             return Err(BeaDoctorError::InvalidEvidence);
         }
@@ -186,21 +171,37 @@ impl BeaDoctorReceipt {
                 .checked_add(page.response_bytes)
                 .ok_or(BeaDoctorError::InvalidEvidence)
         })?;
-        let data = pages.last().ok_or(BeaDoctorError::InvalidEvidence)?;
-        let returned_rows = data.returned_rows;
-        let missing_rows = data.missing_rows;
-        let data_completeness = data.completeness;
-        let metadata_generation = EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            acquisition.metadata().generation().digest(),
-        );
-        let source_production_time = acquisition
-            .data()
-            .page()
-            .production_time()
-            .map(|production| production.timestamp());
+        let metadata_rows = pages.iter().try_fold(0_u64, |total, page| {
+            total
+                .checked_add(page.returned_rows)
+                .ok_or(BeaDoctorError::InvalidEvidence)
+        })?;
+        let missing_metadata_rows = pages.iter().try_fold(Some(0_u64), |total, page| {
+            match (total, page.missing_rows) {
+                (Some(total), Some(missing)) => total
+                    .checked_add(missing)
+                    .map(Some)
+                    .ok_or(BeaDoctorError::InvalidEvidence),
+                _ => Ok(None),
+            }
+        })?;
+        let metadata_completeness = if pages
+            .iter()
+            .any(|page| page.completeness == BeaCompleteness::Partial)
+        {
+            BeaCompleteness::Partial
+        } else if pages
+            .iter()
+            .all(|page| page.completeness == BeaCompleteness::Complete)
+        {
+            BeaCompleteness::Complete
+        } else {
+            BeaCompleteness::ExpectedCountUnknown
+        };
+        let metadata_generation =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, metadata.generation().digest());
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-doctor-receipt/v4");
+        hasher.update(b"market-squawk/bea-metadata-doctor-receipt/v1");
         hash_text(&mut hasher, dataset_id.as_str())?;
         hash_text(&mut hasher, analytical_dataset_id.as_str())?;
         for digest in [
@@ -231,13 +232,6 @@ impl BeaDoctorReceipt {
             }
             hasher.update([completeness_tag(page.completeness)]);
         }
-        match source_production_time {
-            Some(production) => {
-                hasher.update([1]);
-                hasher.update(production.unix_nanos().to_be_bytes());
-            }
-            None => hasher.update([0]),
-        }
         hasher.update(verified_at.unix_nanos().to_be_bytes());
         let receipt_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
         Ok(Self {
@@ -249,10 +243,9 @@ impl BeaDoctorReceipt {
             pages,
             request_count,
             total_response_bytes,
-            returned_rows,
-            missing_rows,
-            data_completeness,
-            source_production_time,
+            metadata_rows,
+            missing_metadata_rows,
+            metadata_completeness,
             verified_at,
             receipt_digest,
         })
@@ -265,31 +258,24 @@ impl BeaDoctorReceipt {
     fn bind_sealed(
         self,
         binding: &BeaSourceBinding,
-        sealed: &BeaSealedAcquisitionReceipt,
-        capture_token: ProviderWholeCaptureToken,
+        evidence: BeaMetadataEvidenceBundle,
+        sealed_capture: SealedProviderCaptureSetReceipt,
     ) -> Result<BeaDoctorAdmissionEvidence, BeaDoctorError> {
+        let sealed_graph_digest =
+            crate::sealed::validate_sealed_metadata_sidecar(&evidence, &sealed_capture)
+                .map_err(|_| BeaDoctorError::InvalidEvidence)?;
         if self.source_binding_digest != binding.binding_digest()
             || self.quota_declaration_digest != binding.quota_declaration_digest()
-            || sealed.source_id() != binding.source_id()
-            || sealed.metadata_revision() != binding.metadata_revision()
-            || sealed.dataset_id() != &self.dataset_id
-            || sealed.evidence().metadata().generation().digest()
-                != self.metadata_generation.bytes()
-            || sealed.evidence().expected_capture_count() != self.pages.len()
-            || sealed
-                .data_response_digest()
-                .map_err(|_| BeaDoctorError::InvalidEvidence)?
-                != self
-                    .pages
-                    .last()
-                    .map(|page| page.response_digest)
-                    .ok_or(BeaDoctorError::InvalidEvidence)?
+            || evidence.dataset_id() != &self.dataset_id
+            || evidence.generation().digest() != self.metadata_generation.bytes()
+            || evidence.expected_capture_count() != self.pages.len()
+            || sealed_capture.capture().source_id() != binding.source_id()
+            || sealed_capture.capture().metadata_revision() != binding.metadata_revision()
         {
             return Err(BeaDoctorError::InvalidAuthority);
         }
         for (ordinal, expected) in self.pages.iter().enumerate() {
-            let capture = sealed
-                .evidence()
+            let capture = evidence
                 .expected_capture(ordinal)
                 .ok_or(BeaDoctorError::InvalidEvidence)?;
             let page = capture
@@ -299,8 +285,7 @@ impl BeaDoctorReceipt {
                 .ok_or(BeaDoctorError::InvalidEvidence)?;
             if capture.request_set_identity() != expected.request_identity
                 || page.request_identity() != expected.request_identity
-                || sealed
-                    .evidence()
+                || evidence
                     .expected_upstream_response_digest(ordinal)
                     .ok_or(BeaDoctorError::InvalidEvidence)?
                     != expected.upstream_response_digest
@@ -312,7 +297,7 @@ impl BeaDoctorReceipt {
                 return Err(BeaDoctorError::InvalidEvidence);
             }
         }
-        if self.data_completeness == BeaCompleteness::Partial {
+        if self.metadata_completeness == BeaCompleteness::Partial {
             return Err(BeaDoctorError::InvalidEvidence);
         }
         let expires_at = self
@@ -331,7 +316,7 @@ impl BeaDoctorReceipt {
         for digest in [
             binding.binding_digest(),
             self.receipt_digest,
-            sealed.sealed_graph_digest(),
+            sealed_graph_digest,
             self.metadata_generation,
             self.quota_declaration_digest,
         ] {
@@ -350,14 +335,15 @@ impl BeaDoctorReceipt {
             quota_declaration_digest: self.quota_declaration_digest,
             metadata_generation: self.metadata_generation,
             doctor_receipt_digest: self.receipt_digest,
-            doctor_sealed_graph_digest: sealed.sealed_graph_digest(),
+            doctor_sealed_graph_digest: sealed_graph_digest,
             verified_at: self.verified_at,
             expires_at,
-            returned_rows: self.returned_rows,
-            missing_rows: self.missing_rows,
-            completeness: self.data_completeness,
+            metadata_rows: self.metadata_rows,
+            missing_metadata_rows: self.missing_metadata_rows,
+            metadata_completeness: self.metadata_completeness,
             admission_digest,
-            capture_token,
+            metadata_evidence: evidence,
+            sealed_capture,
         })
     }
 
@@ -386,24 +372,19 @@ impl BeaDoctorReceipt {
         self.total_response_bytes
     }
 
-    /// Returns validated data rows.
-    pub const fn returned_rows(&self) -> u64 {
-        self.returned_rows
+    /// Returns validated metadata records across the admitted responses.
+    pub const fn metadata_rows(&self) -> u64 {
+        self.metadata_rows
     }
 
-    /// Returns known missing rows.
-    pub const fn missing_rows(&self) -> Option<u64> {
-        self.missing_rows
+    /// Returns known absent metadata records when BEA supplied an expected count.
+    pub const fn missing_metadata_rows(&self) -> Option<u64> {
+        self.missing_metadata_rows
     }
 
-    /// Returns data-page completeness.
-    pub const fn data_completeness(&self) -> BeaCompleteness {
-        self.data_completeness
-    }
-
-    /// Returns BEA response production time when supplied.
-    pub const fn source_production_time(&self) -> Option<Timestamp> {
-        self.source_production_time
+    /// Returns the admitted metadata-response completeness state.
+    pub const fn metadata_completeness(&self) -> BeaCompleteness {
+        self.metadata_completeness
     }
 
     /// Returns local completion time.
@@ -434,11 +415,12 @@ pub struct BeaDoctorAdmissionEvidence {
     doctor_sealed_graph_digest: EvidenceDigest,
     verified_at: Timestamp,
     expires_at: Timestamp,
-    returned_rows: u64,
-    missing_rows: Option<u64>,
-    completeness: BeaCompleteness,
+    metadata_rows: u64,
+    missing_metadata_rows: Option<u64>,
+    metadata_completeness: BeaCompleteness,
     admission_digest: EvidenceDigest,
-    capture_token: ProviderWholeCaptureToken,
+    metadata_evidence: BeaMetadataEvidenceBundle,
+    sealed_capture: SealedProviderCaptureSetReceipt,
 }
 
 impl BeaDoctorAdmissionEvidence {
@@ -456,23 +438,18 @@ impl BeaDoctorAdmissionEvidence {
             || self.quota_declaration_digest != binding.quota_declaration_digest()
             || &self.dataset_id != dataset_id
             || &self.analytical_dataset_id != analytical_dataset_id
-            || self
-                .capture_token
-                .persisted_receipt()
-                .receipt_digest()
-                .bytes()
-                == [0; 32]
-            || self.capture_token.persisted_receipt().capture().source_id() != &self.source_id
-            || self
-                .capture_token
-                .persisted_receipt()
-                .capture()
-                .metadata_revision()
-                != &self.metadata_revision
+            || self.metadata_evidence.dataset_id() != dataset_id
+            || self.metadata_evidence.generation().digest() != self.metadata_generation.bytes()
+            || self.sealed_capture.receipt_digest().bytes() == [0; 32]
+            || self.sealed_capture.capture().source_id() != &self.source_id
+            || self.sealed_capture.capture().metadata_revision() != &self.metadata_revision
         {
             return Err(BeaDoctorError::InvalidAuthority);
         }
-        if observed_at < self.verified_at || observed_at >= self.expires_at {
+        if observed_at < self.verified_at {
+            return Err(BeaDoctorError::InvalidEvidence);
+        }
+        if observed_at >= self.expires_at {
             return Err(BeaDoctorError::Expired);
         }
         Ok(())
@@ -533,39 +510,47 @@ impl BeaDoctorAdmissionEvidence {
         self.expires_at
     }
 
-    /// Returns validated data rows from the doctor request.
-    pub const fn returned_rows(&self) -> u64 {
-        self.returned_rows
+    /// Returns validated metadata records from the doctor admission.
+    pub const fn metadata_rows(&self) -> u64 {
+        self.metadata_rows
     }
 
-    /// Returns known missing rows from the doctor request.
-    pub const fn missing_rows(&self) -> Option<u64> {
-        self.missing_rows
+    /// Returns known absent metadata records from the doctor admission.
+    pub const fn missing_metadata_rows(&self) -> Option<u64> {
+        self.missing_metadata_rows
     }
 
-    /// Returns the doctor data-page completeness state.
-    pub const fn completeness(&self) -> BeaCompleteness {
-        self.completeness
+    /// Returns the doctor metadata-response completeness state.
+    pub const fn metadata_completeness(&self) -> BeaCompleteness {
+        self.metadata_completeness
     }
 
     /// Returns the complete actual-seal-bound doctor admission commitment.
     pub const fn admission_digest(&self) -> EvidenceDigest {
         self.admission_digest
     }
+
+    pub(crate) const fn metadata_evidence(&self) -> &BeaMetadataEvidenceBundle {
+        &self.metadata_evidence
+    }
+
+    pub(crate) const fn sealed_capture(&self) -> &SealedProviderCaptureSetReceipt {
+        &self.sealed_capture
+    }
 }
 
-/// Successful doctor receipt and every raw response awaiting one shared graph seal.
+/// Successful metadata doctor receipt and its raw responses awaiting one shared graph seal.
 #[derive(Debug)]
 pub struct BeaDoctorRun {
     receipt: BeaDoctorReceipt,
-    acquisition: BeaDatasetAcquisition,
+    metadata: BeaMetadataBundle,
 }
 
 /// Exact doctor evidence and private witness awaiting the common physical seal result.
 #[derive(Debug)]
 pub struct BeaPendingDoctorSeal {
     receipt: BeaDoctorReceipt,
-    evidence: crate::BeaDatasetEvidence,
+    evidence: BeaMetadataEvidenceBundle,
     expectation: ProviderCaptureSealExpectation,
 }
 
@@ -586,36 +571,33 @@ impl BeaPendingDoctorSeal {
                 return Err(BeaDoctorError::InvalidAuthority);
             }
         };
-        let sealed_acquisition =
-            BeaSealedAcquisitionReceipt::try_from_token(self.evidence, &capture_token)
-                .map_err(|_| BeaDoctorError::InvalidEvidence)?;
-        self.receipt
-            .bind_sealed(binding, &sealed_acquisition, capture_token)
+        self.receipt.bind_sealed(
+            binding,
+            self.evidence,
+            capture_token.persisted_receipt().clone(),
+        )
     }
 }
 
 impl BeaDoctorRun {
-    /// Binds a validated acquisition into one complete diagnostic doctor result.
+    /// Binds validated metadata into one complete diagnostic admission result.
     pub(crate) fn try_new(
         binding: &BeaSourceBinding,
         quota: &BeaProviderQuotaDeclaration,
         dataset_id: SourceIdentifier,
         analytical_dataset_id: SourceIdentifier,
-        acquisition: BeaDatasetAcquisition,
+        metadata: BeaMetadataBundle,
         verified_at: Timestamp,
     ) -> Result<Self, BeaDoctorError> {
-        let receipt = BeaDoctorReceipt::try_from_acquisition(
+        let receipt = BeaDoctorReceipt::try_from_metadata(
             binding,
             quota,
             dataset_id,
             analytical_dataset_id,
-            &acquisition,
+            &metadata,
             verified_at,
         )?;
-        Ok(Self {
-            receipt,
-            acquisition,
-        })
+        Ok(Self { receipt, metadata })
     }
 
     /// Returns the redacted diagnostic doctor receipt.
@@ -623,16 +605,16 @@ impl BeaDoctorRun {
         &self.receipt
     }
 
-    /// Returns the typed official acquisition and raw-capture material.
-    pub const fn acquisition(&self) -> &BeaDatasetAcquisition {
-        &self.acquisition
+    /// Returns the typed official metadata sequence and raw-capture material.
+    pub const fn metadata(&self) -> &BeaMetadataBundle {
+        &self.metadata
     }
 
     /// Splits the run into a private witness expectation and the sole common seal request.
     pub fn into_sealing_parts(
         self,
     ) -> Result<(BeaPendingDoctorSeal, ProviderCaptureSealRequest), BeaSourceError> {
-        let (evidence, graph) = self.acquisition.into_sealing_parts()?;
+        let (evidence, graph) = self.metadata.into_sealing_parts()?;
         let (expectation, request) = graph.into_whole_seal_parts();
         Ok((
             BeaPendingDoctorSeal {

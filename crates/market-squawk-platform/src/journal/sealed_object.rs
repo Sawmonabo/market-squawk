@@ -4,6 +4,9 @@
 //! body without forcing it into an in-memory journal frame. A value claim is never authority:
 //! authority is issued only after the store verifies the complete immutable object.
 
+#[path = "sealed_backup.rs"]
+mod sealed_backup;
+
 use std::{
     fmt,
     fs::File,
@@ -1860,14 +1863,12 @@ impl SealedResearchRecoverySession<'_, '_> {
             })?;
         let retained_object = match claim {
             SealedResearchRawClaim::JournalSegment(claim) => {
-                let verified = self
-                    .store
-                    .open_verified_claim_inner_with_control(claim, Some(self.control))?;
+                sealed_backup::verify_recovery_journal_claim(self.store, claim, self.control)?;
                 RetainedRawObject {
                     kind: RawObjectKind::JournalSegment,
-                    content_digest: verified.receipt().content_digest(),
-                    physical_receipt_digest: verified.receipt().physical_receipt_digest(),
-                    retained_units: verified.receipt().frames().len(),
+                    content_digest: claim.content_digest(),
+                    physical_receipt_digest: claim.physical_receipt_digest(),
+                    retained_units: claim.frames().len(),
                 }
             }
             SealedResearchRawClaim::LogicalObject(claim) => {

@@ -47,8 +47,9 @@ pub use schwab_oauth_installation::{
 };
 pub(crate) use schwab_oauth_runtime::{
     SchwabOAuthBrowserError, SchwabOAuthMarketAuthority, SchwabOAuthMarketDrain,
-    SchwabOAuthMarketDrainError, SchwabOAuthMarketDrainFuture, SchwabOAuthPublicationEpoch,
-    SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration, SchwabOAuthRuntimeError,
+    SchwabOAuthMarketDrainError, SchwabOAuthMarketDrainFuture, SchwabOAuthMarketDrainPurpose,
+    SchwabOAuthPublicationEpoch, SchwabOAuthReceiptCurrentness, SchwabOAuthRuntime,
+    SchwabOAuthRuntimeConfiguration, SchwabOAuthRuntimeError,
 };
 pub use service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
 pub(crate) use service::{

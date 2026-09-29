@@ -245,6 +245,13 @@ impl CanonicalObservationPayload {
                 encoder.serializable(value.lineage())?;
                 encoder.serializable(value.revision_evidence())
             }),
+            ResearchObservation::MarketCalendar(value) => {
+                Self::encode_with_control(control, &|encoder| {
+                    encoder.u8(12)?;
+                    encoder.serializable(value.scope())?;
+                    encoder.serializable(value.payload())
+                })
+            }
             ResearchObservation::PortfolioPosition(value) => {
                 Self::encode_with_control(control, &|encoder| {
                     encoder.u8(4)?;
@@ -262,6 +269,12 @@ impl CanonicalObservationPayload {
                     encoder.str(value.account_id().as_str())?;
                     encoder.str(value.transaction_type().as_str())?;
                     encoder.str(value.source_record_id().as_str())
+                })
+            }
+            ResearchObservation::CorporateActionSource(value) => {
+                Self::encode_with_control(control, &|encoder| {
+                    encoder.u8(15)?;
+                    encoder.serializable(value.payload())
                 })
             }
             ResearchObservation::CorporateAction(value) => {
@@ -374,15 +387,28 @@ fn encode_market_bar_time(
     encoder: &mut PitV1CanonicalEncoder<'_>,
     semantics: &market_squawk_domain::BarTimeSemantics,
 ) -> Result<(), PitV1EncodingError> {
-    encoder.i64(semantics.period_start().unix_nanos())?;
-    encoder.i64(semantics.period_end_exclusive().unix_nanos())?;
-    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
-    let session = semantics.session();
-    encoder.u8(market_bar_session_kind_tag(session.kind()))?;
-    encoder.str(session.ruleset().as_str())?;
-    let evidence = session.evidence();
-    encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
-    encoder.bytes(&evidence.bytes())
+    match semantics {
+        market_squawk_domain::BarTimeSemantics::TimestampedPeriod(period) => {
+            encoder.u8(1)?;
+            encoder.i64(period.period_start().unix_nanos())?;
+            encoder.i64(period.period_end_exclusive().unix_nanos())?;
+            encoder.u8(bar_timestamp_basis_tag(period.timestamp_basis()))?;
+            let session = period.session();
+            encoder.u8(market_bar_session_kind_tag(session.kind()))?;
+            encoder.str(session.ruleset().as_str())?;
+            let evidence = session.evidence();
+            encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
+            encoder.bytes(&evidence.bytes())
+        }
+        market_squawk_domain::BarTimeSemantics::NominalDailyDate(date) => {
+            encoder.u8(2)?;
+            encode_calendar_date(encoder, date.date())?;
+            encoder.str(date.ruleset().as_str())?;
+            let evidence = date.evidence().content_digest();
+            encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
+            encoder.bytes(&evidence.bytes())
+        }
+    }
 }
 
 const fn bar_timestamp_basis_tag(basis: market_squawk_domain::BarTimestampBasis) -> u8 {

@@ -5,9 +5,10 @@ use sha2::{Digest, Sha256};
 
 use super::receipt::MarketSelectionError;
 
-const MARKET_SELECTION_POLICY_REVISION: u32 = 3;
+const MARKET_SELECTION_POLICY_REVISION: u32 = 4;
 const MAXIMUM_POLICY_CANDIDATES: usize = 4_096;
-const POLICY_CANONICAL_IDENTITY: &[u8] = b"market-squawk.market-selection.v3\0\
+const POLICY_CANONICAL_IDENTITY: &[u8] = b"market-squawk.market-selection.v4\0\
+source-cutoff-independent-of-current-authorization-clock\0\
 strict-before-downgrade\0fewer-downgrades-first\0\
 quality=direct-verified,direct-unverified,official-delayed,aggregated,indicative,modeled,estimated,stale,quarantined\0\
 depth=order-level,price-level,top-of-book,none\0\
@@ -79,6 +80,7 @@ pub(crate) enum ObservationTiming {
     EndOfDay,
     Historical,
     Stored,
+    Unknown,
 }
 
 impl ObservationTiming {
@@ -93,6 +95,7 @@ impl ObservationTiming {
             Self::EndOfDay => 3,
             Self::Historical => 2,
             Self::Stored => 1,
+            Self::Unknown => 0,
         }
     }
 }
@@ -280,6 +283,7 @@ pub(crate) struct MarketSelectionRequest {
     minimum_quality: DataQuality,
     coverage: MarketCoverage,
     freshness: FreshnessRequirement,
+    authorization_at: Timestamp,
     priority: RequestPriority,
     downgrade: DowngradePolicy,
     definition_revision_digest: Option<EvidenceDigest>,
@@ -336,6 +340,7 @@ impl MarketSelectionRequest {
             minimum_quality,
             coverage,
             freshness,
+            authorization_at: freshness.as_of(),
             priority,
             downgrade,
             definition_revision_digest,
@@ -344,6 +349,25 @@ impl MarketSelectionRequest {
 
     pub(crate) const fn asset_class(&self) -> AssetClass {
         self.asset_class
+    }
+
+    /// Uses the actual read admission clock for rights while preserving every source cutoff.
+    /// Execution consumers continue to require one current instant for both clocks.
+    pub(crate) fn with_authorization_at(
+        mut self,
+        at: Timestamp,
+    ) -> Result<Self, MarketSelectionError> {
+        if at < self.freshness.as_of()
+            || (self.operation.requires_execution_quality() && at != self.freshness.as_of())
+        {
+            return Err(MarketSelectionError::InvalidTimestampOrder);
+        }
+        self.authorization_at = at;
+        Ok(self)
+    }
+
+    pub(crate) const fn authorization_at(&self) -> Timestamp {
+        self.authorization_at
     }
 
     pub(crate) const fn operation(&self) -> MarketOperation {

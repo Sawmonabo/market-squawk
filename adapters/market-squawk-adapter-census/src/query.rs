@@ -77,8 +77,11 @@ impl Default for CensusApplicationPacing {
 }
 
 /// The provider route coordinate for one Census dataset.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum CensusDatasetVintage {
     /// A four-digit statistical-product vintage.
     Year(u16),
@@ -96,7 +99,8 @@ impl CensusDatasetVintage {
 }
 
 /// A validated Census dataset vintage and path.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusDataset {
     vintage: CensusDatasetVintage,
     path: Vec<String>,
@@ -270,8 +274,9 @@ impl fmt::Display for CensusAuthorizedUrl<'_> {
 }
 
 /// The `get` selection for one Census data request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(deny_unknown_fields)]
 pub enum CensusSelection {
     /// A bounded ordinary variable list.
     Variables {
@@ -391,7 +396,8 @@ impl CensusSelection {
 }
 
 /// One typed non-geographic Census predicate with one or more provider values.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusPredicate {
     variable: SourceIdentifier,
     predicate_type: CensusPredicateType,
@@ -452,11 +458,58 @@ impl CensusPredicate {
     pub fn values(&self) -> &[String] {
         &self.values
     }
+
+    /// Returns a coordinate fixed by one exact predicate even when the provider omits its column.
+    pub(crate) fn exact_value(&self) -> Option<&str> {
+        let [value] = self.values.as_slice() else {
+            return None;
+        };
+        (!value.contains(['*', ':'])).then_some(value.as_str())
+    }
+
+    /// Checks one echoed coordinate using the same typed grammar admitted for the request.
+    pub(crate) fn contains_response_value(&self, value: &str) -> bool {
+        if value.is_empty() || value.contains(['*', ':']) {
+            return false;
+        }
+        self.values
+            .iter()
+            .any(|expected| match self.predicate_type {
+                CensusPredicateType::String => expected.strip_suffix('*').map_or_else(
+                    || expected == value,
+                    |prefix| !prefix.contains('*') && value.starts_with(prefix),
+                ),
+                CensusPredicateType::Integer => numeric_predicate_contains::<i128>(expected, value),
+                CensusPredicateType::Float => {
+                    numeric_predicate_contains::<rust_decimal::Decimal>(expected, value)
+                }
+                _ => false,
+            })
+    }
+}
+
+fn numeric_predicate_contains<T: std::str::FromStr + PartialOrd>(
+    predicate: &str,
+    value: &str,
+) -> bool {
+    let Ok(value) = value.parse::<T>() else {
+        return false;
+    };
+    match predicate.split_once(':') {
+        Some((start, end)) => match (start.parse::<T>(), end.parse::<T>()) {
+            (Ok(start), Ok(end)) => start <= value && value <= end,
+            _ => false,
+        },
+        None => predicate
+            .parse::<T>()
+            .is_ok_and(|expected| expected == value),
+    }
 }
 
 /// One exact or wildcard geography code.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+#[serde(deny_unknown_fields)]
 pub enum CensusGeographyCode {
     /// One exact provider geography code.
     Exact(String),
@@ -491,7 +544,8 @@ impl CensusGeographyCode {
 }
 
 /// One `for` or `in` geography level and its selected codes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusGeographyClause {
     level: String,
     codes: Vec<CensusGeographyCode>,
@@ -550,8 +604,9 @@ impl CensusGeographyClause {
 }
 
 /// A bounded fully qualified `ucgid` or provider pseudo-geography expression.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 #[serde(transparent)]
+#[serde(deny_unknown_fields)]
 pub struct CensusUcgid(String);
 
 impl CensusUcgid {
@@ -593,8 +648,9 @@ impl CensusUcgid {
 }
 
 /// One standard or UCGID geography selection.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(deny_unknown_fields)]
 pub enum CensusGeography {
     /// Provider `for` plus optional `in` clauses.
     Standard {
@@ -701,8 +757,11 @@ impl CensusGeography {
 }
 
 /// An exact time point admitted by the current Census query guide.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case", tag = "precision")]
+#[serde(deny_unknown_fields)]
 pub enum CensusTimePoint {
     /// Calendar year.
     Year { year: u16 },
@@ -767,8 +826,11 @@ impl CensusTimePoint {
 }
 
 /// The verified point/range forms of the time-series `time` predicate.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(deny_unknown_fields)]
 pub enum CensusTimePredicate {
     /// One exact period.
     At { point: CensusTimePoint },
@@ -840,6 +902,27 @@ impl CensusDataQuery {
         geography: CensusGeography,
         time: Option<CensusTimePredicate>,
     ) -> Result<Self, CensusAdapterError> {
+        let rebuilt_dataset = match dataset.vintage() {
+            CensusDatasetVintage::Year(year) => {
+                CensusDataset::try_new(year, dataset.path_string())?
+            }
+            CensusDatasetVintage::TimeSeries => {
+                CensusDataset::try_time_series(dataset.path_string())?
+            }
+        };
+        if rebuilt_dataset != dataset {
+            return Err(CensusAdapterError::InvalidQuery);
+        }
+        for predicate in &predicates {
+            if CensusPredicate::try_new(
+                predicate.variable.as_str(),
+                predicate.predicate_type.clone(),
+                &predicate.values,
+            )? != *predicate
+            {
+                return Err(CensusAdapterError::InvalidQuery);
+            }
+        }
         validate_selection(&selection)?;
         validate_geography(&geography)?;
         if time.is_some() && dataset.vintage() != CensusDatasetVintage::TimeSeries {
@@ -1130,7 +1213,7 @@ fn validate_predicate_value(
 ) -> Result<(), CensusAdapterError> {
     match predicate_type {
         CensusPredicateType::String => {
-            if value.contains(':') {
+            if value.contains(':') || value.strip_suffix('*').unwrap_or(value).contains('*') {
                 return Err(CensusAdapterError::InvalidQuery);
             }
             Ok(())
@@ -1257,6 +1340,11 @@ fn validate_geography(geography: &CensusGeography) -> Result<(), CensusAdapterEr
             Ok(())
         }
         CensusGeography::Uniform { values } => {
+            for value in values {
+                if CensusUcgid::try_new(value.as_str())? != *value {
+                    return Err(CensusAdapterError::InvalidQuery);
+                }
+            }
             if values.is_empty()
                 || values.len() > MAX_PREDICATE_VALUES
                 || values.iter().collect::<BTreeSet<_>>().len() != values.len()
@@ -1310,5 +1398,37 @@ fn validate_time_predicate(time: CensusTimePredicate) -> Result<(), CensusAdapte
             }
             Ok(())
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CensusDataQuery {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let decode = || -> Result<Self, CensusAdapterError> {
+            let field = |name: &str| {
+                value
+                    .get(name)
+                    .cloned()
+                    .ok_or(CensusAdapterError::InvalidQuery)
+            };
+            let query = Self::try_new(
+                serde_json::from_value(field("dataset")?)
+                    .map_err(|_| CensusAdapterError::InvalidQuery)?,
+                serde_json::from_value(field("selection")?)
+                    .map_err(|_| CensusAdapterError::InvalidQuery)?,
+                serde_json::from_value(field("predicates")?)
+                    .map_err(|_| CensusAdapterError::InvalidQuery)?,
+                serde_json::from_value(field("geography")?)
+                    .map_err(|_| CensusAdapterError::InvalidQuery)?,
+                serde_json::from_value(field("time")?)
+                    .map_err(|_| CensusAdapterError::InvalidQuery)?,
+            )?;
+            if serde_json::to_value(&query).map_err(|_| CensusAdapterError::InvalidQuery)? != value
+            {
+                return Err(CensusAdapterError::InvalidQuery);
+            }
+            Ok(query)
+        };
+        decode().map_err(serde::de::Error::custom)
     }
 }

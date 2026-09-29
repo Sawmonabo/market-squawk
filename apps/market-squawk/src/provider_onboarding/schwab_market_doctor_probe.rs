@@ -25,11 +25,11 @@ use market_squawk_adapter_schwab::{
     SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabSealedStreamerCapture,
     SchwabStreamerConnectionControl, SchwabStreamerConnectionControlSource,
     SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFamilyDoctorAccumulator,
-    SchwabStreamerFamilyDoctorHandoff, SchwabTransportError, SchwabTransportTelemetry,
-    SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission, StreamerCaptureSink,
-    StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription, StreamerTransportBounds,
-    TokenAuthorityError, build_instrument_search_request, build_market_hours_request,
-    build_movers_request,
+    SchwabStreamerFamilyDoctorHandoff, SchwabStreamerRuntimeAuthority, SchwabTransportError,
+    SchwabTransportTelemetry, SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission,
+    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription,
+    StreamerTransportBounds, TokenAuthorityError, build_instrument_search_request,
+    build_market_hours_request, build_movers_request,
 };
 use market_squawk_domain::{
     CoverageDelay, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
@@ -693,6 +693,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
         &self,
         family: SchwabMarketDataFamily,
         authority: &SchwabOAuthMarketAuthority,
+        runtime_authority: Arc<dyn SchwabStreamerRuntimeAuthority>,
         sealer: &dyn SchwabMarketDoctorCaptureSealer,
         cancellation: CancellationToken,
         deadline: Instant,
@@ -724,6 +725,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             self.parse_bounds,
             self.token_admission,
             self.telemetry.clone(),
+            runtime_authority,
         )
         .map_err(map_transport_error)?;
         let subscription = match &probe.target {
@@ -758,70 +760,80 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
         );
         tokio::pin!(run);
         let mut accumulator = None;
-        loop {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    run_cancellation.cancel();
-                    return Err(SchwabMarketDataDoctorError::Cancelled);
-                }
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                    run_cancellation.cancel();
-                    return Err(SchwabMarketDataDoctorError::Deadline);
-                }
-                maybe_batch = receiver.recv() => {
-                    let batch = maybe_batch.ok_or(SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
-                    let capture = self.seal_streamer_batch(
-                        batch,
-                        sealer,
-                        cancellation.child_token(),
-                        deadline,
-                    ).await?;
-                    if let Some(terminal) = observe_streamer_capture(
-                        family,
-                        service,
-                        capture,
-                        &mut accumulator,
-                    )? {
-                        run_cancellation.cancel();
-                        let run_result = bounded(&mut run, &cancellation, deadline).await?;
-                        match run_result {
-                            Ok(_) => return Ok(terminal.evidence),
-                            Err(SchwabTransportError::Adapter)
-                                if terminal.provider_rejected => return Ok(terminal.evidence),
-                            Err(error) => return Err(map_transport_error(error)),
-                        }
+        let mut run_finished = false;
+        let mut provider_rejected = false;
+        let outcome = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(SchwabMarketDataDoctorError::Cancelled),
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        return Err(SchwabMarketDataDoctorError::Deadline);
                     }
-                }
-                result = &mut run => {
-                    while let Ok(batch) = receiver.try_recv() {
+                    maybe_batch = receiver.recv() => {
+                        let batch = maybe_batch.ok_or(SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
                         let capture = self.seal_streamer_batch(
-                            batch,
-                            sealer,
-                            cancellation.child_token(),
-                            deadline,
+                            batch, sealer, cancellation.child_token(), deadline,
                         ).await?;
                         if let Some(terminal) = observe_streamer_capture(
-                            family,
-                            service,
-                            capture,
-                            &mut accumulator,
+                            family, service, capture, &mut accumulator,
                         )? {
-                            return match result {
-                                Ok(_) => Ok(terminal.evidence),
-                                Err(SchwabTransportError::Adapter)
-                                    if terminal.provider_rejected => Ok(terminal.evidence),
-                                Err(error) => Err(map_transport_error(error)),
-                            };
+                            provider_rejected = terminal.provider_rejected;
+                            return Ok(terminal.evidence);
                         }
                     }
-                    return Err(match result {
-                        Ok(_) => SchwabMarketDataDoctorError::InvalidProbeEvidence,
-                        Err(error) => map_transport_error(error),
-                    });
+                    result = &mut run => {
+                        run_finished = true;
+                        while let Ok(batch) = receiver.try_recv() {
+                            let capture = self.seal_streamer_batch(
+                                batch, sealer, cancellation.child_token(), deadline,
+                            ).await?;
+                            if let Some(terminal) = observe_streamer_capture(
+                                family, service, capture, &mut accumulator,
+                            )? {
+                                return match result {
+                                    Ok(_) => Ok(terminal.evidence),
+                                    Err(SchwabTransportError::Adapter) if terminal.provider_rejected => Ok(terminal.evidence),
+                                    Err(error) => Err(map_transport_error(error)),
+                                };
+                            }
+                        }
+                        return Err(match result {
+                            Ok(_) => SchwabMarketDataDoctorError::InvalidProbeEvidence,
+                            Err(error) => map_transport_error(error),
+                        });
+                    }
                 }
             }
+        }.await;
+
+        // Cancellation and work deadlines stop acquisition, but cannot drop the executor before
+        // its internally bounded socket close and final raw microbatch handoff finish.
+        run_cancellation.cancel();
+        let drained = if run_finished {
+            None
+        } else {
+            Some((&mut run).await)
+        };
+        let cleanup_deadline = Instant::now()
+            .checked_add(self.streamer_bounds.io_timeout())
+            .ok_or(SchwabMarketDataDoctorError::Clock)?;
+        let cleanup_cancellation = CancellationToken::new();
+        while let Ok(batch) = receiver.try_recv() {
+            self.seal_streamer_batch(
+                batch,
+                sealer,
+                cleanup_cancellation.child_token(),
+                cleanup_deadline,
+            )
+            .await?;
         }
+        match drained {
+            Some(Err(SchwabTransportError::Adapter)) if provider_rejected => {}
+            Some(Err(error)) if outcome.is_ok() => return Err(map_transport_error(error)),
+            _ => {}
+        }
+        outcome
     }
 
     #[allow(
@@ -879,11 +891,19 @@ impl SchwabMarketDoctorProbeExecutor for ProviderNativeSchwabMarketDoctorProbeEx
         &'a self,
         family: SchwabMarketDataFamily,
         authority: &'a SchwabOAuthMarketAuthority,
+        runtime_authority: Arc<dyn SchwabStreamerRuntimeAuthority>,
         sealer: &'a dyn SchwabMarketDoctorCaptureSealer,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> DoctorFuture<'a, SchwabMarketDoctorFamilyProbeEvidence> {
-        Box::pin(self.execute_streamer(family, authority, sealer, cancellation, deadline))
+        Box::pin(self.execute_streamer(
+            family,
+            authority,
+            runtime_authority,
+            sealer,
+            cancellation,
+            deadline,
+        ))
     }
 }
 

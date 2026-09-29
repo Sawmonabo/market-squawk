@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-use super::jobs::InstalledJobOperations;
+use super::jobs::{InstalledJobOperations, JobStartAdmission};
 
 /// Sole installed transport adapter for the Operations domain.
 pub(super) struct InstalledOperations {
@@ -65,12 +65,25 @@ impl InstalledOperations {
         }
         let captured_at =
             super::runtime::current_timestamp().map_err(|_| ServiceError::Unavailable)?;
-        match self.application.prepare_job(request, context).await? {
+        let permit = match self.jobs.begin_start(request, context).await? {
+            JobStartAdmission::Existing(result) => return Ok(result),
+            JobStartAdmission::Execute(permit) => permit,
+        };
+        let prepared = match self.application.prepare_job(request, context).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.jobs.reject_start(&permit).await?;
+                return Err(error);
+            }
+        };
+        match prepared {
             PreparedOperationsJob::Backup { command, operation } => {
                 let admission = match self.backup.admit(command, captured_at) {
                     Ok(admission) => admission,
                     Err(error) => {
-                        self.application.revoke_backup_operation(&operation);
+                        if self.jobs.reject_start(&permit).await? {
+                            self.application.revoke_backup_operation(&operation);
+                        }
                         return Err(map_runner(error));
                     }
                 };
@@ -79,6 +92,7 @@ impl InstalledOperations {
                     .jobs
                     .start(
                         admission,
+                        &permit,
                         context,
                         ToolResultMetadata::complete_not_applicable(),
                     )
@@ -86,8 +100,10 @@ impl InstalledOperations {
                 {
                     Ok(result) => Ok(result),
                     Err(error) => {
-                        let _ignored = self.backup.revoke(&retained);
-                        self.application.revoke_backup_operation(&operation);
+                        if self.jobs.reject_start(&permit).await? {
+                            let _ignored = self.backup.revoke(&retained);
+                            self.application.revoke_backup_operation(&operation);
+                        }
                         Err(error)
                     }
                 }
@@ -96,7 +112,9 @@ impl InstalledOperations {
                 let admission = match self.recovery.admit(command, captured_at) {
                     Ok(admission) => admission,
                     Err(error) => {
-                        self.application.revoke_recovery_operation(&operation);
+                        if self.jobs.reject_start(&permit).await? {
+                            self.application.revoke_recovery_operation(&operation);
+                        }
                         return Err(map_runner(error));
                     }
                 };
@@ -105,6 +123,7 @@ impl InstalledOperations {
                     .jobs
                     .start(
                         admission,
+                        &permit,
                         context,
                         ToolResultMetadata::complete_not_applicable(),
                     )
@@ -112,8 +131,10 @@ impl InstalledOperations {
                 {
                     Ok(result) => Ok(result),
                     Err(error) => {
-                        let _ignored = self.recovery.revoke(&retained);
-                        self.application.revoke_recovery_operation(&operation);
+                        if self.jobs.reject_start(&permit).await? {
+                            let _ignored = self.recovery.revoke(&retained);
+                            self.application.revoke_recovery_operation(&operation);
+                        }
                         Err(error)
                     }
                 }
@@ -122,7 +143,9 @@ impl InstalledOperations {
                 let admission = match self.update.admit(command, captured_at) {
                     Ok(admission) => admission,
                     Err(error) => {
-                        self.application.revoke_update_operation(&operation);
+                        if self.jobs.reject_start(&permit).await? {
+                            self.application.revoke_update_operation(&operation);
+                        }
                         return Err(map_runner(error));
                     }
                 };
@@ -131,6 +154,7 @@ impl InstalledOperations {
                     .jobs
                     .start(
                         admission,
+                        &permit,
                         context,
                         ToolResultMetadata::complete_not_applicable(),
                     )
@@ -138,8 +162,10 @@ impl InstalledOperations {
                 {
                     Ok(result) => Ok(result),
                     Err(error) => {
-                        let _ignored = self.update.revoke(&retained);
-                        self.application.revoke_update_operation(&operation);
+                        if self.jobs.reject_start(&permit).await? {
+                            let _ignored = self.update.revoke(&retained);
+                            self.application.revoke_update_operation(&operation);
+                        }
                         Err(error)
                     }
                 }

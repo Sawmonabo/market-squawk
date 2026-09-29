@@ -1,13 +1,15 @@
 //! Account-scoped Coinbase Direct runtime supervision.
 //!
-//! Startup completes every credential, metadata, registry, capture, route, and product allocation
-//! before a single product task may open a provider connection. Each product task is the sole
-//! mutable owner of its registry and book generation; the account owner retains cross-process
-//! exclusion, onboarding currentness, cancellation, and coordinated cleanup.
+//! Account startup completes credential, metadata, and bounded product admission before product
+//! tasks begin. Each task seals its original product reference and selects native catalog identity
+//! before its live session, then owns registry, capture, route, and book generation cleanup. The
+//! account owner retains cross-process exclusion, onboarding currentness, and cancellation.
 
+mod coordinator;
 mod evidence;
 mod output;
 mod product;
+mod reference;
 
 use std::mem::size_of;
 use std::sync::{
@@ -39,6 +41,8 @@ use crate::{
     },
 };
 
+use coordinator::DirectAccountCoordinator;
+pub use coordinator::DirectAccountCoordinatorError;
 pub(crate) use evidence::try_build_product_metadata_set;
 use evidence::try_build_product_spec;
 pub use output::CoinbaseDirectOutputFailure;
@@ -180,20 +184,6 @@ impl CoinbaseDirectLiveRuntime {
 }
 
 impl CoinbaseDirectAccountActivation {
-    /// Starts Direct products on the bounded live runtime after atomic account preflight.
-    ///
-    /// # Errors
-    ///
-    /// Returns without network access when any product, credential, queue, capture, registry, or
-    /// live-route prerequisite cannot be admitted.
-    pub async fn start_live(
-        self,
-        runtime_config: LiveRuntimeConfig,
-        cancellation: CancellationToken,
-    ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, None, None, cancellation).await
-    }
-
     /// Starts Direct products with one shared generation-owned order-level read directory.
     pub(crate) async fn start_live_with_order_level(
         self,
@@ -201,33 +191,14 @@ impl CoinbaseDirectAccountActivation {
         order_level: OrderLevelDirectory,
         cancellation: CancellationToken,
     ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, None, Some(order_level), cancellation).await
-    }
-
-    /// Starts Direct products only after exact execution action hooks are installed per route.
-    ///
-    /// This is the source-side composition seam used by paper execution. It preserves the same
-    /// centralized strategy, current-authority, risk, dispatcher, and execution chain as public
-    /// sources.
-    ///
-    /// # Errors
-    ///
-    /// Returns without provider network access when hook or product preflight fails.
-    pub async fn start_live_with_action_hooks(
-        self,
-        runtime_config: LiveRuntimeConfig,
-        action_hooks: Vec<RouteActionHook>,
-        cancellation: CancellationToken,
-    ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, Some(action_hooks), None, cancellation).await
+        start_account(self, runtime_config, order_level, cancellation).await
     }
 }
 
 async fn start_account(
     mut activation: CoinbaseDirectAccountActivation,
     runtime_config: LiveRuntimeConfig,
-    action_hooks: Option<Vec<RouteActionHook>>,
-    order_level: Option<OrderLevelDirectory>,
+    order_level: OrderLevelDirectory,
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
     activation.require_current().await?;
@@ -242,12 +213,7 @@ async fn start_account(
         .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
     for (slot, product) in products.into_iter().enumerate() {
         if let Some(product) = product {
-            specs.push(try_build_product_spec(
-                slot,
-                activation.lease(),
-                product,
-                order_level.is_some(),
-            )?);
+            specs.push(try_build_product_spec(slot, activation.lease(), product)?);
         }
     }
     if specs.len() != product_count {
@@ -323,21 +289,13 @@ async fn start_account(
         runtime_config.mailbox_count_per_shard(),
         runtime_config.maximum_message_bytes(),
     );
-    let mut live = ProductionLiveRuntimeOwner::start_with_research_exports(
+    let live = ProductionLiveRuntimeOwner::start_with_research_exports(
         runtime_config,
         routes,
         Vec::new(),
         committed_exports,
     )
     .await?;
-    if let Some(action_hooks) = action_hooks
-        && let Err(startup) = live
-            .prepare_action_hooks(action_hooks, cancellation.child_token())
-            .await
-    {
-        publication_cancellation.cancel();
-        return rollback_live_start(startup.into(), live).await;
-    }
     let started = start_on_live_runtime(
         activation,
         specs,
@@ -355,7 +313,7 @@ async fn start_account(
         publication_limits,
         publication_cancellation,
         durable_reads,
-        order_level,
+        Some(order_level),
         cancellation,
     )
     .await;
@@ -638,6 +596,14 @@ async fn run_account(
     if publication_ingresses.len() != product_count {
         return Err(CoinbaseDirectSupervisorError::ActivationTopology);
     }
+    let coordinator = DirectAccountCoordinator::try_new(
+        &specs
+            .iter()
+            .map(ProductRuntimeSpec::slot)
+            .collect::<Vec<_>>(),
+        cancellation.clone(),
+    )
+    .map_err(|_| CoinbaseDirectSupervisorError::ActivationTopology)?;
     let mut publication_ingresses = publication_ingresses.into_iter();
     let mut products = JoinSet::new();
     for spec in specs {
@@ -647,6 +613,9 @@ async fn run_account(
             .ok_or(CoinbaseDirectSupervisorError::ActivationTopology)?;
         let task_config = app_config.clone();
         let provider_rate = activation.provider_rate().clone();
+        let catalog_reader = activation.catalog_reader();
+        let catalog_synchronizer = activation.catalog_synchronizer();
+        let research_service = activation.research_service();
         let account_subject = activation.account_subject().clone();
         let task_signer = Arc::clone(&signer);
         let task_ready = ready_sender.clone();
@@ -655,6 +624,7 @@ async fn run_account(
         let task_ingress = live_ingress.clone();
         let task_order_level = order_level.clone();
         let task_bootstrap_slots = Arc::clone(&bootstrap_slots);
+        let task_coordinator = coordinator.clone();
         products.spawn(async move {
             (
                 slot,
@@ -662,6 +632,9 @@ async fn run_account(
                     spec,
                     task_config,
                     provider_rate,
+                    catalog_reader,
+                    catalog_synchronizer,
+                    research_service,
                     account_subject,
                     admission,
                     capture_process,
@@ -673,6 +646,7 @@ async fn run_account(
                     task_ready,
                     task_start,
                     task_bootstrap_slots,
+                    task_coordinator,
                     task_cancellation,
                 )
                 .await,
@@ -693,57 +667,89 @@ async fn run_account(
 
     let mut observed = [false; crate::provider_activation::COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS];
     let mut ready_count = 0;
-    while ready_count < product_count {
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                return stop_products(products, cancellation, None).await;
-            }
-            () = publication_terminal.cancelled() => {
-                return stop_products(
-                    products,
-                    cancellation,
-                    Some(CoinbaseDirectSupervisorError::PublicationExitedBeforeStartup),
-                ).await;
-            }
-            outcome = products.join_next() => {
-                let primary = product_outcome(outcome);
-                return stop_products(products, cancellation, Some(primary)).await;
-            }
-            ready = ready_receiver.recv() => {
-                let Some(ready) = ready else {
+    let mut ready_epoch = None;
+    loop {
+        while ready_count < product_count {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return stop_products(products, cancellation, None).await;
+                }
+                () = publication_terminal.cancelled() => {
                     return stop_products(
                         products,
                         cancellation,
-                        Some(CoinbaseDirectSupervisorError::StartupQueueClosed),
-                    ).await;
-                };
-                let Some(slot) = observed.get_mut(ready.slot) else {
-                    return stop_products(
-                        products,
-                        cancellation,
-                        Some(CoinbaseDirectSupervisorError::ActivationTopology),
-                    ).await;
-                };
-                if *slot {
-                    return stop_products(
-                        products,
-                        cancellation,
-                        Some(CoinbaseDirectSupervisorError::DuplicateReady),
+                        Some(CoinbaseDirectSupervisorError::PublicationExitedBeforeStartup),
                     ).await;
                 }
-                *slot = true;
-                ready_count += 1;
+                outcome = products.join_next() => {
+                    let primary = product_outcome(outcome);
+                    return stop_products(products, cancellation, Some(primary)).await;
+                }
+                ready = ready_receiver.recv() => {
+                    let Some(ready) = ready else {
+                        return stop_products(
+                            products,
+                            cancellation,
+                            Some(CoinbaseDirectSupervisorError::StartupQueueClosed),
+                        ).await;
+                    };
+                    match ready_epoch {
+                        Some(current) if ready.epoch < current => continue,
+                        Some(current) if ready.epoch > current => {
+                            observed.fill(false);
+                            ready_count = 0;
+                            ready_epoch = Some(ready.epoch);
+                        }
+                        None => ready_epoch = Some(ready.epoch),
+                        Some(_) => {}
+                    }
+                    let Some(slot) = observed.get_mut(ready.slot) else {
+                        return stop_products(
+                            products,
+                            cancellation,
+                            Some(CoinbaseDirectSupervisorError::ActivationTopology),
+                        ).await;
+                    };
+                    if *slot {
+                        return stop_products(
+                            products,
+                            cancellation,
+                            Some(CoinbaseDirectSupervisorError::DuplicateReady),
+                        ).await;
+                    }
+                    *slot = true;
+                    ready_count += 1;
+                }
             }
         }
-    }
-    if let Err(error) = activation.require_current().await {
-        return stop_products(
-            products,
-            cancellation,
-            Some(CoinbaseDirectSupervisorError::Onboarding(error)),
-        )
-        .await;
+        let Some(epoch) = ready_epoch else {
+            return stop_products(
+                products,
+                cancellation,
+                Some(CoinbaseDirectSupervisorError::ActivationTopology),
+            )
+            .await;
+        };
+        if !coordinator.is_current_epoch(epoch).await {
+            observed.fill(false);
+            ready_count = 0;
+            continue;
+        }
+        if let Err(error) = activation.require_current().await {
+            return stop_products(
+                products,
+                cancellation,
+                Some(CoinbaseDirectSupervisorError::Onboarding(error)),
+            )
+            .await;
+        }
+        if !coordinator.is_current_epoch(epoch).await {
+            observed.fill(false);
+            ready_count = 0;
+            continue;
+        }
+        break;
     }
     if start_sender.send(true).is_err() {
         return stop_products(

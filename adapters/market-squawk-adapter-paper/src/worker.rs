@@ -69,11 +69,29 @@ pub(crate) enum WorkerCommand {
         receipt: PaperCheckpointReceipt,
         reply: oneshot::Sender<Result<(), PaperControlError>>,
     },
+    ReopenCorporateActions {
+        plan: Box<market_squawk_data::CorporateActionPlan>,
+        source_reference: Vec<u8>,
+        control: PaperControlContext,
+        reply: oneshot::Sender<Result<(), PaperControlError>>,
+    },
+    CorporateActions {
+        plan: Box<market_squawk_data::CorporateActionPlan>,
+        source_reference: Vec<u8>,
+        expected_sequence: u64,
+        virtual_marks: Box<[market_squawk_execution::virtual_paper::VirtualPaperValuationMark]>,
+        control: PaperControlContext,
+        reply: oneshot::Sender<Result<PaperExecutionSnapshot, PaperControlError>>,
+    },
     Snapshot {
         control: PaperControlContext,
         reply: oneshot::Sender<Result<PaperExecutionSnapshot, PaperControlError>>,
     },
     Checkpoint {
+        control: PaperControlContext,
+        reply: oneshot::Sender<Result<PaperExecutionCheckpoint, PaperControlError>>,
+    },
+    PortfolioCheckpoint {
         control: PaperControlContext,
         reply: oneshot::Sender<Result<PaperExecutionCheckpoint, PaperControlError>>,
     },
@@ -92,6 +110,20 @@ impl WorkerCommand {
         let inline = WORKER_ENVELOPE_RETAINED_BYTES;
         let additional = match self {
             Self::Submit { .. } => return Ok(inline.max(64 * 1024)),
+            Self::ReopenCorporateActions {
+                plan,
+                source_reference,
+                ..
+            } => plan
+                .retained_bytes()
+                .checked_add(source_reference.len())
+                .ok_or(ExecutionAdapterError::KnownFailure)?,
+            Self::CorporateActions { plan, source_reference, virtual_marks, .. } => {
+                if virtual_marks.len() > 32 { return Err(ExecutionAdapterError::KnownFailure); }
+                plan.retained_bytes().checked_add(source_reference.len())
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(virtual_marks.as_ref())))
+                    .ok_or(ExecutionAdapterError::KnownFailure)?
+            },
             Self::Reconcile { request, .. } => std::mem::size_of_val(request.order_ids()),
             Self::AcknowledgeReconciliation {
                 acknowledgement, ..
@@ -109,6 +141,7 @@ impl WorkerCommand {
             Self::Cancel { .. }
             | Self::Snapshot { .. }
             | Self::Checkpoint { .. }
+            | Self::PortfolioCheckpoint { .. }
             | Self::InitializeRecovery { .. }
             | Self::Shutdown { .. } => 0,
         };
@@ -174,6 +207,7 @@ struct WorkerState {
     issued_checkpoint: Option<IssuedCheckpoint>,
     ledger: PaperLedger,
     idempotency: BTreeMap<(AccountId, ClientOrderId), OrderId>,
+    source_actions_pending: bool,
     recovery_pending: bool,
     recovery_input_digest: Option<[u8; 32]>,
 }
@@ -276,6 +310,7 @@ impl PaperWorker {
                 reconciled_orders: checkpoint.reconciled_orders,
                 acknowledged_reconciliation_batches: checkpoint.acknowledged_reconciliation_batches,
                 issued_checkpoint: None,
+                source_actions_pending: checkpoint.ledger.requires_action_source_reopen(),
                 ledger: checkpoint.ledger,
                 idempotency: checkpoint.idempotency,
                 recovery_pending,
@@ -295,6 +330,7 @@ impl PaperWorker {
                 reconciled_orders: BTreeSet::new(),
                 acknowledged_reconciliation_batches: Vec::new(),
                 issued_checkpoint: None,
+                source_actions_pending: false,
                 ledger,
                 idempotency: BTreeMap::new(),
                 recovery_pending,
@@ -377,8 +413,11 @@ impl PaperWorker {
     async fn handle_command(&mut self, event_sequence: u64, command: WorkerCommand) -> bool {
         match command {
             WorkerCommand::Submit { order, reply } => {
-                let result = if self.state.recovery_pending {
+                let result = if self.state.source_actions_pending || self.state.recovery_pending {
                     Err(ExecutionAdapterError::ReconciliationRequired)
+                } else if order.is_virtual_paper() && !self.state.ledger.virtual_source_covers(order.execution_terms().instrument_id(), order.market().observed_at()) {
+                    // Known rejection before native mutation; reacquisition must preserve the real quote clock.
+                    Err(ExecutionAdapterError::KnownFailure)
                 } else if order.operation().is_expired() {
                     Err(ExecutionAdapterError::KnownFailure)
                 } else {
@@ -452,6 +491,44 @@ impl PaperWorker {
                 let _ = reply.send(result);
                 false
             }
+            WorkerCommand::ReopenCorporateActions {
+                plan,
+                source_reference,
+                control,
+                reply,
+            } => {
+                let result = if control.is_expired() {
+                    Err(PaperControlError::DeadlineExceeded)
+                } else {
+                    self.state
+                        .ledger
+                        .verify_reopened_action_source(&plan, &source_reference)
+                        .map_err(PaperControlError::CorporateAction)
+                };
+                if result.is_ok() {
+                    self.state.source_actions_pending = false;
+                }
+                let _ = reply.send(result);
+                false
+            }
+            WorkerCommand::CorporateActions {
+                plan,
+                source_reference,
+                expected_sequence,
+                virtual_marks,
+                control,
+                reply,
+            } => {
+                let result = self.reconcile_corporate_actions(
+                    &plan,
+                    &source_reference,
+                    expected_sequence,
+                    &virtual_marks,
+                    &control,
+                );
+                let _ = reply.send(result);
+                false
+            }
             WorkerCommand::Snapshot { control, reply } => {
                 let result = if control.is_expired() {
                     Err(PaperControlError::DeadlineExceeded)
@@ -476,6 +553,18 @@ impl PaperWorker {
                 let _ = reply.send(result);
                 false
             }
+            WorkerCommand::PortfolioCheckpoint { control, reply } => {
+                let result = if control.is_expired() {
+                    Err(PaperControlError::DeadlineExceeded)
+                } else if self.state.recovery_pending {
+                    Err(PaperControlError::RecoveryInitializationUnavailable)
+                } else {
+                    self.refresh_audit_health();
+                    Ok(self.portfolio_checkpoint())
+                };
+                let _ = reply.send(result);
+                false
+            }
             WorkerCommand::InitializeRecovery { control, reply } => {
                 let result = if control.is_expired() {
                     Err(PaperControlError::DeadlineExceeded)
@@ -496,6 +585,85 @@ impl PaperWorker {
                 }
             }
         }
+    }
+
+    fn reconcile_corporate_actions(
+        &mut self,
+        plan: &market_squawk_data::CorporateActionPlan,
+        source_reference: &[u8],
+        expected_sequence: u64,
+        virtual_marks: &[market_squawk_execution::virtual_paper::VirtualPaperValuationMark],
+        control: &PaperControlContext,
+    ) -> Result<PaperExecutionSnapshot, PaperControlError> {
+        if control.is_expired() {
+            return Err(PaperControlError::DeadlineExceeded);
+        }
+        self.refresh_audit_health();
+        if self.state.source_actions_pending || self.state.recovery_pending || self.state.reconciliation_required {
+            return Err(PaperControlError::RecoveryInitializationUnavailable);
+        }
+        if self.state.sequence != expected_sequence {
+            return Err(PaperControlError::FinancialStateAdvanced);
+        }
+        let now = crate::adapter::system_timestamp().map_err(PaperControlError::Adapter)?;
+        if plan.valuation_cutoff() > now || plan.knowledge_cutoff() > now {
+            return Err(PaperControlError::CorporateAction(
+                crate::PaperLedgerError::InvalidActionEvidence,
+            ));
+        }
+        if virtual_marks.len() > 32 { return Err(PaperControlError::CorporateAction(crate::PaperLedgerError::Capacity)); }
+        let mut marks = Vec::new();
+        marks.try_reserve_exact(virtual_marks.len()).map_err(|_| PaperControlError::CorporateAction(crate::PaperLedgerError::Capacity))?;
+        for mark in virtual_marks {
+            if !mark.is_current() || !mark.update().market().is_virtual_paper()
+                || mark.update().market().observed_at() > plan.valuation_cutoff() {
+                return Err(PaperControlError::CorporateAction(crate::PaperLedgerError::InvalidMark));
+            }
+            marks.push(crate::PaperExecutableMark::try_from_update(mark.update())
+                .map_err(PaperControlError::CorporateAction)?);
+        }
+        let snapshot = self.snapshot();
+        let candidate = self
+            .state
+            .ledger
+            .replay_source_actions_with_virtual_marks(
+                plan,
+                source_reference,
+                &snapshot,
+                plan.valuation_cutoff(),
+                self.config.input().maximum_mark_age_nanos,
+                &marks,
+            )
+            .map_err(PaperControlError::CorporateAction)?;
+        if virtual_marks.iter().any(|mark| !mark.is_current()) {
+            return Err(PaperControlError::CorporateAction(crate::PaperLedgerError::InvalidMark));
+        }
+        if control.is_expired() {
+            return Err(PaperControlError::DeadlineExceeded);
+        }
+        let sequence = self
+            .next_mutation_sequence()
+            .map_err(|_| PaperControlError::Closed)?;
+        let audit = PaperAuditRecord::new(
+            sequence,
+            None,
+            PaperAuditKind::CorporateActionsApplied,
+            None,
+            None,
+            plan.valuation_cutoff(),
+            None,
+            self.config.digest(),
+            plan.audit_hash().bytes(),
+        );
+        let financial_audit = self
+            .prepare_financial_audit(sequence, audit)
+            .ok_or(PaperControlError::Closed)?;
+        self.state.sequence = sequence;
+        self.state.ledger = candidate;
+        self.state.source_actions_pending = false;
+        financial_audit.commit();
+        self.publish_financial_mutation(sequence);
+        Ok(self.snapshot())
     }
 
     async fn initialize_recovery(
@@ -1120,7 +1288,9 @@ impl PaperWorker {
             let day_expiry = self
                 .config
                 .input()
-                .day_session_calendar
+                .session_policy
+                .calendar()
+                .ok_or(ExecutionAdapterError::Rejected)?
                 .day_expires_at(
                     dispatch.evidence_binding().venue_id(),
                     dispatch.submitted_at(),
@@ -1247,7 +1417,15 @@ impl PaperWorker {
 
     async fn process_market(&mut self, event: WorkerMarketUpdate) {
         self.refresh_audit_health();
-        if self.state.recovery_pending || self.state.reconciliation_required {
+        if self.state.source_actions_pending
+            || self.state.recovery_pending
+            || self.state.reconciliation_required
+        {
+            return;
+        }
+        if event.update.market().is_virtual_paper() && !self.state.ledger.virtual_source_covers(event.update.market().execution_terms().instrument_id(), event.update.market().observed_at()) {
+            // An uncovered quote cannot execute resting stock orders. This is pending source
+            // evidence, not corrupt ledger state; a genuine applicable plan permits a later retry.
             return;
         }
         let Ok(mut available) = AvailableMarket::try_new(event.update, &self.config) else {

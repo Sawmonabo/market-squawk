@@ -7,9 +7,12 @@ mod backup;
 mod candidate;
 mod import;
 mod model;
+mod paper;
 mod product;
 mod read;
 mod recommendation;
+
+pub(crate) use paper::PaperPortfolioPublishCapability;
 
 pub(crate) use account_catalog::{
     PortfolioAccountCatalogError, PortfolioAccountCatalogReadCapability,
@@ -39,13 +42,16 @@ pub(crate) use import::{
     GovernedImportCommitReceipt, PortfolioImportInterpretation, PortfolioImportPreview,
     ServerHeldPortfolioImportResolution,
 };
+pub use recommendation::PortfolioAnalysisReadReference;
 pub(crate) use recommendation::{
     PortfolioAnalysisCurrentPosition, PortfolioAnalysisHistoricalReturn,
     PortfolioAnalysisHoldingSnapshot, PortfolioAnalysisLiquidityCapacityAvailability,
-    PortfolioAnalysisLiquidityCapacityEvidence, PortfolioAnalysisLiquidityCapacitySideEvidence,
+    PortfolioAnalysisLiquidityCapacityBasis, PortfolioAnalysisLiquidityCapacityEvidence,
+    PortfolioAnalysisLiquidityCapacitySideEvidence,
     PortfolioAnalysisLiquidityCapacityUnavailableReason, PortfolioAnalysisMarkedHolding,
     PortfolioAnalysisMarkedPortfolioEvidence, PortfolioAnalysisPortfolioSnapshot,
-    PortfolioAnalysisPrerequisitePolicy, PortfolioAnalysisPrerequisiteResolution,
+    PortfolioAnalysisPrerequisitePolicy, PortfolioAnalysisPrerequisiteReadCapability,
+    PortfolioAnalysisPrerequisiteReference, PortfolioAnalysisPrerequisiteResolution,
     PortfolioAnalysisPrerequisiteUnavailableEvidence,
     PortfolioAnalysisPrerequisiteUnavailableReason, PortfolioAnalysisRiskAvailability,
     PortfolioAnalysisRiskEvidence, PortfolioAnalysisRiskUnavailableReason,

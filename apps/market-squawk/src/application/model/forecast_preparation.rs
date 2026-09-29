@@ -12,7 +12,9 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_data::{DatasetManifestRef, ForecastDatasetEvidenceFence, Sha256Digest};
-use market_squawk_domain::{CalendarDate, DataQuality, InstrumentId, ModelId, SourceId, Timestamp};
+use market_squawk_domain::{
+    CalendarDate, DataQuality, InstrumentId, MarketBarObservation, ModelId, SourceId, Timestamp,
+};
 use market_squawk_modeling::{
     BundleId, ForecastHorizon, ForecastObservedPoint, ForecastOutputBinding, ForecastRequest,
     ModelBundle, ModelFeatureValue, ModelFormat, ModelInput, ModelMetadata, ModelOutputSemantics,
@@ -35,6 +37,10 @@ use super::{
     },
 };
 use crate::application::lifecycle::WorkspaceRuntimeIdentity;
+
+mod fiscal;
+mod replay;
+pub(crate) use replay::{MAXIMUM_FORECAST_JOB_INPUT_BYTES, PreparedForecastJobInput};
 
 const MAXIMUM_RECEIPTS: usize = 256;
 const MAXIMUM_RECEIPT_LIFETIME: Duration = Duration::from_secs(15 * 60);
@@ -135,6 +141,7 @@ pub(crate) struct ForecastInstrumentAvailability {
     available_at: Timestamp,
     observed_points: NonZeroUsize,
     decimal_scale: u8,
+    session_origin: Option<crate::application::market_calendar::ForecastSessionOrigin>,
 }
 
 impl ForecastInstrumentAvailability {
@@ -161,9 +168,29 @@ impl ForecastInstrumentAvailability {
             available_at,
             observed_points,
             decimal_scale,
+            session_origin: None,
         })
     }
 
+    /// The common-session qualification comes only from an actual source read and reopened
+    /// calendar. A historical OOS endpoint or caller-made scalar cannot construct it.
+    pub(crate) fn with_session_origin(
+        mut self,
+        origin: crate::application::market_calendar::ForecastSessionOrigin,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        if origin.instrument_id() != self.instrument_id
+            || origin.observed_through() != self.observed_through
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        self.session_origin = Some(origin);
+        Ok(self)
+    }
+    pub(crate) fn session_origin(
+        &self,
+    ) -> Option<&crate::application::market_calendar::ForecastSessionOrigin> {
+        self.session_origin.as_ref()
+    }
     pub(crate) const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
     }
@@ -223,7 +250,7 @@ impl ForecastEvidencePolicy {
 
     fn admits(self, selection: &ForecastPreparationSelection) -> bool {
         selection.horizon.points().get() <= self.maximum_horizon_points.get()
-            && selection.horizon.step_nanos() == self.horizon_step_nanos
+            && selection.horizon.step_nanos() == Some(self.horizon_step_nanos)
             && selection.validity_nanos <= self.maximum_validity_nanos.get()
     }
 
@@ -568,11 +595,24 @@ fn evidence_dataset_dynamic_bytes(
             .and_then(|bytes| bytes.checked_add(manifest.schema().name().len()))
             .ok_or(ForecastEvidenceReadError::Capacity)
     })?;
+    let origins = dataset
+        .instruments
+        .iter()
+        .try_fold(0_usize, |total, instrument| {
+            let bytes = instrument
+                .session_origin()
+                .map_or(Ok(0), |origin| origin.retained_dynamic_bytes())
+                .map_err(|_| ForecastEvidenceReadError::Capacity)?;
+            total
+                .checked_add(bytes)
+                .ok_or(ForecastEvidenceReadError::Capacity)
+        })?;
     dataset
         .bundle_id
         .as_str()
         .len()
         .checked_add(manifest_bytes)
+        .and_then(|bytes| bytes.checked_add(origins))
         .and_then(|bytes| {
             bytes.checked_add(
                 dataset
@@ -597,15 +637,95 @@ fn evidence_dataset_dynamic_bytes(
 pub(crate) struct ForecastEvidenceCatalogRequest {
     runtime_generation_sha256: Sha256Digest,
     models: Box<[ForecastModelRequirement]>,
+    knowledge_cutoff: Timestamp,
+    current_feature_input: Option<ForecastCurrentFeatureInputSelection>,
 }
 
 impl ForecastEvidenceCatalogRequest {
+    pub(crate) const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+    pub(crate) fn current_feature_input(&self) -> Option<&ForecastCurrentFeatureInputSelection> {
+        self.current_feature_input.as_ref()
+    }
+
     pub(crate) const fn runtime_generation_sha256(&self) -> Sha256Digest {
         self.runtime_generation_sha256
     }
 
     pub(crate) fn models(&self) -> &[ForecastModelRequirement] {
         &self.models
+    }
+}
+
+/// Exact original current StudyInputs selector. This inert coordinate grants no source authority.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(try_from = "CurrentFeatureInputWire", into = "CurrentFeatureInputWire")]
+pub struct ForecastCurrentFeatureInputSelection {
+    manifest: DatasetManifestRef,
+    example_id: Box<str>,
+    session_cohort: Option<crate::application::market_calendar::ForecastSessionCohortReference>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentFeatureInputWire {
+    manifest: market_squawk_modeling::ForecastArtifactManifestRecord,
+    example_id: String,
+}
+impl TryFrom<CurrentFeatureInputWire> for ForecastCurrentFeatureInputSelection {
+    type Error = ForecastPreparationError;
+    fn try_from(value: CurrentFeatureInputWire) -> Result<Self, Self::Error> {
+        Self::try_new(
+            value
+                .manifest
+                .typed()
+                .map_err(|_| ForecastPreparationError::InvalidSelection)?,
+            &value.example_id,
+        )
+    }
+}
+impl From<ForecastCurrentFeatureInputSelection> for CurrentFeatureInputWire {
+    fn from(value: ForecastCurrentFeatureInputSelection) -> Self {
+        Self {
+            manifest: market_squawk_modeling::ForecastArtifactManifestRecord::from_manifest(
+                &value.manifest,
+            ),
+            example_id: value.example_id.into(),
+        }
+    }
+}
+impl ForecastCurrentFeatureInputSelection {
+    pub(crate) fn with_session_cohort(
+        mut self,
+        reference: crate::application::market_calendar::ForecastSessionCohortReference,
+    ) -> Self {
+        self.session_cohort = Some(reference);
+        self
+    }
+    pub(crate) fn session_cohort(
+        &self,
+    ) -> Option<&crate::application::market_calendar::ForecastSessionCohortReference> {
+        self.session_cohort.as_ref()
+    }
+
+    pub fn try_new(
+        manifest: DatasetManifestRef,
+        example_id: &str,
+    ) -> Result<Self, ForecastPreparationError> {
+        if example_id.is_empty() || example_id.len() > 128 {
+            return Err(ForecastPreparationError::InvalidSelection);
+        }
+        Ok(Self {
+            manifest,
+            example_id: example_id.into(),
+            session_cohort: None,
+        })
+    }
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+    pub(crate) fn example_id(&self) -> &str {
+        &self.example_id
     }
 }
 
@@ -620,9 +740,21 @@ pub struct ForecastPreparationSelection {
     instrument_id: InstrumentId,
     horizon: ForecastHorizon,
     validity_nanos: u64,
+    current_feature_input: Option<ForecastCurrentFeatureInputSelection>,
 }
 
 impl ForecastPreparationSelection {
+    pub fn with_current_feature_input(
+        mut self,
+        input: ForecastCurrentFeatureInputSelection,
+    ) -> Self {
+        self.current_feature_input = Some(input);
+        self
+    }
+    pub(crate) fn current_feature_input(&self) -> Option<&ForecastCurrentFeatureInputSelection> {
+        self.current_feature_input.as_ref()
+    }
+
     /// Constructs a bounded selection over already enumerated model and dataset options.
     #[allow(
         clippy::too_many_arguments,
@@ -650,6 +782,7 @@ impl ForecastPreparationSelection {
             instrument_id,
             horizon,
             validity_nanos,
+            current_feature_input: None,
         })
     }
 
@@ -686,17 +819,52 @@ pub(crate) struct ForecastEvidenceMaterializationRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ForecastServingInputFence {
     manifest: DatasetManifestRef,
+    parent_manifests: Box<[DatasetManifestRef]>,
     source_id: SourceId,
     object_graph_sha256: Sha256Digest,
     selection_sha256: Sha256Digest,
     result_sha256: Sha256Digest,
     knowledge_cutoff: Timestamp,
-    prior_observed_at: Timestamp,
+    prior_observed_at: Option<Timestamp>,
     observed_through: Timestamp,
     feature_sha256: Sha256Digest,
+    current_price_input: Option<market_squawk_modeling::ForecastCurrentPriceServingRecord>,
+    origin_bar: Option<MarketBarObservation>,
 }
 
 impl ForecastServingInputFence {
+    pub(crate) fn from_current_price_output(
+        output: &market_squawk_data::FeatureDatasetInputEpochOutput,
+        index: usize,
+        cohort: Option<&crate::application::market_calendar::ForecastSessionCohortReference>,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        let value = super::forecast::ForecastServingEvidence::from_current_price_output(
+            output, index, cohort,
+        )
+        .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+        Ok(Self {
+            manifest: value.manifest().clone(),
+            parent_manifests: value.parent_manifests().into(),
+            source_id: value.source_id().clone(),
+            object_graph_sha256: value.object_graph_sha256(),
+            selection_sha256: value.selection_sha256(),
+            result_sha256: value.result_sha256(),
+            knowledge_cutoff: value.knowledge_cutoff(),
+            prior_observed_at: None,
+            observed_through: value
+                .observed_through()
+                .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
+            feature_sha256: value.feature_sha256(),
+            origin_bar: value.origin_bar().cloned(),
+            current_price_input: value.current_price_input().cloned(),
+        })
+    }
+    pub(crate) fn current_price_input(
+        &self,
+    ) -> Option<&market_squawk_modeling::ForecastCurrentPriceServingRecord> {
+        self.current_price_input.as_ref()
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "manifest, query, cutoff, temporal, and derived-feature evidence stay explicit"
@@ -726,16 +894,54 @@ impl ForecastServingInputFence {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
         }
         Ok(Self {
+            parent_manifests: vec![manifest.clone()].into_boxed_slice(),
             manifest,
             source_id,
             object_graph_sha256,
             selection_sha256,
             result_sha256,
             knowledge_cutoff,
-            prior_observed_at,
+            prior_observed_at: Some(prior_observed_at),
             observed_through,
             feature_sha256,
+            current_price_input: None,
+            origin_bar: None,
         })
+    }
+
+    pub(crate) fn with_parent_manifests(
+        mut self,
+        parents: Vec<DatasetManifestRef>,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        super::forecast::validate_serving_parent_manifests(&self.manifest, &parents)
+            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+        self.parent_manifests = parents.into_boxed_slice();
+        Ok(self)
+    }
+
+    pub(crate) fn parent_manifests(&self) -> &[DatasetManifestRef] {
+        &self.parent_manifests
+    }
+
+    pub(crate) fn with_origin_bar(
+        mut self,
+        origin: Option<MarketBarObservation>,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        if let Some(bar) = &origin {
+            super::forecast::validate_price_origin(
+                bar,
+                &self.source_id,
+                self.observed_through,
+                self.knowledge_cutoff,
+            )
+            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+        }
+        self.origin_bar = origin;
+        Ok(self)
+    }
+
+    pub(crate) const fn origin_bar(&self) -> Option<&MarketBarObservation> {
+        self.origin_bar.as_ref()
     }
 
     pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
@@ -762,7 +968,7 @@ impl ForecastServingInputFence {
         self.knowledge_cutoff
     }
 
-    pub(crate) const fn prior_observed_at(&self) -> Timestamp {
+    pub(crate) const fn prior_observed_at(&self) -> Option<Timestamp> {
         self.prior_observed_at
     }
 
@@ -823,16 +1029,31 @@ impl PreparedForecastEvidence {
         observed_history: Vec<ForecastObservedPoint>,
         inputs: Vec<Box<[f64]>>,
     ) -> Result<Self, ForecastEvidenceReadError> {
-        let horizon_nanos = i64::try_from(request.selection.horizon.step_nanos().get())
-            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+        let horizon_nanos = i64::try_from(
+            request
+                .selection
+                .horizon
+                .step_nanos()
+                .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
+                .get(),
+        )
+        .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
         let target_at = observed_cutoff
             .checked_add_nanos(horizon_nanos)
             .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
-        if observed_history.is_empty()
+        let event = matches!(
+            request.model.metadata().output_binding().target(),
+            market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }
+        );
+        if (event
+            && (!observed_history.is_empty() || serving_input.current_price_input().is_none()))
+            || (!event && observed_history.is_empty())
             || inputs.is_empty()
             || observed_history.len() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
             || decimal_scale > market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
-            || observed_history.last().map(|point| point.observed_at()) != Some(observed_cutoff)
+            || (!event
+                && observed_history.last().map(|point| point.observed_at())
+                    != Some(observed_cutoff))
             || serving_input.observed_through() != observed_cutoff
             || available_at > serving_input.knowledge_cutoff()
             || target_at <= serving_input.knowledge_cutoff()
@@ -912,6 +1133,14 @@ impl ForecastEvidenceRevalidation {
 /// Narrow analytical authority required by model-owned forecast preparation.
 #[async_trait]
 pub(crate) trait ForecastEvidenceReader: fmt::Debug + Send + Sync {
+    /// Reopens the exact native financial StudyInputs publication through the same reader.
+    async fn financial_input(
+        &self,
+        manifest: &DatasetManifestRef,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_data::FeatureDatasetInputEpochOutput, ForecastEvidenceReadError>;
+
     /// Enumerates only compatible point-in-time datasets, instruments, and closed policies.
     async fn catalog(
         &self,
@@ -1249,6 +1478,7 @@ struct StoredForecastPreparation {
     revalidation: Option<ForecastEvidenceRevalidation>,
     request: TypedToolRequest,
     retained_request_bytes: usize,
+    financial_profile_digest: Option<[u8; 32]>,
 }
 
 impl StoredForecastPreparation {
@@ -1267,6 +1497,7 @@ impl StoredForecastPreparation {
             revalidation: None,
             request,
             retained_request_bytes: 1,
+            financial_profile_digest: None,
         }
     }
 }
@@ -1410,6 +1641,8 @@ impl ForecastPreparationAuthority {
         &self,
         origin: RequestOrigin,
         workspace: WorkspaceRuntimeIdentity,
+        knowledge_cutoff: Timestamp,
+        current_feature_input: Option<&ForecastCurrentFeatureInputSelection>,
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<ForecastPreparationCatalog, ForecastPreparationError> {
@@ -1417,7 +1650,12 @@ impl ForecastPreparationAuthority {
         check_control(deadline, &cancellation)?;
         let retained = self.runtime.retain_forecast_runtime()?;
         let backup = self.runtime.retain_backup()?;
-        let request = catalog_request(&retained, &backup)?;
+        let request = catalog_request(
+            &retained,
+            &backup,
+            knowledge_cutoff,
+            current_feature_input.cloned(),
+        )?;
         let models = request
             .models
             .iter()
@@ -1437,11 +1675,17 @@ impl ForecastPreparationAuthority {
     }
 
     /// Builds a human preview and retains the exact descriptor-admitted terminal request.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source cutoff remains independent of actual preparation and receipt issuance time"
+    )]
     pub(crate) async fn prepare<F>(
         &self,
         origin: RequestOrigin,
         workspace: WorkspaceRuntimeIdentity,
         selection: ForecastPreparationSelection,
+        knowledge_cutoff: Timestamp,
+        financial_profile_digest: Option<[u8; 32]>,
         resolve_product_identity: F,
         deadline: Instant,
         cancellation: CancellationToken,
@@ -1456,9 +1700,17 @@ impl ForecastPreparationAuthority {
     {
         validate_origin(origin, workspace)?;
         check_control(deadline, &cancellation)?;
+        if knowledge_cutoff > wall_now()? || financial_profile_digest == Some([0; 32]) {
+            return Err(ForecastPreparationError::InvalidSelection);
+        }
         let retained = self.runtime.retain_forecast_runtime()?;
         let backup = self.runtime.retain_backup()?;
-        let catalog_request = catalog_request(&retained, &backup)?;
+        let catalog_request = catalog_request(
+            &retained,
+            &backup,
+            knowledge_cutoff,
+            selection.current_feature_input.clone(),
+        )?;
         let model = catalog_request
             .models
             .iter()
@@ -1486,14 +1738,13 @@ impl ForecastPreparationAuthority {
             .copied()
             .find(|candidate| candidate.admits(&selection))
             .ok_or(ForecastPreparationError::IncompatibleSelection)?;
-        if option.pairing.fixed_horizon_nanos() != selection.horizon.step_nanos() {
+        if Some(option.pairing.fixed_horizon_nanos()) != selection.horizon.step_nanos() {
             return Err(ForecastPreparationError::IncompatibleSelection);
         }
         let model = model.bind_selected_horizon(selection.horizon)?;
         if instrument.observed_points.get() < policy.minimum_observed_points.get() {
             return Err(ForecastPreparationError::IncompatibleSelection);
         }
-        let knowledge_cutoff = wall_now()?;
         let macro_effective_date_cutoff = knowledge_cutoff
             .utc_calendar_date()
             .map_err(|_| ForecastPreparationError::TimeUnavailable)?;
@@ -1567,6 +1818,7 @@ impl ForecastPreparationAuthority {
             evidence.evidence_sha256,
             request_sha256,
             expires_at,
+            financial_profile_digest,
         );
         let receipt = ForecastPreparationReceipt {
             receipt_id,
@@ -1601,6 +1853,7 @@ impl ForecastPreparationAuthority {
                 revalidation: Some(revalidation),
                 request,
                 retained_request_bytes,
+                financial_profile_digest,
             },
         )?;
         Ok(PreparedForecast {
@@ -1618,7 +1871,7 @@ impl ForecastPreparationAuthority {
         receipt: ForecastPreparationReceipt,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<TypedToolRequest, ForecastPreparationError> {
+    ) -> Result<PreparedForecastJobInput, ForecastPreparationError> {
         validate_origin(origin, workspace)?;
         check_control(deadline, &cancellation)?;
         let stored = self
@@ -1635,7 +1888,7 @@ impl ForecastPreparationAuthority {
         self.evidence
             .revalidate(revalidation, deadline, cancellation)
             .await?;
-        Ok(stored.request)
+        PreparedForecastJobInput::from_stored(stored)
     }
 
     /// Consumes one process-local opaque confirmation token without returning receipt evidence to
@@ -1648,7 +1901,7 @@ impl ForecastPreparationAuthority {
         receipt_id: Uuid,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<TypedToolRequest, ForecastPreparationError> {
+    ) -> Result<PreparedForecastJobInput, ForecastPreparationError> {
         validate_origin(origin, workspace)?;
         check_control(deadline, &cancellation)?;
         let stored = self
@@ -1665,7 +1918,7 @@ impl ForecastPreparationAuthority {
         self.evidence
             .revalidate(revalidation, deadline, cancellation)
             .await?;
-        Ok(stored.request)
+        PreparedForecastJobInput::from_stored(stored)
     }
 }
 
@@ -1685,18 +1938,21 @@ impl fmt::Debug for ForecastPreparationAuthority {
 fn catalog_request(
     retained: &RetainedForecastRuntime,
     backup: &RetainedRuntimeBackup,
+    knowledge_cutoff: Timestamp,
+    current_feature_input: Option<ForecastCurrentFeatureInputSelection>,
 ) -> Result<ForecastEvidenceCatalogRequest, ForecastPreparationError> {
-    if Sha256Digest::new(Sha256::digest(backup.canonical_index.as_ref()).into())
-        != retained.generation_sha256
-        || backup.models.len() != retained.backends.len()
+    if knowledge_cutoff > wall_now()?
+        || Sha256Digest::new(Sha256::digest(backup.canonical_index.as_ref()).into())
+            != retained.generation_sha256
+        || backup.models.len() != retained.image.backends.len()
     {
         return Err(ForecastPreparationError::ModelUnavailable);
     }
     let mut models = Vec::new();
     models
-        .try_reserve_exact(retained.backends.len())
+        .try_reserve_exact(retained.image.backends.len())
         .map_err(|_| ForecastPreparationError::Capacity)?;
-    for backend in &retained.backends {
+    for backend in &retained.image.backends {
         let metadata = backend.metadata();
         let mut matching = backup.models.iter().filter(|(_, bundle)| {
             let candidate = bundle.metadata();
@@ -1723,6 +1979,8 @@ fn catalog_request(
     Ok(ForecastEvidenceCatalogRequest {
         runtime_generation_sha256: retained.generation_sha256,
         models: models.into_boxed_slice(),
+        knowledge_cutoff,
+        current_feature_input,
     })
 }
 
@@ -1848,6 +2106,24 @@ fn validate_forecast_shape(
                 .map_err(|_| ForecastPreparationError::InvalidEvidence)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if matches!(
+        metadata.output_binding().target(),
+        market_squawk_modeling::ForecastTargetMeaning::FixedHorizonEvent { .. }
+    ) {
+        if !observed_history.is_empty() || selection.current_feature_input().is_none() {
+            return Err(ForecastPreparationError::InvalidEvidence);
+        }
+        return ForecastRequest::try_new(
+            selection.instrument_id,
+            observed_cutoff,
+            available_at,
+            selection.horizon,
+            decimal_scale,
+            &model_inputs,
+        )
+        .map(|_| ())
+        .map_err(|_| ForecastPreparationError::InvalidEvidence);
+    }
     ForecastRequest::try_new_with_observed_history(
         selection.instrument_id,
         observed_cutoff,
@@ -1915,7 +2191,9 @@ fn typed_arguments(
                 "observedThroughUnixNanos": evidence.observed_cutoff.unix_nanos(),
                 "availableAtUnixNanos": evidence.available_at.unix_nanos(),
                 "horizonPoints": selection.horizon.points().get(),
-                "horizonStepNanos": selection.horizon.step_nanos().get(),
+                "horizonStepNanos": selection.horizon.step_nanos()
+                    .ok_or(ForecastPreparationError::IncompatibleSelection)?.get(),
+                "fiscalHorizon": null,
                 "decimalScale": evidence.decimal_scale,
                 "validityNanos": selection.validity_nanos,
                 "observedHistory": observed,
@@ -1940,6 +2218,19 @@ fn typed_arguments(
                     "pairingSha256": hex(pairing.pairing_sha256()),
                 },
                 "servingEvidence": {
+                    "financialInput": null,
+                    "currentPriceInput": serving.current_price_input(),
+                    "originBar": serving.origin_bar(),
+                    "parentManifests": serving.parent_manifests().iter().map(|parent| json!({
+                        "dataset": parent.dataset_id().as_str(),
+                        "manifestVersion": parent.manifest_version(),
+                        "schema": {
+                            "name": parent.schema().name(),
+                            "version": parent.schema_version().get(),
+                            "fingerprint": hex(Sha256Digest::new(parent.schema().fingerprint())),
+                        },
+                        "contentHash": hex(parent.content_hash()),
+                    })).collect::<Vec<_>>(),
                     "manifest": {
                         "dataset": serving.manifest().dataset_id().as_str(),
                         "manifestVersion": serving.manifest().manifest_version(),
@@ -1957,7 +2248,7 @@ fn typed_arguments(
                     "selectionSha256": hex(serving.selection_sha256()),
                     "resultSha256": hex(serving.result_sha256()),
                     "knowledgeCutoffUnixNanos": serving.knowledge_cutoff().unix_nanos(),
-                    "priorObservedAtUnixNanos": serving.prior_observed_at().unix_nanos(),
+                    "priorObservedAtUnixNanos": serving.prior_observed_at().map(|time| time.unix_nanos()),
                     "observedThroughUnixNanos": serving.observed_through().unix_nanos(),
                     "featureSha256": hex(serving.feature_sha256()),
                 },
@@ -1995,7 +2286,14 @@ fn evidence_digest(
     hash_serving_input(&mut digest, serving_input)?;
     digest.update(selection.instrument_id.as_uuid().as_bytes());
     digest.update(selection.horizon.points().get().to_be_bytes());
-    digest.update(selection.horizon.step_nanos().get().to_be_bytes());
+    digest.update(
+        selection
+            .horizon
+            .step_nanos()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
+            .get()
+            .to_be_bytes(),
+    );
     digest.update(selection.validity_nanos.to_be_bytes());
     digest.update(observed_cutoff.unix_nanos().to_be_bytes());
     digest.update(available_at.unix_nanos().to_be_bytes());
@@ -2023,14 +2321,30 @@ fn hash_serving_input(
     serving_input: &ForecastServingInputFence,
 ) -> Result<(), ForecastEvidenceReadError> {
     hash_manifest(digest, serving_input.manifest())?;
+    hash_len(digest, serving_input.parent_manifests().len())?;
+    for parent in serving_input.parent_manifests() {
+        hash_manifest(digest, parent)?;
+    }
     hash_bytes(digest, serving_input.source_id().as_str().as_bytes())?;
     digest.update(serving_input.object_graph_sha256().bytes());
     digest.update(serving_input.selection_sha256().bytes());
     digest.update(serving_input.result_sha256().bytes());
     digest.update(serving_input.knowledge_cutoff().unix_nanos().to_be_bytes());
-    digest.update(serving_input.prior_observed_at().unix_nanos().to_be_bytes());
+    match serving_input.prior_observed_at() {
+        Some(time) => {
+            digest.update([1]);
+            digest.update(time.unix_nanos().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    let current = serde_json::to_vec(&serving_input.current_price_input())
+        .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+    hash_bytes(digest, &current)?;
     digest.update(serving_input.observed_through().unix_nanos().to_be_bytes());
     digest.update(serving_input.feature_sha256().bytes());
+    let origin = serde_json::to_vec(&serving_input.origin_bar())
+        .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+    hash_bytes(digest, &origin)?;
     Ok(())
 }
 
@@ -2115,6 +2429,7 @@ fn receipt_digest(
     evidence_sha256: Sha256Digest,
     request_sha256: Sha256Digest,
     expires_at: Timestamp,
+    financial_profile_digest: Option<[u8; 32]>,
 ) -> Sha256Digest {
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/forecast-preparation-receipt/v1\0");
@@ -2127,6 +2442,10 @@ fn receipt_digest(
     digest.update(evidence_sha256.bytes());
     digest.update(request_sha256.bytes());
     digest.update(expires_at.unix_nanos().to_be_bytes());
+    digest.update([u8::from(financial_profile_digest.is_some())]);
+    if let Some(profile) = financial_profile_digest {
+        digest.update(profile);
+    }
     Sha256Digest::new(digest.finalize().into())
 }
 
@@ -2202,7 +2521,7 @@ fn hash_len(digest: &mut Sha256, value: usize) -> Result<(), ForecastEvidenceRea
     Ok(())
 }
 
-fn hex(value: Sha256Digest) -> String {
+pub(crate) fn hex(value: Sha256Digest) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);
     for byte in value.bytes() {
@@ -2316,7 +2635,7 @@ mod tests {
 
     use super::{ForecastPreparationReceipt, ReceiptRegistry, StoredForecastPreparation};
     use crate::application::{
-        contracts::application_capabilities, lifecycle::WorkspaceRuntimeIdentity,
+        contracts::internal_forecast_generation_descriptor, lifecycle::WorkspaceRuntimeIdentity,
     };
 
     #[test]
@@ -2325,10 +2644,21 @@ mod tests {
         let workspace_id = WorkspaceId::try_from_uuid(Uuid::new_v4())?;
         let workspace = WorkspaceRuntimeIdentity::try_new(workspace_id, 7)?;
         let origin = RequestOrigin::try_new(workspace_id.as_uuid(), Uuid::new_v4())?;
-        let descriptor = application_capabilities()?
-            .find("Model.GenerateForecast")
-            .ok_or("forecast descriptor")?
-            .clone();
+        let descriptor = internal_forecast_generation_descriptor()?;
+        let schema =
+            market_squawk_data::DatasetSchemaRegistry::local().canonical_feature_labels()?;
+        let manifest = serde_json::to_value(
+            market_squawk_modeling::ForecastArtifactManifestRecord::from_manifest(
+                &market_squawk_data::DatasetManifestRef::try_new_with_schema(
+                    market_squawk_data::DatasetId::try_from("fixture.forecast-input")?,
+                    1,
+                    schema,
+                    market_squawk_data::Sha256Digest::new([1; 32]),
+                )?,
+            ),
+        )?;
+        let digest = super::hex(market_squawk_data::Sha256Digest::new([1; 32]));
+        let unavailable = super::super::ForecastModelEvidenceState::Unavailable;
         let request = descriptor.admit(Map::from_iter([
             ("confirm".to_owned(), Value::Bool(true)),
             ("modelId".to_owned(), json!(Uuid::new_v4())),
@@ -2343,12 +2673,40 @@ mod tests {
                 "request".to_owned(),
                 json!({
                     "instrumentId": Uuid::new_v4(),
+                    "productIdentity": {
+                        "displayName": "Fixture investment", "canonicalSymbol": null,
+                        "description": "Fixture research identity", "quoteCurrency": "USD",
+                        "knowledgeAtUnixNanos": 10, "effectiveAtUnixNanos": 10
+                    },
+                    "modelEvidence": {
+                        "modelToken": Uuid::new_v4(), "overall": "unavailable",
+                        "pitInputs": "unavailable", "outOfSample": "unavailable",
+                        "horizonAlignment": "unavailable", "calibration": "unavailable",
+                        "interpretation": super::super::model_evidence_interpretation(
+                            unavailable, unavailable, true,
+                        )
+                    },
+                    "analysisEvidence": {
+                        "manifest": manifest.clone(),
+                        "productionIdentitySha256": digest,
+                        "productionReceiptSha256": digest,
+                        "pairingSha256": digest
+                    },
+                    "servingEvidence": {
+                        "manifest": manifest.clone(), "parentManifests": [manifest],
+                        "sourceId": "fixture-source", "objectGraphSha256": digest,
+                        "selectionSha256": digest, "resultSha256": digest,
+                        "knowledgeCutoffUnixNanos": 10, "priorObservedAtUnixNanos": 9,
+                        "observedThroughUnixNanos": 10, "featureSha256": digest,
+                        "originBar": null, "financialInput": null, "currentPriceInput": null
+                    },
                     "bundleId": "fixture-bundle",
                     "bundleVersion": 1,
                     "observedThroughUnixNanos": 10,
                     "availableAtUnixNanos": 10,
                     "horizonPoints": 1,
                     "horizonStepNanos": 1,
+                    "fiscalHorizon": null,
                     "decimalScale": 2,
                     "validityNanos": 1,
                     "observedHistory": [{

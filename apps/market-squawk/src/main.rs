@@ -139,6 +139,7 @@ async fn run() -> Result<()> {
         command @ (Command::Source { .. }
         | Command::Market { .. }
         | Command::EconomicContext { .. }
+        | Command::EconomicSeriesHistory { .. }
         | Command::Ingest { .. }
         | Command::Dataset { .. }
         | Command::Query { .. }
@@ -147,6 +148,7 @@ async fn run() -> Result<()> {
         | Command::Forecast { .. }
         | Command::Portfolio { .. }
         | Command::Backtest { .. }
+        | Command::Analysis { .. }
         | Command::Bot { .. }
         | Command::Execution { .. }
         | Command::FairValue { .. }

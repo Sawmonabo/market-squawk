@@ -121,6 +121,7 @@ pub(crate) struct SecLiveFundSource {
     rights: ResearchRightsAuthority,
     research: Arc<ResearchService>,
     bridge: SecFundApplicationBridge,
+    fundamentals: super::sec_fundamentals::SecFundamentalsCoordinatorClosure,
     identity_authority_source_id: SourceId,
 }
 
@@ -188,6 +189,14 @@ impl SecLiveFundSource {
         if !digest_is_valid(generation_digest) {
             return Err(SecLiveFundApplicationError::AuthorityMismatch);
         }
+        let fundamentals =
+            super::sec_fundamentals::SecFundamentalsCoordinatorClosure::from_coordinator(
+                _seal,
+                Arc::clone(&source),
+                extraction.clone(),
+                rights.clone(),
+                Arc::clone(&research),
+            )?;
         let bridge = SecFundApplicationBridge::try_new(
             Arc::clone(&research),
             metadata.clone(),
@@ -203,8 +212,110 @@ impl SecLiveFundSource {
             rights,
             research,
             bridge,
+            fundamentals,
             identity_authority_source_id,
         })
+    }
+
+    /// Uses this registered SEC generation for the companies already selected in Settings.
+    pub(crate) async fn publish_company_research(
+        &self,
+        cik: &str,
+        instrument_id: InstrumentId,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), SecLiveFundApplicationError> {
+        use super::super::company_research::{
+            CompanyResearchReadCapability, CompanyResearchRequest, ResearchRevisionPolicy,
+        };
+        use std::num::{NonZeroU32, NonZeroU64};
+        self.validate_current()?;
+        let started_at = system_timestamp()?;
+        self.rights.validate_at(started_at)?;
+        if self.generation.rights_exact_subjects().is_some() {
+            return Err(SecLiveFundApplicationError::ScopedRightsUnavailable);
+        }
+        self.rights.validate_subject(None)?;
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or(SecLiveFundApplicationError::DeadlineExceeded)?;
+        let wall_deadline = started_at
+            .unix_nanos()
+            .checked_add(
+                i64::try_from(remaining.as_nanos())
+                    .map_err(|_| SecLiveFundApplicationError::DeadlineExceeded)?,
+            )
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(SecLiveFundApplicationError::DeadlineExceeded)?;
+        let operation = SecLiveFundOperation::try_new(
+            cancellation,
+            self.admission.cancellation().clone(),
+            wall_deadline,
+            started_at,
+        )?;
+        let cancellation = operation.cancellation();
+        let result = async {
+            let generation = Arc::new(self.admission.acquire_publication_lease().await?);
+            let precommit: Arc<dyn IngestPrecommitAuthority> =
+                Arc::new(SecLiveFundPrecommitAuthority {
+                    generation,
+                    source: self.generation.metadata().clone(),
+                    rights: self.rights.clone(),
+                    cancellation: cancellation.clone(),
+                    deadline: wall_deadline,
+                });
+            precommit.validate_precommit()?;
+            let records = NonZeroU32::new(
+                u32::try_from(market_squawk_sources::MAX_EXTRACTION_RECORDS)
+                    .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?,
+            )
+            .ok_or(SecLiveFundApplicationError::RequestMismatch)?;
+            let bytes =
+                NonZeroU64::new(market_squawk_sources::MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
+                    .ok_or(SecLiveFundApplicationError::RequestMismatch)?;
+            let _filing_published = self
+                .fundamentals
+                .acquire_and_publish_company(
+                    cik,
+                    records,
+                    bytes,
+                    wall_deadline,
+                    deadline,
+                    Arc::clone(&precommit),
+                    cancellation.child_token(),
+                )
+                .await?;
+            precommit.validate_precommit()?;
+            let knowledge_at = system_timestamp()?;
+            use chrono::Datelike as _;
+            let date = chrono::DateTime::from_timestamp_nanos(knowledge_at.unix_nanos());
+            let date = market_squawk_domain::CalendarDate::new(
+                u16::try_from(date.year())
+                    .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?,
+                u8::try_from(date.month())
+                    .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?,
+                u8::try_from(date.day())
+                    .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?,
+            )
+            .map_err(|_| SecLiveFundApplicationError::RequestMismatch)?;
+            let request = CompanyResearchRequest::try_new(
+                instrument_id,
+                knowledge_at,
+                market_squawk_domain::ResearchTemporalCoordinate::calendar_date(date),
+                ResearchRevisionPolicy::LatestKnown,
+            )?;
+            let reader = CompanyResearchReadCapability::new(Arc::clone(&self.research));
+            let read = reader
+                .read_company(request, deadline, cancellation.child_token())
+                .await?;
+            reader
+                .verify_company_restart(&read, deadline, cancellation.child_token())
+                .await?;
+            self.validate_current()?;
+            Ok(())
+        }
+        .await;
+        operation.classify(result)
     }
 
     /// Completes one live bounded SEC fund graph through durable application publication.
@@ -1034,6 +1145,10 @@ pub(crate) enum SecLiveFundApplicationError {
     Precommit(#[from] IngestError),
     #[error("SEC live fund acquisition failed")]
     Client(#[from] SecClientError),
+    #[error("SEC company research publication failed")]
+    Fundamentals(#[from] super::sec_fundamentals::SecFundamentalsApplicationError),
+    #[error("SEC company research restart did not verify")]
+    CompanyRead(#[from] super::super::company_research::CanonicalResearchReadError),
     #[error("SEC fund raw/logical preparation failed")]
     Preparation(#[from] SecBulkError),
     #[error("SEC fund analytical publication failed")]

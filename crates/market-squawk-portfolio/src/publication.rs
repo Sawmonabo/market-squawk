@@ -50,21 +50,79 @@ pub(crate) fn build_revision(
             })
     });
     let mut state = ReplayState::default();
-    let mut operations = ordered
-        .iter()
-        .map(ReplayOperation::Entry)
-        .collect::<Vec<_>>();
+    let action_count = plan.map_or(0, |value| value.steps().len());
+    if action_count > limits.max_results {
+        return Err(PortfolioError::LimitExceeded {
+            resource: "corporate action replay",
+            observed: action_count,
+            limit: limits.max_results,
+        });
+    }
+    let operation_count = action_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(ordered.len()))
+        .ok_or(PortfolioError::Arithmetic)?;
+    let replay_bytes = operation_count
+        .checked_mul(size_of::<ReplayOperation<'_>>())
+        .and_then(|bytes| {
+            bytes.checked_add(action_count.checked_mul(size_of::<crate::CashEntitlement>())?)
+        })
+        .ok_or(PortfolioError::Arithmetic)?;
+    crate::admit_retained_bytes(replay_bytes, limits)?;
+    let mut operations = Vec::new();
+    operations
+        .try_reserve_exact(operation_count)
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    operations.extend(ordered.iter().map(ReplayOperation::Entry));
     if let Some(plan) = plan {
         ReplayState::validate_plan(plan)?;
         for step in plan.steps() {
-            operations.push(ReplayOperation::Action { plan, step });
+            let index = step_index(step);
+            let record = plan
+                .admitted()
+                .get(index)
+                .ok_or(PortfolioError::EvidenceMismatch)?;
+            let at = record
+                .application_at()
+                .ok_or(PortfolioError::EvidenceMismatch)?;
+            if at > evidence.as_of {
+                return Err(PortfolioError::EvidenceMismatch);
+            }
+            operations.push(ReplayOperation::Action { plan, step, at });
+            if matches!(
+                step,
+                AdjustmentStep::CashDividend { .. }
+                    | AdjustmentStep::ReturnOfCapital { .. }
+                    | AdjustmentStep::Merger {
+                        consideration: market_squawk_domain::MergerConsideration::Cash { .. }
+                            | market_squawk_domain::MergerConsideration::Mixed { .. },
+                        ..
+                    }
+            ) {
+                if let Some(at) = record
+                    .application()
+                    .and_then(|application| application.simulated_cash_settlement_at())
+                {
+                    if at <= evidence.as_of {
+                        operations.push(ReplayOperation::CashSettlement { index, at });
+                    }
+                }
+            }
         }
     }
     operations.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
     for operation in operations {
         match operation {
             ReplayOperation::Entry(entry) => state.apply_entry(entry)?,
-            ReplayOperation::Action { plan, step } => state.apply_step(plan, step)?,
+            ReplayOperation::Action { plan, step, .. } => state.apply_step(plan, step)?,
+            ReplayOperation::CashSettlement { index, .. } => state.settle_cash(index)?,
+        }
+        if state.cash_entitlements.len() > limits.max_results {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "cash entitlements",
+                observed: state.cash_entitlements.len(),
+                limit: limits.max_results,
+            });
         }
         if state.lots.len() > limits.max_lots {
             return Err(PortfolioError::LimitExceeded {
@@ -76,6 +134,12 @@ pub(crate) fn build_revision(
     }
     let positions = build_positions(&state.lots, &valuation, limits)?;
     let cash = state.cash.total(&valuation)?;
+    let receivable_value = state.receivable_value(&valuation)?;
+    let mut cash_entitlements = Vec::new();
+    cash_entitlements
+        .try_reserve_exact(state.cash_entitlements.len())
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    cash_entitlements.extend(state.cash_entitlements.values().cloned());
     let cash_balances = state
         .cash
         .0
@@ -107,7 +171,8 @@ pub(crate) fn build_revision(
             .map_err(|_| PortfolioError::Arithmetic)
     })?;
     let marked_equity = cash
-        .checked_add(market_value)
+        .checked_add(receivable_value)
+        .and_then(|value| value.checked_add(market_value))
         .map_err(|_| PortfolioError::Arithmetic)?;
     let prior_peak = previous_revision
         .map(PortfolioRevision::peak_marked_equity)
@@ -123,17 +188,24 @@ pub(crate) fn build_revision(
     let drawdown = peak_marked_equity
         .checked_sub(marked_equity)
         .map_err(|_| PortfolioError::Arithmetic)?;
-    let replay_realized_loss = state.realized_loss.total(&valuation)?;
-    let prior_realized_loss = previous_revision
-        .map(PortfolioRevision::realized_loss)
-        .unwrap_or(replay_realized_loss);
-    if prior_realized_loss.currency() != base_currency {
-        return Err(PortfolioError::CurrencyMismatch);
-    }
-    let realized_loss = if replay_realized_loss.amount() > prior_realized_loss.amount() {
-        replay_realized_loss
+    let realized_loss = if state.incomplete_realized_basis {
+        BasisMeasurement::Incomplete
     } else {
-        prior_realized_loss
+        let current = state.realized_loss.total(&valuation)?;
+        match previous_revision.map(PortfolioRevision::realized_loss) {
+            Some(BasisMeasurement::Incomplete) => BasisMeasurement::Incomplete,
+            Some(BasisMeasurement::Complete(prior)) => {
+                if prior.currency() != base_currency {
+                    return Err(PortfolioError::CurrencyMismatch);
+                }
+                BasisMeasurement::Complete(if current.amount() > prior.amount() {
+                    current
+                } else {
+                    prior
+                })
+            }
+            None => BasisMeasurement::Complete(current),
+        }
     };
     let cost_basis =
         aggregate_basis_measurement(&positions, base_currency, |position| position.cost_basis)?;
@@ -156,6 +228,7 @@ pub(crate) fn build_revision(
     let retained_bytes = estimate_retained(
         &positions,
         &cash_balances,
+        &cash_entitlements,
         active_entries,
         seen_revisions,
         plan,
@@ -174,13 +247,19 @@ pub(crate) fn build_revision(
         base_currency,
         cash,
         cash_balances,
+        cash_entitlements,
+        receivable_value,
         positions,
         market_value,
         gross_exposure,
         marked_equity,
         peak_marked_equity,
         cost_basis,
-        realized_gain: state.realized_gain.total(&valuation)?,
+        realized_gain: if state.incomplete_realized_basis {
+            BasisMeasurement::Incomplete
+        } else {
+            BasisMeasurement::Complete(state.realized_gain.total(&valuation)?)
+        },
         realized_loss,
         unrealized_gain,
         drawdown,
@@ -200,37 +279,41 @@ pub(crate) fn build_revision(
 
 enum ReplayOperation<'a> {
     Entry(&'a LedgerEntry),
+    CashSettlement {
+        index: usize,
+        at: Timestamp,
+    },
     Action {
         plan: &'a CorporateActionPlan,
         step: &'a AdjustmentStep,
+        at: Timestamp,
     },
 }
 
 impl ReplayOperation<'_> {
-    fn key(&self) -> (Timestamp, u8, &str) {
+    fn key(&self) -> (Timestamp, u8, &str, &str, usize) {
         match self {
-            Self::Entry(entry) => (entry.occurred_at, 1, entry.source.as_str()),
-            Self::Action { plan, step } => {
-                let record = plan.admitted().get(step_index(step));
-                let at = record
-                    .and_then(|record| {
-                        record
-                            .observation()
-                            .context()
-                            .time()
-                            .effective()
-                            .exact_timestamp()
-                    })
-                    .unwrap_or(plan.valuation_cutoff());
-                let source = record.map_or("", |record| {
-                    record
-                        .observation()
-                        .context()
-                        .provenance()
-                        .source_identifier()
-                        .as_str()
-                });
-                (at, 0, source)
+            Self::Entry(entry) => (
+                entry.occurred_at,
+                1,
+                entry.source.as_str(),
+                entry.transaction.transaction_id.as_str(),
+                0,
+            ),
+            Self::CashSettlement { at, index } => (*at, 2, "", "", *index),
+            Self::Action { plan, step, at } => {
+                let index = step_index(step);
+                let provenance = plan
+                    .admitted()
+                    .get(index)
+                    .map(|record| record.observation().context().provenance());
+                (
+                    *at,
+                    0,
+                    provenance.map_or("", |value| value.source_id().as_str()),
+                    provenance.map_or("", |value| value.source_identifier().as_str()),
+                    index,
+                )
             }
         }
     }
@@ -356,6 +439,7 @@ fn revision_id(
     hash_bytes(&mut digest, base_currency.as_str().as_bytes());
     digest.update(previous.map_or([0_u8; 32], |revision_id| revision_id.0));
     digest.update(evidence.as_of.unix_nanos().to_be_bytes());
+    digest.update(evidence.knowledge_cutoff.unix_nanos().to_be_bytes());
     digest.update(evidence.dataset.dataset_id().as_str().as_bytes());
     digest.update(evidence.dataset.manifest_version().to_be_bytes());
     hash_bytes(&mut digest, evidence.dataset.schema().name().as_bytes());
@@ -399,6 +483,10 @@ fn revision_id(
                 hash_decimal(&mut digest, trade.quantity);
                 hash_money(&mut digest, trade.price);
                 hash_money(&mut digest, trade.fee);
+                digest.update([u8::from(trade.executed_notional.is_some())]);
+                if let Some(value) = trade.executed_notional {
+                    hash_money(&mut digest, value);
+                }
                 match &trade.lot_selection {
                     LotSelection::Fifo => digest.update([0]),
                     LotSelection::Lifo => digest.update([1]),
@@ -515,6 +603,7 @@ fn hash_bytes(digest: &mut Sha256, value: &[u8]) {
 fn estimate_retained(
     positions: &[Position],
     cash_balances: &[CashBalance],
+    cash_entitlements: &[crate::CashEntitlement],
     active_entries: &BTreeMap<SourceIdentifier, LedgerEntry>,
     seen_revisions: &BTreeSet<(SourceIdentifier, u32)>,
     plan: Option<&CorporateActionPlan>,
@@ -527,6 +616,10 @@ fn estimate_retained(
     })?;
     let mut retained = size_of::<PortfolioRevision>();
     for bytes in [
+        cash_entitlements
+            .len()
+            .checked_mul(size_of::<crate::CashEntitlement>())
+            .ok_or(PortfolioError::Arithmetic)?,
         positions
             .len()
             .checked_mul(size_of::<Position>())

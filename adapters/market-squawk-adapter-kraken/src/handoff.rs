@@ -2,14 +2,17 @@
 
 use std::sync::Arc;
 
-use crate::config::KrakenChannel;
+use crate::config::{
+    KRAKEN_PRODUCT, KRAKEN_PROVIDER, KrakenChannel, KrakenNativeMarketCoordinates,
+};
 use crate::level3::{
     KrakenL3BatchKind, KrakenL3BookBatch, KrakenL3Control, KrakenL3DecodeError,
     KrakenL3SubscriptionRequestEvidence,
 };
 use market_squawk_domain::{
     CapturePayload, EvidenceDigest, InstrumentId, LiveEventClass, MarketDepth, ProviderChannel,
-    ProviderProduct, SourceIdentifier, Timestamp, VenueId,
+    ProviderIdentityKey, ProviderInstrumentId, ProviderProduct, SourceId, SourceIdentifier,
+    Timestamp, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedProviderBatch, DecoderEvidence,
@@ -18,10 +21,6 @@ use market_squawk_sources::{
     TransportFrameKind,
 };
 
-const PROVIDER: &str = "kraken";
-const PRODUCT: &str = "kraken-spot";
-const PUBLIC_BOOK_CHANNEL: &str = "book-v2";
-const PUBLIC_TRADE_CHANNEL: &str = "trade-v2";
 const AUTHENTICATED_LEVEL3_CHANNEL: &str = "level3-v2";
 const MAX_PROVIDER_TEXT_BYTES: usize = 512;
 
@@ -68,6 +67,7 @@ pub struct KrakenConnectionBinding {
     provider_channel: ProviderChannel,
     feed: KrakenFeed,
     depth: Option<MarketDepth>,
+    native_coordinates: Option<Arc<KrakenNativeMarketCoordinates>>,
     subscription_request: Option<KrakenSubscriptionRequestEvidence>,
 }
 
@@ -102,6 +102,12 @@ impl KrakenConnectionBinding {
         self.depth
     }
 
+    /// Returns the mandatory provider-native coordinates for a public Spot connection.
+    /// Authenticated Level 3 uses its independent product-mapping contract.
+    pub fn native_coordinates(&self) -> Option<&KrakenNativeMarketCoordinates> {
+        self.native_coordinates.as_deref()
+    }
+
     /// Returns exact public request evidence or the secret-free authenticated contract.
     pub const fn subscription_request(&self) -> Option<&KrakenSubscriptionRequestEvidence> {
         self.subscription_request.as_ref()
@@ -114,12 +120,16 @@ impl KrakenConnectionBinding {
 #[derive(Debug)]
 pub struct KrakenInstrumentBinding {
     native_symbol: SourceIdentifier,
+    provider_identity_key: ProviderIdentityKey,
+    venue_mapping: VenueMapping,
     externally_resolved_instrument: InstrumentId,
 }
 
 impl PartialEq for KrakenInstrumentBinding {
     fn eq(&self, other: &Self) -> bool {
         self.native_symbol == other.native_symbol
+            && self.provider_identity_key == other.provider_identity_key
+            && self.venue_mapping == other.venue_mapping
             && self.externally_resolved_instrument == other.externally_resolved_instrument
     }
 }
@@ -130,6 +140,20 @@ impl KrakenInstrumentBinding {
     /// Returns the exact Kraken product symbol.
     pub const fn native_symbol(&self) -> &SourceIdentifier {
         &self.native_symbol
+    }
+
+    /// Returns the source-qualified provider identity carried through this exact feed handoff.
+    ///
+    /// Public Spot additionally carries accepted identity revision/digest evidence in
+    /// [`KrakenNativeMarketCoordinates`]. Authenticated Level 3 currently binds the exact
+    /// provider symbol at transport admission without promoting it to reference-catalog authority.
+    pub const fn provider_identity_key(&self) -> &ProviderIdentityKey {
+        &self.provider_identity_key
+    }
+
+    /// Returns the exact Kraken venue and WebSocket symbol admitted for this handoff.
+    pub const fn venue_mapping(&self) -> &VenueMapping {
+        &self.venue_mapping
     }
 
     /// Returns the instrument identity supplied by external reference authority.
@@ -406,6 +430,7 @@ impl KrakenNativeFrame {
 pub struct KrakenPublicMarketEventHandoff {
     native_frame: KrakenNativeFrame,
     connection: Arc<KrakenConnectionBinding>,
+    native_coordinates: Arc<KrakenNativeMarketCoordinates>,
     instrument_binding: Arc<KrakenInstrumentBinding>,
     subscription_acknowledgement: KrakenSubscriptionAcknowledgementEvidence,
     continuity: KrakenMarketContinuity,
@@ -443,6 +468,11 @@ impl KrakenPublicMarketEventHandoff {
         &self.instrument_binding
     }
 
+    /// Returns exact provider identity, venue mapping, source revision, and selection validity.
+    pub fn native_coordinates(&self) -> &KrakenNativeMarketCoordinates {
+        &self.native_coordinates
+    }
+
     /// Returns the captured acknowledgement from this exact source connection generation.
     pub const fn subscription_acknowledgement(&self) -> &KrakenSubscriptionAcknowledgementEvidence {
         &self.subscription_acknowledgement
@@ -469,6 +499,7 @@ impl KrakenPublicMarketEventHandoff {
         CapturePayload,
         TransportFrameKind,
         Arc<KrakenConnectionBinding>,
+        Arc<KrakenNativeMarketCoordinates>,
         Arc<KrakenInstrumentBinding>,
         KrakenSubscriptionAcknowledgementEvidence,
         KrakenMarketContinuity,
@@ -478,6 +509,7 @@ impl KrakenPublicMarketEventHandoff {
             self.native_frame.payload,
             self.native_frame.transport,
             self.connection,
+            self.native_coordinates,
             self.instrument_binding,
             self.subscription_acknowledgement,
             self.continuity,
@@ -719,14 +751,15 @@ pub(crate) fn from_public_outcome(
     };
     match outcome {
         DecodeOutcome::Data(batch) => {
+            let native_coordinates = connection.native_coordinates.clone();
             let subscription_acknowledgement =
                 subscription_acknowledgement.filter(|acknowledgement| {
                     acknowledgement
                         .binding()
                         .shares_allocation_with(batch.evidence().binding())
                 });
-            let (Some(subscription_acknowledgement), Some(continuity)) =
-                (subscription_acknowledgement, continuity)
+            let (Some(subscription_acknowledgement), Some(continuity), Some(native_coordinates)) =
+                (subscription_acknowledgement, continuity, native_coordinates)
             else {
                 return control_handoff(
                     native_frame,
@@ -743,6 +776,7 @@ pub(crate) fn from_public_outcome(
             KrakenMarketEventHandoff::Public(KrakenPublicMarketEventHandoff {
                 native_frame,
                 connection,
+                native_coordinates,
                 instrument_binding,
                 subscription_acknowledgement,
                 continuity,
@@ -852,19 +886,21 @@ pub(crate) fn authenticated_connection(
         .coverage()
         .live()
         .ok_or(DecodeInternalError::InvariantViolation)?;
-    if metadata.provider().as_str() != PROVIDER
-        || live.provider_product().as_source_identifier().as_str() != PRODUCT
+    if metadata.provider().as_str() != KRAKEN_PROVIDER
+        || live.provider_product().as_source_identifier().as_str() != KRAKEN_PRODUCT
         || live.provider_channel().as_source_identifier().as_str() != AUTHENTICATED_LEVEL3_CHANNEL
     {
         return Err(DecodeInternalError::InvariantViolation);
     }
     Ok(Arc::new(KrakenConnectionBinding {
         provider: metadata.provider().clone(),
-        venue: VenueId::try_from(PROVIDER).map_err(|_| DecodeInternalError::InvariantViolation)?,
+        venue: VenueId::try_from(KRAKEN_PROVIDER)
+            .map_err(|_| DecodeInternalError::InvariantViolation)?,
         provider_product: live.provider_product().clone(),
         provider_channel: live.provider_channel().clone(),
         feed: KrakenFeed::AuthenticatedSpotLevel3WebSocketV2,
         depth: Some(MarketDepth::OrderLevel),
+        native_coordinates: None,
         subscription_request: request_evidence.map(|request_evidence| {
             KrakenSubscriptionRequestEvidence::AuthenticatedSecretBearing { request_evidence }
         }),
@@ -956,39 +992,60 @@ pub(crate) fn instrument_binding(
     symbol: &str,
     instrument: InstrumentId,
 ) -> Result<Arc<KrakenInstrumentBinding>, DecodeInternalError> {
+    let provider =
+        SourceId::try_from(KRAKEN_PROVIDER).map_err(|_| DecodeInternalError::InvariantViolation)?;
+    let provider_instrument_id = ProviderInstrumentId::try_from(symbol)
+        .map_err(|_| DecodeInternalError::InvariantViolation)?;
+    let venue =
+        VenueId::try_from(KRAKEN_PROVIDER).map_err(|_| DecodeInternalError::InvariantViolation)?;
+    let venue_symbol =
+        VenueSymbol::try_from(symbol).map_err(|_| DecodeInternalError::InvariantViolation)?;
     Ok(Arc::new(KrakenInstrumentBinding {
         native_symbol: SourceIdentifier::try_from(symbol)
             .map_err(|_| DecodeInternalError::InvariantViolation)?,
+        provider_identity_key: ProviderIdentityKey::new(provider, provider_instrument_id),
+        venue_mapping: VenueMapping::new(venue, venue_symbol),
         externally_resolved_instrument: instrument,
+    }))
+}
+
+pub(crate) fn instrument_binding_from_coordinates(
+    coordinates: &KrakenNativeMarketCoordinates,
+) -> Result<Arc<KrakenInstrumentBinding>, DecodeInternalError> {
+    Ok(Arc::new(KrakenInstrumentBinding {
+        native_symbol: SourceIdentifier::try_from(coordinates.venue_symbol().as_str())
+            .map_err(|_| DecodeInternalError::InvariantViolation)?,
+        provider_identity_key: coordinates.provider_identity_key().clone(),
+        venue_mapping: coordinates.venue_mapping().clone(),
+        externally_resolved_instrument: coordinates.instrument(),
     }))
 }
 
 pub(crate) fn public_connection(
     metadata: &SourceMetadata,
-    channel: KrakenChannel,
+    native_coordinates: Arc<KrakenNativeMarketCoordinates>,
     subscription_request: Option<KrakenSubscriptionRequestEvidence>,
 ) -> Result<Arc<KrakenConnectionBinding>, DecodeInternalError> {
     let live = metadata
         .coverage()
         .live()
         .ok_or(DecodeInternalError::InvariantViolation)?;
-    let (expected_channel, depth) = match channel {
-        KrakenChannel::Book(_) => (PUBLIC_BOOK_CHANNEL, Some(MarketDepth::PriceLevel)),
-        KrakenChannel::Trades => (PUBLIC_TRADE_CHANNEL, None),
+    let channel = native_coordinates.channel();
+    let depth = match channel {
+        KrakenChannel::Book(_) => Some(MarketDepth::PriceLevel),
+        KrakenChannel::Trades => None,
     };
-    if metadata.provider().as_str() != PROVIDER
-        || live.provider_product().as_source_identifier().as_str() != PRODUCT
-        || live.provider_channel().as_source_identifier().as_str() != expected_channel
-    {
+    if !native_coordinates.matches_surface(metadata, channel) {
         return Err(DecodeInternalError::InvariantViolation);
     }
     Ok(Arc::new(KrakenConnectionBinding {
         provider: metadata.provider().clone(),
-        venue: VenueId::try_from(PROVIDER).map_err(|_| DecodeInternalError::InvariantViolation)?,
+        venue: native_coordinates.venue().clone(),
         provider_product: live.provider_product().clone(),
         provider_channel: live.provider_channel().clone(),
         feed: KrakenFeed::PublicSpotWebSocketV2,
         depth,
+        native_coordinates: Some(native_coordinates),
         subscription_request,
     }))
 }
@@ -1003,6 +1060,7 @@ pub(crate) fn public_continuity(
     if observations.is_empty()
         || observations.iter().any(|observation| {
             observation.venue() != connection.venue()
+                || observation.venue() != binding.venue_mapping().venue_id()
                 || observation.instrument() != binding.externally_resolved_instrument()
                 || !matches!(
                     observation.sequence(),

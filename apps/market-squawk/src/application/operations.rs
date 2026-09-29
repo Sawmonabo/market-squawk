@@ -310,7 +310,20 @@ impl OperationsApplicationServices {
             }
             _ => return Err(ServiceError::NotFound),
         };
-        ensure_request_live(context, &self.lifecycle)?;
+        if let Err(error) = ensure_request_live(context, &self.lifecycle) {
+            match &prepared {
+                PreparedOperationsJob::Backup { operation, .. } => {
+                    self.revoke_backup_operation(operation)
+                }
+                PreparedOperationsJob::Recovery { operation, .. } => {
+                    self.revoke_recovery_operation(operation)
+                }
+                PreparedOperationsJob::Update { operation, .. } => {
+                    self.revoke_update_operation(operation)
+                }
+            }
+            return Err(error);
+        }
         Ok(prepared)
     }
 

@@ -34,7 +34,8 @@ pub(crate) const HARMONIC_IMPLEMENTATION_IDENTITY: &str = concat!(
     "bat-valid-b-exact-lt618000over1000000@v1;",
     "selector-strict-local-radius1-outside-max-excursion-high-tie-",
     "same-kind-most-extreme-earlier-tie-latest-five@v1;",
-    "confirmation-max-left-selected-right-observed-and-available@v1;",
+    "confirmation-prefix-knowledge-equal-batch-times-whole-window-availability@v2;",
+    "flat-valid-bars-strict-extrema@v1;",
     "measurement-absolute-leg-reduced-rational-cd-over-xc-undefined-zero-xc@v1;",
     "completion-outward-floor-ceil@v1;",
     "invalidation-abcd-prz-d-other-x-prz-d@v1;",
@@ -713,7 +714,7 @@ impl HarmonicPatternEvidence {
         self.observation_cutoff
     }
 
-    /// Returns the final pivot confirmation time.
+    /// Returns when the full selected window, including trailing confirmation evidence, was known.
     #[must_use]
     pub const fn confirmation_cutoff(self) -> Timestamp {
         self.confirmation_cutoff
@@ -780,7 +781,7 @@ pub enum HarmonicPatternError {
     /// A bar or pivot was observed, available, or confirmed after the decision cutoff.
     #[error("harmonic input exceeds the decision cutoff")]
     FutureInformation,
-    /// Pivot bar indices, observation times, or confirmations are not strictly increasing.
+    /// Pivot positions/effective times regress, or knowledge confirmation moves backward.
     #[error("harmonic pivots are not causally monotonic")]
     NonMonotonicPivots,
     /// Pivot kinds do not alternate high and low.
@@ -1145,7 +1146,14 @@ pub fn classify_harmonic_pattern(
         .last()
         .map(|bar| bar.observed_at)
         .ok_or(HarmonicPatternError::InvalidBarCount)?;
-    let confirmation_cutoff = pivots[4].confirmed_at;
+    // Selection and absence of a newer pivot depend on every admitted bar, including trailing
+    // bars. Retain the latest actual input availability; never backdate the whole result to D.
+    let confirmation_cutoff = input
+        .bars
+        .iter()
+        .map(|bar| bar.available_at)
+        .max()
+        .ok_or(HarmonicPatternError::InvalidBarCount)?;
     let expires_at = evidence_expiry(input.binding, confirmation_cutoff)?;
     let implementation_identity = KnownFeatureImplementation::BatchHarmonicPatterns
         .implementation_digest()
@@ -1223,7 +1231,7 @@ fn validate_bars(
             bar.close.get(),
         ];
         if prices.into_iter().any(|price| price <= 0)
-            || bar.low.get() >= bar.high.get()
+            || bar.low.get() > bar.high.get()
             || bar.open.get() < bar.low.get()
             || bar.open.get() > bar.high.get()
             || bar.close.get() < bar.low.get()
@@ -1250,16 +1258,22 @@ fn select_pivots(
     let mut canonical: [Option<HarmonicPivotEvidence>; HARMONIC_PIVOT_COUNT] =
         [None; HARMONIC_PIVOT_COUNT];
     let mut canonical_count = 0_usize;
+    let mut prefix_available_at = bars[0].available_at;
     for pivot_index in HARMONIC_PIVOT_CONFIRMATION_BARS
         ..bars.len().saturating_sub(HARMONIC_PIVOT_CONFIRMATION_BARS)
     {
         let left = bars[pivot_index - HARMONIC_PIVOT_CONFIRMATION_BARS];
         let bar = bars[pivot_index];
         let right = bars[pivot_index + HARMONIC_PIVOT_CONFIRMATION_BARS];
+        prefix_available_at = prefix_available_at
+            .max(left.available_at)
+            .max(bar.available_at)
+            .max(right.available_at);
         let Some(kind) = selected_pivot_kind(left, bar, right) else {
             continue;
         };
         let confirmed_at = [
+            prefix_available_at,
             left.observed_at,
             left.available_at,
             bar.observed_at,
@@ -1318,7 +1332,7 @@ fn select_pivots(
     for pair in selected.windows(2) {
         if pair[0].bar_index >= pair[1].bar_index
             || pair[0].observed_at >= pair[1].observed_at
-            || pair[0].confirmed_at >= pair[1].confirmed_at
+            || pair[0].confirmed_at > pair[1].confirmed_at
         {
             return Err(HarmonicPatternError::NonMonotonicPivots);
         }

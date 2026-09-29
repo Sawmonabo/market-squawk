@@ -3,6 +3,17 @@ fn validate_observation_profile(
     quality_ceiling: market_squawk_domain::DataQuality,
     observation: &crate::ProviderNormalizedObservation,
 ) -> Result<(), RegistryError> {
+    if matches!(
+        observation.event_class(),
+        market_squawk_domain::LiveEventClass::Chart | market_squawk_domain::LiveEventClass::Screener
+    ) {
+        return Err(RegistryError::DecoderProfileMismatch);
+    }
+    if quality_ceiling == market_squawk_domain::DataQuality::DirectVerified
+        && matches!(observation.payload(),crate::ProviderObservationPayload::Quote{bid,ask} if bid.iter().chain(ask.iter()).any(|level|level.accumulated_evidence().is_some()))
+    {
+        return Err(RegistryError::DecoderProfileMismatch);
+    }
     let sequence_matches = match (protocol.sequence(), observation.sequence()) {
         (
             crate::SequenceValidationProfile::Unsupported { rule: expected },
@@ -38,7 +49,10 @@ fn validate_observation_profile(
                     observation.snapshot(),
                     crate::ProviderSnapshotEvidence::InitializingSnapshot { .. }
                 );
-            (globally_absent || non_executable_initializing_snapshot)
+            (globally_absent
+                || non_executable_initializing_snapshot
+                || (quality_ceiling != market_squawk_domain::DataQuality::DirectVerified
+                    && matches!(observation.payload(),crate::ProviderObservationPayload::Quote{bid,ask} if (bid.is_some() || ask.is_some()) && bid.iter().chain(ask.iter()).all(|level|level.accumulated_evidence().is_some()))))
                 && rule == protocol.timestamp_rule()
         }
     };
@@ -85,6 +99,9 @@ pub enum RegistryError {
     /// Metadata/session state advanced after the handle was minted.
     #[error("source handle is stale")]
     StaleHandle,
+    /// The selected catalog instrument or native-identity collision domain changed.
+    #[error("provider identity selection requires a new catalog selection")]
+    ProviderIdentitySelectionStale,
     /// Source was explicitly revoked.
     #[error("source registration is revoked")]
     SourceRevoked,
@@ -166,6 +183,18 @@ pub enum RegistryError {
     /// Venue, instrument, event, or depth is outside evidenced metadata coverage.
     #[error("live source scope is not covered by current metadata")]
     LiveScopeNotCovered,
+    /// Catalog-backed provider identity selection was cancelled before installation.
+    #[error("provider identity selection was cancelled")]
+    ProviderIdentitySelectionCancelled,
+    /// Catalog-backed provider identity selection exceeded its monotonic deadline.
+    #[error("provider identity selection deadline elapsed")]
+    ProviderIdentitySelectionDeadlineExceeded,
+    /// The catalog identity authority is currently contended or unavailable.
+    #[error("provider identity catalog authority is unavailable")]
+    ProviderIdentityAuthorityUnavailable,
+    /// Required identity/rights authority rejected the operation; retry is not authorization.
+    #[error("provider identity authorization was rejected")]
+    ProviderIdentityAuthorizationRejected,
     /// Health evidence identity differed from the current session tuple.
     #[error("source health evidence is bound to another session")]
     HealthBindingMismatch,

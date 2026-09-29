@@ -1,11 +1,13 @@
 use market_squawk_domain::{
     AccountId, BasisPoints, Currency, DataQuality, Denomination, DigestAlgorithm, EvidenceDigest,
-    FinancialError, InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize,
-    Money, QuantityLots, RevisionNumber, TickSize, Timestamp,
+    FinancialError, HistoricalStudyBasis, HistoricalStudyLimitation, InstrumentDefinitionRevision,
+    InstrumentExecutionTerms, InstrumentId, LotSize, Money, QuantityLots, RevisionNumber, TickSize,
+    Timestamp,
 };
 use market_squawk_modeling::{ForecastCentralStatistic, ProductionFeatureRegistry};
 use market_squawk_portfolio::{PortfolioRevisionToken, RebalanceTarget};
 use market_squawk_valuation::{
+    AutomaticValuationAssumption, AutomaticValuationAssumptionKind, AutomaticValuationMethod,
     DecisionId, FairValueSelectionReceiptHash, MeasurementId, ValuationAmountBasis,
 };
 use rust_decimal::Decimal;
@@ -17,30 +19,32 @@ use std::{
 use crate::{
     AfterTaxPnlAvailability, AppendOutcome, AsOfSemantics, BenchmarkReturnAvailability,
     CandidateFlag, CandidateId, CandidateInput, CandidatePortfolioSizingState,
-    CandidateSizingConstraints, CapacityRange, ComparisonOperator, CostAdjustedPitBacktestEvidence,
-    DecisionActorId, DecisionAuthority, DecisionContentDigest, DecisionContractError,
-    DecisionDossier, DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits,
-    DecisionText, Dossier, DossierEvidence, DossierId, DossierReference, DossierSection,
-    ExactFinancialRatio, ExactPositionScale, ExpectedGrossPricePnlAvailability,
-    ExpectedReturnAvailability, FeasibleLotRangeAvailability, FeasibleNotionalRangeAvailability,
-    ForecastCalibrationSummary, ForecastPriceRanges, GeneratedInvestmentProposal,
-    GovernedTargetSet, GrossPricePnlAvailability, InvestmentAnalysisEvidence,
-    InvestmentAnalysisEvidenceInput, InvestmentOutcomeProjection, InvestmentProjectionAuthority,
-    InvestmentProposalAuthority, InvestmentProposalDecision, InvestmentProposalError,
-    InvestmentProposalIndexOutcome, InvestmentSizingInputs, InvestmentSizingProjection,
-    InvestmentTargetSet, InvestmentTargetSetId, LiquidityEvidence, LotRange,
-    MarketReferenceAdjustmentBasis, MarketReferenceEvidence, MarketReferencePriceKind,
-    NetPnlAvailability, NoActionReason, NonnegativeMoneyRange, NullPolicy, PortfolioPositionState,
-    PortfolioRiskEvidence, PriceForecastEvidence, ProposalEvidenceWindow,
-    ProposalExecutionEligibility, ProposalForecastVintageId, ProposalInvalidator,
-    ProposalUnavailableReason, RankingDirection, RecommendationAction, RecommendationEvidenceKind,
-    RecommendationPolicy, ReferenceMark, SavedScreen, ScreenConstraints, ScreenFeatureBinding,
-    ScreenFeatureObservation, ScreenId, ScreenPredicate, ScreenRanking, ScreenRevision, ScreenRun,
-    ScreenRunId, SignedMoneyRange, SizingCapacityAvailability, SizingCapacityEvidence,
-    SizingConstraintCap, SizingConstraintKind, SizingUnavailableReason, TargetAssumption,
-    TargetDecisionContext, TargetEvidence, TargetGovernanceInput, TargetInvalidationId,
-    TargetMethod, TargetPriceCases, TargetPriceRange, TargetReview, TargetReviewDisposition,
-    TargetReviewId, TargetStatus, ValuationEvidence,
+    CandidateSizingConstraints, CapacityRange, ChronologicalOutOfSampleEvidence,
+    ComparisonOperator, CostAdjustedBacktestEvidence, DecisionActorId, DecisionAuthority,
+    DecisionContentDigest, DecisionContractError, DecisionDossier, DecisionRepository,
+    DecisionRepositoryError, DecisionRepositoryLimits, DecisionText, Dossier, DossierEvidence,
+    DossierId, DossierReference, DossierSection, ExactFinancialRatio, ExactPositionScale,
+    ExpectedGrossPricePnlAvailability, ExpectedReturnAvailability, FeasibleLotRangeAvailability,
+    FeasibleNotionalRangeAvailability, FinancialModelEvidence, FinancialModelMacroAssumptions,
+    FinancialModelValueRange, ForecastCalibrationSummary, ForecastPriceRanges,
+    GeneratedInvestmentProposal, GovernedTargetSet, GrossPricePnlAvailability,
+    InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput, InvestmentOutcomeProjection,
+    InvestmentProjectionAuthority, InvestmentProposalAuthority, InvestmentProposalDecision,
+    InvestmentProposalError, InvestmentProposalIndexOutcome, InvestmentSizingInputs,
+    InvestmentSizingProjection, InvestmentTargetSet, InvestmentTargetSetId, LiquidityEvidence,
+    LotRange, MacroRateMaturity, MacroRateReferenceEvidence, MarketReferenceAdjustmentBasis,
+    MarketReferenceEvidence, MarketReferencePriceKind, NetPnlAvailability, NoActionReason,
+    NonnegativeMoneyRange, NullPolicy, PortfolioPositionState, PortfolioRiskEvidence,
+    PriceForecastEvidence, ProposalEvidenceWindow, ProposalExecutionEligibility,
+    ProposalForecastVintageId, ProposalInvalidator, ProposalUnavailableReason, RankingDirection,
+    RecommendationAction, RecommendationEvidenceKind, RecommendationPolicy,
+    RecommendationStudyQualification, ReferenceMark, SavedScreen, ScreenConstraints,
+    ScreenFeatureBinding, ScreenFeatureObservation, ScreenId, ScreenPredicate, ScreenRanking,
+    ScreenRevision, ScreenRun, ScreenRunId, SignedMoneyRange, SizingCapacityAvailability,
+    SizingCapacityEvidence, SizingConstraintCap, SizingConstraintKind, SizingUnavailableReason,
+    TargetAssumption, TargetDecisionContext, TargetEvidence, TargetGovernanceInput,
+    TargetInvalidationId, TargetMethod, TargetPriceCases, TargetPriceRange, TargetReview,
+    TargetReviewDisposition, TargetReviewId, TargetStatus, ValuationEvidence,
 };
 
 fn content_digest(byte: u8) -> Result<DecisionContentDigest, DecisionContractError> {
@@ -87,6 +91,8 @@ fn proposal_evidence_for_position(
         fair_value_amount,
         position_state,
         true,
+        [RecommendationStudyQualification::try_new(HistoricalStudyBasis::HistoricalAsKnown, &[])?;
+            2],
     )
 }
 
@@ -97,6 +103,7 @@ fn proposal_evidence_for_position_with_expected_terminal(
     fair_value_amount: i64,
     position_state: PortfolioPositionState,
     include_expected_terminal: bool,
+    study_qualifications: [RecommendationStudyQualification; 2],
 ) -> Result<InvestmentAnalysisEvidence, Box<dyn std::error::Error>> {
     let instrument_id = ALPHA_INSTRUMENT.parse::<InstrumentId>()?;
     let account_id = "018f8f6a-9d6f-7b43-9f38-55db5f4b1a01".parse::<AccountId>()?;
@@ -128,7 +135,9 @@ fn proposal_evidence_for_position_with_expected_terminal(
             103,
         )?,
     )?;
-    let forecast_horizon_at = as_of.checked_add_nanos(365 * DAY_NANOS)?;
+    let forecast_horizon_at = as_of
+        .checked_sub_nanos(2 * DAY_NANOS)?
+        .checked_add_nanos(365 * DAY_NANOS)?;
     let output_binding_identity = content_digest(105)?;
     let (
         expected_terminal_statistic,
@@ -182,7 +191,7 @@ fn proposal_evidence_for_position_with_expected_terminal(
         instrument_id,
         money(fair_value_amount, "USD")?,
         ValuationAmountBasis::PerInstrumentUnit,
-        as_of.checked_add_nanos(365 * DAY_NANOS)?,
+        forecast_horizon_at,
         "6d".repeat(32).parse::<MeasurementId>()?,
         "6e".repeat(32).parse::<DecisionId>()?,
         "6f".repeat(32).parse::<FairValueSelectionReceiptHash>()?,
@@ -193,9 +202,87 @@ fn proposal_evidence_for_position_with_expected_terminal(
             112,
         )?,
     )?;
-    let backtest = CostAdjustedPitBacktestEvidence::try_new(
+    let assumption_available_at = as_of.checked_sub_nanos(6 * DAY_NANOS)?;
+    let assumption_expires_at = as_of.checked_add_nanos(60 * DAY_NANOS)?;
+    let macro_assumptions = FinancialModelMacroAssumptions::try_new(
+        MacroRateReferenceEvidence::try_new(
+            MacroRateMaturity::TenYear,
+            Decimal::new(4, 0),
+            content_digest(130)?.evidence_digest(),
+            content_digest(133)?.evidence_digest(),
+            as_of.checked_sub_nanos(5 * DAY_NANOS)?,
+            market_squawk_domain::CalendarDate::new(2025, 1, 1)?,
+            assumption_available_at,
+            assumption_expires_at,
+        )?,
+        AutomaticValuationAssumption::try_new(
+            AutomaticValuationAssumptionKind::DiscountRate,
+            "annual-risk-premium",
+            Decimal::new(6, 2),
+            content_digest(134)?.evidence_digest(),
+            assumption_available_at,
+            assumption_expires_at,
+        )?,
+        AutomaticValuationAssumptionKind::DiscountRate,
+        "annual-discount-rate",
+    )?;
+    let model_assumptions = vec![
+        macro_assumptions.assumption().clone(),
+        AutomaticValuationAssumption::try_new(
+            AutomaticValuationAssumptionKind::UncertaintyLower,
+            "lower",
+            Decimal::new(fair_value_amount - 1_500, 2),
+            content_digest(135)?.evidence_digest(),
+            assumption_available_at,
+            assumption_expires_at,
+        )?,
+        AutomaticValuationAssumption::try_new(
+            AutomaticValuationAssumptionKind::UncertaintyUpper,
+            "upper",
+            Decimal::new(fair_value_amount + 1_500, 2),
+            content_digest(136)?.evidence_digest(),
+            assumption_available_at,
+            assumption_expires_at,
+        )?,
+    ]
+    .into_boxed_slice();
+    let financial_model = FinancialModelEvidence::try_recover_projection(
+        instrument_id,
+        account_id,
+        AutomaticValuationMethod::DiscountedCashFlow,
+        Some(NonZeroU32::MIN),
+        FinancialModelValueRange::try_new(
+            money(fair_value_amount - 1_500, "USD")?,
+            money(fair_value_amount, "USD")?,
+            money(fair_value_amount + 1_500, "USD")?,
+        )?,
+        TargetPriceCases::try_new(
+            money(7_000, "USD")?,
+            money(fair_value_amount, "USD")?,
+            money(17_000, "USD")?,
+        )?,
+        TargetPriceRange::try_new(
+            money(fair_value_amount - 1_000, "USD")?,
+            money(fair_value_amount + 1_000, "USD")?,
+        )?,
+        forecast_horizon_at,
+        content_digest(125)?,
+        content_digest(126)?,
+        model_assumptions,
+        content_digest(128)?,
+        content_digest(129)?,
+        Some(macro_assumptions),
+        future_window(
+            as_of.checked_sub_nanos(5 * DAY_NANOS)?,
+            as_of.checked_sub_nanos(4 * DAY_NANOS)?,
+            60,
+            126,
+        )?,
+    )?;
+    let backtest = CostAdjustedBacktestEvidence::try_new(
         instrument_id,
         Currency::try_from("USD")?,
+        study_qualifications[0],
         365 * DAY_NANOS,
         BasisPoints::new(1_200),
         BasisPoints::new(2_000),
@@ -219,11 +306,35 @@ fn proposal_evidence_for_position_with_expected_terminal(
             119,
         )?,
     )?;
+    let out_of_sample = ChronologicalOutOfSampleEvidence::try_new(
+        instrument_id,
+        Currency::try_from("USD")?,
+        study_qualifications[1],
+        365 * DAY_NANOS,
+        as_of.checked_sub_nanos(120 * DAY_NANOS)?,
+        as_of.checked_sub_nanos(32 * DAY_NANOS)?,
+        as_of.checked_sub_nanos(31 * DAY_NANOS)?,
+        NonZeroU32::new(900).ok_or(DecisionContractError::InvalidBound)?,
+        NonZeroU32::new(1_000).ok_or(DecisionContractError::InvalidBound)?,
+        NonZeroU32::new(10).ok_or(DecisionContractError::InvalidBound)?,
+        900_000,
+        content_digest(113)?,
+        content_digest(114)?,
+        content_digest(115)?,
+        content_digest(116)?,
+        future_window(
+            as_of.checked_sub_nanos(30 * DAY_NANOS)?,
+            as_of.checked_sub_nanos(29 * DAY_NANOS)?,
+            365,
+            119,
+        )?,
+    )?;
     let liquidity = LiquidityEvidence::try_new(
         instrument_id,
         Currency::try_from("USD")?,
         BasisPoints::new(20),
-        900_000,
+        Some(900_000),
+        Some(900_000),
         DataQuality::DirectVerified,
         content_digest(120)?,
         future_window(
@@ -254,10 +365,14 @@ fn proposal_evidence_for_position_with_expected_terminal(
             currency: Currency::try_from("USD")?,
             account_id,
             as_of,
+            admitted_at: as_of,
             market: Some(market),
             price_forecast: Some(forecast),
             valuation: Some(valuation),
+            financial_model: Some(financial_model),
             backtest: Some(backtest),
+            out_of_sample: Some(out_of_sample),
+            harmonic_pattern: None,
             liquidity: Some(liquidity),
             portfolio_risk: Some(portfolio_risk),
         },
@@ -423,7 +538,7 @@ fn repository_with_target_dossiers() -> Result<DecisionRepository, Box<dyn std::
             Some(market_squawk_analytics::StatisticalF64::try_new(0.75)?),
         )],
         market_squawk_analytics::StatisticalF64::try_new(0.95)?,
-        market_squawk_analytics::StatisticalF64::try_new(10_000.0)?,
+        Some(market_squawk_analytics::StatisticalF64::try_new(10_000.0)?),
         DataQuality::DirectVerified,
         None,
         vec![CandidateFlag::ModelDependent],
@@ -437,7 +552,7 @@ fn repository_with_target_dossiers() -> Result<DecisionRepository, Box<dyn std::
             Some(market_squawk_analytics::StatisticalF64::try_new(0.70)?),
         )],
         market_squawk_analytics::StatisticalF64::try_new(0.95)?,
-        market_squawk_analytics::StatisticalF64::try_new(10_000.0)?,
+        Some(market_squawk_analytics::StatisticalF64::try_new(10_000.0)?),
         DataQuality::DirectVerified,
         None,
         vec![CandidateFlag::ModelDependent],
@@ -564,7 +679,7 @@ fn screen_run_binds_exact_pit_inputs_and_rejects_semantic_substitution()
             Some(market_squawk_analytics::StatisticalF64::try_new(0.75)?),
         )],
         market_squawk_analytics::StatisticalF64::try_new(0.95)?,
-        market_squawk_analytics::StatisticalF64::try_new(10_000.0)?,
+        Some(market_squawk_analytics::StatisticalF64::try_new(10_000.0)?),
         DataQuality::DirectVerified,
         None,
         vec![CandidateFlag::ModelDependent],
@@ -893,6 +1008,74 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
     let policy = RecommendationPolicy::v1()?;
     let evidence = proposal_evidence(alpha, 10, 10_000, 12_500)?;
 
+    // Custom profiles cannot disable the same hard calibration gate tested below.
+    let mut unsafe_calibration = policy.parameters();
+    unsafe_calibration.minimum_realized_forecast_coverage_ppm = 0;
+    unsafe_calibration.maximum_forecast_calibration_error_ppm = 1_000_000;
+    assert!(matches!(
+        RecommendationPolicy::try_new(unsafe_calibration),
+        Err(InvestmentProposalError::InvalidPolicy)
+    ));
+
+    // Recalculating original portfolio sources now must retain both clocks. A later source
+    // cutoff or a calculation that has not completed by admission still cannot enter the result.
+    let portfolio = evidence
+        .portfolio_risk()
+        .ok_or("portfolio fixture absent")?;
+    let calculated_at = evidence.as_of().checked_add_nanos(1_000_000_000)?;
+    let admitted_at = calculated_at.checked_add_nanos(1_000_000_000)?;
+    for (source_cutoff, available_at, admitted) in [
+        (evidence.as_of(), calculated_at, true),
+        (evidence.as_of().checked_add_nanos(1)?, calculated_at, false),
+        (evidence.as_of(), admitted_at.checked_add_nanos(1)?, false),
+    ] {
+        let derived_portfolio = PortfolioRiskEvidence::try_new(
+            portfolio.instrument_id(),
+            portfolio.account_id(),
+            portfolio.currency(),
+            portfolio.portfolio_revision().clone(),
+            portfolio.position_state(),
+            portfolio.risk_capacity_ppm(),
+            portfolio.risk_report_identity(),
+            ProposalEvidenceWindow::try_from_derived(
+                portfolio.window().observed_at(),
+                source_cutoff,
+                available_at,
+                portfolio.window().expires_at(),
+                portfolio.window().content_identity(),
+            )?,
+        )?;
+        let result = InvestmentProposalAuthority::generate(
+            InvestmentAnalysisEvidence::new(InvestmentAnalysisEvidenceInput {
+                instrument_id: evidence.instrument_id(),
+                currency: evidence.currency(),
+                account_id: evidence.account_id(),
+                as_of: evidence.as_of(),
+                admitted_at,
+                market: evidence.market().copied(),
+                price_forecast: evidence.price_forecast().cloned(),
+                valuation: evidence.valuation().copied(),
+                financial_model: evidence.financial_model().cloned(),
+                backtest: evidence.backtest().copied(),
+                out_of_sample: evidence.out_of_sample().copied(),
+                harmonic_pattern: evidence.harmonic_pattern().cloned(),
+                liquidity: evidence.liquidity().copied(),
+                portfolio_risk: Some(derived_portfolio),
+            }),
+            policy.clone(),
+        )?;
+        if admitted {
+            assert!(matches!(result, InvestmentProposalDecision::Generated(_)));
+        } else {
+            assert!(
+                matches!(result, InvestmentProposalDecision::Unavailable(ref value)
+                if value.reason() == ProposalUnavailableReason::NotAvailableAtCutoff(
+                    RecommendationEvidenceKind::PortfolioRisk
+                ))
+            );
+        }
+    }
+
     let receipt_hash = "6f".repeat(32).parse::<FairValueSelectionReceiptHash>()?;
     let receipt_window = ProposalEvidenceWindow::try_new(
         Timestamp::from_unix_nanos(1),
@@ -910,7 +1093,10 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
         receipt_hash,
         receipt_window,
     )?;
-    assert_eq!(recovered_valuation.selection_receipt_hash(), receipt_hash);
+    assert_eq!(
+        recovered_valuation.selection_receipt_hash(),
+        Some(receipt_hash)
+    );
     assert!(matches!(
         ValuationEvidence::try_recover_receipt_bound_projection(
             alpha,
@@ -928,6 +1114,87 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
             )?,
         ),
         Err(InvestmentProposalError::InvalidValuationSelection)
+    ));
+
+    // A catastrophic realized-coverage miss must fail before independent reliability weights
+    // or otherwise valid valuation, backtest, liquidity and risk can authorize an action.
+    let forecast = evidence.price_forecast().ok_or("forecast fixture absent")?;
+    let miscalibrated_forecast = PriceForecastEvidence::try_new(
+        forecast.instrument_id(),
+        forecast.cases(),
+        forecast.ranges(),
+        forecast.horizon_at(),
+        forecast.expected_terminal_statistic(),
+        forecast.expected_terminal_price(),
+        forecast.expected_terminal_horizon_at(),
+        forecast.expected_terminal_statistic_identity(),
+        forecast.vintage_id(),
+        forecast.output_binding_identity(),
+        forecast.calibration_identity(),
+        forecast.outcome_set_identity(),
+        ForecastCalibrationSummary::try_new(
+            990_000,
+            0,
+            forecast.calibration().completed_outcomes(),
+        )?,
+        forecast.window(),
+    )?;
+    let miscalibrated = InvestmentProposalAuthority::generate(
+        InvestmentAnalysisEvidence::new(InvestmentAnalysisEvidenceInput {
+            instrument_id: evidence.instrument_id(),
+            currency: evidence.currency(),
+            account_id: evidence.account_id(),
+            as_of: evidence.as_of(),
+            admitted_at: evidence.admitted_at(),
+            market: evidence.market().copied(),
+            price_forecast: Some(miscalibrated_forecast),
+            valuation: evidence.valuation().copied(),
+            financial_model: evidence.financial_model().cloned(),
+            backtest: evidence.backtest().copied(),
+            out_of_sample: evidence.out_of_sample().copied(),
+            harmonic_pattern: evidence.harmonic_pattern().cloned(),
+            liquidity: evidence.liquidity().copied(),
+            portfolio_risk: evidence.portfolio_risk().cloned(),
+        }),
+        policy.clone(),
+    )?;
+    assert!(
+        matches!(miscalibrated, InvestmentProposalDecision::Unavailable(ref value)
+        if matches!(value.reason(), ProposalUnavailableReason::ForecastCalibrationBelowPolicy {
+            nominal_ppm: 990_000, realized_ppm: 0, .. }))
+    );
+
+    // Recovery must reject a different rate despite identical sibling selection digests.
+    let model = evidence.financial_model().ok_or("model fixture absent")?;
+    let mut mismatched_assumptions = model.assumptions().to_vec();
+    let original = &mismatched_assumptions[0];
+    mismatched_assumptions[0] = AutomaticValuationAssumption::try_new(
+        original.kind(),
+        original.identifier(),
+        Decimal::new(11, 2),
+        original.evidence(),
+        original.available_at(),
+        original.expires_at(),
+    )?;
+    assert!(matches!(
+        FinancialModelEvidence::try_recover_projection(
+            model.instrument_id(),
+            model.account_id(),
+            model.method(),
+            model.periods_per_year(),
+            model.range(),
+            model.scenarios(),
+            model.sensitivity_range(),
+            model.horizon_at(),
+            model.pit_input_set_identity(),
+            model.calculation_identity(),
+            mismatched_assumptions.into_boxed_slice(),
+            model.scenario_identity(),
+            model.sensitivity_identity(),
+            model.macro_assumptions().cloned(),
+            model.window(),
+        ),
+        Err(InvestmentProposalError::InvalidEvidenceMetric)
     ));
 
     let first = InvestmentProposalAuthority::generate(evidence.clone(), policy.clone())?;
@@ -961,7 +1228,268 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
         generated.confidence().meaning(),
         crate::RecommendationConfidenceMeaning::PolicyWeightedEvidenceReliabilityV1
     );
-    assert_eq!(generated.confidence().value_ppm(), 920_000);
+    assert_eq!(generated.confidence().value_ppm(), Some(920_000));
+    // Opposite-side depth cannot authorize an action or improve its reliability. A genuine
+    // Hold excludes only liquidity; an unresolved action and missing required side stay missing.
+    let directional_evidence =
+        |mark,
+         position,
+         buy_add,
+         trim_sell|
+         -> Result<InvestmentAnalysisEvidence, Box<dyn std::error::Error>> {
+            let original = proposal_evidence_for_position(alpha, 10, mark, 12_500, position)?;
+            let retained = original.liquidity().ok_or("liquidity fixture absent")?;
+            let liquidity = LiquidityEvidence::try_new(
+                retained.instrument_id(),
+                retained.currency(),
+                retained.quoted_spread(),
+                buy_add,
+                trim_sell,
+                retained.quality(),
+                retained.assessment_identity(),
+                retained.window(),
+            )?;
+            Ok(InvestmentAnalysisEvidence::new(
+                InvestmentAnalysisEvidenceInput {
+                    instrument_id: original.instrument_id(),
+                    currency: original.currency(),
+                    account_id: original.account_id(),
+                    as_of: original.as_of(),
+                    admitted_at: original.admitted_at(),
+                    market: original.market().copied(),
+                    price_forecast: original.price_forecast().cloned(),
+                    valuation: original.valuation().copied(),
+                    financial_model: original.financial_model().cloned(),
+                    backtest: original.backtest().copied(),
+                    out_of_sample: original.out_of_sample().copied(),
+                    harmonic_pattern: original.harmonic_pattern().cloned(),
+                    liquidity: Some(liquidity),
+                    portfolio_risk: original.portfolio_risk().cloned(),
+                },
+            ))
+        };
+    let held_position = PortfolioPositionState::Position {
+        add_allowed: true,
+        trim_allowed: true,
+        exit_allowed: true,
+    };
+    for (mark, position, action, buy_side) in [
+        (
+            10_000,
+            PortfolioPositionState::NoPosition,
+            RecommendationAction::Buy,
+            true,
+        ),
+        (10_730, held_position, RecommendationAction::Add, true),
+        (13_790, held_position, RecommendationAction::Trim, false),
+        (9_470, held_position, RecommendationAction::Sell, false),
+    ] {
+        for (selected_capacity, other_capacity, expected_reason) in [
+            (Some(900_000), None, None),
+            (
+                None,
+                Some(900_000),
+                Some(NoActionReason::LiquidityCapacityUnavailable),
+            ),
+            (
+                Some(400_000),
+                Some(900_000),
+                Some(NoActionReason::LiquidityBelowPolicy),
+            ),
+        ] {
+            let (buy_add, trim_sell) = if buy_side {
+                (selected_capacity, other_capacity)
+            } else {
+                (other_capacity, selected_capacity)
+            };
+            let directional = directional_evidence(mark, position, buy_add, trim_sell)?;
+            let result =
+                InvestmentProposalAuthority::generate(directional.clone(), policy.clone())?;
+            match (result, expected_reason) {
+                (InvestmentProposalDecision::Generated(value), None) => {
+                    assert_eq!(value.action(), action)
+                }
+                (InvestmentProposalDecision::NoAction(value), Some(reason)) => {
+                    assert_eq!(value.reason(), reason);
+                    if selected_capacity.is_none() {
+                        assert_eq!(value.confidence().value_ppm(), None);
+                        assert_eq!(value.confidence().applicable_policy_weight_ppm(), 1_000_000);
+                        assert_eq!(
+                            value.confidence().unavailable_reason(),
+                            Some(if buy_side {
+                                crate::RecommendationConfidenceUnavailableReason::BuyAddCapacityUnavailable
+                            } else {
+                                crate::RecommendationConfidenceUnavailableReason::TrimSellCapacityUnavailable
+                            })
+                        );
+                    } else {
+                        assert!(value.confidence().value_ppm().is_some());
+                    }
+                    let recovered = InvestmentProposalAuthority::try_recover_no_action(
+                        directional,
+                        policy.clone(),
+                        value.analysis_id(),
+                        value.derivation_digest(),
+                        value.proposal_id(),
+                    )?;
+                    assert_eq!(recovered, value);
+                }
+                _ => return Err("directional capacity authorized the wrong action side".into()),
+            }
+        }
+    }
+    let holding = directional_evidence(12_000, held_position, None, None)?;
+    let InvestmentProposalDecision::Generated(hold) =
+        InvestmentProposalAuthority::generate(holding.clone(), policy.clone())?
+    else {
+        return Err("a true Hold must not require directional depth".into());
+    };
+    assert_eq!(hold.action(), RecommendationAction::Hold);
+    assert_eq!(hold.confidence().value_ppm(), Some(937_142));
+    assert_eq!(hold.confidence().applicable_policy_weight_ppm(), 875_000);
+    assert_eq!(hold.confidence().components()[4].weight_ppm(), 125_000);
+    assert_eq!(
+        hold.confidence().components()[4].value(),
+        crate::RecommendationConfidenceComponentValue::NotApplicable
+    );
+    let mut liquidity_only = policy.parameters();
+    liquidity_only.confidence_weights_ppm = [0, 0, 0, 0, 1_000_000, 0];
+    let liquidity_only = RecommendationPolicy::try_new(liquidity_only)?;
+    let InvestmentProposalDecision::NoAction(no_weight) =
+        InvestmentProposalAuthority::generate(holding, liquidity_only)?
+    else {
+        return Err(
+            "Hold cannot infer reliability when applicable configured weight is zero".into(),
+        );
+    };
+    assert_eq!(no_weight.reason(), NoActionReason::ConfidenceUnavailable);
+    assert_eq!(no_weight.confidence().value_ppm(), None);
+    assert_eq!(no_weight.confidence().applicable_policy_weight_ppm(), 0);
+    assert_eq!(
+        no_weight.confidence().unavailable_reason(),
+        Some(crate::RecommendationConfidenceUnavailableReason::NoApplicablePolicyWeight)
+    );
+    let mut no_liquidity_weight = policy.parameters();
+    no_liquidity_weight.confidence_weights_ppm = [375_000, 150_000, 250_000, 100_000, 0, 125_000];
+    let InvestmentProposalDecision::NoAction(missing_zero_weight) =
+        InvestmentProposalAuthority::generate(
+            directional_evidence(
+                10_000,
+                PortfolioPositionState::NoPosition,
+                None,
+                Some(900_000),
+            )?,
+            RecommendationPolicy::try_new(no_liquidity_weight)?,
+        )?
+    else {
+        return Err("zero configured weight must not admit missing required liquidity".into());
+    };
+    assert_eq!(
+        missing_zero_weight.reason(),
+        NoActionReason::LiquidityCapacityUnavailable
+    );
+    assert_eq!(missing_zero_weight.confidence().value_ppm(), None);
+
+    // A later-snapshot study must retain its limitations through admission and recovery;
+    // it cannot become as-known evidence or silently evade a profile requiring that basis.
+    let retrospective_limitations = [
+        HistoricalStudyLimitation::HistoricalRevisionCoverageUnproven,
+        HistoricalStudyLimitation::LaterVintageInputs,
+        HistoricalStudyLimitation::PresentDayFixedCohort,
+        HistoricalStudyLimitation::SimulatedAvailability,
+    ];
+    assert!(
+        RecommendationStudyQualification::try_new(
+            HistoricalStudyBasis::RetrospectiveFrozenSnapshot,
+            &retrospective_limitations[..3],
+        )
+        .is_err()
+    );
+    assert!(
+        RecommendationStudyQualification::try_new(
+            HistoricalStudyBasis::HistoricalAsKnown,
+            &retrospective_limitations,
+        )
+        .is_err()
+    );
+    let retrospective = RecommendationStudyQualification::try_new(
+        HistoricalStudyBasis::RetrospectiveFrozenSnapshot,
+        &retrospective_limitations,
+    )?;
+    let retrospective_evidence = proposal_evidence_for_position_with_expected_terminal(
+        alpha,
+        10,
+        10_000,
+        12_500,
+        PortfolioPositionState::NoPosition,
+        true,
+        [retrospective; 2],
+    )?;
+    let retrospective_result =
+        InvestmentProposalAuthority::generate(retrospective_evidence.clone(), policy.clone())?;
+    let InvestmentProposalDecision::Generated(retrospective_generated) = retrospective_result
+    else {
+        return Err(
+            "complete qualified retrospective evidence must generate under the default".into(),
+        );
+    };
+    assert_eq!(
+        retrospective_generated.confidence().study_qualification(),
+        retrospective
+    );
+    assert_eq!(
+        retrospective_generated.confidence().value_ppm(),
+        generated.confidence().value_ppm()
+    );
+    assert_ne!(
+        retrospective_generated.analysis_id(),
+        generated.analysis_id()
+    );
+    let recovered_retrospective = InvestmentProposalAuthority::try_recover_generated(
+        retrospective_evidence.clone(),
+        policy.clone(),
+        retrospective_generated.analysis_id(),
+        retrospective_generated.derivation_digest(),
+        retrospective_generated.proposal_id(),
+    )?;
+    assert_eq!(
+        recovered_retrospective.confidence().study_qualification(),
+        retrospective
+    );
+    let mut historical_only = policy.parameters();
+    historical_only.allow_retrospective_studies = false;
+    let restricted_result = InvestmentProposalAuthority::generate(
+        retrospective_evidence,
+        RecommendationPolicy::try_new(historical_only)?,
+    )?;
+    assert!(
+        matches!(restricted_result, InvestmentProposalDecision::Unavailable(value)
+        if value.reason() == ProposalUnavailableReason::HistoricalStudyBasisNotAllowed {
+            actual: HistoricalStudyBasis::RetrospectiveFrozenSnapshot,
+        })
+    );
+    let mismatched_qualification = InvestmentProposalAuthority::generate(
+        proposal_evidence_for_position_with_expected_terminal(
+            alpha,
+            10,
+            10_000,
+            12_500,
+            PortfolioPositionState::NoPosition,
+            true,
+            [
+                retrospective,
+                RecommendationStudyQualification::try_new(
+                    HistoricalStudyBasis::HistoricalAsKnown,
+                    &[],
+                )?,
+            ],
+        )?,
+        policy.clone(),
+    )?;
+    assert!(
+        matches!(mismatched_qualification, InvestmentProposalDecision::Unavailable(value)
+        if value.reason() == ProposalUnavailableReason::OutOfSampleBacktestMismatch)
+    );
     let Some(retained_backtest) = generated.evidence().backtest() else {
         return Err("generated proposal must retain admitted backtest evidence".into());
     };
@@ -1142,6 +1670,10 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
             12_500,
             PortfolioPositionState::NoPosition,
             false,
+            [RecommendationStudyQualification::try_new(
+                HistoricalStudyBasis::HistoricalAsKnown,
+                &[],
+            )?; 2],
         )?,
         policy.clone(),
     )?;
@@ -1232,6 +1764,10 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
     let forward_cost_capacity = SizingCapacityAvailability::Available(Box::new(capacity_evidence(
         CapacityRange::Lots(zero_to_five),
         203,
+    )?));
+    let no_feasible_risk = SizingCapacityAvailability::Available(Box::new(capacity_evidence(
+        CapacityRange::NoFeasibleLots,
+        204,
     )?));
     let portfolio_state = CandidatePortfolioSizingState::try_new(
         account_id,
@@ -1358,6 +1894,22 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
             SizingConstraintKind::PreferredWeight,
         ]
     );
+    let no_feasible_sizing = InvestmentSizingProjection::try_from_proposal(
+        sizing_proposal,
+        InvestmentSizingInputs::new(
+            sizing_inputs.evaluated_at(), sizing_inputs.execution_terms(),
+            sizing_inputs.selected_mark(), sizing_inputs.portfolio().clone(),
+            sizing_inputs.constraints(), sizing_inputs.liquidity_capacity().clone(),
+            no_feasible_risk, sizing_inputs.forward_cost_capacity().clone(),
+        ),
+    )?;
+    assert_eq!(
+        no_feasible_sizing.hard_feasible_lots(),
+        &FeasibleLotRangeAvailability::Unavailable(Box::new([
+            SizingUnavailableReason::CapacityRangeContainsNoLots(SizingConstraintKind::PortfolioRisk),
+        ])),
+    );
+    assert_ne!(no_feasible_sizing.result_digest(), sizing.result_digest());
     assert_ne!(sizing.result_digest().bytes(), [0; 32]);
     assert_eq!(
         sizing,
@@ -1620,6 +2172,12 @@ fn generated_investment_proposal_is_deterministic_and_abstains_fail_closed()
             assert_eq!(
                 value.reason(),
                 NoActionReason::ConflictingForecastAndValuation
+            );
+            assert_eq!(value.confidence().value_ppm(), None);
+            assert_eq!(value.confidence().applicable_policy_weight_ppm(), 1_000_000);
+            assert_eq!(
+                value.confidence().unavailable_reason(),
+                Some(crate::RecommendationConfidenceUnavailableReason::ActionSideNotEstablished)
             );
             assert_eq!(
                 value.invalidators(),

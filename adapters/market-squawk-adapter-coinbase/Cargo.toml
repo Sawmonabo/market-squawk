@@ -30,7 +30,10 @@ tokio-tungstenite.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+market-squawk-data.workspace = true
+market-squawk-platform.workspace = true
 static_assertions.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

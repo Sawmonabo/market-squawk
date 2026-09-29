@@ -5,11 +5,20 @@
 //! store, and routes the graph into exactly one canonical family. Mutual-fund NAV and equity/ETF
 //! EOD bars remain separate typed operations, immutable generations, and restart selectors.
 
+mod history;
+pub(crate) use history::{
+    TiingoCompletedEodActionRead, TiingoCompletedEodHistoryReference,
+    TiingoEodHistoryPublicationReceipt, TiingoHistoryApplicationError,
+};
+
+mod current_actions;
+pub(crate) use current_actions::PublishedCurrentOrdinaryActions;
+
 use std::{sync::Arc, time::Instant};
 
 use market_squawk_adapter_tiingo::{
-    TiingoEodBarTimeAuthority, TiingoEodContractEvidence, TiingoEodInstrumentAuthority,
-    TiingoFundContext, TiingoFundNavContractEvidence, TiingoLatestEodPublicationOutcome,
+    TiingoEodContractEvidence, TiingoEodInstrumentAuthority, TiingoFundContext,
+    TiingoFundNavContractEvidence, TiingoLatestEodPublicationOutcome,
     TiingoLatestFundNavPublicationOutcome, TiingoLatestPublicationError,
     TiingoLatestUnavailableReason, TiingoPendingLatestPublication, TiingoSealedLatestPublication,
     TiingoSealedLatestUnavailable,
@@ -164,7 +173,6 @@ impl TiingoLatestApplicationClosure {
         seal_request: ProviderCaptureSealRequest,
         instrument: &TiingoEodInstrumentAuthority,
         contract: &TiingoEodContractEvidence,
-        bar_time_authority: &dyn TiingoEodBarTimeAuthority,
         extraction_request: ExtractionRequest,
         analytical_dataset: DatasetId,
         observed_at: Timestamp,
@@ -177,13 +185,7 @@ impl TiingoLatestApplicationClosure {
         let sealed = self
             .seal_latest(pending, seal_request, &cancellation, deadline)
             .await?;
-        match sealed.try_into_eod(
-            instrument,
-            contract,
-            bar_time_authority,
-            extraction_request,
-            ingested_at,
-        )? {
+        match sealed.try_into_eod(instrument, contract, extraction_request, ingested_at)? {
             TiingoLatestEodPublicationOutcome::Published(publication) => {
                 let (revisions, binding) = publication.into_parts();
                 let prepared = self
@@ -713,7 +715,6 @@ impl ProductionResearchIngestCoordinator {
         seal_request: ProviderCaptureSealRequest,
         instrument: TiingoEodInstrumentAuthority,
         contract: TiingoEodContractEvidence,
-        bar_time_authority: Arc<dyn TiingoEodBarTimeAuthority>,
         extraction_request: ExtractionRequest,
         analytical_dataset: DatasetId,
         observed_at: Timestamp,
@@ -735,7 +736,6 @@ impl ProductionResearchIngestCoordinator {
                 seal_request,
                 &instrument,
                 &contract,
-                bar_time_authority.as_ref(),
                 extraction_request,
                 analytical_dataset,
                 observed_at,

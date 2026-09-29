@@ -405,24 +405,27 @@ released native product rather than a completed installed backend vertical.
 ### Lease-gated research adapters
 
 Research activation requires an active immutable onboarding lease for the exact surface, exact
-source/revision binding, and admitted `persist` rights with non-refresh exact evidence. The CLI
-activation request is a closed schema-version-5 object with bounded schema-version-2 through
-schema-version-4 recovery, capped at 1 MiB. Its provider kinds are `sec`, `bls`,
-`treasury_fiscal`, `treasury_daily_rates`, `fred_alfred`, and
-`federal_reserve_board_h15`; each kind has a closed, provider-specific scope, and Board is admitted
-only in schema version 5. The activation authority also accepts these typed research requests from
-the loopback portal boundary plus source-session activation for public Coinbase, Coinbase Direct,
-and Kraken. Source-session activation verifies onboarding authority but does not manufacture a
-research adapter or expand durable-use rights beyond the exact evidence admitted by its profile
-and request.
+source/revision binding, and admitted `persist` rights with non-refresh exact evidence.
+
+Native Settings and authorized CLI automation share one installed activation authority. The CLI
+accepts only the closed `market-squawk.provider-setup.v1` staged envelope and its `activate`,
+`verifySaved`, `restoreSaved`, or `resumePublication` action. The exact provider configuration is
+code-owned and contains no credential, endpoint override, caller-authored rights, or runtime lease.
+Saved recipes and their credential generations take precedence over a new session. The native
+workflow also supports source-session activation for public Coinbase, Coinbase Direct, and
+Kraken; that does not manufacture research persistence or expand admitted rights.
+
+See [Source operations](../operations/source-operations.md#understand-the-source-activate-boundary)
+for the current envelope and [native contracts](../../apps/market-squawk/src/provider_onboarding/contracts.rs)
+for closed provider fields. Historical evidence schema labels are not parallel request routes.
 
 | Adapter | Extracted scope | Important bounded/authority behavior |
 | --- | --- | --- |
 | SEC EDGAR | Submissions, company facts, and referenced filing/XBRL representations | Exact organization/admin `User-Agent`; endpoint allowlist; shared request budget; raw evidence and representation registry; revision-preserving |
 | BLS v1/v2 | Exact selected series and inclusive year range | Tier-specific endpoint and request plan; at most 1,000 series metadata inputs; v2 secret resolved only in explicit foreground work |
 | FRED/ALFRED | Exact series metadata, observations, vintage dates, and revision history | API key for ephemeral retrieval; durable use additionally requires exact Bank service permission, explicit local review, and exact per-series rights |
-| Treasury Fiscal Data | Average Interest Rates v2 for an exact date interval and page size | Exact endpoint/query allowlist; dataset/version provenance |
-| Treasury daily XML | All five official families over an inclusive year range | Exact family schemas and start years; strict year/month/all-history requests; cross-page integrity; exact payload/revision lineage |
+| Treasury Fiscal Data | Complete published Average Interest Rates v2 history with bounded page size | Exact endpoint/query allowlist; dataset/version provenance |
+| Treasury daily XML | Complete published history across all five official families | Exact family schemas and start years; strict year/month/all-history requests; cross-page integrity; exact payload/revision lineage |
 | Federal Reserve Board H.15 | Exact rolling 100-date × 11-series Treasury constant-maturity dashboard generation | No-key active lease; exact endpoint/query allowlist; shared one-request-per-minute/single-flight application budget; strict 1,100-observation parser bound; distinct doctor/rolling/full-history identities; rich capture binding; full history requires partitioned resumable extraction |
 
 The research metadata for these adapters uses a positive one-nanosecond `delayed` declaration and
@@ -587,12 +590,11 @@ The application exposes:
 | `Source.GetCoverage` | Static declared profile coverage plus active runtime coverage when present |
 | `Source.GetHealth` | Bounded active runtime connection, freshness, integrity, coverage, and quality view, or explicit `not_active` state |
 | `Source.Register` | Confirmed registration of one code-supported profile |
-| `Source.Setup` | Confirmed start/resume of bounded local onboarding |
 
-CLI commands are `source status`, `source coverage`, `source health`, `source register`, `source
-setup`, and the separate evidence-bound `source activate` request-file command. MCP exposes the
-five application operations but not the CLI-owned activation request-file boundary. Full argument
-contracts are in the [CLI reference](cli.md) and [MCP reference](mcp.md).
+CLI commands include `source status`, `source coverage`, `source health`, `source register`, and
+the protected installed `source activate` request-file boundary. Provider setup UI lives in
+Settings → Connections. Native setup/credential operations are absent from the MCP registry. Full
+argument contracts are in the [CLI reference](cli.md) and [MCP reference](mcp.md).
 
 ## Related documentation and code
 

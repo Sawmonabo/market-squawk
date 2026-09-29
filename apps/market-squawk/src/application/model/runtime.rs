@@ -1,7 +1,7 @@
 //! Durable production model admission and restart-safe backend composition.
 
 use std::fmt;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,7 @@ pub struct ModelAdmissionRequest {
     dataset: PythonDatasetAdmissionAuthority,
     backend: ModelBackendAdmission,
     worker_expectation: Option<WorkerCandidateExpectation>,
+    training_job: Option<index::TrainingJobBinding>,
 }
 
 #[derive(Debug)]
@@ -109,6 +110,7 @@ impl ModelAdmissionRequest {
             dataset,
             backend,
             worker_expectation: None,
+            training_job: None,
         })
     }
 }
@@ -286,6 +288,7 @@ impl fmt::Debug for ModelRuntimeSnapshot {
 
 struct RuntimeGate {
     index: ModelRuntimeIndex,
+    publication_unresolved: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,7 +307,7 @@ pub(super) struct RetainedRuntimeBackup {
 
 pub(super) struct RetainedForecastRuntime {
     pub(super) generation_sha256: Sha256Digest,
-    pub(super) backends: Box<[Arc<dyn InferenceBackend>]>,
+    pub(super) image: Arc<super::read_image::ModelReadImage>,
 }
 
 impl fmt::Debug for RetainedForecastRuntime {
@@ -312,7 +315,7 @@ impl fmt::Debug for RetainedForecastRuntime {
         formatter
             .debug_struct("RetainedForecastRuntime")
             .field("generation_sha256", &self.generation_sha256)
-            .field("backend_count", &self.backends.len())
+            .field("backend_count", &self.image.backends.len())
             .finish()
     }
 }
@@ -440,7 +443,10 @@ impl ProductionModelRuntime {
             training_environment: Some(training_environment),
             onnx_worker,
             limits,
-            gate: Mutex::new(RuntimeGate { index }),
+            gate: Mutex::new(RuntimeGate {
+                index,
+                publication_unresolved: false,
+            }),
             read_image,
         })
     }
@@ -453,15 +459,25 @@ impl ProductionModelRuntime {
     ///
     /// # Errors
     ///
-    /// Any authority, immutable-coordinate, resource, runtime, persistence, or deadline failure
-    /// leaves the current durable and in-process runtime unchanged.
+    /// A prepublication failure leaves the runtime unchanged. An uncertain durable write retains
+    /// the candidate and blocks further admissions and backups until exact restart reconciliation.
     pub fn admit(
         &self,
         request: ModelAdmissionRequest,
     ) -> Result<ModelAdmissionReceipt, ProductionModelRuntimeError> {
+        self.admit_with_cancellation(request, &CancellationToken::new())
+    }
+
+    /// The owning job retains its terminal publication permit through this existing commit.
+    pub(crate) fn admit_with_cancellation(
+        &self,
+        request: ModelAdmissionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelAdmissionReceipt, ProductionModelRuntimeError> {
         let deadline = validation_deadline(self.limits.validation_time)?;
+        check_admission_control(deadline, cancellation)?;
         let root = open_candidate_root(&self.paths, &request.candidate_directory)?;
-        let candidate = self.verify_candidate(&root, &request, deadline)?;
+        let candidate = self.verify_candidate(&root, &request, deadline, cancellation)?;
         let RuntimeValidatedCandidate {
             bundle,
             authority_bytes,
@@ -499,6 +515,7 @@ impl ProductionModelRuntime {
             authority_bytes,
             authority_sha256,
             dataset_export_sha256: dataset.export_sha256(),
+            dataset_product_contract: dataset.product_contract(),
             dataset_as_of: dataset.as_of(),
             dataset_selection_sha256: dataset.selection_sha256(),
             catalog_identity: dataset.catalog_identity(),
@@ -510,11 +527,16 @@ impl ProductionModelRuntime {
             training_environment_sha256: metadata.training_environment_hash(),
             output_binding_sha256: metadata.output_binding().identity(),
             runtime_policy,
+            training_job: request.training_job,
         };
+        check_admission_control(deadline, cancellation)?;
         let mut gate = self
             .gate
-            .lock()
+            .try_lock()
             .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
+        if gate.publication_unresolved {
+            return Err(ProductionModelRuntimeError::PublicationUnresolved);
+        }
         let current = gate.index.encode(self.limits.index)?;
         let mut proposed = ModelRuntimeIndex::decode(&current, self.limits.index)?;
         let inserted = proposed.try_insert(admission.clone(), self.limits.index)?;
@@ -537,7 +559,18 @@ impl ProductionModelRuntime {
             }),
         )?;
         let encoded = proposed.encode(self.limits.index)?;
-        self.store.store(&encoded)?;
+        check_admission_control(deadline, cancellation)?;
+        if let Err(error) = self.store.store(&encoded) {
+            match self.store.load() {
+                Ok(Some(actual)) if actual == encoded => {}
+                Ok(Some(actual)) if actual == current => return Err(error.into()),
+                Ok(None) if gate.index.entries().is_empty() => return Err(error.into()),
+                Ok(_) | Err(_) => {
+                    gate.publication_unresolved = true;
+                    return Err(ProductionModelRuntimeError::PublicationUnresolved);
+                }
+            }
+        }
         gate.index = proposed;
         self.read_image.publish(image);
         Ok(receipt(&admission, ModelAdmissionDisposition::Inserted))
@@ -560,6 +593,9 @@ impl ProductionModelRuntime {
             .gate
             .lock()
             .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
+        if gate.publication_unresolved {
+            return Err(ProductionModelRuntimeError::PublicationUnresolved);
+        }
         let canonical_index = gate.index.encode(self.limits.index)?.into_boxed_slice();
         let image = self.read_image.load();
         if image.registry.len()? != gate.index.entries().len() {
@@ -625,7 +661,7 @@ impl ProductionModelRuntime {
         }
         Ok(RetainedForecastRuntime {
             generation_sha256: Sha256Digest::new(Sha256::digest(encoded).into()),
-            backends: image.backends.to_vec().into_boxed_slice(),
+            image,
         })
     }
 
@@ -719,7 +755,10 @@ impl ProductionModelRuntime {
             training_environment: None,
             onnx_worker: None,
             limits,
-            gate: Mutex::new(RuntimeGate { index }),
+            gate: Mutex::new(RuntimeGate {
+                index,
+                publication_unresolved: false,
+            }),
             read_image: Arc::new(ModelReadImageState::new(image)),
         })
     }
@@ -729,6 +768,7 @@ impl ProductionModelRuntime {
         root: &ControlledModelRoot,
         request: &ModelAdmissionRequest,
         deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<RuntimeValidatedCandidate, ProductionModelRuntimeError> {
         let environment = self.training_environment()?;
         let candidate = verify_model_candidate(
@@ -742,7 +782,7 @@ impl ProductionModelRuntime {
             &self.feature_registry,
             self.limits.dataset_verification,
             deadline,
-            &CancellationToken::new(),
+            cancellation,
         )?;
         let (bundle, authority, dataset) = candidate.into_parts();
         Ok(RuntimeValidatedCandidate {
@@ -840,12 +880,7 @@ fn build_runtime(
             let metadata =
                 BundleMetadataRef::try_new(&admission.metadata_path, admission.metadata_sha256)
                     .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)?;
-            let dataset = PythonDatasetAdmissionAuthority::try_new(
-                admission.dataset_export_sha256,
-                admission.dataset_as_of,
-                admission.dataset_selection_sha256,
-                admission.catalog_identity,
-            )?;
+            let dataset = admission.dataset_authority()?;
             recover_model_candidate(
                 &root,
                 &metadata,
@@ -963,6 +998,117 @@ fn open_candidate_root(
     Ok(ControlledModelRoot::from_directory(directory))
 }
 
+impl ModelAdmissionRequest {
+    pub(crate) fn bind_training_job(
+        &mut self,
+        context: &market_squawk_jobs::JobRunContext,
+        stderr: &market_squawk_modeling::TrainingWorkerStderrEvidence,
+    ) -> Result<(), ProductionModelRuntimeError> {
+        let snapshot = context.snapshot();
+        if self.training_job.is_some()
+            || self.candidate_directory.as_ref()
+                != format!(
+                    "models/training-{}/generation-{}/candidate",
+                    snapshot.id().as_uuid(),
+                    snapshot.generation().get()
+                )
+        {
+            return Err(ProductionModelRuntimeError::InvalidAdmission);
+        }
+        self.training_job = Some(index::TrainingJobBinding {
+            id: snapshot.id().as_uuid(),
+            generation: NonZeroU64::new(snapshot.generation().get())
+                .ok_or(ProductionModelRuntimeError::InvalidAdmission)?,
+            input_sha256: snapshot.spec().input().digest().bytes(),
+            stderr_bytes: u64::from(stderr.captured_bytes()),
+            stderr_sha256: stderr.sha256(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn require_dataset_authority(
+        &self,
+        expected: PythonDatasetAdmissionAuthority,
+    ) -> Result<(), ProductionModelRuntimeError> {
+        if self.dataset == expected {
+            Ok(())
+        } else {
+            Err(ProductionModelRuntimeError::CandidateEvidenceMismatch)
+        }
+    }
+}
+
+impl ProductionModelRuntime {
+    pub(crate) fn training_model_token(
+        &self,
+        receipt: &ModelAdmissionReceipt,
+    ) -> Result<uuid::Uuid, ProductionModelRuntimeError> {
+        let image = self.read_image.load();
+        let bundle = image
+            .registry
+            .get(receipt.bundle_id(), receipt.bundle_version())?
+            .ok_or(ProductionModelRuntimeError::CorruptRuntime)?;
+        if bundle.metadata().metadata_hash() != receipt.metadata_sha256() {
+            return Err(ProductionModelRuntimeError::CorruptRuntime);
+        }
+        super::forecast_model_evidence_projection(&bundle)
+            .map(|value| value.model_token())
+            .map_err(|_| ProductionModelRuntimeError::CorruptRuntime)
+    }
+
+    /// Resolves a durable admission only when its owning job binding also matches.
+    pub(crate) fn training_admission(
+        &self,
+        snapshot: &market_squawk_jobs::JobSnapshot,
+    ) -> Result<Option<(ModelAdmissionReceipt, Sha256Digest)>, ProductionModelRuntimeError> {
+        let gate = self
+            .gate
+            .try_lock()
+            .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
+        if gate.publication_unresolved {
+            return Err(ProductionModelRuntimeError::PublicationUnresolved);
+        }
+        let mut found = gate.index.entries().iter().filter(|entry| {
+            entry.training_job.as_ref().is_some_and(|job| {
+                job.id == snapshot.id().as_uuid()
+                    && job.generation.get() == snapshot.generation().get()
+                    && job.input_sha256 == snapshot.spec().input().digest().bytes()
+            })
+        });
+        let value = found
+            .next()
+            .map(|entry| {
+                Ok::<_, ProductionModelRuntimeError>((
+                    receipt(entry, ModelAdmissionDisposition::AlreadyAdmitted),
+                    entry
+                        .training_result_sha256()
+                        .ok_or(ProductionModelRuntimeError::CorruptRuntime)?,
+                ))
+            })
+            .transpose()?;
+        if found.next().is_some() {
+            return Err(ProductionModelRuntimeError::CorruptRuntime);
+        }
+        Ok(value)
+    }
+}
+
+fn check_admission_control(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), ProductionModelRuntimeError> {
+    if cancellation.is_cancelled() {
+        Err(market_squawk_modeling::ModelAdmissionError::Dataset(
+            market_squawk_data::PythonDatasetCatalogError::Cancelled,
+        )
+        .into())
+    } else if Instant::now() >= deadline {
+        Err(ProductionModelRuntimeError::ValidationDeadline)
+    } else {
+        Ok(())
+    }
+}
+
 fn validation_deadline(duration: Duration) -> Result<Instant, ProductionModelRuntimeError> {
     Instant::now()
         .checked_add(duration)
@@ -989,6 +1135,9 @@ fn receipt(
 /// Durable production model runtime construction, recovery, or admission failure.
 #[derive(Debug, Error)]
 pub enum ProductionModelRuntimeError {
+    /// A durable index write has an unknown outcome; its candidate files must be retained.
+    #[error("production model publication requires exact restart reconciliation")]
+    PublicationUnresolved,
     /// Fixed resource limits are invalid.
     #[error("production model runtime limits are invalid")]
     InvalidLimits,

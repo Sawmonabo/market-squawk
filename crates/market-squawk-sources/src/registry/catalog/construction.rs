@@ -490,6 +490,7 @@ impl AuthoritativeSourceRegistry {
             history,
             clock,
             authorization_subject_resolver,
+            provider_identity_authority: None,
             composition,
         })
     }
@@ -547,6 +548,7 @@ impl AuthoritativeSourceRegistry {
             history,
             clock,
             authorization_subject_resolver,
+            provider_identity_authority: None,
             composition: AuthorityComposition::Durable(durability),
         })
     }

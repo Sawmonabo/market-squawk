@@ -79,6 +79,41 @@ impl ExactFinancialRatio {
         })
     }
 
+    /// Compares dimensionless ratios exactly, including ratios denominated in different currencies.
+    ///
+    /// Each ratio cancels its own same-currency money units. This does not compare cash gains,
+    /// convert currencies, annualize horizons, or use rounded decimal products. Structural `Eq`
+    /// remains distinct from this numerical comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns an arithmetic error if the bounded cross-product representation overflows. Its
+    /// 384-bit capacity covers every admitted 96-bit Decimal mantissa and scale through 28.
+    pub fn checked_cmp(self, other: Self) -> Result<std::cmp::Ordering, InvestmentProjectionError> {
+        let left_numerator = self.numerator.amount();
+        let right_numerator = other.numerator.amount();
+        let sign = left_numerator.mantissa().signum();
+        let other_sign = right_numerator.mantissa().signum();
+        if sign != other_sign || sign == 0 {
+            return Ok(sign.cmp(&other_sign));
+        }
+        let left_scale = left_numerator.scale() + other.denominator.amount().scale();
+        let right_scale = right_numerator.scale() + self.denominator.amount().scale();
+        let common_scale = left_scale.max(right_scale);
+        let left = exact_scaled_product(
+            left_numerator,
+            other.denominator.amount(),
+            common_scale - left_scale,
+        )?;
+        let right = exact_scaled_product(
+            right_numerator,
+            self.denominator.amount(),
+            common_scale - right_scale,
+        )?;
+        let order = left.iter().rev().cmp(right.iter().rev());
+        Ok(if sign < 0 { order.reverse() } else { order })
+    }
+
     /// Returns the exact signed numerator.
     #[must_use]
     pub const fn numerator(self) -> Money {
@@ -90,6 +125,53 @@ impl ExactFinancialRatio {
     pub const fn denominator(self) -> Money {
         self.denominator
     }
+}
+
+// A cross product uses at most 192 mantissa bits plus 56 decimal scale digits:
+// (2^96 - 1)^2 * 10^56 < 2^379. Twelve little-endian u32 limbs leave five spare bits.
+// Fixed storage also bounds sorting memory independently of the input amounts.
+fn exact_scaled_product(
+    left: rust_decimal::Decimal,
+    right: rust_decimal::Decimal,
+    extra_scale: u32,
+) -> Result<[u32; 12], InvestmentProjectionError> {
+    let mut product = [0_u32; 12];
+    let left_bytes = left.mantissa().unsigned_abs().to_le_bytes();
+    let right_bytes = right.mantissa().unsigned_abs().to_le_bytes();
+    for (i, left_chunk) in left_bytes.chunks_exact(4).enumerate() {
+        let left_limb =
+            u32::from_le_bytes([left_chunk[0], left_chunk[1], left_chunk[2], left_chunk[3]]);
+        let mut carry = 0_u64;
+        for (j, right_chunk) in right_bytes.chunks_exact(4).enumerate() {
+            let right_limb = u32::from_le_bytes([
+                right_chunk[0],
+                right_chunk[1],
+                right_chunk[2],
+                right_chunk[3],
+            ]);
+            // Two u32 factors, a stored u32 and a u32 carry fit exactly in u64.
+            let total =
+                u64::from(left_limb) * u64::from(right_limb) + u64::from(product[i + j]) + carry;
+            product[i + j] = u32::try_from(total & u64::from(u32::MAX))
+                .map_err(|_| InvestmentProjectionError::ArithmeticOverflow)?;
+            carry = total >> 32;
+        }
+        product[i + 4] =
+            u32::try_from(carry).map_err(|_| InvestmentProjectionError::ArithmeticOverflow)?;
+    }
+    for _ in 0..extra_scale {
+        let mut carry = 0_u64;
+        for limb in &mut product {
+            let total = u64::from(*limb) * 10 + carry;
+            *limb = u32::try_from(total & u64::from(u32::MAX))
+                .map_err(|_| InvestmentProjectionError::ArithmeticOverflow)?;
+            carry = total >> 32;
+        }
+        if carry != 0 {
+            return Err(InvestmentProjectionError::ArithmeticOverflow);
+        }
+    }
+    Ok(product)
 }
 
 /// Inclusive exact mark-relative return interval.

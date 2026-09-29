@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_schwab::{
-    MarketDataService, SchwabOAuthAuthorityReceipt, SchwabObservedCapabilityFamily,
+    ConnectionGeneration, MarketDataService, SchwabOAuthAuthorityReceipt,
+    SchwabObservedCapabilityFamily, SchwabStreamerConnectionPermit,
+    SchwabStreamerRequestAcknowledgement, SchwabStreamerRequestPermit,
+    SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent, SchwabTransportError,
 };
 use market_squawk_data::IngestError;
 use market_squawk_domain::{
@@ -237,7 +240,7 @@ pub(crate) trait SchwabMarketDoctorRatePermit: fmt::Debug + Send {
     ) -> DoctorFuture<'a, ()>;
 }
 
-/// Sole shared adaptive rate authority used before every provider attempt.
+/// Sole shared request-rate enforcement authority used before every provider attempt.
 pub(crate) trait SchwabMarketDoctorRateAuthority: fmt::Debug + Send + Sync {
     fn acquire<'a>(
         &'a self,
@@ -444,7 +447,10 @@ impl SchwabMarketDoctorFamilyProbeEvidence {
             || input.rate_observation.status() != input.status
             || input.rate_observation.observed_at() != input.observed_at
             || input.service.as_deref() != expected_service
-            || matches!(input.quote_delay, Some(CoverageDelay::Delayed(0)))
+            || matches!(
+                input.quote_delay,
+                Some(CoverageDelay::Delayed(0) | CoverageDelay::NotApplicable | CoverageDelay::Unknown)
+            )
             || input.quote_delay.is_some()
                 && (input.family != SchwabMarketDataFamily::Quotes
                     || !input.status.accepted()
@@ -539,6 +545,7 @@ pub(crate) trait SchwabMarketDoctorProbeExecutor: fmt::Debug + Send + Sync {
         &'a self,
         family: SchwabMarketDataFamily,
         authority: &'a SchwabOAuthMarketAuthority,
+        runtime_authority: Arc<dyn SchwabStreamerRuntimeAuthority>,
         sealer: &'a dyn SchwabMarketDoctorCaptureSealer,
         cancellation: CancellationToken,
         deadline: Instant,
@@ -656,13 +663,10 @@ impl SchwabMarketDataDoctorExecutor {
             deadline,
         )
         .await??;
-        let preference = await_bounded(
-            self.probes
-                .user_preference(&authority, cancellation.child_token(), deadline),
-            &cancellation,
-            deadline,
-        )
-        .await??;
+        let preference = self
+            .probes
+            .user_preference(&authority, cancellation.child_token(), deadline)
+            .await?;
         let (user_preference, user_preference_rate_observation) = match preference {
             SchwabMarketDoctorUserPreferenceOutcome::Available(available) => {
                 if available.token_generation != oauth.generation().get() {
@@ -822,42 +826,61 @@ impl SchwabMarketDataDoctorExecutor {
         if streamer != matches!(scope, SchwabMarketDoctorProbeScope::Streamer(_)) {
             return Err(SchwabMarketDataDoctorError::InvalidProbeContract);
         }
-        let mut permit = self
-            .acquire_rate(scope, binding, cancellation, deadline)
-            .await?;
-        await_bounded(
-            permit.commit_dispatch(cancellation, deadline),
-            cancellation,
-            deadline,
-        )
-        .await??;
-        let operation = if streamer {
-            self.probes.streamer(
+        let evidence = if streamer {
+            let runtime_authority = Arc::new(SchwabDoctorStreamerRateAuthority {
+                rate: Arc::clone(&self.rate),
                 family,
-                authority,
-                self.sealer.as_ref(),
-                cancellation.child_token(),
-                deadline,
-            )
+                rate_policy_digest: binding.rate_policy_digest(),
+                oauth: authority.receipt_currentness(),
+                receipt: oauth,
+                generation: std::sync::Mutex::new(None),
+            });
+            // The transport owns each handshake and command permit. An outer family permit
+            // would count imaginary work and deadlock a one-slot account queue.
+            self.probes
+                .streamer(
+                    family,
+                    authority,
+                    runtime_authority,
+                    self.sealer.as_ref(),
+                    cancellation.child_token(),
+                    deadline,
+                )
+                .await?
         } else {
-            self.probes.rest(
-                family,
-                authority,
-                self.sealer.as_ref(),
-                cancellation.child_token(),
+            let mut permit = self
+                .acquire_rate(scope, binding, cancellation, deadline)
+                .await?;
+            await_bounded(
+                permit.commit_dispatch(cancellation, deadline),
+                cancellation,
                 deadline,
             )
+            .await??;
+            // The native probe owns its finite sealing/drain cleanup after work cancellation.
+            let evidence = self
+                .probes
+                .rest(
+                    family,
+                    authority,
+                    self.sealer.as_ref(),
+                    cancellation.child_token(),
+                    deadline,
+                )
+                .await?;
+            ensure_active(cancellation, deadline)?;
+            await_bounded(
+                permit.observe(&evidence.rate_observation, cancellation, deadline),
+                cancellation,
+                deadline,
+            )
+            .await??;
+            evidence
         };
-        let evidence = await_bounded(operation, cancellation, deadline).await??;
+        ensure_active(cancellation, deadline)?;
         if evidence.family() != family || evidence.token_generation != oauth.generation().get() {
             return Err(SchwabMarketDataDoctorError::AuthorityChanged);
         }
-        await_bounded(
-            permit.observe(&evidence.rate_observation, cancellation, deadline),
-            cancellation,
-            deadline,
-        )
-        .await??;
         Ok(evidence)
     }
 
@@ -890,6 +913,260 @@ impl fmt::Debug for SchwabMarketDataDoctorExecutor {
             .field("sealer", &self.sealer)
             .field("probes", &self.probes)
             .finish()
+    }
+}
+
+/// A doctor uses the same durable account queue as product work, with no token acquisition
+/// capability in the rate owner. The selected family cannot be changed by the probe executor.
+#[derive(Debug)]
+struct SchwabDoctorStreamerRateAuthority {
+    rate: Arc<dyn SchwabMarketDoctorRateAuthority>,
+    family: SchwabMarketDataFamily,
+    rate_policy_digest: EvidenceDigest,
+    oauth: super::schwab_oauth_runtime::SchwabOAuthReceiptCurrentness,
+    receipt: SchwabOAuthAuthorityReceipt,
+    generation: std::sync::Mutex<Option<ConnectionGeneration>>,
+}
+
+impl SchwabDoctorStreamerRateAuthority {
+    fn require_current(&self) -> Result<(), SchwabTransportError> {
+        self.oauth
+            .validate_current_receipt(self.receipt)
+            .map_err(|_| SchwabTransportError::TokenRefreshRequired)
+    }
+
+    async fn acquire(
+        &self,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<SchwabDoctorStreamerPermit, SchwabTransportError> {
+        self.require_current()?;
+        let scope = SchwabMarketDoctorProbeScope::Streamer(self.family);
+        let mut inner = self
+            .rate
+            .acquire(scope, cancellation.child_token(), deadline)
+            .await
+            .map_err(map_streamer_rate_error)?;
+        if inner.rate_policy_digest() != self.rate_policy_digest {
+            return Err(SchwabTransportError::Protocol);
+        }
+        self.require_current()?;
+        inner
+            .commit_dispatch(cancellation, deadline)
+            .await
+            .map_err(map_streamer_rate_error)?;
+        Ok(SchwabDoctorStreamerPermit {
+            inner,
+            scope,
+            deadline,
+        })
+    }
+}
+
+impl SchwabStreamerRuntimeAuthority for SchwabDoctorStreamerRateAuthority {
+    fn observe(&self, event: SchwabStreamerRuntimeEvent) -> Result<(), SchwabTransportError> {
+        if !matches!(event, SchwabStreamerRuntimeEvent::Disconnected { .. }) {
+            self.require_current()?;
+        }
+        let mut current = self
+            .generation
+            .lock()
+            .map_err(|_| SchwabTransportError::Protocol)?;
+        match event {
+            SchwabStreamerRuntimeEvent::Connected { generation }
+            | SchwabStreamerRuntimeEvent::Frame { generation, .. } => {
+                if *current != Some(generation) {
+                    return Err(SchwabTransportError::Protocol);
+                }
+            }
+            SchwabStreamerRuntimeEvent::Disconnected { generation, .. } => {
+                if *current != Some(generation) {
+                    return Err(SchwabTransportError::Protocol);
+                }
+                *current = None;
+            }
+            SchwabStreamerRuntimeEvent::ConnectAttempt { .. }
+            | SchwabStreamerRuntimeEvent::QueuePressure => {}
+        }
+        Ok(())
+    }
+
+    fn commit_connection<'a>(
+        &'a self,
+        generation: ConnectionGeneration,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Box<dyn SchwabStreamerConnectionPermit>, SchwabTransportError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if self
+                .generation
+                .lock()
+                .map_err(|_| SchwabTransportError::Protocol)?
+                .is_some()
+            {
+                return Err(SchwabTransportError::Protocol);
+            }
+            let permit = self.acquire(cancellation, deadline).await?;
+            *self
+                .generation
+                .lock()
+                .map_err(|_| SchwabTransportError::Protocol)? = Some(generation);
+            Ok(Box::new(permit) as Box<dyn SchwabStreamerConnectionPermit>)
+        })
+    }
+
+    fn commit_request<'a>(
+        &'a self,
+        generation: ConnectionGeneration,
+        service: Option<MarketDataService>,
+        command: &'a str,
+        request_id: &'a str,
+        request_payload_sha256: EvidenceDigest,
+        request_payload_bytes: u64,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Box<dyn SchwabStreamerRequestPermit>, SchwabTransportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if request_id.is_empty()
+                || request_payload_bytes == 0
+                || request_payload_sha256.bytes() == [0; 32]
+                || self
+                    .generation
+                    .lock()
+                    .map_err(|_| SchwabTransportError::Protocol)?
+                    .as_ref()
+                    != Some(&generation)
+                || match service {
+                    None => command != "LOGIN",
+                    Some(service) => {
+                        Some(service) != streamer_service(self.family)
+                            || !matches!(command, "SUBS" | "ADD" | "UNSUBS")
+                    }
+                }
+            {
+                return Err(SchwabTransportError::Protocol);
+            }
+            let permit = self.acquire(cancellation, deadline).await?;
+            Ok(Box::new(SchwabDoctorStreamerRequestPermit {
+                permit,
+                generation,
+                service,
+                command: command.into(),
+                request_id: request_id.into(),
+                request_payload_sha256,
+                request_payload_bytes,
+            }) as Box<dyn SchwabStreamerRequestPermit>)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SchwabDoctorStreamerPermit {
+    inner: Box<dyn SchwabMarketDoctorRatePermit>,
+    scope: SchwabMarketDoctorProbeScope,
+    deadline: Instant,
+}
+
+impl SchwabDoctorStreamerPermit {
+    async fn observe(
+        &mut self,
+        status: SchwabMarketDoctorProbeStatus,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), SchwabTransportError> {
+        ensure_active(cancellation, deadline).map_err(map_streamer_rate_error)?;
+        let observation = SchwabMarketDoctorRateObservation::try_new(
+            self.scope,
+            status,
+            None,
+            system_timestamp().map_err(map_streamer_rate_error)?,
+        )
+        .map_err(map_streamer_rate_error)?;
+        self.inner
+            .observe(&observation, cancellation, self.deadline)
+            .await
+            .map_err(map_streamer_rate_error)
+    }
+}
+
+impl SchwabStreamerConnectionPermit for SchwabDoctorStreamerPermit {
+    fn connected<'a>(
+        mut self: Box<Self>,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.observe(
+                SchwabMarketDoctorProbeStatus::Http(101),
+                cancellation,
+                deadline,
+            )
+            .await
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SchwabDoctorStreamerRequestPermit {
+    permit: SchwabDoctorStreamerPermit,
+    generation: ConnectionGeneration,
+    service: Option<MarketDataService>,
+    command: Box<str>,
+    request_id: Box<str>,
+    request_payload_sha256: EvidenceDigest,
+    request_payload_bytes: u64,
+}
+
+impl SchwabStreamerRequestPermit for SchwabDoctorStreamerRequestPermit {
+    fn settle<'a>(
+        mut self: Box<Self>,
+        acknowledgement: SchwabStreamerRequestAcknowledgement,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
+        Box::pin(async move {
+            if acknowledgement.generation() != self.generation
+                || acknowledgement.service() != self.service
+                || acknowledgement.command() != self.command.as_ref()
+                || acknowledgement.request_id() != self.request_id.as_ref()
+                || acknowledgement.request_payload_sha256() != self.request_payload_sha256
+                || acknowledgement.request_payload_bytes() != self.request_payload_bytes
+            {
+                return Err(SchwabTransportError::Protocol);
+            }
+            self.permit
+                .observe(
+                    SchwabMarketDoctorProbeStatus::Streamer(acknowledgement.status_code()),
+                    cancellation,
+                    deadline,
+                )
+                .await
+        })
+    }
+}
+
+const fn map_streamer_rate_error(error: SchwabMarketDataDoctorError) -> SchwabTransportError {
+    match error {
+        SchwabMarketDataDoctorError::Cancelled => SchwabTransportError::Cancelled,
+        SchwabMarketDataDoctorError::Deadline => SchwabTransportError::Deadline,
+        SchwabMarketDataDoctorError::AuthorityChanged
+        | SchwabMarketDataDoctorError::AuthorityUnavailable => {
+            SchwabTransportError::TokenRefreshRequired
+        }
+        _ => SchwabTransportError::Protocol,
     }
 }
 

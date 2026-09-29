@@ -90,13 +90,19 @@ const MACRO_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadCont
 const MARKET_BAR_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
     json_tag: "market_bar",
     semantic_tag: 10,
-    semantic_encoder: "market_bar-v1:provider_instrument,feed,interval,adjustment(raw=1|split=2|dividend=3|spin_off=4|all=5),period_start,period_end,timestamp_basis(start=1|end=2),session(kind=1..4,ruleset,evidence_algorithm,evidence),ohlc,currency,volume,optional_trade_count,optional_vwap",
+    semantic_encoder: "market_bar-v1:provider_instrument,feed,interval,adjustment(raw=1|split=2|dividend=3|spin_off=4|all=5),time_precision(timestamped=1:period_start,period_end,timestamp_basis(start=1|end=2),session(kind=1..4,ruleset,evidence_algorithm,evidence)|nominal_daily_date=2:year,month,day,ruleset,native_row_evidence_algorithm,native_row_evidence),ohlc,currency,volume,optional_trade_count,optional_vwap",
 };
 const FUND_NAV_PAYLOAD_CONTRACT: ResearchPayloadContractEntry = ResearchPayloadContractEntry {
     json_tag: "fund_nav",
     semantic_tag: 11,
     semantic_encoder: "fund_nav-v1:provider_instrument,instrument_reference_revision,provider_product,provider_channel,nav_date,valuation_basis(per_share=1),currency,value_state(observed=1|missing=2),money_or_missing_reason(1..5),canonical_published_at,native_schema+entitlement+request+raw_object+raw_row+page+checkpoint+completeness+disposition_lineage,source_revision+correction+finality+predecessor+successor_evidence",
 };
+const MARKET_CALENDAR_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
+    ResearchPayloadContractEntry {
+        json_tag: "market_calendar",
+        semantic_tag: 12,
+        semantic_encoder: "market_calendar-v1:canonical_serde_exact_scope,canonical_serde_payload(coverage|session_day);local_observed_clock_excluded",
+    };
 const PORTFOLIO_POSITION_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
     ResearchPayloadContractEntry {
         json_tag: "portfolio_position",
@@ -127,15 +133,24 @@ const ALTERNATIVE_DATA_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
         semantic_encoder: "alternative_data-v1:dataset,field,normalized_decimal,optional_unit",
     };
 
-const RESEARCH_PAYLOAD_CONTRACT: [ResearchPayloadContractEntry; 10] = [
+const CORPORATE_ACTION_SOURCE_PAYLOAD_CONTRACT: ResearchPayloadContractEntry =
+    ResearchPayloadContractEntry {
+        json_tag: "corporate_action_source",
+        semantic_tag: 15,
+        semantic_encoder: "corporate_action_source-v1:canonical_serde_query_summary_or_returned_action_disposition",
+    };
+
+const RESEARCH_PAYLOAD_CONTRACT: [ResearchPayloadContractEntry; 12] = [
     FILING_PAYLOAD_CONTRACT,
     FUNDAMENTAL_PAYLOAD_CONTRACT,
     MACRO_PAYLOAD_CONTRACT,
     MARKET_BAR_PAYLOAD_CONTRACT,
     FUND_NAV_PAYLOAD_CONTRACT,
+    MARKET_CALENDAR_PAYLOAD_CONTRACT,
     PORTFOLIO_POSITION_PAYLOAD_CONTRACT,
     TRANSACTION_PAYLOAD_CONTRACT,
     CORPORATE_ACTION_PAYLOAD_CONTRACT,
+    CORPORATE_ACTION_SOURCE_PAYLOAD_CONTRACT,
     UNIVERSE_MEMBERSHIP_PAYLOAD_CONTRACT,
     ALTERNATIVE_DATA_PAYLOAD_CONTRACT,
 ];
@@ -150,9 +165,11 @@ pub(crate) const fn research_payload_contract_for(
         ResearchObservation::Macro(_) => MACRO_PAYLOAD_CONTRACT,
         ResearchObservation::MarketBar(_) => MARKET_BAR_PAYLOAD_CONTRACT,
         ResearchObservation::FundNav(_) => FUND_NAV_PAYLOAD_CONTRACT,
+        ResearchObservation::MarketCalendar(_) => MARKET_CALENDAR_PAYLOAD_CONTRACT,
         ResearchObservation::PortfolioPosition(_) => PORTFOLIO_POSITION_PAYLOAD_CONTRACT,
         ResearchObservation::Transaction(_) => TRANSACTION_PAYLOAD_CONTRACT,
         ResearchObservation::CorporateAction(_) => CORPORATE_ACTION_PAYLOAD_CONTRACT,
+        ResearchObservation::CorporateActionSource(_) => CORPORATE_ACTION_SOURCE_PAYLOAD_CONTRACT,
         ResearchObservation::UniverseMembership(_) => UNIVERSE_MEMBERSHIP_PAYLOAD_CONTRACT,
         ResearchObservation::AlternativeData(_) => ALTERNATIVE_DATA_PAYLOAD_CONTRACT,
     }
@@ -579,9 +596,9 @@ fn feature_label_schema_definition() -> Schema {
                 DataType::FixedSizeBinary(FEATURE_LABEL_INSTRUMENT_ID_BYTES),
                 false,
             ),
-            Field::new("cutoff_at", timestamp.clone(), false),
+            Field::new("source_selection_as_of", timestamp.clone(), false),
             Field::new("observed_effective_at", timestamp.clone(), true),
-            Field::new("label_effective_at", timestamp, true),
+            Field::new("label_effective_at", timestamp.clone(), true),
             Field::new("target_coordinate_kind", DataType::UInt8, false),
             Field::new("split", DataType::UInt8, false),
             Field::new("component_kind", DataType::UInt8, false),
@@ -609,7 +626,11 @@ fn feature_label_schema_definition() -> Schema {
                 DataType::FixedSizeBinary(FEATURE_LABEL_MISSING_REASON_BYTES),
                 true,
             ),
+            Field::new("decision_at", timestamp.clone(), true),
+            Field::new("label_selection_as_of", timestamp, true),
             Field::new("lineage_sha256", DataType::FixedSizeBinary(32), false),
+            Field::new("input_epoch_json", DataType::Binary, true),
+            Field::new("decision_on", DataType::Date32, true),
         ],
         HashMap::from([
             (
@@ -622,7 +643,7 @@ fn feature_label_schema_definition() -> Schema {
             ),
             (
                 "market_squawk.component_layout".to_owned(),
-                "fixed-width-long-form-v3".to_owned(),
+                "long-form-native-financial-study-input-epoch-v3".to_owned(),
             ),
             (
                 "market_squawk.timestamp_timezone".to_owned(),
@@ -640,9 +661,13 @@ fn market_event_schema_definition() -> Schema {
             Field::new("canonical_row_ordinal", DataType::UInt32, false),
             Field::new("source_id", DataType::Utf8, false),
             Field::new("event_kind", DataType::Utf8, false),
-            Field::new("instrument_id", DataType::FixedSizeBinary(16), false),
+            Field::new("instrument_id", DataType::FixedSizeBinary(16), true),
             Field::new("venue_id", DataType::Utf8, false),
             Field::new("source_identifier", DataType::Utf8, false),
+            Field::new("scope_kind", DataType::Utf8, false),
+            Field::new("cohort_key", DataType::Utf8, true),
+            Field::new("provider_product", DataType::Utf8, false),
+            Field::new("provider_channel", DataType::Utf8, false),
             Field::new("source_timestamp", timestamp.clone(), true),
             Field::new("received_at", timestamp.clone(), false),
             Field::new("available_at", timestamp.clone(), false),
@@ -659,6 +684,7 @@ fn market_event_schema_definition() -> Schema {
                 DataType::FixedSizeBinary(32),
                 false,
             ),
+            Field::new("identity_selection", DataType::Binary, true),
             Field::new("event_sha256", DataType::FixedSizeBinary(32), false),
             Field::new("event_json", DataType::Binary, false),
         ],
@@ -677,7 +703,7 @@ fn market_event_schema_definition() -> Schema {
             ),
             (
                 "market_squawk.market_event_encoding".to_owned(),
-                "typed-json-v1".to_owned(),
+                "market-data-reference-native-trade-stream-scope-v1".to_owned(),
             ),
         ]),
     )
@@ -731,7 +757,7 @@ fn option_market_schema_definition() -> Schema {
             ),
             (
                 "market_squawk.option_market_encoding".to_owned(),
-                "batch-header-plus-typed-json-rows-v1".to_owned(),
+                "batch-header-plus-native-contract-count-json-v1".to_owned(),
             ),
         ]),
     )

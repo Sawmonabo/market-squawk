@@ -71,7 +71,7 @@ pub(super) struct StoredSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-enum StoredRequestId {
+pub(super) enum StoredRequestId {
     Integer(i64),
     String(String),
 }
@@ -232,7 +232,7 @@ impl From<&RequestId> for StoredRequestId {
 }
 
 impl StoredRequestId {
-    fn into_request_id(self) -> Result<RequestId, JobRepositoryError> {
+    pub(super) fn into_request_id(self) -> Result<RequestId, JobRepositoryError> {
         match self {
             Self::Integer(value) => Ok(RequestId::Integer(value)),
             Self::String(value) => {

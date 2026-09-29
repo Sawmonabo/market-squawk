@@ -1,5 +1,20 @@
 //! Rights-bound analytical ingestion, immutable generation commit, and compaction.
 
+mod provider_logical_original;
+mod board_full_history;
+pub use board_full_history::{
+    BoardFullHistoryAnnualRead, BoardFullHistoryMacroRead, BoardFullHistoryArrowPartition, BoardFullHistoryAssignedPartition,
+    BoardFullHistoryNativePartition, BoardFullHistoryPublication, BoardFullHistoryPublicationInput,
+    BoardFullHistoryPublicationReference, BoardFullHistoryReservedPublication,
+    BoardFullHistoryStagingLease,
+};
+mod provider_capture_metadata;
+pub use provider_capture_metadata::ProviderMacroMetadataCapture;
+mod provider_capture_original;
+pub use provider_capture_original::{ProviderCaptureOriginalLease, ProviderCaptureOriginalRead};
+mod source_backup;
+pub use source_backup::SealedSourceBackupInventory;
+
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
@@ -137,6 +152,7 @@ fn check_market_event_read(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedDataset {
     pinned: PinnedDataset,
+    reobserved_provider_binding: Option<(EvidenceDigest, EvidenceDigest)>,
 }
 
 /// Closed durable kind of one generation-bound provider market-event publication.
@@ -206,11 +222,19 @@ impl ProviderOptionMarketPublicationSelector {
     }
 }
 
+type ProviderNativeReobservationValidator = fn(
+    &crate::PersistedProviderCaptureBindingEvidence,
+    &crate::PersistedProviderCaptureBindingEvidence,
+    &[ResearchObservation],
+) -> Result<(), IngestError>;
+
 /// Exclusive provider publication request consumed by one atomic ingest transition.
 #[derive(Debug)]
 pub struct ProviderPublicationInput {
     sealed_capture: SealedProviderCaptureBinding,
     revisions: ExtractionRevisionPlan,
+    reobservation_rights: Option<RightsDecisionInput>,
+    native_reobservation_validator: Option<ProviderNativeReobservationValidator>,
     company_identity: Option<CompanyIdentityObservation>,
     precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
 }
@@ -228,9 +252,36 @@ impl ProviderPublicationInput {
         Ok(Self {
             sealed_capture,
             revisions,
+            reobservation_rights: None,
+            native_reobservation_validator: None,
             company_identity: None,
             precommit_authority: None,
         })
+    }
+
+    /// Retains the current request's rights for a fresh capture of unchanged macro facts.
+    ///
+    /// Reobservation still requires native/canonical equality and live precommit authority.
+    pub fn with_reobservation_rights(mut self, rights: RightsDecisionInput) -> Self {
+        self.reobservation_rights = Some(rights);
+        self
+    }
+
+    /// Supplies application-selected comparison of provider-owned batch sidecar semantics.
+    ///
+    /// Without this code-owned callback, reobservation requires exact sidecar bytes. The callback
+    /// receives the original and fresh binding evidence and fresh canonical rows; it can replace
+    /// only sidecar equality, never common capture, row, rights, or live-authority checks.
+    pub fn with_native_reobservation_validator(
+        mut self,
+        validator: fn(
+            &crate::PersistedProviderCaptureBindingEvidence,
+            &crate::PersistedProviderCaptureBindingEvidence,
+            &[ResearchObservation],
+        ) -> Result<(), IngestError>,
+    ) -> Self {
+        self.native_reobservation_validator = Some(validator);
+        self
     }
 
     /// Attaches source-authored company identity to the same provider publication transition.
@@ -317,6 +368,7 @@ pub struct ProviderMacroPlanChunkInput {
     source_generation_digest: EvidenceDigest,
     semantics: ProviderMacroPlanSemantics,
     sealed_capture: SealedProviderCaptureBinding,
+    metadata_capture: Option<ProviderMacroMetadataCapture>,
     revisions: ExtractionRevisionPlan,
 }
 
@@ -354,8 +406,17 @@ impl ProviderMacroPlanChunkInput {
             source_generation_digest,
             semantics,
             sealed_capture,
+            metadata_capture: None,
             revisions,
         })
+    }
+
+    /// Retains one physically verified original metadata capture without changing canonical rows.
+    pub fn with_metadata_capture(mut self, metadata: ProviderMacroMetadataCapture) -> Result<Self, IngestError> {
+        if self.metadata_capture.is_some() { return Err(IngestError::InvalidProviderMacroPlan); }
+        metadata.evidence.validate_data(self.sealed_capture.capture_evidence())?;
+        self.metadata_capture = Some(metadata);
+        Ok(self)
     }
 
     /// Returns this chunk's contiguous position in the provider plan.
@@ -453,6 +514,12 @@ impl ProviderMacroPlanPublicationInput {
                         .map_err(|_| IngestError::InvalidProviderMacroPlan)?,
                 )
                 .ok_or(IngestError::InvalidProviderMacroPlan)?;
+            if let Some(metadata) = &chunk.metadata_capture {
+                metadata.evidence.validate_data(capture)?;
+                total_semantics_bytes = total_semantics_bytes.checked_add(
+                    u64::try_from(metadata.evidence.retained_bytes()?).map_err(|_| IngestError::InvalidProviderMacroPlan)?
+                ).ok_or(IngestError::InvalidProviderMacroPlan)?;
+            }
         }
         if total_rows == 0
             || total_rows != expected_total_rows
@@ -620,18 +687,30 @@ impl ProviderMacroPlanPublicationReceipt {
     }
 }
 
+/// Original atomic-plan coordinates retained inside the immutable generation transaction.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AtomicProviderMacroPlanCoordinates {
+    pub(crate) completion_digest: EvidenceDigest,
+    pub(crate) publication_digest: EvidenceDigest,
+    pub(crate) request_set_identity: EvidenceDigest,
+    pub(crate) source_generation_digest: EvidenceDigest,
+    pub(crate) total_chunks: u16,
+    pub(crate) total_rows: u64,
+}
+
 /// Exact immutable selector required to verify a complete macro plan after restart.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMacroPlanRestartSelector {
-    manifest: DatasetManifestRef,
-    completion_digest: EvidenceDigest,
-    publication_digest: EvidenceDigest,
-    catalog_receipt_digest: EvidenceDigest,
-    source_id: SourceId,
-    request_set_identity: EvidenceDigest,
-    source_generation_digest: EvidenceDigest,
-    total_chunks: u16,
-    total_rows: u64,
+    pub(crate) manifest: DatasetManifestRef,
+    pub(crate) completion_digest: EvidenceDigest,
+    pub(crate) publication_digest: EvidenceDigest,
+    pub(crate) catalog_receipt_digest: EvidenceDigest,
+    pub(crate) source_id: SourceId,
+    pub(crate) request_set_identity: EvidenceDigest,
+    pub(crate) source_generation_digest: EvidenceDigest,
+    pub(crate) total_chunks: u16,
+    pub(crate) total_rows: u64,
 }
 
 impl ProviderMacroPlanRestartSelector {
@@ -945,6 +1024,49 @@ impl StagedProviderMacroPlanRestartEvidence {
     }
 }
 
+// Native time, values, units, quality and the canonical macro family must be unchanged.
+// Local acquisition clocks and an adapter's attempt-specific source identifier may differ;
+// EIA's identifier includes its received_at clock. Exact native bytes are checked by the caller,
+// and each identifier remains in its original binding rather than being rewritten or promoted.
+// The original durable revision remains owned by its generation.
+fn same_macro_facts_on_reobservation(
+    original: &ResearchObservation,
+    fresh: &ResearchObservation,
+) -> bool {
+    let (ResearchObservation::Macro(old), ResearchObservation::Macro(new)) = (original, fresh)
+    else {
+        return false;
+    };
+    let old_context = old.context();
+    let new_context = new.context();
+    let old_provenance = old_context.provenance();
+    let new_provenance = new_context.provenance();
+    let availability_matches = match (old_provenance.availability(), new_provenance.availability())
+    {
+        (
+            market_squawk_domain::AvailabilityEvidence::LocalFirstObserved { observed_at: old },
+            market_squawk_domain::AvailabilityEvidence::LocalFirstObserved { observed_at: new },
+        ) => new >= old,
+        (old, new) => old == new,
+    };
+    old.series() == new.series()
+        && old.value() == new.value()
+        && old.unit() == new.unit()
+        && old_context.time().effective() == new_context.time().effective()
+        && old_context.time().published() == new_context.time().published()
+        && old_context.time().superseded() == new_context.time().superseded()
+        && old_provenance.schema_version() == new_provenance.schema_version()
+        && old_provenance.source_id() == new_provenance.source_id()
+        && old_provenance.instrument_id() == new_provenance.instrument_id()
+        && old_provenance.venue_id() == new_provenance.venue_id()
+        && old_provenance.source_timestamp() == new_provenance.source_timestamp()
+        && old_provenance.quality() == new_provenance.quality()
+        && old_provenance.payload_reference() == new_provenance.payload_reference()
+        && old_provenance.received_at() <= new_provenance.received_at()
+        && old_provenance.ingested_at() <= new_provenance.ingested_at()
+        && availability_matches
+}
+
 impl CommittedDataset {
     /// Returns the exact immutable generation pin.
     pub const fn manifest(&self) -> &DatasetManifestRef {
@@ -956,8 +1078,24 @@ impl CommittedDataset {
         &self.pinned
     }
 
+    /// Returns the original publication binding for an independently retained reobservation.
+    ///
+    /// Only successful native/canonical equality checks and durable fresh-capture retention
+    /// construct this mapping. It does not replace the manifest's original physical evidence.
+    pub fn original_binding_for_reobservation(
+        &self,
+        observed_binding: EvidenceDigest,
+    ) -> Option<EvidenceDigest> {
+        self.reobserved_provider_binding
+            .filter(|(observed, _)| *observed == observed_binding)
+            .map(|(_, original)| original)
+    }
+
     fn new(pinned: PinnedDataset) -> Self {
-        Self { pinned }
+        Self {
+            pinned,
+            reobserved_provider_binding: None,
+        }
     }
 }
 
@@ -1125,6 +1263,10 @@ fn provider_macro_plan_publication_digest(
         provider_macro_hash_evidence(&mut digest, chunk.semantics.schema_requirement_digest);
         provider_macro_hash_evidence(&mut digest, chunk.semantics.semantic_digest);
         provider_macro_hash_evidence(&mut digest, chunk.semantics.payload_content_digest);
+        if let Some(metadata) = &chunk.metadata_capture {
+            digest.update(b"original-metadata-capture\0");
+            provider_macro_hash_evidence(&mut digest, metadata.evidence.digest);
+        }
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
@@ -1458,6 +1600,54 @@ fn verify_persisted_sec_fund_raw_objects(
     Ok(())
 }
 
+fn map_native_identity_catalog_error(
+    error: crate::MarketDataInstrumentCatalogError,
+) -> IngestError {
+    match error {
+        crate::MarketDataInstrumentCatalogError::Cancelled => IngestError::Cancelled,
+        crate::MarketDataInstrumentCatalogError::DeadlineExceeded => IngestError::DeadlineExceeded,
+        error => IngestError::MarketDataInstrumentReference(Box::new(error)),
+    }
+}
+
+/// Borrows the exact prepared publication; never reacquires the caller's catalog mutex.
+#[derive(Debug)]
+struct ProviderEventIdentityPrecommitAuthority<'a> {
+    inner: &'a dyn IngestPrecommitAuthority,
+    binding: &'a PreparedProviderPublicationBinding,
+    cancellation: &'a CancellationToken,
+}
+
+impl IngestPrecommitAuthority for ProviderEventIdentityPrecommitAuthority<'_> {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        if self.cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        self.inner.validate_precommit()
+    }
+
+    fn validate_catalog_precommit(&self, catalog: &CatalogAuthority) -> Result<(), IngestError> {
+        if self.cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        self.inner.validate_catalog_precommit(catalog)?;
+        self.binding
+            .validate_current_identities(
+                catalog,
+                system_timestamp().map_err(|_| IngestError::PublicationAuthorityRevoked)?,
+                Instant::now() + std::time::Duration::from_secs(5),
+                self.cancellation,
+            )
+            .map_err(map_native_identity_catalog_error)?;
+        // Catalog replay may take time. Recheck the caller's deadline and sealed source clocks
+        // immediately before the existing transaction while retaining the same catalog lock.
+        if self.cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        self.inner.validate_catalog_precommit(catalog)
+    }
+}
+
 /// Process-local authority that must remain live through the durable ingest commit boundary.
 pub trait IngestPrecommitAuthority: fmt::Debug + Send + Sync {
     /// Revalidates the exact caller authority immediately before catalog and manifest commit.
@@ -1552,6 +1742,7 @@ pub struct GenerationOwnedProviderCaptureInputEvidence {
     input_ordinal: usize,
     object_input_ordinal: usize,
     binding: crate::PersistedProviderCaptureBindingEvidence,
+    metadata: Option<crate::catalog::ProviderMetadataCaptureEvidence>,
 }
 
 impl GenerationOwnedProviderCaptureEvidence {
@@ -1614,9 +1805,101 @@ impl GenerationOwnedProviderCaptureInputEvidence {
         self.object_input_ordinal
     }
 
+    /// Returns the original metadata capture retained by this exact publication, when required.
+    pub fn metadata_capture(&self) -> Option<&market_squawk_sources::ProviderCaptureSetReceipt> {
+        self.metadata.as_ref().map(|metadata| &metadata.capture)
+    }
+
+    /// Returns the original metadata raw claim, physically verified before this input is returned.
+    pub fn metadata_physical_claim(&self) -> Option<&market_squawk_platform::SealedResearchJournalSegmentClaim> {
+        self.metadata.as_ref().map(|metadata| metadata.physical.claim())
+    }
+
+    /// Returns the original metadata logical-to-physical seal identity.
+    pub fn metadata_sealed_receipt_digest(&self) -> Option<EvidenceDigest> {
+        self.metadata.as_ref().map(|metadata| metadata.physical.sealed_capture_receipt_digest())
+    }
+
     /// Returns the physically verified direct provider binding.
     pub const fn binding(&self) -> &crate::PersistedProviderCaptureBindingEvidence {
         &self.binding
+    }
+}
+
+/// Original selected-row custody joined to one exact immutable analytical selection.
+///
+/// Construction is internal: consumers cannot substitute a manifest, selection or row ordinal.
+/// Provider-specific sidecar semantics still require their code-owned decoder.
+#[derive(Debug)]
+pub struct SelectedProviderCaptureEvidence {
+    pub(crate) selection: crate::analytical_read::SelectedProviderCaptureRows,
+    pub(crate) rows: Box<[SelectedProviderCaptureRowEvidence]>,
+}
+
+impl SelectedProviderCaptureEvidence {
+    /// Returns the exact analytical selection identity.
+    pub const fn selection_digest(&self) -> EvidenceDigest {
+        self.selection.selection_digest
+    }
+    /// Returns the exact immutable manifest.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.selection.manifest
+    }
+    /// Returns rows in the same order as the typed analytical selection.
+    pub fn rows(&self) -> &[SelectedProviderCaptureRowEvidence] {
+        &self.rows
+    }
+}
+
+/// Shared original header for selected rows from the same publication binding.
+#[derive(Debug)]
+pub struct SelectedProviderCaptureBinding {
+    pub(crate) binding_digest: EvidenceDigest,
+    pub(crate) capture: market_squawk_sources::ProviderCaptureSetReceipt,
+    pub(crate) extraction_content_identity: EvidenceDigest,
+    pub(crate) native: crate::PersistedProviderNativeLineageSchema,
+}
+
+impl SelectedProviderCaptureBinding {
+    /// Returns the original binding committed by the selected Arrow row.
+    pub const fn binding_digest(&self) -> EvidenceDigest {
+        self.binding_digest
+    }
+    /// Returns the original code-owned native schema and exact sidecar bytes.
+    pub const fn native_lineage(&self) -> &crate::PersistedProviderNativeLineageSchema {
+        &self.native
+    }
+    /// Returns the original extraction identity, before durable revision assignment.
+    pub const fn extraction_content_identity(&self) -> EvidenceDigest {
+        self.extraction_content_identity
+    }
+    /// Returns the original logical capture receipt.
+    pub const fn capture(&self) -> &market_squawk_sources::ProviderCaptureSetReceipt {
+        &self.capture
+    }
+}
+
+/// Exact original native row and physically verified frame for a selected canonical payload.
+#[derive(Debug)]
+pub struct SelectedProviderCaptureRowEvidence {
+    pub(crate) stored_payload_digest: EvidenceDigest,
+    pub(crate) binding: Arc<SelectedProviderCaptureBinding>,
+    pub(crate) row: crate::PersistedProviderCaptureBindingRow,
+    pub(crate) physical: Arc<crate::PersistedProviderCapturePhysicalClaim>,
+}
+
+impl SelectedProviderCaptureRowEvidence {
+    /// Returns the stored canonical digest after durable revision assignment.
+    pub const fn stored_payload_digest(&self) -> EvidenceDigest {
+        self.stored_payload_digest
+    }
+    /// Returns the original binding; multiple selected rows share its bounded sidecar.
+    pub fn binding(&self) -> &SelectedProviderCaptureBinding {
+        &self.binding
+    }
+    /// Returns the original extraction/native/physical row coordinates.
+    pub const fn row(&self) -> &crate::PersistedProviderCaptureBindingRow {
+        &self.row
     }
 }
 
@@ -1693,6 +1976,55 @@ impl ListingReferenceAdmissionCapability {
             self.dataset.clone(),
             self.source.source_id().clone(),
         )
+    }
+
+    /// Admits explicitly evidenced internal cohort uses beneath the exact source-rights grant.
+    /// This never upgrades display rights: the existing registry checks each required operation.
+    pub fn admit_with_research_uses(
+        &self,
+        rights: RightsDecisionInput,
+        uses: crate::ResearchUseSet,
+        evidence: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ListingReferencePublicationCapability, IngestError> {
+        check_market_event_read(deadline, cancellation)?;
+        if self.source.source_id() != &rights.source_id
+            || evidence
+                != self
+                    .source
+                    .revision_evidence()
+                    .payload_evidence()
+                    .content_digest()
+            || evidence != self.source.authorization().evidence().content_digest()
+            || evidence != rights.authorization_evidence
+            || uses.contains(crate::ResearchUse::Display)
+        {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
+        let source_id = self.source.source_id().clone();
+        let grant = {
+            let authority = self.authority.try_lock().map_err(|error| match error {
+                TryLockError::WouldBlock => IngestError::AuthorityBusy,
+                TryLockError::Poisoned(_) => IngestError::AuthorityLockPoisoned,
+            })?;
+            authority.admit_listing_research_source(
+                &self.source,
+                self.registered_at,
+                rights,
+                uses,
+                evidence,
+                deadline,
+                cancellation,
+            )?
+        };
+        ListingReferencePublicationCapability::try_new(
+            Arc::clone(&self.authority),
+            self.dataset.clone(),
+            source_id,
+            grant,
+        )
+        .map_err(Into::into)
     }
 
     /// Registers the exact source revision and binds a payload-specific rights decision into one
@@ -2413,6 +2745,144 @@ impl AnalyticalDataService {
         }
     }
 
+    /// Publishes one source reference through the existing owned blocking and catalog authorities.
+    pub async fn publish_market_data_source_reference(
+        &self,
+        input: crate::MarketDataInstrumentSourceReferenceInput,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<crate::MarketDataInstrumentRecord, crate::MarketDataInstrumentCatalogError> {
+        self.publish_market_data_reference(deadline, cancellation, move |publisher, cancellation| {
+            publisher.publish_source_reference(input, precommit.as_ref(), deadline, cancellation)
+        }).await
+    }
+
+    /// Publishes one original Alpaca asset reference through the existing bounded catalog writer.
+    pub async fn publish_alpaca_asset_reference(
+        &self,
+        input: crate::AlpacaAssetReferenceAdmission,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<crate::MarketDataInstrumentRecord, crate::MarketDataInstrumentCatalogError> {
+        self.publish_market_data_reference(
+            deadline,
+            cancellation,
+            move |publisher, cancellation| {
+                publisher.publish_alpaca_asset_reference(
+                    input,
+                    precommit.as_ref(),
+                    deadline,
+                    cancellation,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Admits one complete original Alpaca contract reference graph through the existing writer.
+    pub async fn publish_alpaca_option_references(
+        &self,
+        input: crate::AlpacaOptionReferenceAdmission,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        crate::MarketDataInstrumentSynchronizationReceipt,
+        crate::MarketDataInstrumentCatalogError,
+    > {
+        self.publish_market_data_reference(
+            deadline,
+            cancellation,
+            move |publisher, cancellation| {
+                publisher.publish_alpaca_option_references(
+                    input,
+                    precommit.as_ref(),
+                    deadline,
+                    cancellation,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Admits original issuer documents and an exact durable listing through the same owned writer.
+    pub async fn publish_market_data_issuer_reference(
+        &self,
+        issuer: crate::OfficialIssuerInstrumentReference,
+        listing: crate::ListingReferenceRecord,
+        expected_current: Option<crate::MarketDataInstrumentRecord>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<crate::MarketDataInstrumentRecord, crate::MarketDataInstrumentCatalogError> {
+        self.publish_market_data_reference(deadline, cancellation, move |publisher, cancellation| {
+            publisher.publish_issuer_reference(issuer, listing, expected_current, deadline, cancellation)
+        }).await
+    }
+
+    async fn publish_market_data_reference<F, T>(
+        &self,
+        deadline: Instant,
+        cancellation: CancellationToken,
+        publish: F,
+    ) -> Result<T, crate::MarketDataInstrumentCatalogError>
+    where
+        F: FnOnce(
+                crate::MarketDataInstrumentSynchronizationCapability,
+                &CancellationToken,
+            ) -> Result<T, crate::MarketDataInstrumentCatalogError>
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        use crate::MarketDataInstrumentCatalogError as Error;
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::DeadlineExceeded);
+        }
+        let child = cancellation.child_token();
+        let _cancel_on_drop = child.clone().drop_guard();
+        let operation = tokio::select! {
+            biased;
+            _ = child.cancelled() => return Err(Error::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => return Err(Error::DeadlineExceeded),
+            lease = self.operation_gate.acquire(&child) => lease.ok_or(Error::Cancelled)?,
+        };
+        let permit = tokio::select! {
+            biased;
+            _ = child.cancelled() => return Err(Error::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => return Err(Error::DeadlineExceeded),
+            permit = self.objects.acquire_blocking_permit(&child) => permit.map_err(Error::BlockingIo)?,
+        };
+        let publisher = self.market_data_instrument_synchronization();
+        let worker_cancellation = child.clone();
+        let supervisor = BlockingIoSupervisor::new(child);
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _operation = operation;
+                let _permit = permit;
+                publish(publisher, &worker_cancellation)
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => Error::Cancelled,
+                BlockingIoAdmissionError::Saturated => {
+                    Error::BlockingIo(ParquetStoreError::BlockingTaskLimitExceeded)
+                }
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    Error::BlockingIo(ParquetStoreError::BlockingTaskFailed)
+                }
+            })?;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Error::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(Error::DeadlineExceeded),
+            result = &mut worker => result.map_err(|_| Error::BlockingIo(ParquetStoreError::BlockingTaskFailed))?,
+        }
+    }
+
     /// Returns fair-value persistence authority over this service's sole catalog writer.
     pub fn fair_value_catalog(&self) -> crate::FairValueCatalogCapability {
         crate::FairValueCatalogCapability::new(Arc::clone(&self.authority))
@@ -2590,7 +3060,51 @@ impl AnalyticalDataService {
             .lock_authority()?
             .provider_capture_binding_evidence(binding_digest)?
             .ok_or(IngestError::ProviderCaptureRequired)?;
+        let metadata = self.lock_authority()?.catalog().metadata_for_provider_binding(binding_digest)?;
         verify_persisted_provider_capture_binding(&evidence, store)?;
+        if let Some(metadata) = metadata {
+            metadata.validate_data(evidence.capture())?;
+            provider_capture_metadata::verify_metadata(&metadata, store, None)?;
+        }
+        Ok(evidence)
+    }
+
+    /// Verifies original physical custody for only the rows selected by the fixed PIT reader.
+    /// Run in the existing supervised blocking lane; no catalog guard survives object I/O.
+    pub fn selected_provider_capture_evidence_bounded(
+        &self,
+        selection: crate::analytical_read::SelectedProviderCaptureRows,
+        maximum_bytes: usize,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedProviderCaptureEvidence, IngestError> {
+        let evidence = self
+            .market_recovery_authority(deadline, cancellation)?
+            .catalog()
+            .selected_provider_capture_rows(selection, maximum_bytes, deadline, cancellation)
+            .map_err(map_market_recovery_catalog_error)?;
+        let control = MarketEventReadControl {
+            deadline,
+            cancellation,
+        };
+        let mut verified_claims = std::collections::BTreeSet::new();
+        for row in &evidence.rows {
+            check_market_event_read(deadline, cancellation)?;
+            let claim_digest = row.physical.raw_claim_digest();
+            if claim_digest.algorithm() != DigestAlgorithm::Sha256 {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+            if verified_claims.insert(claim_digest.bytes()) {
+                let verified = store
+                    .open_verified_claim_with_control(row.physical.claim(), &control)
+                    .map_err(map_provider_recovery_store_error)?;
+                if verified.receipt().claim() != row.physical.claim() {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+            }
+        }
+        check_market_event_read(deadline, cancellation)?;
         Ok(evidence)
     }
 
@@ -2656,6 +3170,7 @@ impl AnalyticalDataService {
         for _ in 0..object_count {
             grouped_inputs.push(Vec::new());
         }
+        let mut metadata_retained_bytes = 0_u64;
         {
             let authority = match control {
                 Some(control) => {
@@ -2689,6 +3204,18 @@ impl AnalyticalDataService {
                 output.push(GenerationOwnedProviderCaptureInputEvidence {
                     input_ordinal: input.input_ordinal,
                     object_input_ordinal: input.object_input_ordinal,
+                    metadata: input.metadata_dependency_digest.map(|digest| {
+                        let metadata = match control {
+                            Some(control) => authority.catalog().provider_metadata_capture(digest, control.deadline, control.cancellation),
+                            None => authority.catalog().provider_metadata_capture_unbounded(digest),
+                        }.map_err(map_market_recovery_catalog_error)?;
+                        metadata.validate_data(evidence.capture())?;
+                        metadata_retained_bytes = metadata_retained_bytes.checked_add(
+                            u64::try_from(metadata.retained_bytes()?).map_err(|_| IngestError::ProviderCaptureRequired)?
+                        ).filter(|bytes| *bytes <= MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
+                         .ok_or(IngestError::ProviderCaptureRequired)?;
+                        Ok::<_, IngestError>(metadata)
+                    }).transpose()?,
                     binding: evidence,
                 });
             }
@@ -2696,6 +3223,9 @@ impl AnalyticalDataService {
         // The catalog authority is no longer held during physical integrity verification.
         for input in grouped_inputs.iter().flatten() {
             verify_persisted_provider_capture_binding_inner(&input.binding, store, control)?;
+            if let Some(metadata) = &input.metadata {
+                provider_capture_metadata::verify_metadata(metadata, store, control)?;
+            }
         }
         let mut objects = Vec::new();
         objects
@@ -2926,9 +3456,29 @@ impl AnalyticalDataService {
                 }
                 None => self.lock_authority()?,
             };
-            authority
+            let evidence = authority
                 .provider_publication_evidence(selector.publication_digest)?
-                .ok_or(IngestError::ProviderCaptureRequired)?
+                .ok_or(IngestError::ProviderCaptureRequired)?;
+            evidence.verify_integrity()?;
+            let fallback_cancellation = CancellationToken::new();
+            let deadline = control.map_or_else(
+                || Instant::now() + std::time::Duration::from_secs(5),
+                |control| control.deadline,
+            );
+            let cancellation =
+                control.map_or(&fallback_cancellation, |control| control.cancellation);
+            for payload in evidence.identity_selections().flatten() {
+                let selection = serde_json::from_slice(payload)
+                    .map_err(|_| IngestError::ProviderCaptureRequired)?;
+                authority
+                    .verify_provider_identity_evidence_in_catalog(
+                        &selection,
+                        deadline,
+                        cancellation,
+                    )
+                    .map_err(map_native_identity_catalog_error)?;
+            }
+            evidence
         };
         evidence.verify_integrity()?;
         if evidence.publication_digest() != selector.publication_digest
@@ -2978,7 +3528,11 @@ impl AnalyticalDataService {
             .objects
             .read_pinned_async(&pinned, &cancellation)
             .await?;
-        Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)
+        let batch = Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)?;
+        self.lock_authority()?
+            .catalog()
+            .validate_provider_market_event_metadata(batch.events(), &evidence)?;
+        Ok(batch)
     }
 
     fn provider_market_event_batch_from_pinned(
@@ -3145,6 +3699,9 @@ impl AnalyticalDataService {
             )?);
             let batch =
                 Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)?;
+            self.market_recovery_authority(deadline, cancellation)?
+                .catalog()
+                .validate_provider_market_event_metadata(batch.events(), &evidence)?;
             reopened.push((selector, evidence, batch));
         }
 
@@ -3768,6 +4325,11 @@ impl AnalyticalDataService {
         let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
             .map_err(|_| IngestError::InvalidDataset)?;
         let observations = ResearchArrowBatch::validated_extraction_observations(batch)?;
+        crate::corporate_actions::source_capture::validate_corporate_action_source_capture(
+            &observations,
+            provider_binding.map(|binding| &binding.evidence),
+        )
+        .map_err(|_| IngestError::ProviderCaptureRequired)?;
         let market_bar_history = MarketBarHistoryPublicationCandidate::try_from_batch(
             batch,
             &observations,
@@ -3789,7 +4351,7 @@ impl AnalyticalDataService {
                     &authority,
                     &reservation,
                     &analytical_dataset,
-                    provider_binding,
+                    &provider_binding.evidence,
                     company_identity.as_ref(),
                 );
             }
@@ -3947,33 +4509,85 @@ impl AnalyticalDataService {
     }
 
     /// Consumes one exclusive provider binding through canonical publication and catalog commit.
-    pub async fn ingest_provider_publication(
+    ///
+    /// The synchronous factory owns the future on the heap before any caller polls it. Keeping
+    /// first publication and retained reobservation behind this boundary prevents their combined
+    /// state from inflating every enclosing provider/application poll frame. The same caller still
+    /// owns cancellation, drop, precommit authority, and the complete publication lifetime.
+    #[inline(never)]
+    pub fn ingest_provider_publication(
         &self,
         reservation: IngestReservation,
         analytical_dataset: DatasetId,
         input: ProviderPublicationInput,
         cancellation: CancellationToken,
-    ) -> Result<CommittedDataset, IngestError> {
-        let ProviderPublicationInput {
-            sealed_capture,
-            revisions,
-            company_identity,
-            precommit_authority,
-        } = input;
-        sealed_capture.validate()?;
-        let prepared = PreparedProviderCaptureBinding::try_from_live(&sealed_capture)?;
-        self.ingest_batch(
-            reservation,
-            analytical_dataset,
-            sealed_capture.batch(),
-            Some(revisions),
-            Some(&prepared),
-            Some(sealed_capture.native_lineage()),
-            company_identity,
-            cancellation,
-            precommit_authority,
-        )
-        .await
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CommittedDataset, IngestError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let ProviderPublicationInput {
+                sealed_capture,
+                revisions,
+                reobservation_rights,
+                native_reobservation_validator,
+                company_identity,
+                precommit_authority,
+            } = input;
+            sealed_capture.validate()?;
+            let prepared = PreparedProviderCaptureBinding::try_from_live(&sealed_capture)?;
+            let reobserved = {
+                let authority = self.lock_authority()?;
+                let run = self.validate_run(
+                    &authority,
+                    &reservation,
+                    extraction_provider_payload_digest(sealed_capture.batch()),
+                    Some(prepared.source_id()),
+                )?;
+                if run.state() == IngestRunState::Succeeded {
+                    let retained = authority
+                        .provider_capture_for_run(reservation.run_id())?
+                        .ok_or(IngestError::IncompleteSuccessfulRun)?;
+                    (retained != prepared.evidence).then_some(retained)
+                } else {
+                    None
+                }
+            };
+            if let Some(retained) = reobserved {
+                if company_identity.is_some()
+                    || !revisions.is_locally_observed()
+                    || !revisions.native_lineage_required()
+                {
+                    return Err(IngestError::ReplayConflict);
+                }
+                return self
+                    .reconcile_macro_reobservation(
+                        &reservation,
+                        &analytical_dataset,
+                        &prepared,
+                        &retained,
+                        sealed_capture.batch(),
+                        native_reobservation_validator,
+                        reobservation_rights.ok_or(IngestError::ReplayConflict)?,
+                        precommit_authority
+                            .as_deref()
+                            .ok_or(IngestError::ReplayConflict)?,
+                        &cancellation,
+                    )
+                    .await;
+            }
+            self.ingest_batch(
+                reservation,
+                analytical_dataset,
+                sealed_capture.batch(),
+                Some(revisions),
+                Some(&prepared),
+                Some(sealed_capture.native_lineage()),
+                company_identity,
+                cancellation,
+                precommit_authority,
+            )
+            .await
+        })
     }
 
     /// Consumes and validates every input needed by one atomic provider macro-plan publication.
@@ -4540,9 +5154,13 @@ impl AnalyticalDataService {
             .try_reserve_exact(input.chunks.len())
             .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
         for chunk in &input.chunks {
-            prepared.push(PreparedProviderCaptureBinding::try_from_live(
-                &chunk.sealed_capture,
-            )?);
+            let mut capture = PreparedProviderCaptureBinding::try_from_live(&chunk.sealed_capture)?;
+            if let Some(metadata) = &chunk.metadata_capture {
+                if metadata.catalog_id != self.catalog_id { return Err(IngestError::InvalidProviderMacroPlan); }
+                metadata.evidence.validate_data(chunk.sealed_capture.capture_evidence())?;
+                capture.metadata = Some(metadata.evidence.clone());
+            }
+            prepared.push(capture);
         }
         {
             let authority = self.lock_authority()?;
@@ -4635,6 +5253,8 @@ impl AnalyticalDataService {
                     &capture_coordinates,
                     completion_digest,
                     publication_digest,
+                    request_set_identity,
+                    source_generation_digest,
                     total_rows,
                 )?;
             let receipt = ProviderMacroPlanPublicationReceipt {
@@ -4687,6 +5307,7 @@ impl AnalyticalDataService {
                 candidate_digest: _,
                 source_generation_digest: _,
                 semantics: _,
+                metadata_capture: _,
                 sealed_capture,
                 revisions,
             } = chunk;
@@ -4812,6 +5433,8 @@ impl AnalyticalDataService {
                 &capture_coordinates,
                 completion_digest,
                 publication_digest,
+                request_set_identity,
+                source_generation_digest,
                 total_rows,
             )
             .map_err(|error| match error {
@@ -4834,6 +5457,17 @@ impl AnalyticalDataService {
         Ok(receipt)
     }
 
+    /// Reconstructs the original atomic selector from one exact immutable generation, then
+    /// subjects it to the same whole-plan verifier as a retained caller receipt.
+    pub fn recover_provider_macro_plan_selector(
+        &self,
+        manifest: &DatasetManifestRef,
+    ) -> Result<ProviderMacroPlanRestartSelector, IngestError> {
+        self.manifests
+            .recover_provider_macro_plan_selector(manifest)
+            .map_err(Into::into)
+    }
+
     /// Reopens only the exact generation and whole-plan receipt supplied by the selector.
     pub fn verify_provider_macro_plan_restart(
         &self,
@@ -4847,6 +5481,8 @@ impl AnalyticalDataService {
                 selector.manifest(),
                 selector.completion_digest(),
                 selector.publication_digest(),
+                selector.request_set_identity(),
+                selector.source_generation_digest(),
                 selector.total_chunks(),
                 selector.total_rows(),
                 selector.catalog_receipt_digest(),
@@ -4873,6 +5509,12 @@ impl AnalyticalDataService {
         precommit_authority: Arc<dyn IngestPrecommitAuthority>,
     ) -> Result<(CommittedDataset, EvidenceDigest), IngestError> {
         precommit_authority.validate_precommit()?;
+        let coordinates = binding
+            .canonical_partitions()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| ProviderArtifactInputCoordinate::try_new(0, ordinal))
+            .collect::<Result<Vec<_>, _>>()?;
         let payload_digest = binding.binding_digest();
         let source_id = binding.terminal().source_id().clone();
         let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
@@ -4946,10 +5588,7 @@ impl AnalyticalDataService {
             None,
             None,
             None,
-            PublicationSourceEvidence::ProviderLogical(
-                &binding,
-                ProviderArtifactInputCoordinate::try_new(0, 0)?,
-            ),
+            PublicationSourceEvidence::ProviderLogical(&binding, &coordinates),
         )?;
         let persisted = authority
             .provider_logical_publication_binding(payload_digest)?
@@ -4983,6 +5622,11 @@ impl AnalyticalDataService {
         if prepared.publication_digest() != payload_digest {
             return Err(IngestError::ReservationPayloadMismatch);
         }
+        let publication_authority = ProviderEventIdentityPrecommitAuthority {
+            inner: precommit_authority.as_ref(),
+            binding: &prepared,
+            cancellation: &cancellation,
+        };
         let schema = converted.schema_ref().clone();
         let lineage = converted.lineage_digest()?;
         let converted = converted.dataset_batch();
@@ -5009,6 +5653,7 @@ impl AnalyticalDataService {
                 );
             }
             self.validate_provider_event_binding(&authority, &reservation, &prepared)?;
+            publication_authority.validate_catalog_precommit(&authority)?;
         }
         let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
@@ -5043,7 +5688,7 @@ impl AnalyticalDataService {
             plan,
             std::slice::from_ref(&published),
             GenerationKind::Ingest,
-            Some(precommit_authority.as_ref()),
+            Some(&publication_authority),
             None,
             None,
             None,
@@ -5463,12 +6108,186 @@ impl AnalyticalDataService {
         Ok(Some(CommittedDataset::new(existing)))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "reobservation binds original rows, fresh physical capture, rights, and live authority"
+    )]
+    async fn reconcile_macro_reobservation(
+        &self,
+        reservation: &IngestReservation,
+        dataset: &DatasetId,
+        input: &PreparedProviderCaptureBinding,
+        retained: &crate::PersistedProviderCaptureBindingEvidence,
+        batch: &ExtractionBatch,
+        native_reobservation_validator: Option<ProviderNativeReobservationValidator>,
+        rights: RightsDecisionInput,
+        precommit: &dyn IngestPrecommitAuthority,
+        cancellation: &CancellationToken,
+    ) -> Result<CommittedDataset, IngestError> {
+        let deadline = Instant::now()
+            .checked_add(REVISION_ASSIGNMENT_DEADLINE)
+            .ok_or(IngestError::DeadlineExceeded)?;
+        check_market_event_read(deadline, cancellation)?;
+        precommit.validate_precommit()?;
+        let fresh = &input.evidence;
+        let old_schema = retained.native_lineage();
+        let new_schema = fresh.native_lineage();
+        // Content binds the full request, metadata revision, ordered pages and native bodies.
+        // Observation/binding digests deliberately remain different: they include receive clocks
+        // and the exact new sealed physical claims, which are retained independently below.
+        if fresh.capture().content_digest() != retained.capture().content_digest()
+            || fresh.scope() != retained.scope()
+            || fresh.component_ordinal() != retained.component_ordinal()
+            || fresh.record_count() != retained.record_count()
+            || fresh.record_count() == 0
+            || input.metadata.is_some()
+            || old_schema.version() != new_schema.version()
+            || old_schema.implementation() != new_schema.implementation()
+            || old_schema.fingerprint() != new_schema.fingerprint()
+            || old_schema.row_count() != new_schema.row_count()
+            || fresh.rows().iter().zip(retained.rows()).any(|(new, old)| {
+                new.canonical_row_ordinal() != old.canonical_row_ordinal()
+                    || new.native_semantic_payload() != old.native_semantic_payload()
+                    || new.capture_page_ordinal() != old.capture_page_ordinal()
+                    || new.page_body_digest() != old.page_body_digest()
+                    || new.received_at() < old.received_at()
+            })
+            || fresh
+                .capture()
+                .pages()
+                .iter()
+                .zip(retained.capture().pages())
+                .any(|(new, old)| new.received_at() < old.received_at())
+            || rights.source_id != *fresh.capture().source_id()
+            || rights.payload_digest != extraction_provider_payload_digest(batch)
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        let fresh_rows = ResearchArrowBatch::validated_extraction_observations(batch)?;
+        if fresh_rows.len() != retained.record_count()
+            || fresh_rows
+                .iter()
+                .any(|row| !matches!(row, ResearchObservation::Macro(_)))
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        match native_reobservation_validator {
+            Some(validate) => validate(retained, fresh, &fresh_rows)?,
+            None if old_schema.batch_sidecar_semantic_payload()
+                != new_schema.batch_sidecar_semantic_payload() =>
+            {
+                return Err(IngestError::ReplayConflict);
+            }
+            None => {}
+        }
+        check_market_event_read(deadline, cancellation)?;
+        let mut committed = {
+            let authority = self.market_recovery_authority(deadline, cancellation)?;
+            self.reconcile_succeeded_provider_run(&authority, reservation, dataset, retained, None)?
+        };
+        let owned = self
+            .manifests
+            .generation_owned_provider_captures_bounded(
+                committed.manifest(),
+                deadline,
+                cancellation,
+            )
+            .map_err(map_recovery_manifest_error)?;
+        // The exact replay check above admits exactly one creating output and one direct input.
+        // A metadata-dependent publication needs its own metadata reobservation contract.
+        let original_input = owned.inputs.first().ok_or(IngestError::ReplayConflict)?;
+        if owned.inputs.len() != 1 || original_input.metadata_dependency_digest.is_some() {
+            return Err(IngestError::ReplayConflict);
+        }
+        let object = owned
+            .pinned
+            .objects()
+            .get(owned.suffix_start)
+            .ok_or(IngestError::ReplayConflict)?;
+        let maximum_bytes = usize::try_from(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
+            .map_err(|_| IngestError::ReplayConflict)?;
+        // The store owns a child-token drop guard and a supervised/reaped blocking task.
+        // Dropping this timed read cancels its child without cancelling the caller's token.
+        let batches = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.objects.read_pinned_object_bounded_async(
+                &owned.pinned,
+                object.artifact_id(),
+                owned.suffix_start,
+                retained.record_count(),
+                maximum_bytes,
+                cancellation,
+            ),
+        )
+        .await
+        .map_err(|_| IngestError::DeadlineExceeded)??;
+        let control = MarketEventReadControl {
+            deadline,
+            cancellation,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for batch in batches {
+            let (originals, _) = ResearchArrowBatch::decode_query_capture_binding_rows_bounded(
+                batch,
+                retained,
+                maximum_bytes,
+                &control,
+            )?;
+            for (ordinal, original) in originals {
+                check_market_event_read(deadline, cancellation)?;
+                let ordinal = usize::try_from(ordinal).map_err(|_| IngestError::ReplayConflict)?;
+                let fresh = fresh_rows.get(ordinal).ok_or(IngestError::ReplayConflict)?;
+                if !seen.insert(ordinal) || !same_macro_facts_on_reobservation(&original, fresh) {
+                    return Err(IngestError::ReplayConflict);
+                }
+            }
+        }
+        if seen.len() != fresh_rows.len() {
+            return Err(IngestError::ReplayConflict);
+        }
+        let _operation = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.operation_gate.acquire(cancellation),
+        )
+        .await
+        .map_err(|_| IngestError::DeadlineExceeded)?
+        .ok_or(IngestError::Cancelled)?;
+        check_market_event_read(deadline, cancellation)?;
+        precommit.validate_precommit()?;
+        let authority = self.market_recovery_authority(deadline, cancellation)?;
+        let run = self.validate_run(
+            &authority,
+            reservation,
+            rights.payload_digest,
+            Some(&rights.source_id),
+        )?;
+        if run.state() != IngestRunState::Succeeded {
+            return Err(IngestError::ReplayConflict);
+        }
+        precommit.validate_catalog_precommit(&authority)?;
+        let grant = authority.admit_source_rights(rights)?;
+        authority
+            .catalog()
+            .retain_macro_reobservation(
+                reservation,
+                retained,
+                input,
+                &grant,
+                deadline,
+                cancellation,
+            )
+            .map_err(map_market_recovery_catalog_error)?;
+        committed.reobserved_provider_binding =
+            Some((fresh.binding_digest(), retained.binding_digest()));
+        Ok(committed)
+    }
+
     fn reconcile_succeeded_provider_run(
         &self,
         authority: &CatalogAuthority,
         reservation: &IngestReservation,
         dataset_id: &DatasetId,
-        input: &PreparedProviderCaptureBinding,
+        input: &crate::PersistedProviderCaptureBindingEvidence,
         company_identity: Option<&CompanyIdentityObservation>,
     ) -> Result<CommittedDataset, IngestError> {
         let existing = self
@@ -5487,7 +6306,7 @@ impl AnalyticalDataService {
         let generation_bindings = self
             .manifests
             .provider_capture_binding_digests(existing.manifest())?;
-        if input.evidence != retained
+        if input != &retained
             || owned.suffix_start + owned.inputs.len() != owned.pinned.objects().len()
             || owned.inputs.len() != 1
             || owned.inputs[0].input_ordinal != 0
@@ -5648,10 +6467,24 @@ impl AnalyticalDataService {
                     fund_nav,
                 )
                 .map_err(|error| match error {
-                    ManifestCatalogError::CatalogAuthority(error) => IngestError::Catalog(error),
-                    error => IngestError::Manifest(error),
+                    ManifestCatalogError::CatalogAuthority(error) => {
+                        map_market_recovery_catalog_error(error)
+                    }
+                    error => map_recovery_manifest_error(error),
                 })?;
-            return Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?));
+            let pinned = match source_evidence {
+                PublicationSourceEvidence::ProviderLogicalOriginal(
+                    _,
+                    _,
+                    deadline,
+                    cancellation,
+                ) => self
+                    .manifests
+                    .pinned_bounded(&manifest, deadline, cancellation)
+                    .map_err(map_recovery_manifest_error)?,
+                _ => self.manifests.pinned(&manifest)?,
+            };
+            return Ok(CommittedDataset::new(pinned));
         }
         if !matches!(source_evidence, PublicationSourceEvidence::NoNewRawInput)
             || kind != GenerationKind::Compaction
@@ -5862,9 +6695,15 @@ pub enum IngestError {
     /// Task 3 rejected a reservation, publication, or transition.
     #[error("analytical catalog authority rejected the operation")]
     Catalog(#[from] CatalogError),
+    /// Existing source-use registry rejected an explicitly requested grant.
+    #[error("source research-use authority rejected the operation")]
+    ResearchUse(#[source] Box<crate::ResearchUseCatalogError>),
     /// Reference-source registration, publication authority, or bounded read setup failed.
     #[error("listing-reference authority rejected the operation")]
     ListingReference(#[from] ListingReferenceError),
+    /// Exact market instrument reference validation failed during publication.
+    #[error("market instrument reference validation failed")]
+    MarketDataInstrumentReference(#[source] Box<crate::MarketDataInstrumentCatalogError>),
     /// Catalog and manifest capabilities do not identify the same prepared catalog path.
     #[error("analytical service capabilities name different catalogs")]
     CatalogCompositionMismatch,

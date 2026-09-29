@@ -16,7 +16,7 @@ use market_squawk_adapter_alpaca::{
     AlpacaPaperIexDoctorObservation,
 };
 use market_squawk_domain::{
-    CompanyIdentityObservation, CompanyIdentitySurface, DataQuality, DigestAlgorithm,
+    AssetClass, CompanyIdentityObservation, CompanyIdentitySurface, DataQuality, DigestAlgorithm,
     EvidenceDigest, InstrumentDefinition, InstrumentId, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::SecretGeneration;
@@ -200,6 +200,28 @@ impl InstrumentDefinitionReadCapability {
         self.lock(deadline, cancellation)?
             .pin_instrument_definitions_bounded(
                 instrument_ids,
+                as_of,
+                limit,
+                deadline,
+                cancellation,
+            )
+    }
+
+    /// Separately qualifies optional original terms without requiring them for a monetary mark.
+    /// Absence or an incompatible canonical asset family returns None; corruption remains an error.
+    pub fn pin_optional(
+        &self,
+        instrument_id: InstrumentId,
+        expected_asset_class: AssetClass,
+        as_of: Timestamp,
+        limit: CatalogLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PinnedInstrumentDefinitions>, CatalogError> {
+        self.lock(deadline, cancellation)?
+            .pin_optional_instrument_definition_bounded(
+                instrument_id,
+                expected_asset_class,
                 as_of,
                 limit,
                 deadline,

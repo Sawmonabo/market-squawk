@@ -10,7 +10,7 @@ use market_squawk_domain::{
     OptionContractTermsInput, OptionExpirationClass, OptionExpirationObservation,
     OptionExpirationObservationInput, OptionKind, OptionSettlementKind, OptionSnapshotObservation,
     OptionSnapshotObservationInput, OptionUnderlyingObservation, ProviderChannel, ProviderProduct,
-    QuantityLots, SourceIdentifier, Timestamp, VenueId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ExtractionRevisionPlan, OptionExpirationRange, OptionMarketBatchDisposition,
@@ -416,6 +416,7 @@ impl SchwabSealedRestResponse {
             batch,
             native_lineage,
             vec![0; row_count],
+            Vec::new(),
         )?;
         binding.validate()?;
         Ok(SchwabRestOptionPublicationOutcome::Published(Box::new(
@@ -631,21 +632,21 @@ fn option_snapshot(
             request.market_data.currency,
             quote_at,
         ),
-        bid_size: quantity_component(contract, OptionContractField::BidSize, quote_at),
+        bid_size: unsigned_component(contract, OptionContractField::BidSize, quote_at),
         ask_price: money_component(
             contract,
             OptionContractField::Ask,
             request.market_data.currency,
             quote_at,
         ),
-        ask_size: quantity_component(contract, OptionContractField::AskSize, quote_at),
+        ask_size: unsigned_component(contract, OptionContractField::AskSize, quote_at),
         last_price: money_component(
             contract,
             OptionContractField::Last,
             request.market_data.currency,
             trade_at,
         ),
-        last_size: quantity_component(contract, OptionContractField::LastSize, trade_at),
+        last_size: unsigned_component(contract, OptionContractField::LastSize, trade_at),
         mark_price: money_component(
             contract,
             OptionContractField::Mark,
@@ -858,26 +859,6 @@ fn money_component(
         OptionComponent::Observed { source_at, .. } => {
             OptionComponent::unavailable(OptionComponentState::Invalid, source_at)
         }
-        OptionComponent::Unavailable { reason, source_at } => {
-            OptionComponent::unavailable(reason, source_at)
-        }
-    }
-}
-
-fn quantity_component(
-    contract: &OptionContract,
-    name: OptionContractField,
-    source_at: Option<Timestamp>,
-) -> OptionComponent<QuantityLots> {
-    match decimal_component(contract, name, source_at) {
-        OptionComponent::Observed { value, source_at } => value
-            .to_i64()
-            .filter(|lots| Decimal::from(*lots) == value)
-            .and_then(|lots| QuantityLots::new(lots).ok())
-            .map_or_else(
-                || OptionComponent::unavailable(OptionComponentState::Invalid, source_at),
-                |value| OptionComponent::observed(value, source_at),
-            ),
         OptionComponent::Unavailable { reason, source_at } => {
             OptionComponent::unavailable(reason, source_at)
         }

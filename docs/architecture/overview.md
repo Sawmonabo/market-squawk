@@ -112,7 +112,7 @@ flowchart LR
     McpClients -->|"named stdio relay to authenticated loopback MCP"| MarketSquawk
     MarketSquawk -->|"bounded results and artifact references"| Operator
     MarketSquawk -->|"typed MCP results"| McpClients
-    Browser <-->|"official handoff or ephemeral loopback onboarding"| MarketSquawk
+    MarketSquawk -->|"explicit official provider handoff"| Browser
     Files -->|"capability-confined reads"| MarketSquawk
     Providers <-->|"allowlisted HTTPS or WebSocket protocols"| MarketSquawk
     Python <-->|"admitted datasets and finalized model candidates"| MarketSquawk
@@ -123,9 +123,10 @@ The system has no remote or public inbound service. One per-user service binds a
 loopback listener only on `127.0.0.1`: its private `/app/v1` route serves Desktop and CLI clients,
 and its `/mcp` route serves the shared Streamable HTTP MCP endpoint. The endpoint and generation
 are published through an owner-only rendezvous record; named stdio relays keep their credentials
-out of client configuration. The separate IPv4 loopback provider-onboarding portal is ephemeral and
-bounded by lifetime, request count, connection count, request body, session, Host/Origin, and CSRF
-checks. Provider feeds and official research interfaces remain outbound, allowlisted connections.
+out of client configuration. Provider setup stays in native Settings using the same installed
+onboarding authority. A provider OAuth callback remains only where technically required and
+serves no signup or setup website. Provider feeds and official research interfaces remain
+outbound, allowlisted connections.
 
 User files enter through an explicitly authorized root and stable file identity. Python operates
 outside the live path and consumes only catalog-authorized point-in-time exports. Finalized model
@@ -145,7 +146,6 @@ flowchart TB
     subgraph ServiceProcess["One Market Squawk per-user service"]
         Runtime["Authenticated loopback /app/v1 and /mcp"]
         Jobs["Durable job authority"]
-        Portal["Bounded loopback onboarding portal"]
         App["Transport-neutral application services"]
 
         subgraph Live["Live execution plane"]
@@ -184,7 +184,6 @@ flowchart TB
     Cli --> Runtime
     Relays --> Runtime
     Runtime --> App
-    Portal --> App
     App --> Jobs
     ProviderInterfaces --> Sources
     ProviderInterfaces --> Extract

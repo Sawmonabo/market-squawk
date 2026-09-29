@@ -92,7 +92,7 @@ impl Catalog {
                    ON publication.publication_digest=indexed.publication_digest
                   AND publication.publication_kind=indexed.publication_kind
                   AND publication.source_id=indexed.source_id
-                 JOIN analytical_generations AS generation
+                 JOIN analytical_available_generations AS generation
                    ON generation.generation_sequence=publication.generation_sequence
                  JOIN analytical_generation_source_inputs AS source_input
                    ON source_input.generation_sequence=generation.generation_sequence
@@ -102,7 +102,7 @@ impl Catalog {
                    AND indexed.source_timestamp_ns IS NOT NULL
                    AND indexed.source_timestamp_ns<=?2
                    AND indexed.available_at_ns<=?3 AND indexed.ingested_at_ns<=?3
-                   AND generation.created_at_ns<=?3 AND generation.generation_kind='ingest'
+                   AND generation.available_at_ns<=?3 AND generation.generation_kind='ingest'
                    AND generation.schema_name=?4 AND generation.schema_version=?5
                    AND generation.schema_fingerprint=?6
                    AND indexed.event_kind IN (?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
@@ -211,7 +211,7 @@ impl Catalog {
         })
     }
 
-    pub(super) fn market_recovery_read<T>(
+    pub(crate) fn market_recovery_read<T>(
         &self,
         deadline: Instant,
         cancellation: &CancellationToken,

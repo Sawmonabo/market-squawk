@@ -28,6 +28,11 @@ use crate::{
     CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 
+#[path = "../../tests/common/catalog.rs"]
+mod catalog_fixture;
+
+use catalog_fixture::CatalogFixture;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 static SOURCE_BUDGET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -47,8 +52,9 @@ impl RawMarketSink for RecordingSink {
 #[tokio::test]
 async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -> TestResult {
     let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
-    let config = config()?;
-    let (mut registry, session) = session(&config, "source-local-1")?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config.clone();
+    let (mut registry, session) = session(&config, &fixture.catalog, "source-local-1")?;
     let generation = live_generation(&mut registry, &session)?;
     let mut source = CoinbaseExchangeSource::try_new(config.clone(), generation)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -164,8 +170,9 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
 #[tokio::test]
 async fn cancellation_preempts_read_and_source_refuses_same_generation_restart() -> TestResult {
     let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
-    let config = config()?;
-    let (mut registry, session) = session(&config, "source-local-2")?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config.clone();
+    let (mut registry, session) = session(&config, &fixture.catalog, "source-local-2")?;
     let generation = live_generation(&mut registry, &session)?;
     let mut source = CoinbaseExchangeSource::try_new(config, generation)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -199,9 +206,9 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
 
 #[test]
 fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_sessions() -> TestResult {
-    let config = config()?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config.clone();
+    let (mut registry, registered) = fixture.catalog.selected_registry(config.metadata())?;
     let first = registry.begin_session(
         &registered,
         SessionId::new(identifier("coinbase-session-first")?),
@@ -230,9 +237,8 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
         Err(RegistryError::RawFrameFactoryAlreadyTaken)
     ));
 
-    let mut foreign_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let foreign_registered =
-        foreign_registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let (mut foreign_registry, foreign_registered) =
+        fixture.catalog.selected_registry(config.metadata())?;
     let foreign = foreign_registry.begin_session(
         &foreign_registered,
         SessionId::new(identifier("coinbase-session-successor")?),
@@ -252,13 +258,13 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
 
 fn session(
     config: &CoinbaseExchangeConfig,
+    catalog: &CatalogFixture,
     session_id: &str,
 ) -> TestResult<(
     AuthoritativeSourceRegistry,
     market_squawk_sources::CurrentSourceSession,
 )> {
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let (mut registry, registered) = catalog.selected_registry(config.metadata())?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(identifier(session_id)?),
@@ -278,7 +284,35 @@ fn live_generation(
     Ok(registry.take_live_source_generation(session)?)
 }
 
+struct SelectedFixture {
+    config: CoinbaseExchangeConfig,
+    catalog: CatalogFixture,
+}
+
+fn selected_fixture() -> TestResult<SelectedFixture> {
+    let base = config()?;
+    let instrument = base
+        .mappings()
+        .first()
+        .ok_or("Coinbase product mapping missing")?
+        .instrument();
+    let catalog = CatalogFixture::new(instrument)?;
+    let config = config_with_mapping(CoinbaseProductMapping::try_new_selected_public(
+        ProviderProduct::new(identifier("BTC-USD")?),
+        instrument,
+        catalog.selected.clone(),
+    )?)?;
+    Ok(SelectedFixture { config, catalog })
+}
+
 fn config() -> TestResult<CoinbaseExchangeConfig> {
+    config_with_mapping(CoinbaseProductMapping::try_new(
+        ProviderProduct::new(identifier("BTC-USD")?),
+        InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+    )?)
+}
+
+fn config_with_mapping(mapping: CoinbaseProductMapping) -> TestResult<CoinbaseExchangeConfig> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let authorization = AuthorizationGrant::new(
         AuthorizationMode::PublicInterface,
@@ -306,10 +340,7 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
         authorization,
         evidence(4),
         effective,
-        vec![CoinbaseProductMapping::try_new(
-            ProviderProduct::new(identifier("BTC-USD")?),
-            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
-        )?],
+        vec![mapping],
         vec![
             CoinbaseChannel::Level2,
             CoinbaseChannel::MarketTrades,

@@ -513,15 +513,23 @@ fn validate_doctor_capture(
         .pages()
         .first()
         .ok_or(BlsSourceError::InvalidPublication)?;
-    if doctor.readiness() != BlsDoctorReadiness::Available
+    // An explicit missing observation degrades data coverage, not the authority to retain it.
+    // Provider errors and zero observed values still cannot admit production acquisition.
+    let expected_readiness = if doctor.missing_values() == 0 {
+        BlsDoctorReadiness::Available
+    } else {
+        BlsDoctorReadiness::Degraded
+    };
+    if doctor.readiness() != expected_readiness
         || doctor.source_id() != plan.source_id()
         || doctor.metadata_revision() != plan.metadata_revision()
         || doctor.tier() != plan.rate().tier()
         || doctor.dataset() != plan.provider_dataset()
         || doctor.returned_series() != 1
         || doctor.returned_observations() == 0
-        || doctor.observed_values() != doctor.returned_observations()
-        || doctor.missing_values() != 0
+        || doctor.observed_values() == 0
+        || doctor.observed_values().checked_add(doctor.missing_values())
+            != Some(doctor.returned_observations())
         || doctor.provider_messages() != 0
         || doctor.credential_rejoin() != plan.credential_rejoin()
         || doctor.provider_rate_declaration_digest() != plan.rate().declaration_digest()

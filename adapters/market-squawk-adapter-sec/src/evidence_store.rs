@@ -27,98 +27,6 @@ pub(crate) struct RawEvidenceReceipt {
     size_bytes: u64,
 }
 
-/// Bounded capability-scoped content writer used by immutable provider-local generations.
-pub(crate) struct RawEvidenceContentWriter<'a> {
-    store: &'a RawEvidenceStore,
-    scratch: RawEvidenceScratch<'a>,
-    digest: Sha256,
-    observed: u64,
-    maximum: u64,
-    deadline: Timestamp,
-}
-
-impl RawEvidenceContentWriter<'_> {
-    /// Appends one bounded chunk while preserving a streaming SHA-256 identity.
-    pub(crate) fn write_bytes(
-        &mut self,
-        bytes: &[u8],
-        cancellation: &CancellationToken,
-    ) -> Result<(), RawEvidenceError> {
-        check_deadline(cancellation, self.deadline)?;
-        let increment =
-            u64::try_from(bytes.len()).map_err(|_| RawEvidenceError::WriteLimitExceeded)?;
-        let next = self
-            .observed
-            .checked_add(increment)
-            .ok_or(RawEvidenceError::WriteLimitExceeded)?;
-        if next > self.maximum {
-            return Err(RawEvidenceError::WriteLimitExceeded);
-        }
-        self.scratch.file_mut()?.write_all(bytes)?;
-        self.digest.update(bytes);
-        self.observed = next;
-        Ok(())
-    }
-
-    /// Returns bytes durably staged so far.
-    pub(crate) const fn observed_bytes(&self) -> u64 {
-        self.observed
-    }
-
-    /// Flushes, rereads, seals read-only, and atomically publishes this exact content object.
-    pub(crate) fn seal(
-        mut self,
-        cancellation: &CancellationToken,
-    ) -> Result<RawEvidenceReceipt, RawEvidenceError> {
-        check_deadline(cancellation, self.deadline)?;
-        if self.observed == 0 {
-            return Err(RawEvidenceError::LengthMismatch);
-        }
-        self.scratch.file_mut()?.sync_all()?;
-        let evidence = EvidenceDigest::new(DigestAlgorithm::Sha256, self.digest.finalize().into());
-        verify_reader_before(
-            self.scratch.file_mut()?,
-            evidence,
-            self.observed,
-            self.deadline,
-            cancellation,
-        )?;
-        seal_readonly(self.scratch.file_mut()?)?;
-        self.scratch.file_mut()?.sync_all()?;
-        check_deadline(cancellation, self.deadline)?;
-        let final_name = evidence_name(evidence)?;
-        match self
-            .store
-            .directory
-            .hard_link(&self.scratch.name, &self.store.directory, &final_name)
-        {
-            Ok(()) => {
-                self.store.observe_final_link(cancellation);
-                #[cfg(windows)]
-                sync_new_link_metadata(self.scratch.file_mut()?)?;
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                let mut existing = self.store.open_named(&final_name, self.observed)?;
-                verify_reader_before(
-                    &mut existing,
-                    evidence,
-                    self.observed,
-                    self.deadline,
-                    cancellation,
-                )?;
-                self.store.observe_identical_final();
-            }
-            Err(error) => return Err(error.into()),
-        }
-        sync_publication_directory(&self.store.directory)?;
-        self.store.observe_directory_synced();
-        Ok(RawEvidenceReceipt {
-            evidence,
-            size_bytes: self.observed,
-        })
-    }
-}
-
 impl RawEvidenceReceipt {
     pub(crate) const fn new(evidence: EvidenceDigest, size_bytes: u64) -> Self {
         Self {
@@ -224,27 +132,6 @@ impl RawEvidenceStore {
             directory: &self.directory,
             name,
             file: Some(file),
-        })
-    }
-
-    /// Begins one bounded streaming content object under an absolute publication deadline.
-    pub(crate) fn create_content_writer(
-        &self,
-        maximum: u64,
-        deadline: Timestamp,
-        cancellation: &CancellationToken,
-    ) -> Result<RawEvidenceContentWriter<'_>, RawEvidenceError> {
-        if maximum == 0 {
-            return Err(RawEvidenceError::WriteLimitExceeded);
-        }
-        check_deadline(cancellation, deadline)?;
-        Ok(RawEvidenceContentWriter {
-            store: self,
-            scratch: self.create_scratch()?,
-            digest: Sha256::new(),
-            observed: 0,
-            maximum,
-            deadline,
         })
     }
 

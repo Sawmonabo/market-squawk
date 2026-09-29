@@ -9,7 +9,7 @@ use market_squawk_jobs::{
     JobProgress, JobRecoveryDisposition, JobResultReference, JobRunContext, JobRunError, JobRunner,
     JobRunnerEvent,
 };
-use market_squawk_services::ServiceError;
+use market_squawk_services::{RequestContext, RequestOrigin, ServiceError, ServiceLimits};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -17,7 +17,9 @@ use crate::application::{
     analysis::{
         GovernedBacktestAuthority, GovernedBacktestCommand, GovernedBacktestInputRegistrar,
         GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationJsonError,
-        GovernedBacktestPrepublishAuthority,
+        GovernedBacktestPrepublishAuthority, GovernedRecommendationBacktestRequestV1,
+        GovernedRecommendationSignalIssuerV1, ProductionGovernedBacktestInputAuthority,
+        ProductionGovernedBacktestRepository,
     },
     job::JobAdmission,
 };
@@ -32,6 +34,34 @@ const AUTHORITY_IDENTITY: &str = "governed-backtest-authority-v1";
 #[derive(Debug)]
 struct JobBacktestPrepublishAuthority {
     slot: Arc<JobTerminalCommitSlot>,
+}
+
+/// Actual installed recommendation inputs, signal producer, and existing terminal authority.
+pub(crate) struct RecommendationBacktestRuntimeV1 {
+    pub(crate) inputs: Arc<ProductionGovernedBacktestInputAuthority>,
+    pub(crate) repository: Arc<ProductionGovernedBacktestRepository>,
+}
+
+enum PendingBacktestCommand {
+    Generic(GovernedBacktestCommand),
+    Recommendation {
+        request: GovernedRecommendationBacktestRequestV1,
+        issuer: Arc<GovernedRecommendationSignalIssuerV1>,
+        service_limits: ServiceLimits,
+        fiscal_reader: Arc<crate::application::HistoricalFiscalForecastReadCapability>,
+    },
+}
+
+impl PendingBacktestCommand {
+    fn evidence_digest(&self) -> Result<EvidenceDigest, ServiceError> {
+        match self {
+            Self::Generic(command) => command.evidence_digest(),
+            Self::Recommendation { request, .. } => Ok(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                request.digest()?.bytes(),
+            )),
+        }
+    }
 }
 
 impl GovernedBacktestPrepublishAuthority for JobBacktestPrepublishAuthority {
@@ -55,7 +85,8 @@ pub struct BacktestJobRunner {
     authority_identity: SourceIdentifier,
     authority_digest: EvidenceDigest,
     backtests: Arc<dyn GovernedBacktestAuthority>,
-    pending: std::sync::Mutex<BTreeMap<SourceIdentifier, GovernedBacktestCommand>>,
+    pending: std::sync::Mutex<BTreeMap<SourceIdentifier, PendingBacktestCommand>>,
+    recommendation: Option<RecommendationBacktestRuntimeV1>,
     maximum_pending: usize,
     run_timeout: Duration,
 }
@@ -87,6 +118,7 @@ impl BacktestJobRunner {
             authority_digest,
             backtests,
             pending: std::sync::Mutex::new(BTreeMap::new()),
+            recommendation: None,
             maximum_pending,
             run_timeout,
         })
@@ -96,6 +128,99 @@ impl BacktestJobRunner {
     pub fn admit(
         &self,
         command: GovernedBacktestCommand,
+        captured_at: Timestamp,
+    ) -> Result<JobAdmission, BacktestJobRunnerError> {
+        self.admit_command(PendingBacktestCommand::Generic(command), captured_at)
+    }
+
+    /// Installs the concrete recommendation lane before this runner enters the job registry.
+    pub(crate) fn with_recommendations(mut self, runtime: RecommendationBacktestRuntimeV1) -> Self {
+        self.recommendation = Some(runtime);
+        self
+    }
+
+    pub(crate) fn admit_recommendation(
+        &self,
+        request: GovernedRecommendationBacktestRequestV1,
+        issuer: Arc<GovernedRecommendationSignalIssuerV1>,
+        captured_at: Timestamp,
+        service_limits: ServiceLimits,
+        fiscal_reader: Arc<crate::application::HistoricalFiscalForecastReadCapability>,
+    ) -> Result<JobAdmission, BacktestJobRunnerError> {
+        if self.recommendation.is_none()
+            || issuer.identity().digest() != request.issuer_identity_digest
+            || serde_json::to_string(issuer.reference())
+                .map_err(|_| BacktestJobRunnerError::InvalidCommand)?
+                != request.issuer_reference.as_ref()
+        {
+            return Err(BacktestJobRunnerError::Unavailable);
+        }
+        self.admit_command(
+            PendingBacktestCommand::Recommendation {
+                request,
+                issuer,
+                service_limits,
+                fiscal_reader,
+            },
+            captured_at,
+        )
+    }
+
+    pub(crate) async fn read_recommendation_result(
+        &self,
+        snapshot: &market_squawk_jobs::JobSnapshot,
+        historical_reader: &crate::application::analysis::HistoricalRecommendationAlphaProducerReadCapability,
+        context: &market_squawk_services::RequestContext,
+    ) -> Result<crate::application::analysis::GovernedRecommendationBacktestReceiptV1, ServiceError>
+    {
+        let spec = snapshot.spec();
+        let terminal = snapshot.terminal_result().ok_or(ServiceError::NotFound)?;
+        if snapshot.state() != market_squawk_jobs::JobState::Completed
+            || spec.kind() != &self.kind
+            || spec.input().authority() != &self.input_authority
+            || spec.authority().authority() != &self.result_authority
+            || spec.authority().identity() != &self.authority_identity
+            || spec.authority().digest() != self.authority_digest
+            || terminal.authority() != &self.result_authority
+            || terminal.identity().as_str()
+                != format!(
+                    "recommendation-backtest-{}",
+                    encode_hex(terminal.evidence_digest().bytes())
+                )
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let runtime = self
+            .recommendation
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        let receipt = runtime
+            .repository
+            .read_recommendation_receipt(
+                &runtime.inputs,
+                market_squawk_data::Sha256Digest::new(terminal.evidence_digest().bytes()),
+                current_time()?,
+                historical_reader,
+                context,
+            )
+            .await?;
+        if receipt.reference.request_digest.bytes() != spec.input().digest().bytes()
+            || receipt.reference.evidence_digest.bytes() != terminal.evidence_digest().bytes()
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        let expected_artifacts = std::iter::once(receipt.materialization_artifact.clone())
+            .chain(receipt.fiscal_recipe_artifacts.iter().cloned())
+            .collect::<Vec<_>>();
+        if terminal.artifacts() != expected_artifacts.as_slice() {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(receipt)
+    }
+
+    fn admit_command(
+        &self,
+        command: PendingBacktestCommand,
         captured_at: Timestamp,
     ) -> Result<JobAdmission, BacktestJobRunnerError> {
         let digest = command
@@ -186,10 +311,7 @@ impl BacktestJobRunner {
         Ok(())
     }
 
-    fn take_command(
-        &self,
-        context: &JobRunContext,
-    ) -> Result<GovernedBacktestCommand, JobRunError> {
+    fn take_command(&self, context: &JobRunContext) -> Result<PendingBacktestCommand, JobRunError> {
         let spec = context.snapshot().spec();
         if spec.kind() != &self.kind
             || spec.input().authority() != &self.input_authority
@@ -247,30 +369,84 @@ impl JobRunner for BacktestJobRunner {
             Arc::new(JobBacktestPrepublishAuthority {
                 slot: Arc::clone(&slot),
             });
-        let record = self
-            .backtests
-            .run_with_prepublish(
-                command,
-                context.cancellation().clone(),
-                deadline,
-                prepublish,
-            )
-            .await
-            .map_err(map_service_error)?;
+        let (identity, digest, artifacts) = match command {
+            PendingBacktestCommand::Generic(command) => {
+                let record = self
+                    .backtests
+                    .run_with_prepublish(
+                        command,
+                        context.cancellation().clone(),
+                        deadline,
+                        prepublish,
+                    )
+                    .await
+                    .map_err(map_service_error)?;
+                (
+                    identifier(record.run_id()).map_err(|_| recovery_failure())?,
+                    record.evidence_digest().map_err(map_service_error)?,
+                    Vec::new(),
+                )
+            }
+            PendingBacktestCommand::Recommendation {
+                request,
+                issuer,
+                service_limits,
+                fiscal_reader,
+            } => {
+                // Original admitted job origin/request plus this job's actual execution lifetime.
+                // Reuse the forecast runner's authenticated-origin reconstruction; never a fake client.
+                let spec = context.snapshot().spec();
+                let origin = RequestOrigin::try_new(
+                    uuid::Uuid::parse_str(spec.origin().workspace().as_str())
+                        .map_err(|_| recovery_failure())?,
+                    uuid::Uuid::parse_str(spec.origin().client().as_str())
+                        .map_err(|_| recovery_failure())?,
+                )
+                .map_err(|_| recovery_failure())?;
+                let request_context = RequestContext::new(
+                    spec.request_id().clone(),
+                    context.cancellation().clone(),
+                    deadline,
+                    service_limits,
+                )
+                .with_origin(origin);
+                let runtime = self.recommendation.as_ref().ok_or_else(recovery_failure)?;
+                let receipt = runtime
+                    .repository
+                    .run_recommendation(
+                        &runtime.inputs,
+                        &issuer,
+                        request,
+                        &fiscal_reader,
+                        &request_context,
+                        Some(prepublish),
+                    )
+                    .await
+                    .map_err(map_service_error)?;
+                (
+                    identifier(format!(
+                        "recommendation-backtest-{}",
+                        encode_hex(receipt.reference.evidence_digest.bytes(),)
+                    ))
+                    .map_err(|_| recovery_failure())?,
+                    EvidenceDigest::new(
+                        DigestAlgorithm::Sha256,
+                        receipt.reference.evidence_digest.bytes(),
+                    ),
+                    std::iter::once(receipt.materialization_artifact)
+                        .chain(receipt.fiscal_recipe_artifacts)
+                        .collect(),
+                )
+            }
+        };
         let published = slot.take_published()?;
-        let digest = record.evidence_digest().map_err(map_service_error)?;
-        let identity = identifier(record.run_id()).map_err(|_error| recovery_failure())?;
-        let result = JobResultReference::try_new(
-            self.result_authority.clone(),
-            identity,
-            digest,
-            Vec::new(),
-        )
-        .map_err(|_error| recovery_failure())?;
+        let result =
+            JobResultReference::try_new(self.result_authority.clone(), identity, digest, artifacts)
+                .map_err(|_error| recovery_failure())?;
         Ok(JobCompletion::Published(result, published))
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         // The governed terminal repository is idempotent, but the job-owned command capability is
         // deliberately process-bound. A restart therefore interrupts this generation instead of
         // guessing whether unpublished execution may be replayed.
@@ -378,4 +554,14 @@ fn encode_hex(bytes: [u8; 32]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn current_time() -> Result<Timestamp, ServiceError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ServiceError::Unavailable)?
+        .as_nanos();
+    Ok(Timestamp::from_unix_nanos(
+        i64::try_from(nanos).map_err(|_| ServiceError::Unavailable)?,
+    ))
 }

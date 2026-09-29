@@ -11,8 +11,8 @@ use super::catalog::{
 use super::identity::{output_reservation_digest_parts, research_use_mask, to_i64, to_i64_usize};
 use super::{DerivedPublicationInput, DerivedRetentionOperation};
 use crate::manifest::{
-    ManifestCatalogError, propagate_generation_market_bar_history_inputs,
-    propagate_generation_provider_capture_bindings,
+    ManifestCatalogError, finalize_generation_availability,
+    propagate_generation_market_bar_history_inputs, propagate_generation_provider_capture_bindings,
     propagate_generation_provider_publication_bindings,
 };
 use crate::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, GenerationParentRelation};
@@ -43,6 +43,8 @@ pub(super) fn publish(
         return Err(ResearchUseCatalogError::InvalidPublication);
     }
     let anchor_manifest_id = validate_outputs(transaction, session_id, now, &input)?;
+    let generation_started_at = crate::catalog::trusted_catalog_now(transaction)?;
+    validate_permit(transaction, session_id, generation_started_at, &input)?;
     let parent_sequences = validate_parents(transaction, &input)?;
     let version = next_version(transaction, input.plan().dataset_id())?;
     reject_schema_change(transaction, &input)?;
@@ -66,7 +68,7 @@ pub(super) fn publish(
             anchor_manifest_id.to_string(),
             to_i64_usize(parent_sequences.len())?,
             input.build_spec_digest().digest().bytes(),
-            now.unix_nanos(),
+            generation_started_at.unix_nanos(),
         ],
     )?;
     let generation_sequence = positive_u64(transaction.last_insert_rowid())?;
@@ -208,6 +210,9 @@ pub(super) fn publish(
         input.plan().content_hash(),
     )
     .map_err(|_| ResearchUseCatalogError::InvalidPublication)?;
+    let available_at = finalize_generation_availability(transaction, &manifest)
+        .map_err(map_manifest_lineage_error)?;
+    validate_permit(transaction, session_id, available_at, &input)?;
     Ok(PublishedDerivedGeneration::new(
         generation_sequence,
         manifest,
@@ -410,7 +415,7 @@ fn validate_parents(
     for parent in input.parents() {
         let sequence = transaction
             .query_row(
-                "SELECT generation_sequence FROM analytical_generations
+                "SELECT generation_sequence FROM analytical_available_generations
                  WHERE dataset_id=?1 AND manifest_version=?2 AND schema_name=?3
                    AND schema_version=?4 AND schema_fingerprint=?5 AND content_hash=?6",
                 params![
@@ -523,7 +528,8 @@ fn positive_u64(value: i64) -> Result<u64, ResearchUseCatalogError> {
 fn map_manifest_lineage_error(error: ManifestCatalogError) -> ResearchUseCatalogError {
     match error {
         ManifestCatalogError::Sqlite(error) => ResearchUseCatalogError::Sqlite(error),
-        ManifestCatalogError::CaptureInputLimitExceeded { .. }
+        ManifestCatalogError::SourceRunInputLimitExceeded { .. }
+        | ManifestCatalogError::CaptureInputLimitExceeded { .. }
         | ManifestCatalogError::MarketBarHistoryInputLimitExceeded { .. }
         | ManifestCatalogError::CountOverflow => ResearchUseCatalogError::LimitExceeded,
         _ => ResearchUseCatalogError::CorruptCatalog,

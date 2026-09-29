@@ -190,7 +190,7 @@ impl SourceMetadata {
         }
         if input.capabilities.live
             && (input.coverage.domain != CoverageDomain::Instruments
-                || input.coverage.live.is_none()
+                || input.coverage.live.is_empty()
                 || input.coverage.topology.is_not_applicable())
         {
             return Err(SourceMetadataError::LiveCoverageWithoutVenue);
@@ -199,7 +199,7 @@ impl SourceMetadata {
             && (input.capabilities.sequence != SequenceCapability::Unsupported
                 || input.capabilities.checksum != ChecksumCapability::Unsupported
                 || input.capabilities.source_timestamps
-                || input.coverage.live.is_some())
+                || !input.coverage.live.is_empty())
         {
             return Err(SourceMetadataError::NonLiveCapabilityConflict);
         }

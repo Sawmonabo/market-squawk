@@ -159,6 +159,7 @@ fn map_model_backup_error(error: ModelBackupError) -> ProductBackupError {
             ProductBackupError::InvalidComponent
         }
         ModelBackupError::Runtime(_)
+        | ModelBackupError::Domain(_)
         | ModelBackupError::Forecast(_)
         | ModelBackupError::Artifact(_)
         | ModelBackupError::Path(_)

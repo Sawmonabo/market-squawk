@@ -1,3 +1,12 @@
+use crate::{
+    SchwabStreamerConnectionPermit, SchwabStreamerRequestAcknowledgement,
+    SchwabStreamerRequestPermit, SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent,
+};
+use market_squawk_sources::{
+    BackoffPolicy, BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservationDecision,
+    BudgetScope, ProviderBudgetPolicy, ProviderRateAuthority, ProviderRateDeclaration,
+    SharedProviderBudget,
+};
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::{Future, pending};
@@ -586,7 +595,7 @@ fn option_contract_missing_greek_retains_component_unavailability() {
 }
 
 #[tokio::test]
-async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_user_preference() {
+async fn rest_price_history_seals_raw_evidence_but_denies_unverified_bar_semantics() {
     let temporary = TemporaryDirectory::new();
     let secrets = Arc::new(
         EncryptedFileSecretStore::try_open(
@@ -854,7 +863,9 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         capability,
         oauth_authority: oauth_receipt,
         user_preference,
-        response: &history,
+        receipt: history.capture().receipt(),
+        payload: history.payload(),
+        accounting: history.accounting(),
         instrument_id,
         instrument_revision_digest,
         admitted_plan_digest,
@@ -940,6 +951,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         ),
     )
     .unwrap_or_else(|error| panic!("history market-data evidence: {error}"));
+    assert_eq!(market_data.delay(), SchwabMarketDataDelay::Unknown);
     let publication_request = SchwabDailyPriceHistoryPublicationRequest::new(
         capability,
         oauth_receipt,
@@ -955,57 +967,22 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         received_at,
     );
     let event_id = Uuid::new_v4();
-    let (pending, seal_request) = history
-        .into_pending_daily_price_history_publication(
-            registered_coordinates.clone(),
-            event_id,
-            publication_request,
-        )
-        .unwrap_or_else(|error| panic!("pending REST publication: {error}"));
+    let (rejoin, seal_request) = history
+        .into_pending_capture(registered_coordinates.clone(), event_id)
+        .unwrap_or_else(|error| panic!("pending REST raw capture: {error}"))
+        .into_sealing_parts();
     let paths = LocalPaths::prepare(temporary.path().join("raw-publication"))
         .unwrap_or_else(|error| panic!("raw publication paths: {error}"));
     let store = paths
         .sealed_research_journal_store()
         .unwrap_or_else(|error| panic!("raw publication store: {error}"));
-    let sealed = seal_request
+    let physical_seal = seal_request
         .seal(&store)
         .unwrap_or_else(|error| panic!("REST physical seal: {error}"));
-    let publication = pending
-        .try_rejoin(sealed)
-        .unwrap_or_else(|error| panic!("sealed REST publication: {error}"));
-    assert_eq!(publication.market_data().route(), route);
-    assert_eq!(
-        publication.market_data().delay(),
-        SchwabMarketDataDelay::Unknown
-    );
-    assert_eq!(publication.revision_plan().len(), 1);
-    assert!(publication.revision_plan().native_lineage_required());
-    let binding = publication.sealed_capture_binding();
-    assert_eq!(binding.batch().records().len(), 1);
-    assert_eq!(binding.native_lineage().rows().len(), 1);
-    let sidecar = binding
-        .native_lineage()
-        .batch_sidecar()
-        .unwrap_or_else(|| panic!("missing Schwab REST native-lineage sidecar"));
-    let sidecar_value: serde_json::Value = serde_json::from_slice(sidecar.semantic_payload())
-        .unwrap_or_else(|error| panic!("Schwab REST sidecar JSON: {error}"));
-    assert_eq!(sidecar_value["service"], "schwab-market-data-rest");
-    assert_eq!(sidecar_value["route"], "price-history");
-    assert_eq!(sidecar_value["feed"], "schwab-rest-price-history");
-    assert_eq!(sidecar_value["reference_venue"], "XNYS");
-    assert_eq!(
-        sidecar_value["provider_reported_venue"],
-        serde_json::Value::Null
-    );
-    assert_eq!(sidecar_value["delay"]["kind"], "unknown");
-    let native_row: serde_json::Value =
-        serde_json::from_slice(binding.native_lineage().rows()[0].semantic_payload())
-            .unwrap_or_else(|error| panic!("Schwab REST native row JSON: {error}"));
-    assert_eq!(native_row["datetime_millis"], 1_704_067_200_000_u64);
-    assert_eq!(native_row["open"], "475.00");
-    let persisted = binding
-        .persisted_segment_receipt(0)
-        .unwrap_or_else(|| panic!("missing Schwab physical receipt"));
+    let sealed = rejoin
+        .try_rejoin(physical_seal)
+        .unwrap_or_else(|error| panic!("sealed REST response: {error}"));
+    let persisted = sealed.persisted_receipt();
     assert_eq!(
         persisted.capture().source_id(),
         registered_coordinates.source_id()
@@ -1030,6 +1007,11 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         reopened.records()[0].received_at().timestamp_millis() as u64
     );
     assert_eq!(accounting.provider_records, 1);
+    assert_eq!(sealed.route(), route);
+    assert!(matches!(
+        sealed.into_daily_price_history_publication(publication_request),
+        Err(crate::SchwabPriceHistoryPublicationError::SemanticsUnverified)
+    ));
 
     assert_eq!(preference.receipt().route(), ReadOnlyRoute::UserPreference);
     assert_eq!(preference.accounting().provider_records, 1);
@@ -1132,11 +1114,39 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     let quote_identity = SchwabResolvedProviderIdentity::try_new(
         ProviderIdentifier::try_new("AAPL")
             .unwrap_or_else(|error| panic!("quote provider symbol: {error}")),
-        ProviderInstrumentId::try_from("schwab:AAPL")
+        ProviderInstrumentId::try_from("AAPL")
             .unwrap_or_else(|error| panic!("quote provider instrument: {error}")),
         EvidenceDigest::new(DigestAlgorithm::Sha256, [46; 32]),
     )
     .unwrap_or_else(|error| panic!("quote identity: {error}"));
+    let quote_reference = (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
+        use market_squawk_domain::{EffectiveInterval, MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput, RevisionBoundPayloadEvidence};
+        let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+            instrument_id: quote_instrument,
+            source_id: SourceId::try_from("schwab-trader-api-instruments")?,
+            provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
+            evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256, [46;32])),
+            source_timestamp: None,
+            observed_at: quote_received_at,
+            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("schwab-instruments-test-v1")?),
+            validity: interval,
+            supersedes: None,
+        });
+        let definition = MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+            instrument_id: quote_instrument,
+            reference_evidence: RevisionBoundPayloadEvidence::new(MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?), market_squawk_domain::ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256,[47;32]))),
+            effective_interval: interval,
+            asset_class: market_squawk_domain::AssetClass::Equity,
+            display_name: None,
+            quote_currency: market_squawk_domain::Currency::try_from("USD")?,
+            quote_currency_evidence: market_squawk_domain::ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(DigestAlgorithm::Sha256,[48;32])),
+            venue_mappings: vec![], provider_identities: vec![identity.clone()], identifiers: vec![],
+        })?;
+        let json = serde_json::to_vec(&definition)?;
+        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, <sha2::Sha256 as sha2::Digest>::digest(json).into());
+        Ok(market_squawk_domain::MarketDataReference::try_new(&definition,digest,&identity,quote_received_at)?)
+    })().unwrap_or_else(|error| panic!("quote reference: {error}"));
     let mismatched_quote_session = SourceIdentifier::try_from("schwab-rest-session-mismatch")
         .unwrap_or_else(|error| panic!("mismatched quote session: {error}"));
     assert!(matches!(
@@ -1162,10 +1172,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
                 quote_instrument,
                 quote_source_identifier,
                 quote_provenance,
-                TickSize::power_of_ten(3)
-                    .unwrap_or_else(|error| panic!("quote tick size: {error}")),
-                LotSize::try_from_decimal(rust_decimal::Decimal::ONE)
-                    .unwrap_or_else(|error| panic!("quote lot size: {error}")),
+                quote_reference,
                 quote_market_data,
             ),
         ]))
@@ -1177,7 +1184,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     assert_eq!(publication.binding().record_count(), 1);
     assert!(matches!(
         publication.binding().batch().events(),
-        [MarketEvent::Quote(_)]
+        [MarketEvent::MarketDataQuote(_)]
     ));
     assert_eq!(
         publication.binding().row_frames()[0].capture_page_ordinal(),
@@ -1694,6 +1701,252 @@ impl SchwabStreamerConnection for SensitiveHandoffConnection {
     }
 }
 
+// The existing wire doubles use the same durable shared-budget admission as production.
+struct MockStreamerRateAuthority {
+    budget: Arc<SharedProviderBudget>,
+    generation: Mutex<Option<ConnectionGeneration>>,
+    _authority: ProviderRateAuthority,
+    _temporary: TemporaryDirectory,
+}
+impl fmt::Debug for MockStreamerRateAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MockStreamerRateAuthority")
+            .finish_non_exhaustive()
+    }
+}
+impl MockStreamerRateAuthority {
+    fn new() -> Self {
+        let temporary = TemporaryDirectory::new();
+        std::fs::create_dir_all(temporary.path()).expect("rate fixture directory");
+        let store = market_squawk_data::SqliteProviderRateStore::try_open(
+            temporary.path().join("rate.sqlite3"),
+        )
+        .expect("rate fixture store");
+        let authority = ProviderRateAuthority::try_new(Arc::new(store)).expect("rate authority");
+        let subject = SourceIdentifier::try_from(format!("schwab-fixture-{}", Uuid::new_v4()))
+            .expect("rate subject");
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::with_authorization_account(
+                SourceIdentifier::try_from("schwab").expect("provider"),
+                subject.clone(),
+            ),
+            NonZeroU32::new(64).expect("request capacity"),
+            NonZeroU64::new(60_000_000_000).expect("request window"),
+            NonZeroU16::new(1).expect("single in-flight request"),
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000).expect("backoff"),
+                NonZeroU64::new(1_000_000_000).expect("maximum backoff"),
+                0,
+            )
+            .expect("backoff policy"),
+        )
+        .expect("rate policy");
+        let declaration = ProviderRateDeclaration::try_for_authorization_subject(policy, &subject)
+            .expect("rate declaration");
+        let budget = Arc::new(
+            authority
+                .register_budget(declaration)
+                .expect("shared rate budget"),
+        );
+        Self {
+            budget,
+            generation: Mutex::new(None),
+            _authority: authority,
+            _temporary: temporary,
+        }
+    }
+    fn acquire(
+        &self,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<BudgetPermit, SchwabTransportError> {
+        mock_streamer_rate_active(cancellation, deadline)?;
+        let BudgetReservationDecision::Ready(reservation) = self.budget.try_reserve_request()
+        else {
+            return Err(SchwabTransportError::Protocol);
+        };
+        mock_streamer_rate_active(cancellation, deadline)?;
+        let BudgetDispatchDecision::Ready(permit) = reservation.commit_dispatch() else {
+            return Err(SchwabTransportError::Protocol);
+        };
+        Ok(permit)
+    }
+}
+fn mock_streamer_rate_active(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), SchwabTransportError> {
+    if cancellation.is_cancelled() {
+        Err(SchwabTransportError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(SchwabTransportError::Deadline)
+    } else {
+        Ok(())
+    }
+}
+impl SchwabStreamerRuntimeAuthority for MockStreamerRateAuthority {
+    fn observe(&self, event: SchwabStreamerRuntimeEvent) -> Result<(), SchwabTransportError> {
+        let mut current = self
+            .generation
+            .lock()
+            .map_err(|_| SchwabTransportError::Protocol)?;
+        match event {
+            SchwabStreamerRuntimeEvent::Connected { generation }
+            | SchwabStreamerRuntimeEvent::Frame { generation, .. } => {
+                assert_eq!(*current, Some(generation));
+            }
+            SchwabStreamerRuntimeEvent::Disconnected { generation, .. } => {
+                assert_eq!(*current, Some(generation));
+                *current = None;
+            }
+            SchwabStreamerRuntimeEvent::ConnectAttempt { .. }
+            | SchwabStreamerRuntimeEvent::QueuePressure => {}
+        }
+        Ok(())
+    }
+    fn commit_connection<'a>(
+        &'a self,
+        generation: ConnectionGeneration,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Box<dyn SchwabStreamerConnectionPermit>, SchwabTransportError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let permit = self.acquire(cancellation, deadline)?;
+            let mut current = self
+                .generation
+                .lock()
+                .map_err(|_| SchwabTransportError::Protocol)?;
+            assert!(current.is_none());
+            *current = Some(generation);
+            Ok(Box::new(MockStreamerConnectionRatePermit {
+                budget: Arc::clone(&self.budget),
+                permit,
+            }) as Box<dyn SchwabStreamerConnectionPermit>)
+        })
+    }
+    fn commit_request<'a>(
+        &'a self,
+        generation: ConnectionGeneration,
+        service: Option<MarketDataService>,
+        command: &'a str,
+        request_id: &'a str,
+        request_payload_sha256: EvidenceDigest,
+        request_payload_bytes: u64,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Box<dyn SchwabStreamerRequestPermit>, SchwabTransportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            assert_eq!(
+                *self
+                    .generation
+                    .lock()
+                    .map_err(|_| SchwabTransportError::Protocol)?,
+                Some(generation)
+            );
+            assert!(!request_id.is_empty());
+            assert_ne!(request_payload_sha256.bytes(), [0; 32]);
+            assert!(request_payload_bytes > 0);
+            assert!(match service {
+                None => command == "LOGIN",
+                Some(_) => matches!(command, "SUBS" | "ADD" | "UNSUBS"),
+            });
+            let permit = self.acquire(cancellation, deadline)?;
+            Ok(Box::new(MockStreamerRequestRatePermit {
+                budget: Arc::clone(&self.budget),
+                permit,
+                generation,
+                service,
+                command: command.to_owned(),
+                request_id: request_id.to_owned(),
+                request_payload_sha256,
+                request_payload_bytes,
+            }) as Box<dyn SchwabStreamerRequestPermit>)
+        })
+    }
+}
+#[derive(Debug)]
+struct MockStreamerConnectionRatePermit {
+    budget: Arc<SharedProviderBudget>,
+    permit: BudgetPermit,
+}
+impl SchwabStreamerConnectionPermit for MockStreamerConnectionRatePermit {
+    fn connected<'a>(
+        self: Box<Self>,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
+        Box::pin(async move {
+            mock_streamer_rate_active(cancellation, deadline)?;
+            self.budget
+                .record_success()
+                .map_err(|_| SchwabTransportError::Protocol)?;
+            self.permit.release();
+            Ok(())
+        })
+    }
+}
+#[derive(Debug)]
+struct MockStreamerRequestRatePermit {
+    budget: Arc<SharedProviderBudget>,
+    permit: BudgetPermit,
+    generation: ConnectionGeneration,
+    service: Option<MarketDataService>,
+    command: String,
+    request_id: String,
+    request_payload_sha256: EvidenceDigest,
+    request_payload_bytes: u64,
+}
+impl SchwabStreamerRequestPermit for MockStreamerRequestRatePermit {
+    fn settle<'a>(
+        self: Box<Self>,
+        acknowledgement: SchwabStreamerRequestAcknowledgement,
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
+        Box::pin(async move {
+            mock_streamer_rate_active(cancellation, deadline)?;
+            assert_eq!(acknowledgement.generation(), self.generation);
+            assert_eq!(acknowledgement.service(), self.service);
+            assert_eq!(acknowledgement.command(), self.command);
+            assert_eq!(acknowledgement.request_id(), self.request_id);
+            assert_eq!(
+                acknowledgement.request_payload_sha256(),
+                self.request_payload_sha256
+            );
+            assert_eq!(
+                acknowledgement.request_payload_bytes(),
+                self.request_payload_bytes
+            );
+            assert!(acknowledgement.transport_ordinal().is_some());
+            if acknowledgement.status_code() == 0 {
+                self.budget
+                    .record_success()
+                    .map_err(|_| SchwabTransportError::Protocol)?;
+            } else {
+                let BudgetDecision::WaitUntil(_) = self.budget.apply_refusal(0) else {
+                    return Err(SchwabTransportError::Protocol);
+                };
+            }
+            self.permit.release();
+            Ok(())
+        })
+    }
+}
+
 #[tokio::test]
 async fn bearer_network_handoffs_keep_one_zeroizing_owner_through_completion() {
     let rest_audit = crate::transport::SensitiveDropAudit::default();
@@ -1766,6 +2019,16 @@ async fn bearer_network_handoffs_keep_one_zeroizing_owner_through_completion() {
             owner_address: login.expose_body().as_ptr() as usize,
             audit: streamer_audit.clone(),
         };
+        let rate_authority = MockStreamerRateAuthority::new();
+        let setup_cancellation = CancellationToken::new();
+        let setup_deadline = Instant::now() + Duration::from_secs(1);
+        rate_authority
+            .commit_connection(generation, &setup_cancellation, setup_deadline)
+            .await
+            .expect("fixture handshake permit")
+            .connected(&setup_cancellation, setup_deadline)
+            .await
+            .expect("fixture connected");
         let cancellation = CancellationToken::new();
         if cancel {
             cancellation.cancel();
@@ -1773,6 +2036,7 @@ async fn bearer_network_handoffs_keep_one_zeroizing_owner_through_completion() {
         let result = crate::transport::send_streamer_request_for_test(
             &mut connection,
             login,
+            &rate_authority,
             timeout,
             &cancellation,
         )
@@ -1811,7 +2075,8 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let connector_state = Arc::new(Mutex::new(MockStreamerState {
         connects: 0,
         inbound: VecDeque::from([VecDeque::from([
-            MockStreamerInbound::Frame(InboundStreamerFrame::Text(login)),
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(login.clone())),
+            MockStreamerInbound::FlushBoundary,
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(equities_subscribed.clone())),
             MockStreamerInbound::FlushBoundary,
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(options_subscribed.clone())),
@@ -1888,6 +2153,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         bounds(),
         token_admission,
         telemetry,
+        Arc::new(MockStreamerRateAuthority::new()),
     )
     .unwrap_or_else(|error| panic!("stream executor: {error}"));
     streamer
@@ -1921,7 +2187,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let cancellation = CancellationToken::new();
     let mut sink = CancellingCaptureSink {
         cancellation: cancellation.clone(),
-        cancel_after: 6,
+        cancel_after: 7,
         microbatches: Vec::new(),
     };
     let run_error = streamer
@@ -1929,7 +2195,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         .await
         .expect_err("malformed selected-service frame must close the typed Streamer run");
     assert_eq!(run_error, SchwabTransportError::Adapter);
-    assert_eq!(sink.microbatches.len(), 6);
+    assert_eq!(sink.microbatches.len(), 7);
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path().join("stream-raw-publication"))
         .unwrap_or_else(|error| panic!("Streamer publication paths: {error}"));
@@ -1937,6 +2203,20 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         .sealed_research_journal_store()
         .unwrap_or_else(|error| panic!("Streamer publication store: {error}"));
     let mut microbatches = sink.microbatches.into_iter();
+    let login_acknowledgement = seal_stream_microbatch(
+        microbatches
+            .next()
+            .expect("missing LOGIN acknowledgement microbatch"),
+        &store,
+    );
+    let login_reopened = store
+        .open_verified(login_acknowledgement.persisted_receipt().segment())
+        .expect("reopen LOGIN physical seal");
+    let [login_record] = login_reopened.records() else {
+        panic!("LOGIN seal must contain one exact native ACK");
+    };
+    assert_eq!(login_record.payload(), login.as_ref());
+    assert!(login_acknowledgement.service_responses().is_empty());
     let equities_acknowledgement = seal_stream_microbatch(
         microbatches
             .next()
@@ -2212,10 +2492,22 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     };
     assert!(publication.dispositions().is_empty());
     assert_eq!(publication.binding().record_count(), 2);
-    assert!(matches!(
-        publication.binding().batch().events(),
-        [MarketEvent::Quote(_), MarketEvent::Quote(_)]
-    ));
+    let [MarketEvent::MarketDataQuote(equities), MarketEvent::MarketDataQuote(options)] =
+        publication.binding().batch().events()
+    else {
+        panic!("Streamer prices must retain currency-qualified decimal quote semantics");
+    };
+    for (quote, symbol, price, size) in [
+        (equities, "AAPL", rust_decimal::Decimal::new(100_125, 3), 2),
+        (options, "AAPL_260116C100", rust_decimal::Decimal::new(4_125, 3), 5),
+    ] {
+        assert_eq!(quote.provenance().source_timestamp(), None);
+        assert_eq!(quote.provenance().received_at(), received_at);
+        assert_eq!(quote.reference().provider_identity().expect("native provider reference").provider_instrument_id().as_str(), symbol);
+        let bid = quote.bid().expect("fixture bid is present");
+        assert_eq!(bid.price().amount(), price);
+        assert_eq!(bid.size(), &market_squawk_domain::MarketDataQuoteSize::UnresolvedUnit(rust_decimal::Decimal::from(size)));
+    }
     assert!(
         publication
             .binding()
@@ -2334,6 +2626,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         bounds(),
         token_admission,
         SchwabTransportTelemetry::default(),
+        Arc::new(MockStreamerRateAuthority::new()),
     )
     .unwrap_or_else(|error| panic!("reconnecting executor: {error}"));
     reconnecting_streamer
@@ -2997,10 +3290,10 @@ fn test_streamer_quote_record_request(
         None,
     )
     .unwrap_or_else(|error| panic!("mixed-service live binding: {error}"));
-    let source_timestamp = Timestamp::from_unix_nanos(1_710_000_000_004_000_000);
+    // The fixture carries an envelope time but no native QuoteTime field.
     let provenance = LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
         live_binding,
-        Some(source_timestamp),
+        None,
         received_at,
         received_at,
         received_at,
@@ -3022,15 +3315,54 @@ fn test_streamer_quote_record_request(
         ],
     )
     .unwrap_or_else(|error| panic!("mixed-service dictionary: {error}"));
-    let provider_instrument = format!("schwab:{symbol}");
-    let identity = SchwabResolvedProviderIdentity::try_new(
-        ProviderIdentifier::try_new(symbol)
-            .unwrap_or_else(|error| panic!("mixed-service provider symbol: {error}")),
-        ProviderInstrumentId::try_from(provider_instrument)
-            .unwrap_or_else(|error| panic!("mixed-service provider instrument: {error}")),
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [evidence_byte.wrapping_add(2); 32]),
-    )
-    .unwrap_or_else(|error| panic!("mixed-service resolved identity: {error}"));
+    let reference = (|| -> Result<market_squawk_domain::MarketDataReference, Box<dyn std::error::Error>> {
+        use market_squawk_domain::{
+            AssetClass, Currency, EffectiveInterval, ExactPayloadEvidence,
+            MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+            MarketDataReference, ProviderIdentityEvidence, ProviderIdentityRecord,
+            ProviderIdentityRecordInput, RevisionBoundPayloadEvidence,
+        };
+        let interval = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+            instrument_id,
+            source_id: SourceId::try_from("schwab-trader-api-instruments")?,
+            provider_instrument_id: ProviderInstrumentId::try_from(symbol)?,
+            evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256, [evidence_byte.wrapping_add(2); 32],
+            )),
+            source_timestamp: None,
+            observed_at: received_at,
+            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("schwab-instruments-test-v1")?),
+            validity: interval,
+            supersedes: None,
+        });
+        let definition = MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+            instrument_id,
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("schwab-test-reference")?),
+                ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                    DigestAlgorithm::Sha256, [evidence_byte.wrapping_add(3); 32],
+                )),
+            ),
+            effective_interval: interval,
+            asset_class: match service {
+                MarketDataService::LevelOneEquities => AssetClass::Equity,
+                MarketDataService::LevelOneOptions => AssetClass::Option,
+                _ => panic!("focused quote fixture requires an admitted Level-One service"),
+            },
+            display_name: None,
+            quote_currency: Currency::try_from("USD")?,
+            quote_currency_evidence: ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256, [evidence_byte.wrapping_add(4); 32],
+            )),
+            venue_mappings: vec![],
+            provider_identities: vec![identity.clone()],
+            identifiers: vec![],
+        })?;
+        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256,
+            <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&definition)?).into());
+        Ok(MarketDataReference::try_new(&definition, digest, &identity, received_at)?)
+    })().unwrap_or_else(|error| panic!("mixed-service quote reference: {error}"));
     let market_evidence = SchwabStreamerQuoteMarketDataEvidence::try_new(venue_id, qualification)
         .unwrap_or_else(|error| panic!("mixed-service market evidence: {error}"));
     SchwabStreamerQuoteRecordRequest::new(
@@ -3038,13 +3370,8 @@ fn test_streamer_quote_record_request(
         data_batch_ordinal,
         0,
         dictionary,
-        identity,
-        instrument_id,
-        source_identifier,
+        reference,
         provenance,
-        TickSize::power_of_ten(3).unwrap_or_else(|error| panic!("tick size: {error}")),
-        LotSize::try_from_decimal(rust_decimal::Decimal::ONE)
-            .unwrap_or_else(|error| panic!("lot size: {error}")),
         market_evidence,
     )
 }

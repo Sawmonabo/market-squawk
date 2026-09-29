@@ -8,11 +8,11 @@ use chrono::DateTime;
 use hmac::{Hmac, Mac as _};
 use market_squawk_domain::{
     AssetClass, CapturePayload, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentExecutionTerms,
-    IntegrityRule, LiveEventClass, MarketDepth, PriceTicks, ProviderChannel, ProviderProduct,
-    QuantityLots, RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion, SequenceCapability,
-    SequenceNumber, SequenceValidationRule, SnapshotApplicability, SourceId, SourceIdentifier,
-    Timestamp, TradingStatus, VenueId,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+    InstrumentExecutionTerms, IntegrityRule, LiveEventClass, MarketDepth, MetadataRevision, PriceTicks,
+    ProviderChannel, ProviderProduct, QuantityLots, RevisionBoundPayloadEvidence, RuleVersion,
+    SchemaVersion, SequenceCapability, SequenceNumber, SequenceValidationRule,
+    SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, CaptureAdmissionReceipt,
@@ -20,19 +20,21 @@ use market_squawk_sources::{
     DirectOrderBook, DirectOrderBookError, EndpointPolicy, FrameId, FreshnessPolicy,
     HistoricalCapability, HttpCaptureMethod, HttpRequestBounds, InstrumentCoverage,
     LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, MAX_DECODED_BOOK_ITEMS,
-    NetworkAccessPolicy, PathScope, ProviderBookSide, ProviderBudgetPolicy,
-    ProviderCursorOnlyReason, ProviderDecimalLexeme, ProviderNumericPolicy,
-    ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord,
-    ProviderPrice, ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
-    SegmentedHttpResponseReceipt, SemanticInterpretationProfile, SequenceValidationProfile,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame, normalize_delta_quantity,
-    normalize_positive_quantity, normalize_price,
+    MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy, PathScope, ProviderBookSide,
+    ProviderBudgetPolicy, ProviderCaptureTerminalDisposition, ProviderCursorOnlyReason,
+    ProviderDecimalLexeme, ProviderNumericPolicy, ProviderOrderChangeReason, ProviderOrderEvent,
+    ProviderOrderEventKind, ProviderOrderRecord, ProviderPrice, ProviderQuantity,
+    ProviderWholeCaptureToken, QueryParameterRule, SealedProviderCaptureSetReceipt,
+    SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SemanticInterpretationProfile,
+    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceMetadataProvider, SourceProtocolProfile, TransportFrameKind,
+    ValidatedRawMarketFrame, normalize_delta_quantity, normalize_positive_quantity,
+    normalize_price,
 };
 use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -297,6 +299,7 @@ fn direct_memory_product(count: usize, bytes: u64) -> Result<u64, CoinbaseConfig
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectConfig {
     metadata: SourceMetadata,
+    product_reference_profile: CoinbaseDirectProductReferenceProfile,
     mapping: CoinbaseProductMapping,
     venue: VenueId,
     terms: InstrumentExecutionTerms,
@@ -304,6 +307,25 @@ pub struct CoinbaseDirectConfig {
     publication_depth: MarketDepth,
     snapshot_url: Box<str>,
     product_url: Box<str>,
+}
+
+/// Separate registered extraction profile whose only network target is this product GET.
+#[derive(Clone, Debug)]
+pub struct CoinbaseDirectProductReferenceProfile {
+    metadata: SourceMetadata,
+}
+
+impl CoinbaseDirectProductReferenceProfile {
+    /// Returns the immutable product-only metadata used for extraction registration.
+    pub const fn metadata(&self) -> &SourceMetadata {
+        &self.metadata
+    }
+}
+
+impl SourceMetadataProvider for CoinbaseDirectProductReferenceProfile {
+    fn metadata(&self) -> &SourceMetadata {
+        &self.metadata
+    }
 }
 
 impl CoinbaseDirectConfig {
@@ -529,8 +551,16 @@ impl CoinbaseDirectConfig {
                 ProviderNumericPolicy::ExactDecimalLexeme,
             ))),
         ))?;
+        let product_reference_profile = direct_product_reference_profile(
+            &metadata,
+            mapping.instrument(),
+            &venue,
+            &product_url,
+            limits,
+        )?;
         Ok(Self {
             metadata,
+            product_reference_profile,
             mapping,
             venue,
             terms,
@@ -544,6 +574,11 @@ impl CoinbaseDirectConfig {
     /// Returns immutable metadata. It remains a ceiling declaration, not current authority.
     pub const fn metadata(&self) -> &SourceMetadata {
         &self.metadata
+    }
+
+    /// Returns the separately registered product-only extraction source.
+    pub const fn product_reference_profile(&self) -> &CoinbaseDirectProductReferenceProfile {
+        &self.product_reference_profile
     }
 
     /// Returns the authenticated Direct WebSocket endpoint.
@@ -655,6 +690,108 @@ impl CoinbaseDirectConfig {
         .map_err(CoinbaseDirectProductError::Capture)?;
         let wire: ProductWire = serde_json::from_reader(capture.reader())
             .map_err(|_| CoinbaseDirectProductError::Schema)?;
+        let fields = self.decode_product_fields(wire)?;
+        Ok(CoinbaseDirectProductEvidence {
+            product: self.product().clone(),
+            base_currency: fields.base_currency,
+            quote_currency: fields.quote_currency,
+            provider_status: fields.provider_status,
+            trading_status: fields.trading_status,
+            base_increment: fields.base_increment,
+            quote_increment: fields.quote_increment,
+            trading_disabled: fields.trading_disabled,
+            cancel_only: fields.cancel_only,
+            post_only: fields.post_only,
+            limit_only: fields.limit_only,
+            auction_mode: fields.auction_mode,
+            capture: capture.receipt().clone(),
+        })
+    }
+
+    /// Decodes the original pre-session product GET after its bytes have been physically sealed.
+    /// The one-use token remains inside the returned evidence through catalog admission and
+    /// Direct bootstrap; a copied persisted receipt cannot construct this value.
+    pub fn decode_product_reference_evidence(
+        &self,
+        body: &[u8],
+        token: ProviderWholeCaptureToken,
+    ) -> Result<CoinbaseDirectProductReferenceEvidence, CoinbaseDirectProductError> {
+        let sealed = token.persisted_receipt();
+        let capture = sealed.capture();
+        let [page] = capture.pages() else {
+            return Err(CoinbaseDirectProductError::Capture(
+                CoinbaseDirectCaptureError::InvalidReceipt,
+            ));
+        };
+        let body_len = u64::try_from(body.len()).map_err(|_| {
+            CoinbaseDirectProductError::Capture(CoinbaseDirectCaptureError::InvalidReceipt)
+        })?;
+        let body_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(body).into());
+        if capture.source_id() != self.product_reference_profile.metadata().source_id()
+            || capture.metadata_revision() != self.product_reference_profile.metadata().revision()
+            || capture.dataset().as_str() != self.product_url()
+            || capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+            || capture.request_set_identity() != page.request_identity()
+            || page.ordinal() != 0
+            || page.request_page_token_digest().is_some()
+            || page.response_next_page_token_digest().is_some()
+            || page.http_status() != 200
+            || page.body_bytes() != body_len
+            || page.body_digest() != body_digest
+            || body_len == 0
+            || body_len > self.limits.max_snapshot_bytes
+        {
+            return Err(CoinbaseDirectProductError::Capture(
+                CoinbaseDirectCaptureError::InvalidReceipt,
+            ));
+        }
+        let wire: ProductWire =
+            serde_json::from_slice(body).map_err(|_| CoinbaseDirectProductError::Schema)?;
+        let fields = self.decode_product_fields(wire)?;
+        self.validate_reference_fields(&fields)?;
+        Ok(CoinbaseDirectProductReferenceEvidence {
+            product: self.product().clone(),
+            fields,
+            token,
+        })
+    }
+
+    /// Validates product content before settling the preflight request budget. This returns no
+    /// identity evidence or catalog authority; physical sealing is still required afterward.
+    pub fn validate_product_reference_body(
+        &self,
+        body: &[u8],
+    ) -> Result<(), CoinbaseDirectProductError> {
+        let wire: ProductWire =
+            serde_json::from_slice(body).map_err(|_| CoinbaseDirectProductError::Schema)?;
+        let fields = self.decode_product_fields(wire)?;
+        self.validate_reference_fields(&fields)
+    }
+
+    fn validate_reference_fields(
+        &self,
+        fields: &DecodedProductFields,
+    ) -> Result<(), CoinbaseDirectProductError> {
+        let base = fields
+            .base_currency
+            .as_ref()
+            .ok_or(CoinbaseDirectProductError::Schema)?;
+        let quote = fields
+            .quote_currency
+            .as_ref()
+            .ok_or(CoinbaseDirectProductError::Schema)?;
+        if format!("{base}-{quote}") != self.product().as_source_identifier().as_str()
+            || quote.as_str() != self.terms.quote_currency().as_str()
+        {
+            return Err(CoinbaseDirectProductError::WrongProduct);
+        }
+        Ok(())
+    }
+
+    fn decode_product_fields(
+        &self,
+        wire: ProductWire,
+    ) -> Result<DecodedProductFields, CoinbaseDirectProductError> {
         if wire.id != self.product().as_source_identifier().as_str() {
             return Err(CoinbaseDirectProductError::WrongProduct);
         }
@@ -682,8 +819,9 @@ impl CoinbaseDirectConfig {
         } else {
             TradingStatus::Inactive
         };
-        Ok(CoinbaseDirectProductEvidence {
-            product: self.product().clone(),
+        Ok(DecodedProductFields {
+            base_currency: wire.base_currency,
+            quote_currency: wire.quote_currency,
             provider_status: status,
             trading_status,
             base_increment,
@@ -693,7 +831,6 @@ impl CoinbaseDirectConfig {
             post_only: wire.post_only,
             limit_only: wire.limit_only,
             auction_mode: wire.auction_mode,
-            capture: capture.receipt().clone(),
         })
     }
 }
@@ -716,6 +853,13 @@ fn validate_direct_budget(budget: &ProviderBudgetPolicy) -> Result<(), CoinbaseC
 fn direct_request_bounds(
     limits: CoinbaseDirectLimits,
 ) -> Result<HttpRequestBounds, CoinbaseConfigError> {
+    direct_request_bounds_with_max(limits, limits.max_snapshot_bytes)
+}
+
+fn direct_request_bounds_with_max(
+    limits: CoinbaseDirectLimits,
+    max_body_bytes: u64,
+) -> Result<HttpRequestBounds, CoinbaseConfigError> {
     let websocket = limits.websocket();
     let connect = u64::try_from(websocket.connect_timeout().as_nanos())
         .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?;
@@ -729,9 +873,115 @@ fn direct_request_bounds(
         NonZeroU64::new(read).ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
         NonZeroU64::new(total).ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
         0,
-        NonZeroU64::new(limits.max_snapshot_bytes)
-            .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        NonZeroU64::new(max_body_bytes).ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
     )?)
+}
+
+fn direct_product_reference_profile(
+    live: &SourceMetadata,
+    instrument: market_squawk_domain::InstrumentId,
+    venue: &VenueId,
+    product_url: &str,
+    limits: CoinbaseDirectLimits,
+) -> Result<CoinbaseDirectProductReferenceProfile, CoinbaseConfigError> {
+    let mut source_hash = Sha256::new();
+    source_hash.update(b"market-squawk/coinbase-direct-product-reference-source/v1\0");
+    for bytes in [live.source_id().as_str().as_bytes(), product_url.as_bytes()] {
+        source_hash.update(
+            u64::try_from(bytes.len())
+                .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?
+                .to_be_bytes(),
+        );
+        source_hash.update(bytes);
+    }
+    let source_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, source_hash.finalize().into());
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/coinbase-direct-product-reference-metadata/v1\0");
+    let live_digest = live
+        .revision_evidence()
+        .payload_evidence()
+        .content_digest()
+        .bytes();
+    for bytes in [
+        live.source_id().as_str().as_bytes(),
+        live.revision().as_source_identifier().as_str().as_bytes(),
+        live_digest.as_slice(),
+        product_url.as_bytes(),
+    ] {
+        hash.update(
+            u64::try_from(bytes.len())
+                .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?
+                .to_be_bytes(),
+        );
+        hash.update(bytes);
+    }
+    let metadata_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into());
+    let suffix = direct_digest_hex(metadata_digest);
+    let source_id = SourceId::try_from(format!(
+        "coinbase-direct-reference-{}",
+        direct_digest_hex(source_digest)
+    ))?;
+    let revision = MetadataRevision::new(SourceIdentifier::try_from(format!(
+        "coinbase-direct-reference-v1-{suffix}"
+    ))?);
+    let product_rule = ApiEndpointRule::try_new(product_url, PathScope::Exact, Vec::new(), 1, 1)?;
+    let endpoints = EndpointPolicy::try_new_combined(
+        std::iter::empty::<&str>(),
+        vec![product_rule],
+        direct_request_bounds_with_max(
+            limits,
+            limits
+                .max_snapshot_bytes
+                .min(MAX_PROVIDER_CAPTURE_PAGE_BYTES),
+        )?,
+    )?;
+    endpoints.authorize(product_url)?;
+    let coverage = SourceCoverage::try_instrument(
+        live.coverage().evidence().clone(),
+        live.coverage().effective_interval(),
+        vec![AssetClass::Crypto],
+        CoverageTopology::single_venue(venue.clone()),
+        InstrumentCoverage::enumerated(vec![instrument])?,
+        None,
+        CoverageDelay::RealTime,
+        DeliveryEvidence::DirectVenue,
+    )?;
+    let metadata = SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        source_id,
+        RevisionBoundPayloadEvidence::new(
+            revision,
+            ExactPayloadEvidence::from_content_digest(metadata_digest),
+        ),
+        SourceClass::Exchange,
+        live.provider().clone(),
+        live.authorization().clone(),
+        coverage,
+        DataQuality::DirectUnverified,
+        NetworkAccessPolicy::Allowlisted(endpoints),
+        live.freshness_policy(),
+        live.budget_policy().cloned(),
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::None,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))?;
+    Ok(CoinbaseDirectProductReferenceProfile { metadata })
+}
+
+fn direct_digest_hex(digest: EvidenceDigest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(64);
+    for byte in digest.bytes() {
+        result.push(char::from(HEX[usize::from(byte >> 4)]));
+        result.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    result
 }
 
 fn direct_rule(value: &str) -> Result<IntegrityRule, CoinbaseConfigError> {
@@ -2616,6 +2866,8 @@ pub enum CoinbaseDirectCaptureError {
 #[derive(Deserialize)]
 struct ProductWire {
     id: String,
+    base_currency: Option<SourceIdentifier>,
+    quote_currency: Option<SourceIdentifier>,
     status: String,
     base_increment: String,
     quote_increment: String,
@@ -2626,10 +2878,87 @@ struct ProductWire {
     auction_mode: bool,
 }
 
+#[derive(Clone, Debug)]
+struct DecodedProductFields {
+    base_currency: Option<SourceIdentifier>,
+    quote_currency: Option<SourceIdentifier>,
+    provider_status: SourceIdentifier,
+    trading_status: TradingStatus,
+    base_increment: ProviderQuantity,
+    quote_increment: ProviderQuantity,
+    trading_disabled: bool,
+    cancel_only: bool,
+    post_only: bool,
+    limit_only: bool,
+    auction_mode: bool,
+}
+
+/// Provider-authored product terms bound to the original sealed pre-session GET.
+/// This value deliberately retains the non-cloneable physical capture token.
+#[derive(Debug)]
+pub struct CoinbaseDirectProductReferenceEvidence {
+    product: ProviderProduct,
+    fields: DecodedProductFields,
+    token: ProviderWholeCaptureToken,
+}
+
+impl CoinbaseDirectProductReferenceEvidence {
+    pub const fn product(&self) -> &ProviderProduct {
+        &self.product
+    }
+
+    pub const fn base_currency(&self) -> Option<&SourceIdentifier> {
+        self.fields.base_currency.as_ref()
+    }
+
+    pub const fn quote_currency(&self) -> Option<&SourceIdentifier> {
+        self.fields.quote_currency.as_ref()
+    }
+
+    pub const fn trading_status(&self) -> TradingStatus {
+        self.fields.trading_status
+    }
+
+    pub const fn trading_disabled(&self) -> bool {
+        self.fields.trading_disabled
+    }
+
+    pub const fn cancel_only(&self) -> bool {
+        self.fields.cancel_only
+    }
+
+    pub const fn post_only(&self) -> bool {
+        self.fields.post_only
+    }
+
+    pub const fn limit_only(&self) -> bool {
+        self.fields.limit_only
+    }
+
+    pub const fn auction_mode(&self) -> bool {
+        self.fields.auction_mode
+    }
+
+    pub fn observed_at(&self) -> Timestamp {
+        self.token.persisted_receipt().capture().pages()[0].received_at()
+    }
+
+    pub fn capture_receipt(&self) -> &SealedProviderCaptureSetReceipt {
+        self.token.persisted_receipt()
+    }
+
+    /// Borrows the original non-cloneable physical proof for atomic catalog custody.
+    pub const fn capture_token(&self) -> &ProviderWholeCaptureToken {
+        &self.token
+    }
+}
+
 /// Current provider-authored product status and precision evidence.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectProductEvidence {
     product: ProviderProduct,
+    base_currency: Option<SourceIdentifier>,
+    quote_currency: Option<SourceIdentifier>,
     provider_status: SourceIdentifier,
     trading_status: TradingStatus,
     base_increment: ProviderQuantity,
@@ -2646,6 +2975,16 @@ impl CoinbaseDirectProductEvidence {
     /// Returns the exact provider product.
     pub const fn product(&self) -> &ProviderProduct {
         &self.product
+    }
+
+    /// Returns the provider-authored base currency when supplied by the product response.
+    pub const fn base_currency(&self) -> Option<&SourceIdentifier> {
+        self.base_currency.as_ref()
+    }
+
+    /// Returns the provider-authored quote currency when supplied by the product response.
+    pub const fn quote_currency(&self) -> Option<&SourceIdentifier> {
+        self.quote_currency.as_ref()
     }
 
     /// Returns the exact provider status token.
@@ -2765,6 +3104,38 @@ mod tests {
     static_assertions::assert_not_impl_any!(CoinbaseDirectAuthentication: Clone);
     static_assertions::assert_not_impl_any!(CoinbaseDirectHmacSigner: Clone);
     static_assertions::assert_not_impl_any!(super::CoinbaseSignedSubscription: Clone);
+
+    #[test]
+    fn product_reference_profile_only_authorizes_its_exact_get() -> TestResult {
+        let config = config()?;
+        let live = config.metadata();
+        let reference = config.product_reference_profile().metadata();
+        assert_ne!(reference.source_id(), live.source_id());
+        assert_ne!(reference.revision(), live.revision());
+        assert!(live.capabilities().live());
+        assert!(!live.capabilities().extraction());
+        assert!(!reference.capabilities().live());
+        assert!(reference.capabilities().extraction());
+        assert!(
+            reference
+                .network_policy()
+                .authorize(config.product_url())
+                .is_ok()
+        );
+        assert!(
+            reference
+                .network_policy()
+                .authorize(config.snapshot_url())
+                .is_err()
+        );
+        assert!(
+            reference
+                .network_policy()
+                .authorize(config.websocket_endpoint())
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn production_signer_decodes_and_zeroizes_the_exchange_secret_boundary() -> TestResult {

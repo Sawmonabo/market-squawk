@@ -41,9 +41,25 @@ use serde_json::{Value, json};
 use super::{ApplicationDomainService, domain_support::DomainLifecycle, effective_service_limits};
 use crate::ResearchService;
 
+mod benchmark_selection;
+pub(crate) mod saved_benchmark;
+pub(crate) use market_history::benchmark;
 mod company_product;
 mod company_research;
+pub(crate) mod corporate_actions;
+pub(crate) use corporate_actions::{
+    SourceActionPreparationCapability, SourceAppliedCorporateActionPlan,
+    SourceAppliedCorporateActionPlanReference, SourceAppliedCorporateActionReadCapability,
+};
 mod dataset_preparation;
+mod equity_premium;
+pub(crate) use equity_premium::{
+    HistoricalOriginEquityPremiumRead, EquityPremiumReadError, EquityPremiumUnavailable,
+    HistoricalEquityPremiumRead, HistoricalEquityPremiumReference,
+    MAXIMUM_EQUITY_PREMIUM_REFERENCE_BYTES, required_annual_source_dates,
+};
+pub(crate) mod financial_targets;
+pub(crate) mod fiscal_projection;
 mod forecast_evidence;
 mod fred;
 mod fund_product;
@@ -51,29 +67,66 @@ mod ingest;
 mod instrument_context;
 mod macro_context;
 mod macro_features;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+mod h15_installed_acceptance;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+pub use h15_installed_acceptance::{
+    H15InstalledAcceptance, H15InstalledAcceptanceError, H15InstalledAcceptanceRead,
+};
 mod market_history;
 mod options_context;
 mod sec_fund_job;
 mod sec_fund_product;
 mod sec_fundamentals;
+mod source_errors;
 mod treasury;
 
+pub(crate) use source_errors::{
+    map_current_population_error, map_durable_market_ingest_error,
+    map_market_definition_read_error, map_point_in_time_read_error, map_python_dataset_error,
+    map_research_use_error,
+};
+
+pub(crate) use benchmark_selection::{
+    RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
+    RecommendationBenchmarkSelectionReference, SelectedRecommendationBenchmark, BenchmarkComparisonChoice,
+};
 pub(crate) use company_product::CompanyProductResult;
 pub(crate) use company_research::{
     CompanyProductRead, CompanyResearchReadCapability, FundProductRead,
     ResearchProductReadCapability, ResearchProductReadError,
 };
 pub(crate) use dataset_preparation::{
+    HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGES,
+    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs, HistoricalFiscalJobReference,
+    HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference, HistoricalFiscalStudyBinding,
+    RecommendationCohortPreparationRequest,
+    ProbabilityBenchmarkSource, ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
+    ProbabilityCohortCoverage, PreparedProbabilityDatasetPair,
     DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
     DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
-    DatasetPreparationSelection, FeatureDatasetProductionFinalizer, PreparedFeatureDatasetBuild,
+    DatasetPreparationSelection, DatasetPreparationUse, FeatureDatasetProductionFinalizer,
+    PreparedFeatureDatasetBuild,
+    CurrentFindPartitionEvidenceReference, CurrentFindPartitionPreparationEvidence,
+    CurrentFindScreenPartition, PreparedCurrentFindFeaturePartition, PreparedCurrentFindFeatures,
+    FiscalDatasetPreparationRequest, PreparedFiscalDatasetPair,
+    HistoricalFiscalDatasetExpectation, HistoricalFiscalForecastReadCapability,
+    HistoricalFiscalForecastReference, HistoricalFiscalRecipeReference,
+    HistoricalFiscalSourceSelection, HistoricalFiscalTrainingAuthority,
+    HistoricalFiscalUnavailableReference, HistoricalOriginFinancialForecast,
+    PreparedHistoricalFiscalDatasets,
 };
-pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
+pub(crate) use forecast_evidence::{
+    AnalyticalForecastEvidenceReader, reopen_forecast_serving_output,
+};
 pub(crate) use fred::{
     FredLatestKnownAvailability, FredLatestKnownCompositionError, FredLatestKnownOperation,
 };
 pub(crate) use fund_product::FundProductResult;
+pub(crate) use ingest::BoardFullHistoryApplicationError;
 pub(crate) use ingest::{
+    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError, AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
+    AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector, AlpacaOptionMarketPointInTimeSelector,
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
     BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BLS_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION,
@@ -86,7 +139,10 @@ pub(crate) use ingest::{
     BlsSealFirstExtractionLimits, BlsWholePlanApplicationHandoff, CoinbaseMarketApplicationOutcome,
     CryptoCommittedRowIngress, CryptoMarketPublicationAuthority, CryptoMarketPublicationClosure,
     CryptoMarketPublicationError, CryptoMarketSurface, CryptoPendingFrameIngress,
-    CryptoPublicationRendezvousLimits, EiaApplicationAcquisitionLimits, EiaLiveComposition,
+    CryptoPublicationRendezvousLimits, CensusLiveComposition, CensusMacroApplicationClosure,
+    CensusMacroApplicationError, CensusPublicationReceipt, CensusQuarterlyPointInTimeRequest,
+    CensusQuarterlyRestartReceipt, CensusRestartSelector, CensusSealFirstExtractionLimits,
+    EiaApplicationAcquisitionLimits, EiaLiveComposition,
     EiaMacroApplicationClosure, EiaMacroApplicationError, EiaMacroEffectiveCutoff,
     EiaMacroPointInTimeRequest, EiaMacroPublicationReceipt, EiaMacroRestartReceipt,
     EiaMacroRestartSelector, FredPublishedGenerationHandoff, IexHistApplicationError,
@@ -103,10 +159,13 @@ pub(crate) use ingest::{
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
     SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
     SchwabRestQuotePostSealFailure, SchwabRestQuotePublicationPackage,
-    SchwabRestQuoteSourceHealthOutcome, SecFundPublicationReceipt, SecLiveFundApplicationError,
+    SchwabRestQuoteSourceHealthOutcome, SchwabStreamerApplicationOutcome,
+    SchwabStreamerGenerationAuthority, SchwabStreamerPublicationPackage, SecFundPublicationReceipt, SecLiveFundApplicationError,
     SecLiveFundRequest, SecLiveFundSource, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
-    TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION, TreasuryApplicationClosure,
-    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
+    TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION, TiingoCompletedEodActionRead,
+    TiingoCompletedEodHistoryReference, TiingoEodHistoryPublicationReceipt,
+    TiingoHistoryApplicationError, TiingoLatestApplicationError, TreasuryApplicationClosure, TreasuryMacroPublicationReceipt,
+    TreasurySelectedObjectRequest,
 };
 pub(crate) use ingest::{
     BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
@@ -119,7 +178,10 @@ pub use ingest::{
     ResearchSourceObjectListing,
 };
 pub(crate) use instrument_context::{
-    InstrumentContext, InstrumentContextOutcome, InstrumentContextReadCapability,
+    FindPopulationCoverage, FindPopulationExclusion, FindPopulationExclusionReason,
+    FindPopulationReference, PreparedFindCandidate, PreparedFindPopulation,
+    prepare_find_population, prepare_fixed_current_population, read_find_population,
+    InstrumentContext, InstrumentContextOutcome, InstrumentContextRead, InstrumentContextReadCapability,
     InstrumentContextReadError, InstrumentContextRequest, InstrumentIdentityReadCapability,
     InstrumentIdentityResolutionOutcome, InstrumentIdentityResolutionRead,
     InstrumentIdentityResolutionRequest, InstrumentOfficialLifecycleEvidence,
@@ -127,13 +189,15 @@ pub(crate) use instrument_context::{
     InstrumentSearchRead, InstrumentSearchRequest,
 };
 pub(crate) use macro_context::{
-    MACRO_GET_CONTEXT, MacroContextOperation, MacroContextReadCapability,
+    MACRO_CONTEXT_INDICATOR_COUNT, MACRO_GET_CONTEXT, MACRO_GET_LATEST_SERIES_OBSERVATION, MACRO_GET_SERIES_HISTORY, MacroContextOperation, MacroContextReadCapability,
     RESIDENTIAL_ELECTRICITY_PRICE_DATASET,
 };
 pub(crate) use macro_features::{
-    MacroFeatureVector, read_macro_feature_vector,
+    MacroFeatureVector, MacroInvestmentContext, read_macro_feature_vector,
 };
 pub(crate) use market_history::{
+    HarmonicHistoryEvaluation,
+    MarketHistoryInterval,
     LatestMarketHistoryReadRequest, MAX_MARKET_HISTORY_BARS, MarketHistoryAdjustmentPolicy,
     MarketHistoryBar, MarketHistoryCoverage, MarketHistoryMissingReason,
     MarketHistoryPartialReason, MarketHistoryQuality, MarketHistoryReadCapability,
@@ -141,7 +205,8 @@ pub(crate) use market_history::{
     MarketHistorySessionPolicy, MarketHistoryTimeframe, MarketHistoryUnavailableReason,
 };
 pub(crate) use options_context::{
-    OptionsContextReadCapability, OptionsObservationReadAvailability,
+    OptionsContextAvailability, OptionsContextError, OptionsContextReadCapability,
+    OptionsContextRequest, OptionsContextUnavailableReason, OptionsObservationReadAvailability,
     OptionsReferenceReadAvailability,
 };
 pub(crate) use sec_fund_job::{
@@ -339,6 +404,10 @@ impl ResearchApplicationServices {
         )
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "fixed option dataset and singleton route are valid by construction"
+    )]
     fn compose(
         service: Arc<ResearchService>,
         ingest: Arc<dyn ResearchIngestCoordinator>,
@@ -374,7 +443,11 @@ impl ResearchApplicationServices {
                     .analytical()
                     .official_options_reference_catalog_reader(),
             ),
-            OptionsObservationReadAvailability::SetupRequired,
+            OptionsObservationReadAvailability::try_ready(vec![
+                DatasetId::try_from("market_squawk.option_snapshots")
+                    .expect("code-owned option snapshot dataset"),
+            ])
+            .expect("code-owned option observation route"),
         );
         let market_history = MarketHistoryReadCapability::new(reader.clone());
         Self {
@@ -711,8 +784,19 @@ impl ApplicationDomainService for MacroDomainService {
                     .macro_dashboard(&request, &context, limits)
                     .await
             }
-            MACRO_LIST_SERIES
-            | MACRO_GET_OBSERVATIONS
+            MACRO_LIST_SERIES => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller.macro_context.list_saved_series(&request, &context, limits).await
+            }
+            MACRO_GET_LATEST_SERIES_OBSERVATION => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller.macro_context.get_latest_saved_series_observation(&request, &context, limits).await
+            }
+            MACRO_GET_SERIES_HISTORY => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller.macro_context.get_saved_series_history(&request, &context, limits).await
+            }
+            MACRO_GET_OBSERVATIONS
             | MACRO_GET_VINTAGES
             | MACRO_GET_REVISIONS => {
                 let limits = effective_service_limits(&request, &context)?;
@@ -1723,6 +1807,19 @@ fn encode_hex(bytes: [u8; 32]) -> String {
 
 fn map_read_error(error: AnalyticalReadError) -> ServiceError {
     match error {
+        AnalyticalReadError::NativeSessionControl(error) => match error {
+            market_squawk_platform::ResearchObjectControlError::Cancelled => {
+                ServiceError::Cancelled
+            }
+            market_squawk_platform::ResearchObjectControlError::DeadlineExceeded => {
+                ServiceError::DeadlineExceeded
+            }
+            market_squawk_platform::ResearchObjectControlError::Unavailable => {
+                ServiceError::Unavailable
+            }
+        },
+        AnalyticalReadError::InputEpochResultRequiresInline => ServiceError::ResourceExhausted,
+        AnalyticalReadError::InvalidInputEpoch => ServiceError::InvalidResult,
         AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
@@ -1731,6 +1828,7 @@ fn map_read_error(error: AnalyticalReadError) -> ServiceError {
         | AnalyticalReadError::InvalidMarketBarEffectiveRange
         | AnalyticalReadError::InvalidFundNavLimit
         | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidMacroHistoryRequest
         | AnalyticalReadError::InvalidMacroSeriesAllowlist
         | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
         | AnalyticalReadError::InvalidOutcomeMarketBarWindow
@@ -1745,42 +1843,77 @@ fn map_read_error(error: AnalyticalReadError) -> ServiceError {
         | AnalyticalReadError::MacroSnapshotIncomplete
         | AnalyticalReadError::InvalidMacroSnapshotResult => ServiceError::InvalidResult,
         AnalyticalReadError::ForecastDatasetUnavailable => ServiceError::NotFound,
-        AnalyticalReadError::Parquet(_) | AnalyticalReadError::PythonDataset(_) => {
-            ServiceError::Unavailable
-        }
+        AnalyticalReadError::Parquet(error) => source_errors::map_parquet_error(error),
+        AnalyticalReadError::PythonDataset(error) => map_python_dataset_error(error),
         AnalyticalReadError::Manifest(error) => map_manifest_error(error),
         AnalyticalReadError::Query(error) => map_query_error(error),
     }
 }
 
-fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
+pub(crate) fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
     match error {
+        ManifestCatalogError::PopulationResearchUse(error) => map_research_use_error(*error),
         ManifestCatalogError::Cancelled => ServiceError::Cancelled,
         ManifestCatalogError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         ManifestCatalogError::ObjectLimitExceeded { .. }
+        | ManifestCatalogError::CaptureInputLimitExceeded { .. }
+        | ManifestCatalogError::SourceRunInputLimitExceeded { .. }
         | ManifestCatalogError::ReferenceWorkLimitExceeded { .. }
         | ManifestCatalogError::FeatureDatasetCandidateLimitExceeded { .. }
         | ManifestCatalogError::FundNavInputLimitExceeded { .. }
+        | ManifestCatalogError::MarketBarHistoryInputLimitExceeded { .. }
         | ManifestCatalogError::CountOverflow
         | ManifestCatalogError::AllocationContract => ServiceError::ResourceExhausted,
-        ManifestCatalogError::FundNavPublicationMismatch => ServiceError::InvalidResult,
-        ManifestCatalogError::InvalidConfiguration
-        | ManifestCatalogError::MigrationMissing
-        | ManifestCatalogError::AnchorMismatch
+        ManifestCatalogError::AnchorMismatch
         | ManifestCatalogError::GenerationConflict
         | ManifestCatalogError::SourceMismatch
         | ManifestCatalogError::SchemaMismatch
         | ManifestCatalogError::SchemaIdentity(_)
         | ManifestCatalogError::CorruptCatalog
-        | ManifestCatalogError::CaptureInputLimitExceeded { .. }
         | ManifestCatalogError::MarketBarHistoryMismatch
-        | ManifestCatalogError::MarketBarHistoryInputLimitExceeded { .. }
-        | ManifestCatalogError::ProviderMacroPlanMismatch
+        | ManifestCatalogError::FundNavPublicationMismatch
+        | ManifestCatalogError::ProviderMacroPlanMismatch => ServiceError::InvalidResult,
+        ManifestCatalogError::SourceRunsIncomplete => ServiceError::InvalidResult,
+        ManifestCatalogError::CatalogAuthority(error) => map_catalog_error(error),
+        ManifestCatalogError::InvalidConfiguration
+        | ManifestCatalogError::MigrationMissing
         | ManifestCatalogError::LockPoisoned
         | ManifestCatalogError::Plan(_)
         | ManifestCatalogError::Path(_)
-        | ManifestCatalogError::Sqlite(_)
-        | ManifestCatalogError::CatalogAuthority(_) => ServiceError::Unavailable,
+        | ManifestCatalogError::Sqlite(_) => ServiceError::Unavailable,
+    }
+}
+
+pub(super) fn map_catalog_error(error: market_squawk_data::CatalogError) -> ServiceError {
+    use market_squawk_data::CatalogError;
+    match error {
+        CatalogError::InstrumentDefinitionReadCancelled
+        | CatalogError::CompanyIdentityReadCancelled
+        | CatalogError::MarketRecoveryReadCancelled
+        | CatalogError::AnalyticalEvidenceCancelled
+        | CatalogError::QueryArtifactCancelled => ServiceError::Cancelled,
+        CatalogError::InstrumentDefinitionReadDeadlineExceeded
+        | CatalogError::CompanyIdentityReadDeadlineExceeded
+        | CatalogError::MarketRecoveryReadDeadlineExceeded
+        | CatalogError::QueryArtifactDeadlineExceeded
+        | CatalogError::OnboardingDeadlineExceeded => ServiceError::DeadlineExceeded,
+        CatalogError::ResultByteLimitExceeded
+        | CatalogError::ResultRowLimitExceeded
+        | CatalogError::Allocation
+        | CatalogError::AnalyticalEvidenceLimitExceeded => ServiceError::ResourceExhausted,
+        CatalogError::InvalidLimit => ServiceError::InvalidRequest,
+        CatalogError::CorruptCatalog
+        | CatalogError::InvalidRecord
+        | CatalogError::InstrumentRevisionConflict
+        | CatalogError::EvidenceConflict
+        | CatalogError::ProviderEventMismatch
+        | CatalogError::ProviderCaptureMismatch
+        | CatalogError::ManifestArtifactMismatch
+        | CatalogError::PublicationTimeConflict => ServiceError::InvalidResult,
+        CatalogError::RightsDenied(_)
+        | CatalogError::RightsNotAdmitted
+        | CatalogError::InvalidRightsCapability => ServiceError::Unauthorized,
+        _ => ServiceError::Unavailable,
     }
 }
 
@@ -1826,3 +1959,8 @@ fn map_query_error(error: QueryError) -> ServiceError {
         | QueryError::ObjectStore(_) => ServiceError::Unavailable,
     }
 }
+
+pub(crate) use ingest::{
+    BeaLivePublicationError, BeaRegionalLiveComposition, BeaRegionalLiveOutcome,
+    BeaRegionalLiveRequest, BeaRegionalLiveRuntime, BeaRegisteredSource,
+};

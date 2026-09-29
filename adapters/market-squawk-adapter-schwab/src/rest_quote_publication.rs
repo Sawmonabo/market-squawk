@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use market_squawk_domain::{
     ConnectionGeneration as DomainConnectionGeneration, DataQuality, DigestAlgorithm,
-    EvidenceDigest, InstrumentId, LiveEventClass, LiveProvenance, LotSize, MarketDepth,
-    ProviderChannel, ProviderProduct, SourceIdentifier, TickSize, Timestamp, VenueId,
+    EvidenceDigest, InstrumentId, LiveEventClass, LiveProvenance, MarketDataReference, MarketDepth,
+    ProviderChannel, ProviderProduct, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ProviderCaptureError, ProviderMarketEventBatch, ProviderMarketEventNativeLineageBatch,
@@ -21,7 +21,7 @@ use crate::{
     NativeField, NativeScalar, QuoteComponentField, ReadOnlyRoute, SchwabCanonicalError,
     SchwabMarketDataDelay, SchwabMarketDataQualification, SchwabQuote, SchwabQuoteAbstention,
     SchwabQuoteCanonicalOutcome, SchwabResolvedProviderIdentity, SchwabRestPayload,
-    SchwabSealedRestResponse, canonicalize_quote,
+    SchwabSealedRestResponse, canonicalize_market_data_quote,
 };
 
 /// Exact REST feed/venue/depth/delay and live-provenance binding for one quote record.
@@ -113,8 +113,7 @@ pub struct SchwabRestQuoteRecordRequest {
     instrument_id: InstrumentId,
     source_identifier: SourceIdentifier,
     provenance: LiveProvenance,
-    tick_size: TickSize,
-    lot_size: LotSize,
+    reference: MarketDataReference,
     market_data: SchwabRestQuoteMarketDataEvidence,
 }
 
@@ -122,15 +121,14 @@ impl SchwabRestQuoteRecordRequest {
     /// Constructs one exact quote mapping input. Validation occurs against the sealed response.
     #[allow(
         clippy::too_many_arguments,
-        reason = "identity, economics, provenance, and market semantics remain explicit"
+        reason = "identity, reference evidence, provenance, and market semantics remain explicit"
     )]
     pub fn new(
         identity: SchwabResolvedProviderIdentity,
         instrument_id: InstrumentId,
         source_identifier: SourceIdentifier,
         provenance: LiveProvenance,
-        tick_size: TickSize,
-        lot_size: LotSize,
+        reference: MarketDataReference,
         market_data: SchwabRestQuoteMarketDataEvidence,
     ) -> Self {
         Self {
@@ -138,8 +136,7 @@ impl SchwabRestQuoteRecordRequest {
             instrument_id,
             source_identifier,
             provenance,
-            tick_size,
-            lot_size,
+            reference,
             market_data,
         }
     }
@@ -230,6 +227,15 @@ pub struct SchwabSealedRestQuotePublication {
 }
 
 impl SchwabSealedRestQuotePublication {
+    /// Attaches accepted-row catalog selections before the publication digest is reserved.
+    pub fn with_provider_identities(
+        mut self,
+        selections: Vec<Option<market_squawk_sources::ProviderIdentitySelectionEvidence>>,
+    ) -> Result<Self, SchwabRestQuotePublicationError> {
+        self.binding = self.binding.with_provider_identities(selections)?;
+        Ok(self)
+    }
+
     /// Sole shared typed response-event publication authority.
     pub const fn binding(&self) -> &SealedProviderResponseMarketEventBinding {
         &self.binding
@@ -303,12 +309,11 @@ impl SchwabSealedRestResponse {
             };
             used.insert(quote.symbol().clone());
             validate_quote_mapping(parts, quote, input)?;
-            match canonicalize_quote(
+            match canonicalize_market_data_quote(
                 quote,
                 input.identity.clone(),
                 input.provenance.clone(),
-                input.tick_size,
-                input.lot_size,
+                input.reference.clone(),
             ) {
                 Ok(SchwabQuoteCanonicalOutcome::Mapped {
                     provider_instrument_id,
@@ -395,7 +400,14 @@ fn validate_quote_mapping(
     let binding = input.provenance.binding();
     let received_at = timestamp_from_millis(parts.receipt.received_at_unix_millis())?;
     let source_timestamp = quote_source_timestamp(quote)?;
-    if input.identity.provider_symbol() != quote.symbol()
+    if input.reference.instrument_id() != input.instrument_id
+        || input
+            .reference
+            .provider_identity()
+            .ok_or(SchwabRestQuotePublicationError::InvalidEvidence)?
+            .provider_instrument_id()
+            != input.identity.provider_instrument_id()
+        || input.identity.provider_symbol() != quote.symbol()
         || input.identity.resolution_evidence().algorithm() != DigestAlgorithm::Sha256
         || input.identity.resolution_evidence().bytes() == [0; 32]
         || input.market_data.depth() != MarketDepth::TopOfBook
@@ -404,7 +416,7 @@ fn validate_quote_mapping(
         || binding.session_id() != &input.market_data.session_id
         || binding.connection_generation() != input.market_data.connection_generation
         || binding.venue_id() != input.market_data.venue_id()
-        || binding.instrument_id() != input.instrument_id
+        || binding.instrument_id() != Some(input.instrument_id)
         || binding.provider_product() != input.market_data.provider_product()
         || binding.provider_channel() != input.market_data.provider_channel()
         || binding.event_class() != LiveEventClass::Quote

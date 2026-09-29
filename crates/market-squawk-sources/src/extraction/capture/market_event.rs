@@ -2,7 +2,9 @@
 
 use std::io::{self, Write};
 
-use market_squawk_domain::{LiveProvenance, MarketEvent};
+use market_squawk_domain::{
+    LiveEvidenceBinding, LiveEvidenceScope, LiveEventClass, LiveProvenance, MarketEvent,
+};
 
 use super::super::native_lineage::{
     MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
@@ -88,6 +90,7 @@ impl ProviderMarketEventBatch {
         let mut retained_bytes = 0_usize;
         for event in &events {
             let provenance = market_event_provenance(event);
+            validate_market_event_scope(event)?;
             if provenance.source_id() != &source_id
                 || provenance.binding().metadata_revision() != &metadata_revision
             {
@@ -126,6 +129,29 @@ impl ProviderMarketEventBatch {
                 event_count,
             },
         })
+    }
+
+    /// Checks observational publication against exact registered declarations.
+    ///
+    /// This does not mint current-price or execution authority. Instrument observations require
+    /// enumerated membership; source cohorts require their exact declared key on their own channel.
+    pub fn validate_source_metadata(
+        &self,
+        metadata: &crate::SourceMetadata,
+    ) -> Result<(), ProviderCaptureError> {
+        if self.source_id() != metadata.source_id()
+            || self.metadata_revision() != metadata.revision()
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        for event in self.events() {
+            validate_market_event_scope(event)?;
+            let provenance = market_event_provenance(event);
+            validate_provider_market_event_binding_metadata(
+                provenance.binding(), provenance.received_at(), metadata,
+            )?;
+        }
+        Ok(())
     }
 
     /// Returns the exact source authority identity.
@@ -174,16 +200,84 @@ impl ProviderMarketEventBatch {
     }
 }
 
+/// Checks one retained observation binding against its exact registered source revision.
+///
+/// The original receive time controls metadata effectiveness. This observational check never
+/// grants current price, health, or execution authority and does not substitute for typed payload
+/// validation or independent canonical-reference admission.
+pub fn validate_provider_market_event_binding_metadata(
+    binding: &LiveEvidenceBinding,
+    received_at: Timestamp,
+    metadata: &crate::SourceMetadata,
+) -> Result<(), ProviderCaptureError> {
+    let coverage = metadata.coverage();
+    if binding.source_id() != metadata.source_id()
+        || binding.metadata_revision() != metadata.revision()
+        || !metadata.is_effective_at(received_at)
+        || !coverage.topology().contains_venue(binding.venue_id())
+        || binding.authorization_basis() != metadata.authorization().basis()
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let channel = coverage
+        .live_for(binding.provider_product(), binding.provider_channel())
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    let rule = channel
+        .rule_for(
+            binding.event_class(),
+            binding.book_state().map(|state| state.depth()),
+        )
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    let declared = match binding.scope() {
+        LiveEvidenceScope::Instrument(instrument) => {
+            rule.source_cohorts().is_empty()
+                && coverage.instruments().membership(*instrument)
+                    == crate::InstrumentCoverageMembership::Enumerated
+        }
+        LiveEvidenceScope::SourceCohort(key) => rule.permits_source_cohort(key),
+    };
+    if declared {
+        Ok(())
+    } else {
+        Err(ProviderCaptureError::SealedBindingMismatch)
+    }
+}
+
 fn market_event_provenance(event: &MarketEvent) -> &LiveProvenance {
     match event {
         MarketEvent::Trade(event) => event.provenance(),
         MarketEvent::Quote(event) => event.provenance(),
+        MarketEvent::MarketDataQuote(event) => event.provenance(),
+        MarketEvent::MarketDataTrade(event) => event.provenance(),
+        MarketEvent::MarketDataBook(event) => event.provenance(),
+        MarketEvent::MarketDataChart(event) => event.provenance(),
+        MarketEvent::MarketDataScreener(event) => event.provenance(),
         MarketEvent::BookSnapshot(event) => event.provenance(),
         MarketEvent::BookDelta(event) => event.provenance(),
         MarketEvent::Auction(event) => event.provenance(),
         MarketEvent::TradingHalt(event) => event.provenance(),
         MarketEvent::InstrumentStatus(event) => event.provenance(),
         MarketEvent::CorporateAction(event) => event.provenance(),
+    }
+}
+
+fn validate_market_event_scope(event: &MarketEvent) -> Result<(), ProviderCaptureError> {
+    let binding = market_event_provenance(event).binding();
+    let valid = match (event, binding.scope()) {
+        (MarketEvent::MarketDataScreener(event), LiveEvidenceScope::SourceCohort(key)) => {
+            binding.event_class() == LiveEventClass::Screener
+                && key == &event.input().cohort_key
+                && key == binding.source_identifier()
+                && binding.book_state().is_none()
+        }
+        (MarketEvent::MarketDataScreener(_), LiveEvidenceScope::Instrument(_))
+        | (_, LiveEvidenceScope::SourceCohort(_)) => false,
+        (_, LiveEvidenceScope::Instrument(_)) => binding.event_class() != LiveEventClass::Screener,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ProviderCaptureError::SealedBindingMismatch)
     }
 }
 
@@ -244,6 +338,10 @@ fn provider_market_event_schema_fingerprint() -> EvidenceDigest {
     let mut digest = Sha256::new();
     hash_field(&mut digest, PROVIDER_MARKET_EVENT_SCHEMA_DOMAIN);
     digest.update(PROVIDER_MARKET_EVENT_SCHEMA_VERSION.to_be_bytes());
+    hash_field(
+        &mut digest,
+        b"market-data-reference-native-trade-stream-scope-v1",
+    );
     EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
 }
 
@@ -254,6 +352,7 @@ pub struct ProviderMarketEventNativeLineageBatch {
     content_identity: ProviderMarketEventContentIdentity,
     rows: Box<[Bytes]>,
     row_digests: Box<[EvidenceDigest]>,
+    identity_selections: Box<[Option<Bytes>]>,
     batch_sidecar: Option<Bytes>,
     batch_sidecar_digest: Option<EvidenceDigest>,
     batch_digest: EvidenceDigest,
@@ -267,6 +366,28 @@ impl ProviderMarketEventNativeLineageBatch {
         rows: Vec<Bytes>,
         batch_sidecar: Option<Bytes>,
     ) -> Result<Self, ProviderCaptureError> {
+        if rows.len() != batch.events().len() || rows.len() > MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(rows.len())
+            .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        identities.resize_with(rows.len(), || None);
+        Self::try_new_with_identity_bytes(implementation, batch, rows, batch_sidecar, identities)
+    }
+
+    fn try_new_with_identity_bytes(
+        implementation: ProviderNativeLineageImplementation,
+        batch: &ProviderMarketEventBatch,
+        rows: Vec<Bytes>,
+        batch_sidecar: Option<Bytes>,
+        identity_selections: Vec<Option<Bytes>>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if identity_selections.len() != rows.len() {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
         if rows.len() != batch.events().len() || rows.len() > MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS
         {
             return Err(ProviderCaptureError::SealedBindingMismatch);
@@ -306,6 +427,30 @@ impl ProviderMarketEventNativeLineageBatch {
         if retained > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
+        for (event, selection) in batch.events().iter().zip(&identity_selections) {
+            if let Some(payload) = selection {
+                if payload.is_empty() || payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+                    return Err(ProviderCaptureError::SealedBindingMismatch);
+                }
+                let evidence: crate::ProviderIdentitySelectionEvidence =
+                    serde_json::from_slice(payload)
+                        .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+                let provenance = market_event_provenance(event);
+                if provenance.instrument_id() != Some(evidence.native.instrument)
+                    || provenance.venue_id() != Some(&evidence.native.venue)
+                    || evidence.native.knowledge_at > provenance.received_at()
+                    || evidence.native.effective_at > provenance.received_at()
+                {
+                    return Err(ProviderCaptureError::SealedBindingMismatch);
+                }
+                retained = retained
+                    .checked_add(payload.len())
+                    .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+            }
+        }
+        if retained > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
         let content_identity = batch.content_identity();
         let batch_digest = provider_market_event_native_lineage_batch_digest(
             PROVIDER_MARKET_EVENT_SCHEMA_VERSION,
@@ -323,6 +468,7 @@ impl ProviderMarketEventNativeLineageBatch {
                             .ok_or(ProviderCaptureError::SealedBindingMismatch)?,
                         native_semantic_bytes: row.len(),
                         native_semantic_digest: *row_digest,
+                        identity_selection: identity_selections[ordinal].as_deref(),
                     })
                 }),
             batch_sidecar
@@ -340,6 +486,7 @@ impl ProviderMarketEventNativeLineageBatch {
             content_identity,
             rows: rows.into_boxed_slice(),
             row_digests: row_digests.into_boxed_slice(),
+            identity_selections: identity_selections.into_boxed_slice(),
             batch_sidecar,
             batch_sidecar_digest,
             batch_digest,
@@ -366,6 +513,55 @@ impl ProviderMarketEventNativeLineageBatch {
         self.row_digests.get(ordinal).copied()
     }
 
+    /// Returns bounded serialized catalog selection evidence for the exact canonical row.
+    /// This projection is historical evidence and cannot recreate current authority.
+    pub fn identity_selection(&self, ordinal: usize) -> Option<&[u8]> {
+        self.identity_selections
+            .get(ordinal)
+            .and_then(Option::as_deref)
+    }
+
+    fn with_provider_identities(
+        self,
+        batch: &ProviderMarketEventBatch,
+        selections: Vec<Option<crate::ProviderIdentitySelectionEvidence>>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if selections.len() != self.rows.len()
+            || self.identity_selections.iter().any(Option::is_some)
+        {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(selections.len())
+            .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        for selection in selections {
+            let Some(selection) = selection else {
+                identities.push(None);
+                continue;
+            };
+            if selection
+                .dynamic_retained_bytes()
+                .is_none_or(|bytes| bytes > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES)
+            {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            let payload = serde_json::to_vec(&selection)
+                .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+            if payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            identities.push(Some(Bytes::from(payload)));
+        }
+        Self::try_new_with_identity_bytes(
+            self.implementation,
+            batch,
+            self.rows.into_vec(),
+            self.batch_sidecar,
+            identities,
+        )
+    }
+
     /// Returns optional exact batch-level provider-native semantics.
     pub const fn batch_sidecar(&self) -> Option<&Bytes> {
         self.batch_sidecar.as_ref()
@@ -382,11 +578,12 @@ impl ProviderMarketEventNativeLineageBatch {
     }
 
     fn validate(&self, batch: &ProviderMarketEventBatch) -> Result<(), ProviderCaptureError> {
-        let rebuilt = Self::try_new(
+        let rebuilt = Self::try_new_with_identity_bytes(
             self.implementation,
             batch,
             self.rows.to_vec(),
             self.batch_sidecar.clone(),
+            self.identity_selections.to_vec(),
         )?;
         if rebuilt.content_identity != self.content_identity
             || rebuilt.row_digests != self.row_digests
@@ -409,6 +606,7 @@ pub struct ProviderMarketEventNativeLineageRowEvidenceRef<'a> {
     canonical_event_digest: EvidenceDigest,
     native_semantic_payload: &'a [u8],
     native_semantic_digest: EvidenceDigest,
+    identity_selection: Option<&'a [u8]>,
 }
 
 impl<'a> ProviderMarketEventNativeLineageRowEvidenceRef<'a> {
@@ -442,15 +640,33 @@ impl<'a> ProviderMarketEventNativeLineageRowEvidenceRef<'a> {
             canonical_event_digest,
             native_semantic_payload,
             native_semantic_digest,
+            identity_selection: None,
         })
     }
 
-    fn digest_projection(&self) -> ProviderMarketEventNativeLineageDigestRow {
+    /// Adds the original serialized selection projection to the restart hash contract.
+    pub fn with_identity_selection(
+        mut self,
+        evidence: Option<&'a [u8]>,
+    ) -> Result<Self, ProviderCaptureError> {
+        if let Some(payload) = evidence {
+            if payload.is_empty() || payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+                return Err(ProviderCaptureError::SealedBindingMismatch);
+            }
+            let _: crate::ProviderIdentitySelectionEvidence = serde_json::from_slice(payload)
+                .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+        }
+        self.identity_selection = evidence;
+        Ok(self)
+    }
+
+    fn digest_projection(&self) -> ProviderMarketEventNativeLineageDigestRow<'_> {
         ProviderMarketEventNativeLineageDigestRow {
             canonical_row_ordinal: self.canonical_row_ordinal,
             canonical_event_digest: self.canonical_event_digest,
             native_semantic_bytes: self.native_semantic_payload.len(),
             native_semantic_digest: self.native_semantic_digest,
+            identity_selection: self.identity_selection,
         }
     }
 }
@@ -490,6 +706,7 @@ pub fn verify_provider_market_event_native_lineage_batch_evidence(
     for (expected_ordinal, row) in rows.iter().enumerate() {
         retained_bytes = retained_bytes
             .checked_add(row.native_semantic_payload.len())
+            .and_then(|bytes| bytes.checked_add(row.identity_selection.map_or(0, <[u8]>::len)))
             .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
         if row.canonical_row_ordinal
             != u32::try_from(expected_ordinal)
@@ -541,11 +758,12 @@ pub fn verify_provider_market_event_native_lineage_batch_evidence(
 }
 
 #[derive(Clone, Copy)]
-struct ProviderMarketEventNativeLineageDigestRow {
+struct ProviderMarketEventNativeLineageDigestRow<'a> {
     canonical_row_ordinal: u32,
     canonical_event_digest: EvidenceDigest,
     native_semantic_bytes: usize,
     native_semantic_digest: EvidenceDigest,
+    identity_selection: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Copy)]
@@ -554,12 +772,12 @@ struct ProviderMarketEventNativeLineageSidecarDigestEvidence {
     native_semantic_digest: EvidenceDigest,
 }
 
-fn provider_market_event_native_lineage_batch_digest(
+fn provider_market_event_native_lineage_batch_digest<'a>(
     schema_version: u16,
     implementation: ProviderNativeLineageImplementation,
     canonical_content_digest: EvidenceDigest,
     rows: impl ExactSizeIterator<
-        Item = Result<ProviderMarketEventNativeLineageDigestRow, ProviderCaptureError>,
+        Item = Result<ProviderMarketEventNativeLineageDigestRow<'a>, ProviderCaptureError>,
     >,
     batch_sidecar: Option<ProviderMarketEventNativeLineageSidecarDigestEvidence>,
 ) -> Result<EvidenceDigest, ProviderCaptureError> {
@@ -579,6 +797,13 @@ fn provider_market_event_native_lineage_batch_digest(
         hash_digest(&mut digest, row.canonical_event_digest);
         hash_binding_length(&mut digest, row.native_semantic_bytes)?;
         hash_digest(&mut digest, row.native_semantic_digest);
+        match row.identity_selection {
+            Some(evidence) => {
+                digest.update([1]);
+                hash_binding_field(&mut digest, evidence)?;
+            }
+            None => digest.update([0]),
+        }
     }
     match batch_sidecar {
         Some(sidecar) => {
@@ -801,6 +1026,26 @@ pub struct SealedProviderEventMicrobatchBinding {
 }
 
 impl SealedProviderEventMicrobatchBinding {
+    /// Binds row-aligned catalog-selected evidence before the publication digest is reserved.
+    /// Source-cohort rows retain `None`; they never acquire an invented instrument identity.
+    /// Copied evidence grants no live authority; data publication replays it under catalog lock.
+    pub fn with_provider_identities(
+        mut self,
+        selections: Vec<Option<crate::ProviderIdentitySelectionEvidence>>,
+    ) -> Result<Self, ProviderCaptureError> {
+        self.native_lineage = self
+            .native_lineage
+            .with_provider_identities(&self.batch, selections)?;
+        self.evidence_digest = provider_event_microbatch_binding_digest(
+            &self.authority,
+            self.content_identity,
+            &self.native_lineage,
+            &self.row_frames,
+        )?;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Consumes one sealed event token into canonical/native publication authority.
     pub fn try_new(
         authority: ProviderEventMicrobatchToken,
@@ -1049,6 +1294,26 @@ pub struct SealedProviderResponseMarketEventBinding {
 }
 
 impl SealedProviderResponseMarketEventBinding {
+    /// Binds row-aligned catalog-selected evidence before the publication digest is reserved.
+    /// Source-cohort rows retain `None`; they never acquire an invented instrument identity.
+    /// Copied evidence grants no live authority; data publication replays it under catalog lock.
+    pub fn with_provider_identities(
+        mut self,
+        selections: Vec<Option<crate::ProviderIdentitySelectionEvidence>>,
+    ) -> Result<Self, ProviderCaptureError> {
+        self.native_lineage = self
+            .native_lineage
+            .with_provider_identities(&self.batch, selections)?;
+        self.evidence_digest = provider_response_market_event_binding_digest(
+            &self.authority,
+            self.content_identity,
+            &self.native_lineage,
+            &self.row_frames,
+        )?;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Consumes a whole sealed HTTP response into typed canonical market-event authority.
     pub fn try_new(
         authority: ProviderWholeCaptureToken,
@@ -1474,7 +1739,14 @@ fn event_microbatch_row_frames(
             .frames()
             .get(frame_index)
             .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
-        if event.ordinal() != event_frame_ordinal
+        let canonical = batch
+            .events()
+            .get(row_ordinal)
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        let provenance = market_event_provenance(canonical);
+        if provenance.binding().payload_digest() != event.payload_digest()
+            || provenance.received_at() != event.received_at()
+            || event.ordinal() != event_frame_ordinal
             || physical.ordinal() != u32::from(event_frame_ordinal)
             || physical.provider_payload_bytes() != event.payload_bytes()
             || physical.provider_payload_digest() != event.payload_digest()
@@ -1834,6 +2106,25 @@ pub struct SealedProviderCompositeResponseEventBinding {
 }
 
 impl SealedProviderCompositeResponseEventBinding {
+    /// Binds selections in canonical response-then-event order before reserving the composite.
+    pub fn with_provider_identities(
+        self,
+        mut selections: Vec<Option<crate::ProviderIdentitySelectionEvidence>>,
+    ) -> Result<Self, ProviderCaptureError> {
+        let response_count = self.response.record_count();
+        let total = response_count
+            .checked_add(self.event.record_count())
+            .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+        if selections.len() != total {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let event = selections.split_off(response_count);
+        Self::try_new(
+            self.response.with_provider_identities(selections)?,
+            self.event.with_provider_identities(event)?,
+        )
+    }
+
     /// Joins independently sealed and canonical-bound response and event authorities.
     pub fn try_new(
         response: SealedProviderResponseMarketEventBinding,

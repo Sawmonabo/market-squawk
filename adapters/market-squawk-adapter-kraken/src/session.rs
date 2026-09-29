@@ -151,14 +151,12 @@ impl KrakenSocketHandoffConsumer {
         let decoder = match config.channel() {
             KrakenChannel::Book(depth) => KrakenMarketDecoder::try_new(
                 config.metadata().clone(),
-                config.symbol(),
-                config.instrument(),
+                config.native_coordinates().clone(),
                 depth,
             ),
             KrakenChannel::Trades => KrakenMarketDecoder::try_trades(
                 config.metadata().clone(),
-                config.symbol(),
-                config.instrument(),
+                config.native_coordinates().clone(),
             ),
         }
         .map_err(|_| SourceError::InvalidProtocolState)?;
@@ -998,11 +996,9 @@ impl KrakenL3SubscriptionDispatch {
             .take()
             .ok_or(SourceError::InvalidProtocolState)?;
         permit.release();
-        let result = self
-            .budget
+        self.budget
             .record_success()
-            .map_err(|reason| SourceError::BudgetUnavailable { reason });
-        result
+            .map_err(|reason| SourceError::BudgetUnavailable { reason })
     }
 
     /// Returns whether every exact symbol acknowledgement settled this dispatch.

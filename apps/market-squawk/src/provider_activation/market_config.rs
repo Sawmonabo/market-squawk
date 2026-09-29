@@ -23,7 +23,8 @@ use market_squawk_adapter_kraken::{
     KrakenL3Depth, KrakenL3MetadataError, KrakenL3MetadataInput, KrakenL3ProductMapping,
 };
 use market_squawk_data::{
-    ListingReferenceRecord, ListingReferenceRightsState, MarketDataInstrumentRecord, RightsBasis,
+    ListingReferenceRecord, ListingReferenceRightsState, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentRecord, RightsBasis,
     SourceOperation,
 };
 use market_squawk_domain::{
@@ -36,7 +37,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BudgetPoolError, DataUseOperation, FreshnessPolicy,
-    HttpRequestBounds, ProviderBudgetPolicy, ProviderRateDeclaration, SourceMetadata,
+    HttpRequestBounds, ProviderBudgetPolicy, ProviderNativeIdentityRequest,
+    ProviderRateDeclaration, SourceMetadata,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -290,6 +292,7 @@ pub struct MarketDataInstrumentBinding {
     definition_revision_digest: EvidenceDigest,
     subscription_symbol: ProviderInstrumentId,
     symbol_evidence: MarketDataSubscriptionSymbolEvidence,
+    native_identity: Option<ProviderNativeIdentityRequest>,
 }
 
 impl MarketDataInstrumentBinding {
@@ -407,7 +410,141 @@ impl MarketDataInstrumentBinding {
             definition_revision_digest: definition_record.revision_digest(),
             subscription_symbol,
             symbol_evidence,
+            native_identity: None,
         }
+    }
+
+    /// Repins a sealed pre-acquisition binding after the official Alpaca native assertion has
+    /// been synchronized into the same catalog. The original listing/identifier proof remains
+    /// necessary; a copied catalog record or native request cannot construct this binding.
+    pub(crate) fn try_rebind_after_alpaca_reference(
+        &self,
+        before: &MarketDataInstrumentRecord,
+        after: &MarketDataInstrumentRecord,
+        native: &ProviderNativeIdentityRequest,
+        reader: &MarketDataInstrumentReadCapability,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self, MarketProviderConfigurationError> {
+        let at = native.effective_at;
+        self.publication_reference(before, at)?;
+        let old = before.definition();
+        let new = after.definition();
+        if before.revision_digest() != self.definition_revision_digest
+            || native.instrument != self.instrument_id
+            || native.provider_instrument_id.as_str().is_empty()
+            || native.venue_symbol.as_str() != self.subscription_symbol.as_str()
+            || old.instrument_id() != new.instrument_id()
+            || old.asset_class() != new.asset_class()
+            || old.quote_currency() != new.quote_currency()
+            || old.quote_currency_evidence() != new.quote_currency_evidence()
+            || old.reference_evidence() != new.reference_evidence()
+            || old.effective_interval() != new.effective_interval()
+            || !old.venue_mappings().iter().all(|mapping| new.venue_mappings().contains(mapping))
+            || !old.identifiers().iter().all(|identifier| new.identifiers().contains(identifier))
+            || !old.provider_identities().iter().all(|identity| new.provider_identities().contains(identity))
+            || !new.venue_mappings().iter().any(|mapping| {
+                mapping.venue_id() == &native.venue
+                    && mapping.venue_symbol() == &native.venue_symbol
+            })
+            || new.provider_identity_at(
+                &native.namespace,
+                &native.provider_instrument_id,
+                at,
+            ).is_none_or(|identity| identity.instrument_id() != self.instrument_id)
+            || reader
+                .latest(self.instrument_id, deadline, cancellation)
+                .map_err(|_| MarketProviderConfigurationError::LeaseBinding)?
+                .is_none_or(|latest| latest != *after)
+        {
+            return Err(MarketProviderConfigurationError::LeaseBinding);
+        }
+        let mut rebound = Self::from_validated_parts(
+            self.priority,
+            after,
+            self.subscription_symbol.clone(),
+            self.symbol_evidence.clone(),
+        );
+        rebound.publication_reference(after, at)?;
+        rebound.native_identity = Some(native.clone());
+        Ok(rebound)
+    }
+
+    /// Exact catalog-selected native route attached only by the post-reference rebind.
+    pub(crate) const fn native_identity(&self) -> Option<&ProviderNativeIdentityRequest> {
+        self.native_identity.as_ref()
+    }
+
+    /// Projects the exact admitted catalog record and genuine assigned identifier into publication.
+    pub(crate) fn publication_reference(
+        &self,
+        record: &MarketDataInstrumentRecord,
+        at: Timestamp,
+    ) -> Result<market_squawk_domain::MarketDataReference, MarketProviderConfigurationError> {
+        if record.revision_digest() != self.definition_revision_digest
+            || record.definition().instrument_id() != self.instrument_id
+            || record.definition().reference_evidence() != &self.definition_reference_evidence
+        {
+            return Err(MarketProviderConfigurationError::LeaseBinding);
+        }
+        let definition = record.definition();
+        let reference = match &self.symbol_evidence.kind {
+            MarketDataSubscriptionSymbolEvidenceKind::AssignedExternalIdentifier { record } => {
+                market_squawk_domain::MarketDataReference::try_from_assigned_identifier(
+                    definition, self.definition_revision_digest, record,
+                    self.subscription_symbol.clone(), at,
+                ).map_err(|_| MarketProviderConfigurationError::LeaseBinding)?
+            }
+            MarketDataSubscriptionSymbolEvidenceKind::NasdaqSessionListing {
+                source_id,
+                source_payload_evidence,
+                source_timestamp,
+                observed_at,
+                symbol,
+                mic,
+                asset_class,
+                effective,
+                ..
+            } => {
+                // The opaque listing and catalog approval corroborate current venue-symbol
+                // membership. The pinned definition independently retains the original verified
+                // ticker assignment. Its normalized row evidence is not the whole-directory
+                // payload, and a later directory observation must not replace that original.
+                if symbol != &self.subscription_symbol
+                    || *asset_class != self.asset_class
+                    || definition.asset_class() != *asset_class
+                    || !matches!(asset_class, AssetClass::Equity | AssetClass::Fund)
+                    || !interval_contains(*effective, at)
+                    || source_timestamp > observed_at
+                    || *observed_at > at
+                    || source_payload_evidence.content_digest().bytes() == [0; 32]
+                    || !definition.venue_mappings().iter().any(|mapping| {
+                        mapping.venue_id() == mic
+                            && mapping.venue_symbol().as_str() == symbol.as_str()
+                    })
+                {
+                    return Err(MarketProviderConfigurationError::LeaseBinding);
+                }
+                let mut accepted = None;
+                for identifier in definition.identifiers() {
+                    if identifier.source_id() != source_id
+                        || !matches!(identifier.identifier(), ExternalIdentifier::Ticker(ticker)
+                            if ticker.as_str() == symbol.as_str())
+                    {
+                        continue;
+                    }
+                    if let Ok(reference) = market_squawk_domain::MarketDataReference::try_from_assigned_identifier(
+                        definition, self.definition_revision_digest, identifier,
+                        self.subscription_symbol.clone(), at,
+                    ) {
+                        if accepted.is_some() { return Err(MarketProviderConfigurationError::LeaseBinding); }
+                        accepted = Some(reference);
+                    }
+                }
+                accepted.ok_or(MarketProviderConfigurationError::LeaseBinding)?
+            }
+        };
+        Ok(reference)
     }
 
     /// Returns the bounded subscription-priority reason.
@@ -805,6 +942,12 @@ pub struct AlpacaBasicMarketConfigurationInput {
     /// Trusted caller instant at which every retained authority is jointly revalidated.
     pub configured_at: Timestamp,
     pub iex_evidence: MarketSourceEvidence,
+    /// Separate exact calendar contract and application revalidation policy.
+    pub calendar_evidence: MarketSourceEvidence,
+    /// Independent source contract for bounded, demand-only indicative REST chains.
+    /// This is request authority, not an option entitlement or completeness receipt.
+    pub option_chain_evidence: Option<MarketSourceEvidence>,
+    /// Optional stream source evidence; requires the exact option subscription inventory below.
     pub options_evidence: Option<MarketSourceEvidence>,
     pub iex_instruments: BoundedMarketDataInstrumentSet,
     pub option_instruments: Option<BoundedMarketDataInstrumentSet>,
@@ -840,10 +983,17 @@ pub struct PreparedAlpacaBasicMarketConfiguration {
     historical_metadata: SourceMetadata,
     historical_request_bounds: HttpRequestBounds,
     historical_rights: ResearchRightsAuthority,
+    calendar_metadata: SourceMetadata,
+    calendar_rights: ResearchRightsAuthority,
     options: Option<(AlpacaOptionsLiveConfig, Box<[MarketDataInstrumentBinding]>)>,
+    option_chain: Option<market_squawk_adapter_alpaca::AlpacaOptionChainConfig>,
 }
 
 impl PreparedAlpacaBasicMarketConfiguration {
+    pub(crate) const fn option_chain_config(&self) -> Option<&market_squawk_adapter_alpaca::AlpacaOptionChainConfig> {
+        self.option_chain.as_ref()
+    }
+
     pub const fn lease(&self) -> &ProviderActivationLease {
         &self.lease
     }
@@ -882,6 +1032,14 @@ impl PreparedAlpacaBasicMarketConfiguration {
         &self.historical_rights
     }
 
+    pub const fn calendar_metadata(&self) -> &SourceMetadata {
+        &self.calendar_metadata
+    }
+
+    pub const fn calendar_rights(&self) -> &ResearchRightsAuthority {
+        &self.calendar_rights
+    }
+
     /// Moves the exact lease, configs, and route-definition inputs into central composition.
     #[allow(
         clippy::type_complexity,
@@ -896,6 +1054,8 @@ impl PreparedAlpacaBasicMarketConfiguration {
         SourceMetadata,
         HttpRequestBounds,
         ResearchRightsAuthority,
+        SourceMetadata,
+        ResearchRightsAuthority,
         Option<(AlpacaOptionsLiveConfig, Box<[MarketDataInstrumentBinding]>)>,
     ) {
         (
@@ -905,6 +1065,8 @@ impl PreparedAlpacaBasicMarketConfiguration {
             self.historical_metadata,
             self.historical_request_bounds,
             self.historical_rights,
+            self.calendar_metadata,
+            self.calendar_rights,
             self.options,
         )
     }
@@ -1038,6 +1200,8 @@ fn prepare_alpaca(
     let account =
         ProviderAccountBinding::try_from_lease(ProviderMarketAccount::AlpacaBasic, lease)?;
     validate_source_evidence(input.configured_at, &input.iex_evidence)?;
+    validate_source_evidence(input.configured_at, &input.calendar_evidence)?;
+    require_distinct_source_ids(&[&input.iex_evidence, &input.calendar_evidence])?;
     validate_set_bound(
         "alpaca-basic-iex",
         input.iex_instruments.bindings(),
@@ -1048,9 +1212,24 @@ fn prepare_alpaca(
         input.iex_instruments.bindings(),
         |class| matches!(class, AssetClass::Equity | AssetClass::Fund),
     )?;
+    if let Some(evidence) = &input.option_chain_evidence {
+        validate_source_evidence(input.configured_at, evidence)?;
+        require_distinct_source_ids(&[
+            &input.iex_evidence,
+            &input.calendar_evidence,
+            evidence,
+        ])?;
+        if let Some(stream_evidence) = &input.options_evidence {
+            require_distinct_source_ids(&[evidence, stream_evidence])?;
+        }
+    }
     let options_configured = match (&input.options_evidence, &input.option_instruments) {
         (Some(evidence), Some(instruments)) => {
-            require_distinct_source_ids(&[&input.iex_evidence, evidence])?;
+            require_distinct_source_ids(&[
+                &input.iex_evidence,
+                &input.calendar_evidence,
+                evidence,
+            ])?;
             validate_source_evidence(input.configured_at, evidence)?;
             validate_set_bound(
                 "alpaca-basic-indicative-options",
@@ -1081,6 +1260,7 @@ fn prepare_alpaca(
         &budget,
         &input.iex_evidence,
         MetadataProfile::AlpacaIex {
+            current_source_id: "alpaca-basic-iex-current-v1",
             indicative_options_configured: options_configured,
             boot_snapshot_revision: boot_snapshot.revision(),
             boot_snapshot_maximum_body_bytes: boot_snapshot.maximum_body_bytes(),
@@ -1104,7 +1284,7 @@ fn prepare_alpaca(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let iex = AlpacaIexLiveConfig::try_new(
-        input.iex_evidence.source_id.clone(),
+        SourceId::try_from("alpaca-basic-iex-current-v1")?,
         revision_evidence(lease, "alpaca-iex", iex_digest)?,
         authorization.clone(),
         input.iex_evidence.coverage_evidence.clone(),
@@ -1144,6 +1324,78 @@ fn prepare_alpaca(
     )?;
     let historical_rights =
         alpaca_historical_research_rights(lease, historical_metadata.source_id())?;
+    // Credential realm is recovered from actual verified onboarding evidence, never a URL default.
+    let calendar_environment = match lease
+        .runtime_verification_evidence()
+        .alpaca_paper_iex_receipt()
+        .ok_or(MarketProviderConfigurationError::LeaseBinding)?
+        .realm()
+    {
+        market_squawk_sources::AlpacaDoctorCredentialRealm::Paper => {
+            market_squawk_adapter_alpaca::AlpacaTradingApiEnvironment::Paper
+        }
+    };
+    let calendar_digest = metadata_digest_for_bindings(
+        b"market-squawk/authenticated-calendar-source-metadata/v1\0",
+        lease,
+        input.configured_at,
+        &account,
+        &budget,
+        &input.calendar_evidence,
+        MetadataProfile::AlpacaCalendar {
+            credential_origin: calendar_environment.origin(),
+            markets: ["IEX", "XNYS", "XNAS"],
+            output_timezone: "UTC",
+        },
+        (),
+        &historical_request_bounds,
+    )?;
+    let calendar_metadata = market_squawk_adapter_alpaca::try_alpaca_calendar_metadata(
+        input.calendar_evidence.source_id.clone(),
+        revision_evidence(lease, "alpaca-calendar", calendar_digest)?,
+        authorization.clone(),
+        input.calendar_evidence.coverage_evidence.clone(),
+        input.calendar_evidence.coverage_effective,
+        input.calendar_evidence.freshness,
+        budget.clone(),
+        historical_request_bounds,
+        calendar_environment,
+    )?;
+    let calendar_rights = alpaca_historical_research_rights(lease, calendar_metadata.source_id())?;
+    // REST chain acquisition discovers its exact contracts from sealed provider originals on
+    // demand. It must not depend on (or manufacture) an optional live subscription inventory.
+    let option_chain = input
+        .option_chain_evidence
+        .as_ref()
+        .map(|evidence| -> Result<_, MarketProviderConfigurationError> {
+            let digest = metadata_digest_for_bindings(
+                HISTORICAL_METADATA_EVIDENCE_DOMAIN,
+                lease,
+                input.configured_at,
+                &account,
+                &budget,
+                evidence,
+                MetadataProfile::AlpacaIndicativeOptionChain,
+                input
+                    .iex_instruments
+                    .bindings()
+                    .iter()
+                    .map(MarketDataBindingEvidenceWire::from)
+                    .collect::<Vec<_>>(),
+                &historical_request_bounds,
+            )?;
+            market_squawk_adapter_alpaca::AlpacaOptionChainConfig::try_new(
+                evidence.source_id.clone(),
+                revision_evidence(lease, "alpaca-option-chain", digest)?,
+                authorization.clone(),
+                evidence.coverage_evidence.clone(),
+                evidence.coverage_effective,
+                evidence.freshness,
+                budget.clone(),
+            )
+            .map_err(Into::into)
+        })
+        .transpose()?;
     let options = match (input.options_evidence, input.option_instruments) {
         (Some(evidence), Some(instruments)) => {
             let digest = display_metadata_digest(
@@ -1196,7 +1448,10 @@ fn prepare_alpaca(
         historical_metadata,
         historical_request_bounds,
         historical_rights,
+        calendar_metadata,
+        calendar_rights,
         options,
+        option_chain,
     })
 }
 
@@ -1770,13 +2025,20 @@ fn authorization(
 #[serde(rename_all = "snake_case")]
 enum MetadataProfile {
     AlpacaIex {
+        current_source_id: &'static str,
         indicative_options_configured: bool,
         boot_snapshot_revision: &'static str,
         boot_snapshot_maximum_body_bytes: usize,
         boot_snapshot_total_timeout_nanos: u64,
     },
     AlpacaIndicativeOptions,
+    AlpacaIndicativeOptionChain,
     AlpacaHistoricalIexDaily,
+    AlpacaCalendar {
+        credential_origin: &'static str,
+        markets: [&'static str; 3],
+        output_timezone: &'static str,
+    },
     KrakenAuthenticatedLevel3 {
         depth: KrakenL3DepthWire,
         tier: KrakenL3ClientTierWire,

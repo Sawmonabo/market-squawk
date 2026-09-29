@@ -152,15 +152,20 @@ impl ManualPaperStrategy {
     }
 }
 
-impl Strategy for ManualPaperStrategy {
-    fn on_market_event(
+impl ManualPaperStrategy {
+    pub(crate) fn on_market_context(
         &mut self,
-        context: &StrategyContext<'_>,
-        _event: &MarketEvent,
+        route: &ShardKey,
+        market: crate::ExecutionMarketReference,
     ) -> Result<BoundedOrderIntents, StrategyError> {
-        if context.route() != &self.route
-            || context.market().execution_terms().instrument_id() != self.route.instrument()
-            || context.market().quality() != DataQuality::DirectVerified
+        if route != &self.route
+            || market.execution_terms().instrument_id() != self.route.instrument()
+            || market.quality()
+                != if market.is_virtual_paper() {
+                    DataQuality::DirectUnverified
+                } else {
+                    DataQuality::DirectVerified
+                }
         {
             return Err(StrategyError::Evaluation);
         }
@@ -170,7 +175,6 @@ impl Strategy for ManualPaperStrategy {
                 return Ok(BoundedOrderIntents::new());
             }
         };
-        let market = context.market();
         if draft.input.expires_at <= market.observed_at() {
             return Ok(BoundedOrderIntents::new());
         }
@@ -190,7 +194,12 @@ impl Strategy for ManualPaperStrategy {
             maximum_slippage,
             target_reference,
         } = draft.input;
-        let intent = OrderIntent::try_new_with_target_reference(
+        let construct = if market.is_virtual_paper() {
+            OrderIntent::try_new_virtual_paper
+        } else {
+            OrderIntent::try_new_with_target_reference
+        };
+        let intent = construct(
             OrderIntentInput {
                 order_id,
                 client_order_id,
@@ -216,6 +225,20 @@ impl Strategy for ManualPaperStrategy {
         let mut output = BoundedOrderIntents::new();
         output.try_push(intent)?;
         Ok(output)
+    }
+}
+
+impl Strategy for ManualPaperStrategy {
+    fn supports_virtual_paper(&self) -> bool { true }
+    fn on_virtual_paper_quote(&mut self, route: &ShardKey, market: crate::ExecutionMarketReference)
+        -> Result<BoundedOrderIntents, StrategyError> { self.on_market_context(route, market) }
+
+    fn on_market_event(
+        &mut self,
+        context: &StrategyContext<'_>,
+        _event: &MarketEvent,
+    ) -> Result<BoundedOrderIntents, StrategyError> {
+        self.on_market_context(context.route(), context.market())
     }
 
     fn retained_bytes(&self) -> Result<usize, StrategyError> {

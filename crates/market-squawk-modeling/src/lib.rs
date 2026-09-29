@@ -23,6 +23,8 @@ mod test_contracts;
 mod training_environment;
 mod training_protocol;
 
+pub use market_squawk_data::FixedHorizonOriginBasis;
+
 pub use admission::{
     BundleAuthorityDocument, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
     ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, ValidatedModelCandidate,
@@ -40,16 +42,22 @@ pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
     MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_FORECAST_POLICY_BYTES, MAX_FORECAST_RESIDUAL_BYTES,
     MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES, MAX_TRAINING_RUN_BYTES, ModelBundle,
+    ProbabilityCalibrationArtifacts, ProbabilityReliabilityBin,
 };
 pub use forecast::{
-    CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow,
-    ForecastCentralStatistic, ForecastCoverage, ForecastError, ForecastEstimatorProfile,
+    AuthenticatedForecastServingBinding, CalibrationBand, CalibrationCoverageEvaluation,
+    CalibrationEvidence, CalibrationMethod, CalibrationWindow, ForecastArtifactManifestRecord,
+    ForecastArtifactSchemaRecord, ForecastCentralStatistic, ForecastCoverage,
+    ForecastCurrentPriceServingRecord, ForecastDistributionPoint, ForecastError,
+    ForecastEstimatorProfile, ForecastFinancialServingRecord, ForecastFinancialTarget,
     ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastMeasurement,
     ForecastObservedPoint, ForecastOutcome, ForecastOutcomeId, ForecastOutputBinding, ForecastPath,
-    ForecastPoint, ForecastRequest, ForecastTargetMeaning, ForecastTrainingObjective,
-    ForecastTransform, ForecastValue, ForecastVintage, ForecastVintageId,
-    MAX_FORECAST_DECIMAL_SCALE, MAX_FORECAST_OBSERVED_POINTS, MAX_FORECAST_POINTS,
-    RealizedCoverage, ResearchForecastBackend, verify_forecast_vintage_identity,
+    ForecastPoint, ForecastRequest, ForecastResidualDistribution, ForecastResidualMass,
+    ForecastServingArtifactRecord, ForecastStudyDistribution, ForecastTargetMeaning,
+    ForecastTerminalDistribution, ForecastTrainingObjective, ForecastTransform, ForecastValue,
+    ForecastVintage, ForecastVintageId, MAX_FORECAST_DECIMAL_SCALE, MAX_FORECAST_OBSERVED_POINTS,
+    MAX_FORECAST_POINTS, MAX_FORECAST_SERVING_PARENTS, RealizedCoverage, ResearchForecastBackend,
+    validate_forecast_price_origin, verify_forecast_vintage_identity,
 };
 pub use input::{
     ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,
@@ -328,6 +336,7 @@ const fn bundle_error_code(error: BundleError) -> u16 {
         BundleError::ForecastCalibrationStructureLimit => 52,
         BundleError::ForecastCalibrationSyntax => 53,
         BundleError::InvalidForecastCalibration => 54,
+        BundleError::InvalidProbabilityCalibration => 56,
     }
 }
 

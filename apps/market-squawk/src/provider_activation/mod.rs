@@ -2,7 +2,12 @@
 
 mod account;
 mod alpaca;
+pub(crate) use alpaca::{AlpacaOptionChainRuntimeAuthority, AlpacaOptionChainRuntimeError};
+mod alpaca_option_chain;
+mod bea;
 mod bls;
+mod census;
+pub(crate) mod census_configuration;
 pub(crate) mod credentials;
 mod direct;
 mod eia;
@@ -14,6 +19,11 @@ mod market_config;
 pub(crate) mod nasdaq_reference;
 mod reference_identity;
 mod schwab;
+mod schwab_market_hours;
+mod schwab_quote_binding;
+mod schwab_quote_metadata;
+mod schwab_reference;
+mod schwab_streamer;
 mod specs;
 pub mod tiingo;
 mod treasury;
@@ -66,13 +76,20 @@ use market_squawk_sources::{
 use specs::BlsAdapterConfiguration;
 
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
-pub(crate) use account::ProviderAccountRuntimeCurrentness;
+pub(crate) use account::{ProviderAccountPublicationAuthority, ProviderAccountRuntimeCurrentness};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
+pub(crate) use bea::{
+    BEA_SOURCE_ID, BEA_SURFACE, BeaProductAvailability, BeaProductError, BeaProductStatus,
+    BeaRegionalProductOutput, BeaRegionalProductRequest, BeaRegionalRestartOutput,
+    BeaRegionalRestartRead, fixed_regional_source_config, selected_regional_source_config,
+};
 pub(crate) use bls::{
     MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodLatestKnownRequest,
     MacroProviderPeriodOperationError,
 };
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
+pub use census::CensusAdapterActivation;
+pub use census_configuration::CensusRequestConfiguration;
 pub use eia::EiaAdapterActivation;
 pub(crate) use fred::{
     FredPublicationActivationError, publish_fred_latest_known, reopen_fred_latest_known,
@@ -98,20 +115,26 @@ pub(crate) use reference_identity::{
     MarketReferenceIdentityError, MarketReferenceIdentityRequest,
     MarketReferenceIdentityResolution, MarketReferenceIdentityUnavailable,
 };
-pub(crate) use schwab::{PreparedSchwabMarketRuntimeStart, SchwabMarketRuntimeStartError};
+pub(crate) use schwab::{
+    PreparedSchwabMarketRuntimeStart, SchwabMarketRuntimeStartError, SchwabQuoteReferencePrecommit,
+};
 pub use schwab::{SchwabMarketDataAccountActivation, SchwabMarketDataActivationError};
+pub(crate) use schwab_quote_binding::{SchwabQuotePublicationSelection, SchwabQuoteReferenceBinding};
+pub(crate) use schwab_quote_metadata::schwab_streamer_selections;
+pub(crate) use schwab_streamer::PreparedSchwabStreamerMarketRuntimeStart;
 pub use specs::{
-    BlsAdapterActivation, BoardAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,
-    CoinbaseDirectActivationSpecError, CoinbaseDirectAdapterActivation,
-    CoinbaseDirectProductActivation, ControlledLocalFileAdapterActivation, FredAdapterActivation,
-    LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
-    ProviderAdapterActivationRequest, SecAdapterActivation, TiingoAdapterActivation,
-    TreasuryAdapterActivation, YahooAdapterActivation,
+    BeaAdapterActivation, BlsAdapterActivation, BoardAdapterActivation,
+    COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
+    CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
+    ControlledLocalFileAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
+    PortfolioAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
+    SecAdapterActivation, TiingoAdapterActivation, TreasuryAdapterActivation,
+    YahooAdapterActivation,
 };
 pub(crate) use tiingo::{
-    TIINGO_EOD_OPERATION, TIINGO_FUND_NAV_OPERATION, TiingoCanonicalFamily, TiingoLatestOperation,
-    TiingoLatestOperationOutcome, TiingoProductAvailability, TiingoProductError,
-    TiingoProductStatus, TiingoUnavailableReason,
+    TIINGO_EOD_OPERATION, TIINGO_FUND_NAV_OPERATION, TiingoCanonicalFamily,
+    TiingoEquityPremiumHistoryPreparation, TiingoLatestOperation, TiingoLatestOperationOutcome,
+    TiingoProductAvailability, TiingoProductError, TiingoProductStatus, TiingoUnavailableReason,
 };
 pub(crate) use treasury::{
     TreasuryDurableRecovery, TreasuryPublicationActivationError, publish_treasury_latest_known,
@@ -271,6 +294,7 @@ struct SecFundProductActivation {
     source: Arc<SecEdgarSource>,
     generation: ResearchProviderRuntimeGeneration,
     operation: Arc<SecLiveFundSource>,
+    selected_companies: Vec<(SourceIdentifier, market_squawk_domain::InstrumentId)>,
 }
 
 impl SecFundProductActivation {
@@ -312,7 +336,9 @@ pub struct ProviderAdapterActivation {
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
     provider_control_root: PathBuf,
+    bea: RwLock<Option<Arc<bea::BeaProductActivation>>>,
     bls: RwLock<Option<Arc<bls::BlsProductActivation>>>,
+    census: RwLock<Option<Arc<census::CensusProductActivation>>>,
     eia: RwLock<Option<Arc<eia::EiaProductActivation>>>,
     sec_fund: RwLock<Option<Arc<SecFundProductActivation>>>,
     yahoo_authority: Mutex<Option<Arc<yahoo::YahooProviderAuthority>>>,
@@ -350,6 +376,46 @@ impl AccountMarketRuntimeMutationAuthority<'_> {
 }
 
 impl ProviderAdapterActivation {
+    /// Shared installed catalog reader for native source-route selection.
+    pub(crate) fn market_data_instruments(
+        &self,
+    ) -> market_squawk_data::MarketDataInstrumentReadCapability {
+        self.research.market_data_instruments()
+    }
+
+    /// Retains the sole research custody service for an authorized provider reference capture.
+    pub(crate) fn research_service(&self) -> Arc<crate::ResearchService> {
+        self.research.research_service()
+    }
+
+    pub(crate) fn provider_capture_store(&self) -> Arc<market_squawk_platform::SealedResearchJournalStore> {
+        self.research.provider_capture_store()
+    }
+
+    pub(crate) async fn acquire_alpaca_reference_operation(
+        &self,
+        generation: &crate::application::ResearchProviderRuntimeGeneration,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<crate::application::ResearchProviderPublicationOperation,
+              crate::application::ResearchIngestCompositionError> {
+        self.research.acquire_provider_publication_operation(generation, cancellation, deadline).await
+    }
+
+    /// Sole installed writer used by official native reference acquisition.
+    pub(crate) fn market_data_instrument_synchronization(
+        &self,
+    ) -> market_squawk_data::MarketDataInstrumentSynchronizationCapability {
+        self.research.market_data_instrument_synchronization()
+    }
+
+    /// Exact execution-definition history for live actor term agreement.
+    pub(crate) fn instrument_definitions(
+        &self,
+    ) -> market_squawk_data::InstrumentDefinitionReadCapability {
+        self.research.instrument_definitions()
+    }
+
     pub(crate) fn activate_public_live_metadata(
         &self,
         session_id: Uuid,
@@ -556,7 +622,9 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            bea: RwLock::new(None),
             bls: RwLock::new(None),
+            census: RwLock::new(None),
             eia: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo_authority: Mutex::new(None),
@@ -584,7 +652,9 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            bea: RwLock::new(None),
             bls: RwLock::new(None),
+            census: RwLock::new(None),
             eia: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo_authority: Mutex::new(None),
@@ -777,6 +847,46 @@ impl ProviderAdapterActivation {
             .map_err(Into::into)
     }
 
+    /// Closes the selected companies through the existing Settings SEC generation and catalog.
+    pub(crate) async fn publish_sec_fundamentals(
+        &self,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<(), SecFundProductError> {
+        let activation = self
+            .sec_fund
+            .read()
+            .map_err(|_| SecFundProductError::Unavailable)?
+            .as_ref()
+            .cloned()
+            .ok_or(SecFundProductError::SetupRequired)?;
+        self.onboarding
+            .try_acquire_runtime_mutation_authority()
+            .and_then(|authority| authority.require_active(&activation.lease))
+            .map_err(|_| SecFundProductError::Unavailable)?;
+        if self
+            .research
+            .provider_runtime_generation(activation.generation.profile())
+            .map_err(|_| SecFundProductError::Unavailable)?
+            .as_ref()
+            != Some(&activation.generation)
+        {
+            return Err(SecFundProductError::Unavailable);
+        }
+        for (cik, instrument_id) in &activation.selected_companies {
+            activation
+                .operation
+                .publish_company_research(
+                    cik.as_str(),
+                    *instrument_id,
+                    deadline,
+                    cancellation.child_token(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Executes one bounded SEC N-PORT or N-CEN publication through the retained exact source.
     pub(crate) async fn execute_sec_fund_operation(
         &self,
@@ -850,6 +960,18 @@ impl ProviderAdapterActivation {
             self.research_mutation
                 .revoke_provider_generation(expected.profile(), expected)
                 .await?;
+            if expected.profile().as_str() == census::CENSUS_SURFACE {
+                let mut retained = self
+                    .census
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == expected)
+                {
+                    retained.take();
+                }
+            }
             if expected.profile().as_str() == eia::EIA_SURFACE {
                 let mut retained = self
                     .eia
@@ -892,6 +1014,18 @@ impl ProviderAdapterActivation {
             ) {
                 let mut retained = self
                     .bls
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == expected)
+                {
+                    retained.take();
+                }
+            }
+            if expected.profile().as_str() == bea::BEA_SURFACE {
+                let mut retained = self
+                    .bea
                     .write()
                     .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
                 if retained
@@ -1098,14 +1232,21 @@ impl ProviderAdapterActivation {
         let lease = onboarding_authority.active_lease(committed.candidate().session_id())?;
         require_runtime_lease(committed.candidate(), &lease)?;
         let expected_generation = committed.expected().clone();
+        let candidate_generation = committed.candidate().clone();
         let transaction = committed
             .transaction
             .as_mut()
             .ok_or(ProviderAdapterActivationError::SourceBinding)?;
         let profile = lease.surface_id().clone();
         let specialized_authority = match committed.specialized.as_ref() {
+            Some(SpecializedReplacementKind::Bea(activation)) => {
+                Some(SpecializedReplacementAuthority::Bea(Arc::clone(activation)))
+            }
             Some(SpecializedReplacementKind::Bls(activation)) => {
                 Some(SpecializedReplacementAuthority::Bls(Arc::clone(activation)))
+            }
+            Some(SpecializedReplacementKind::Census(activation)) => {
+                Some(SpecializedReplacementAuthority::Census(Arc::clone(activation)))
             }
             Some(SpecializedReplacementKind::Eia(activation)) => {
                 Some(SpecializedReplacementAuthority::Eia(Arc::clone(activation)))
@@ -1147,6 +1288,29 @@ impl ProviderAdapterActivation {
             }
             None => None,
         };
+        // All async preparation is complete. Retain BEA's exact predecessor slot before the
+        // shared cutover, so neither lock contention nor a stale slot can fail after finalization.
+        let bea_install = match specialized_authority.as_ref() {
+            Some(SpecializedReplacementAuthority::Bea(activation)) => {
+                if activation.generation() != &candidate_generation
+                    || transaction.expected() != &expected_generation
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                let retained = self
+                    .bea
+                    .try_write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if !retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == &expected_generation)
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                Some((retained, Arc::clone(activation)))
+            }
+            _ => None,
+        };
         // Validate and retain the EIA slot before finalizing the shared replacement. No slot
         // acquisition or predecessor check may fail after the shared transaction is finalized.
         let eia_install = match specialized_authority.as_ref() {
@@ -1168,14 +1332,41 @@ impl ProviderAdapterActivation {
             }
             _ => None,
         };
+        let census_install = match specialized_authority.as_ref() {
+            Some(SpecializedReplacementAuthority::Census(activation)) => {
+                if activation.generation() != &committed.candidate {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                let retained = self
+                    .census
+                    .try_write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() != &expected_generation)
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                Some((retained, Arc::clone(activation)))
+            }
+            _ => None,
+        };
         let generation = self.research_mutation.finalize(transaction)?;
-        if generation != committed.candidate {
+        if let Some((mut retained, activation)) = bea_install {
+            // The sealed transaction returns its immutable candidate by construction. Both
+            // original identities were checked before cutover; installation cannot now fail.
+            *retained = Some(activation);
+        } else if generation != committed.candidate {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
         if let Some((mut retained, activation)) = eia_install {
             *retained = Some(activation);
         }
+        if let Some((mut retained, activation)) = census_install {
+            *retained = Some(activation);
+        }
         match specialized_authority {
+            Some(SpecializedReplacementAuthority::Bea(_)) => {}
             Some(SpecializedReplacementAuthority::Bls(activation)) => {
                 if activation.generation() != &generation {
                     return Err(ProviderAdapterActivationError::SourceBinding);
@@ -1192,6 +1383,7 @@ impl ProviderAdapterActivation {
                 }
                 *retained = Some(activation);
             }
+            Some(SpecializedReplacementAuthority::Census(_)) => {}
             Some(SpecializedReplacementAuthority::Eia(_)) => {}
             Some(SpecializedReplacementAuthority::Yahoo(authority)) => {
                 *self
@@ -1227,9 +1419,17 @@ impl ProviderAdapterActivation {
                 &spec.metadata,
                 provider_research_rights(lease, spec.metadata.source_id())?,
             ),
+            ProviderAdapterActivationRequest::Bea(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
             ProviderAdapterActivationRequest::Bls(spec) => (
                 &spec.metadata,
                 provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
+            ProviderAdapterActivationRequest::Census(spec) => (
+                spec.metadata(),
+                provider_research_rights(lease, spec.metadata().source_id())?,
             ),
             ProviderAdapterActivationRequest::Eia(spec) => (
                 spec.metadata(),
@@ -1287,6 +1487,36 @@ impl ProviderAdapterActivation {
         let candidate = self.runtime_generation_for_request(&lease, &request)?;
         self.bind_authorization_subject(candidate.metadata())?;
         let (prepared, specialized) = match request {
+            ProviderAdapterActivationRequest::Bea(spec) => {
+                let (replacement, activation) = self
+                    .prepare_bea_regional_replacement(
+                        lease.clone(),
+                        spec,
+                        expected,
+                        candidate.clone(),
+                        cancellation.clone(),
+                    )
+                    .await?;
+                (
+                    replacement,
+                    Some(SpecializedReplacementKind::Bea(activation)),
+                )
+            }
+            ProviderAdapterActivationRequest::Census(spec) => {
+                let (replacement, activation) = self
+                    .prepare_census_runtime_replacement(
+                        &lease,
+                        expected,
+                        candidate.clone(),
+                        spec,
+                        cancellation.clone(),
+                    )
+                    .await?;
+                (
+                    replacement,
+                    Some(SpecializedReplacementKind::Census(activation)),
+                )
+            }
             ProviderAdapterActivationRequest::Eia(spec) => {
                 let (replacement, activation) = self
                     .prepare_eia_replacement(
@@ -1565,6 +1795,9 @@ impl ProviderAdapterActivation {
                     Arc::clone(&self.onboarding),
                     self.app_config.clone(),
                     self.provider_rate.clone(),
+                    self.market_data_instruments(),
+                    self.market_data_instrument_synchronization(),
+                    self.research_service(),
                     lease,
                     spec,
                     publication_packages,
@@ -1581,8 +1814,16 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Sec(spec) => {
                 self.activate_sec(lease, spec).map(Into::into)
             }
+            ProviderAdapterActivationRequest::Bea(spec) => self
+                .activate_bea(lease, spec, cancellation)
+                .await
+                .map(Into::into),
             ProviderAdapterActivationRequest::Bls(spec) => self
                 .activate_bls(lease, spec, cancellation)
+                .await
+                .map(Into::into),
+            ProviderAdapterActivationRequest::Census(spec) => self
+                .activate_census(lease, spec, cancellation)
                 .await
                 .map(Into::into),
             ProviderAdapterActivationRequest::Eia(spec) => self
@@ -1634,8 +1875,16 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Sec(spec) => {
                 self.activate_sec(lease, spec).map(Into::into)
             }
+            ProviderAdapterActivationRequest::Bea(_) => {
+                require_surface(&lease, BEA_SURFACE)?;
+                Err(ProviderAdapterActivationError::ExplicitResumeRequired)
+            }
             ProviderAdapterActivationRequest::Bls(spec) => {
                 self.restore_bls(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Census(_spec) => {
+                require_surface(&lease, census::CENSUS_SURFACE)?;
+                Err(ProviderAdapterActivationError::ExplicitResumeRequired)
             }
             ProviderAdapterActivationRequest::Eia(_spec) => {
                 require_surface(&lease, eia::EIA_SURFACE)?;
@@ -1695,6 +1944,9 @@ impl ProviderAdapterActivation {
         spec: SecAdapterActivation,
     ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
         require_surface(&lease, SEC_EDGAR_PROFILE_ID)?;
+        if spec.selected_companies.is_empty() || spec.selected_companies.len() > 16 {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
         let organization = lease
             .public_configuration()
             .get("organization")
@@ -1711,6 +1963,7 @@ impl ProviderAdapterActivation {
             .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
         if let Some(current) = retained.as_ref() {
             if current.matches(&lease, &spec.metadata)
+                && current.selected_companies == spec.selected_companies
                 && self
                     .research
                     .provider_runtime_generation(current.generation.profile())?
@@ -1761,11 +2014,29 @@ impl ProviderAdapterActivation {
             source,
             generation: generation.clone(),
             operation,
+            selected_companies: spec.selected_companies,
         }));
         Ok(ActivatedResearchProvider {
             lease,
             profile,
             generation,
+        })
+    }
+
+    async fn activate_bea(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BeaAdapterActivation,
+        cancellation: CancellationToken,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        let activation = self
+            .prepare_bea_regional(lease.clone(), spec, cancellation)
+            .await
+            .map_err(ProviderAdapterActivationError::from)?;
+        Ok(ActivatedResearchProvider {
+            profile: activation.generation().profile().clone(),
+            generation: activation.generation().clone(),
+            lease,
         })
     }
 
@@ -1885,7 +2156,19 @@ impl ProviderAdapterActivation {
         };
         #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let source = BoardSource::try_new(spec.metadata, spec.profile)?;
-        self.register(lease, source, rights)
+        let source = Arc::new(source);
+        let generation =
+            self.runtime_registration_generation(&lease, source.metadata(), &rights)?;
+        self.research_mutation.register_board_provider_source(
+            generation.clone(),
+            source,
+            rights,
+        )?;
+        Ok(ActivatedResearchProvider {
+            lease,
+            profile: generation.profile().clone(),
+            generation,
+        })
     }
 
     fn activate_yahoo(
@@ -2321,14 +2604,18 @@ pub(crate) struct CommittedProviderAdapterReplacement {
 }
 
 enum SpecializedReplacementKind {
+    Bea(Arc<bea::BeaProductActivation>),
     Bls(Arc<bls::BlsProductActivation>),
+    Census(Arc<census::CensusProductActivation>),
     Eia(Arc<eia::EiaProductActivation>),
     Yahoo,
     Tiingo,
 }
 
 enum SpecializedReplacementAuthority {
+    Bea(Arc<bea::BeaProductActivation>),
     Bls(Arc<bls::BlsProductActivation>),
+    Census(Arc<census::CensusProductActivation>),
     Eia(Arc<eia::EiaProductActivation>),
     Yahoo(Arc<yahoo::YahooProductActivation>),
     Tiingo(Arc<tiingo::TiingoProductActivation>),

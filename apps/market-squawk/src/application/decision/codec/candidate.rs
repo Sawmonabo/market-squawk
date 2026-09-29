@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::DecisionApplicationError;
 use super::common::{FeatureBindingWire, content_digest, statistical};
+use super::proposal::RequiredOption;
 use super::screen::RunWire;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -37,7 +38,8 @@ pub(in crate::application::decision) struct CandidateInputWire {
     instrument_id: InstrumentId,
     observations: Vec<ObservationWire>,
     coverage_bits: u64,
-    liquidity_bits: u64,
+    #[serde(deserialize_with = "RequiredOption::deserialize")]
+    liquidity_bits: RequiredOption<u64>,
     data_quality: DataQuality,
     portfolio_revision: Option<[u8; 32]>,
     flags: Vec<CandidateFlagWire>,
@@ -58,7 +60,7 @@ impl From<&CandidateInput> for CandidateInputWire {
                 })
                 .collect(),
             coverage_bits: value.coverage().get().to_bits(),
-            liquidity_bits: value.liquidity().get().to_bits(),
+            liquidity_bits: RequiredOption(value.liquidity().map(|value| value.get().to_bits())),
             data_quality: value.data_quality(),
             portfolio_revision: value.portfolio_impact().map(PortfolioRevisionToken::bytes),
             flags: value.flags().iter().copied().map(Into::into).collect(),
@@ -73,6 +75,11 @@ impl CandidateInputWire {
         bindings: &[ScreenFeatureBinding],
         registry: &FeatureRegistry,
     ) -> Result<CandidateInput, DecisionApplicationError> {
+        if self.observations.len() != bindings.len()
+            || bindings.len() > market_squawk_decisions::MAX_SCREEN_FEATURE_BINDINGS
+        {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
         let observations = self
             .observations
             .iter()
@@ -97,7 +104,7 @@ impl CandidateInputWire {
             self.instrument_id,
             observations,
             statistical(self.coverage_bits)?,
-            statistical(self.liquidity_bits)?,
+            self.liquidity_bits.0.map(statistical).transpose()?,
             self.data_quality,
             self.portfolio_revision
                 .map(PortfolioRevisionToken::from_bytes),
@@ -148,7 +155,8 @@ struct CandidateWire {
     selected_at: Timestamp,
     contributions: Vec<ContributionWire>,
     coverage_bits: u64,
-    liquidity_bits: u64,
+    #[serde(deserialize_with = "RequiredOption::deserialize")]
+    liquidity_bits: RequiredOption<u64>,
     data_quality: DataQuality,
     portfolio_revision: Option<[u8; 32]>,
     flags: Vec<CandidateFlagWire>,
@@ -173,7 +181,7 @@ impl From<&CandidateAssessment> for CandidateWire {
                 })
                 .collect(),
             coverage_bits: value.coverage().get().to_bits(),
-            liquidity_bits: value.liquidity().get().to_bits(),
+            liquidity_bits: RequiredOption(value.liquidity().map(|value| value.get().to_bits())),
             data_quality: value.data_quality(),
             portfolio_revision: value.portfolio_impact().map(PortfolioRevisionToken::bytes),
             flags: value.flags().iter().copied().map(Into::into).collect(),
@@ -226,7 +234,7 @@ impl CandidateWire {
             self.instrument_id,
             observations,
             statistical(self.coverage_bits)?,
-            statistical(self.liquidity_bits)?,
+            self.liquidity_bits.0.map(statistical).transpose()?,
             self.data_quality,
             self.portfolio_revision
                 .map(PortfolioRevisionToken::from_bytes),

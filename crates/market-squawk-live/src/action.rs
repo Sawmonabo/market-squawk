@@ -753,6 +753,16 @@ impl<'actor> CommittedActionContext<'actor> {
         features: &'actor dyn LiveFeatureView,
     ) -> Result<Self, LiveActionHookError> {
         let provenance = event_provenance(event);
+        if matches!(
+            event,
+            MarketEvent::MarketDataQuote(_)
+                | MarketEvent::MarketDataTrade(_)
+                | MarketEvent::MarketDataBook(_)
+                | MarketEvent::MarketDataChart(_)
+                | MarketEvent::MarketDataScreener(_)
+        ) {
+            return Err(LiveActionHookError::IneligibleEvent);
+        }
         if authority.quality != DataQuality::DirectVerified {
             return Err(LiveActionHookError::IneligibleQuality);
         }
@@ -880,6 +890,9 @@ pub trait LiveActionHook: Send + std::fmt::Debug {
 /// Action-context or retained-accounting failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum LiveActionHookError {
+    /// Observational market data does not grant execution authority.
+    #[error("observational market data cannot enter the live action hook")]
+    IneligibleEvent,
     /// The committed observation did not retain execution-eligible quality.
     #[error("live action requires DirectVerified quality")]
     IneligibleQuality,
@@ -915,6 +928,11 @@ fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
     match event {
         MarketEvent::Trade(value) => value.provenance(),
         MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::MarketDataQuote(value) => value.provenance(),
+        MarketEvent::MarketDataTrade(value) => value.provenance(),
+        MarketEvent::MarketDataBook(value) => value.provenance(),
+        MarketEvent::MarketDataChart(value) => value.provenance(),
+        MarketEvent::MarketDataScreener(value) => value.provenance(),
         MarketEvent::BookSnapshot(value) => value.provenance(),
         MarketEvent::BookDelta(value) => value.provenance(),
         MarketEvent::Auction(value) => value.provenance(),

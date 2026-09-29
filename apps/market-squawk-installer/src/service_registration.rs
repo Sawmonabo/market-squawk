@@ -43,7 +43,6 @@ use crate::store::InstallStore;
 const RECEIPT_FILE: &str = "service-registration.json";
 const RECEIPT_SCHEMA_VERSION: u32 = 2;
 const REGISTRATION_OWNER: &str = "market-squawk-installer-v1";
-const MAXIMUM_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
 const MAXIMUM_RECEIPT_BYTES: usize = 64 * 1024;
 const MAXIMUM_NATIVE_DOCUMENT_BYTES: usize = 64 * 1024;
 const MAXIMUM_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
@@ -658,11 +657,7 @@ fn program_identity(
     let path = release_root.join(program.relative_path(target));
     let metadata = fs::symlink_metadata(&path)
         .map_err(|source| ServiceRegistrationError::io("inspect registered program", source))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > MAXIMUM_EXECUTABLE_BYTES
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
         return Err(ServiceRegistrationError::UnsafePath);
     }
     #[cfg(unix)]
@@ -871,7 +866,6 @@ fn validate_receipt_identity(
             .any(|identity| {
                 !identity.path.is_absolute()
                     || identity.size == 0
-                    || identity.size > MAXIMUM_EXECUTABLE_BYTES
                     || !is_lower_sha256(&identity.sha256)
             })
     {

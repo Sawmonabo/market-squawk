@@ -7,12 +7,12 @@ WHEN NOT (
         NEW.schema_name = 'market_squawk.research_observations'
         AND NEW.schema_version = 3
         AND NEW.schema_fingerprint =
-            X'adbb26ab67e0389eb0a4422f1eb29b54be518fbb01a6b0624da41cb862e61c0a'
+            X'ff8f8b2c282a4386b1a0075da64aaf692fe6dc7a8c72fc648fed6aa24d44b1d2'
     ) OR (
         NEW.schema_name = 'market_squawk.feature_label_components'
         AND NEW.schema_version = 3
         AND NEW.schema_fingerprint =
-            X'ca7f3447c5c353181b3776f2980a55dcbc54ae69a75b9231d5925912444322a4'
+            X'9f66fb43d2269bbab58354505292c545cfeed08c8490c4c3e64fc7f4634860e9'
     )
 ) BEGIN
     SELECT RAISE(ABORT, 'analytical generation schema identity is not registered');
@@ -39,7 +39,10 @@ CREATE TABLE feature_dataset_production_admissions (
     product_contract TEXT NOT NULL CHECK (
         product_contract IN (
             'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.analysis/v1',
-            'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1'
+            'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1',
+            'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon.study-inputs/v1',
+            'market-squawk.feature-dataset.native-fiscal-financial-amount.training/v1',
+            'market-squawk.feature-dataset.native-fiscal-financial-amount.study-inputs/v1'
         )
     ),
     export_sha256 BLOB NOT NULL UNIQUE CHECK (
@@ -87,12 +90,17 @@ CREATE TABLE feature_dataset_production_admissions (
     admitted_at_ns INTEGER NOT NULL CHECK (admitted_at_ns < research_use_expires_at_ns),
     CHECK (
         (
-            product_contract =
-                'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.analysis/v1'
+            product_contract IN (
+                'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.analysis/v1',
+                'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon.study-inputs/v1',
+                'market-squawk.feature-dataset.native-fiscal-financial-amount.study-inputs/v1'
+            )
             AND research_use = 'local_analysis'
         ) OR (
-            product_contract =
-                'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1'
+            product_contract IN (
+                'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1',
+                'market-squawk.feature-dataset.native-fiscal-financial-amount.training/v1'
+            )
             AND research_use = 'train'
         )
     ),

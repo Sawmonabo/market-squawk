@@ -486,6 +486,11 @@ mod tests {
                 SourceIdentifier::try_from("message-1")?,
                 VenueId::try_from("coinbase")?,
                 InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+                crate::ProviderNativeInstrumentIdentity::new(
+                    market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+                    market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+                    market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+                ),
                 ProviderTimestampEvidence::Provided {
                     value: Timestamp::from_unix_nanos(1),
                     rule: timestamp.clone(),
@@ -567,6 +572,11 @@ mod tests {
                 SourceIdentifier::try_from(id)?,
                 VenueId::try_from("coinbase")?,
                 instrument,
+                crate::ProviderNativeInstrumentIdentity::new(
+                    market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+                    market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+                    market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+                ),
                 ProviderTimestampEvidence::AuthoritativelyAbsent(timestamp.clone()),
                 ProviderSequenceEvidence::Unsupported {
                     rule: no_sequence.clone(),

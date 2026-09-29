@@ -23,6 +23,8 @@ datafusion = { workspace = true }
 futures-util = { workspace = true }
 libc = { workspace = true }
 market-squawk-adapter-alpaca = { workspace = true }
+market-squawk-adapter-federal-reserve = { workspace = true }
+market-squawk-adapter-tiingo = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-platform = { workspace = true }
 market-squawk-sources = { workspace = true }

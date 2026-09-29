@@ -27,8 +27,12 @@ pub const MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// Closed adapter encoder implementations admitted by the current native-lineage schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderNativeLineageImplementation {
+    /// Alpaca all-category corporate-action source-query semantics v1.
+    AlpacaCorporateActionsV1,
     /// Alpaca historical-bar response semantics encoder v1.
     AlpacaHistoricalBarV1,
+    /// Alpaca exact calendar market metadata and native dated sessions encoder v1.
+    AlpacaCalendarV1,
     /// Alpaca IEX current market-data response semantics encoder v1.
     AlpacaIexMarketDataV1,
     /// Alpaca indicative options response semantics encoder v1.
@@ -63,6 +67,8 @@ pub enum ProviderNativeLineageImplementation {
     TiingoFundNavV1,
     /// Tiingo end-of-day market-bar response semantics encoder v1.
     TiingoEodMarketBarV1,
+    /// Maintained Tiingo economic-date ordinary action response semantics.
+    TiingoCorporateActionsV1,
     /// U.S. Treasury Fiscal Data and daily-rate macro semantics encoder v1.
     UsTreasuryMacroV1,
     /// Yahoo explicit-demand enrichment response semantics encoder v1.
@@ -72,6 +78,10 @@ pub enum ProviderNativeLineageImplementation {
 impl ProviderNativeLineageImplementation {
     const fn identifier(self) -> &'static [u8] {
         match self {
+            Self::AlpacaCorporateActionsV1 => {
+                b"market-squawk/alpaca-corporate-actions/provider-native-lineage/v1"
+            }
+            Self::AlpacaCalendarV1 => b"market-squawk/alpaca-calendar/provider-native-lineage/v1",
             Self::AlpacaHistoricalBarV1 => {
                 b"market-squawk/alpaca-historical/provider-native-lineage/v1"
             }
@@ -108,6 +118,9 @@ impl ProviderNativeLineageImplementation {
             Self::SchwabStreamerMarketDataV1 => {
                 b"market-squawk/schwab-streamer-market-data/provider-native-lineage/v1"
             }
+            Self::TiingoCorporateActionsV1 => {
+                b"market-squawk/tiingo-corporate-actions/provider-native-lineage/v1"
+            }
             Self::TiingoFundNavV1 => b"market-squawk/tiingo-fund-nav/provider-native-lineage/v1",
             Self::TiingoEodMarketBarV1 => {
                 b"market-squawk/tiingo-eod-market-bar/provider-native-lineage/v1"
@@ -121,7 +134,9 @@ impl ProviderNativeLineageImplementation {
 
     pub(crate) const fn tag(self) -> u8 {
         match self {
+            Self::AlpacaCorporateActionsV1 => 27,
             Self::AlpacaHistoricalBarV1 => 5,
+            Self::AlpacaCalendarV1 => 26,
             Self::AlpacaIexMarketDataV1 => 24,
             Self::AlpacaIndicativeOptionsV1 => 25,
             Self::BeaRegionalV1 => 1,
@@ -137,6 +152,7 @@ impl ProviderNativeLineageImplementation {
             Self::SecEdgarV1 => 8,
             Self::SchwabRestMarketDataV1 => 14,
             Self::SchwabStreamerMarketDataV1 => 15,
+            Self::TiingoCorporateActionsV1 => 28,
             Self::TiingoFundNavV1 => 6,
             Self::TiingoEodMarketBarV1 => 7,
             Self::UsTreasuryMacroV1 => 21,
@@ -548,6 +564,8 @@ pub struct ProviderNativeLineageBatchBuilder<'batch> {
     rows: Vec<ProviderNativeLineageRow>,
     batch_sidecar: Option<ProviderNativeLineageBatchSidecar>,
     retained_bytes: usize,
+    logical_retained_bytes: usize,
+    maximum_retained_bytes: usize,
 }
 
 impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
@@ -565,29 +583,71 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
         implementation: ProviderNativeLineageImplementation,
         batch: &'batch ExtractionBatch,
     ) -> Result<Self, ProviderNativeLineageError> {
+        // Preserve the established global logical-payload ceiling for existing providers.
+        // Only explicit bounded callers impose a tighter aggregate runtime admission.
+        Self::try_new_with_admission(implementation, batch, usize::MAX)
+    }
+
+    /// Starts an encoder under the caller's remaining aggregate working-set admission.
+    ///
+    /// Reserves row slots and ownership metadata before encoding. Every payload serializer receives
+    /// only the remaining admission, with twofold headroom for its buffer and ownership transition.
+    pub fn try_new_bounded(
+        implementation: ProviderNativeLineageImplementation,
+        batch: &'batch ExtractionBatch,
+        maximum_retained_bytes: usize,
+    ) -> Result<Self, ProviderNativeLineageError> {
+        Self::try_new_with_admission(
+            implementation,
+            batch,
+            maximum_retained_bytes.min(MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES),
+        )
+    }
+
+    fn try_new_with_admission(
+        implementation: ProviderNativeLineageImplementation,
+        batch: &'batch ExtractionBatch,
+        maximum_retained_bytes: usize,
+    ) -> Result<Self, ProviderNativeLineageError> {
         let expected = batch.records().len();
         if expected > MAX_EXTRACTION_RECORDS {
             return Err(ProviderNativeLineageError::RecordLimitExceeded {
                 max: MAX_EXTRACTION_RECORDS,
             });
         }
-        let retained_bytes = size_of::<ProviderNativeLineageBatch>()
+        let logical_retained_bytes = size_of::<ProviderNativeLineageBatch>()
             .checked_add(
                 size_of::<ProviderNativeLineageRow>()
                     .checked_mul(expected)
                     .ok_or(ProviderNativeLineageError::ByteCountOverflow)?,
             )
             .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
-        if retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES {
+        if logical_retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES {
             return Err(ProviderNativeLineageError::BatchByteLimitExceeded {
                 max: MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES,
             });
         }
+        let retained_bytes = size_of::<ProviderNativeLineageBatch>()
+            .checked_add(
+                size_of::<ProviderNativeLineageRow>()
+                    .checked_mul(expected)
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(ProviderNativeLineageError::ByteCountOverflow)?,
+            )
+            .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+        if retained_bytes > maximum_retained_bytes {
+            return Err(ProviderNativeLineageError::BatchByteLimitExceeded {
+                max: maximum_retained_bytes,
+            });
+        }
         let content_identity = ExtractionContentIdentity::try_from_batch(batch)
             .map_err(|_| ProviderNativeLineageError::AlignmentMismatch)?;
-        let mut rows = Vec::new();
+        let mut rows = Vec::<ProviderNativeLineageRow>::new();
         rows.try_reserve_exact(expected)
             .map_err(|_| ProviderNativeLineageError::AllocationFailure)?;
+        if rows.capacity() > expected.saturating_mul(2) {
+            return Err(ProviderNativeLineageError::AllocationFailure);
+        }
         Ok(Self {
             schema: ProviderNativeLineageSchema::for_implementation(implementation),
             batch,
@@ -595,7 +655,14 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
             rows,
             batch_sidecar: None,
             retained_bytes,
+            logical_retained_bytes,
+            maximum_retained_bytes,
         })
+    }
+
+    /// Returns the conservative runtime reservation accumulated by this encoder.
+    pub const fn runtime_retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     /// Serializes and retains the sole optional batch-level provider-native semantic payload.
@@ -609,17 +676,28 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
         if self.batch_sidecar.is_some() {
             return Err(ProviderNativeLineageError::SidecarAlreadyPresent);
         }
-        let payload = serialize_provider_native_lineage_sidecar(value)?;
+        let header = size_of::<ProviderNativeLineageBatchSidecar>()
+            .checked_add(2 * size_of::<Bytes>())
+            .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
+        let maximum = self
+            .remaining_payload_bytes(header, size_of::<ProviderNativeLineageBatchSidecar>())?
+            .min(MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES);
+        let payload = serialize_provider_native_lineage_sidecar(value, maximum)?;
         let retained_bytes = self
             .retained_bytes
-            .checked_add(size_of::<ProviderNativeLineageBatchSidecar>())
-            .and_then(|bytes| bytes.checked_add(payload.len()))
+            .checked_add(header)
+            .and_then(|bytes| bytes.checked_add(payload.capacity().checked_mul(2)?))
             .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
-        if retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES {
+        if retained_bytes > self.maximum_retained_bytes {
             return Err(ProviderNativeLineageError::BatchByteLimitExceeded {
-                max: MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES,
+                max: self.maximum_retained_bytes,
             });
         }
+        self.logical_retained_bytes = self
+            .logical_retained_bytes
+            .checked_add(size_of::<ProviderNativeLineageBatchSidecar>())
+            .and_then(|n| n.checked_add(payload.len()))
+            .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
         let semantic_payload = Bytes::from(payload);
         let semantic_payload_digest = sha256(&semantic_payload);
         self.batch_sidecar = Some(ProviderNativeLineageBatchSidecar {
@@ -649,16 +727,25 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
                     .ok_or(ProviderNativeLineageError::ByteCountOverflow)?,
             });
         };
-        let semantic_payload = serialize_provider_native_lineage_row(value, ordinal)?;
+        let header = 2 * size_of::<Bytes>();
+        let maximum = self
+            .remaining_payload_bytes(header, 0)?
+            .min(MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES);
+        let semantic_payload = serialize_provider_native_lineage_row(value, ordinal, maximum)?;
         let retained_bytes = self
             .retained_bytes
-            .checked_add(semantic_payload.len())
+            .checked_add(header)
+            .and_then(|bytes| bytes.checked_add(semantic_payload.capacity().checked_mul(2)?))
             .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
-        if retained_bytes > MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES {
+        if retained_bytes > self.maximum_retained_bytes {
             return Err(ProviderNativeLineageError::BatchByteLimitExceeded {
-                max: MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES,
+                max: self.maximum_retained_bytes,
             });
         }
+        self.logical_retained_bytes = self
+            .logical_retained_bytes
+            .checked_add(semantic_payload.len())
+            .ok_or(ProviderNativeLineageError::ByteCountOverflow)?;
         let semantic_payload = Bytes::from(semantic_payload);
         let semantic_payload_digest = sha256(&semantic_payload);
         self.rows.push(ProviderNativeLineageRow {
@@ -670,6 +757,30 @@ impl<'batch> ProviderNativeLineageBatchBuilder<'batch> {
         });
         self.retained_bytes = retained_bytes;
         Ok(())
+    }
+
+    fn remaining_payload_bytes(
+        &self,
+        runtime_header: usize,
+        logical_header: usize,
+    ) -> Result<usize, ProviderNativeLineageError> {
+        let runtime = self
+            .maximum_retained_bytes
+            .checked_sub(self.retained_bytes)
+            .and_then(|bytes| bytes.checked_sub(runtime_header))
+            .map(|bytes| bytes / 2)
+            .filter(|bytes| *bytes > 0)
+            .ok_or(ProviderNativeLineageError::BatchByteLimitExceeded {
+                max: self.maximum_retained_bytes,
+            })?;
+        let logical = MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES
+            .checked_sub(self.logical_retained_bytes)
+            .and_then(|bytes| bytes.checked_sub(logical_header))
+            .filter(|bytes| *bytes > 0)
+            .ok_or(ProviderNativeLineageError::BatchByteLimitExceeded {
+                max: MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES,
+            })?;
+        Ok(runtime.min(logical))
     }
 
     /// Finishes only when every canonical record has exactly one aligned native row.
@@ -762,16 +873,17 @@ pub enum ProviderNativeLineageError {
 fn serialize_provider_native_lineage_row<T>(
     value: &T,
     ordinal: usize,
+    maximum: usize,
 ) -> Result<Vec<u8>, ProviderNativeLineageError>
 where
     T: Serialize + ?Sized,
 {
-    let mut writer = BoundedNativeLineageWriter::new(MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES);
+    let mut writer = BoundedNativeLineageWriter::new(maximum);
     if serde_json::to_writer(&mut writer, value).is_err() {
         return Err(if writer.limit_exceeded {
             ProviderNativeLineageError::RowByteLimitExceeded {
                 ordinal,
-                max: MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
+                max: maximum,
             }
         } else if writer.allocation_failed {
             ProviderNativeLineageError::AllocationFailure
@@ -787,16 +899,15 @@ where
 
 fn serialize_provider_native_lineage_sidecar<T>(
     value: &T,
+    maximum: usize,
 ) -> Result<Vec<u8>, ProviderNativeLineageError>
 where
     T: Serialize + ?Sized,
 {
-    let mut writer = BoundedNativeLineageWriter::new(MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES);
+    let mut writer = BoundedNativeLineageWriter::new(maximum);
     if serde_json::to_writer(&mut writer, value).is_err() {
         return Err(if writer.limit_exceeded {
-            ProviderNativeLineageError::SidecarByteLimitExceeded {
-                max: MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES,
-            }
+            ProviderNativeLineageError::SidecarByteLimitExceeded { max: maximum }
         } else if writer.allocation_failed {
             ProviderNativeLineageError::AllocationFailure
         } else {
@@ -843,10 +954,25 @@ impl Write for BoundedNativeLineageWriter {
                 "provider-native lineage row exceeds bound",
             ));
         }
-        if self.bytes.try_reserve_exact(value.len()).is_err() {
-            self.allocation_failed = true;
+        if next_len > self.bytes.capacity() {
+            let capacity = next_len
+                .max(self.bytes.capacity().saturating_mul(2).max(8))
+                .min(self.maximum);
+            if self
+                .bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .is_err()
+            {
+                self.allocation_failed = true;
+                return Err(io::Error::other(
+                    "provider-native lineage bounded allocation failed",
+                ));
+            }
+        }
+        if self.bytes.capacity() > self.maximum {
+            self.limit_exceeded = true;
             return Err(io::Error::other(
-                "provider-native lineage bounded allocation failed",
+                "provider-native lineage allocation exceeds admission",
             ));
         }
         self.bytes.extend_from_slice(value);

@@ -521,9 +521,10 @@ fn pagination_from_request(evidence: &TiingoResponseEvidence) -> TiingoPaginatio
         TiingoRequestScope::History { page, .. } => {
             TiingoPaginationEvidence::ApplicationDateWindow(*page)
         }
-        TiingoRequestScope::Latest | TiingoRequestScope::Metadata => {
-            TiingoPaginationEvidence::NotApplicable
-        }
+        TiingoRequestScope::Latest
+        | TiingoRequestScope::Metadata
+        | TiingoRequestScope::Distributions { .. }
+        | TiingoRequestScope::Splits { .. } => TiingoPaginationEvidence::NotApplicable,
     }
 }
 

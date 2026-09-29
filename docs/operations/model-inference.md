@@ -559,6 +559,7 @@ For the native candidate above, use:
   },
   "dataset": {
     "exportSha256": "<receipt-dataset-export-sha256>",
+    "productContract": "market-squawk.feature-dataset.completed-bar-close-price-return-macro-context-fixed-horizon-forward-return.training/v1",
     "asOfUnixNanos": 1753228800000000000,
     "selectionSha256": "<receipt-dataset-selection-sha256>",
     "catalogIdentitySha256": "<receipt-catalog-identity-sha256>"
@@ -571,6 +572,10 @@ For the native candidate above, use:
 
 The timestamp above illustrates the integer field and must be replaced by the receipt's exact
 selection cutoff.
+
+`productContract` must name the original published training recipe. Native fiscal financial models
+use `market-squawk.feature-dataset.native-fiscal-financial-amount.training/v1`. The same identity is
+required in the durable model index and revalidated against the original dataset on restart.
 
 `candidateDirectory` is relative to `<data-root>/artifacts`, at most 512 bytes and 32 components.
 Each component is at most 255 bytes and contains only lowercase ASCII letters, digits, `-`, `_`, or

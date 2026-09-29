@@ -14,6 +14,7 @@ use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
 };
 use market_squawk_services::ServiceError;
+use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -26,9 +27,15 @@ use crate::PinnedBacktestInput;
 
 mod index;
 pub(in crate::application::analysis::backtest) mod lifecycle;
+mod materialization;
+mod recommendation;
 
 use index::{StoredTerminal, TerminalIndex, command_digest, value_digest};
 use lifecycle::{LinkedOperation, RepositoryLifecycle, await_blocking, ensure_operation_live};
+pub(crate) use recommendation::{
+    GovernedRecommendationBacktestReceiptV1, GovernedRecommendationBacktestReferenceV1,
+    GovernedRecommendationBacktestRequestV1,
+};
 
 const TERMINAL_INDEX_DIRECTORY: &str = "analysis/governed-backtests";
 const HARD_MAXIMUM_TERMINALS: usize = 16_384;
@@ -43,6 +50,10 @@ pub struct GovernedBacktestRepositoryLimits {
 }
 
 impl GovernedBacktestRepositoryLimits {
+    pub(crate) const fn maximum_backup_index_bytes(self) -> usize {
+        self.maximum_index_bytes
+    }
+
     /// Constructs limits no greater than the fixed process and persistence ceilings.
     ///
     /// # Errors
@@ -106,7 +117,7 @@ impl ResolvedGovernedBacktestInput {
         }
     }
 
-    fn validate(
+    pub(super) fn validate(
         self,
         command: &GovernedBacktestCommand,
     ) -> Result<PinnedBacktestInput, ServiceError> {
@@ -157,11 +168,15 @@ pub trait GovernedBacktestInputResolver: Send + Sync + 'static {
 
 /// Capability-confined, restart-safe production repository for governed backtests.
 pub struct ProductionGovernedBacktestRepository {
+    artifacts: Arc<dyn market_squawk_services::ArtifactRepository>,
     resolver: Arc<dyn GovernedBacktestInputResolver>,
     store: Arc<LocalAuthorityStateStore>,
     index: Arc<Mutex<TerminalIndex>>,
     limits: GovernedBacktestRepositoryLimits,
     lifecycle: Arc<RepositoryLifecycle>,
+    recommendation_cache:
+        Mutex<Option<([u8; 32], super::GovernedRecommendationBacktestEvidenceV1)>>,
+    recommendation_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl ProductionGovernedBacktestRepository {
@@ -174,6 +189,7 @@ impl ProductionGovernedBacktestRepository {
     pub fn try_new(
         paths: &LocalPaths,
         resolver: Arc<dyn GovernedBacktestInputResolver>,
+        artifacts: Arc<dyn market_squawk_services::ArtifactRepository>,
         limits: GovernedBacktestRepositoryLimits,
     ) -> Result<Self, ProductionGovernedBacktestRepositoryError> {
         GovernedBacktestRepositoryLimits::try_new(
@@ -191,11 +207,14 @@ impl ProductionGovernedBacktestRepository {
             |bytes| TerminalIndex::decode(&bytes, limits),
         )?;
         Ok(Self {
+            artifacts,
             resolver,
             store,
             index: Arc::new(Mutex::new(index)),
             limits,
             lifecycle: RepositoryLifecycle::new(),
+            recommendation_cache: Mutex::new(None),
+            recommendation_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 }
@@ -479,7 +498,7 @@ fn batch_within_time_range(
     ends_at: Timestamp,
 ) -> bool {
     let Some(cutoffs) = batch
-        .column_by_name("cutoff_at")
+        .column_by_name("decision_at")
         .and_then(|column| column.as_any().downcast_ref::<TimestampNanosecondArray>())
     else {
         return false;
@@ -525,7 +544,10 @@ fn publish_terminal(
                 Err(ServiceError::InvalidResult)
             };
         }
-        Err(_) if current.entries.len() >= limits.maximum_terminals => {
+        Err(_)
+            if current.entries.len() + current.recommendation_entries.len()
+                >= limits.maximum_terminals =>
+        {
             return Err(ServiceError::ResourceExhausted);
         }
         Err(_) => {}
@@ -568,6 +590,148 @@ fn map_repository_error_to_service(
     }
 }
 
+impl ProductionGovernedBacktestRepository {
+    pub(crate) fn backup_index_artifacts(
+        &self,
+        bytes: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<market_squawk_services::ArtifactReference>, ServiceError> {
+        Self::validated_backup_index_artifacts(bytes, self.limits, maximum)
+    }
+    pub(crate) fn validated_backup_index_artifacts(
+        bytes: &[u8],
+        limits: GovernedBacktestRepositoryLimits,
+        maximum: usize,
+    ) -> Result<Vec<market_squawk_services::ArtifactReference>, ServiceError> {
+        TerminalIndex::decode(bytes, limits)
+            .map_err(map_repository_error_to_service)?
+            .backup_artifacts(maximum)
+    }
+
+    /// Captures one canonical index and its original sealed durable revision; no source authority is minted.
+    pub(crate) async fn export_backup_index(
+        &self,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(Vec<u8>, [u8; 32]), ServiceError> {
+        let call = RepositoryLifecycle::enter(&self.lifecycle, cancellation, deadline)?;
+        let index = Arc::clone(&self.index);
+        let store = Arc::clone(&self.store);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let limits = self.limits;
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _call = call;
+            ensure_operation_live(&worker_cancellation, &lifecycle, deadline)?;
+            let current = index.try_lock().map_err(|_| ServiceError::Unavailable)?;
+            let bytes = current
+                .encode(limits)
+                .map_err(map_repository_error_to_service)?;
+            Self::validate_backup_index(&bytes, limits)?;
+            let durable = store
+                .load_snapshot()
+                .map_err(map_authority_error_to_service)?;
+            let mut revision = sha2::Sha256::new();
+            revision.update(b"market-squawk/terminal_index_directory-backup/v1\0");
+            match durable {
+                Some(snapshot) => {
+                    if snapshot.payload() != bytes.as_slice() {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                    revision.update([1]);
+                    revision.update(snapshot.context().authentication_bytes());
+                }
+                None if current.is_empty() => revision.update([0]),
+                None => return Err(ServiceError::InvalidResult),
+            }
+            revision.update(&bytes);
+            ensure_operation_live(&worker_cancellation, &lifecycle, deadline)?;
+            Ok((bytes, revision.finalize().into()))
+        });
+        await_blocking(
+            worker,
+            cancellation,
+            self.lifecycle.shutdown_token(),
+            deadline,
+        )
+        .await
+    }
+
+    pub(crate) async fn revalidate_backup_index(
+        &self,
+        expected_revision: [u8; 32],
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ServiceError> {
+        let (_, actual) = self.export_backup_index(cancellation, deadline).await?;
+        if actual != expected_revision {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_backup_index(
+        bytes: &[u8],
+        limits: GovernedBacktestRepositoryLimits,
+    ) -> Result<(), ServiceError> {
+        let decoded =
+            TerminalIndex::decode(bytes, limits).map_err(map_repository_error_to_service)?;
+        drop(decoded);
+        Ok(())
+    }
+
+    /// Writes only the existing fixed namespace in a fresh, unpublished restore target.
+    pub(crate) fn restore_backup_index_fresh(
+        paths: &LocalPaths,
+        limits: GovernedBacktestRepositoryLimits,
+        bytes: &[u8],
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ServiceError> {
+        Self::validate_backup_index(bytes, limits)?;
+        let ensure_live = || {
+            if cancellation.is_cancelled() {
+                Err(ServiceError::Cancelled)
+            } else if Instant::now() >= deadline {
+                Err(ServiceError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        };
+        ensure_live()?;
+        let control = paths
+            .control_root()
+            .map_err(|_| ServiceError::Unavailable)?;
+        control
+            .try_clone_directory()
+            .map_err(|_| ServiceError::Unavailable)?;
+        let store =
+            LocalAuthorityStateStore::try_open(control.root().join(TERMINAL_INDEX_DIRECTORY))
+                .map_err(map_authority_error_to_service)?;
+        control
+            .try_clone_directory()
+            .map_err(|_| ServiceError::Unavailable)?;
+        if store
+            .load_snapshot()
+            .map_err(map_authority_error_to_service)?
+            .is_some()
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        ensure_live()?;
+        store.store(bytes).map_err(map_authority_error_to_service)?;
+        if store
+            .load()
+            .map_err(map_authority_error_to_service)?
+            .as_deref()
+            != Some(bytes)
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        ensure_live()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroUsize, sync::Arc, time::Instant};
@@ -586,7 +750,7 @@ mod tests {
     use super::{
         GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
         ProductionGovernedBacktestRepository, ResolvedGovernedBacktestInput, command_digest,
-        value_digest,
+        value_digest, materialization,
     };
     use crate::application::analysis::{
         BacktestScope, GovernedBacktestCommand, GovernedBacktestRecord, GovernedBacktestRepository,
@@ -627,6 +791,10 @@ mod tests {
         let first = ProductionGovernedBacktestRepository::try_new(
             &paths,
             Arc::new(MissingInputResolver),
+            crate::artifact_repository::controlled_artifact_repository(
+                paths.artifacts()?.clone(),
+                NonZeroUsize::new(materialization::MAXIMUM_MATERIALIZATION_BYTES).ok_or("artifact limit")?,
+            )?,
             limits,
         )?;
         let instrument = InstrumentId::try_from(Uuid::from_u128(1))?;
@@ -677,6 +845,10 @@ mod tests {
         let restarted = ProductionGovernedBacktestRepository::try_new(
             &paths,
             Arc::new(MissingInputResolver),
+            crate::artifact_repository::controlled_artifact_repository(
+                paths.artifacts()?.clone(),
+                NonZeroUsize::new(materialization::MAXIMUM_MATERIALIZATION_BYTES).ok_or("artifact limit")?,
+            )?,
             limits,
         )?;
         let restored = restarted

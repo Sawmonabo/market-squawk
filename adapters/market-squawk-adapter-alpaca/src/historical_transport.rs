@@ -636,8 +636,10 @@ fn validate_calendar_request(url: &Url) -> Result<(), AlpacaError> {
     if !matches!(
         url.host_str(),
         Some("api.alpaca.markets" | "paper-api.alpaca.markets")
-    ) || url.path() != "/v3/calendar/IEX"
-    {
+    ) || !matches!(
+        url.path(),
+        "/v3/calendar/IEX" | "/v3/calendar/XNYS" | "/v3/calendar/XNAS"
+    ) {
         return Err(AlpacaError::Protocol);
     }
     let mut query = url.query_pairs();

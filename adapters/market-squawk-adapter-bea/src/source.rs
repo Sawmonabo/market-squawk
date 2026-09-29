@@ -43,8 +43,8 @@ use crate::transport::{
 use crate::{
     BEA_API_ENDPOINT, BEA_APPLICATION_ERRORS_PER_MINUTE, BEA_APPLICATION_REQUESTS_PER_MINUTE,
     BEA_APPLICATION_RESPONSE_BYTES_PER_MINUTE, BEA_MINIMUM_REQUEST_INTERVAL, BeaCompleteness,
-    BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorRun, BeaError,
-    BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod,
+    BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorError, BeaDoctorRun,
+    BeaError, BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod,
     BeaMissingValue, BeaObservation, BeaObservationValue, BeaParameterDefinition,
     BeaParameterIdentity, BeaParseLimits, BeaProviderQuotaDeclaration, BeaQuery, BeaRequest,
     BeaSourceBinding, BeaUserId, bea_provider_quota_declaration,
@@ -60,6 +60,21 @@ const BEA_ANALYTICAL_PREFIX: &str = "bea.data-v1.";
 const BEA_JSON_MEDIA_TYPE: &str = "application/json";
 const MAX_RETRY_AFTER_BYTES: usize = 256;
 const BEA_METADATA_DISCOVERY_DAG_SCHEMA: &[u8] = b"market-squawk/bea-metadata-discovery-dag/v2";
+
+/// Why the sealed metadata admission used by one publication changed or was retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeaDoctorRefreshDisposition {
+    /// No prior admission existed for this exact selected dataset.
+    Activated,
+    /// Current sealed metadata admission was reused; only this publication's observations are new.
+    ReusedCurrent,
+    /// The prior admission reached its exclusive expiry and was replaced explicitly.
+    RefreshedExpired,
+    /// A strictly newer physical doctor proof replaced a still-current matching generation.
+    RefreshedEvidence,
+    /// Provider metadata changed and the exact newly sealed generation replaced the predecessor.
+    RefreshedMetadataDrift,
+}
 
 /// One metadata-first BEA data selection admitted by application composition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -668,6 +683,58 @@ impl BeaMetadataBundle {
     pub const fn generation(&self) -> BeaMetadataGeneration {
         self.generation
     }
+
+    /// Splits one metadata-only admission graph from its exact raw material.
+    pub(crate) fn into_sealing_parts(
+        self,
+    ) -> Result<(BeaMetadataEvidenceBundle, ProviderCaptureMaterial), BeaSourceError> {
+        let mut materials = Vec::new();
+        materials
+            .try_reserve_exact(self.pages.len())
+            .map_err(|_| BeaSourceError::Allocation)?;
+        let mut evidence_pages = Vec::new();
+        evidence_pages
+            .try_reserve_exact(self.pages.len())
+            .map_err(|_| BeaSourceError::Allocation)?;
+        for captured in self.pages {
+            let BeaCapturedMetadataPage {
+                request,
+                page,
+                material,
+                telemetry,
+            } = captured;
+            let capture = material.receipt().clone();
+            materials.push(material);
+            evidence_pages.push(BeaMetadataEvidencePage {
+                request,
+                page,
+                capture,
+                telemetry,
+            });
+        }
+        let evidence = BeaMetadataEvidenceBundle {
+            dataset_id: self.dataset_id,
+            pages: evidence_pages,
+            generation: self.generation,
+        };
+        let mut capture_refs = Vec::new();
+        capture_refs
+            .try_reserve_exact(materials.len())
+            .map_err(|_| BeaSourceError::Allocation)?;
+        capture_refs.extend(materials.iter().map(ProviderCaptureMaterial::receipt));
+        let graph_identity =
+            bea_capture_graph_identity(evidence.dataset_id(), evidence.generation(), &capture_refs)
+                .map_err(|_| BeaSourceError::Protocol)?;
+        let graph_owner = materials.first().ok_or(BeaSourceError::Protocol)?.receipt();
+        let graph = ProviderCaptureMaterial::try_combine_request_graph(
+            graph_owner.source_id().clone(),
+            graph_owner.metadata_revision().clone(),
+            evidence.dataset_id().clone(),
+            graph_identity,
+            materials,
+        )?;
+        Ok((evidence, graph))
+    }
 }
 
 /// One validated data response retaining typed rows and exact capture-ready material.
@@ -692,6 +759,20 @@ impl BeaCapturedDataPage {
     }
     pub const fn telemetry(&self) -> &BeaResponseTelemetry {
         &self.telemetry
+    }
+
+    /// Splits one fresh observation response from its exact raw sealing material.
+    pub(crate) fn into_sealing_parts(self) -> (BeaDataEvidencePage, ProviderCaptureMaterial) {
+        let capture = self.material.receipt().clone();
+        (
+            BeaDataEvidencePage {
+                request: self.request,
+                page: self.page,
+                capture,
+                telemetry: self.telemetry,
+            },
+            self.material,
+        )
     }
 }
 
@@ -744,13 +825,32 @@ impl BeaMetadataEvidenceBundle {
     pub const fn generation(&self) -> BeaMetadataGeneration {
         self.generation
     }
+
+    pub(crate) fn expected_capture_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub(crate) fn expected_capture(&self, ordinal: usize) -> Option<&ProviderCaptureSetReceipt> {
+        self.pages
+            .get(ordinal)
+            .map(BeaMetadataEvidencePage::capture)
+    }
+
+    pub(crate) fn expected_upstream_response_digest(
+        &self,
+        ordinal: usize,
+    ) -> Option<EvidenceDigest> {
+        self.pages
+            .get(ordinal)
+            .map(|page| page.page().receipt().upstream_response_digest())
+            .map(evidence_digest)
+    }
 }
 
-/// Complete typed BEA acquisition evidence whose exact raw bytes are no longer clonable.
+/// Typed evidence joining one sealed metadata admission to one fresh observation response.
 ///
-/// Root composition receives this value inside a pending seal continuation, seals the combined
-/// request graph, then rejoins the exact opaque seal result. Canonical candidate construction
-/// accepts only that one-use rejoined proof.
+/// The metadata responses and fresh observation response retain distinct physical seals.
+/// Canonical candidate construction accepts only the one-use rejoin proving both authorities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeaDatasetEvidence {
     metadata: BeaMetadataEvidenceBundle,
@@ -758,6 +858,13 @@ pub struct BeaDatasetEvidence {
 }
 
 impl BeaDatasetEvidence {
+    pub(crate) fn from_admitted_parts(
+        metadata: BeaMetadataEvidenceBundle,
+        data: BeaDataEvidencePage,
+    ) -> Self {
+        Self { metadata, data }
+    }
+
     /// Returns metadata-first typed evidence.
     pub const fn metadata(&self) -> &BeaMetadataEvidenceBundle {
         &self.metadata
@@ -766,132 +873,13 @@ impl BeaDatasetEvidence {
     pub const fn data(&self) -> &BeaDataEvidencePage {
         &self.data
     }
-
-    pub(crate) fn expected_capture_count(&self) -> usize {
-        self.metadata.pages.len().saturating_add(1)
-    }
-
-    pub(crate) fn expected_capture(&self, ordinal: usize) -> Option<&ProviderCaptureSetReceipt> {
-        self.metadata
-            .pages
-            .get(ordinal)
-            .map(BeaMetadataEvidencePage::capture)
-            .or_else(|| (ordinal == self.metadata.pages.len()).then_some(self.data.capture()))
-    }
-
-    pub(crate) fn expected_upstream_response_digest(
-        &self,
-        ordinal: usize,
-    ) -> Option<EvidenceDigest> {
-        self.metadata
-            .pages
-            .get(ordinal)
-            .map(|page| page.page().receipt().upstream_response_digest())
-            .or_else(|| {
-                (ordinal == self.metadata.pages.len())
-                    .then_some(self.data.page().receipt().upstream_response_digest())
-            })
-            .map(evidence_digest)
-    }
-}
-
-/// Complete metadata-first acquisition; it is not canonical-publication authority.
-#[derive(Debug)]
-pub struct BeaDatasetAcquisition {
-    metadata: BeaMetadataBundle,
-    data: BeaCapturedDataPage,
-}
-
-impl BeaDatasetAcquisition {
-    pub const fn metadata(&self) -> &BeaMetadataBundle {
-        &self.metadata
-    }
-    pub const fn data(&self) -> &BeaCapturedDataPage {
-        &self.data
-    }
-
-    /// Splits typed evidence from one-shot raw material without cloning provider bytes.
-    ///
-    /// This order is the exact request order and is the intended handoff to the sole `MSJ1`
-    /// sealing boundary before any canonical publication can be attempted.
-    pub fn into_sealing_parts(
-        self,
-    ) -> Result<(BeaDatasetEvidence, ProviderCaptureMaterial), BeaSourceError> {
-        let Self { metadata, data } = self;
-        let mut materials = Vec::new();
-        materials
-            .try_reserve_exact(metadata.pages.len().saturating_add(1))
-            .map_err(|_| BeaSourceError::Allocation)?;
-        let mut metadata_evidence = Vec::new();
-        metadata_evidence
-            .try_reserve_exact(metadata.pages.len())
-            .map_err(|_| BeaSourceError::Allocation)?;
-        for captured in metadata.pages {
-            let BeaCapturedMetadataPage {
-                request,
-                page,
-                material,
-                telemetry,
-            } = captured;
-            let capture = material.receipt().clone();
-            materials.push(material);
-            metadata_evidence.push(BeaMetadataEvidencePage {
-                request,
-                page,
-                capture,
-                telemetry,
-            });
-        }
-        let BeaCapturedDataPage {
-            request,
-            page,
-            material,
-            telemetry,
-        } = data;
-        let capture = material.receipt().clone();
-        materials.push(material);
-        let evidence = BeaDatasetEvidence {
-            metadata: BeaMetadataEvidenceBundle {
-                dataset_id: metadata.dataset_id,
-                pages: metadata_evidence,
-                generation: metadata.generation,
-            },
-            data: BeaDataEvidencePage {
-                request,
-                page,
-                capture,
-                telemetry,
-            },
-        };
-        let mut capture_refs = Vec::new();
-        capture_refs
-            .try_reserve_exact(materials.len())
-            .map_err(|_| BeaSourceError::Allocation)?;
-        capture_refs.extend(materials.iter().map(ProviderCaptureMaterial::receipt));
-        let graph_identity = bea_capture_graph_identity(
-            evidence.metadata().dataset_id(),
-            evidence.metadata().generation(),
-            &capture_refs,
-        )
-        .map_err(|_| BeaSourceError::Protocol)?;
-        let graph_owner = materials.first().ok_or(BeaSourceError::Protocol)?.receipt();
-        let graph = ProviderCaptureMaterial::try_combine_request_graph(
-            graph_owner.source_id().clone(),
-            graph_owner.metadata_revision().clone(),
-            evidence.metadata().dataset_id().clone(),
-            graph_identity,
-            materials,
-        )?;
-        Ok((evidence, graph))
-    }
 }
 
 /// Rich discovery output preserving raw material that the trait-only batch cannot carry.
 pub struct BeaCapturedDiscovery {
     batch: DiscoveryBatch,
-    acquisition: BeaDatasetAcquisition,
-    doctor_admission_digest: EvidenceDigest,
-    doctor_sealed_graph_digest: EvidenceDigest,
+    data: BeaCapturedDataPage,
+    admission: Arc<BeaDoctorAdmissionEvidence>,
 }
 
 impl std::fmt::Debug for BeaCapturedDiscovery {
@@ -903,8 +891,13 @@ impl std::fmt::Debug for BeaCapturedDiscovery {
 }
 
 impl BeaCapturedDiscovery {
-    /// Hides the discovery batch behind the one-use continuation and exposes only the common seal
-    /// request for the complete metadata-first graph.
+    /// Returns the fresh typed observation response before its one-use sealing handoff.
+    pub const fn data(&self) -> &BeaCapturedDataPage {
+        &self.data
+    }
+
+    /// Hides the discovery batch behind the one-use continuation and exposes only the seal
+    /// request for the fresh observation response.
     pub fn into_sealing_parts(
         self,
     ) -> Result<
@@ -914,14 +907,13 @@ impl BeaCapturedDiscovery {
         ),
         BeaSourceError,
     > {
-        let (evidence, graph) = self.acquisition.into_sealing_parts()?;
-        let (expectation, request) = graph.into_whole_seal_parts();
+        let (data, material) = self.data.into_sealing_parts();
+        let (expectation, request) = material.into_whole_seal_parts();
         Ok((
             crate::sealed::BeaPendingDiscoverySeal::from_source(
                 self.batch,
-                evidence,
-                self.doctor_admission_digest,
-                self.doctor_sealed_graph_digest,
+                data,
+                self.admission,
                 expectation,
             ),
             request,
@@ -950,6 +942,8 @@ pub enum BeaSourceError {
     Clock,
     #[error("BEA extraction authority became unavailable")]
     Authority,
+    #[error("BEA doctor completion is older than the active sealed admission")]
+    StaleDoctorAdmission,
     #[error("BEA bounded allocation failed")]
     Allocation,
     #[error("BEA typed adapter contract failed: {0}")]
@@ -1180,7 +1174,7 @@ impl BeaSource {
         self.telemetry.snapshot()
     }
 
-    /// Runs the real metadata-first provider journey without creating activation authority.
+    /// Runs the bounded metadata-only provider journey without creating activation authority.
     pub async fn doctor(
         &self,
         authority: &ExtractionAuthority,
@@ -1193,8 +1187,8 @@ impl BeaSource {
             .config
             .contract(provider_dataset)
             .ok_or_else(invalid_protocol)?;
-        let acquisition = self
-            .acquire_dataset(authority, provider_dataset, deadline, cancellation.clone())
+        let metadata = self
+            .acquire_metadata(authority, provider_dataset, deadline, cancellation.clone())
             .await?;
         let verified_at = system_timestamp().map_err(map_source_error)?;
         let run = BeaDoctorRun::try_new(
@@ -1202,10 +1196,14 @@ impl BeaSource {
             &self.quota,
             provider_dataset.clone(),
             contract.analytical_dataset_id().clone(),
-            acquisition,
+            metadata,
             verified_at,
         )
-        .map_err(|_| invalid_protocol())?;
+        .map_err(|error| {
+            // BeaDoctorError is a closed, payload-free enum.
+            tracing::warn!(stage = "doctor_receipt", reason = ?error, "BEA metadata rejected");
+            invalid_protocol()
+        })?;
         self.validate_operation_current(authority, deadline, &cancellation)?;
         Ok(run)
     }
@@ -1217,7 +1215,7 @@ impl BeaSource {
     pub fn activate_doctor(
         &self,
         admission: Arc<BeaDoctorAdmissionEvidence>,
-    ) -> Result<(), BeaSourceError> {
+    ) -> Result<BeaDoctorRefreshDisposition, BeaSourceError> {
         let observed_at = system_timestamp()?;
         let contract = self
             .config
@@ -1231,11 +1229,65 @@ impl BeaSource {
                 observed_at,
             )
             .map_err(|_| BeaSourceError::InvalidConfiguration)?;
-        self.active_datasets
+        let mut active = self
+            .active_datasets
             .write()
+            .map_err(|_| BeaSourceError::Authority)?;
+        let disposition = match active.get(contract.dataset_id()) {
+            None => BeaDoctorRefreshDisposition::Activated,
+            Some(current) if current.admission_digest() == admission.admission_digest() => {
+                return Ok(BeaDoctorRefreshDisposition::ReusedCurrent);
+            }
+            Some(current)
+                if admission.verified_at() <= current.verified_at()
+                    || admission.expires_at() <= current.expires_at() =>
+            {
+                return Err(BeaSourceError::StaleDoctorAdmission);
+            }
+            Some(current) if current.metadata_generation() != admission.metadata_generation() => {
+                BeaDoctorRefreshDisposition::RefreshedMetadataDrift
+            }
+            Some(current) if observed_at >= current.expires_at() => {
+                BeaDoctorRefreshDisposition::RefreshedExpired
+            }
+            Some(_) => BeaDoctorRefreshDisposition::RefreshedEvidence,
+        };
+        active.insert(contract.dataset_id().clone(), admission);
+        Ok(disposition)
+    }
+
+    /// Returns one current sealed metadata admission without making a provider request.
+    pub fn current_doctor_admission(
+        &self,
+        provider_dataset: &SourceIdentifier,
+        required_through: Timestamp,
+    ) -> Result<Option<Arc<BeaDoctorAdmissionEvidence>>, BeaSourceError> {
+        let contract = self
+            .config
+            .contract(provider_dataset)
+            .ok_or(BeaSourceError::InvalidConfiguration)?;
+        let admission = self
+            .active_datasets
+            .read()
             .map_err(|_| BeaSourceError::Authority)?
-            .insert(contract.dataset_id().clone(), admission);
-        Ok(())
+            .get(provider_dataset)
+            .cloned();
+        let Some(admission) = admission else {
+            return Ok(None);
+        };
+        let observed_at = system_timestamp()?;
+        match admission.validate_current(
+            &self.source_binding,
+            contract.dataset_id(),
+            contract.analytical_dataset_id(),
+            observed_at,
+        ) {
+            Ok(()) if required_through < admission.expires_at() => Ok(Some(admission)),
+            Ok(()) | Err(BeaDoctorError::Expired) => Ok(None),
+            Err(BeaDoctorError::InvalidAuthority | BeaDoctorError::InvalidEvidence) => {
+                Err(BeaSourceError::Authority)
+            }
+        }
     }
 
     /// Returns the storage-safe analytical identity for a configured provider request.
@@ -1339,6 +1391,7 @@ impl BeaSource {
         ) {
             Ok(page) => page,
             Err(error) => {
+                record_bea_parser_rejection("metadata_parse", Some(&request), &error);
                 self.record_parse_failure(&error);
                 fetched.settle_parse_error(&error)?;
                 return Err(map_source_error(BeaSourceError::Adapter(error)));
@@ -1459,33 +1512,7 @@ impl BeaSource {
         })
     }
 
-    /// Runs the complete metadata-first acquisition and rejects known partial row sets.
-    async fn acquire_dataset(
-        &self,
-        authority: &ExtractionAuthority,
-        provider_dataset: &SourceIdentifier,
-        deadline: Timestamp,
-        cancellation: CancellationToken,
-    ) -> Result<BeaDatasetAcquisition, ExtractionSourceError> {
-        let metadata = self
-            .acquire_metadata(authority, provider_dataset, deadline, cancellation.clone())
-            .await?;
-        let data = self
-            .acquire_data(
-                authority,
-                metadata.dataset_id(),
-                metadata.generation(),
-                deadline,
-                cancellation,
-            )
-            .await?;
-        if data.page().receipt().completeness() == BeaCompleteness::Partial {
-            return Err(invalid_protocol());
-        }
-        Ok(BeaDatasetAcquisition { metadata, data })
-    }
-
-    /// Captures discovery with every exact metadata/data response still available for sealing.
+    /// Captures one fresh observation response against the current sealed metadata admission.
     pub async fn discover_captured(
         &self,
         authority: ExtractionAuthority,
@@ -1497,26 +1524,33 @@ impl BeaSource {
         if request.deadline() >= activation.expires_at() {
             return Err(invalid_protocol());
         }
-        if request.effective_at().is_some() || request.max_results() != 1 {
+        if request.effective_at().is_some() {
             return Err(invalid_protocol());
         }
         let contract = self
             .config
             .contract(request.dataset())
             .ok_or_else(invalid_protocol)?;
-        let acquisition = self
-            .acquire_dataset(
+        let metadata_generation = activation.metadata_evidence().generation();
+        let data = self
+            .acquire_data(
                 &authority,
                 request.dataset(),
+                metadata_generation,
                 request.deadline(),
                 cancellation.clone(),
             )
             .await?;
-        if acquisition.metadata().generation().digest() != activation.metadata_generation().bytes()
-        {
+        if data.page().metadata_generation().digest() != activation.metadata_generation().bytes() {
             return Err(SourceError::GenerationResynchronizationRequired.into());
         }
-        let object = source_object(&self.metadata, &request, contract, &acquisition)?;
+        let object = source_object(
+            &self.metadata,
+            &request,
+            contract,
+            data.page().metadata_generation(),
+            data.material().receipt(),
+        )?;
         let batch = DiscoveryBatch::try_new(&request, vec![object])?;
         let completed_at = system_timestamp().map_err(map_source_error)?;
         activation
@@ -1530,9 +1564,8 @@ impl BeaSource {
         self.validate_operation_current(&authority, request.deadline(), &cancellation)?;
         Ok(BeaCapturedDiscovery {
             batch,
-            acquisition,
-            doctor_admission_digest: activation.admission_digest(),
-            doctor_sealed_graph_digest: activation.doctor_sealed_graph_digest(),
+            data,
+            admission: activation,
         })
     }
 
@@ -1968,7 +2001,10 @@ impl FetchedResponse {
                     }
                     Ok(())
                 })
-                .map_err(BeaCompleteResponseFailure::from_sanitization)?;
+                .map_err(|error| {
+                    record_bea_parser_rejection("response_sanitization", Some(request), &error);
+                    BeaCompleteResponseFailure::from_sanitization(error)
+                })?;
             if u64::try_from(body.bytes().len())
                 .map_err(|_| BeaCompleteResponseFailure::invalid(invalid_protocol()))?
                 != response_bytes
@@ -2143,55 +2179,174 @@ pub(crate) fn settle_complete_response(
     in_flight.settle_response(settlement).map_err(Into::into)
 }
 
+// Only code-owned labels reach logs. Neither a request/provider name nor any value is emitted.
+fn metadata_parameter_label(parameter: Option<&BeaParameterIdentity>) -> &'static str {
+    let Some(parameter) = parameter else {
+        return "none";
+    };
+    ["GeoFips", "LineCode", "TableName", "Year"]
+        .into_iter()
+        .find(|name| parameter.as_str().eq_ignore_ascii_case(name))
+        .unwrap_or("other")
+}
+
+fn metadata_protocol_rejection(
+    reason: &'static str,
+    parameter: Option<&BeaParameterIdentity>,
+) -> BeaSourceError {
+    tracing::warn!(
+        stage = "metadata_validation",
+        reason,
+        parameter = metadata_parameter_label(parameter),
+        "BEA metadata rejected"
+    );
+    BeaSourceError::Protocol
+}
+
+fn record_bea_parser_rejection(
+    stage: &'static str,
+    request: Option<&BeaRequest>,
+    error: &BeaError,
+) {
+    // Do not format BeaError: its Provider variant contains provider-authored description text.
+    let reason = match error {
+        BeaError::InvalidCredential => "invalid_credential",
+        BeaError::InvalidRequest => "invalid_request",
+        BeaError::InvalidLimit => "invalid_limit",
+        BeaError::BodyTooLarge => "body_too_large",
+        BeaError::RowLimitExceeded => "row_limit",
+        BeaError::StringLimitExceeded => "string_limit",
+        BeaError::Allocation => "allocation",
+        BeaError::SanitizationCancelled => "cancelled",
+        BeaError::SanitizationDeadlineExceeded => "deadline",
+        BeaError::SanitizationClockUnavailable => "clock",
+        BeaError::InvalidJson => "invalid_json",
+        BeaError::InvalidField(_) => "invalid_field",
+        BeaError::RequestEchoMismatch => "request_echo_mismatch",
+        BeaError::Provider(_) => "provider_error",
+        BeaError::FilteredParameterValuesUnsupported => "filtered_values_unsupported",
+        BeaError::InvalidDecimal => "invalid_decimal",
+        BeaError::InvalidTimePeriod => "invalid_time_period",
+        BeaError::InvalidRevision => "invalid_revision",
+    };
+    let field = match error {
+        BeaError::InvalidField(field) => *field, // Static parser-owned field label.
+        _ => "none",
+    };
+    let provider_code = match error {
+        BeaError::Provider(error) => Some(error.code()),
+        _ => None,
+    };
+    tracing::warn!(
+        stage,
+        reason,
+        field,
+        provider_code,
+        method = request.map_or("none", |request| request.query().method().as_str()),
+        parameter = metadata_parameter_label(request.and_then(|request| {
+            request
+                .query()
+                .parameter()
+                .or_else(|| request.query().target_parameter())
+        })),
+        "BEA metadata rejected"
+    );
+}
+
 fn validate_metadata_bundle(
     contract: &BeaDatasetContract,
     pages: &[BeaCapturedMetadataPage],
 ) -> Result<(), BeaSourceError> {
     validate_metadata_roots(contract, pages)?;
     if pages.len() != contract.parameters.len().saturating_add(2) {
-        return Err(BeaSourceError::Protocol);
+        return Err(metadata_protocol_rejection("page_count", None));
     }
     let definitions = match pages.get(1).map(|page| page.page.records()) {
         Some(BeaMetadataRecords::Parameters(definitions)) => definitions,
-        _ => return Err(BeaSourceError::Protocol),
+        _ => return Err(metadata_protocol_rejection("parameter_records", None)),
     };
     for definition in definitions {
         if definition.is_required()
             && !contract.parameters.contains_key(definition.identity())
             && definition.default_value().is_none()
         {
-            return Err(BeaSourceError::Protocol);
+            return Err(metadata_protocol_rejection(
+                "required_parameter_missing",
+                Some(definition.identity()),
+            ));
         }
     }
     let expected = contract.parameter_value_requests(definitions)?;
     for (expected_request, page) in expected.iter().zip(pages.iter().skip(2)) {
         if page.request() != expected_request {
-            return Err(BeaSourceError::Protocol);
+            return Err(metadata_protocol_rejection("value_request_identity", None));
         }
         let parameter = expected_request
             .query()
             .parameter()
             .or_else(|| expected_request.query().target_parameter())
-            .ok_or(BeaSourceError::Protocol)?;
+            .ok_or_else(|| metadata_protocol_rejection("value_request_parameter", None))?;
         let (configured_parameter, selected) = contract
             .selected_parameter(parameter.as_str())
-            .ok_or(BeaSourceError::Protocol)?;
+            .ok_or_else(|| {
+                metadata_protocol_rejection("configured_parameter_missing", Some(parameter))
+            })?;
         if configured_parameter != parameter {
-            return Err(BeaSourceError::Protocol);
+            return Err(metadata_protocol_rejection(
+                "configured_parameter_identity",
+                Some(parameter),
+            ));
         }
-        let definition = definition(definitions, parameter).ok_or(BeaSourceError::Protocol)?;
+        let definition = definition(definitions, parameter).ok_or_else(|| {
+            metadata_protocol_rejection("parameter_definition_missing", Some(parameter))
+        })?;
         if !definition.accepts_multiple_values() && selected.split(',').count() != 1 {
-            return Err(BeaSourceError::Protocol);
+            return Err(metadata_protocol_rejection(
+                "multiple_values_disallowed",
+                Some(parameter),
+            ));
         }
         let values = match page.page.records() {
             BeaMetadataRecords::ParameterValues(values) => values,
-            _ => return Err(BeaSourceError::Protocol),
+            _ => {
+                return Err(metadata_protocol_rejection("value_records", Some(parameter)));
+            }
         };
         for value in selected.split(',') {
             let admitted_all = definition
                 .all_value()
                 .is_some_and(|all| all.eq_ignore_ascii_case(value));
-            if !admitted_all && !values.iter().any(|candidate| candidate.key() == value) {
+            let admitted_default = definition
+                .default_value()
+                .is_some_and(|default| default.eq_ignore_ascii_case(value));
+            // The Regional API documents STATE as a GeoFips selector, but its
+            // concrete geography-value list need not include that selector.
+            let admitted_regional_state =
+                contract.dataset.as_str().eq_ignore_ascii_case("Regional")
+                    && parameter.as_str().eq_ignore_ascii_case("GeoFips")
+                    && selected == "STATE";
+            if !admitted_all
+                && !admitted_default
+                && !admitted_regional_state
+                && !values.iter().any(|candidate| candidate.key() == value)
+            {
+                tracing::warn!(
+                    stage = "metadata_validation",
+                    reason = "selected_value_not_admitted",
+                    parameter = metadata_parameter_label(Some(parameter)),
+                    returned_values = values.len(),
+                    default_present = definition.default_value().is_some(),
+                    default_empty = definition.default_value().is_some_and(str::is_empty),
+                    default_trimmed_match = definition
+                        .default_value()
+                        .is_some_and(|default| default.trim().eq_ignore_ascii_case(value)),
+                    all_present = definition.all_value().is_some(),
+                    case_match = values
+                        .iter()
+                        .any(|candidate| candidate.key().eq_ignore_ascii_case(value)),
+                    trimmed_match = values.iter().any(|candidate| candidate.key().trim() == value),
+                    "BEA metadata rejected"
+                );
                 return Err(BeaSourceError::Protocol);
             }
         }
@@ -2204,27 +2359,27 @@ fn validate_metadata_roots(
     pages: &[BeaCapturedMetadataPage],
 ) -> Result<(), BeaSourceError> {
     if pages.len() < 2 {
-        return Err(BeaSourceError::Protocol);
+        return Err(metadata_protocol_rejection("root_page_count", None));
     }
     let expected = contract.metadata_root_requests()?;
     if pages[0].request() != &expected[0] || pages[1].request() != &expected[1] {
-        return Err(BeaSourceError::Protocol);
+        return Err(metadata_protocol_rejection("root_request_identity", None));
     }
     let datasets = match pages.first().map(|page| page.page.records()) {
         Some(BeaMetadataRecords::Datasets(datasets)) => datasets,
-        _ => return Err(BeaSourceError::Protocol),
+        _ => return Err(metadata_protocol_rejection("dataset_records", None)),
     };
     if !datasets
         .iter()
         .any(|dataset| dataset.identity() == &contract.dataset)
     {
-        return Err(BeaSourceError::Protocol);
+        return Err(metadata_protocol_rejection("dataset_not_advertised", None));
     }
     if !matches!(
         pages.get(1).map(|page| page.page.records()),
         Some(BeaMetadataRecords::Parameters(_))
     ) {
-        return Err(BeaSourceError::Protocol);
+        return Err(metadata_protocol_rejection("parameter_records", None));
     }
     Ok(())
 }
@@ -2242,10 +2397,9 @@ fn source_object(
     metadata: &SourceMetadata,
     request: &DiscoveryRequest,
     contract: &BeaDatasetContract,
-    acquisition: &BeaDatasetAcquisition,
+    metadata_generation: BeaMetadataGeneration,
+    capture: &ProviderCaptureSetReceipt,
 ) -> Result<SourceObject, ExtractionSourceError> {
-    let data = acquisition.data();
-    let capture = data.material().receipt();
     let received_at = capture
         .pages()
         .first()
@@ -2275,12 +2429,7 @@ fn source_object(
         availability: &availability,
         expected_bytes,
     })?;
-    let object_id = object_id(
-        contract,
-        acquisition.metadata().generation(),
-        capture,
-        lineage_digest,
-    )?;
+    let object_id = object_id(contract, metadata_generation, capture, lineage_digest)?;
     SourceObject::try_new_with_capture_identity(
         metadata.source_id().clone(),
         metadata.revision().clone(),
@@ -2888,11 +3037,13 @@ fn map_source_error(error: BeaSourceError) -> ExtractionSourceError {
     match error {
         BeaSourceError::DeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
         BeaSourceError::Cancelled => ExtractionSourceError::Cancelled,
-        BeaSourceError::Network | BeaSourceError::Clock => SourceError::Network.into(),
+        BeaSourceError::Network => SourceError::Network.into(),
+        BeaSourceError::Clock => invalid_protocol(),
         BeaSourceError::BodyTooLarge
         | BeaSourceError::Protocol
         | BeaSourceError::InvalidMetadata
         | BeaSourceError::InvalidConfiguration
+        | BeaSourceError::StaleDoctorAdmission
         | BeaSourceError::Authority
         | BeaSourceError::Allocation
         | BeaSourceError::Adapter(_)
@@ -2905,7 +3056,7 @@ fn map_sanitization_error(error: BeaError) -> ExtractionSourceError {
     match error {
         BeaError::SanitizationCancelled => ExtractionSourceError::Cancelled,
         BeaError::SanitizationDeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
-        BeaError::SanitizationClockUnavailable => SourceError::Network.into(),
+        BeaError::SanitizationClockUnavailable => invalid_protocol(),
         error => map_source_error(BeaSourceError::Adapter(error)),
     }
 }

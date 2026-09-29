@@ -1,6 +1,12 @@
 //! Focused research forecast contracts.
 
 use super::*;
+use market_squawk_data::{
+    FeatureDatasetInputCoordinate, FinancialAmountBasis, FinancialAmountRole,
+    FinancialFiscalTargetBinding, FinancialShareConvention, FixedHorizonOriginBasis,
+    ProbabilityEventTarget,
+};
+use market_squawk_domain::{FundamentalCadence, FundamentalPeriod, ResearchTemporalCoordinate};
 
 /// Maximum future points in one admitted forecast path.
 pub const MAX_FORECAST_POINTS: usize = 512;
@@ -19,6 +25,13 @@ pub(super) const MAX_CALIBRATION_ASSUMPTION_BYTES: usize = 512;
 pub enum ForecastMeasurement {
     /// A modeled price in one exact quote currency.
     Price { currency: Currency },
+    /// A signed reported amount with its exact economic role and allocation convention.
+    FinancialAmount {
+        currency: Currency,
+        role: FinancialAmountRole,
+        basis: FinancialAmountBasis,
+        share_convention: Option<FinancialShareConvention>,
+    },
     /// A dimensionless return under the admitted label contract.
     Return,
     /// A probability under the admitted binary-output contract.
@@ -30,7 +43,7 @@ pub enum ForecastMeasurement {
 /// Admitted statistical meaning of the model's central scalar.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ForecastCentralStatistic {
-    /// A sealed squared-error estimator of an exact fixed-horizon terminal price.
+    /// A sealed squared-error estimator of an exact fixed-horizon price or arithmetic return.
     ModelEstimatedConditionalMean,
     /// The output remains useful as a modeled scalar but is not admitted for expected-value use.
     Unavailable,
@@ -40,7 +53,21 @@ pub enum ForecastCentralStatistic {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ForecastTargetMeaning {
     /// One terminal observation at the same positive effective-time offset for every admitted row.
-    FixedHorizonTerminal { horizon_nanos: NonZeroU64 },
+    FixedHorizonTerminal {
+        horizon_nanos: NonZeroU64,
+        origin_basis: FixedHorizonOriginBasis,
+    },
+    /// A separate binary event with its complete stable economic assumptions.
+    FixedHorizonEvent {
+        horizon_nanos: NonZeroU64,
+        origin_basis: FixedHorizonOriginBasis,
+        event: ProbabilityEventTarget,
+    },
+    /// A native reporting-period ordinal proven by selected source contexts.
+    FinancialPeriod {
+        cadence: FundamentalCadence,
+        periods_ahead: NonZeroU16,
+    },
     /// Row precision or varying offsets do not prove one terminal horizon.
     Unsupported,
 }
@@ -70,6 +97,13 @@ pub enum ForecastEstimatorProfile {
     SealedDirectLeastSquaresV1,
     /// The sealed direct scikit-learn Ridge profile, including the exact IEEE alpha bits.
     SealedDirectRidgeV1 { ridge_alpha_bits: u64 },
+    /// Non-overlapping block-bootstrap Ridge members with the actual OOB-weighted mean center.
+    SealedOobMeanBlockBootstrapRidgeV1 {
+        ridge_alpha_bits: u64,
+        resampling_block_length: u32,
+        resampling_count: u16,
+        resampling_seed: u32,
+    },
     /// The sealed direct binary logistic implementation in the installed Python wheel.
     SealedBinaryLogisticV1,
 }
@@ -79,9 +113,10 @@ impl ForecastEstimatorProfile {
     #[must_use]
     pub fn ridge_alpha(self) -> Option<f64> {
         match self {
-            Self::SealedDirectRidgeV1 { ridge_alpha_bits } => {
-                Some(f64::from_bits(ridge_alpha_bits))
-            }
+            Self::SealedDirectRidgeV1 { ridge_alpha_bits }
+            | Self::SealedOobMeanBlockBootstrapRidgeV1 {
+                ridge_alpha_bits, ..
+            } => Some(f64::from_bits(ridge_alpha_bits)),
             Self::SealedDirectLeastSquaresV1 | Self::SealedBinaryLogisticV1 => None,
         }
     }
@@ -124,6 +159,7 @@ impl ForecastOutputBinding {
             (
                 ModelOutputSemantics::Regression,
                 ForecastMeasurement::Price { .. }
+                    | ForecastMeasurement::FinancialAmount { .. }
                     | ForecastMeasurement::Return
                     | ForecastMeasurement::OtherRegression
             ) | (
@@ -136,6 +172,18 @@ impl ForecastOutputBinding {
                 let alpha = f64::from_bits(ridge_alpha_bits);
                 alpha.is_finite() && alpha >= 0.0
             }
+            ForecastEstimatorProfile::SealedOobMeanBlockBootstrapRidgeV1 {
+                ridge_alpha_bits,
+                resampling_block_length,
+                resampling_count,
+                ..
+            } => {
+                let alpha = f64::from_bits(ridge_alpha_bits);
+                alpha.is_finite()
+                    && alpha >= 0.0
+                    && (1..=100_000).contains(&resampling_block_length)
+                    && (2..=30).contains(&resampling_count)
+            }
             ForecastEstimatorProfile::SealedDirectLeastSquaresV1
             | ForecastEstimatorProfile::SealedBinaryLogisticV1 => true,
         };
@@ -143,6 +191,7 @@ impl ForecastOutputBinding {
             estimator,
             ForecastEstimatorProfile::SealedDirectLeastSquaresV1
                 | ForecastEstimatorProfile::SealedDirectRidgeV1 { .. }
+                | ForecastEstimatorProfile::SealedOobMeanBlockBootstrapRidgeV1 { .. }
         );
         let estimator_contract = match output_semantics {
             ModelOutputSemantics::Regression => {
@@ -156,19 +205,71 @@ impl ForecastOutputBinding {
                     && output_transform == ForecastTransform::Logistic
             }
         };
-        let expected_value_qualified = matches!(measurement, ForecastMeasurement::Price { .. })
-            && matches!(target, ForecastTargetMeaning::FixedHorizonTerminal { .. })
-            && output_semantics == ModelOutputSemantics::Regression
-            && target_transform == ForecastTransform::Identity
-            && output_transform == ForecastTransform::Identity
-            && objective == ForecastTrainingObjective::SquaredError
-            && regression_profile;
-        if label.kind() != ComponentKind::Label
+        let arithmetic_return = measurement == ForecastMeasurement::Return
+            && label.name() == "research.fixed-horizon-forward-return"
+            && label.version().get() == 1
+            && label.corporate_actions() == CorporateActionSensitivity::RequiresAdjustment
+            && matches!(
+                target,
+                ForecastTargetMeaning::FixedHorizonTerminal {
+                    origin_basis: FixedHorizonOriginBasis::CompletedBarClose
+                        | FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar,
+                    ..
+                }
+            );
+        let financial_target = matches!(measurement, ForecastMeasurement::FinancialAmount { .. })
+            && matches!(
+                target,
+                ForecastTargetMeaning::FinancialPeriod {
+                    cadence: FundamentalCadence::Annual | FundamentalCadence::Quarterly,
+                    ..
+                }
+            )
+            && label.name() == "research.fiscal-forward-financial-amount"
+            && label.version().get() == 1;
+        let expected_value_qualified =
+            (((matches!(measurement, ForecastMeasurement::Price { .. }) || arithmetic_return)
+                && matches!(target, ForecastTargetMeaning::FixedHorizonTerminal { .. }))
+                || financial_target)
+                && output_semantics == ModelOutputSemantics::Regression
+                && target_transform == ForecastTransform::Identity
+                && output_transform == ForecastTransform::Identity
+                && objective == ForecastTrainingObjective::SquaredError
+                && regression_profile
+                && !matches!(
+                    estimator,
+                    ForecastEstimatorProfile::SealedOobMeanBlockBootstrapRidgeV1 { .. }
+                );
+        let event_valid = match target {
+            ForecastTargetMeaning::FixedHorizonEvent {
+                event,
+                origin_basis,
+                ..
+            } => {
+                output_semantics == ModelOutputSemantics::BinaryProbability
+                    && event.validate().is_ok()
+                    && label.name() == event.label_component_name()
+                    && label.version().get() == 1
+                    && label.corporate_actions() == CorporateActionSensitivity::RequiresAdjustment
+                    && matches!(
+                        origin_basis,
+                        FixedHorizonOriginBasis::CompletedBarClose
+                            | FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar
+                    )
+            }
+            _ => output_semantics != ModelOutputSemantics::BinaryProbability,
+        };
+        if !event_valid
+            || label.kind() != ComponentKind::Label
             || label.scope() != ComponentScope::Instrument
             || !compatible
             || !estimator_valid
             || !estimator_contract
             || target_transform != ForecastTransform::Identity
+            || (matches!(measurement, ForecastMeasurement::FinancialAmount { .. })
+                != matches!(target, ForecastTargetMeaning::FinancialPeriod { .. }))
+            || (matches!(target, ForecastTargetMeaning::FinancialPeriod { .. })
+                && !financial_target)
             || (central_statistic == ForecastCentralStatistic::ModelEstimatedConditionalMean
                 && !expected_value_qualified)
         {
@@ -254,18 +355,58 @@ impl ForecastOutputBinding {
             (
                 ForecastCentralStatistic::ModelEstimatedConditionalMean,
                 ForecastMeasurement::Price { .. },
-                ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos },
+                ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos, .. },
             ) => Some(horizon_nanos),
             _ => None,
         }
     }
 
-    pub(super) const fn admits_path_horizon(&self, horizon: ForecastHorizon) -> bool {
-        match self.expected_terminal_price_horizon_nanos() {
-            Some(expected) => {
-                horizon.points.get() == 1 && horizon.step_nanos.get() == expected.get()
+    /// Exact arithmetic-return mean horizon; monetary conversion still requires causal origin-price evidence.
+    #[must_use]
+    pub fn expected_arithmetic_return_horizon_nanos(&self) -> Option<NonZeroU64> {
+        if self.measurement == ForecastMeasurement::Return
+            && self.central_statistic == ForecastCentralStatistic::ModelEstimatedConditionalMean
+            && self.label.name() == "research.fixed-horizon-forward-return"
+            && self.label.version().get() == 1
+            && self.label.corporate_actions() == CorporateActionSensitivity::RequiresAdjustment
+        {
+            if let ForecastTargetMeaning::FixedHorizonTerminal {
+                horizon_nanos,
+                origin_basis:
+                    FixedHorizonOriginBasis::CompletedBarClose
+                    | FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar,
+            } = self.target
+            {
+                return Some(horizon_nanos);
             }
-            None => true,
+        }
+        None
+    }
+
+    pub(super) fn admits_path_horizon(&self, horizon: ForecastHorizon) -> bool {
+        match (self.central_statistic, self.target) {
+            (
+                ForecastCentralStatistic::ModelEstimatedConditionalMean,
+                ForecastTargetMeaning::FixedHorizonTerminal {
+                    horizon_nanos: expected,
+                    ..
+                },
+            ) => horizon.points.get() == 1 && horizon.step_nanos() == Some(expected),
+            (
+                _,
+                ForecastTargetMeaning::FixedHorizonEvent {
+                    horizon_nanos: expected,
+                    ..
+                },
+            ) => horizon.points.get() == 1 && horizon.step_nanos() == Some(expected),
+            (
+                _,
+                ForecastTargetMeaning::FinancialPeriod {
+                    cadence,
+                    periods_ahead,
+                },
+            ) => horizon.fiscal_periods() == Some((cadence, periods_ahead)),
+            _ => horizon.step_nanos().is_some(),
         }
     }
 
@@ -287,6 +428,7 @@ impl ForecastOutputBinding {
         match self.measurement {
             ForecastMeasurement::Price { currency } => Some(currency),
             ForecastMeasurement::Return
+            | ForecastMeasurement::FinancialAmount { .. }
             | ForecastMeasurement::Probability
             | ForecastMeasurement::OtherRegression => None,
         }
@@ -318,17 +460,61 @@ fn digest_output_binding(
         ForecastMeasurement::Return => hash.update([2]),
         ForecastMeasurement::Probability => hash.update([3]),
         ForecastMeasurement::OtherRegression => hash.update([4]),
+        ForecastMeasurement::FinancialAmount {
+            currency,
+            role,
+            basis,
+            share_convention,
+        } => {
+            hash.update([5]);
+            update_binding_bytes(&mut hash, currency.as_str().as_bytes())?;
+            let meaning = serde_json::to_vec(&(role, basis, share_convention))
+                .map_err(|_| ForecastError::InvalidOutputBinding)?;
+            update_binding_bytes(&mut hash, &meaning)?;
+        }
     }
     hash.update([match central_statistic {
         ForecastCentralStatistic::ModelEstimatedConditionalMean => 1,
         ForecastCentralStatistic::Unavailable => 2,
     }]);
     match target {
-        ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos } => {
+        ForecastTargetMeaning::FixedHorizonTerminal {
+            horizon_nanos,
+            origin_basis,
+        } => {
             hash.update([1]);
             hash.update(horizon_nanos.get().to_be_bytes());
+            hash.update([match origin_basis {
+                FixedHorizonOriginBasis::ExactEffectiveTimestamp => 1,
+                FixedHorizonOriginBasis::CompletedBarClose => 2,
+                FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar => 3,
+            }]);
+        }
+        ForecastTargetMeaning::FixedHorizonEvent {
+            horizon_nanos,
+            origin_basis,
+            event,
+        } => {
+            hash.update([4]);
+            hash.update(horizon_nanos.get().to_be_bytes());
+            hash.update([match origin_basis {
+                FixedHorizonOriginBasis::ExactEffectiveTimestamp => 1,
+                FixedHorizonOriginBasis::CompletedBarClose => 2,
+                FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar => 3,
+            }]);
+            hash.update(event.digest().bytes());
         }
         ForecastTargetMeaning::Unsupported => hash.update([2]),
+        ForecastTargetMeaning::FinancialPeriod {
+            cadence,
+            periods_ahead,
+        } => {
+            hash.update([3]);
+            let cadence =
+                serde_json::to_vec(&cadence).map_err(|_| ForecastError::InvalidOutputBinding)?;
+            update_binding_bytes(&mut hash, &cadence)?;
+            hash.update(periods_ahead.get().to_be_bytes());
+        }
     }
     hash.update([
         transform_tag(target_transform),
@@ -345,6 +531,18 @@ fn digest_output_binding(
             hash.update(ridge_alpha_bits.to_be_bytes());
         }
         ForecastEstimatorProfile::SealedBinaryLogisticV1 => hash.update([3]),
+        ForecastEstimatorProfile::SealedOobMeanBlockBootstrapRidgeV1 {
+            ridge_alpha_bits,
+            resampling_block_length,
+            resampling_count,
+            resampling_seed,
+        } => {
+            hash.update([4]);
+            hash.update(ridge_alpha_bits.to_be_bytes());
+            hash.update(resampling_block_length.to_be_bytes());
+            hash.update(resampling_count.to_be_bytes());
+            hash.update(resampling_seed.to_be_bytes());
+        }
     }
     hash.update([match label.kind() {
         ComponentKind::Feature => 1,
@@ -382,7 +580,16 @@ fn update_binding_bytes(hash: &mut Sha256, bytes: &[u8]) -> Result<(), ForecastE
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ForecastHorizon {
     pub(super) points: NonZeroU16,
-    pub(super) step_nanos: NonZeroU64,
+    step: ForecastHorizonStep,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ForecastHorizonStep {
+    ExactElapsed(NonZeroU64),
+    FiscalPeriods {
+        cadence: FundamentalCadence,
+        periods_ahead: NonZeroU16,
+    },
 }
 
 impl ForecastHorizon {
@@ -400,7 +607,30 @@ impl ForecastHorizon {
         if point_count > MAX_FORECAST_POINTS || maximum_offset > i64::MAX as u64 {
             return Err(ForecastError::InvalidHorizon);
         }
-        Ok(Self { points, step_nanos })
+        Ok(Self {
+            points,
+            step: ForecastHorizonStep::ExactElapsed(step_nanos),
+        })
+    }
+
+    /// One monetary target at an exact native reporting ordinal.
+    pub fn try_fiscal(
+        cadence: FundamentalCadence,
+        periods_ahead: NonZeroU16,
+    ) -> Result<Self, ForecastError> {
+        if !matches!(
+            cadence,
+            FundamentalCadence::Annual | FundamentalCadence::Quarterly
+        ) {
+            return Err(ForecastError::InvalidHorizon);
+        }
+        Ok(Self {
+            points: NonZeroU16::MIN,
+            step: ForecastHorizonStep::FiscalPeriods {
+                cadence,
+                periods_ahead,
+            },
+        })
     }
 
     /// Number of future points.
@@ -411,8 +641,22 @@ impl ForecastHorizon {
 
     /// Exact positive spacing in nanoseconds.
     #[must_use]
-    pub const fn step_nanos(self) -> NonZeroU64 {
-        self.step_nanos
+    pub const fn step_nanos(self) -> Option<NonZeroU64> {
+        match self.step {
+            ForecastHorizonStep::ExactElapsed(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Native fiscal cadence and positive ordinal distance, without elapsed-time conversion.
+    pub const fn fiscal_periods(self) -> Option<(FundamentalCadence, NonZeroU16)> {
+        match self.step {
+            ForecastHorizonStep::FiscalPeriods {
+                cadence,
+                periods_ahead,
+            } => Some((cadence, periods_ahead)),
+            _ => None,
+        }
     }
 
     pub(super) fn target_at(
@@ -425,7 +669,8 @@ impl ForecastHorizon {
             .and_then(|value| value.checked_add(1))
             .ok_or(ForecastError::InvalidHorizon)?;
         let offset = self
-            .step_nanos
+            .step_nanos()
+            .ok_or(ForecastError::InvalidHorizon)?
             .get()
             .checked_mul(ordinal)
             .and_then(|value| i64::try_from(value).ok())
@@ -613,9 +858,11 @@ mod observed_history_tests {
     use market_squawk_data::{
         CatalogEndpointIdentity, ComponentKind, ComponentScope, CorporateActionSensitivity,
         DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
-        FeatureLabelComponentSpec, Sha256Digest, UniverseId,
+        FeatureLabelComponentSpec, FixedHorizonOriginBasis, Sha256Digest, UniverseId,
     };
-    use market_squawk_domain::{Currency, DataQuality, InstrumentId, ModelId, Timestamp};
+    use market_squawk_domain::{
+        Currency, DataQuality, InstrumentId, ModelId, ResearchTemporalCoordinate, Timestamp,
+    };
 
     use super::{
         CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow,
@@ -623,7 +870,7 @@ mod observed_history_tests {
         ForecastHorizon, ForecastIntervals, ForecastMeasurement, ForecastObservedPoint,
         ForecastOutputBinding, ForecastPath, ForecastPoint, ForecastTargetMeaning,
         ForecastTrainingObjective, ForecastTransform, ForecastValue, ForecastVintage,
-        RealizedCoverage, validate_observed_history,
+        validate_observed_history,
     };
     use crate::{
         BundleExpectations, BundleId, DecisionThresholds, ForecastCalibrationArtifacts,
@@ -675,6 +922,7 @@ mod observed_history_tests {
                 ForecastCentralStatistic::ModelEstimatedConditionalMean,
                 ForecastTargetMeaning::FixedHorizonTerminal {
                     horizon_nanos: NonZeroU64::MIN,
+                    origin_basis: FixedHorizonOriginBasis::ExactEffectiveTimestamp,
                 },
                 ForecastTransform::Identity,
                 ForecastTransform::Identity,
@@ -695,6 +943,7 @@ mod observed_history_tests {
             ForecastCentralStatistic::ModelEstimatedConditionalMean,
             ForecastTargetMeaning::FixedHorizonTerminal {
                 horizon_nanos: NonZeroU64::new(60).ok_or(ForecastError::InvalidOutputBinding)?,
+                origin_basis: FixedHorizonOriginBasis::ExactEffectiveTimestamp,
             },
             ForecastTransform::Identity,
             ForecastTransform::Identity,
@@ -711,6 +960,7 @@ mod observed_history_tests {
             ForecastCentralStatistic::ModelEstimatedConditionalMean,
             ForecastTargetMeaning::FixedHorizonTerminal {
                 horizon_nanos: NonZeroU64::new(60).ok_or(ForecastError::InvalidOutputBinding)?,
+                origin_basis: FixedHorizonOriginBasis::ExactEffectiveTimestamp,
             },
             ForecastTransform::Identity,
             ForecastTransform::Identity,
@@ -739,6 +989,7 @@ mod observed_history_tests {
             ForecastCentralStatistic::ModelEstimatedConditionalMean,
             ForecastTargetMeaning::FixedHorizonTerminal {
                 horizon_nanos: NonZeroU64::new(120).ok_or(ForecastError::InvalidOutputBinding)?,
+                origin_basis: FixedHorizonOriginBasis::ExactEffectiveTimestamp,
             },
             ForecastTransform::Identity,
             ForecastTransform::Identity,
@@ -755,6 +1006,7 @@ mod observed_history_tests {
             ForecastCentralStatistic::Unavailable,
             ForecastTargetMeaning::FixedHorizonTerminal {
                 horizon_nanos: NonZeroU64::new(60).ok_or(ForecastError::InvalidOutputBinding)?,
+                origin_basis: FixedHorizonOriginBasis::ExactEffectiveTimestamp,
             },
             ForecastTransform::Identity,
             ForecastTransform::Identity,
@@ -873,7 +1125,6 @@ mod observed_history_tests {
     }
 
     fn calibration_fixture() -> Result<CalibrationFixture, ForecastError> {
-        let total = std::num::NonZeroU64::new(80).ok_or(ForecastError::InvalidCalibration)?;
         Ok(CalibrationFixture {
             method: CalibrationMethod::MapieEnbpi,
             window: CalibrationWindow::try_new(
@@ -886,24 +1137,9 @@ mod observed_history_tests {
             residuals_hash: Sha256Digest::new([52; 32]),
             residuals_size_bytes: 640,
             bands: [
-                CalibrationBand::try_new(
-                    ForecastCoverage::Fifty,
-                    -0.5,
-                    0.5,
-                    RealizedCoverage::try_new(41, total)?,
-                )?,
-                CalibrationBand::try_new(
-                    ForecastCoverage::Eighty,
-                    -1.0,
-                    1.0,
-                    RealizedCoverage::try_new(65, total)?,
-                )?,
-                CalibrationBand::try_new(
-                    ForecastCoverage::NinetyFive,
-                    -2.0,
-                    2.0,
-                    RealizedCoverage::try_new(76, total)?,
-                )?,
+                CalibrationBand::try_new(ForecastCoverage::Fifty, -0.5, 0.5)?,
+                CalibrationBand::try_new(ForecastCoverage::Eighty, -1.0, 1.0)?,
+                CalibrationBand::try_new(ForecastCoverage::NinetyFive, -2.0, 2.0)?,
             ],
             assumptions: "block bootstrap dependence; marginal coverage only",
         })
@@ -933,6 +1169,14 @@ mod observed_history_tests {
             Sha256Digest::new([27; 32]),
             Timestamp::from_unix_nanos(900),
             std::num::NonZeroU64::MIN,
+            market_squawk_data::ChronologicalSplitPolicy::try_new(
+                Timestamp::from_unix_nanos(99),
+                Timestamp::from_unix_nanos(799),
+                Timestamp::from_unix_nanos(899),
+            )
+            .map_err(|_| ForecastError::InvalidCalibration)?,
+            None,
+            None,
         )
         .map_err(|_| ForecastError::InvalidCalibration)?;
         let label = instrument_label()?;
@@ -945,6 +1189,7 @@ mod observed_history_tests {
             ForecastCentralStatistic::ModelEstimatedConditionalMean,
             ForecastTargetMeaning::FixedHorizonTerminal {
                 horizon_nanos: NonZeroU64::new(60).ok_or(ForecastError::InvalidOutputBinding)?,
+                origin_basis: FixedHorizonOriginBasis::ExactEffectiveTimestamp,
             },
             ForecastTransform::Identity,
             ForecastTransform::Identity,
@@ -997,6 +1242,7 @@ mod observed_history_tests {
                 value.residuals_hash,
                 value.residuals_size_bytes,
                 value.bands,
+                None,
                 value.assumptions.to_owned(),
             )
         })))
@@ -1037,12 +1283,17 @@ mod observed_history_tests {
         Ok(ForecastPath {
             instrument_id: InstrumentId::from_str("018f3c2a-91ab-7ccd-b3de-123456789bbb")
                 .map_err(|_| ForecastError::InvalidRequest)?,
-            observed_cutoff: Timestamp::from_unix_nanos(1_000),
+            observed_cutoff: Some(Timestamp::from_unix_nanos(1_000)),
+            financial_target: None,
+            calibration_cutoff: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(
+                1_000,
+            )),
             available_at: Timestamp::from_unix_nanos(1_000),
             horizon,
             observed_history: vec![observation].into_boxed_slice(),
             points: vec![ForecastPoint {
-                target_at: Timestamp::from_unix_nanos(1_060),
+                target_at: Some(Timestamp::from_unix_nanos(1_060)),
+                financial_target: None,
                 central,
                 intervals: Some(intervals),
             }]
@@ -1059,6 +1310,7 @@ mod observed_history_tests {
             training_period: metadata.training_period(),
             feature_semantic_digests: metadata.feature_semantic_digests().into(),
             calibration: Some(calibration),
+            probability_calibration: None,
             quality: DataQuality::Modeled,
             limitations: metadata.limitations().into(),
             fallback_reason: metadata.fallback_reason().into(),
@@ -1070,7 +1322,10 @@ mod observed_history_tests {
 #[derive(Clone, Copy, Debug)]
 pub struct ForecastRequest<'input> {
     pub(super) instrument_id: InstrumentId,
-    pub(super) observed_cutoff: Timestamp,
+    pub(super) observed_cutoff: Option<Timestamp>,
+    pub(super) financial_target: Option<&'input FinancialFiscalTargetBinding>,
+    pub(super) financial_measurement: Option<ForecastMeasurement>,
+    pub(super) financial_decision: Option<&'input ResearchTemporalCoordinate>,
     pub(super) available_at: Timestamp,
     pub(super) horizon: ForecastHorizon,
     pub(super) decimal_scale: u8,
@@ -1104,7 +1359,10 @@ impl<'input> ForecastRequest<'input> {
         horizon.target_at(observed_cutoff, inputs.len() - 1)?;
         Ok(Self {
             instrument_id,
-            observed_cutoff,
+            observed_cutoff: Some(observed_cutoff),
+            financial_target: None,
+            financial_measurement: None,
+            financial_decision: None,
             available_at,
             horizon,
             decimal_scale,
@@ -1148,7 +1406,10 @@ impl<'input> ForecastRequest<'input> {
         horizon.target_at(observed_cutoff, inputs.len() - 1)?;
         Ok(Self {
             instrument_id,
-            observed_cutoff,
+            observed_cutoff: Some(observed_cutoff),
+            financial_target: None,
+            financial_measurement: None,
+            financial_decision: None,
             available_at,
             horizon,
             decimal_scale,
@@ -1165,8 +1426,66 @@ impl<'input> ForecastRequest<'input> {
 
     /// Last effective observation cutoff; every target is strictly later in effective time.
     #[must_use]
-    pub const fn observed_cutoff(self) -> Timestamp {
+    pub const fn observed_cutoff(self) -> Option<Timestamp> {
         self.observed_cutoff
+    }
+
+    /// Builds one fiscal request from the data authority's exact current coordinate.
+    pub fn try_for_financial_coordinate(
+        coordinate: FeatureDatasetInputCoordinate<'input>,
+        decimal_scale: u8,
+        inputs: &'input [ModelInput<'input>],
+    ) -> Result<Self, ForecastError> {
+        let epoch = coordinate.epoch();
+        let financial = epoch
+            .financial_period()
+            .ok_or(ForecastError::InvalidRequest)?;
+        let measurement = match epoch.financial_measurement() {
+            Some(market_squawk_data::FeatureLabelMeasurement::FinancialAmount {
+                currency,
+                role,
+                basis,
+                share_convention,
+            }) => ForecastMeasurement::FinancialAmount {
+                currency,
+                role,
+                basis,
+                share_convention,
+            },
+            _ => return Err(ForecastError::InvalidOutputBinding),
+        };
+        let distance = financial
+            .target_ordinal()
+            .checked_sub(financial.observed_ordinal())
+            .and_then(|value| u16::try_from(value).ok())
+            .and_then(NonZeroU16::new)
+            .ok_or(ForecastError::InvalidHorizon)?;
+        let horizon = ForecastHorizon::try_fiscal(financial.cadence(), distance)?;
+        if decimal_scale > MAX_FORECAST_DECIMAL_SCALE || inputs.len() != 1 {
+            return Err(ForecastError::InvalidRequest);
+        }
+        Ok(Self {
+            instrument_id: epoch.instrument_id(),
+            observed_cutoff: None,
+            financial_target: Some(financial),
+            financial_measurement: Some(measurement),
+            financial_decision: Some(epoch.decision_coordinate()),
+            available_at: epoch.source_selection_as_of(),
+            horizon,
+            decimal_scale,
+            observed_history: &[],
+            inputs,
+        })
+    }
+
+    pub(super) fn observed_coordinate(&self) -> Result<ResearchTemporalCoordinate, ForecastError> {
+        match (self.observed_cutoff, self.financial_target) {
+            (Some(timestamp), None) => Ok(ResearchTemporalCoordinate::exact(timestamp)),
+            (None, Some(financial)) => Ok(ResearchTemporalCoordinate::calendar_date(
+                financial.observed_period().end(),
+            )),
+            _ => Err(ForecastError::InvalidRequest),
+        }
     }
 
     /// Conservative knowledge time of the complete point-in-time input set.
@@ -1308,7 +1627,8 @@ impl ForecastIntervals {
 /// One future point, never confused with an observed market value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForecastPoint {
-    pub(super) target_at: Timestamp,
+    pub(super) target_at: Option<Timestamp>,
+    pub(super) financial_target: Option<ForecastFinancialTarget>,
     pub(super) central: ForecastValue,
     pub(super) intervals: Option<ForecastIntervals>,
 }
@@ -1316,8 +1636,13 @@ pub struct ForecastPoint {
 impl ForecastPoint {
     /// Exact future target time.
     #[must_use]
-    pub const fn target_at(self) -> Timestamp {
+    pub const fn target_at(self) -> Option<Timestamp> {
         self.target_at
+    }
+
+    /// Native target ordinal and an actual period only when one has been reported.
+    pub const fn financial_target(self) -> Option<ForecastFinancialTarget> {
+        self.financial_target
     }
 
     /// Central modeled value under the recorded decimal policy.
@@ -1333,11 +1658,37 @@ impl ForecastPoint {
     }
 }
 
+/// Native fiscal forecast coordinate; it does not invent an unreported period's dates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForecastFinancialTarget {
+    pub(super) ordinal: u32,
+    pub(super) period: Option<FundamentalPeriod>,
+}
+impl ForecastFinancialTarget {
+    /// Retains a target only from the data authority's proven fiscal coordinate.
+    pub fn from_binding(binding: &FinancialFiscalTargetBinding) -> Self {
+        Self {
+            ordinal: binding.target_ordinal(),
+            period: binding.target_period(),
+        }
+    }
+    /// Exact ordinal in the source-proven contiguous reporting series.
+    pub const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+    /// Actual reported target interval, absent for an unobserved future period.
+    pub const fn period(self) -> Option<FundamentalPeriod> {
+        self.period
+    }
+}
+
 /// Complete research forecast path with exact model/data/PIT identities.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ForecastPath {
     pub(super) instrument_id: InstrumentId,
-    pub(super) observed_cutoff: Timestamp,
+    pub(super) observed_cutoff: Option<Timestamp>,
+    pub(super) financial_target: Option<Box<FinancialFiscalTargetBinding>>,
+    pub(super) calibration_cutoff: ResearchTemporalCoordinate,
     pub(super) available_at: Timestamp,
     pub(super) horizon: ForecastHorizon,
     pub(super) observed_history: Box<[ForecastObservedPoint]>,
@@ -1354,6 +1705,7 @@ pub struct ForecastPath {
     pub(super) training_period: TrainingPeriod,
     pub(super) feature_semantic_digests: Box<[FeatureSemanticDigest]>,
     pub(super) calibration: Option<CalibrationEvidence>,
+    pub(super) probability_calibration: Option<crate::ProbabilityCalibrationArtifacts>,
     pub(super) quality: DataQuality,
     pub(super) limitations: Box<[Box<str>]>,
     pub(super) fallback_reason: Box<str>,
@@ -1368,8 +1720,29 @@ impl ForecastPath {
 
     /// Last effective observation cutoff.
     #[must_use]
-    pub const fn observed_cutoff(&self) -> Timestamp {
+    pub const fn observed_cutoff(&self) -> Option<Timestamp> {
         self.observed_cutoff
+    }
+
+    /// Original source-sealed fiscal period chain and target ordinal.
+    pub fn financial_target(&self) -> Option<&FinancialFiscalTargetBinding> {
+        self.financial_target.as_deref()
+    }
+
+    /// Economic issuance coordinate used to admit the prior training and interval fit.
+    pub const fn calibration_cutoff(&self) -> &ResearchTemporalCoordinate {
+        &self.calibration_cutoff
+    }
+
+    /// Exact effective coordinate at its original timestamp or calendar-date precision.
+    pub fn observed_coordinate(&self) -> Option<ResearchTemporalCoordinate> {
+        match (self.observed_cutoff, self.financial_target.as_deref()) {
+            (Some(timestamp), None) => Some(ResearchTemporalCoordinate::exact(timestamp)),
+            (None, Some(financial)) => Some(ResearchTemporalCoordinate::calendar_date(
+                financial.observed_period().end(),
+            )),
+            _ => None,
+        }
     }
 
     /// Conservative knowledge time of the complete PIT input.
@@ -1468,6 +1841,11 @@ impl ForecastPath {
     #[must_use]
     pub const fn calibration(&self) -> Option<&CalibrationEvidence> {
         self.calibration.as_ref()
+    }
+
+    /// Held-out event calibration and untouched evaluation bound to this exact model.
+    pub const fn probability_calibration(&self) -> Option<&crate::ProbabilityCalibrationArtifacts> {
+        self.probability_calibration.as_ref()
     }
 
     /// Always [`DataQuality::Modeled`]; forecasts cannot mint direct evidence.

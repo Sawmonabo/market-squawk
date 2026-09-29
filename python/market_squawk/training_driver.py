@@ -13,13 +13,14 @@ import sys
 from typing import Any, BinaryIO, Mapping, Sequence
 
 from .bundle import (
+    BundleReceipt,
     BundleAuthorityRef,
     BundleExportError,
     _binary_open_flags,
     _windows_reparse_path,
     _windows_reparse_point,
 )
-from .data import DatasetIntegrityError, UtcNanoseconds, open_dataset
+from .data import DatasetIntegrityError, UtcNanoseconds, open_dataset, _verify_dataset_receipt
 from .finance import OperationContext
 from .training import (
     TrainingProposal,
@@ -81,18 +82,32 @@ def finalize_candidate(
 def _finalize_proposal(
     config: Mapping[str, Any],
     proposal: TrainingProposal,
-    authority_path: Path | str,
+    authority_path: Path | str | None,
     candidate_parent: str,
     request_path: Path | str,
 ) -> Mapping[str, Any]:
     data_root = Path(config["dataset"]["root"])
-    authority = _authority_ref(Path(authority_path), data_root, proposal.authority_sha256)
     output_root = _controlled_candidate_parent(data_root, candidate_parent)
-    receipt = proposal.export(
-        output_root,
-        authority,
-        context=_operation_context(config),
-    )
+    if authority_path is None:
+        # The proposal is untrusted. Rust checks its predeclared product plan and
+        # independently revalidates the complete candidate before runtime admission.
+        _verify_dataset_receipt(proposal.dataset, _operation_context(config))
+        root = proposal.candidate._stage_for_product_admission(output_root, proposal.authority_bytes)
+        authority_coordinate = root / "authority-proposal.json"
+        receipt = BundleReceipt(
+            root=root, metadata=root / "bundle.json", artifact=root / proposal.candidate.artifact_path,
+            run_record=root / "training-run.json", metadata_sha256=proposal.candidate.metadata_sha256,
+            artifact_sha256=proposal.candidate.artifact_sha256,
+            training_run_sha256=proposal.candidate.training_run_sha256,
+            authority_sha256=proposal.authority_sha256, dataset_export_sha256=proposal.dataset.export_sha256,
+            dataset_selection_sha256=proposal.dataset.identity.selection_sha256,
+            catalog_identity_sha256=proposal.dataset.identity.catalog_identity_sha256,
+            validated_by_rust=False,
+        )
+    else:
+        authority = _authority_ref(Path(authority_path), data_root, proposal.authority_sha256)
+        authority_coordinate = authority.root / authority.relative_path
+        receipt = proposal.export(output_root, authority, context=_operation_context(config))
     output_semantics = (
         "binary_probability"
         if config["training"]["modelKind"] == "logistic"
@@ -107,11 +122,12 @@ def _finalize_proposal(
             "sha256": receipt.metadata_sha256,
         },
         "authority": {
-            "path": str((authority.root / authority.relative_path).resolve()),
+            "path": str(authority_coordinate.resolve()),
             "sha256": receipt.authority_sha256,
         },
         "dataset": {
             "exportSha256": receipt.dataset_export_sha256,
+            "productContract": config["dataset"]["productContract"],
             "asOfUnixNanos": config["dataset"]["asOfUnixNanos"],
             "selectionSha256": receipt.dataset_selection_sha256,
             "catalogIdentitySha256": receipt.catalog_identity_sha256,
@@ -144,8 +160,8 @@ def _finalize_proposal(
 
 
 def run_worker(
-    config_path: Path | str,
-    authority_path: Path | str,
+    config_path: Path | str | None,
+    authority_path: Path | str | None,
     candidate_parent: str,
     request_path: Path | str,
     *,
@@ -163,7 +179,21 @@ def run_worker(
     completed_units = 0
     try:
         protocol.progress("validation", "Validating sealed training inputs.", 0, 4)
-        config = _load_config(config_path)
+        if config_path is None:
+            if authority_path is not None:
+                raise TrainingDriverError("product worker cannot accept caller authority")
+            content = sys.stdin.buffer.read(MAX_CONFIG_BYTES + 1)
+            if not content or len(content) > MAX_CONFIG_BYTES:
+                raise TrainingDriverError("product configuration exceeds its byte bound")
+            try:
+                value = json.loads(content, object_pairs_hook=_unique_object)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise TrainingDriverError("product configuration is invalid") from error
+            config = _validate_config(value)
+        else:
+            if authority_path is None:
+                raise TrainingDriverError("governed worker requires independent authority")
+            config = _load_config(config_path)
         completed_units = 1
         protocol.progress("training", "Training deterministic model candidate.", 1, 4)
         proposal = _proposal(config)
@@ -226,6 +256,7 @@ def _proposal(config: Mapping[str, Any]):
         dataset_config["root"],
         dataset_config["exportSha256"],
         UtcNanoseconds(dataset_config["asOfUnixNanos"]),
+        product_contract=dataset_config["productContract"],
         max_rows=dataset_config["maximumRows"],
         max_bytes=dataset_config["maximumBytes"],
         context=_operation_context(config),
@@ -258,7 +289,10 @@ def _operation_context(config: Mapping[str, Any]) -> OperationContext:
 
 
 def _load_config(path: Path | str) -> Mapping[str, Any]:
-    value = _read_json(Path(path), MAX_CONFIG_BYTES)
+    return _validate_config(_read_json(Path(path), MAX_CONFIG_BYTES))
+
+
+def _validate_config(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, dict) or set(value) != {
         "schemaVersion",
         "dataset",
@@ -277,10 +311,19 @@ def _load_config(path: Path | str) -> Mapping[str, Any]:
             "asOfUnixNanos",
             "maximumRows",
             "maximumBytes",
+            "productContract",
         },
         "dataset",
     )
     root = _absolute_controlled_directory(dataset["root"], "dataset root")
+    if dataset["productContract"] not in {
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1",
+        "market-squawk.feature-dataset.native-fiscal-financial-amount.training/v1",
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-price-higher.training/v1",
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-benchmark-outperformance.training/v1",
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-profit-after-costs.training/v1",
+    }:
+        raise TrainingDriverError("training product contract is unsupported")
     _hex(dataset["exportSha256"], "dataset export")
     _integer(dataset["asOfUnixNanos"], -(2**63), 2**63 - 1, "dataset cutoff")
     _integer(dataset["maximumRows"], 1, 100_000, "dataset row limit")
@@ -832,8 +875,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     worker = commands.add_parser("worker")
     worker.add_argument("--run-id", required=True)
     worker.add_argument("--generation", required=True, type=int)
-    worker.add_argument("--config", required=True, type=Path)
-    worker.add_argument("--authority", required=True, type=Path)
+    worker_input = worker.add_mutually_exclusive_group(required=True)
+    worker_input.add_argument("--config", type=Path)
+    worker_input.add_argument("--product-config-stdin", action="store_true")
+    worker.add_argument("--authority", type=Path)
     worker.add_argument("--candidate-parent", required=True)
     worker.add_argument("--request", required=True, type=Path)
     options = parser.parse_args(argv)

@@ -1,3 +1,7 @@
+mod corporate_actions;
+pub use corporate_actions::{
+    TiingoCorporateActionReceipt, TiingoCorporateActionRow, TiingoCorporateActionValue,
+};
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Datelike as _, Timelike as _};
@@ -106,7 +110,10 @@ impl TiingoDecoder {
         received_at: Timestamp,
         decoded_at: Timestamp,
     ) -> Result<TiingoEodReceipt, TiingoAdapterError> {
-        if request.endpoint() == TiingoEndpointFamily::Metadata {
+        if !matches!(
+            request.endpoint(),
+            TiingoEndpointFamily::LatestDailyPrices | TiingoEndpointFamily::HistoricalDailyPrices
+        ) {
             return Err(TiingoAdapterError::RequestBuild);
         }
         let body_digest = validate_response(&request, status, body, received_at, decoded_at)?;
@@ -121,7 +128,9 @@ impl TiingoDecoder {
                 TiingoPaginationEvidence::ApplicationDateWindow(*page)
             }
             TiingoRequestScope::Latest => TiingoPaginationEvidence::NotApplicable,
-            TiingoRequestScope::Metadata => return Err(TiingoAdapterError::RequestBuild),
+            TiingoRequestScope::Metadata
+            | TiingoRequestScope::Distributions { .. }
+            | TiingoRequestScope::Splits { .. } => return Err(TiingoAdapterError::RequestBuild),
         };
         let response_bytes =
             u64::try_from(body.len()).map_err(|_| TiingoAdapterError::BodyTooLarge)?;
@@ -470,7 +479,7 @@ fn parse_calendar_date(value: &str) -> SchemaResult<CalendarDate> {
     CalendarDate::new(year, month, day).map_err(|_| TiingoSchemaChangeReason::InvalidFieldValue)
 }
 
-fn digest(value: &[u8]) -> EvidenceDigest {
+pub(crate) fn digest(value: &[u8]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(value).into())
 }
 

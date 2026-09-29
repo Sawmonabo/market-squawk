@@ -1,27 +1,43 @@
 //! Immutable evidence supplied to the pure recommendation authority.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
+mod share_units;
+pub use share_units::{CurrentShareDecisionProjection, CurrentShareMarketAdmission};
+
+use market_squawk_analytics::{
+    FeatureImplementationDigest, HarmonicDirection, HarmonicPatternEvidence, HarmonicPatternKind,
+    HarmonicPatternQuality,
+};
 use market_squawk_domain::{
-    AccountId, BasisPoints, Currency, DataQuality, DigestAlgorithm, FairValueHierarchy,
-    InstrumentId, Money, Timestamp,
+    AccountId, BasisPoints, Currency, DataQuality, DigestAlgorithm, EvidenceDigest,
+    FairValueHierarchy, HistoricalStudyBasis, HistoricalStudyLimitation, InstrumentId, Money,
+    PriceTicks, Timestamp,
 };
 use market_squawk_modeling::ForecastCentralStatistic;
 use market_squawk_portfolio::PortfolioRevisionToken;
 use market_squawk_valuation::{
-    ApprovalStatus, DecisionId, FairValueSelectionDisposition, FairValueSelectionReceipt,
-    FairValueSelectionReceiptHash, MeasurementId, ValuationAmountBasis,
+    ApprovalStatus, AutomaticValuationAssumption, AutomaticValuationAssumptionKind,
+    AutomaticValuationIdentity, AutomaticValuationInputSetIdentity, AutomaticValuationMethod,
+    AutomaticValuationMethodReceipt, DecisionId, EvidenceOrigin, FairValueSelectionDisposition,
+    FairValueSelectionReceipt, FairValueSelectionReceiptHash, MeasurementId, ValuationAmountBasis,
+    ValuationMeasurement,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     DecisionContentDigest, SelectedCandidateAnalysisEvidence, TargetPriceCases, TargetPriceRange,
 };
 
-use super::{CONFIDENCE_PARTS_PER_MILLION, InvestmentProposalError, ProposalForecastVintageId};
+use super::{
+    CONFIDENCE_PARTS_PER_MILLION, FinancialModelMacroAssumptions, InvestmentProposalError,
+    ProposalForecastVintageId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProposalEvidenceWindow {
     pub(super) observed_at: Timestamp,
+    pub(super) source_knowledge_cutoff: Timestamp,
     pub(super) available_at: Timestamp,
     pub(super) expires_at: Timestamp,
     pub(super) content_identity: DecisionContentDigest,
@@ -39,15 +55,43 @@ impl ProposalEvidenceWindow {
         expires_at: Timestamp,
         content_identity: DecisionContentDigest,
     ) -> Result<Self, InvestmentProposalError> {
-        if observed_at > available_at || available_at >= expires_at {
+        Self::try_from_derived(
+            observed_at,
+            available_at,
+            available_at,
+            expires_at,
+            content_identity,
+        )
+    }
+
+    /// Binds an authenticated derived result to its original source-knowledge cutoff.
+    /// Calculation publication remains a separate clock and cannot backdate the result.
+    pub fn try_from_derived(
+        observed_at: Timestamp,
+        source_knowledge_cutoff: Timestamp,
+        available_at: Timestamp,
+        expires_at: Timestamp,
+        content_identity: DecisionContentDigest,
+    ) -> Result<Self, InvestmentProposalError> {
+        if observed_at > source_knowledge_cutoff
+            || source_knowledge_cutoff > available_at
+            || available_at >= expires_at
+        {
             return Err(InvestmentProposalError::InvalidTimeOrder);
         }
         Ok(Self {
             observed_at,
+            source_knowledge_cutoff,
             available_at,
             expires_at,
             content_identity,
         })
+    }
+
+    /// Returns the original knowledge cutoff admitted by the source or derived producer.
+    #[must_use]
+    pub const fn source_knowledge_cutoff(self) -> Timestamp {
+        self.source_knowledge_cutoff
     }
 
     /// Returns when the underlying fact was observed.
@@ -502,18 +546,53 @@ impl PriceForecastEvidence {
     }
 }
 
-/// Governed fair-value evidence consumed independently of the forecast.
+/// The actual authority retained by one valuation projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValuationEvidenceProvenance {
+    /// Independently approved accounting valuation selected by its existing authority.
+    AccountingSelection {
+        classification_decision_id: DecisionId,
+        selection_receipt_hash: FairValueSelectionReceiptHash,
+    },
+    /// Source-authenticated research calculation; it conveys no accounting approval.
+    ResearchCalculation {
+        account_id: AccountId,
+        method: AutomaticValuationMethod,
+        calculation_identity: AutomaticValuationIdentity,
+        input_set_identity: AutomaticValuationInputSetIdentity,
+    },
+}
+
+/// Independently selected accounting valuation or actual source-backed research valuation.
+#[derive(Clone, Copy, Debug)]
 pub struct ValuationEvidence {
     pub(super) instrument_id: InstrumentId,
     pub(super) fair_value: Money,
     pub(super) basis: ValuationAmountBasis,
     pub(super) horizon_at: Timestamp,
     pub(super) measurement_id: MeasurementId,
-    pub(super) classification_decision_id: DecisionId,
-    pub(super) selection_receipt_hash: FairValueSelectionReceiptHash,
+    pub(super) provenance: ValuationEvidenceProvenance,
+    // Recovery may reproduce a saved result but cannot authorize a fresh source admission.
+    source_authenticated: bool,
     pub(super) window: ProposalEvidenceWindow,
 }
+
+// Equality follows the immutable economic projection retained by the evidence digest and wire.
+// Fresh source admission is deliberately not durable: recovery reproduces these fields with
+// source_authenticated=false, and generate/evaluate_alpha still check that flag independently.
+impl PartialEq for ValuationEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        self.instrument_id == other.instrument_id
+            && self.fair_value == other.fair_value
+            && self.basis == other.basis
+            && self.horizon_at == other.horizon_at
+            && self.measurement_id == other.measurement_id
+            && self.provenance == other.provenance
+            && self.window == other.window
+    }
+}
+
+impl Eq for ValuationEvidence {}
 
 impl ValuationEvidence {
     /// Derives governed fair-value evidence from one exact completed selection receipt.
@@ -522,9 +601,11 @@ impl ValuationEvidence {
     ///
     /// Rejects an incomplete/unselected receipt, an account/instrument/currency mismatch, a
     /// detached or unclassified selected chain, a nonpositive fair value, or a supplied evidence
-    /// window that does not exactly describe the receipt. The required window uses the selected
-    /// measurement time as `observed_at`, the receipt request cutoff as `available_at`, the active
-    /// approval expiry as `expires_at`, and the receipt's SHA-256 hash as `content_identity`.
+    /// window that does not exactly describe the receipt. Automatic calculations retain their
+    /// original source cutoff as observation/knowledge time; their accounting measurement,
+    /// classification and approval keep their actual clocks. Other measurements use their
+    /// measurement time as observation. Availability is the selection request time, expiry is the
+    /// active approval expiry, and content identity is the exact selection receipt hash.
     pub fn try_from_fair_value_selection(
         receipt: &FairValueSelectionReceipt,
         account_id: AccountId,
@@ -545,6 +626,19 @@ impl ValuationEvidence {
             .first()
             .ok_or(InvestmentProposalError::InvalidValuationSelection)?;
         let fair_value = measurement.amount().money();
+        let automatic = match measurement.inputs() {
+            [input] => match input.evidence().origin() {
+                EvidenceOrigin::AutomaticValuation { receipt } => Some(receipt.as_ref()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let observed_at = automatic.map_or(measurement.measurement_at(), |receipt| {
+            receipt.measurement_at()
+        });
+        let expires_at = automatic.map_or(selected.expires_at(), |receipt| {
+            selected.expires_at().min(receipt.expires_at())
+        });
 
         if receipt.disposition() != FairValueSelectionDisposition::Complete
             || request.account_id() != Some(account_id)
@@ -586,14 +680,18 @@ impl ValuationEvidence {
         {
             return Err(InvestmentProposalError::InvalidValuationSelection);
         }
-        if window.observed_at() != measurement.measurement_at()
+        if window.observed_at() != observed_at
+            || automatic.is_some_and(|receipt| {
+                window.source_knowledge_cutoff() != receipt.measurement_at()
+                    || receipt.calculated_at() > measurement.measurement_at()
+            })
             || window.available_at() != request.as_of()
-            || window.expires_at() != selected.expires_at()
+            || window.expires_at() != expires_at
             || measurement.prepared_at() > request.as_of()
             || selected.classification_recorded_at() > request.as_of()
             || approval.approved_at() > request.as_of()
             || selected.approval_recorded_at() > request.as_of()
-            || selected.expires_at() <= request.as_of()
+            || expires_at <= request.as_of()
             || horizon_at <= request.as_of()
         {
             return Err(InvestmentProposalError::InvalidTimeOrder);
@@ -604,8 +702,116 @@ impl ValuationEvidence {
             measurement.amount_basis(),
             horizon_at,
             measurement.id(),
-            classification.id(),
-            receipt.hash(),
+            ValuationEvidenceProvenance::AccountingSelection {
+                classification_decision_id: classification.id(),
+                selection_receipt_hash: receipt.hash(),
+            },
+            true,
+            window,
+        )
+    }
+
+    /// Admits the genuine nested research calculation in an exact retained measurement.
+    /// The current lifetime may only shorten the original receipt's exclusive lifetime.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source identity, consumer horizon and actual admission clocks remain distinct"
+    )]
+    pub fn try_from_automatic_measurement(
+        measurement: &ValuationMeasurement,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        currency: Currency,
+        horizon_at: Timestamp,
+        admitted_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<Self, InvestmentProposalError> {
+        let [input] = measurement.inputs() else {
+            return Err(InvestmentProposalError::InvalidValuationSelection);
+        };
+        let EvidenceOrigin::AutomaticValuation { receipt } = input.evidence().origin() else {
+            return Err(InvestmentProposalError::InvalidValuationSelection);
+        };
+        if measurement.account_id() != account_id
+            || receipt.account_id() != account_id
+            || measurement.instrument_id() != instrument_id
+            || receipt.instrument_id() != instrument_id
+            || measurement.amount() != receipt.range().central()
+            || input.amount() != receipt.range().central()
+            || measurement.amount().money().currency() != currency
+            || receipt.calculated_at() > measurement.measurement_at()
+            || measurement.prepared_at() > admitted_at
+            || receipt.calculated_at() > admitted_at
+            || horizon_at <= admitted_at
+            || expires_at <= admitted_at
+            || expires_at > receipt.expires_at()
+            || (receipt.method() == AutomaticValuationMethod::ForecastDistribution
+                && receipt.forecast_terminal_at() != Some(horizon_at))
+        {
+            return Err(InvestmentProposalError::InvalidValuationSelection);
+        }
+        let window = ProposalEvidenceWindow::try_from_derived(
+            receipt.measurement_at(),
+            receipt.measurement_at(),
+            measurement.prepared_at().max(receipt.calculated_at()),
+            expires_at,
+            sha256_content(receipt.id().bytes())?,
+        )?;
+        Self::try_from_parts(
+            instrument_id,
+            receipt.range().central().money(),
+            receipt.range().central().basis(),
+            horizon_at,
+            measurement.id(),
+            ValuationEvidenceProvenance::ResearchCalculation {
+                account_id,
+                method: receipt.method(),
+                calculation_identity: receipt.id(),
+                input_set_identity: receipt.input_set_id(),
+            },
+            true,
+            window,
+        )
+    }
+
+    /// Reconstructs a read-only saved research projection. Fresh generation rejects this value.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all exact persisted research coordinates remain explicit"
+    )]
+    pub fn try_recover_research_projection(
+        instrument_id: InstrumentId,
+        fair_value: Money,
+        basis: ValuationAmountBasis,
+        horizon_at: Timestamp,
+        measurement_id: MeasurementId,
+        account_id: AccountId,
+        method: AutomaticValuationMethod,
+        calculation_identity: AutomaticValuationIdentity,
+        input_set_identity: AutomaticValuationInputSetIdentity,
+        window: ProposalEvidenceWindow,
+    ) -> Result<Self, InvestmentProposalError> {
+        if calculation_identity.bytes() == [0; 32]
+            || input_set_identity.bytes() == [0; 32]
+            || window.content_identity().evidence_digest().algorithm() != DigestAlgorithm::Sha256
+            || window.content_identity().evidence_digest().bytes() != calculation_identity.bytes()
+            || window.source_knowledge_cutoff() != window.observed_at()
+        {
+            return Err(InvestmentProposalError::InvalidValuationSelection);
+        }
+        Self::try_from_parts(
+            instrument_id,
+            fair_value,
+            basis,
+            horizon_at,
+            measurement_id,
+            ValuationEvidenceProvenance::ResearchCalculation {
+                account_id,
+                method,
+                calculation_identity,
+                input_set_identity,
+            },
+            false,
             window,
         )
     }
@@ -648,8 +854,11 @@ impl ValuationEvidence {
             basis,
             horizon_at,
             measurement_id,
-            classification_decision_id,
-            selection_receipt_hash,
+            ValuationEvidenceProvenance::AccountingSelection {
+                classification_decision_id,
+                selection_receipt_hash,
+            },
+            false,
             window,
         )
     }
@@ -671,8 +880,11 @@ impl ValuationEvidence {
             basis,
             horizon_at,
             measurement_id,
-            classification_decision_id,
-            selection_receipt_hash,
+            ValuationEvidenceProvenance::AccountingSelection {
+                classification_decision_id,
+                selection_receipt_hash,
+            },
+            true,
             window,
         )
     }
@@ -683,8 +895,8 @@ impl ValuationEvidence {
         basis: ValuationAmountBasis,
         horizon_at: Timestamp,
         measurement_id: MeasurementId,
-        classification_decision_id: DecisionId,
-        selection_receipt_hash: FairValueSelectionReceiptHash,
+        provenance: ValuationEvidenceProvenance,
+        source_authenticated: bool,
         window: ProposalEvidenceWindow,
     ) -> Result<Self, InvestmentProposalError> {
         ensure_positive(fair_value)?;
@@ -700,8 +912,8 @@ impl ValuationEvidence {
             basis,
             horizon_at,
             measurement_id,
-            classification_decision_id,
-            selection_receipt_hash,
+            provenance,
+            source_authenticated,
             window,
         })
     }
@@ -738,14 +950,34 @@ impl ValuationEvidence {
 
     /// Returns the valuation-classification identity.
     #[must_use]
-    pub const fn classification_decision_id(self) -> DecisionId {
-        self.classification_decision_id
+    pub const fn classification_decision_id(self) -> Option<DecisionId> {
+        match self.provenance {
+            ValuationEvidenceProvenance::AccountingSelection {
+                classification_decision_id,
+                ..
+            } => Some(classification_decision_id),
+            ValuationEvidenceProvenance::ResearchCalculation { .. } => None,
+        }
     }
 
     /// Returns the deterministic valuation-selection identity.
     #[must_use]
-    pub const fn selection_receipt_hash(self) -> FairValueSelectionReceiptHash {
-        self.selection_receipt_hash
+    pub const fn selection_receipt_hash(self) -> Option<FairValueSelectionReceiptHash> {
+        match self.provenance {
+            ValuationEvidenceProvenance::AccountingSelection {
+                selection_receipt_hash,
+                ..
+            } => Some(selection_receipt_hash),
+            ValuationEvidenceProvenance::ResearchCalculation { .. } => None,
+        }
+    }
+
+    /// Returns the actual accounting or research provenance without inventing an approval.
+    pub const fn provenance(self) -> ValuationEvidenceProvenance {
+        self.provenance
+    }
+    pub(super) const fn is_source_authenticated(self) -> bool {
+        self.source_authenticated
     }
 
     /// Returns exact valuation evidence timing and payload identity.
@@ -755,11 +987,681 @@ impl ValuationEvidence {
     }
 }
 
-/// Cost-adjusted point-in-time backtest evidence and its complete reproducibility bindings.
+/// Exact inclusive per-instrument value range produced by one financial model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CostAdjustedPitBacktestEvidence {
+pub struct FinancialModelValueRange {
+    lower: Money,
+    central: Money,
+    upper: Money,
+}
+
+impl FinancialModelValueRange {
+    /// Constructs a positive same-currency range with its central value inside the bounds.
+    pub fn try_new(
+        lower: Money,
+        central: Money,
+        upper: Money,
+    ) -> Result<Self, InvestmentProposalError> {
+        ensure_positive(lower)?;
+        if central.currency() != lower.currency()
+            || upper.currency() != lower.currency()
+            || central.amount() < lower.amount()
+            || central.amount() > upper.amount()
+            || upper.amount().is_zero()
+            || upper.amount().is_sign_negative()
+        {
+            return Err(InvestmentProposalError::InvalidPrice);
+        }
+        Ok(Self {
+            lower,
+            central,
+            upper,
+        })
+    }
+
+    #[must_use]
+    pub const fn lower(self) -> Money {
+        self.lower
+    }
+
+    #[must_use]
+    pub const fn central(self) -> Money {
+        self.central
+    }
+
+    #[must_use]
+    pub const fn upper(self) -> Money {
+        self.upper
+    }
+}
+
+/// Typed financial-model projection retained independently of governed fair-value selection.
+///
+/// This projection is constructible from the automatic-valuation receipt only. Scenario and
+/// sensitivity identities remain exact parents. Macro rate derivation must match the actual
+/// retained model assumptions at mint and recovery; none of this grants
+/// valuation approval, recommendation confidence, or execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinancialModelEvidence {
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    method: AutomaticValuationMethod,
+    periods_per_year: Option<NonZeroU32>,
+    range: FinancialModelValueRange,
+    scenarios: TargetPriceCases,
+    sensitivity_range: TargetPriceRange,
+    horizon_at: Timestamp,
+    pit_input_set_identity: DecisionContentDigest,
+    calculation_identity: DecisionContentDigest,
+    assumptions_identity: DecisionContentDigest,
+    scenario_identity: DecisionContentDigest,
+    sensitivity_identity: DecisionContentDigest,
+    assumptions: Box<[AutomaticValuationAssumption]>,
+    macro_assumptions: Option<FinancialModelMacroAssumptions>,
+    window: ProposalEvidenceWindow,
+}
+
+impl FinancialModelEvidence {
+    /// Projects one evidence-closed automatic calculation into the decision contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "model, scenario, sensitivity, Macro, horizon, and timing authorities remain explicit"
+    )]
+    pub fn try_from_automatic_valuation_receipt(
+        receipt: &AutomaticValuationMethodReceipt,
+        scenarios: TargetPriceCases,
+        scenario_identity: DecisionContentDigest,
+        sensitivity_range: TargetPriceRange,
+        sensitivity_identity: DecisionContentDigest,
+        macro_assumptions: Option<FinancialModelMacroAssumptions>,
+        horizon_at: Timestamp,
+        window: ProposalEvidenceWindow,
+    ) -> Result<Self, InvestmentProposalError> {
+        let receipt_range = receipt.range();
+        let lower = receipt_range.lower();
+        let central = receipt_range.central();
+        let upper = receipt_range.upper();
+        if [lower.basis(), central.basis(), upper.basis()]
+            .into_iter()
+            .any(|basis| basis != ValuationAmountBasis::PerInstrumentUnit)
+            || macro_assumptions.as_ref() != receipt.macro_assumptions()
+            || receipt.assumptions().is_empty()
+            || receipt.intermediates().is_empty()
+            || receipt.method() == AutomaticValuationMethod::ForecastDistribution
+                && receipt.forecast_terminal_at() != Some(horizon_at)
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        let range =
+            FinancialModelValueRange::try_new(lower.money(), central.money(), upper.money())?;
+        let currency = range.central().currency();
+        if scenarios.base().currency() != currency
+            || sensitivity_range.lower().currency() != currency
+            || window.observed_at() != receipt.measurement_at()
+            || window.source_knowledge_cutoff() != receipt.measurement_at()
+            || window.available_at() != receipt.calculated_at()
+            || window.expires_at() > receipt.expires_at()
+            || horizon_at <= window.available_at()
+        {
+            return Err(InvestmentProposalError::InvalidTimeOrder);
+        }
+        let calculation_identity = sha256_content(receipt.id().bytes())?;
+        if window.content_identity() != calculation_identity {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        Self::try_recover_projection(
+            receipt.instrument_id(),
+            receipt.account_id(),
+            receipt.method(),
+            receipt.periods_per_year(),
+            range,
+            scenarios,
+            sensitivity_range,
+            horizon_at,
+            sha256_content(receipt.input_set_id().bytes())?,
+            calculation_identity,
+            retained_assumptions(receipt.assumptions())?,
+            scenario_identity,
+            sensitivity_identity,
+            macro_assumptions,
+            window,
+        )
+    }
+
+    /// Recovers the exact durable projection and revalidates its closed semantics.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every durable financial-model authority remains explicit"
+    )]
+    pub fn try_recover_projection(
+        instrument_id: InstrumentId,
+        account_id: AccountId,
+        method: AutomaticValuationMethod,
+        periods_per_year: Option<NonZeroU32>,
+        range: FinancialModelValueRange,
+        scenarios: TargetPriceCases,
+        sensitivity_range: TargetPriceRange,
+        horizon_at: Timestamp,
+        pit_input_set_identity: DecisionContentDigest,
+        calculation_identity: DecisionContentDigest,
+        assumptions: Box<[AutomaticValuationAssumption]>,
+        scenario_identity: DecisionContentDigest,
+        sensitivity_identity: DecisionContentDigest,
+        macro_assumptions: Option<FinancialModelMacroAssumptions>,
+        window: ProposalEvidenceWindow,
+    ) -> Result<Self, InvestmentProposalError> {
+        let currency = range.central().currency();
+        if scenarios.base().currency() != currency
+            || sensitivity_range.lower().currency() != currency
+            || horizon_at <= window.available_at()
+            || calculation_identity != window.content_identity()
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        if macro_assumptions.is_some()
+            && (currency.as_str() != "USD" || periods_per_year != Some(NonZeroU32::MIN))
+            || macro_assumptions.is_none() && periods_per_year.is_some()
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        validate_model_assumptions(
+            method,
+            range,
+            &assumptions,
+            macro_assumptions.as_ref(),
+            window,
+        )?;
+        let assumptions_identity = automatic_assumptions_identity(&assumptions)?;
+        Ok(Self {
+            instrument_id,
+            account_id,
+            method,
+            periods_per_year,
+            range,
+            scenarios,
+            sensitivity_range,
+            horizon_at,
+            pit_input_set_identity,
+            calculation_identity,
+            assumptions_identity,
+            assumptions,
+            scenario_identity,
+            sensitivity_identity,
+            macro_assumptions,
+            window,
+        })
+    }
+
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+    #[must_use]
+    pub const fn method(&self) -> AutomaticValuationMethod {
+        self.method
+    }
+    #[must_use]
+    pub const fn periods_per_year(&self) -> Option<NonZeroU32> {
+        self.periods_per_year
+    }
+    #[must_use]
+    pub const fn range(&self) -> FinancialModelValueRange {
+        self.range
+    }
+    #[must_use]
+    pub const fn scenarios(&self) -> TargetPriceCases {
+        self.scenarios
+    }
+    #[must_use]
+    pub const fn sensitivity_range(&self) -> TargetPriceRange {
+        self.sensitivity_range
+    }
+    #[must_use]
+    pub const fn horizon_at(&self) -> Timestamp {
+        self.horizon_at
+    }
+    #[must_use]
+    pub const fn pit_input_set_identity(&self) -> DecisionContentDigest {
+        self.pit_input_set_identity
+    }
+    #[must_use]
+    pub const fn calculation_identity(&self) -> DecisionContentDigest {
+        self.calculation_identity
+    }
+    #[must_use]
+    pub const fn assumptions_identity(&self) -> DecisionContentDigest {
+        self.assumptions_identity
+    }
+    #[must_use]
+    pub const fn scenario_identity(&self) -> DecisionContentDigest {
+        self.scenario_identity
+    }
+    #[must_use]
+    pub const fn sensitivity_identity(&self) -> DecisionContentDigest {
+        self.sensitivity_identity
+    }
+    #[must_use]
+    pub fn macro_context_identity(&self) -> Option<EvidenceDigest> {
+        self.macro_assumptions
+            .as_ref()
+            .map(|value| value.reference().context_identity())
+    }
+    #[must_use]
+    pub fn assumptions(&self) -> &[AutomaticValuationAssumption] {
+        &self.assumptions
+    }
+    #[must_use]
+    pub const fn macro_assumptions(&self) -> Option<&FinancialModelMacroAssumptions> {
+        self.macro_assumptions.as_ref()
+    }
+    #[must_use]
+    pub const fn window(&self) -> ProposalEvidenceWindow {
+        self.window
+    }
+}
+
+/// Bounded qualification retained from a governed historical study.
+///
+/// This value validates the declaration; it cannot grant dataset, model, study, or live authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecommendationStudyQualification {
+    basis: HistoricalStudyBasis,
+    limitations: [HistoricalStudyLimitation; 4],
+    limitation_count: u8,
+}
+
+impl RecommendationStudyQualification {
+    /// Requires canonical, complete limitations without inferring an as-known default.
+    pub fn try_new(
+        basis: HistoricalStudyBasis,
+        limitations: &[HistoricalStudyLimitation],
+    ) -> Result<Self, InvestmentProposalError> {
+        use HistoricalStudyLimitation::{
+            HistoricalRevisionCoverageUnproven, LaterVintageInputs, SimulatedAvailability,
+        };
+        if limitations.len() > 4
+            || limitations.windows(2).any(|pair| pair[0] >= pair[1])
+            || match basis {
+                HistoricalStudyBasis::HistoricalAsKnown => limitations
+                    .iter()
+                    .any(|value| matches!(value, LaterVintageInputs | SimulatedAvailability)),
+                HistoricalStudyBasis::RetrospectiveFrozenSnapshot => [
+                    HistoricalRevisionCoverageUnproven,
+                    LaterVintageInputs,
+                    SimulatedAvailability,
+                ]
+                .iter()
+                .any(|value| !limitations.contains(value)),
+            }
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        let mut retained = [HistoricalRevisionCoverageUnproven; 4];
+        retained[..limitations.len()].copy_from_slice(limitations);
+        Ok(Self {
+            basis,
+            limitations: retained,
+            limitation_count: u8::try_from(limitations.len())
+                .map_err(|_| InvestmentProposalError::InvalidEvidenceMetric)?,
+        })
+    }
+
+    /// Returns the actual study's historical knowledge qualification.
+    #[must_use]
+    pub const fn basis(self) -> HistoricalStudyBasis {
+        self.basis
+    }
+
+    /// Returns every required limitation in canonical order.
+    #[must_use]
+    pub fn limitations(&self) -> &[HistoricalStudyLimitation] {
+        &self.limitations[..usize::from(self.limitation_count)]
+    }
+}
+
+/// Exact chronological, horizon-aligned out-of-sample evidence with its historical basis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChronologicalOutOfSampleEvidence {
+    instrument_id: InstrumentId,
+    currency: Currency,
+    qualification: RecommendationStudyQualification,
+    outcome_horizon_nanos: i64,
+    evaluation_starts_at: Timestamp,
+    evaluation_ends_at: Timestamp,
+    simulation_cutoff_at: Timestamp,
+    completed_observations: NonZeroU32,
+    total_signals: NonZeroU32,
+    fold_count: NonZeroU32,
+    completion_coverage_ppm: u32,
+    dataset_identity: DecisionContentDigest,
+    signal_plan_identity: DecisionContentDigest,
+    aggregate_identity: DecisionContentDigest,
+    study_identity: DecisionContentDigest,
+    window: ProposalEvidenceWindow,
+}
+
+impl ChronologicalOutOfSampleEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "chronology, horizon, coverage, and exact study parents remain explicit"
+    )]
+    pub fn try_new(
+        instrument_id: InstrumentId,
+        currency: Currency,
+        qualification: RecommendationStudyQualification,
+        outcome_horizon_nanos: i64,
+        evaluation_starts_at: Timestamp,
+        evaluation_ends_at: Timestamp,
+        simulation_cutoff_at: Timestamp,
+        completed_observations: NonZeroU32,
+        total_signals: NonZeroU32,
+        fold_count: NonZeroU32,
+        completion_coverage_ppm: u32,
+        dataset_identity: DecisionContentDigest,
+        signal_plan_identity: DecisionContentDigest,
+        aggregate_identity: DecisionContentDigest,
+        study_identity: DecisionContentDigest,
+        window: ProposalEvidenceWindow,
+    ) -> Result<Self, InvestmentProposalError> {
+        ensure_ppm(completion_coverage_ppm)?;
+        let exact_completion_coverage_ppm = u32::try_from(
+            u64::from(completed_observations.get())
+                .checked_mul(1_000_000)
+                .ok_or(InvestmentProposalError::ArithmeticOverflow)?
+                / u64::from(total_signals.get()),
+        )
+        .map_err(|_| InvestmentProposalError::ArithmeticOverflow)?;
+        if outcome_horizon_nanos <= 0
+            || evaluation_starts_at >= evaluation_ends_at
+            || evaluation_ends_at > simulation_cutoff_at
+            || simulation_cutoff_at > window.available_at()
+            || completed_observations > total_signals
+            || fold_count > total_signals
+            || completion_coverage_ppm != exact_completion_coverage_ppm
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        Ok(Self {
+            instrument_id,
+            currency,
+            qualification,
+            outcome_horizon_nanos,
+            evaluation_starts_at,
+            evaluation_ends_at,
+            simulation_cutoff_at,
+            completed_observations,
+            total_signals,
+            fold_count,
+            completion_coverage_ppm,
+            dataset_identity,
+            signal_plan_identity,
+            aggregate_identity,
+            study_identity,
+            window,
+        })
+    }
+
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+    #[must_use]
+    pub const fn currency(self) -> Currency {
+        self.currency
+    }
+    #[must_use]
+    pub const fn qualification(self) -> RecommendationStudyQualification {
+        self.qualification
+    }
+    #[must_use]
+    pub const fn outcome_horizon_nanos(self) -> i64 {
+        self.outcome_horizon_nanos
+    }
+    #[must_use]
+    pub const fn evaluation_starts_at(self) -> Timestamp {
+        self.evaluation_starts_at
+    }
+    #[must_use]
+    pub const fn evaluation_ends_at(self) -> Timestamp {
+        self.evaluation_ends_at
+    }
+    #[must_use]
+    pub const fn simulation_cutoff_at(self) -> Timestamp {
+        self.simulation_cutoff_at
+    }
+    #[must_use]
+    pub const fn completed_observations(self) -> NonZeroU32 {
+        self.completed_observations
+    }
+    #[must_use]
+    pub const fn total_signals(self) -> NonZeroU32 {
+        self.total_signals
+    }
+    #[must_use]
+    pub const fn fold_count(self) -> NonZeroU32 {
+        self.fold_count
+    }
+    #[must_use]
+    pub const fn completion_coverage_ppm(self) -> u32 {
+        self.completion_coverage_ppm
+    }
+    #[must_use]
+    pub const fn dataset_identity(self) -> DecisionContentDigest {
+        self.dataset_identity
+    }
+    #[must_use]
+    pub const fn signal_plan_identity(self) -> DecisionContentDigest {
+        self.signal_plan_identity
+    }
+    #[must_use]
+    pub const fn aggregate_identity(self) -> DecisionContentDigest {
+        self.aggregate_identity
+    }
+    #[must_use]
+    pub const fn study_identity(self) -> DecisionContentDigest {
+        self.study_identity
+    }
+    #[must_use]
+    pub const fn window(self) -> ProposalEvidenceWindow {
+        self.window
+    }
+}
+
+/// Exact digest-bound decision receipt for one causal harmonic classification.
+///
+/// The exact analytics digest binds pivots, ratios, parents, adjustment/session/completeness/
+/// marketability policy, targets, and invalidation. This receipt retains the typed fields needed
+/// by decisions while granting neither confidence nor execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarmonicPatternEvidenceReceipt {
+    instrument_id: InstrumentId,
+    timeframe_nanos: NonZeroU64,
+    kind: HarmonicPatternKind,
+    direction: HarmonicDirection,
+    quality: HarmonicPatternQuality,
+    completion_lower: PriceTicks,
+    completion_upper: PriceTicks,
+    targets: [PriceTicks; 3],
+    invalidation: PriceTicks,
+    observation_cutoff: Timestamp,
+    confirmation_cutoff: Timestamp,
+    decision_cutoff: Timestamp,
+    expires_at: Timestamp,
+    implementation_identity: FeatureImplementationDigest,
+    evidence_digest: EvidenceDigest,
+    window: ProposalEvidenceWindow,
+}
+
+impl HarmonicPatternEvidenceReceipt {
+    pub fn try_from_pattern(
+        value: HarmonicPatternEvidence,
+    ) -> Result<Self, InvestmentProposalError> {
+        let binding = *value.binding();
+        let completion = value.completion_zone();
+        let evidence_digest = value.evidence_digest();
+        if evidence_digest.algorithm() != DigestAlgorithm::Sha256
+            || evidence_digest.bytes() == [0; 32]
+        {
+            return Err(InvestmentProposalError::ReservedIdentity);
+        }
+        let window = ProposalEvidenceWindow::try_new(
+            value.observation_cutoff(),
+            value.confirmation_cutoff(),
+            value.expires_at(),
+            DecisionContentDigest::try_new(evidence_digest)
+                .map_err(|_| InvestmentProposalError::ReservedIdentity)?,
+        )?;
+        Self::try_recover_projection(
+            binding.instrument_id(),
+            binding.timeframe_nanos(),
+            value.kind(),
+            value.direction(),
+            value.quality(),
+            completion.lower(),
+            completion.upper(),
+            value.targets(),
+            value.invalidation(),
+            value.observation_cutoff(),
+            value.confirmation_cutoff(),
+            value.decision_cutoff(),
+            value.expires_at(),
+            value.implementation_identity(),
+            evidence_digest,
+            window,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every durable harmonic projection field remains explicit"
+    )]
+    pub fn try_recover_projection(
+        instrument_id: InstrumentId,
+        timeframe_nanos: NonZeroU64,
+        kind: HarmonicPatternKind,
+        direction: HarmonicDirection,
+        quality: HarmonicPatternQuality,
+        completion_lower: PriceTicks,
+        completion_upper: PriceTicks,
+        targets: [PriceTicks; 3],
+        invalidation: PriceTicks,
+        observation_cutoff: Timestamp,
+        confirmation_cutoff: Timestamp,
+        decision_cutoff: Timestamp,
+        expires_at: Timestamp,
+        implementation_identity: FeatureImplementationDigest,
+        evidence_digest: EvidenceDigest,
+        window: ProposalEvidenceWindow,
+    ) -> Result<Self, InvestmentProposalError> {
+        if evidence_digest.algorithm() != DigestAlgorithm::Sha256
+            || evidence_digest.bytes() == [0; 32]
+            || completion_lower.get() > completion_upper.get()
+            || observation_cutoff > confirmation_cutoff
+            || confirmation_cutoff > decision_cutoff
+            || decision_cutoff >= expires_at
+            || window.observed_at() != observation_cutoff
+            || window.available_at() != confirmation_cutoff
+            || window.expires_at() != expires_at
+            || window.content_identity().evidence_digest() != evidence_digest
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        Ok(Self {
+            instrument_id,
+            timeframe_nanos,
+            kind,
+            direction,
+            quality,
+            completion_lower,
+            completion_upper,
+            targets,
+            invalidation,
+            observation_cutoff,
+            confirmation_cutoff,
+            decision_cutoff,
+            expires_at,
+            implementation_identity,
+            evidence_digest,
+            window,
+        })
+    }
+
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+    #[must_use]
+    pub const fn timeframe_nanos(&self) -> NonZeroU64 {
+        self.timeframe_nanos
+    }
+    #[must_use]
+    pub const fn kind(&self) -> HarmonicPatternKind {
+        self.kind
+    }
+    #[must_use]
+    pub const fn direction(&self) -> HarmonicDirection {
+        self.direction
+    }
+    #[must_use]
+    pub const fn quality(&self) -> HarmonicPatternQuality {
+        self.quality
+    }
+    #[must_use]
+    pub const fn completion_lower(&self) -> PriceTicks {
+        self.completion_lower
+    }
+    #[must_use]
+    pub const fn completion_upper(&self) -> PriceTicks {
+        self.completion_upper
+    }
+    #[must_use]
+    pub const fn targets(&self) -> [PriceTicks; 3] {
+        self.targets
+    }
+    #[must_use]
+    pub const fn invalidation(&self) -> PriceTicks {
+        self.invalidation
+    }
+    #[must_use]
+    pub const fn observation_cutoff(&self) -> Timestamp {
+        self.observation_cutoff
+    }
+    #[must_use]
+    pub const fn confirmation_cutoff(&self) -> Timestamp {
+        self.confirmation_cutoff
+    }
+    #[must_use]
+    pub const fn decision_cutoff(&self) -> Timestamp {
+        self.decision_cutoff
+    }
+    #[must_use]
+    pub const fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+    #[must_use]
+    pub const fn implementation_identity(&self) -> FeatureImplementationDigest {
+        self.implementation_identity
+    }
+    #[must_use]
+    pub const fn evidence_digest(&self) -> EvidenceDigest {
+        self.evidence_digest
+    }
+    #[must_use]
+    pub const fn window(&self) -> ProposalEvidenceWindow {
+        self.window
+    }
+}
+
+/// Cost-adjusted historical evidence with an explicit basis and complete reproducibility bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CostAdjustedBacktestEvidence {
     pub(super) instrument_id: InstrumentId,
     pub(super) currency: Currency,
+    pub(super) qualification: RecommendationStudyQualification,
     pub(super) outcome_horizon_nanos: i64,
     pub(super) net_return: BasisPoints,
     pub(super) max_drawdown: BasisPoints,
@@ -779,7 +1681,7 @@ pub struct CostAdjustedPitBacktestEvidence {
     pub(super) window: ProposalEvidenceWindow,
 }
 
-impl CostAdjustedPitBacktestEvidence {
+impl CostAdjustedBacktestEvidence {
     /// Constructs an immutable cost-adjusted backtest result.
     ///
     /// # Errors
@@ -788,11 +1690,12 @@ impl CostAdjustedPitBacktestEvidence {
     /// assumptions or stability, or a simulation cutoff later than the evidence publication time.
     #[allow(
         clippy::too_many_arguments,
-        reason = "PIT dataset, command, terminal, report, cohort, and cost authorities remain explicit"
+        reason = "qualified dataset, command, terminal, report, cohort, and cost authorities remain explicit"
     )]
     pub fn try_new(
         instrument_id: InstrumentId,
         currency: Currency,
+        qualification: RecommendationStudyQualification,
         outcome_horizon_nanos: i64,
         net_return: BasisPoints,
         max_drawdown: BasisPoints,
@@ -829,6 +1732,7 @@ impl CostAdjustedPitBacktestEvidence {
         Ok(Self {
             instrument_id,
             currency,
+            qualification,
             outcome_horizon_nanos,
             net_return,
             max_drawdown,
@@ -859,6 +1763,12 @@ impl CostAdjustedPitBacktestEvidence {
     #[must_use]
     pub const fn currency(self) -> Currency {
         self.currency
+    }
+
+    /// Returns the historical basis and all retained limitations.
+    #[must_use]
+    pub const fn qualification(self) -> RecommendationStudyQualification {
+        self.qualification
     }
 
     /// Returns the evaluated forecast-to-outcome horizon in nanoseconds.
@@ -903,13 +1813,13 @@ impl CostAdjustedPitBacktestEvidence {
         self.maximum_random_slippage_basis_points
     }
 
-    /// Returns the number of evaluated point-in-time observations.
+    /// Returns the number of evaluated observations; overlapping targets are not independent.
     #[must_use]
     pub const fn observations(self) -> NonZeroU32 {
         self.observations
     }
 
-    /// Returns the number of independent backtest trials.
+    /// Returns the number of separately retained backtest folds.
     #[must_use]
     pub const fn trials(self) -> NonZeroU32 {
         self.trials
@@ -927,7 +1837,7 @@ impl CostAdjustedPitBacktestEvidence {
         self.simulation_cutoff_at
     }
 
-    /// Returns the exact point-in-time dataset identity.
+    /// Returns the exact qualified dataset identity.
     #[must_use]
     pub const fn dataset_identity(self) -> DecisionContentDigest {
         self.dataset_identity
@@ -976,28 +1886,40 @@ pub struct LiquidityEvidence {
     pub(super) instrument_id: InstrumentId,
     pub(super) currency: Currency,
     pub(super) quoted_spread: BasisPoints,
-    pub(super) capacity_ppm: u32,
+    pub(super) buy_add_capacity_ppm: Option<u32>,
+    pub(super) trim_sell_capacity_ppm: Option<u32>,
     pub(super) quality: DataQuality,
     pub(super) assessment_identity: DecisionContentDigest,
     pub(super) window: ProposalEvidenceWindow,
 }
 
 impl LiquidityEvidence {
-    /// Constructs nonnegative spread and bounded capacity evidence.
+    /// Constructs nonnegative spread and separate policy-relative capacities for both sides.
+    /// Missing depth remains absent; one side cannot authorize the opposite action.
     ///
     /// # Errors
     ///
-    /// Rejects negative spread or capacity above one million parts per million.
+    /// Rejects negative spread or a supplied capacity above one million parts per million.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "both directional capacities and source, identity, currency and time remain explicit"
+    )]
     pub fn try_new(
         instrument_id: InstrumentId,
         currency: Currency,
         quoted_spread: BasisPoints,
-        capacity_ppm: u32,
+        buy_add_capacity_ppm: Option<u32>,
+        trim_sell_capacity_ppm: Option<u32>,
         quality: DataQuality,
         assessment_identity: DecisionContentDigest,
         window: ProposalEvidenceWindow,
     ) -> Result<Self, InvestmentProposalError> {
-        ensure_ppm(capacity_ppm)?;
+        for capacity in [buy_add_capacity_ppm, trim_sell_capacity_ppm]
+            .into_iter()
+            .flatten()
+        {
+            ensure_ppm(capacity)?;
+        }
         if quoted_spread.get().is_negative() {
             return Err(InvestmentProposalError::InvalidEvidenceMetric);
         }
@@ -1005,7 +1927,8 @@ impl LiquidityEvidence {
             instrument_id,
             currency,
             quoted_spread,
-            capacity_ppm,
+            buy_add_capacity_ppm,
+            trim_sell_capacity_ppm,
             quality,
             assessment_identity,
             window,
@@ -1030,10 +1953,16 @@ impl LiquidityEvidence {
         self.quoted_spread
     }
 
-    /// Returns policy-relative usable capacity in parts per million.
+    /// Returns actual buy/add capacity in parts per million, or missing buy-side evidence.
     #[must_use]
-    pub const fn capacity_ppm(self) -> u32 {
-        self.capacity_ppm
+    pub const fn buy_add_capacity_ppm(self) -> Option<u32> {
+        self.buy_add_capacity_ppm
+    }
+
+    /// Returns actual trim/sell capacity in parts per million, or missing sell-side evidence.
+    #[must_use]
+    pub const fn trim_sell_capacity_ppm(self) -> Option<u32> {
+        self.trim_sell_capacity_ppm
     }
 
     /// Returns the source-qualified liquidity quality.
@@ -1179,16 +2108,24 @@ pub struct InvestmentAnalysisEvidenceInput {
     pub currency: Currency,
     /// Exact account whose risk constraints apply.
     pub account_id: AccountId,
-    /// Point-in-time analysis cutoff.
+    /// Point-in-time ceiling for the underlying analytical sources.
     pub as_of: Timestamp,
+    /// Actual admission time for completed derived evidence and freshness evaluation.
+    pub admitted_at: Timestamp,
     /// Current market evidence, when a configured producer supplied it.
     pub market: Option<MarketReferenceEvidence>,
     /// Calibrated price-forecast evidence, when available.
     pub price_forecast: Option<PriceForecastEvidence>,
     /// Governed fair-value evidence, when available.
     pub valuation: Option<ValuationEvidence>,
-    /// Cost-adjusted point-in-time backtest evidence, when available.
-    pub backtest: Option<CostAdjustedPitBacktestEvidence>,
+    /// Typed financial-model evidence, when available.
+    pub financial_model: Option<FinancialModelEvidence>,
+    /// Cost-adjusted historical evidence with its explicit source basis, when available.
+    pub backtest: Option<CostAdjustedBacktestEvidence>,
+    /// Chronological out-of-sample evidence with its matching historical qualification.
+    pub out_of_sample: Option<ChronologicalOutOfSampleEvidence>,
+    /// Causal harmonic-pattern evidence, when a valid pattern is present.
+    pub harmonic_pattern: Option<HarmonicPatternEvidenceReceipt>,
     /// Current liquidity evidence, when available.
     pub liquidity: Option<LiquidityEvidence>,
     /// Current portfolio-risk evidence, when available.
@@ -1202,13 +2139,24 @@ pub struct InvestmentAnalysisEvidence {
     pub(super) currency: Currency,
     pub(super) account_id: AccountId,
     pub(super) as_of: Timestamp,
+    pub(super) admitted_at: Timestamp,
     pub(super) market: Option<MarketReferenceEvidence>,
     pub(super) price_forecast: Option<PriceForecastEvidence>,
     pub(super) valuation: Option<ValuationEvidence>,
-    pub(super) backtest: Option<CostAdjustedPitBacktestEvidence>,
+    pub(super) financial_model: Option<FinancialModelEvidence>,
+    pub(super) backtest: Option<CostAdjustedBacktestEvidence>,
+    pub(super) out_of_sample: Option<ChronologicalOutOfSampleEvidence>,
+    pub(super) harmonic_pattern: Option<HarmonicPatternEvidenceReceipt>,
     pub(super) liquidity: Option<LiquidityEvidence>,
     pub(super) portfolio_risk: Option<PortfolioRiskEvidence>,
+    pub(super) probabilities: Option<super::InvestmentProbabilityEvidence>,
+    pub(super) benchmark_comparison: Option<super::SavedBenchmarkComparisonEvidence>,
     pub(super) selected_candidate: Option<SelectedCandidateAnalysisEvidence>,
+    pub(super) harmonic_history: Option<super::HarmonicHistoryAudit>,
+    pub(super) forecast_chart: Option<super::SavedForecastChartEvidence>,
+    pub(super) current_share_projection: Option<CurrentShareDecisionProjection>,
+    pub(super) valuation_method_set:
+        Option<market_squawk_valuation::AutomaticValuationMethodSetAudit>,
 }
 
 impl InvestmentAnalysisEvidence {
@@ -1218,20 +2166,193 @@ impl InvestmentAnalysisEvidence {
     /// [`super::InvestmentProposalAuthority`] so incomplete requests yield persisted typed
     /// unavailable analyses.
     #[must_use]
-    pub const fn new(input: InvestmentAnalysisEvidenceInput) -> Self {
+    pub fn new(input: InvestmentAnalysisEvidenceInput) -> Self {
         Self {
             instrument_id: input.instrument_id,
             currency: input.currency,
             account_id: input.account_id,
             as_of: input.as_of,
+            admitted_at: input.admitted_at,
             market: input.market,
             price_forecast: input.price_forecast,
             valuation: input.valuation,
+            financial_model: input.financial_model,
             backtest: input.backtest,
+            out_of_sample: input.out_of_sample,
+            harmonic_pattern: input.harmonic_pattern,
             liquidity: input.liquidity,
             portfolio_risk: input.portfolio_risk,
+            probabilities: None,
+            benchmark_comparison: None,
             selected_candidate: None,
+            harmonic_history: None,
+            forecast_chart: None,
+            valuation_method_set: None,
+            current_share_projection: None,
         }
+    }
+
+    /// Binds the original forecast unit/history recipe to the same immutable forecast.
+    pub fn try_with_forecast_chart(
+        mut self,
+        chart: super::SavedForecastChartEvidence,
+    ) -> Result<Self, InvestmentProposalError> {
+        if self.forecast_chart.is_some()
+            || self.harmonic_history.is_some()
+            || chart.instrument_id() != self.instrument_id
+            || chart.currency() != self.currency
+            || chart.source_cutoff() > self.as_of
+            || self
+                .current_share_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    chart.basis_identity().evidence_digest().bytes()
+                        != projection.conversion().original_basis_identity().bytes()
+                })
+            || self.price_forecast.as_ref().is_none_or(|price| {
+                price.vintage_id() != chart.vintage_id()
+                    || price.window().observed_at() != chart.origin_at()
+            })
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        self.forecast_chart = Some(chart);
+        Ok(self)
+    }
+
+    /// Original bounded source recipe, which must be physically replayed before use.
+    #[must_use]
+    pub const fn forecast_chart(&self) -> Option<&super::SavedForecastChartEvidence> {
+        self.forecast_chart.as_ref()
+    }
+
+    /// Binds the saved comparison independently of probability availability.
+    pub fn try_with_benchmark_comparison(
+        mut self,
+        comparison: super::SavedBenchmarkComparisonEvidence,
+    ) -> Result<Self, InvestmentProposalError> {
+        if self.benchmark_comparison.is_some()
+            || comparison.instrument_id() != self.instrument_id
+            || comparison.currency() != self.currency
+            || comparison.source_cutoff() != self.as_of
+            || comparison.source_cutoff() > self.admitted_at
+            || self
+                .price_forecast
+                .is_some_and(|price| comparison.observed_through() != price.window().observed_at())
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        self.benchmark_comparison = Some(comparison);
+        Ok(self)
+    }
+
+    /// Exact original comparison recipe, including honestly missing source members.
+    #[must_use]
+    pub const fn benchmark_comparison(&self) -> Option<&super::SavedBenchmarkComparisonEvidence> {
+        self.benchmark_comparison.as_ref()
+    }
+
+    /// Retains three separate event forecasts without changing price/risk/action admission.
+    pub fn try_with_probabilities(
+        mut self,
+        probabilities: super::InvestmentProbabilityEvidence,
+    ) -> Result<Self, InvestmentProposalError> {
+        if self.probabilities.is_some() || probabilities.instrument_id() != self.instrument_id {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        for event in probabilities.events() {
+            if let super::ProbabilityEventEvidence::Ready(value) = event {
+                let record = value.record();
+                if record.window.source_knowledge_cutoff() > self.as_of
+                    || record.window.available_at() > self.admitted_at
+                    || record.window.expires_at() <= self.admitted_at
+                    || self
+                        .price_forecast
+                        .as_ref()
+                        .is_some_and(|price| price.horizon_at() != record.target_at)
+                {
+                    return Err(InvestmentProposalError::InvalidTimeOrder);
+                }
+            }
+        }
+        self.probabilities = Some(probabilities);
+        Ok(self)
+    }
+
+    /// Exact independently available event results and original assumptions.
+    pub const fn probabilities(&self) -> Option<&super::InvestmentProbabilityEvidence> {
+        self.probabilities.as_ref()
+    }
+
+    /// Attaches the actual detector audit, including absence of a qualifying pattern.
+    pub fn try_with_harmonic_history(
+        mut self,
+        audit: super::HarmonicHistoryAudit,
+    ) -> Result<Self, InvestmentProposalError> {
+        let input = audit.input();
+        let source_matches = match self.forecast_chart.as_ref() {
+            Some(chart) => {
+                input.source_cutoff == chart.source_cutoff()
+                    && input.source_cutoff <= self.as_of
+                    && input.observed_through == chart.origin_at()
+                    && input.adjustment_identity == chart.basis_identity().evidence_digest()
+                    && input.completeness_identity == chart.history_identity().evidence_digest()
+            }
+            None => input.source_cutoff == self.as_of,
+        };
+        if input.instrument_id != self.instrument_id
+            || input.currency != self.currency
+            || !source_matches
+            || input.evaluated_at > self.admitted_at
+            || input.pattern_digest
+                != self
+                    .harmonic_pattern
+                    .as_ref()
+                    .map(HarmonicPatternEvidenceReceipt::evidence_digest)
+            || self.harmonic_pattern.as_ref().is_some_and(|pattern| {
+                pattern.decision_cutoff() != input.source_cutoff
+                    || pattern.observation_cutoff() != input.observed_at
+                    || pattern.confirmation_cutoff() != input.available_at
+            })
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        self.harmonic_history = Some(audit);
+        Ok(self)
+    }
+
+    /// Exact persisted detector evaluation and price scales.
+    #[must_use]
+    pub const fn harmonic_history(&self) -> Option<&super::HarmonicHistoryAudit> {
+        self.harmonic_history.as_ref()
+    }
+
+    /// Retains every actual method outcome without promoting its audit into source authority.
+    pub fn try_with_valuation_method_set(
+        mut self,
+        audit: market_squawk_valuation::AutomaticValuationMethodSetAudit,
+    ) -> Result<Self, InvestmentProposalError> {
+        if audit.account_id() != self.account_id
+            || audit.instrument_id() != self.instrument_id
+            || audit.source_cutoff() != self.as_of
+            || audit.market_cutoff() < self.as_of
+            || audit.market_cutoff() > self.admitted_at
+            || audit.completed_at() > self.admitted_at
+            || audit.selected_measurement_id()
+                != self.valuation.map(ValuationEvidence::measurement_id)
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        self.valuation_method_set = Some(audit);
+        Ok(self)
+    }
+
+    /// Saved four-method calculation and admission outcomes, including unsuccessful methods.
+    #[must_use]
+    pub const fn valuation_method_set(
+        &self,
+    ) -> Option<&market_squawk_valuation::AutomaticValuationMethodSetAudit> {
+        self.valuation_method_set.as_ref()
     }
 
     /// Adds an exact retained screen-candidate binding for a new selected-candidate analysis.
@@ -1277,6 +2398,12 @@ impl InvestmentAnalysisEvidence {
         self.as_of
     }
 
+    /// Returns actual completion/admission time used for evidence expiry and freshness.
+    #[must_use]
+    pub const fn admitted_at(&self) -> Timestamp {
+        self.admitted_at
+    }
+
     /// Returns current-market evidence, when supplied.
     #[must_use]
     pub const fn market(&self) -> Option<&MarketReferenceEvidence> {
@@ -1295,10 +2422,28 @@ impl InvestmentAnalysisEvidence {
         self.valuation.as_ref()
     }
 
-    /// Returns point-in-time backtest evidence, when supplied.
+    /// Returns financial-model evidence, when supplied.
     #[must_use]
-    pub const fn backtest(&self) -> Option<&CostAdjustedPitBacktestEvidence> {
+    pub const fn financial_model(&self) -> Option<&FinancialModelEvidence> {
+        self.financial_model.as_ref()
+    }
+
+    /// Returns qualified historical backtest evidence, when supplied.
+    #[must_use]
+    pub const fn backtest(&self) -> Option<&CostAdjustedBacktestEvidence> {
         self.backtest.as_ref()
+    }
+
+    /// Returns qualified chronological out-of-sample evidence, when supplied.
+    #[must_use]
+    pub const fn out_of_sample(&self) -> Option<&ChronologicalOutOfSampleEvidence> {
+        self.out_of_sample.as_ref()
+    }
+
+    /// Returns causal harmonic-pattern evidence, when supplied.
+    #[must_use]
+    pub const fn harmonic_pattern(&self) -> Option<&HarmonicPatternEvidenceReceipt> {
+        self.harmonic_pattern.as_ref()
     }
 
     /// Returns liquidity evidence, when supplied.
@@ -1334,4 +2479,104 @@ const fn ensure_ppm(value: u32) -> Result<(), InvestmentProposalError> {
     } else {
         Ok(())
     }
+}
+
+pub(super) fn sha256_content(
+    bytes: [u8; 32],
+) -> Result<DecisionContentDigest, InvestmentProposalError> {
+    DecisionContentDigest::try_new(EvidenceDigest::new(DigestAlgorithm::Sha256, bytes))
+        .map_err(|_| InvestmentProposalError::ReservedIdentity)
+}
+
+pub(super) fn automatic_assumptions_identity(
+    assumptions: &[AutomaticValuationAssumption],
+) -> Result<DecisionContentDigest, InvestmentProposalError> {
+    let identity = market_squawk_valuation::automatic_assumptions_identity(assumptions)
+        .map_err(|_| InvestmentProposalError::InvalidEvidenceMetric)?;
+    DecisionContentDigest::try_new(identity).map_err(|_| InvestmentProposalError::ReservedIdentity)
+}
+
+fn retained_assumptions(
+    assumptions: &[AutomaticValuationAssumption],
+) -> Result<Box<[AutomaticValuationAssumption]>, InvestmentProposalError> {
+    if assumptions.is_empty() || assumptions.len() > 128 {
+        return Err(InvestmentProposalError::InvalidEvidenceMetric);
+    }
+    let mut retained = Vec::new();
+    retained
+        .try_reserve_exact(assumptions.len())
+        .map_err(|_| InvestmentProposalError::ArithmeticOverflow)?;
+    retained.extend_from_slice(assumptions);
+    Ok(retained.into_boxed_slice())
+}
+
+fn validate_model_assumptions(
+    method: AutomaticValuationMethod,
+    range: FinancialModelValueRange,
+    assumptions: &[AutomaticValuationAssumption],
+    macro_assumptions: Option<&FinancialModelMacroAssumptions>,
+    window: ProposalEvidenceWindow,
+) -> Result<(), InvestmentProposalError> {
+    if assumptions.is_empty() || assumptions.len() > 128 {
+        return Err(InvestmentProposalError::InvalidEvidenceMetric);
+    }
+    let required = match method {
+        AutomaticValuationMethod::DiscountedCashFlow => {
+            AutomaticValuationAssumptionKind::DiscountRate
+        }
+        AutomaticValuationMethod::ResidualIncome => AutomaticValuationAssumptionKind::CostOfEquity,
+        AutomaticValuationMethod::ComparableCompanies => {
+            AutomaticValuationAssumptionKind::ComparableWeight
+        }
+        AutomaticValuationMethod::ForecastDistribution => {
+            AutomaticValuationAssumptionKind::ForecastProbability
+        }
+    };
+    let mut method_count = 0;
+    let mut lower_count = 0;
+    let mut upper_count = 0;
+    for (index, assumption) in assumptions.iter().enumerate() {
+        if assumption.available_at() > window.observed_at()
+            || assumption.expires_at() < window.expires_at()
+            || assumptions[..index].iter().any(|prior| {
+                (prior.kind(), prior.identifier()) >= (assumption.kind(), assumption.identifier())
+            })
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+        match assumption.kind() {
+            kind if kind == required => method_count += 1,
+            AutomaticValuationAssumptionKind::UncertaintyLower
+                if assumption.value() == range.lower().amount() =>
+            {
+                lower_count += 1
+            }
+            AutomaticValuationAssumptionKind::UncertaintyUpper
+                if assumption.value() == range.upper().amount() =>
+            {
+                upper_count += 1
+            }
+            _ => return Err(InvestmentProposalError::InvalidEvidenceMetric),
+        }
+    }
+    if method_count == 0 || lower_count != 1 || upper_count != 1 {
+        return Err(InvestmentProposalError::InvalidEvidenceMetric);
+    }
+    if matches!(
+        required,
+        AutomaticValuationAssumptionKind::DiscountRate
+            | AutomaticValuationAssumptionKind::CostOfEquity
+    ) {
+        let binding = macro_assumptions.ok_or(InvestmentProposalError::InvalidEvidenceMetric)?;
+        if method_count != 1
+            || binding.reference().knowledge_cutoff() > window.observed_at()
+            || binding.assumption().kind() != required
+            || !assumptions.contains(binding.assumption())
+        {
+            return Err(InvestmentProposalError::InvalidEvidenceMetric);
+        }
+    } else if macro_assumptions.is_some() {
+        return Err(InvestmentProposalError::InvalidEvidenceMetric);
+    }
+    Ok(())
 }

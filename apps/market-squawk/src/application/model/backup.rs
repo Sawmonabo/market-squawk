@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use market_squawk_data::AnalyticalReadCapability;
 use market_squawk_modeling::{OnnxWorkerProgram, VerifiedTrainingEnvironment};
 use market_squawk_platform::{ArtifactPathError, LocalPaths, PathError};
 use market_squawk_services::{
@@ -26,6 +27,7 @@ use self::archive::{
 };
 use super::{
     ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
+    ModelDomainService, ModelDomainServiceError,
     forecast::ForecastBackupCaptureError,
     runtime::{
         ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
@@ -130,6 +132,7 @@ impl ModelBackupAuthority {
         &self,
         paths: LocalPaths,
         artifacts: Arc<dyn ArtifactRepository>,
+        analytical: AnalyticalReadCapability,
     ) -> Result<FreshModelWorkspaceTarget, ModelBackupError> {
         let (runtime_capabilities, runtime_limits) = match &self.runtime {
             Some(runtime) => {
@@ -142,6 +145,7 @@ impl ModelBackupAuthority {
         Ok(FreshModelWorkspaceTarget::new(
             paths,
             artifacts,
+            analytical,
             runtime_capabilities,
             runtime_limits,
             self.forecasts.backup_limits(),
@@ -154,10 +158,19 @@ impl ModelBackupAuthority {
         reader: &mut (dyn Read + Send),
         paths: LocalPaths,
         artifacts: Arc<dyn ArtifactRepository>,
+        analytical: AnalyticalReadCapability,
+        evaluation_records: NonZeroUsize,
         cancellation: &CancellationToken,
     ) -> Result<RestoredModelAuthorities, ModelBackupError> {
-        let target = self.fresh_workspace_target(paths, artifacts)?;
-        restore_into_fresh_workspace(reader, target, self.limits, cancellation).await
+        let target = self.fresh_workspace_target(paths, artifacts, analytical)?;
+        restore_into_fresh_workspace(
+            reader,
+            target,
+            self.limits,
+            evaluation_records,
+            cancellation,
+        )
+        .await
     }
 
     /// Retains one immutable cross-authority image and verifies every referenced artifact.
@@ -372,6 +385,7 @@ impl ModelBackupReceipt {
 pub(crate) struct FreshModelWorkspaceTarget {
     paths: LocalPaths,
     artifacts: Arc<dyn ArtifactRepository>,
+    analytical: AnalyticalReadCapability,
     runtime_capabilities: Option<(VerifiedTrainingEnvironment, Option<OnnxWorkerProgram>)>,
     runtime_limits: ProductionModelRuntimeLimits,
     forecast_limits: ForecastApplicationLimits,
@@ -381,6 +395,7 @@ impl FreshModelWorkspaceTarget {
     pub(crate) fn new(
         paths: LocalPaths,
         artifacts: Arc<dyn ArtifactRepository>,
+        analytical: AnalyticalReadCapability,
         runtime_capabilities: Option<(VerifiedTrainingEnvironment, Option<OnnxWorkerProgram>)>,
         runtime_limits: ProductionModelRuntimeLimits,
         forecast_limits: ForecastApplicationLimits,
@@ -388,6 +403,7 @@ impl FreshModelWorkspaceTarget {
         Self {
             paths,
             artifacts,
+            analytical,
             runtime_capabilities,
             runtime_limits,
             forecast_limits,
@@ -415,6 +431,23 @@ impl std::fmt::Debug for FreshModelWorkspaceTarget {
 pub(crate) struct RestoredModelAuthorities {
     _runtime: Option<Arc<ProductionModelRuntime>>,
     _forecasts: Arc<ForecastApplicationService>,
+    model_domain: Arc<ModelDomainService>,
+}
+
+impl RestoredModelAuthorities {
+    /// Binds saved cohort reconstruction to existing restored captures without provider runtime.
+    pub(crate) fn bind_retained_forecast_calendar(
+        &mut self,
+        calendar: crate::application::market_calendar::RetainedMarketSessionReadCapability,
+    ) -> Result<(), ModelBackupError> {
+        let model = Arc::get_mut(&mut self.model_domain).ok_or(ModelBackupError::ArtifactMismatch)?;
+        model.forecast_calendar = Some(crate::application::market_calendar::ForecastSessionReadCapability::Retained(calendar));
+        Ok(())
+    }
+
+    pub(crate) fn model_domain(&self) -> Arc<ModelDomainService> {
+        Arc::clone(&self.model_domain)
+    }
 }
 
 impl std::fmt::Debug for RestoredModelAuthorities {
@@ -428,6 +461,7 @@ pub(crate) async fn restore_into_fresh_workspace(
     reader: &mut (dyn Read + Send),
     target: FreshModelWorkspaceTarget,
     limits: ModelBackupLimits,
+    evaluation_records: NonZeroUsize,
     cancellation: &CancellationToken,
 ) -> Result<RestoredModelAuthorities, ModelBackupError> {
     if cancellation.is_cancelled() {
@@ -544,9 +578,28 @@ pub(crate) async fn restore_into_fresh_workspace(
         Arc::clone(&target.artifacts),
         target.forecast_limits,
     )?);
+    if cancellation.is_cancelled() {
+        return Err(ModelBackupError::Cancelled);
+    }
+    let snapshot = match runtime.as_ref().map(|runtime| runtime.snapshot()) {
+        Some(Ok(snapshot)) => snapshot,
+        None | Some(Err(ProductionModelRuntimeError::EmptyRuntime)) => {
+            ProductionModelRuntime::empty_snapshot(target.runtime_limits)?
+        }
+        Some(Err(error)) => return Err(error.into()),
+    };
+    let model_domain = Arc::new(
+        ModelDomainService::try_from_runtime_snapshot_with_forecasts(
+            snapshot,
+            evaluation_records,
+            Arc::clone(&forecasts),
+            target.analytical,
+        )?,
+    );
     Ok(RestoredModelAuthorities {
         _runtime: runtime,
         _forecasts: forecasts,
+        model_domain,
     })
 }
 
@@ -790,6 +843,7 @@ fn valid_model_members(model: &ModelManifestRecord) -> bool {
     matches!(
         roles.as_slice(),
         ["metadata", "artifact", "training_run"]
+            | ["metadata", "artifact", "training_run", "probability_outcomes", "probability_policy"]
             | [
                 "metadata",
                 "artifact",
@@ -883,6 +937,8 @@ pub enum ModelBackupError {
     Cancelled,
     #[error(transparent)]
     Runtime(#[from] ProductionModelRuntimeError),
+    #[error(transparent)]
+    Domain(#[from] ModelDomainServiceError),
     #[error(transparent)]
     Forecast(#[from] ForecastApplicationError),
     #[error(transparent)]

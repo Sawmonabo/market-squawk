@@ -20,6 +20,7 @@ bls-installed-fixture = [
 release-evidence = [
     "dep:memory-stats",
     "dep:tempfile",
+    "market-squawk-adapter-kraken/loopback-fixture",
     "market-squawk-backtesting/release-evidence",
     "market-squawk-data/release-evidence",
     "market-squawk-modeling/release-evidence",

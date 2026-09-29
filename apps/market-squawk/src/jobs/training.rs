@@ -1,5 +1,9 @@
 //! Governed contained-worker adapter for Rust-owned model admission.
 
+mod prepared;
+pub(crate) use prepared::PreparedProductTraining;
+use prepared::TrainingAdmission;
+
 use std::{
     collections::BTreeMap,
     fmt,
@@ -171,7 +175,7 @@ pub struct TrainingJobRunner {
     result_authority: SourceIdentifier,
     result_authority_identity: SourceIdentifier,
     result_authority_digest: EvidenceDigest,
-    pending: Mutex<BTreeMap<SourceIdentifier, GovernedTrainingInput>>,
+    pending: Mutex<BTreeMap<SourceIdentifier, TrainingAdmission>>,
     maximum_pending: usize,
     process_deadline: Duration,
 }
@@ -243,6 +247,14 @@ impl TrainingJobRunner {
         input: GovernedTrainingInput,
         captured_at: Timestamp,
     ) -> Result<JobAdmission, TrainingJobRunnerError> {
+        self.admit_input(TrainingAdmission::Governed(input), captured_at)
+    }
+
+    fn admit_input(
+        &self,
+        input: TrainingAdmission,
+        captured_at: Timestamp,
+    ) -> Result<JobAdmission, TrainingJobRunnerError> {
         let digest = input.evidence_digest();
         let identity = identifier(format!("training-input-{}", encode_hex(digest.bytes())))?;
         let mut pending = self
@@ -295,7 +307,7 @@ impl TrainingJobRunner {
         Ok(())
     }
 
-    fn take_input(&self, context: &JobRunContext) -> Result<GovernedTrainingInput, JobRunError> {
+    fn take_input(&self, context: &JobRunContext) -> Result<TrainingAdmission, JobRunError> {
         let spec = context.snapshot().spec();
         if spec.kind() != &self.kind
             || spec.input().authority() != &self.input_authority
@@ -320,15 +332,23 @@ impl TrainingJobRunner {
     async fn run_owned(
         &self,
         context: &JobRunContext,
-        input: &GovernedTrainingInput,
-        staging: &TrainingStaging,
+        input: &TrainingAdmission,
+        staging: &mut TrainingStaging,
     ) -> Result<JobCompletion, JobRunError> {
-        input.revalidate(&self.paths).map_err(map_admission_error)?;
+        input
+            .revalidate(&self.paths, context.cancellation())
+            .map_err(|error| {
+                if context.cancellation().is_cancelled() {
+                    JobRunError::Cancelled
+                } else {
+                    map_admission_error(error)
+                }
+            })?;
         let request = ContainedProcessRequest::try_new(
             self.program.clone(),
             worker_arguments(context, input, staging),
-            Vec::new(),
-            1,
+            input.stdin(),
+            MAXIMUM_CONFIG_BYTES as usize,
         )
         .map_err(map_process_error)?;
         let limits = ContainedProcessLimits::try_new(
@@ -376,7 +396,15 @@ impl TrainingJobRunner {
         let candidate = protocol
             .finish(output.success())
             .map_err(map_protocol_error)?;
-        input.revalidate(&self.paths).map_err(map_admission_error)?;
+        input
+            .revalidate(&self.paths, context.cancellation())
+            .map_err(|error| {
+                if context.cancellation().is_cancelled() {
+                    JobRunError::Cancelled
+                } else {
+                    map_admission_error(error)
+                }
+            })?;
         if candidate.candidate_directory() != staging.candidate_directory {
             return Err(failed("training-candidate-coordinate-mismatch", false));
         }
@@ -387,21 +415,34 @@ impl TrainingJobRunner {
         if request_sha256 != candidate.admission_request_sha256() {
             return Err(failed("training-request-digest-mismatch", false));
         }
-        let admission =
-            crate::application::model::runtime::ModelAdmissionRequest::decode_training_worker(
+        let mut admission = input
+            .authorize(
+                &self.paths,
+                staging,
                 &request_bytes,
-                input.authority_bytes.clone(),
-                input.authority.path(),
                 &candidate,
                 self.runtime
                     .training_environment()
                     .map_err(map_runtime_error)?,
             )
+            .map_err(map_admission_error)?;
+        admission
+            .bind_training_job(context, &stderr)
             .map_err(map_runtime_error)?;
         let reference =
             result_reference(&candidate, stderr, context, self.result_authority.clone())?;
         let permit = context.claim_terminal_publication(expected)?;
-        self.runtime.admit(admission).map_err(map_runtime_error)?;
+        if let Err(error) = self
+            .runtime
+            .admit_with_cancellation(admission, context.cancellation())
+        {
+            if matches!(error, ProductionModelRuntimeError::PublicationUnresolved) {
+                staging.publication_unresolved = true;
+                permit.retain_for_reconciliation();
+                return Err(JobRunError::Recovery);
+            }
+            return Err(map_runtime_error(error));
+        }
         Ok(JobCompletion::Published(reference, permit.seal()))
     }
 }
@@ -417,20 +458,35 @@ impl JobRunner for TrainingJobRunner {
             return Err(JobRunError::Cancelled);
         }
         let input = self.take_input(&context)?;
-        let staging =
+        let mut staging =
             TrainingStaging::try_new(&self.paths, &context).map_err(map_admission_error)?;
-        let result = self.run_owned(&context, &input, &staging).await;
+        let result = self.run_owned(&context, &input, &mut staging).await;
         match result {
             Ok(completion) => Ok(completion),
             Err(error) => {
-                staging.destroy(&self.paths).map_err(map_cleanup_error)?;
+                if !staging.publication_unresolved {
+                    staging.destroy(&self.paths).map_err(map_cleanup_error)?;
+                }
                 Err(error)
             }
         }
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
-        JobRecoveryDisposition::MarkInterrupted
+    async fn recover(&self, snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+        match self.published_receipt(snapshot) {
+            Ok(Some((_receipt, digest))) => match durable_result_reference(
+                digest.bytes(),
+                snapshot,
+                self.result_authority.clone(),
+            ) {
+                Ok(reference) => JobRecoveryDisposition::CompleteAlreadyPublished(reference),
+                Err(_) => JobRecoveryDisposition::ReconciliationRequired,
+            },
+            // Pending product inputs are process-owned. A restart never refits them or
+            // treats staged candidate bytes as a publication; fresh preparation is required.
+            Ok(None) => JobRecoveryDisposition::MarkInterrupted,
+            Err(_) => JobRecoveryDisposition::ReconciliationRequired,
+        }
     }
 }
 
@@ -439,6 +495,7 @@ struct TrainingStaging {
     candidate_directory: String,
     request_relative: PathBuf,
     request_display: String,
+    publication_unresolved: bool,
 }
 
 impl TrainingStaging {
@@ -463,6 +520,7 @@ impl TrainingStaging {
             candidate_parent,
             candidate_directory,
             request_relative,
+            publication_unresolved: false,
             request_display: request_display
                 .to_str()
                 .ok_or(TrainingJobRunnerError::InvalidInput)?
@@ -537,24 +595,30 @@ async fn publish_frame(
 
 fn worker_arguments(
     context: &JobRunContext,
-    input: &GovernedTrainingInput,
+    input: &TrainingAdmission,
     staging: &TrainingStaging,
 ) -> Vec<String> {
-    vec![
+    let mut arguments = vec![
         "worker".to_owned(),
         "--run-id".to_owned(),
         context.snapshot().id().as_uuid().to_string(),
         "--generation".to_owned(),
         context.snapshot().generation().get().to_string(),
-        "--config".to_owned(),
-        input.config.path().to_string_lossy().into_owned(),
-        "--authority".to_owned(),
-        input.authority.path().to_string_lossy().into_owned(),
         "--candidate-parent".to_owned(),
         staging.candidate_parent.clone(),
         "--request".to_owned(),
         staging.request_display.clone(),
-    ]
+    ];
+    match input {
+        TrainingAdmission::Governed(input) => arguments.extend([
+            "--config".to_owned(),
+            input.config.path().to_string_lossy().into_owned(),
+            "--authority".to_owned(),
+            input.authority.path().to_string_lossy().into_owned(),
+        ]),
+        TrainingAdmission::Product(_) => arguments.push("--product-config-stdin".to_owned()),
+    }
+    arguments
 }
 
 fn verify_config_root(bytes: &[u8], root: &Path) -> Result<(), TrainingJobRunnerError> {
@@ -638,14 +702,84 @@ fn result_reference(
     evidence.update(stderr.captured_bytes().to_be_bytes());
     evidence.update(stderr.sha256());
     let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, evidence.finalize().into());
+    durable_result_reference(digest.bytes(), context.snapshot(), authority)
+}
+
+fn durable_result_reference(
+    result_sha256: [u8; 32],
+    snapshot: &market_squawk_jobs::JobSnapshot,
+    authority: SourceIdentifier,
+) -> Result<JobResultReference, JobRunError> {
     let identity = identifier(format!(
         "training-result-{}-{}",
-        context.snapshot().id().as_uuid(),
-        context.snapshot().generation().get()
+        snapshot.id().as_uuid(),
+        snapshot.generation().get()
     ))
     .map_err(|_| JobRunError::Recovery)?;
-    JobResultReference::try_new(authority, identity, digest, Vec::new())
-        .map_err(|_| JobRunError::Recovery)
+    JobResultReference::try_new(
+        authority,
+        identity,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, result_sha256),
+        Vec::new(),
+    )
+    .map_err(|_| JobRunError::Recovery)
+}
+
+impl TrainingJobRunner {
+    fn published_receipt(
+        &self,
+        snapshot: &market_squawk_jobs::JobSnapshot,
+    ) -> Result<
+        Option<(
+            crate::application::model::runtime::ModelAdmissionReceipt,
+            market_squawk_data::Sha256Digest,
+        )>,
+        TrainingJobRunnerError,
+    > {
+        let spec = snapshot.spec();
+        if spec.kind() != &self.kind
+            || spec.input().authority() != &self.input_authority
+            || spec.authority().authority() != &self.result_authority
+            || spec.authority().identity() != &self.result_authority_identity
+            || spec.authority().digest() != self.result_authority_digest
+        {
+            return Err(TrainingJobRunnerError::InvalidInput);
+        }
+        self.runtime
+            .training_admission(snapshot)
+            .map_err(|_| TrainingJobRunnerError::Unavailable)
+    }
+
+    pub(crate) fn completed_model_token(
+        &self,
+        receipt: &crate::application::model::runtime::ModelAdmissionReceipt,
+    ) -> Result<uuid::Uuid, TrainingJobRunnerError> {
+        self.runtime
+            .training_model_token(receipt)
+            .map_err(|_| TrainingJobRunnerError::InvalidCandidate)
+    }
+
+    /// Reopens the exact model generation named by the actual completed job.
+    /// Callers retain this receipt and request its exact model/bundle from the existing runtime.
+    pub(crate) fn resolve_completed(
+        &self,
+        snapshot: &market_squawk_jobs::JobSnapshot,
+    ) -> Result<crate::application::model::runtime::ModelAdmissionReceipt, TrainingJobRunnerError>
+    {
+        if snapshot.state() != market_squawk_jobs::JobState::Completed {
+            return Err(TrainingJobRunnerError::InvalidInput);
+        }
+        let (receipt, digest) = self
+            .published_receipt(snapshot)?
+            .ok_or(TrainingJobRunnerError::InvalidCandidate)?;
+        let expected =
+            durable_result_reference(digest.bytes(), snapshot, self.result_authority.clone())
+                .map_err(|_| TrainingJobRunnerError::InvalidCandidate)?;
+        if snapshot.terminal_result() != Some(&expected) {
+            return Err(TrainingJobRunnerError::InvalidCandidate);
+        }
+        Ok(receipt)
+    }
 }
 
 fn identifier(
@@ -703,8 +837,18 @@ fn map_protocol_error(_error: TrainingWorkerProtocolError) -> JobRunError {
     failed("training-protocol-rejected", false)
 }
 
-fn map_runtime_error(_error: ProductionModelRuntimeError) -> JobRunError {
-    failed("training-candidate-rejected", false)
+fn map_runtime_error(error: ProductionModelRuntimeError) -> JobRunError {
+    match error {
+        ProductionModelRuntimeError::Admission(
+            market_squawk_modeling::ModelAdmissionError::Dataset(
+                market_squawk_data::PythonDatasetCatalogError::Cancelled,
+            ),
+        ) => JobRunError::Cancelled,
+        ProductionModelRuntimeError::ValidationDeadline => {
+            failed("training-admission-deadline-exceeded", true)
+        }
+        _ => failed("training-candidate-rejected", false),
+    }
 }
 
 fn map_admission_error(error: TrainingJobRunnerError) -> JobRunError {

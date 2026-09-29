@@ -86,7 +86,9 @@ pub use registry::{
     LiveFeatureView, MAX_FEATURE_REGISTRY_ENTRIES, MAX_FEATURE_REGISTRY_RETAINED_BYTES,
     RegistrationOutcome,
 };
-pub use returns::{cumulative_return, simple_returns, total_returns};
+pub use returns::{
+    cash_distribution_holding_return, cumulative_return, simple_returns, total_returns,
+};
 pub use risk::{
     AlphaBetaResult, DrawdownResult, alpha_beta, correlation, discrete_expected_shortfall,
     historical_var, information_ratio, maximum_drawdown, parametric_var, sharpe_ratio,

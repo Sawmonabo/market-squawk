@@ -13,21 +13,39 @@ use arrow::array::{
 };
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
-    BarTimestampBasis, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
-    FundNavObservation, InstrumentId, MacroObservation, MarketBarAdjustment, MarketBarObservation,
-    MarketBarSessionEvidence, MarketBarSessionKind, ProviderInstrumentId, ResearchObservation,
-    ResearchPeriod, ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp, VenueId,
+    BarTimestampBasis, CalendarDate, CorporateActionObservation, DataQuality, DigestAlgorithm,
+    EvidenceDigest, FundNavObservation, InstrumentId, MacroObservation, MarketBarAdjustment,
+    MarketBarObservation, MarketBarSessionEvidence, MarketBarSessionKind, ProviderInstrumentId,
+    ResearchObservation, ResearchPeriod, ResearchTemporalCoordinate, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_sources::{CanonicalObservationFamily, CanonicalObservationPayload};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+#[path = "analytical_read/corporate_action_source.rs"]
+mod corporate_action_source;
+#[path = "analytical_read/current_ordinary.rs"]
+mod current_ordinary;
+pub use corporate_action_source::{CorporateActionSourceReadError, CorporateActionSourceSnapshot};
+
+#[path = "analytical_read/history_sessions.rs"]
+mod history_sessions;
+pub use history_sessions::{RetainedHistoryNativeSession, RetainedHistoryNativeSessions};
+
 #[path = "analytical_read/forecast.rs"]
 mod forecast;
+#[path = "analytical_read/input_epoch.rs"]
+mod input_epoch;
+pub use input_epoch::{
+    FeatureDatasetInputCoordinate, FeatureDatasetInputEpochOutput,
+    OwnedFeatureDatasetInputCoordinate,
+};
 
 pub use forecast::{
     ForecastDatasetEvidence, ForecastDatasetEvidenceFence, ForecastDatasetReadLimits,
+    ForecastProbabilityOutcome,
     ForecastFeatureRow, ForecastFeatureValue,
 };
 
@@ -50,6 +68,13 @@ use crate::{
     PointInTimeRevisionMode, PointInTimeService,
 };
 
+#[path = "analytical_read/macro_history.rs"]
+mod macro_history;
+pub use macro_history::{
+    AnalyticalMacroHistoryCursor, AnalyticalMacroHistoryPage, AnalyticalMacroHistoryRange,
+    AnalyticalMacroHistoryRequest,
+};
+
 const MAX_READ_ITEMS: usize = 64;
 const MAX_FILTER_INSTRUMENTS: usize = 256;
 const MAX_MARKET_BAR_ROWS: u32 = 50_000;
@@ -61,7 +86,7 @@ const MAX_MACRO_SNAPSHOT_TIED_CANDIDATES_PER_SERIES: usize = 8;
 const MAX_OUTCOME_MARKET_BAR_CANDIDATES: usize = 4_096;
 const OUTCOME_MARKET_BAR_QUERY_BYTES: u64 = 64 * 1024 * 1024;
 const OUTCOME_MARKET_BAR_QUERY_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
-const COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+const COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const COMPLETE_MARKET_BAR_HISTORY_READ_DOMAIN: &[u8] =
     b"market-squawk/complete-market-bar-history-read/v1";
 const COMPLETE_MARKET_BAR_HISTORY_CONTENT_DOMAIN: &[u8] =
@@ -209,6 +234,9 @@ impl AnalyticalGenerationPage {
 /// One durable receipt-admitted feature/label generation in the public analytical registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyticalFeatureDataset {
+    study_policy: Option<crate::DatasetStudyPolicy>,
+    source_snapshot_digest: Option<Sha256Digest>,
+    split_policy: crate::ChronologicalSplitPolicy,
     generation: AnalyticalGeneration,
     python_export_sha256: Sha256Digest,
     production_receipt: crate::FeatureDatasetProductionReceiptV1,
@@ -216,11 +244,77 @@ pub struct AnalyticalFeatureDataset {
     policy_digest: Sha256Digest,
     universe_digest: Sha256Digest,
     universe_id: UniverseId,
+    population_basis: crate::DatasetPopulationBasis,
+    population_member_count: usize,
+    population_unavailable: Box<[crate::CurrentPopulationInputUnavailable]>,
+    population_partition: Option<crate::DatasetPopulationPartition>,
+    population_source_use: Option<crate::DatasetPopulationSourceUse>,
     split_counts: DatasetSplitCounts,
     source_ids: Box<[SourceId]>,
 }
 
 impl AnalyticalFeatureDataset {
+    /// Returns the source-owned population qualification for this publication.
+    pub const fn population_basis(&self) -> crate::DatasetPopulationBasis {
+        self.population_basis
+    }
+    /// Returns the complete admitted population count, including unavailable inputs.
+    pub const fn population_member_count(&self) -> usize {
+        self.population_member_count
+    }
+    /// Returns actual producer-unavailable inputs retained once for the dataset.
+    pub fn population_unavailable(&self) -> &[crate::CurrentPopulationInputUnavailable] {
+        &self.population_unavailable
+    }
+    /// Returns the exact bounded partition of the one source-admitted population.
+    pub const fn population_partition(&self) -> Option<&crate::DatasetPopulationPartition> {
+        self.population_partition.as_ref()
+    }
+    pub const fn population_source_use(&self) -> Option<&crate::DatasetPopulationSourceUse> {
+        self.population_source_use.as_ref()
+    }
+    pub fn retained_bytes(&self) -> usize {
+        let manifest_bytes = |manifest: &DatasetManifestRef| {
+            manifest.dataset_id().as_str().len() + manifest.schema().name().len()
+        };
+        std::mem::size_of::<Self>()
+            + self.production_receipt.canonical_json().len() * 8
+            + manifest_bytes(self.generation.manifest())
+            + self.generation.source_id().as_str().len()
+            + self.universe_id.as_str().len()
+            + std::mem::size_of_val(self.population_unavailable.as_ref())
+            + self
+                .population_source_use
+                .as_ref()
+                .map_or(0, |value| value.retained_bytes())
+            + self
+                .population_partition
+                .as_ref()
+                .map_or(0, |value| std::mem::size_of_val(value.member_ids()))
+            + self
+                .generation
+                .parents()
+                .iter()
+                .map(|parent| {
+                    std::mem::size_of::<GenerationParent>() + manifest_bytes(parent.manifest())
+                })
+                .sum::<usize>()
+            + self
+                .source_ids
+                .iter()
+                .map(|source| std::mem::size_of::<SourceId>() + source.as_str().len())
+                .sum::<usize>()
+    }
+
+    pub const fn study_policy(&self) -> Option<&crate::DatasetStudyPolicy> {
+        self.study_policy.as_ref()
+    }
+    pub const fn source_snapshot_digest(&self) -> Option<Sha256Digest> {
+        self.source_snapshot_digest
+    }
+    pub const fn split_policy(&self) -> crate::ChronologicalSplitPolicy {
+        self.split_policy
+    }
     fn from_catalog(
         dataset: CatalogFeatureDataset,
         expected_contract: FeatureDatasetProductContract,
@@ -247,6 +341,11 @@ impl AnalyticalFeatureDataset {
                 policy_digest: summary.identity.policy_digest(),
                 universe_digest: summary.identity.universe_digest(),
                 universe_id: summary.identity.universe_id().as_str(),
+                population_basis: summary.identity.population_basis(),
+                population_member_count: summary.identity.population_member_count(),
+                population_unavailable: summary.identity.population_unavailable(),
+                population_partition: summary.identity.population_partition(),
+                population_source_use: summary.identity.population_source_use(),
                 output_group_id: dataset.output_group_id,
                 final_output_rights_id: dataset.final_output_rights_id,
                 export_sha256: dataset.export_sha256,
@@ -271,7 +370,17 @@ impl AnalyticalFeatureDataset {
         {
             return Err(ManifestCatalogError::CorruptCatalog.into());
         }
+        if summary
+            .identity
+            .study_policy()
+            .is_none_or(|policy| policy.purpose() != expected_contract.purpose())
+        {
+            return Err(ManifestCatalogError::CorruptCatalog.into());
+        }
         Ok(Self {
+            study_policy: summary.identity.study_policy().copied(),
+            source_snapshot_digest: summary.identity.source_snapshot_digest(),
+            split_policy: summary.identity.split_policy(),
             generation,
             python_export_sha256: dataset.export_sha256,
             production_receipt,
@@ -279,6 +388,15 @@ impl AnalyticalFeatureDataset {
             policy_digest: summary.identity.policy_digest(),
             universe_digest: summary.identity.universe_digest(),
             universe_id: summary.identity.universe_id().clone(),
+            population_basis: summary.identity.population_basis(),
+            population_member_count: summary.identity.population_member_count(),
+            population_unavailable: summary
+                .identity
+                .population_unavailable()
+                .to_vec()
+                .into_boxed_slice(),
+            population_partition: summary.identity.population_partition().cloned(),
+            population_source_use: summary.identity.population_source_use().cloned(),
             split_counts: summary.split_counts,
             source_ids: dataset.source_ids,
         })
@@ -401,8 +519,12 @@ pub enum AnalyticalObservationTemplate {
     Macro,
     /// Exact historical market-bar observations.
     MarketBar,
+    /// Exact source-native calendar coverage and dated sessions.
+    MarketCalendar,
     /// Exact daily fund/share-class NAV observations.
     FundNav,
+    /// Source corporate-action rows; selection alone does not prove complete action coverage.
+    CorporateAction,
     /// Exact historical universe-membership observations.
     UniverseMembership,
     /// User-owned or licensed alternative-data observations.
@@ -417,7 +539,9 @@ impl AnalyticalObservationTemplate {
             Self::Fundamental => Some("fundamental"),
             Self::Macro => Some("macro"),
             Self::MarketBar => Some("market_bar"),
+            Self::MarketCalendar => Some("market_calendar"),
             Self::FundNav => Some("fund_nav"),
+            Self::CorporateAction => Some("corporate_action"),
             Self::UniverseMembership => Some("universe_membership"),
             Self::AlternativeData => Some("alternative_data"),
         }
@@ -598,7 +722,7 @@ impl AnalyticalMacroProviderPeriodLatestKnownRequest {
             "WITH eligible AS ( \
                  SELECT macro_series, effective_period_scheme, effective_period_year, \
                         effective_period_ordinal, effective_period_code, revision, \
-                        payload_sha256, payload_json, source_identifier \
+                        payload_sha256, payload_json, source_identifier, request_sha256, extraction_lineage_json \
                  FROM {OBSERVATION_TABLE} \
                  WHERE observation_kind = 'macro' \
                    AND source_id = {source_id} \
@@ -651,7 +775,7 @@ impl AnalyticalMacroProviderPeriodLatestKnownRequest {
                         eligible.effective_period_year, eligible.effective_period_ordinal, \
                         eligible.effective_period_code, eligible.revision, \
                         eligible.payload_sha256, eligible.payload_json, \
-                        eligible.source_identifier \
+                        eligible.source_identifier, eligible.request_sha256, eligible.extraction_lineage_json \
                  FROM eligible \
                  JOIN latest_revision \
                    ON eligible.macro_series = latest_revision.macro_series \
@@ -675,7 +799,8 @@ impl AnalyticalMacroProviderPeriodLatestKnownRequest {
              SELECT selected.macro_series, selected.effective_period_scheme, \
                     selected.effective_period_year, selected.effective_period_ordinal, \
                     selected.effective_period_code, selected.revision, \
-                    selected.payload_sha256, selected.payload_json, tie_counts.tie_count \
+                    selected.payload_sha256, selected.payload_json, tie_counts.tie_count, \
+                    selected.request_sha256, selected.extraction_lineage_json \
              FROM selected \
              JOIN tie_counts \
                ON selected.macro_series = tie_counts.macro_series \
@@ -783,7 +908,7 @@ impl AnalyticalMacroLatestKnownRequest {
         format!(
             "WITH eligible AS ( \
                  SELECT macro_series, effective_date, revision, payload_sha256, payload_json, \
-                        source_identifier \
+                        source_identifier, request_sha256, extraction_lineage_json \
                  FROM {OBSERVATION_TABLE} \
                  WHERE observation_kind = 'macro' \
                    AND source_id = {source_id} \
@@ -813,7 +938,7 @@ impl AnalyticalMacroLatestKnownRequest {
              ), selected AS ( \
                  SELECT eligible.macro_series, eligible.effective_date, eligible.revision, \
                         eligible.payload_sha256, eligible.payload_json, \
-                        eligible.source_identifier \
+                        eligible.source_identifier, eligible.request_sha256, eligible.extraction_lineage_json \
                  FROM eligible \
                  JOIN latest_revision \
                    ON eligible.macro_series = latest_revision.macro_series \
@@ -824,7 +949,8 @@ impl AnalyticalMacroLatestKnownRequest {
                  FROM selected GROUP BY macro_series, effective_date, revision \
              ) \
              SELECT selected.macro_series, selected.effective_date, selected.revision, \
-                    selected.payload_sha256, selected.payload_json, tie_counts.tie_count \
+                    selected.payload_sha256, selected.payload_json, tie_counts.tie_count, \
+                    selected.request_sha256, selected.extraction_lineage_json \
              FROM selected \
              JOIN tie_counts \
                ON selected.macro_series = tie_counts.macro_series \
@@ -1002,29 +1128,59 @@ impl AnalyticalMarketBarReadLimit {
 
 /// Inclusive exact effective-time range for typed market-bar reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MarketBarEffectiveRange {
-    start: Timestamp,
-    end: Timestamp,
+pub enum MarketBarEffectiveRange {
+    Timestamps {
+        start: Timestamp,
+        end: Timestamp,
+    },
+    NominalDates {
+        start: CalendarDate,
+        end: CalendarDate,
+    },
 }
-
 impl MarketBarEffectiveRange {
-    /// Constructs an inclusive range over exact bar timestamps.
     pub fn try_new(start: Timestamp, end: Timestamp) -> Result<Self, AnalyticalReadError> {
         if start > end {
-            Err(AnalyticalReadError::InvalidMarketBarEffectiveRange)
-        } else {
-            Ok(Self { start, end })
+            return Err(AnalyticalReadError::InvalidMarketBarEffectiveRange);
+        }
+        Ok(Self::Timestamps { start, end })
+    }
+    pub fn try_nominal_dates(
+        start: CalendarDate,
+        end: CalendarDate,
+    ) -> Result<Self, AnalyticalReadError> {
+        if start > end {
+            return Err(AnalyticalReadError::InvalidMarketBarEffectiveRange);
+        }
+        Ok(Self::NominalDates { start, end })
+    }
+    pub const fn start(self) -> Option<Timestamp> {
+        match self {
+            Self::Timestamps { start, .. } => Some(start),
+            Self::NominalDates { .. } => None,
         }
     }
-
-    /// Returns the inclusive lower effective-time bound.
-    pub const fn start(self) -> Timestamp {
-        self.start
+    pub const fn end(self) -> Option<Timestamp> {
+        match self {
+            Self::Timestamps { end, .. } => Some(end),
+            Self::NominalDates { .. } => None,
+        }
     }
-
-    /// Returns the inclusive upper effective-time bound.
-    pub const fn end(self) -> Timestamp {
-        self.end
+    pub const fn requested_dates(self) -> Option<(CalendarDate, CalendarDate)> {
+        match self {
+            Self::NominalDates { start, end } => Some((start, end)),
+            Self::Timestamps { .. } => None,
+        }
+    }
+    fn contains(self, coordinate: &ResearchTemporalCoordinate) -> bool {
+        match self {
+            Self::Timestamps { start, end } => coordinate
+                .exact_timestamp()
+                .is_some_and(|value| value >= start && value <= end),
+            Self::NominalDates { start, end } => coordinate
+                .calendar_date_value()
+                .is_some_and(|value| value >= start && value <= end),
+        }
     }
 }
 
@@ -1101,21 +1257,20 @@ impl AnalyticalMarketBarReadRequest {
                 "CAST(ingested_at AS BIGINT) <= {}",
                 self.knowledge_cutoff.unix_nanos()
             ),
-            "effective_at IS NOT NULL".to_owned(),
+            "(effective_at IS NOT NULL OR effective_date IS NOT NULL)".to_owned(),
         ];
         if let Some(range) = self.effective_range {
-            filters.push(format!(
-                "CAST(effective_at AS BIGINT) >= {} AND CAST(effective_at AS BIGINT) <= {}",
-                range.start.unix_nanos(),
-                range.end.unix_nanos()
-            ));
+            filters.push(match range {
+                MarketBarEffectiveRange::Timestamps{start,end}=>format!("CAST(effective_at AS BIGINT) >= {} AND CAST(effective_at AS BIGINT) <= {}",start.unix_nanos(),end.unix_nanos()),
+                MarketBarEffectiveRange::NominalDates{start,end}=>format!("effective_date >= DATE '{:04}-{:02}-{:02}' AND effective_date <= DATE '{:04}-{:02}-{:02}'",start.year(),start.month(),start.day(),end.year(),end.month(),end.day()),
+            });
         }
         let predicate = filters.join(" AND ");
         format!(
             "SELECT payload_json \
              FROM {OBSERVATION_TABLE} \
              WHERE {predicate} \
-             ORDER BY effective_at, source_id, venue_id, revision DESC, payload_sha256, \
+             ORDER BY effective_date, effective_at, source_id, venue_id, revision DESC, payload_sha256, \
                       source_identifier \
              LIMIT {}",
             MAX_MARKET_BAR_REVISION_CANDIDATES + 1
@@ -1562,12 +1717,31 @@ pub struct AnalyticalMacroLatestKnownOutput {
     output: PinnedQueryOutput,
     observations: Box<[MacroObservation]>,
     selection_digest: EvidenceDigest,
+    selected_provider_rows: Box<[Option<crate::arrow_convert::ProviderCaptureRowCoordinate>]>,
 }
 
 impl AnalyticalMacroLatestKnownOutput {
     /// Returns the exact source-rights namespace requested and verified for the generation.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
+    }
+
+    /// Returns the exact selected payload/capture coordinates minted by this pinned PIT read.
+    pub fn selected_provider_rows(
+        &self,
+    ) -> Result<SelectedProviderCaptureRows, AnalyticalReadError> {
+        let rows = self
+            .selected_provider_rows
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        Ok(SelectedProviderCaptureRows {
+            manifest: self.output.manifest().clone(),
+            source_id: self.source_id.clone(),
+            selection_digest: self.selection_digest,
+            rows: rows.into_boxed_slice(),
+        })
     }
 
     /// Returns exact manifest, object graph, candidate query, and candidate result evidence.
@@ -1586,6 +1760,16 @@ impl AnalyticalMacroLatestKnownOutput {
     }
 }
 
+/// Constructor-private selected-row authority from one exact manifest-pinned PIT query.
+/// Cloning preserves the same selection; callers cannot replace its rows or source namespace.
+#[derive(Clone, Debug)]
+pub struct SelectedProviderCaptureRows {
+    pub(crate) manifest: DatasetManifestRef,
+    pub(crate) source_id: SourceId,
+    pub(crate) selection_digest: EvidenceDigest,
+    pub(crate) rows: Box<[crate::arrow_convert::ProviderCaptureRowCoordinate]>,
+}
+
 /// Typed latest-known provider-period Macro observations plus exact query/selection evidence.
 #[derive(Debug)]
 pub struct AnalyticalMacroProviderPeriodLatestKnownOutput {
@@ -1594,12 +1778,31 @@ pub struct AnalyticalMacroProviderPeriodLatestKnownOutput {
     output: PinnedQueryOutput,
     observations: Box<[MacroObservation]>,
     selection_digest: EvidenceDigest,
+    selected_provider_rows: Box<[Option<crate::arrow_convert::ProviderCaptureRowCoordinate>]>,
 }
 
 impl AnalyticalMacroProviderPeriodLatestKnownOutput {
     /// Returns the exact source-rights namespace requested and verified for the generation.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
+    }
+
+    /// Returns the exact selected payload/capture coordinates minted by this pinned PIT read.
+    pub fn selected_provider_rows(
+        &self,
+    ) -> Result<SelectedProviderCaptureRows, AnalyticalReadError> {
+        let rows = self
+            .selected_provider_rows
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        Ok(SelectedProviderCaptureRows {
+            manifest: self.output.manifest().clone(),
+            source_id: self.source_id.clone(),
+            selection_digest: self.selection_digest,
+            rows: rows.into_boxed_slice(),
+        })
     }
 
     /// Returns the sole provider/frequency period ordering namespace admitted by the request.
@@ -1634,6 +1837,9 @@ pub struct AnalyticalMarketBarOutput {
 /// Exact complete daily history plus catalog publication and immutable object-read evidence.
 #[derive(Debug)]
 pub struct CompleteMarketBarHistoryOutput {
+    companion_bars: Box<[MarketBarObservation]>,
+    source_actions: Box<[CorporateActionObservation]>,
+    native_sessions: Option<RetainedHistoryNativeSessions>,
     selection: CompleteMarketBarHistorySelection,
     read_receipt: CompleteMarketBarHistoryReadReceipt,
     bars: Box<[MarketBarObservation]>,
@@ -1642,6 +1848,8 @@ pub struct CompleteMarketBarHistoryOutput {
 /// Non-forgeable receipt for the one origin object that published a complete history window.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompleteMarketBarHistoryReadReceipt {
+    knowledge_cutoff: Timestamp,
+    source_result_digest: Sha256Digest,
     selection_digest: Sha256Digest,
     publication_receipt_digest: Sha256Digest,
     origin_manifest: DatasetManifestRef,
@@ -1656,6 +1864,13 @@ pub struct CompleteMarketBarHistoryReadReceipt {
 }
 
 impl CompleteMarketBarHistoryOutput {
+    pub fn source_actions(&self) -> &[CorporateActionObservation] {
+        &self.source_actions
+    }
+    pub fn companion_bars(&self) -> &[MarketBarObservation] {
+        &self.companion_bars
+    }
+
     /// Returns the restart-safe descendant generation and exact origin publication receipt.
     pub const fn selection(&self) -> &CompleteMarketBarHistorySelection {
         &self.selection
@@ -1673,6 +1888,13 @@ impl CompleteMarketBarHistoryOutput {
 }
 
 impl CompleteMarketBarHistoryReadReceipt {
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+    pub const fn source_result_digest(&self) -> Sha256Digest {
+        self.source_result_digest
+    }
+
     /// Returns the exact catalog selection identity consumed by this read.
     pub const fn selection_digest(&self) -> Sha256Digest {
         self.selection_digest
@@ -1938,6 +2160,44 @@ impl AnalyticalReadCapability {
             .next())
     }
 
+    /// Reopens only the unique committed generation for the original admitted build.
+    /// Production receipt, descriptor, and current read control use the existing atomic reader.
+    pub fn feature_dataset_for_build(
+        &self,
+        expected_contract: FeatureDatasetProductContract,
+        dataset_id: &DatasetId,
+        build_spec: DatasetBuildSpecDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<AnalyticalFeatureDataset>, AnalyticalReadError> {
+        let page = self.manifests.read_feature_dataset_snapshot(
+            expected_contract,
+            CatalogFeatureDatasetSelection::ExactBuild {
+                dataset_id,
+                build_spec,
+            },
+            &[],
+            1,
+            deadline,
+            cancellation,
+        )?;
+        let mut values = page.datasets.into_iter();
+        let result = values
+            .next()
+            .map(|value| AnalyticalFeatureDataset::from_catalog(value, expected_contract))
+            .transpose()?;
+        if values.next().is_some() {
+            return Err(ManifestCatalogError::CorruptCatalog.into());
+        }
+        if result.as_ref().is_some_and(|value| {
+            value.generation().build_spec_digest() != Some(build_spec)
+                || value.generation().manifest().dataset_id() != dataset_id
+        }) {
+            return Err(ManifestCatalogError::CorruptCatalog.into());
+        }
+        Ok(result)
+    }
+
     /// Resolves the latest immutable generation for one dataset.
     pub fn latest(
         &self,
@@ -1977,6 +2237,28 @@ impl AnalyticalReadCapability {
                 knowledge_cutoff,
                 before_version,
                 limit.get(),
+                deadline,
+                cancellation,
+            )
+            .map_err(Into::into)
+    }
+
+    /// Resolves the unique original publication for an exact retained capture reference.
+    ///
+    /// This does not replace the physical capture, source-revision, or current-use checks.
+    pub fn provider_capture_origin(
+        &self,
+        binding_digest: EvidenceDigest,
+        origin_content_hash: Sha256Digest,
+        knowledge_cutoff: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<DatasetManifestRef>, AnalyticalReadError> {
+        self.manifests
+            .provider_capture_origin(
+                binding_digest,
+                origin_content_hash,
+                knowledge_cutoff,
                 deadline,
                 cancellation,
             )
@@ -2128,6 +2410,11 @@ impl AnalyticalReadCapability {
         let selected =
             decode_macro_latest_known_snapshot(&output, &request, deadline, &cancellation).await?;
         let selection_digest = macro_latest_known_selection_digest(&request, &output, &selected);
+        let selected_provider_rows = selected
+            .iter()
+            .map(|row| row.provider_capture)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let observations = selected
             .into_iter()
             .map(|selected| selected.observation)
@@ -2138,6 +2425,7 @@ impl AnalyticalReadCapability {
             output,
             observations,
             selection_digest,
+            selected_provider_rows,
         })
     }
 
@@ -2197,6 +2485,11 @@ impl AnalyticalReadCapability {
         let selection_digest =
             macro_provider_period_latest_known_selection_digest(&request, &output, &selected);
         let period_scheme = request.effective_period_cutoff.scheme().clone();
+        let selected_provider_rows = selected
+            .iter()
+            .map(|row| row.provider_capture)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let observations = selected
             .into_iter()
             .map(|selected| selected.observation)
@@ -2208,6 +2501,7 @@ impl AnalyticalReadCapability {
             output,
             observations,
             selection_digest,
+            selected_provider_rows,
         })
     }
 
@@ -2255,12 +2549,29 @@ impl AnalyticalReadCapability {
             }
             result = execution.as_mut() => result?,
         };
-        let bars = decode_market_bars(&output, &request)?;
+        let bars = decode_market_bars(&output, &request, deadline, &cancellation).await?;
+        history_read_checkpoint(deadline, &cancellation).await?;
         Ok(AnalyticalMarketBarOutput {
             source_id,
             output,
             bars,
         })
+    }
+
+    /// Reopens only the original saved history content hash under the existing canonical policy.
+    #[allow(clippy::too_many_arguments, reason = "exact identity and read controls stay explicit")]
+    pub fn exact_canonical_market_bar_history_window(
+        &self,
+        instrument_id: market_squawk_domain::InstrumentId,
+        selected_content_hash: Sha256Digest,
+        policy: crate::MarketHistorySelectionPolicy,
+        cutoff: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CanonicalMarketBarHistoryRequest>, AnalyticalReadError> {
+        self.manifests.exact_canonical_market_bar_history_window(
+            instrument_id, selected_content_hash, policy, cutoff, deadline, cancellation,
+        ).map_err(Into::into)
     }
 
     /// Selects the latest complete canonical daily history window known at one cutoff.
@@ -2356,7 +2667,7 @@ impl AnalyticalReadCapability {
             .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
         if origin_source != *receipt.source_id()
             || origin_object.object().row_count()
-                != u64::try_from(receipt.bar_count())
+                != u64::try_from(receipt.origin_record_count())
                     .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?
         {
             return Err(AnalyticalReadError::InvalidMarketBarResult);
@@ -2372,7 +2683,7 @@ impl AnalyticalReadCapability {
             &origin,
             origin_artifact_id,
             origin_ordinal,
-            receipt.bar_count(),
+            receipt.origin_record_count() as usize,
             COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES,
             &read_cancellation,
         );
@@ -2393,8 +2704,14 @@ impl AnalyticalReadCapability {
             }
             result = read.as_mut() => result?,
         };
-        let bars =
-            decode_complete_market_bar_history_object(batches, &selection, knowledge_cutoff)?;
+        let (bars, companion_bars, source_actions) = decode_complete_market_bar_history_object(
+            batches,
+            &selection,
+            knowledge_cutoff,
+            deadline,
+            &cancellation,
+        )
+        .await?;
         let history_content_digest = complete_market_bar_history_content_digest(
             &selection,
             origin_artifact_id,
@@ -2404,7 +2721,10 @@ impl AnalyticalReadCapability {
             object_row_count,
             object_size_bytes,
             &bars,
-        )?;
+            deadline,
+            &cancellation,
+        )
+        .await?;
         let result_digest = complete_market_bar_history_read_digest(
             &selection,
             origin_artifact_id,
@@ -2414,8 +2734,14 @@ impl AnalyticalReadCapability {
             object_row_count,
             object_size_bytes,
             &bars,
-        )?;
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        history_read_checkpoint(deadline, &cancellation).await?;
         let read_receipt = CompleteMarketBarHistoryReadReceipt {
+            knowledge_cutoff,
+            source_result_digest: result_digest,
             selection_digest: selection.selection_digest(),
             publication_receipt_digest: receipt.receipt_digest(),
             origin_manifest: receipt.origin_manifest().clone(),
@@ -2429,6 +2755,9 @@ impl AnalyticalReadCapability {
             result_digest,
         };
         Ok(CompleteMarketBarHistoryOutput {
+            companion_bars,
+            source_actions,
+            native_sessions: None,
             selection,
             read_receipt,
             bars,
@@ -2566,7 +2895,10 @@ impl AnalyticalReadCapability {
             }
             result = execution.as_mut() => result?,
         };
-        select_outcome_from_output(request, output)
+        let selection =
+            select_outcome_from_output(request, output, deadline, &cancellation).await?;
+        history_read_checkpoint(deadline, &cancellation).await?;
+        Ok(selection)
     }
 
     /// Reads one producer-issued monetary observation from an exact immutable generation.
@@ -2671,6 +3003,15 @@ impl AnalyticalReadCapability {
 /// Immutable analytical request validation or execution failure.
 #[derive(Debug, Error)]
 pub enum AnalyticalReadError {
+    /// Original raw-reader cancellation, deadline or revocation stopped native-session attachment.
+    #[error(transparent)]
+    NativeSessionControl(market_squawk_platform::ResearchObjectControlError),
+    /// Source-authenticated feature input epochs require bounded inline materialization.
+    #[error("feature input epoch result must be inline")]
+    InputEpochResultRequiresInline,
+    /// An exact admitted feature cohort failed its source-clock or lineage contract.
+    #[error("feature input epoch evidence is invalid or incomplete")]
+    InvalidInputEpoch,
     /// A page limit was zero or exceeded the hard service ceiling.
     #[error("analytical read limit is invalid")]
     InvalidLimit,
@@ -2695,6 +3036,9 @@ pub enum AnalyticalReadError {
     /// A typed Fund NAV calendar-date range was reversed.
     #[error("analytical Fund NAV date range is invalid")]
     InvalidFundNavDateRange,
+    /// A Macro history range or continuation does not match its immutable request.
+    #[error("analytical Macro history request is invalid")]
+    InvalidMacroHistoryRequest,
     /// A Macro snapshot series set was empty, duplicated, invalid, or above its fixed ceiling.
     #[error("analytical Macro series allowlist is invalid")]
     InvalidMacroSeriesAllowlist,
@@ -2756,6 +3100,7 @@ struct SelectedMacroObservation {
     effective_date: CalendarDate,
     revision: u32,
     stored_payload_sha256: EvidenceDigest,
+    provider_capture: Option<crate::arrow_convert::ProviderCaptureRowCoordinate>,
     payload_identity: EvidenceDigest,
     provenance_identity: EvidenceDigest,
     evidence_identity: EvidenceDigest,
@@ -2789,6 +3134,10 @@ async fn decode_macro_latest_known_snapshot(
     stored_payload_sha256
         .try_reserve_exact(row_count)
         .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let mut provider_captures = Vec::new();
+    provider_captures
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
     let mut observed_ties = BTreeMap::<(String, i32, u32), (usize, usize)>::new();
     for batch in batches {
         let series = batch
@@ -2811,6 +3160,8 @@ async fn decode_macro_latest_known_snapshot(
             .column_by_name("payload_json")
             .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
             .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+        let requests = required_macro_column::<BinaryArray>(batch, "request_sha256")?;
+        let lineages = required_macro_column::<BinaryArray>(batch, "extraction_lineage_json")?;
         let tie_counts = batch
             .column_by_name("tie_count")
             .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
@@ -2821,6 +3172,8 @@ async fn decode_macro_latest_known_snapshot(
             revisions.len(),
             payload_digests.len(),
             payloads.len(),
+            requests.len(),
+            lineages.len(),
             tie_counts.len(),
         ]
         .into_iter()
@@ -2834,6 +3187,8 @@ async fn decode_macro_latest_known_snapshot(
                 || revisions.is_null(row)
                 || payload_digests.is_null(row)
                 || payloads.is_null(row)
+                || requests.is_null(row)
+                || lineages.is_null(row)
                 || tie_counts.is_null(row)
                 || revisions.value(row) == 0
             {
@@ -2901,6 +3256,15 @@ async fn decode_macro_latest_known_snapshot(
             {
                 return Err(AnalyticalReadError::InvalidMacroSnapshotResult);
             }
+            provider_captures.push(
+                ResearchArrowBatch::selected_provider_capture_coordinate(
+                    lineages.value(row),
+                    requests.value(row),
+                    &observation,
+                    payload,
+                )
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?,
+            );
             candidates.push(PointInTimeCandidate::new(
                 observation,
                 request.manifest.clone(),
@@ -2984,6 +3348,9 @@ async fn decode_macro_latest_known_snapshot(
             stored_payload_sha256: *stored_payload_sha256
                 .get(candidate_index)
                 .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?,
+            provider_capture: *provider_captures
+                .get(candidate_index)
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?,
             payload_identity: EvidenceDigest::new(
                 DigestAlgorithm::Sha256,
                 record.payload_identity().bytes(),
@@ -3061,6 +3428,7 @@ struct SelectedMacroProviderPeriodObservation {
     effective_period: ResearchPeriod,
     revision: u32,
     stored_payload_sha256: EvidenceDigest,
+    provider_capture: Option<crate::arrow_convert::ProviderCaptureRowCoordinate>,
     payload_identity: EvidenceDigest,
     provenance_identity: EvidenceDigest,
     evidence_identity: EvidenceDigest,
@@ -3090,6 +3458,10 @@ async fn decode_macro_provider_period_latest_known_snapshot(
     candidates
         .try_reserve_exact(row_count)
         .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
+    let mut provider_captures = Vec::new();
+    provider_captures
+        .try_reserve_exact(row_count)
+        .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?;
     let mut stored_payload_sha256 = Vec::new();
     stored_payload_sha256
         .try_reserve_exact(row_count)
@@ -3106,6 +3478,8 @@ async fn decode_macro_provider_period_latest_known_snapshot(
         let revisions = required_macro_column::<UInt32Array>(batch, "revision")?;
         let payload_digests = required_macro_column::<BinaryArray>(batch, "payload_sha256")?;
         let payloads = required_macro_column::<BinaryArray>(batch, "payload_json")?;
+        let requests = required_macro_column::<BinaryArray>(batch, "request_sha256")?;
+        let lineages = required_macro_column::<BinaryArray>(batch, "extraction_lineage_json")?;
         let tie_counts = required_macro_column::<Int64Array>(batch, "tie_count")?;
         if [
             series.len(),
@@ -3116,6 +3490,8 @@ async fn decode_macro_provider_period_latest_known_snapshot(
             revisions.len(),
             payload_digests.len(),
             payloads.len(),
+            requests.len(),
+            lineages.len(),
             tie_counts.len(),
         ]
         .into_iter()
@@ -3132,6 +3508,8 @@ async fn decode_macro_provider_period_latest_known_snapshot(
                 || revisions.is_null(row)
                 || payload_digests.is_null(row)
                 || payloads.is_null(row)
+                || requests.is_null(row)
+                || lineages.is_null(row)
                 || tie_counts.is_null(row)
                 || revisions.value(row) == 0
             {
@@ -3218,6 +3596,15 @@ async fn decode_macro_provider_period_latest_known_snapshot(
                 .1
                 .checked_add(1)
                 .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?;
+            provider_captures.push(
+                ResearchArrowBatch::selected_provider_capture_coordinate(
+                    lineages.value(row),
+                    requests.value(row),
+                    &observation,
+                    payload,
+                )
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?,
+            );
             candidates.push(PointInTimeCandidate::new(
                 observation,
                 request.manifest.clone(),
@@ -3295,6 +3682,9 @@ async fn decode_macro_provider_period_latest_known_snapshot(
             effective_period: effective_period.clone(),
             revision: observation.context().time().revision().get(),
             stored_payload_sha256: *stored_payload_sha256
+                .get(candidate_index)
+                .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?,
+            provider_capture: *provider_captures
                 .get(candidate_index)
                 .ok_or(AnalyticalReadError::InvalidMacroSnapshotResult)?,
             payload_identity: EvidenceDigest::new(
@@ -3532,59 +3922,148 @@ async fn decode_fund_nav_history(
     })
 }
 
-fn decode_complete_market_bar_history_object(
+async fn history_read_checkpoint(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), AnalyticalReadError> {
+    tokio::task::yield_now().await;
+    if cancellation.is_cancelled() {
+        Err(AnalyticalReadError::Query(QueryError::Cancelled))
+    } else if Instant::now() >= deadline {
+        Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded))
+    } else {
+        Ok(())
+    }
+}
+
+async fn decode_complete_market_bar_history_object(
     batches: Vec<RecordBatch>,
     selection: &CompleteMarketBarHistorySelection,
     knowledge_cutoff: Timestamp,
-) -> Result<Box<[MarketBarObservation]>, AnalyticalReadError> {
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<
+    (
+        Box<[MarketBarObservation]>,
+        Box<[MarketBarObservation]>,
+        Box<[CorporateActionObservation]>,
+    ),
+    AnalyticalReadError,
+> {
+    history_read_checkpoint(deadline, cancellation).await?;
+    let invalid = || AnalyticalReadError::InvalidMarketBarResult;
     let receipt = selection.receipt();
     let row_count = batches.iter().try_fold(0_usize, |total, batch| {
-        total
-            .checked_add(batch.num_rows())
-            .ok_or(AnalyticalReadError::InvalidMarketBarResult)
+        total.checked_add(batch.num_rows()).ok_or_else(invalid)
     })?;
-    if row_count != receipt.bar_count() {
-        return Err(AnalyticalReadError::InvalidMarketBarResult);
+    if row_count != receipt.origin_record_count() as usize {
+        return Err(invalid());
     }
     let mut bars = Vec::new();
-    bars.try_reserve_exact(row_count)
-        .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
+    let mut companion = Vec::new();
+    let mut actions = Vec::new();
+    bars.try_reserve_exact(receipt.bar_count())
+        .map_err(|_| invalid())?;
+    companion
+        .try_reserve_exact(receipt.bar_count())
+        .map_err(|_| invalid())?;
+    actions
+        .try_reserve_exact(row_count.saturating_sub(receipt.bar_count()))
+        .map_err(|_| invalid())?;
+    let mut action_suffix = false;
+    // Charge output containers as well as the decoder's retained observation estimate.
+    let mut retained_bytes = bars
+        .capacity()
+        .checked_add(companion.capacity())
+        .and_then(|slots| slots.checked_mul(std::mem::size_of::<MarketBarObservation>()))
+        .and_then(|bytes| {
+            actions
+                .capacity()
+                .checked_mul(std::mem::size_of::<CorporateActionObservation>())
+                .and_then(|action_bytes| bytes.checked_add(action_bytes))
+        })
+        .filter(|bytes| *bytes <= COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES)
+        .ok_or_else(invalid)?;
     for batch in batches {
-        let observations = ResearchArrowBatch::try_from_record_batch(batch)
-            .and_then(|batch| batch.observations())
-            .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
-        for observation in observations {
-            let ResearchObservation::MarketBar(bar) = observation else {
-                return Err(AnalyticalReadError::InvalidMarketBarResult);
-            };
-            let provenance = bar.context().provenance();
-            let available_at = provenance
-                .availability()
-                .conservative_available_at()
-                .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
-            if available_at > knowledge_cutoff
-                || provenance.received_at() > knowledge_cutoff
-                || provenance.ingested_at() > knowledge_cutoff
-            {
-                return Err(AnalyticalReadError::InvalidMarketBarResult);
+        for offset in (0..batch.num_rows()).step_by(256) {
+            history_read_checkpoint(deadline, cancellation).await?;
+            let remaining_bytes = COMPLETE_MARKET_BAR_HISTORY_OBJECT_MEMORY_BYTES
+                .checked_sub(retained_bytes)
+                .ok_or_else(invalid)?;
+            let (observations, decoded_bytes) = ResearchArrowBatch::decode_record_batch_bounded(
+                batch.slice(offset, (batch.num_rows() - offset).min(256)),
+                remaining_bytes,
+            )
+            .map_err(|_| invalid())?;
+            retained_bytes = retained_bytes
+                .checked_add(decoded_bytes)
+                .ok_or_else(invalid)?;
+            for observation in observations {
+                let provenance = match &observation {
+                    ResearchObservation::MarketBar(bar) => bar.context().provenance(),
+                    ResearchObservation::CorporateAction(action) => action.context().provenance(),
+                    _ => return Err(invalid()),
+                };
+                let available = provenance
+                    .availability()
+                    .conservative_available_at()
+                    .ok_or_else(invalid)?;
+                if available > knowledge_cutoff
+                    || provenance.received_at() > knowledge_cutoff
+                    || provenance.ingested_at() > knowledge_cutoff
+                    || provenance.source_id() != receipt.source_id()
+                    || provenance.instrument_id() != Some(receipt.instrument_id())
+                {
+                    return Err(invalid());
+                }
+                match observation {
+                    ResearchObservation::MarketBar(bar) if !action_suffix => {
+                        if bar.adjustment() == receipt.adjustment() {
+                            bars.push(bar);
+                        } else if receipt.date_windows().is_some()
+                            && matches!(
+                                bar.adjustment(),
+                                MarketBarAdjustment::Raw | MarketBarAdjustment::All
+                            )
+                        {
+                            companion.push(bar);
+                        } else {
+                            return Err(invalid());
+                        }
+                    }
+                    ResearchObservation::CorporateAction(action)
+                        if receipt.date_windows().is_some() =>
+                    {
+                        action_suffix = true;
+                        actions.push(action);
+                    }
+                    _ => return Err(invalid()),
+                }
             }
-            bars.push(bar);
         }
     }
-    bars.sort_unstable_by(|left, right| {
-        left.time_semantics()
-            .provider_timestamp()
-            .cmp(&right.time_semantics().provider_timestamp())
-    });
+    history_read_checkpoint(deadline, cancellation).await?;
+    // Source order is part of the nominal graph. Reordering cannot repair malformed source rows.
+    if receipt.date_windows().is_none() {
+        bars.sort_unstable_by_key(|bar| bar.time_semantics().provider_timestamp());
+    }
     receipt.validate_selected_bars(&bars)?;
-    Ok(bars.into_boxed_slice())
+    if selection.surface_requirement() == crate::MarketHistoryPriceSurfaceRequirement::RawWithAll {
+        receipt.validate_companion_bars(&companion)?;
+    }
+    history_read_checkpoint(deadline, cancellation).await?;
+    Ok((
+        bars.into_boxed_slice(),
+        companion.into_boxed_slice(),
+        actions.into_boxed_slice(),
+    ))
 }
 
 #[allow(
     clippy::too_many_arguments,
     reason = "the read digest binds every independently verified object coordinate"
 )]
-fn complete_market_bar_history_read_digest(
+async fn complete_market_bar_history_read_digest(
     selection: &CompleteMarketBarHistorySelection,
     origin_artifact_id: uuid::Uuid,
     origin_object_ordinal: u16,
@@ -3593,6 +4072,8 @@ fn complete_market_bar_history_read_digest(
     object_row_count: u64,
     object_size_bytes: u64,
     bars: &[MarketBarObservation],
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<Sha256Digest, AnalyticalReadError> {
     let receipt = selection.receipt();
     let mut hash = Sha256::new();
@@ -3608,7 +4089,10 @@ fn complete_market_bar_history_read_digest(
         object_row_count,
         object_size_bytes,
         bars,
-    )?;
+        deadline,
+        cancellation,
+    )
+    .await?;
     Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
@@ -3616,7 +4100,7 @@ fn complete_market_bar_history_read_digest(
     clippy::too_many_arguments,
     reason = "the stable digest binds every independently verified object coordinate"
 )]
-fn complete_market_bar_history_content_digest(
+async fn complete_market_bar_history_content_digest(
     selection: &CompleteMarketBarHistorySelection,
     origin_artifact_id: uuid::Uuid,
     origin_object_ordinal: u16,
@@ -3625,6 +4109,8 @@ fn complete_market_bar_history_content_digest(
     object_row_count: u64,
     object_size_bytes: u64,
     bars: &[MarketBarObservation],
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<Sha256Digest, AnalyticalReadError> {
     let mut hash = Sha256::new();
     hash.update(COMPLETE_MARKET_BAR_HISTORY_CONTENT_DOMAIN);
@@ -3638,7 +4124,10 @@ fn complete_market_bar_history_content_digest(
         object_row_count,
         object_size_bytes,
         bars,
-    )?;
+        deadline,
+        cancellation,
+    )
+    .await?;
     Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
@@ -3646,7 +4135,7 @@ fn complete_market_bar_history_content_digest(
     clippy::too_many_arguments,
     reason = "the shared hash input binds every independently verified object coordinate"
 )]
-fn hash_complete_market_bar_history_content(
+async fn hash_complete_market_bar_history_content(
     hash: &mut Sha256,
     receipt: &crate::MarketBarHistoryPublicationReceipt,
     origin_artifact_id: uuid::Uuid,
@@ -3656,6 +4145,8 @@ fn hash_complete_market_bar_history_content(
     object_row_count: u64,
     object_size_bytes: u64,
     bars: &[MarketBarObservation],
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<(), AnalyticalReadError> {
     let origin_manifest = receipt.origin_manifest();
     hash.update(receipt.receipt_digest().bytes());
@@ -3677,49 +4168,70 @@ fn hash_complete_market_bar_history_content(
             .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?
             .to_be_bytes(),
     );
-    for bar in bars {
+    for (ordinal, bar) in bars.iter().enumerate() {
+        if ordinal % 256 == 0 {
+            history_read_checkpoint(deadline, cancellation).await?;
+        }
         let observation = ResearchObservation::MarketBar(bar.clone());
         let payload = CanonicalObservationPayload::try_from_observation(&observation)
             .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
-        hash.update(
-            bar.time_semantics()
-                .provider_timestamp()
-                .unix_nanos()
-                .to_be_bytes(),
-        );
+        if let Some(timestamp) = bar.time_semantics().provider_timestamp() {
+            hash.update([1]);
+            hash.update(timestamp.unix_nanos().to_be_bytes());
+        } else if let Some(nominal) = bar.time_semantics().nominal_daily_date() {
+            hash.update([2]);
+            hash.update(nominal.date().year().to_be_bytes());
+            hash.update([nominal.date().month(), nominal.date().day()]);
+        } else {
+            return Err(AnalyticalReadError::InvalidMarketBarResult);
+        }
         hash_evidence(hash, payload.identity());
     }
     Ok(())
 }
 
-fn decode_market_bars(
+async fn decode_market_bars(
     output: &PinnedQueryOutput,
     request: &AnalyticalMarketBarReadRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<Box<[MarketBarObservation]>, AnalyticalReadError> {
+    history_read_checkpoint(deadline, cancellation).await?;
     if inline_market_bar_row_count(output)? > MAX_MARKET_BAR_REVISION_CANDIDATES {
         return Err(AnalyticalReadError::InvalidMarketBarResult);
     }
-    let mut candidates = decode_market_bar_candidates(output)?;
-    for candidate in &candidates {
+    let mut candidates = decode_market_bar_candidates(output, deadline, cancellation).await?;
+    for (ordinal, candidate) in candidates.iter().enumerate() {
+        if ordinal % 256 == 0 {
+            history_read_checkpoint(deadline, cancellation).await?;
+        }
         let provenance = candidate.bar.context().provenance();
         if provenance.instrument_id() != Some(request.instrument_id)
             || candidate.available_at > request.knowledge_cutoff
             || provenance.received_at() > request.knowledge_cutoff
             || provenance.ingested_at() > request.knowledge_cutoff
-            || request.effective_range.is_some_and(|range| {
-                candidate.effective_at < range.start || candidate.effective_at > range.end
-            })
+            || request
+                .effective_range
+                .is_some_and(|range| !range.contains(&candidate.effective_at))
         {
             return Err(AnalyticalReadError::InvalidMarketBarResult);
         }
     }
-    candidates = latest_market_bar_revisions(candidates)?;
+    candidates = latest_market_bar_revisions(candidates, deadline, cancellation).await?;
+    history_read_checkpoint(deadline, cancellation).await?;
     candidates.sort_unstable_by(|left, right| {
-        left.effective_at
-            .cmp(&right.effective_at)
+        (
+            left.effective_at.exact_timestamp(),
+            left.effective_at.calendar_date_value(),
+        )
+            .cmp(&(
+                right.effective_at.exact_timestamp(),
+                right.effective_at.calendar_date_value(),
+            ))
             .then_with(|| left.family.exact_bytes().cmp(right.family.exact_bytes()))
             .then_with(|| left.ordinal.cmp(&right.ordinal))
     });
+    history_read_checkpoint(deadline, cancellation).await?;
     let result_limit = usize::try_from(request.limit.get())
         .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
     candidates.truncate(result_limit);
@@ -3734,7 +4246,7 @@ struct DecodedMarketBarCandidate {
     ordinal: u32,
     payload_digest: EvidenceDigest,
     family: CanonicalObservationFamily,
-    effective_at: Timestamp,
+    effective_at: ResearchTemporalCoordinate,
     available_at: Timestamp,
     bar: MarketBarObservation,
 }
@@ -3756,9 +4268,12 @@ fn inline_market_bar_row_count(output: &PinnedQueryOutput) -> Result<usize, Anal
     })
 }
 
-fn decode_market_bar_candidates(
+async fn decode_market_bar_candidates(
     output: &PinnedQueryOutput,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<DecodedMarketBarCandidate>, AnalyticalReadError> {
+    history_read_checkpoint(deadline, cancellation).await?;
     let crate::QueryResult::Inline { batches, .. } = output.result() else {
         return Err(AnalyticalReadError::MarketBarResultRequiresInline);
     };
@@ -3777,6 +4292,9 @@ fn decode_market_bar_candidates(
             return Err(AnalyticalReadError::InvalidMarketBarResult);
         }
         for row in 0..payloads.len() {
+            if ordinal % 256 == 0 {
+                history_read_checkpoint(deadline, cancellation).await?;
+            }
             if payloads.is_null(row) {
                 return Err(AnalyticalReadError::InvalidMarketBarResult);
             }
@@ -3789,11 +4307,12 @@ fn decode_market_bar_candidates(
                 return Err(AnalyticalReadError::InvalidMarketBarResult);
             };
             let context = bar.context();
-            let effective_at = context
-                .time()
-                .effective()
-                .exact_timestamp()
-                .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
+            let effective_at = context.time().effective().clone();
+            if effective_at.exact_timestamp().is_none()
+                && effective_at.calendar_date_value().is_none()
+            {
+                return Err(AnalyticalReadError::InvalidMarketBarResult);
+            }
             let available_at = context
                 .provenance()
                 .availability()
@@ -3819,9 +4338,12 @@ fn decode_market_bar_candidates(
     Ok(candidates)
 }
 
-fn latest_market_bar_revisions(
+async fn latest_market_bar_revisions(
     mut candidates: Vec<DecodedMarketBarCandidate>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<DecodedMarketBarCandidate>, AnalyticalReadError> {
+    history_read_checkpoint(deadline, cancellation).await?;
     candidates.sort_unstable_by(|left, right| {
         left.family
             .exact_bytes()
@@ -3842,12 +4364,16 @@ fn latest_market_bar_revisions(
             })
             .then_with(|| left.ordinal.cmp(&right.ordinal))
     });
+    history_read_checkpoint(deadline, cancellation).await?;
     let mut latest: Vec<DecodedMarketBarCandidate> = Vec::new();
     latest
         .try_reserve_exact(candidates.len())
         .map_err(|_| AnalyticalReadError::InvalidMarketBarResult)?;
     let mut current_family_start: Option<usize> = None;
-    for candidate in candidates {
+    for (ordinal, candidate) in candidates.into_iter().enumerate() {
+        if ordinal % 256 == 0 {
+            history_read_checkpoint(deadline, cancellation).await?;
+        }
         let same_family = current_family_start
             .and_then(|index| latest.get(index))
             .is_some_and(|current| current.family.exact_bytes() == candidate.family.exact_bytes());
@@ -3882,16 +4408,19 @@ fn outcome_market_bar_query_limits() -> Result<QueryLimits, AnalyticalReadError>
     .map_err(Into::into)
 }
 
-fn select_outcome_from_output(
+async fn select_outcome_from_output(
     request: OutcomeMarketBarRequest,
     output: PinnedQueryOutput,
+    deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<OutcomeMarketBarSelection, AnalyticalReadError> {
+    history_read_checkpoint(deadline, cancellation).await?;
     if inline_market_bar_row_count(&output)? > MAX_OUTCOME_MARKET_BAR_CANDIDATES {
         return Ok(OutcomeMarketBarSelection::Unavailable(
             OutcomeMarketBarUnavailableReason::CandidateSetSaturated,
         ));
     }
-    let candidates = match decode_market_bar_candidates(&output) {
+    let candidates = match decode_market_bar_candidates(&output, deadline, cancellation).await {
         Ok(candidates) => candidates,
         Err(AnalyticalReadError::InvalidMarketBarResult) => {
             return Ok(OutcomeMarketBarSelection::Unavailable(
@@ -3900,7 +4429,10 @@ fn select_outcome_from_output(
         }
         Err(error) => return Err(error),
     };
-    for candidate in &candidates {
+    for (ordinal, candidate) in candidates.iter().enumerate() {
+        if ordinal % 256 == 0 {
+            history_read_checkpoint(deadline, cancellation).await?;
+        }
         let provenance = candidate.bar.context().provenance();
         let effective_before_horizon = request.series.timestamp_basis
             == BarTimestampBasis::PeriodEnd
@@ -3919,7 +4451,7 @@ fn select_outcome_from_output(
             ));
         }
     }
-    let candidates = match latest_market_bar_revisions(candidates) {
+    let candidates = match latest_market_bar_revisions(candidates, deadline, cancellation).await {
         Ok(candidates) => candidates,
         Err(AnalyticalReadError::InvalidMarketBarResult) => {
             return Ok(OutcomeMarketBarSelection::Unavailable(
@@ -3931,11 +4463,16 @@ fn select_outcome_from_output(
 
     let mut selected: Option<DecodedOutcomeMarketBar> = None;
     let mut ambiguous = false;
-    for candidate in candidates {
+    for (ordinal, candidate) in candidates.into_iter().enumerate() {
+        if ordinal % 256 == 0 {
+            history_read_checkpoint(deadline, cancellation).await?;
+        }
         if !outcome_series_matches(&candidate.bar, &request.series) {
             continue;
         }
-        let completed_at = candidate.bar.completed_at();
+        let Some(completed_at) = candidate.bar.completed_at() else {
+            continue;
+        };
         if completed_at < request.horizon || completed_at > request.latest_eligible_completion {
             continue;
         }
@@ -3995,9 +4532,15 @@ fn outcome_series_matches(bar: &MarketBarObservation, series: &OutcomeMarketBarS
         && bar.feed() == &series.feed
         && bar.interval() == &series.interval
         && bar.adjustment() == series.adjustment
-        && bar.time_semantics().timestamp_basis() == series.timestamp_basis
-        && bar.time_semantics().session().kind() == series.session_kind
-        && bar.time_semantics().session().ruleset() == &series.session_ruleset
+        && bar.time_semantics().timestamp_basis() == Some(series.timestamp_basis)
+        && bar
+            .time_semantics()
+            .session()
+            .is_some_and(|session| session.kind() == series.session_kind)
+        && bar
+            .time_semantics()
+            .session()
+            .is_some_and(|session| session.ruleset() == &series.session_ruleset)
 }
 
 fn outcome_market_bar_request_digest(request: &OutcomeMarketBarRequest) -> EvidenceDigest {
@@ -4040,18 +4583,39 @@ fn outcome_market_bar_receipt_digest(
     let provenance = context.provenance();
     hash_str(&mut hash, provenance.source_id().as_str());
     hash_str(&mut hash, provenance.source_identifier().as_str());
-    hash_timestamp(&mut hash, bar.time_semantics().period_start());
-    hash_timestamp(&mut hash, bar.completed_at());
-    hash_timestamp(&mut hash, bar.time_semantics().provider_timestamp());
+    hash_timestamp(
+        &mut hash,
+        bar.time_semantics()
+            .period_start()
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?,
+    );
+    hash_timestamp(
+        &mut hash,
+        bar.completed_at()
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?,
+    );
+    hash_timestamp(
+        &mut hash,
+        bar.time_semantics()
+            .provider_timestamp()
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?,
+    );
     let available_at = provenance
         .availability()
         .conservative_available_at()
         .ok_or(AnalyticalReadError::InvalidMarketBarResult)?;
     hash_timestamp(&mut hash, available_at);
     hash.update([bar_timestamp_basis_digest_tag(
-        bar.time_semantics().timestamp_basis(),
+        bar.time_semantics()
+            .timestamp_basis()
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?,
     )]);
-    hash_market_bar_session_evidence(&mut hash, bar.time_semantics().session());
+    hash_market_bar_session_evidence(
+        &mut hash,
+        bar.time_semantics()
+            .session()
+            .ok_or(AnalyticalReadError::InvalidMarketBarResult)?,
+    );
     let close = bar.close().amount().normalize();
     hash.update(close.mantissa().to_be_bytes());
     hash.update(close.scale().to_be_bytes());

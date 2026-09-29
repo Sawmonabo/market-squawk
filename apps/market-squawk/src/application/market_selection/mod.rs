@@ -7,6 +7,7 @@
 mod candidate;
 mod digest;
 mod investment;
+pub(crate) mod product;
 mod receipt;
 mod requirements;
 mod resolver;
@@ -16,10 +17,12 @@ pub(crate) use candidate::{
     CandidateIdentity, CandidateIntegrity, CandidateTimestamps, HealthState, IntegrityState,
     ProviderBudgetSnapshot, RightsAdmission, RightsState, SourceCandidate,
 };
+pub use investment::MarketInvestmentReadReference;
 pub(crate) use investment::{
     LiveMarketInvestmentSource, MarketFeatureEvidence, MarketFeatureUnavailableReason,
     MarketInvestmentMarkBasis, MarketInvestmentObservation, MarketInvestmentRead,
-    MarketInvestmentReadError, MarketInvestmentUnavailableReason, SelectedMarketInvestmentSource,
+    MarketInvestmentReadCapability, MarketInvestmentReadError, MarketInvestmentReadReceipt,
+    MarketInvestmentUnavailableReason, SelectedMarketInvestmentSource, map_market_event_read_error,
     read_market_investment_observation, selected_generation_matches,
 };
 pub(crate) use receipt::{

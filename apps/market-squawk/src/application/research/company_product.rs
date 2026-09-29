@@ -299,6 +299,8 @@ pub(crate) enum CompanyFinancialMetric {
     OperatingExpenses,
     OperatingIncome,
     NetIncome,
+    CommonNetIncome,
+    PreferredDividendsAndAdjustments,
     ProfitOrLossIncludingNoncontrollingInterests,
     BasicEarningsPerShare,
     DilutedEarningsPerShare,
@@ -306,6 +308,10 @@ pub(crate) enum CompanyFinancialMetric {
     InvestingCashFlow,
     FinancingCashFlow,
     PropertyPlantAndEquipmentPurchases,
+    LongTermBorrowingProceeds,
+    LongTermDebtRepayments,
+    PreferredDividendsPaid,
+    PreferredStockIssuedValue,
     EntityCommonSharesOutstanding,
     CommonStockSharesOutstanding,
     WeightedAverageBasicShares,
@@ -336,6 +342,10 @@ impl CompanyFinancialMetric {
             Self::OperatingExpenses => "Operating expenses",
             Self::OperatingIncome => "Operating income or loss",
             Self::NetIncome => "Net income or loss",
+            Self::CommonNetIncome => "Net income or loss available to common stockholders",
+            Self::PreferredDividendsAndAdjustments => {
+                "Preferred dividends and other income adjustments"
+            }
             Self::ProfitOrLossIncludingNoncontrollingInterests => {
                 "Profit or loss including noncontrolling interests"
             }
@@ -345,6 +355,10 @@ impl CompanyFinancialMetric {
             Self::InvestingCashFlow => "Investing cash flow",
             Self::FinancingCashFlow => "Financing cash flow",
             Self::PropertyPlantAndEquipmentPurchases => "Property, plant, and equipment purchases",
+            Self::LongTermBorrowingProceeds => "Proceeds from long-term borrowing",
+            Self::LongTermDebtRepayments => "Repayments of long-term debt",
+            Self::PreferredDividendsPaid => "Preferred dividends paid",
+            Self::PreferredStockIssuedValue => "Preferred stock issued value",
             Self::EntityCommonSharesOutstanding => "Entity common shares outstanding",
             Self::CommonStockSharesOutstanding => "Common stock shares outstanding",
             Self::WeightedAverageBasicShares => "Weighted-average basic shares",
@@ -1182,6 +1196,7 @@ const fn statement_for_metric(metric: CompanyFinancialMetric) -> CompanyStatemen
         | CompanyFinancialMetric::CurrentLongTermDebt
         | CompanyFinancialMetric::NoncurrentLongTermDebt
         | CompanyFinancialMetric::ShareholdersEquity
+        | CompanyFinancialMetric::PreferredStockIssuedValue
         | CompanyFinancialMetric::TotalEquityIncludingNoncontrollingInterests => {
             CompanyStatementKind::FinancialPosition
         }
@@ -1193,12 +1208,17 @@ const fn statement_for_metric(metric: CompanyFinancialMetric) -> CompanyStatemen
         | CompanyFinancialMetric::OperatingExpenses
         | CompanyFinancialMetric::OperatingIncome
         | CompanyFinancialMetric::NetIncome
+        | CompanyFinancialMetric::CommonNetIncome
+        | CompanyFinancialMetric::PreferredDividendsAndAdjustments
         | CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests
         | CompanyFinancialMetric::BasicEarningsPerShare
         | CompanyFinancialMetric::DilutedEarningsPerShare => CompanyStatementKind::Operations,
         CompanyFinancialMetric::OperatingCashFlow
         | CompanyFinancialMetric::InvestingCashFlow
         | CompanyFinancialMetric::FinancingCashFlow
+        | CompanyFinancialMetric::LongTermBorrowingProceeds
+        | CompanyFinancialMetric::LongTermDebtRepayments
+        | CompanyFinancialMetric::PreferredDividendsPaid
         | CompanyFinancialMetric::PropertyPlantAndEquipmentPurchases => {
             CompanyStatementKind::CashFlows
         }
@@ -1590,7 +1610,7 @@ fn project_fact(
     }))
 }
 
-fn product_metric(source_metric: &str) -> Option<CompanyFinancialMetric> {
+pub(crate) fn product_metric(source_metric: &str) -> Option<CompanyFinancialMetric> {
     match source_metric {
         "us-gaap:CashAndCashEquivalentsAtCarryingValue" => {
             Some(CompanyFinancialMetric::CashAndCashEquivalents)
@@ -1619,6 +1639,20 @@ fn product_metric(source_metric: &str) -> Option<CompanyFinancialMetric> {
         "us-gaap:OperatingExpenses" => Some(CompanyFinancialMetric::OperatingExpenses),
         "us-gaap:OperatingIncomeLoss" => Some(CompanyFinancialMetric::OperatingIncome),
         "us-gaap:NetIncomeLoss" => Some(CompanyFinancialMetric::NetIncome),
+        "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic" => {
+            Some(CompanyFinancialMetric::CommonNetIncome)
+        }
+        "us-gaap:PreferredStockDividendsAndOtherAdjustments" => {
+            Some(CompanyFinancialMetric::PreferredDividendsAndAdjustments)
+        }
+        "us-gaap:ProceedsFromIssuanceOfLongTermDebt" => {
+            Some(CompanyFinancialMetric::LongTermBorrowingProceeds)
+        }
+        "us-gaap:RepaymentsOfLongTermDebt" => Some(CompanyFinancialMetric::LongTermDebtRepayments),
+        "us-gaap:PaymentsOfDividendsPreferredStockAndPreferenceStock" => {
+            Some(CompanyFinancialMetric::PreferredDividendsPaid)
+        }
+        "us-gaap:PreferredStockValue" => Some(CompanyFinancialMetric::PreferredStockIssuedValue),
         "us-gaap:ProfitLoss" => {
             Some(CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests)
         }

@@ -150,7 +150,7 @@ pub(crate) fn dispose(
                 .checked_mul(ratio)
                 .ok_or(PortfolioError::Arithmetic)?
                 .normalize();
-            let allocation = Money::new(basis_amount, currency);
+            let allocation = Money::new(basis_amount, lot.basis.currency());
             lot.quantity = lot
                 .quantity
                 .checked_sub(removed_quantity)
@@ -160,9 +160,13 @@ pub(crate) fn dispose(
                 .basis
                 .checked_sub(allocation)
                 .map_err(|_| PortfolioError::Arithmetic)?;
-            removed_basis = removed_basis
-                .checked_add(allocation)
-                .map_err(|_| PortfolioError::Arithmetic)?;
+            if allocation.currency() == removed_basis.currency() {
+                removed_basis = removed_basis
+                    .checked_add(allocation)
+                    .map_err(|_| PortfolioError::Arithmetic)?;
+            } else {
+                basis_complete = false;
+            }
             basis_complete &= lot.basis_complete;
             remaining = remaining
                 .checked_sub(removed_quantity)
@@ -196,7 +200,7 @@ pub(crate) fn dispose(
                 .ok_or(PortfolioError::Arithmetic)?
                 .normalize()
         };
-        let allocation = Money::new(basis_amount, currency);
+        let allocation = Money::new(basis_amount, lot.basis.currency());
         lot.quantity = lot
             .quantity
             .checked_sub(removed_quantity)
@@ -206,9 +210,13 @@ pub(crate) fn dispose(
             .basis
             .checked_sub(allocation)
             .map_err(|_| PortfolioError::Arithmetic)?;
-        removed_basis = removed_basis
-            .checked_add(allocation)
-            .map_err(|_| PortfolioError::Arithmetic)?;
+        if allocation.currency() == removed_basis.currency() {
+            removed_basis = removed_basis
+                .checked_add(allocation)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+        } else {
+            basis_complete = false;
+        }
         basis_complete &= lot.basis_complete;
         remaining = remaining
             .checked_sub(removed_quantity)

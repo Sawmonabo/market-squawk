@@ -108,6 +108,12 @@ pub enum ProviderPortalActivationError {
     /// Durable activation state could not be committed.
     #[error("provider adapter state is unavailable")]
     StateUnavailable,
+    /// The admitted operation exceeded its deadline.
+    #[error("provider adapter activation deadline exceeded")]
+    DeadlineExceeded,
+    /// Trusted local time or internal operation state could not be established.
+    #[error("provider adapter activation failed internally")]
+    Internal,
     /// The caller or application lifecycle cancelled the operation.
     #[error("provider adapter activation was cancelled")]
     Cancelled,

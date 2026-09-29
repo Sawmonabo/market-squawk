@@ -1931,6 +1931,352 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     Ok(())
 }
 
+#[tokio::test]
+async fn native_reference_custody_preserves_prior_identity_and_recovers_original() -> TestResult {
+    use bytes::Bytes;
+    use chrono::{DateTime, Utc};
+    use market_squawk_data::{
+        AcceptedNativeReferenceCapture, MarketDataInstrumentCurrentExpectation,
+    };
+    use market_squawk_platform::{RawCaptureRecord, SealedResearchRawClaim};
+    use market_squawk_sources::{
+        CatalogProviderIdentityAuthority, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+        ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+        ProviderNativeIdentityRequest, RegistryError,
+    };
+
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("native-reference-custody"))?;
+    let config = CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let initialize = || -> TestResult<AnalyticalDataService> {
+        Ok(AnalyticalDataService::initialize(
+            CatalogAuthority::open(config.clone())?,
+            AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+            paths.artifacts()?.clone(),
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 32, Duration::from_secs(10))?,
+        )?)
+    };
+    let deadline = || Instant::now() + Duration::from_secs(10);
+    let now = || -> TestResult<Timestamp> {
+        Ok(Timestamp::from_unix_nanos(i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?))
+    };
+    let cancellation = CancellationToken::new();
+    let service = initialize()?;
+    let publisher = service.market_data_instrument_synchronization();
+    let reader = service.market_data_instruments();
+    let raw_store = Arc::new(paths.sealed_research_journal_store()?);
+    let instrument: InstrumentId = "00000000-0000-0000-0000-000000000501".parse()?;
+    let initial = market_data_definition(instrument, 10, None, "Apple", "AAPL.OLD", 31)?;
+    let unrelated_identity = initial.provider_identities()[0].clone();
+    publisher.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![initial.clone()], 1)?,
+        deadline(),
+        &cancellation,
+    )?;
+    let prior = reader
+        .latest(instrument, deadline(), &cancellation)?
+        .ok_or("missing prior")?;
+
+    // Use the same consuming seal/rejoin path as a real standalone HTTP extraction. No value
+    // claim or physical receipt is fabricated; the original body is written and verified.
+    let source = SourceId::try_from("native-reference-fixture")?;
+    let revision = MetadataRevision::new(SourceIdentifier::try_from("native-reference-v1")?);
+    let namespace = SourceId::try_from("native-reference-namespace")?;
+    let received_at = Timestamp::from_unix_nanos(20);
+    let body = Bytes::from_static(br#"{"id":"AAPL.NATIVE","venue":"XNAS","quote_currency":"USD"}"#);
+    let source_reference: serde_json::Value = serde_json::from_slice(&body)?;
+    let native_symbol = source_reference["id"]
+        .as_str()
+        .ok_or("missing source native ID")?;
+    let native_id = ProviderInstrumentId::try_from(native_symbol)?;
+    let native_mapping = VenueMapping::new(
+        VenueId::try_from(
+            source_reference["venue"]
+                .as_str()
+                .ok_or("missing source venue")?,
+        )?,
+        VenueSymbol::try_from(native_symbol)?,
+    );
+    let body_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
+    let material = ProviderCaptureMaterial::try_new(
+        ProviderCaptureSetReceipt::try_new(
+            source.clone(),
+            revision.clone(),
+            SourceIdentifier::try_from("native-reference")?,
+            digest(141),
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![ProviderCapturePageReceipt::try_new(
+                0,
+                digest(142),
+                None,
+                None,
+                200,
+                u64::try_from(body.len())?,
+                body_digest,
+                received_at,
+            )?],
+        )?,
+        vec![RawCaptureRecord::try_new_live(
+            uuid::Uuid::from_u128(501),
+            Arc::from(source.as_str()),
+            uuid::Uuid::from_u128(502),
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            body.clone(),
+        )?],
+    )?;
+    let (expectation, seal) = material.into_whole_seal_parts();
+    let capture = expectation
+        .try_rejoin(seal.seal(&raw_store)?)?
+        .try_into_whole()?;
+    let original_claim = capture.persisted_receipt().segment().claim().clone();
+    let accepted = AcceptedNativeReferenceCapture::from_extraction_http(
+        instrument,
+        namespace.clone(),
+        native_id.clone(),
+        &capture,
+    )?;
+    let original_coordinate = accepted.coordinate().clone();
+    let native = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: instrument,
+        source_id: namespace.clone(),
+        provider_instrument_id: native_id.clone(),
+        evidence: ProviderIdentityEvidence::from_content_digest(body_digest),
+        source_timestamp: None,
+        observed_at: received_at,
+        metadata_revision: revision,
+        validity: EffectiveInterval::new(received_at, None)?,
+        supersedes: None,
+    });
+    let revised = |base: &MarketDataInstrumentDefinition,
+                   start: i64,
+                   identities: Vec<ProviderIdentityRecord>|
+     -> TestResult<MarketDataInstrumentDefinition> {
+        // One current symbol is allowed per venue. The sealed reference supplies this native
+        // mapping; subsequent revisions copy and preserve it without adding a duplicate venue.
+        let mut mappings = base.venue_mappings().to_vec();
+        mappings.retain(|mapping| mapping.venue_id() != native_mapping.venue_id());
+        mappings.push(native_mapping.clone());
+        Ok(MarketDataInstrumentDefinition::try_new(
+            MarketDataInstrumentDefinitionInput {
+                instrument_id: base.instrument_id(),
+                reference_evidence: base.reference_evidence().clone(),
+                effective_interval: EffectiveInterval::new(
+                    Timestamp::from_unix_nanos(start),
+                    None,
+                )?,
+                asset_class: base.asset_class(),
+                display_name: base.display_name().cloned(),
+                quote_currency: base.quote_currency(),
+                quote_currency_evidence: base.quote_currency_evidence().clone(),
+                venue_mappings: mappings,
+                provider_identities: identities,
+                identifiers: base.identifiers().to_vec(),
+            },
+        )?)
+    };
+    let admitted = revised(&initial, 20, vec![unrelated_identity.clone(), native])?;
+    publisher.synchronize_native_references_if_current(
+        MarketDataInstrumentSynchronization::try_new(vec![admitted], 1)?,
+        vec![MarketDataInstrumentCurrentExpectation::from_record(&prior)],
+        vec![accepted],
+        deadline(),
+        &cancellation,
+    )?;
+    let admitted = reader
+        .latest(instrument, deadline(), &cancellation)?
+        .ok_or("missing admitted")?;
+    assert!(
+        admitted
+            .definition()
+            .provider_identities()
+            .contains(&unrelated_identity)
+    );
+    assert!(
+        admitted
+            .definition()
+            .venue_mappings()
+            .contains(&native_mapping)
+    );
+    let live_cutoff = now()?;
+    let request = ProviderNativeIdentityRequest {
+        namespace: namespace.clone(),
+        provider_instrument_id: native_id.clone(),
+        instrument,
+        venue: native_mapping.venue_id().clone(),
+        venue_symbol: native_mapping.venue_symbol().clone(),
+        knowledge_at: live_cutoff,
+        effective_at: live_cutoff,
+    };
+    let selected = reader.select_current(&request, deadline(), &cancellation)?;
+    selected.validate_at(now()?)?;
+    publisher.synchronize(
+        MarketDataInstrumentSynchronization::try_new(
+            vec![market_data_definition(
+                "00000000-0000-0000-0000-000000000502".parse()?,
+                10,
+                None,
+                "Other",
+                "OTHER",
+                51,
+            )?],
+            1,
+        )?,
+        deadline(),
+        &cancellation,
+    )?;
+    selected.validate_at(now()?)?;
+
+    // An ordinary successor keeps the exact original identity/custody, while revoking the
+    // earlier live token for this canonical instrument only.
+    publisher.synchronize_native_references_if_current(
+        MarketDataInstrumentSynchronization::try_new(
+            vec![revised(
+                admitted.definition(),
+                30,
+                admitted.definition().provider_identities().to_vec(),
+            )?],
+            1,
+        )?,
+        vec![MarketDataInstrumentCurrentExpectation::from_record(
+            &admitted,
+        )],
+        Vec::new(),
+        deadline(),
+        &cancellation,
+    )?;
+    assert!(matches!(
+        selected.validate_at(now()?),
+        Err(RegistryError::ProviderIdentitySelectionStale)
+    ));
+    let successor = reader
+        .latest(instrument, deadline(), &cancellation)?
+        .ok_or("missing successor")?;
+    assert!(
+        successor
+            .definition()
+            .venue_mappings()
+            .contains(&native_mapping)
+    );
+    let unclaimed = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: instrument,
+        source_id: namespace.clone(),
+        provider_instrument_id: ProviderInstrumentId::try_from("UNCLAIMED")?,
+        evidence: ProviderIdentityEvidence::from_content_digest(digest(151)),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(40),
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("unclaimed-v1")?),
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(40), None)?,
+        supersedes: None,
+    });
+    let mut identities = successor.definition().provider_identities().to_vec();
+    identities.push(unclaimed.clone());
+    assert!(matches!(
+        publisher.synchronize_native_references_if_current(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![revised(successor.definition(), 40, identities)?],
+                1
+            )?,
+            vec![MarketDataInstrumentCurrentExpectation::from_record(
+                &successor
+            )],
+            Vec::new(),
+            deadline(),
+            &cancellation,
+        ),
+        Err(MarketDataInstrumentCatalogError::InvalidInput)
+    ));
+    assert_eq!(
+        reader.latest(instrument, deadline(), &cancellation)?,
+        Some(successor.clone())
+    );
+    assert!(
+        reader
+            .select_provider_identity_as_of(
+                MarketDataProviderIdentityQuery::try_new(
+                    namespace.clone(),
+                    unclaimed.provider_instrument_id().clone(),
+                    now()?,
+                    Timestamp::from_unix_nanos(40),
+                )?,
+                deadline(),
+                &cancellation
+            )?
+            .is_none()
+    );
+    let query = MarketDataProviderIdentityQuery::try_new(
+        namespace,
+        native_id,
+        successor.published_at(),
+        Timestamp::from_unix_nanos(30),
+    )?;
+    let selection = reader
+        .select_provider_identity_as_of(query.clone(), deadline(), &cancellation)?
+        .ok_or("missing selection")?;
+    let retained = reader
+        .native_reference(&selection, deadline(), &cancellation)?
+        .ok_or("missing custody")?;
+    assert_eq!(retained.coordinate(), &original_coordinate);
+    assert_eq!(
+        retained.raw_claim(),
+        &SealedResearchRawClaim::JournalSegment(original_claim.clone())
+    );
+    assert_eq!(
+        publisher
+            .synchronize_native_references_if_current(
+                MarketDataInstrumentSynchronization::try_new(
+                    vec![successor.definition().clone()],
+                    1
+                )?,
+                vec![MarketDataInstrumentCurrentExpectation::from_record(
+                    &successor
+                )],
+                Vec::new(),
+                deadline(),
+                &cancellation,
+            )?
+            .replayed(),
+        1
+    );
+    drop(selected);
+    drop(reader);
+    drop(publisher);
+    drop(service);
+    drop(raw_store);
+
+    let service = initialize()?;
+    let raw_store = Arc::new(paths.sealed_research_journal_store()?);
+    let recovery = service
+        .recover_provider_capture_store(Arc::clone(&raw_store), &cancellation)
+        .await?;
+    assert_eq!(recovery.retained_journal_segments(), 1);
+    assert!(recovery.quarantined_objects().is_empty());
+    let reader = service.market_data_instruments();
+    let selection = reader
+        .select_provider_identity_as_of(query, deadline(), &cancellation)?
+        .ok_or("missing restarted selection")?;
+    let reopened = reader
+        .native_reference(&selection, deadline(), &cancellation)?
+        .ok_or("missing restarted custody")?;
+    assert_eq!(reopened, retained);
+    let SealedResearchRawClaim::JournalSegment(claim) = reopened.raw_claim() else {
+        return Err("native extraction lost its original journal claim".into());
+    };
+    let verified = raw_store.open_verified_claim(claim)?;
+    assert_eq!(verified.receipt().claim(), &original_claim);
+    assert_eq!(verified.records()[0].payload(), body.as_ref());
+    assert_eq!(reopened.received_at(), received_at);
+    Ok(())
+}
+
 fn market_data_definition(
     instrument_id: InstrumentId,
     effective_start: i64,

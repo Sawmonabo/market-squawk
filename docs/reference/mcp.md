@@ -124,7 +124,7 @@ arbitrary shell, credential, audit-deletion, remote-code, direct-order, or risk-
 | Domain | Exact tool names |
 | --- | --- |
 | Job | `Job.List`, `Job.Get`, `Job.Watch`, `Job.Cancel`, `Job.Confirm`, `Job.Retry` |
-| Source | `Source.Register`, `Source.GetStatus`, `Source.GetCoverage`, `Source.GetHealth`, `Source.Setup`, `Source.ListObjects`, `Source.Inspect`, `Source.Discover`, `Source.Start`, `Source.Stop`, `Source.Retry`, `Source.Resynchronize`, `Source.Verify`, `Source.Reconfigure`, `Source.Remove` |
+| Source | `Source.Register`, `Source.GetStatus`, `Source.GetCoverage`, `Source.GetHealth`, `Source.ListObjects`, `Source.Inspect`, `Source.Discover`, `Source.Start`, `Source.Stop`, `Source.Retry`, `Source.Resynchronize`, `Source.Verify`, `Source.Reconfigure`, `Source.Remove` |
 | Market | `Market.GetSnapshot`, `Market.GetTrades`, `Market.GetQuotes`, `Market.GetBooks`, `Market.GetQuality`, `Market.GetComparisons` |
 | Research | `Research.ListDatasets`, `Research.GetManifest`, `Research.GetHistory`, `Research.GetAlternativeData`, `Research.StartIngestSource`, `Research.IngestSource`, `Research.StartDatasetBuild`, `Research.StartExport` |
 | Fundamental | `Fundamental.GetFilings`, `Fundamental.GetFacts`, `Fundamental.GetStatements`, `Fundamental.GetRatios` |
@@ -160,6 +160,10 @@ Important operation-specific forms include the following code-owned bounds:
   Backup pages limit to 64; workspace pages limit to 64; retention is `keepLatest 1..128`.
   Settings and setup are revision-fenced. The full type/schema is in the corresponding advertised
   descriptor, rather than a user-editable generic JSON schema.
+
+Provider onboarding and credential operations are private installed-client operations. They are
+absent from this MCP registry. Use Settings → Connections for setup; ordinary MCP mutation
+confirmation cannot grant credential, unlock, or native setup authority.
 
 ## Resources and controlled artifacts
 

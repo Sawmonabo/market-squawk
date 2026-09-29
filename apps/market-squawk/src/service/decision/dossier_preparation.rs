@@ -550,6 +550,7 @@ const fn amount_basis_name(value: market_squawk_valuation::ValuationAmountBasis)
             "reporting_entity_total"
         }
         market_squawk_valuation::ValuationAmountBasis::PositionTotal => "position_total",
+        market_squawk_valuation::ValuationAmountBasis::TotalCommonEquity => "total_common_equity",
     }
 }
 

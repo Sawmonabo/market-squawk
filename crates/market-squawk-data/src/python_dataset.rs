@@ -2,12 +2,17 @@
 
 #[path = "python_dataset/descriptor.rs"]
 mod descriptor;
+#[path = "python_dataset/probability.rs"]
+mod probability;
+pub use probability::ProbabilityLabelObservation;
 #[path = "python_dataset/verify.rs"]
 mod verify;
 
 use std::{num::NonZeroU64, time::Instant};
 
-use market_squawk_domain::{Currency, InstrumentId, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    Currency, InstrumentId, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +31,8 @@ const MAX_PYTHON_DATASET_BYTES: usize = 256 * 1024 * 1024;
 /// Durable Python-dataset registration or read-only verification failure.
 #[derive(Debug, Error)]
 pub enum PythonDatasetCatalogError {
+    #[error("population source research use is unavailable: {0}")]
+    PopulationResearchUse(#[source] Box<crate::ResearchUseCatalogError>),
     /// The requested export is absent from the selected catalog.
     #[error("Python dataset admission is unknown")]
     UnknownAdmission,
@@ -127,7 +134,9 @@ pub enum PythonDatasetValue {
 pub struct PythonDatasetRow {
     example_id: Box<str>,
     instrument_id: [u8; 16],
-    cutoff_at: Timestamp,
+    source_selection_as_of: Timestamp,
+    label_selection_as_of: Option<Timestamp>,
+    decision_coordinate: ResearchTemporalCoordinate,
     observed_effective_at: Option<Timestamp>,
     label_effective_at: Option<Timestamp>,
     target_coordinate_kind: u8,
@@ -139,6 +148,7 @@ pub struct PythonDatasetRow {
     unit: Option<Box<str>>,
     currency: Option<Box<str>>,
     lineage: [u8; 32],
+    input_epoch_json: Option<Box<[u8]>>,
 }
 
 impl PythonDatasetRow {
@@ -150,7 +160,9 @@ impl PythonDatasetRow {
     pub fn try_new(
         example_id: &str,
         instrument_id: [u8; 16],
-        cutoff_at: Timestamp,
+        source_selection_as_of: Timestamp,
+        label_selection_as_of: Option<Timestamp>,
+        decision_coordinate: ResearchTemporalCoordinate,
         observed_effective_at: Option<Timestamp>,
         label_effective_at: Option<Timestamp>,
         target_coordinate_kind: u8,
@@ -162,6 +174,7 @@ impl PythonDatasetRow {
         unit: Option<&str>,
         currency: Option<&str>,
         lineage: [u8; 32],
+        input_epoch_json: Option<&[u8]>,
     ) -> Result<Self, PythonDatasetCatalogError> {
         let instrument = Uuid::from_bytes(instrument_id);
         let target_coordinates_valid = match (
@@ -169,11 +182,69 @@ impl PythonDatasetRow {
             observed_effective_at,
             label_effective_at,
         ) {
-            (1, Some(observed), Some(target)) => target > observed,
-            (2, None, None) => true,
+            (1 | 3 | 5, Some(observed), Some(target)) => target > observed,
+            (2 | 4, None, None) => true,
             _ => false,
         };
-        let positive_currency_value = currency.is_none()
+        match (target_coordinate_kind, input_epoch_json) {
+            (3 | 4 | 5, Some(bytes)) => {
+                let epoch = crate::FeatureDatasetInputEpoch::decode(bytes)
+                    .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+                epoch
+                    .validate_label_selection(
+                        label_selection_as_of,
+                        component_kind,
+                        matches!(&value, PythonDatasetValue::Missing(_)),
+                    )
+                    .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+                if epoch.example_id() != example_id
+                    || epoch.instrument_id().as_uuid().into_bytes() != instrument_id
+                    || epoch.source_selection_as_of() != source_selection_as_of
+                    || epoch.decision_coordinate() != &decision_coordinate
+                    || epoch.target_origin() != observed_effective_at
+                    || epoch.target_at() != label_effective_at
+                    || (epoch.financial_period().is_some() != (target_coordinate_kind == 4))
+                    || epoch.fixed_horizon_origin_basis()
+                        != match target_coordinate_kind {
+                            3 => Some(crate::FixedHorizonOriginBasis::CompletedBarClose),
+                            5 => Some(
+                                crate::FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar,
+                            ),
+                            _ => None,
+                        }
+                    || (epoch.population_basis()
+                        == crate::DatasetPopulationBasis::CurrentListedSnapshot
+                        && split != 3)
+                {
+                    return Err(PythonDatasetCatalogError::CorruptAdmission);
+                }
+                if target_coordinate_kind == 4 {
+                    let measurement = FeatureLabelMeasurement::try_from_parts(unit, currency)
+                        .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+                    if epoch.financial_measurement() != Some(measurement)
+                        || !matches!(&value, PythonDatasetValue::Decimal { .. })
+                    {
+                        return Err(PythonDatasetCatalogError::CorruptAdmission);
+                    }
+                    if component_kind == 1 {
+                        let amount = epoch
+                            .current_financial_amount()
+                            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+                        if !matches!(&value,PythonDatasetValue::Decimal {mantissa,scale} if *mantissa==amount.mantissa() && u32::from(*scale)==amount.scale())
+                        {
+                            return Err(PythonDatasetCatalogError::CorruptAdmission);
+                        }
+                    }
+                }
+            }
+            (1 | 2, None)
+                if decision_coordinate.exact_timestamp() == Some(source_selection_as_of)
+                    && label_selection_as_of
+                        .is_some_and(|label| label > source_selection_as_of) => {}
+            _ => return Err(PythonDatasetCatalogError::CorruptAdmission),
+        }
+        let positive_currency_value = target_coordinate_kind == 4
+            || currency.is_none()
             || match &value {
                 PythonDatasetValue::Float(value) => *value > 0.0,
                 PythonDatasetValue::Decimal { mantissa, .. } => *mantissa > 0,
@@ -201,7 +272,9 @@ impl PythonDatasetRow {
         Ok(Self {
             example_id: example_id.into(),
             instrument_id,
-            cutoff_at,
+            source_selection_as_of,
+            label_selection_as_of,
+            decision_coordinate,
             observed_effective_at,
             label_effective_at,
             target_coordinate_kind,
@@ -213,7 +286,48 @@ impl PythonDatasetRow {
             unit: unit.map(Into::into),
             currency: currency.map(Into::into),
             lineage,
+            input_epoch_json: input_epoch_json.map(Into::into),
         })
+    }
+
+    /// A label is selectable only after its independently retained acquisition cutoff.
+    pub(crate) fn available_as_of(&self, as_of: Timestamp) -> bool {
+        self.source_selection_as_of <= as_of
+            && (self.component_kind != 2
+                || self
+                    .label_selection_as_of
+                    .is_some_and(|known| known <= as_of))
+    }
+
+    fn target_horizon(
+        &self,
+    ) -> Result<Option<crate::DatasetTargetHorizon>, PythonDatasetCatalogError> {
+        if self.target_coordinate_kind == 4 {
+            let epoch = crate::FeatureDatasetInputEpoch::decode(
+                self.input_epoch_json
+                    .as_deref()
+                    .ok_or(PythonDatasetCatalogError::CorruptAdmission)?,
+            )
+            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+            Ok(Some(
+                epoch
+                    .study_policy()
+                    .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?
+                    .target_horizon(),
+            ))
+        } else {
+            Ok(self.fixed_horizon_nanos().map(|v| {
+                crate::DatasetTargetHorizon::ExactElapsed(std::time::Duration::from_nanos(v.get()))
+            }))
+        }
+    }
+    fn fixed_horizon_origin_basis(&self) -> Option<crate::FixedHorizonOriginBasis> {
+        match self.target_coordinate_kind {
+            1 => Some(crate::FixedHorizonOriginBasis::ExactEffectiveTimestamp),
+            3 => Some(crate::FixedHorizonOriginBasis::CompletedBarClose),
+            5 => Some(crate::FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar),
+            _ => None,
+        }
     }
 
     fn fixed_horizon_nanos(&self) -> Option<NonZeroU64> {
@@ -233,10 +347,19 @@ pub struct PythonDatasetIdentity {
     universe_digest: Sha256Digest,
     policy_digest: Sha256Digest,
     universe_id: UniverseId,
+    population_basis: crate::DatasetPopulationBasis,
+    population_member_count: usize,
+    population_unavailable: Box<[crate::CurrentPopulationInputUnavailable]>,
+    population_partition: Option<crate::DatasetPopulationPartition>,
+    population_source_use: Option<crate::DatasetPopulationSourceUse>,
+    study_policy: Option<crate::DatasetStudyPolicy>,
+    source_snapshot_digest: Option<Sha256Digest>,
+    split_policy: crate::ChronologicalSplitPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PythonFeatureDatasetSummary {
+    pub(crate) probability_event_target: Option<crate::ProbabilityEventTarget>,
     pub(crate) identity: PythonDatasetIdentity,
     pub(crate) split_counts: DatasetSplitCounts,
 }
@@ -258,13 +381,51 @@ pub(crate) fn feature_dataset_summary(
         descriptor.split_counts.validation,
         descriptor.split_counts.test,
     );
+    let mut probability_event_target = None;
+    for component in &descriptor.components {
+        if let Some(event) = component.probability_event_target()? {
+            if probability_event_target.replace(event).is_some() {
+                return Err(PythonDatasetCatalogError::CorruptAdmission);
+            }
+        }
+    }
     Ok(PythonFeatureDatasetSummary {
         identity,
         split_counts,
+        probability_event_target,
     })
 }
 
 impl PythonDatasetIdentity {
+    /// Returns the source-owned population qualification for this publication.
+    pub const fn population_basis(&self) -> crate::DatasetPopulationBasis {
+        self.population_basis
+    }
+    /// Returns the complete admitted population count, including unavailable inputs.
+    pub const fn population_member_count(&self) -> usize {
+        self.population_member_count
+    }
+    /// Returns actual producer-unavailable inputs retained once for the dataset.
+    pub fn population_unavailable(&self) -> &[crate::CurrentPopulationInputUnavailable] {
+        &self.population_unavailable
+    }
+    /// Returns the exact bounded partition of the one source-admitted population.
+    pub const fn population_partition(&self) -> Option<&crate::DatasetPopulationPartition> {
+        self.population_partition.as_ref()
+    }
+    pub const fn population_source_use(&self) -> Option<&crate::DatasetPopulationSourceUse> {
+        self.population_source_use.as_ref()
+    }
+    pub const fn study_policy(&self) -> Option<&crate::DatasetStudyPolicy> {
+        self.study_policy.as_ref()
+    }
+    pub const fn source_snapshot_digest(&self) -> Option<Sha256Digest> {
+        self.source_snapshot_digest
+    }
+    pub const fn split_policy(&self) -> crate::ChronologicalSplitPolicy {
+        self.split_policy
+    }
+
     /// Returns the exact registered feature/label generation.
     pub const fn manifest(&self) -> &DatasetManifestRef {
         &self.manifest
@@ -305,9 +466,35 @@ pub struct PythonDatasetSelection {
     selected_rows: usize,
     as_of: Timestamp,
     label_measurements: Box<[FeatureLabelMeasurementBinding]>,
+    probability_observations: Option<probability::ProbabilityObservedDataset>,
 }
 
 impl PythonDatasetSelection {
+    pub const fn population_basis(&self) -> crate::DatasetPopulationBasis {
+        self.identity.population_basis()
+    }
+    pub const fn population_member_count(&self) -> usize {
+        self.identity.population_member_count()
+    }
+    pub fn population_unavailable(&self) -> &[crate::CurrentPopulationInputUnavailable] {
+        self.identity.population_unavailable()
+    }
+    pub const fn population_partition(&self) -> Option<&crate::DatasetPopulationPartition> {
+        self.identity.population_partition()
+    }
+    pub const fn population_source_use(&self) -> Option<&crate::DatasetPopulationSourceUse> {
+        self.identity.population_source_use()
+    }
+    pub const fn study_policy(&self) -> Option<&crate::DatasetStudyPolicy> {
+        self.identity.study_policy()
+    }
+    pub const fn source_snapshot_digest(&self) -> Option<Sha256Digest> {
+        self.identity.source_snapshot_digest()
+    }
+    pub const fn split_policy(&self) -> crate::ChronologicalSplitPolicy {
+        self.identity.split_policy()
+    }
+
     /// Returns the canonical local root derived by retained platform path authority.
     pub fn local_root(&self) -> &std::path::Path {
         &self.local_root
@@ -348,6 +535,35 @@ impl PythonDatasetSelection {
         self.selection_sha256
     }
 
+    /// Original complete-case observations retained only after the same native scan verifies.
+    pub fn probability_label_observations(
+        &self,
+        label: &FeatureLabelComponentSpec,
+    ) -> Option<&[ProbabilityLabelObservation]> {
+        self.probability_observations
+            .as_ref()
+            .filter(|value| &value.label == label)
+            .map(|value| value.observations.as_ref())
+    }
+
+    /// Canonical feature order for the exact retained original observation vectors.
+    pub fn probability_feature_specs(&self) -> &[FeatureLabelComponentSpec] {
+        self.probability_observations
+            .as_ref()
+            .map_or(&[], |value| value.feature_specs.as_ref())
+    }
+
+    /// Exact closed event independently read from the original admitted target descriptor.
+    pub fn label_probability_event_target(
+        &self,
+        label: &FeatureLabelComponentSpec,
+    ) -> Option<crate::ProbabilityEventTarget> {
+        self.label_measurements
+            .iter()
+            .find(|binding| binding.label() == label)
+            .and_then(FeatureLabelMeasurementBinding::probability_event_target)
+    }
+
     /// Returns the exact selected component-row count.
     pub const fn selected_rows(&self) -> usize {
         self.selected_rows
@@ -371,6 +587,17 @@ impl PythonDatasetSelection {
             .map(FeatureLabelMeasurementBinding::measurement)
     }
 
+    /// Returns the native row-rederived horizon for one admitted label.
+    pub fn label_target_horizon(
+        &self,
+        label: &FeatureLabelComponentSpec,
+    ) -> Option<crate::DatasetTargetHorizon> {
+        self.label_measurements
+            .iter()
+            .find(|binding| binding.label() == label)
+            .and_then(FeatureLabelMeasurementBinding::target_horizon)
+    }
+
     /// Returns the exact row-rederived positive terminal offset for one admitted label.
     #[must_use]
     pub fn label_fixed_horizon_nanos(
@@ -381,6 +608,17 @@ impl PythonDatasetSelection {
             .iter()
             .find(|binding| binding.label() == label)
             .and_then(FeatureLabelMeasurementBinding::fixed_horizon_nanos)
+    }
+
+    /// Returns the exact row-rederived origin basis for an admitted terminal label.
+    pub fn label_fixed_horizon_origin_basis(
+        &self,
+        label: &FeatureLabelComponentSpec,
+    ) -> Option<crate::FixedHorizonOriginBasis> {
+        self.label_measurements
+            .iter()
+            .find(|binding| binding.label() == label)
+            .and_then(FeatureLabelMeasurementBinding::fixed_horizon_origin_basis)
     }
 
     /// Starts a streaming rehash against this immutable receipt.
@@ -510,7 +748,15 @@ fn row_digest(row: &PythonDatasetRow) -> [u8; 32] {
     hash.update(b"market-squawk/python-dataset-row/v2");
     update_bytes(&mut hash, row.example_id.as_bytes());
     hash.update(row.instrument_id);
-    hash.update(row.cutoff_at.unix_nanos().to_be_bytes());
+    hash.update(row.source_selection_as_of.unix_nanos().to_be_bytes());
+    update_optional_timestamp(&mut hash, row.label_selection_as_of);
+    if let Some(value) = row.decision_coordinate.exact_timestamp() {
+        hash.update([1]);
+        hash.update(value.unix_nanos().to_be_bytes());
+    } else if let Some(value) = row.decision_coordinate.calendar_date_value() {
+        hash.update([2]);
+        hash.update(value.days_since_unix_epoch().to_be_bytes());
+    }
     hash.update([row.target_coordinate_kind]);
     update_optional_timestamp(&mut hash, row.observed_effective_at);
     update_optional_timestamp(&mut hash, row.label_effective_at);
@@ -535,6 +781,12 @@ fn row_digest(row: &PythonDatasetRow) -> [u8; 32] {
     update_optional(&mut hash, row.unit.as_deref());
     update_optional(&mut hash, row.currency.as_deref());
     hash.update(row.lineage);
+    if let Some(bytes) = &row.input_epoch_json {
+        hash.update([1]);
+        update_bytes(&mut hash, bytes);
+    } else {
+        hash.update([0]);
+    }
     hash.finalize().into()
 }
 
@@ -593,4 +845,63 @@ fn canonical_unit(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'%')
         })
+}
+
+pub(crate) fn input_epoch_bytes(
+    batch: &arrow::record_batch::RecordBatch,
+    index: usize,
+) -> Result<Option<&[u8]>, PythonDatasetCatalogError> {
+    use arrow::array::Array as _;
+    let values = batch
+        .column_by_name("input_epoch_json")
+        .and_then(|array| array.as_any().downcast_ref::<arrow::array::BinaryArray>())
+        .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+    Ok((!values.is_null(index)).then(|| values.value(index)))
+}
+
+/// Decode the two mutually exclusive physical columns without changing temporal precision.
+pub(crate) fn decision_coordinate(
+    batch: &arrow::record_batch::RecordBatch,
+    index: usize,
+) -> Result<ResearchTemporalCoordinate, PythonDatasetCatalogError> {
+    use arrow::array::Array as _;
+    let exact = batch
+        .column_by_name("decision_at")
+        .and_then(|a| {
+            a.as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+        })
+        .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+    let dates = batch
+        .column_by_name("decision_on")
+        .and_then(|a| a.as_any().downcast_ref::<arrow::array::Date32Array>())
+        .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+    match (exact.is_null(index), dates.is_null(index)) {
+        (false, true) => Ok(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(exact.value(index)),
+        )),
+        (true, false) => {
+            let epoch = crate::FeatureDatasetInputEpoch::decode(
+                input_epoch_bytes(batch, index)?
+                    .ok_or(PythonDatasetCatalogError::CorruptAdmission)?,
+            )
+            .map_err(|_| PythonDatasetCatalogError::CorruptAdmission)?;
+            let date = epoch
+                .decision_coordinate()
+                .calendar_date_value()
+                .ok_or(PythonDatasetCatalogError::CorruptAdmission)?;
+            if date.days_since_unix_epoch() != dates.value(index) {
+                return Err(PythonDatasetCatalogError::CorruptAdmission);
+            }
+            Ok(ResearchTemporalCoordinate::calendar_date(date))
+        }
+        _ => Err(PythonDatasetCatalogError::CorruptAdmission),
+    }
+}
+
+pub(crate) fn canonical_row(
+    batch: &arrow::record_batch::RecordBatch,
+    index: usize,
+) -> Result<PythonDatasetRow, PythonDatasetCatalogError> {
+    verify::row(batch, index)
 }

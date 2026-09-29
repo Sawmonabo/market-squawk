@@ -22,6 +22,7 @@ pub(crate) struct PaperOrder {
     pub(crate) account_id: AccountId,
     pub(crate) account_revision: u64,
     pub(crate) terms: InstrumentExecutionTerms,
+    pub(crate) virtual_paper: bool,
     pub(crate) side: OrderSide,
     pub(crate) order_type: OrderType,
     pub(crate) quantity: QuantityLots,
@@ -63,6 +64,7 @@ pub(crate) struct PaperOrderRecoveryWire {
     account_id: AccountId,
     account_revision: u64,
     terms: InstrumentExecutionTerms,
+    virtual_paper: bool,
     side: OrderSide,
     order_type: OrderType,
     quantity: QuantityLots,
@@ -100,12 +102,6 @@ pub(crate) struct PaperOrderRecoveryWire {
     valid_until: Timestamp,
 }
 
-impl PaperOrderRecoveryWire {
-    pub(crate) const fn has_target_reference(&self) -> bool {
-        self.target_reference.is_some()
-    }
-}
-
 impl PaperOrder {
     pub(crate) fn from_dispatch(
         dispatch: &DispatchOrder,
@@ -130,6 +126,7 @@ impl PaperOrder {
             account_id: dispatch.account_id(),
             account_revision: dispatch.account_revision(),
             terms: dispatch.execution_terms(),
+            virtual_paper: dispatch.is_virtual_paper(),
             side: dispatch.side(),
             order_type: dispatch.order_type(),
             quantity: dispatch.quantity(),
@@ -239,6 +236,7 @@ impl PaperOrder {
             account_id: self.account_id,
             account_revision: self.account_revision,
             terms: self.terms,
+            virtual_paper: self.virtual_paper,
             side: self.side,
             order_type: self.order_type,
             quantity: self.quantity,
@@ -314,7 +312,8 @@ impl PaperOrder {
             wire.risk_policy_version,
         )
         .map_err(|_| PaperStateError::InvalidTransition)?;
-        if !price_shape_valid
+        if (wire.virtual_paper && wire.target_reference.is_none())
+            || !price_shape_valid
             || wire.reference_price.get() <= 0
             || !execution_price_bound.permits(wire.reference_price)
             || wire.limit_price.is_some_and(|price| price.get() <= 0)
@@ -356,6 +355,7 @@ impl PaperOrder {
             account_id: wire.account_id,
             account_revision: wire.account_revision,
             terms: wire.terms,
+            virtual_paper: wire.virtual_paper,
             side: wire.side,
             order_type: wire.order_type,
             quantity: wire.quantity,

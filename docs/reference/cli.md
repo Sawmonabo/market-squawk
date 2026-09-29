@@ -67,10 +67,10 @@ that name one; MCP never receives a filesystem path.
 | --- | --- |
 | `source register <provider> --confirm` | Register a code-supported profile. Configure connections in Desktop Settings → Connections → Set up connections. |
 | `source status [provider]`; `source coverage [provider]`; `source health [provider]` | Bounded provider status, explicit coverage, or connection/integrity/freshness facts. |
-| `source discover <provider> --dataset <dataset>` | Bounded object list without ingestion authority. |
+| `source discover <provider> --dataset <dataset> --confirm` | Bounded exact objects with single-use ingestion receipts. |
 | `source inspect <provider> --onboarding-session-id <UUID> --dataset-identifier <dataset> [--page-index 0..63] [--max-records 1..1024]` | One non-persisting provider page; defaults are `0` and `256`. |
 | `source activate <request> --confirm` | One-shot, bounded installed-service request using `market-squawk.provider-setup.v1`. Supports `activate`, `verifySaved`, `restoreSaved`, and `resumePublication` for an existing session; see [the exact envelope](../operations/source-operations.md#understand-the-source-activate-boundary). |
-| `ingest source <provider> <object> --dataset <dataset> --confirm` | Mints the exact discovery receipt then uses it for source ingestion. |
+| `ingest source <provider> <object> --dataset <dataset> --discovery-receipt <receipt> --confirm` | Consumes the original receipt for that exact object without rediscovery. |
 | `ingest file <manifest> --object <id> --dataset <id> --confirm` | CLI-owned confined local-file manifest admission. |
 | `dataset list [--after-dataset <id>]`; `dataset manifest <dataset>` | Bounded immutable dataset inventory or one manifest. |
 | `dataset build <request> --confirm`; `feature build <request> --confirm` | CLI-owned confined typed point-in-time dataset request and immutable publication. |
@@ -96,8 +96,12 @@ path-free Parquet artifact reference with `artifactId`, `sha256`, `byteCount`, `
 | `portfolio holdings --account <id>`; `portfolio transactions --account <id>` | Bounded current holdings or normalized transactions. |
 | `portfolio performance <request>`; `portfolio exposure <request>`; `portfolio risk <request>` | Confined typed point-in-time request object. |
 | `backtest run <request> --confirm`; `backtest show <run>` | CLI-owned governed-input registration followed by a bounded backtest request, or one result. |
-| `bot status`; `bot start --confirm [--provider <coinbase|coinbase-direct|kraken>] [--provider-session-id <UUID>] [--seconds <n>] [--initial-cash <decimal>] [--fee-basis-points <n>]`; `bot stop --reason <text> --confirm` | Paper lifecycle. The provider defaults to `coinbase`, cash to `100000`, and fee basis points to `100`; `coinbase-direct` requires its exact active session. A timed/interactive start stops through the typed `Bot.Stop` path. |
-| `execution orders`; `execution fills`; `execution cancel <order> --confirm`; `execution reconcile --confirm` | Paper order/fill reads and risk-mediated cancel/reconciliation. |
+| `bot status`; `bot preparation` | Current paper state or available market, virtual-cash, trading-cost and practice-mode choices. Choices come from the service; none is silently selected. |
+| `bot prepare --market-choice <token> --cash-choice <token> --cost-choice <token> --mode-choice <token>` | Prepare the exact selected session and return its short-lived confirmation token. |
+| `bot start --confirmation-token <token> --confirm [--seconds <n>]`; `bot stop --reason <text> --confirm` | Start the reviewed session or stop it. A timed/interactive start remains attached and stops through `Bot.Stop` when its time expires or it is interrupted. |
+| `execution targets [--analysis-action-token <UUID>]` | List eligible active plans, or open one original saved recommendation for paper practice. Expired or unavailable evidence cannot authorize an order. |
+| `execution prepare-manual <request>`; `execution submit-manual --confirmation-token <token> --confirm` | Prepare explicit trade choices, review their original recommendation and safeguards, then submit the exact one-use draft. |
+| `execution orders`; `execution fills`; `execution cancel <action-token> --confirm` | Paper order/fill reads and risk-mediated cancellation using the returned action token. |
 | `fair-value list`; `fair-value measure <request> --confirm`; `fair-value classify <measurement> --confirm`; `fair-value explain <measurement>`; `fair-value evidence <measurement>` | Bounded evidence-bound fair-value workflow. |
 | `fair-value approval-status <measurement> --at <RFC3339>` | Approval/revocation state at one exact time. |
 | `fair-value approve <measurement> --decision <id> --reviewer <id> --approved-at <RFC3339> --expires-at <RFC3339> --confirm` | Controlled review approval. |

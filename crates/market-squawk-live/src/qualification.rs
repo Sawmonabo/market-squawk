@@ -100,7 +100,7 @@ pub struct CommittedQualifiedMarketObservation {
 /// Only the instrument-owned runtime can construct this value. It retains the complete canonical
 /// event and qualification assessment but carries no execution authority, action gate, or price
 /// eligibility projection.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct CommittedResearchMarketObservation {
     event: MarketEvent,
     assessment: QualificationAssessment,
@@ -108,6 +108,8 @@ pub struct CommittedResearchMarketObservation {
     committed_state_revision: u64,
     generation: ConnectionGeneration,
     source_coordinate: CommittedResearchSourceCoordinate,
+    provider_identity: market_squawk_sources::CurrentProviderIdentity,
+    source_authority: market_squawk_sources::CurrentSourceAuthorityLease,
     stable_trade_id: Option<SourceIdentifier>,
 }
 
@@ -125,7 +127,10 @@ impl CommittedResearchSourceCoordinate {
         row_ordinal: usize,
         row_count: usize,
     ) -> Option<Self> {
-        if row_count == 0 || row_ordinal >= row_count {
+        if row_count == 0
+            || row_count > market_squawk_sources::MAX_DECODED_EVENTS
+            || row_ordinal >= row_count
+        {
             return None;
         }
         Some(Self {
@@ -168,6 +173,29 @@ impl CommittedResearchSourceCoordinate {
 }
 
 impl CommittedResearchMarketObservation {
+    /// Returns exact replayable selection evidence; it cannot mint live authority.
+    pub fn native_identity_selection(
+        &self,
+    ) -> &market_squawk_sources::ProviderIdentitySelectionEvidence {
+        self.provider_identity.evidence()
+    }
+
+    /// Returns the catalog-selected identity retained through the actual live commit.
+    pub const fn provider_identity(&self) -> &market_squawk_sources::CurrentProviderIdentity {
+        &self.provider_identity
+    }
+
+    /// Returns the current source authority retained through the actual live commit.
+    pub const fn source_authority(&self) -> &market_squawk_sources::CurrentSourceAuthorityLease {
+        &self.source_authority
+    }
+
+    /// Rechecks source and catalog currentness before publication, using the source's sealed clock.
+    pub fn validate_at(&self, at: Timestamp) -> Result<(), market_squawk_sources::RegistryError> {
+        self.source_authority
+            .validate_provider_identity_at(&self.provider_identity, at)
+    }
+
     pub(crate) fn from_committed(
         event: MarketEvent,
         assessment: QualificationAssessment,
@@ -175,6 +203,8 @@ impl CommittedResearchMarketObservation {
         committed_state_revision: u64,
         generation: ConnectionGeneration,
         source_evidence: CurrentObservationEvidence,
+        provider_identity: market_squawk_sources::CurrentProviderIdentity,
+        source_authority: market_squawk_sources::CurrentSourceAuthorityLease,
         row_ordinal: usize,
         row_count: usize,
         stable_trade_id: Option<SourceIdentifier>,
@@ -183,6 +213,17 @@ impl CommittedResearchMarketObservation {
         if assessment.recorded_quality() != DataQuality::DirectUnverified
             || provenance.binding() != assessment.binding()
             || provenance.connection_generation() != generation
+            || !source_evidence
+                .binding()
+                .shares_allocation_with(source_authority.binding())
+            || source_evidence.binding().connection_generation() != generation
+            || assessment.binding().instrument_id()
+                != Some(provider_identity.evidence().native.instrument)
+            || assessment.binding().venue_id() != &provider_identity.evidence().native.venue
+            || assessment.binding().source_id() != provider_identity.source_id()
+            || source_authority
+                .validate_provider_identity_at(&provider_identity, provenance.ingested_at())
+                .is_err()
         {
             return None;
         }
@@ -195,6 +236,8 @@ impl CommittedResearchMarketObservation {
             committed_state_revision,
             generation,
             source_coordinate,
+            provider_identity,
+            source_authority,
             stable_trade_id,
         })
     }
@@ -256,13 +299,15 @@ impl CommittedResearchMarketObservation {
             committed_state_revision: self.committed_state_revision,
             generation: self.generation,
             source_coordinate: self.source_coordinate,
+            provider_identity: self.provider_identity,
+            source_authority: self.source_authority,
             stable_trade_id: self.stable_trade_id,
         }
     }
 }
 
 /// Owned parts of one consumed research-only committed observation.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct CommittedResearchMarketObservationParts {
     pub event: MarketEvent,
     pub assessment: QualificationAssessment,
@@ -270,6 +315,8 @@ pub struct CommittedResearchMarketObservationParts {
     pub committed_state_revision: u64,
     pub generation: ConnectionGeneration,
     pub source_coordinate: CommittedResearchSourceCoordinate,
+    pub provider_identity: market_squawk_sources::CurrentProviderIdentity,
+    pub source_authority: market_squawk_sources::CurrentSourceAuthorityLease,
     pub stable_trade_id: Option<SourceIdentifier>,
 }
 
@@ -294,7 +341,12 @@ impl CommittedQualifiedMarketObservation {
                 bid: value.bid(),
                 ask: value.ask(),
             },
-            (MarketEvent::BookSnapshot(_), _)
+            (MarketEvent::MarketDataTrade(_), _)
+            | (MarketEvent::MarketDataQuote(_), _)
+            | (MarketEvent::MarketDataBook(_), _)
+            | (MarketEvent::MarketDataChart(_), _)
+            | (MarketEvent::MarketDataScreener(_), _)
+            | (MarketEvent::BookSnapshot(_), _)
             | (MarketEvent::BookDelta(_), _)
             | (MarketEvent::Auction(_), _)
             | (MarketEvent::TradingHalt(_), _)
@@ -306,7 +358,7 @@ impl CommittedQualifiedMarketObservation {
         let provenance = event_provenance(&event);
         let binding = assessment.binding();
         if provenance.binding() != binding
-            || execution_terms.instrument_id() != binding.instrument_id()
+            || binding.instrument_id() != Some(execution_terms.instrument_id())
         {
             return None;
         }
@@ -333,7 +385,7 @@ impl CommittedQualifiedMarketObservation {
 
     /// Returns the stable instrument identity.
     pub const fn instrument_id(&self) -> InstrumentId {
-        self.assessment.binding().instrument_id()
+        self.execution_terms.instrument_id()
     }
 
     /// Returns the source-native observation identity.
@@ -443,6 +495,11 @@ fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
     match event {
         MarketEvent::Trade(value) => value.provenance(),
         MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::MarketDataQuote(value) => value.provenance(),
+        MarketEvent::MarketDataTrade(value) => value.provenance(),
+        MarketEvent::MarketDataBook(value) => value.provenance(),
+        MarketEvent::MarketDataChart(value) => value.provenance(),
+        MarketEvent::MarketDataScreener(value) => value.provenance(),
         MarketEvent::BookSnapshot(value) => value.provenance(),
         MarketEvent::BookDelta(value) => value.provenance(),
         MarketEvent::Auction(value) => value.provenance(),
@@ -461,7 +518,7 @@ pub(crate) fn build_qualified_event<F>(
 where
     F: FnOnce(LiveProvenance) -> Result<MarketEvent, MarketEventError>,
 {
-    current.current_lease().validate_at(evaluated_at)?;
+    current.validate_at(evaluated_at)?;
     let observation = current.observation();
     let stable_trade_id = match observation.payload() {
         market_squawk_sources::ProviderObservationPayload::Trade { trade_id, .. } => {
@@ -526,10 +583,13 @@ where
     let binding_digest = digest_execution_binding(
         &binding,
         source_evidence.coordinate_digest(),
+        current.provider_identity().evidence().selection_digest,
+        current.row_ordinal(),
+        current.row_count(),
         evidence.state_revision,
-    );
+    )?;
     let assessment_id =
-        QualificationAssessmentId::new(digest_identifier("live-v2-", binding_digest)?);
+        QualificationAssessmentId::new(digest_identifier("live-v3-", binding_digest)?);
     let source_policy = SourcePolicyAssessment::new(
         policy.quality_ceiling(),
         integrity_capabilities(policy.protocol()),
@@ -727,10 +787,16 @@ fn snapshot_evidence(
 fn digest_execution_binding(
     binding: &LiveEvidenceBinding,
     source_coordinate: EvidenceDigest,
+    provider_selection: EvidenceDigest,
+    row_ordinal: usize,
+    row_count: usize,
     state_revision: u64,
-) -> [u8; 32] {
+) -> Result<[u8; 32], BindingError> {
+    let instrument_id = binding
+        .instrument_id()
+        .ok_or(BindingError::InvalidEventScope)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"MSQKLIVEEXECUTIONBINDING\x02");
+    hasher.update(b"MSQKLIVEEXECUTIONBINDING\x03");
     digest_component(&mut hasher, binding.source_id().as_str().as_bytes());
     digest_component(&mut hasher, binding.session_id().as_str().as_bytes());
     digest_component(
@@ -750,7 +816,7 @@ fn digest_execution_binding(
             .as_bytes(),
     );
     digest_component(&mut hasher, binding.venue_id().as_str().as_bytes());
-    hasher.update(binding.instrument_id().as_uuid().as_bytes());
+    hasher.update(instrument_id.as_uuid().as_bytes());
     hasher.update(binding.connection_generation().get().to_be_bytes());
     digest_component(
         &mut hasher,
@@ -783,8 +849,13 @@ fn digest_execution_binding(
         hasher.update([0]);
     }
     digest_evidence(&mut hasher, source_coordinate);
+    digest_evidence(&mut hasher, provider_selection);
+    let row_ordinal = u64::try_from(row_ordinal).map_err(|_| BindingError::InvalidEventScope)?;
+    let row_count = u64::try_from(row_count).map_err(|_| BindingError::InvalidEventScope)?;
+    hasher.update(row_ordinal.to_be_bytes());
+    hasher.update(row_count.to_be_bytes());
     hasher.update(state_revision.to_be_bytes());
-    hasher.finalize().into()
+    Ok(hasher.finalize().into())
 }
 
 const fn market_depth_tag(depth: market_squawk_domain::MarketDepth) -> u8 {
@@ -819,6 +890,8 @@ const fn event_class_tag(event_class: market_squawk_domain::LiveEventClass) -> u
         market_squawk_domain::LiveEventClass::TradingHalt => 6,
         market_squawk_domain::LiveEventClass::InstrumentStatus => 7,
         market_squawk_domain::LiveEventClass::CorporateAction => 8,
+        market_squawk_domain::LiveEventClass::Chart => 9,
+        market_squawk_domain::LiveEventClass::Screener => 10,
     }
 }
 

@@ -10,12 +10,11 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_data::{
-    InstrumentDefinitionReadCapability, ListingReferenceReadCapability,
-    MarketDataInstrumentReadCapability,
+    ListingReferenceReadCapability, MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+    OfficialIssuerInstrumentReference,
 };
-use market_squawk_domain::{AssetClass, InstrumentDefinition, ProviderIdentityRecord, Timestamp};
+use market_squawk_domain::{AssetClass, ProviderIdentityRecord, Timestamp, VenueId};
 use market_squawk_services::ServiceError;
-use market_squawk_sources::SourceMetadata;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -25,11 +24,12 @@ use crate::{
         PreparedSchwabMarketRuntimeResolver,
     },
     provider_activation::{
-        BoundedMarketInstrumentSet, MarketDataInstrumentBinding, MarketInstrumentBinding,
-        MarketInstrumentReferenceBinding, MarketReferenceIdentityApprovalV1,
-        MarketReferenceIdentityAuthority, MarketReferenceIdentityRequest,
-        MarketReferenceIdentityResolution, MarketSubscriptionPriority,
-        PreparedSchwabMarketRuntimeStart,
+        MarketDataInstrumentBinding, MarketInstrumentReferenceBinding,
+        MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
+        MarketReferenceIdentityRequest, MarketReferenceIdentityResolution,
+        MarketSubscriptionPriority, PreparedSchwabMarketRuntimeStart,
+        SchwabMarketDataAccountActivation,
+        SchwabQuoteReferenceBinding,
         nasdaq_reference::{NasdaqListingKey, NasdaqReferenceUniverseService},
     },
 };
@@ -37,7 +37,6 @@ use crate::{
 use super::cli_provider::ProviderResearchActivationService;
 
 const MAXIMUM_SCHWAB_INSTRUMENTS: usize = 50;
-const MAXIMUM_EXACT_LISTING_MATCHES: usize = 16;
 
 pub(super) struct ProductionSchwabMarketRuntimeResolver {
     onboarding: Arc<ProviderOnboardingService>,
@@ -45,7 +44,6 @@ pub(super) struct ProductionSchwabMarketRuntimeResolver {
     nasdaq: Arc<NasdaqReferenceUniverseService>,
     reference_identity: MarketReferenceIdentityAuthority,
     listing_reference: Option<ListingReferenceReadCapability>,
-    instrument_definitions: InstrumentDefinitionReadCapability,
     market_data_instruments: MarketDataInstrumentReadCapability,
     portal: OnceLock<Arc<ProviderResearchActivationService>>,
     accepting: AtomicBool,
@@ -68,7 +66,6 @@ impl ProductionSchwabMarketRuntimeResolver {
             ),
             listing_reference: nasdaq.listing_reference_reader(),
             nasdaq,
-            instrument_definitions: research.instrument_definitions(),
             market_data_instruments,
             portal: OnceLock::new(),
             accepting: AtomicBool::new(true),
@@ -84,148 +81,148 @@ impl ProductionSchwabMarketRuntimeResolver {
             .map_err(|_| ServiceError::InvalidRequest)
     }
 
+    async fn bootstrap_instrument_references(
+        &self,
+        activation: &SchwabMarketDataAccountActivation,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<MarketDataInstrumentRecord>, ServiceError> {
+        let reader = self
+            .listing_reference
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        let mut records = Vec::new();
+        for issuer in OfficialIssuerInstrumentReference::predeclared_benchmarks().map_err(|_| ServiceError::InvalidResult)? {
+            ensure_before(&self.accepting, deadline, cancellation)?;
+            let key = NasdaqListingKey::new(
+                market_squawk_domain::ProviderInstrumentId::try_from(issuer.symbol().as_str())
+                    .map_err(|_| ServiceError::Internal)?,
+                issuer.venue().clone(),
+            );
+            let listings = self
+                .nasdaq
+                .selected_current_listings(&[key], deadline, cancellation)
+                .await
+                .map_err(|_| request_state_error(deadline, cancellation))?;
+            if listings.len() != 1 {
+                return Err(ServiceError::Unavailable);
+            }
+            let listing = reader
+                .exact_current(issuer.symbol().as_str(), issuer.venue(), deadline, cancellation)
+                .map_err(|_| request_state_error(deadline, cancellation))?
+                .ok_or(ServiceError::Unavailable)?;
+            let at = system_timestamp()?;
+            let existing = self
+                .market_data_instruments
+                .resolve_exact_as_of(issuer.cusip().as_str(), at, at, deadline, cancellation)
+                .map_err(|_| request_state_error(deadline, cancellation))?;
+            if existing.has_more() || existing.matches().len() > 1 {
+                return Err(ServiceError::Unavailable);
+            }
+            let expected = existing
+                .matches()
+                .first()
+                .map(|matched| matched.record().clone());
+            let record = self
+                .provider_activation
+                .publish_schwab_instrument_reference(
+                    activation,
+                    &issuer,
+                    listing,
+                    expected,
+                    deadline,
+                    cancellation.child_token(),
+                )
+                .await?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     async fn resolve_bindings(
         &self,
-        metadata: &SourceMetadata,
+        records: Vec<MarketDataInstrumentRecord>,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<ResolvedSchwabBindings, ServiceError> {
         ensure_before(&self.accepting, deadline, cancellation)?;
-        let instrument_ids = metadata.coverage().instruments().instruments();
-        if instrument_ids.is_empty() || instrument_ids.len() > MAXIMUM_SCHWAB_INSTRUMENTS {
+        if records.is_empty() || records.len() > MAXIMUM_SCHWAB_INSTRUMENTS {
             return Err(ServiceError::Unavailable);
         }
-        let definitions = self
-            .instrument_definitions
-            .latest(
-                instrument_ids,
-                MAXIMUM_SCHWAB_INSTRUMENTS,
-                deadline,
-                cancellation,
-            )
-            .map_err(|error| {
-                tracing::warn!(%error, "canonical Schwab instrument definitions are unavailable");
-                request_state_error(deadline, cancellation)
-            })?;
-        if definitions.len() != instrument_ids.len() {
-            return Err(ServiceError::Unavailable);
-        }
-        let evaluated_at = system_timestamp()?;
-        let mut strict = Vec::new();
+        let mut quotes = Vec::new();
         let mut display = Vec::new();
         let mut approvals = Vec::new();
-        strict
-            .try_reserve_exact(definitions.len())
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        display
-            .try_reserve_exact(definitions.len())
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        approvals
-            .try_reserve_exact(definitions.len())
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        let mut uses_listing_reference = false;
-        for definition in definitions {
+        let issuers = OfficialIssuerInstrumentReference::predeclared_benchmarks().map_err(|_| ServiceError::InvalidResult)?;
+        let reader = self
+            .listing_reference
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        for record in records {
             ensure_before(&self.accepting, deadline, cancellation)?;
-            let provider_identity = exact_provider_identity(&definition, metadata, evaluated_at)?;
-            let market_data = self
-                .market_data_instruments
-                .latest(definition.instrument_id(), deadline, cancellation)
-                .map_err(|error| {
-                    tracing::warn!(%error, "canonical Schwab market-data identity is unavailable");
-                    request_state_error(deadline, cancellation)
-                })?
+            let at = system_timestamp()?;
+            let definition = record.definition();
+            let identity = exact_provider_identity(definition, at)?;
+            let issuer = issuers
+                .iter()
+                .find(|issuer| {
+                    issuer.symbol().as_str() == identity.provider_instrument_id().as_str()
+                })
                 .ok_or(ServiceError::Unavailable)?;
-            match definition.asset_class() {
-                AssetClass::Equity | AssetClass::Fund => {
-                    let listing_reader = self
-                        .listing_reference
-                        .as_ref()
-                        .ok_or(ServiceError::Unavailable)?;
-                    let (listing, official) = self
-                        .exact_current_listing(
-                            &definition,
-                            &provider_identity,
-                            listing_reader,
-                            deadline,
-                            cancellation,
-                        )
-                        .await?;
-                    let resolution = self
-                        .reference_identity
-                        .resolve(
-                            MarketReferenceIdentityRequest::new(
-                                listing.key().symbol().clone(),
-                                listing.key().mic().clone(),
-                            ),
-                            deadline,
-                            cancellation,
-                        )
-                        .await
-                        .map_err(|error| {
-                            tracing::warn!(%error, "Schwab reference identity approval failed");
-                            request_state_error(deadline, cancellation)
-                        })?;
-                    let MarketReferenceIdentityResolution::Available(approval) = resolution else {
-                        return Err(ServiceError::Unavailable);
-                    };
-                    display.push(
-                        MarketDataInstrumentBinding::try_from_nasdaq_session_listing(
-                            MarketSubscriptionPriority::Benchmark,
-                            market_data.clone(),
-                            listing.key().symbol().clone(),
-                            listing,
-                            &approval,
-                        )
-                        .map_err(|error| {
-                            tracing::warn!(%error, "Schwab display identity binding failed");
-                            ServiceError::InvalidResult
-                        })?,
-                    );
-                    strict.push(
-                        MarketInstrumentBinding::try_new_with_market_data_definition(
-                            MarketSubscriptionPriority::Benchmark,
-                            definition,
-                            provider_identity,
-                            MarketInstrumentReferenceBinding::NasdaqListing(official),
-                            market_data,
-                        )
-                        .map_err(|error| {
-                            tracing::warn!(%error, "Schwab execution identity binding failed");
-                            ServiceError::InvalidResult
-                        })?,
-                    );
-                    approvals.push(approval);
-                    uses_listing_reference = true;
-                }
-                AssetClass::Option | AssetClass::Index | AssetClass::Crypto => {
-                    let (strict_binding, display_binding) =
-                        exact_assigned_binding(definition, market_data, provider_identity)?;
-                    strict.push(strict_binding);
-                    display.push(display_binding);
-                }
-                AssetClass::FixedIncome
-                | AssetClass::Future
-                | AssetClass::ForeignExchange
-                | AssetClass::Commodity
-                | AssetClass::Cash => return Err(ServiceError::Unavailable),
+            if definition.asset_class() != AssetClass::Fund {
+                return Err(ServiceError::Unavailable);
             }
+            let (listing, official) = self
+                .exact_current_listing(&identity, issuer.venue(), reader, deadline, cancellation)
+                .await?;
+            let resolution = self
+                .reference_identity
+                .resolve(
+                    MarketReferenceIdentityRequest::new(
+                        listing.key().symbol().clone(),
+                        listing.key().mic().clone(),
+                    ),
+                    deadline,
+                    cancellation,
+                )
+                .await
+                .map_err(|_| request_state_error(deadline, cancellation))?;
+            let MarketReferenceIdentityResolution::Available(approval) = resolution else {
+                return Err(ServiceError::Unavailable);
+            };
+            display.push(
+                MarketDataInstrumentBinding::try_from_nasdaq_session_listing(
+                    MarketSubscriptionPriority::Benchmark,
+                    record.clone(),
+                    listing.key().symbol().clone(),
+                    listing,
+                    &approval,
+                )
+                .map_err(|_| ServiceError::InvalidResult)?,
+            );
+            quotes.push(
+                SchwabQuoteReferenceBinding::try_new(
+                    record,
+                    identity,
+                    MarketInstrumentReferenceBinding::NasdaqListing(official),
+                    MarketSubscriptionPriority::Benchmark,
+                    at,
+                )
+                .map_err(|_| ServiceError::InvalidResult)?,
+            );
+            approvals.push(approval);
         }
-        let strict = BoundedMarketInstrumentSet::try_new(strict).map_err(|error| {
-            tracing::warn!(%error, "bounded Schwab instrument set is invalid");
-            ServiceError::InvalidResult
-        })?;
         Ok(ResolvedSchwabBindings {
-            strict,
+            quotes,
             display,
             approvals,
-            uses_listing_reference,
+            uses_listing_reference: true,
         })
     }
 
     async fn exact_current_listing(
         &self,
-        definition: &InstrumentDefinition,
         provider_identity: &ProviderIdentityRecord,
+        venue: &VenueId,
         listing_reader: &ListingReferenceReadCapability,
         deadline: Instant,
         cancellation: &CancellationToken,
@@ -237,22 +234,7 @@ impl ProductionSchwabMarketRuntimeResolver {
         ServiceError,
     > {
         let symbol = provider_identity.provider_instrument_id();
-        let mut keys = Vec::new();
-        for mapping in definition
-            .venue_mappings()
-            .iter()
-            .filter(|mapping| mapping.venue_symbol().as_str() == symbol.as_str())
-        {
-            keys.push(NasdaqListingKey::new(
-                symbol.clone(),
-                mapping.venue_id().clone(),
-            ));
-        }
-        keys.sort();
-        keys.dedup();
-        if keys.is_empty() {
-            return Err(ServiceError::Unavailable);
-        }
+        let keys = [NasdaqListingKey::new(symbol.clone(), venue.clone())];
         let listings = self
             .nasdaq
             .selected_current_listings(&keys, deadline, cancellation)
@@ -268,31 +250,13 @@ impl ProductionSchwabMarketRuntimeResolver {
             .into_iter()
             .next()
             .ok_or(ServiceError::Unavailable)?;
-        let page = listing_reader
-            .search(
-                symbol.as_str(),
-                MAXIMUM_EXACT_LISTING_MATCHES,
-                deadline,
-                cancellation,
-            )
+        let official = listing_reader
+            .exact_current(symbol.as_str(), listing.key().mic(), deadline, cancellation)
             .map_err(|error| {
                 tracing::warn!(%error, "durable Schwab listing reference is unavailable");
                 request_state_error(deadline, cancellation)
-            })?;
-        if page.has_more() {
-            return Err(ServiceError::Unavailable);
-        }
-        let mut matches = page.matches().iter().filter(|matched| {
-            matched.record().provider_symbol() == symbol.as_str()
-                && matched.record().listing_venue() == listing.key().mic()
-        });
-        let official = matches
-            .next()
-            .map(|matched| matched.record().clone())
+            })?
             .ok_or(ServiceError::Unavailable)?;
-        if matches.next().is_some() {
-            return Err(ServiceError::Unavailable);
-        }
         Ok((listing, official))
     }
 }
@@ -324,20 +288,6 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
         {
             return Err(ServiceError::InvalidRequest);
         }
-        let profile =
-            market_squawk_domain::SourceIdentifier::try_from(request.surface().surface_id())
-                .map_err(|_| ServiceError::Internal)?;
-        let generation = self
-            .provider_activation
-            .research_runtime_generation(&profile)
-            .map_err(|error| {
-                tracing::warn!(%error, "registered Schwab research generation is unavailable");
-                ServiceError::Unavailable
-            })?
-            .ok_or(ServiceError::Unavailable)?;
-        let resolved = self
-            .resolve_bindings(generation.metadata(), deadline, &cancellation)
-            .await?;
         let portal = self.portal.get().ok_or(ServiceError::Unavailable)?;
         let oauth = portal
             .schwab_market_authority(request.onboarding_session_id(), cancellation.child_token())
@@ -354,6 +304,45 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
                 tracing::warn!(%error, "Schwab market-data account activation failed");
                 request_state_error(deadline, &cancellation)
             })?;
+        let activation = Arc::new(activation);
+        let records = self
+            .bootstrap_instrument_references(&activation, deadline, &cancellation)
+            .await?;
+        let resolved = self
+            .resolve_bindings(records, deadline, &cancellation)
+            .await?;
+        let streamer_admitted = activation
+            .doctor_receipt()
+            .observation()
+            .families
+            .iter()
+            .any(|family| {
+                family.family == market_squawk_sources::SchwabMarketDataFamily::LevelOneEquities
+                    && matches!(
+                        family.disposition,
+                        market_squawk_sources::RuntimeCapabilityDisposition::Available
+                            | market_squawk_sources::RuntimeCapabilityDisposition::Degraded
+                    )
+            });
+        if streamer_admitted {
+            return self
+                .provider_activation
+                .prepare_schwab_streamer_market_runtime_start(
+                    activation,
+                    resolved.quotes,
+                    resolved.display,
+                    resolved.approvals,
+                    self.market_data_instruments.clone(),
+                    self.listing_reference.clone(),
+                    deadline,
+                    cancellation,
+                )
+                .await;
+        }
+        let generation = self
+            .provider_activation
+            .register_schwab_quote_generation(&activation, &resolved.quotes)
+            .await?;
         let reference_identity = resolved
             .uses_listing_reference
             .then_some(self.reference_identity.clone());
@@ -363,11 +352,13 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
             None
         };
         let preparation_cancellation = cancellation.clone();
-        self.provider_activation
+        let retained_generation = generation.clone();
+        let prepared = self
+            .provider_activation
             .prepare_schwab_market_runtime_start(
                 activation,
                 generation,
-                resolved.strict,
+                resolved.quotes,
                 resolved.display,
                 reference_identity,
                 listing_reference,
@@ -379,7 +370,14 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
             .map_err(|error| {
                 tracing::warn!(%error, "Schwab market runtime preparation failed");
                 request_state_error(deadline, &preparation_cancellation)
-            })
+            });
+        if prepared.is_err() {
+            self.provider_activation
+                .revoke_research_runtime(&retained_generation)
+                .await
+                .map_err(|_| ServiceError::Unavailable)?;
+        }
+        prepared
     }
 
     fn begin_shutdown(&self) {
@@ -396,19 +394,18 @@ impl PreparedSchwabMarketRuntimeResolver for ProductionSchwabMarketRuntimeResolv
 }
 
 struct ResolvedSchwabBindings {
-    strict: BoundedMarketInstrumentSet,
+    quotes: Vec<SchwabQuoteReferenceBinding>,
     display: Vec<MarketDataInstrumentBinding>,
     approvals: Vec<MarketReferenceIdentityApprovalV1>,
     uses_listing_reference: bool,
 }
 
 fn exact_provider_identity(
-    definition: &InstrumentDefinition,
-    metadata: &SourceMetadata,
+    definition: &market_squawk_domain::MarketDataInstrumentDefinition,
     at: Timestamp,
 ) -> Result<ProviderIdentityRecord, ServiceError> {
     let mut exact = definition.provider_identities().iter().filter(|identity| {
-        identity.source_id() == metadata.source_id()
+        identity.source_id().as_str() == "schwab-trader-api-instruments"
             && definition.provider_identity_at(
                 identity.source_id(),
                 identity.provider_instrument_id(),
@@ -420,35 +417,6 @@ fn exact_provider_identity(
         return Err(ServiceError::Unavailable);
     }
     Ok(identity)
-}
-
-fn exact_assigned_binding(
-    definition: InstrumentDefinition,
-    market_data: market_squawk_data::MarketDataInstrumentRecord,
-    provider_identity: ProviderIdentityRecord,
-) -> Result<(MarketInstrumentBinding, MarketDataInstrumentBinding), ServiceError> {
-    let mut selected = None;
-    for identifier in definition.identifiers() {
-        let strict = MarketInstrumentBinding::try_new_with_market_data_definition(
-            MarketSubscriptionPriority::Benchmark,
-            definition.clone(),
-            provider_identity.clone(),
-            MarketInstrumentReferenceBinding::AssignedExternalIdentifier(identifier.clone()),
-            market_data.clone(),
-        );
-        let display = MarketDataInstrumentBinding::try_from_assigned_identifier(
-            MarketSubscriptionPriority::Benchmark,
-            market_data.clone(),
-            provider_identity.provider_instrument_id().clone(),
-            identifier.clone(),
-        );
-        if let (Ok(strict), Ok(display)) = (strict, display) {
-            if selected.replace((strict, display)).is_some() {
-                return Err(ServiceError::Unavailable);
-            }
-        }
-    }
-    selected.ok_or(ServiceError::Unavailable)
 }
 
 fn ensure_before(

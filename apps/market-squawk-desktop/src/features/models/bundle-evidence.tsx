@@ -78,8 +78,16 @@ export function BundleEvidence({
         <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-2 xl:grid-cols-3">
           <Fact
             label="Training period"
-            value={`${formatTimestamp(model.training.observedFromUnixNanos)} through ${formatTimestamp(model.training.observedThroughUnixNanos)}`}
+            value={formatTrainingPeriod(model.training.period)}
           />
+          {model.training.studyBasis ? (
+            <Fact
+              label="Training source basis"
+              value={model.training.studyBasis === "historical_as_known"
+                ? "Information known at the historical cutoff"
+                : "Retrospective frozen source snapshot"}
+            />
+          ) : null}
           <Fact
             label="Information available by"
             value={formatTimestamp(model.training.availableAtUnixNanos)}
@@ -165,6 +173,15 @@ export function BundleEvidence({
       </p>
     </section>
   )
+}
+
+function formatTrainingPeriod(period: ModelEvidence["training"]["period"]): string {
+  if (period.kind === "exact_time") {
+    return `${formatTimestamp(period.startUnixNanos)} through ${formatTimestamp(period.endUnixNanos)}`
+  }
+  const calendar = (value: typeof period.start) =>
+    `${value.year.toString().padStart(4, "0")}-${value.month.toString().padStart(2, "0")}-${value.day.toString().padStart(2, "0")}`
+  return `${calendar(period.start)} through ${calendar(period.end)} (fiscal dates)`
 }
 
 function EvidenceNotice({ text }: { text: string }) {

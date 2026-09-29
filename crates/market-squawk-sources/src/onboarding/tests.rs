@@ -304,6 +304,52 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         Some((1, 60_000_000_000))
     );
 
+    let eia = profiles.get("eia.api-v2").ok_or("missing EIA profile")?;
+    assert_eq!(eia.release_state(), ProfileReleaseState::RightsLimited);
+    assert_eq!(
+        eia.activation_mode(),
+        ProfileActivationMode::ManualSecretImport
+    );
+    assert_eq!(eia.capability().revision().get(), 1);
+    assert_eq!(
+        eia.capability_history()
+            .map(|capability| capability.revision().get())
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(eia.capability().credential_kind(), CredentialKind::ApiKey);
+    assert_eq!(eia.probe().transport(), ProbeTransport::HttpGet);
+    assert_eq!(
+        eia.probe().endpoint(),
+        Some("https://api.eia.gov/v2/electricity/retail-sales/data/")
+    );
+    assert_eq!(
+        eia.capability().verifier_revision().as_str(),
+        "eia.api-v2.probe.v1"
+    );
+    assert_eq!(
+        eia.capability()
+            .rate_policy()
+            .enforcement_revision()
+            .map(ProviderCapabilityRevision::get),
+        Some(1)
+    );
+    let eia_budget = eia
+        .capability()
+        .rate_policy()
+        .enforcement_policy()
+        .ok_or("missing EIA budget")?;
+    assert_eq!(eia_budget.max_concurrent(), 1);
+    assert_eq!(
+        eia_budget
+            .window(0)
+            .map(|window| (window.requests_per_window(), window.window_nanos())),
+        Some((1, 1_000_000_000))
+    );
+    assert!(eia.capability().evidence().iter().any(|binding| {
+        binding.source_id().as_str() == "MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11"
+    }));
+
     for (profile_id, activation, release, setup, credential, coverage_marker, windows) in [
         (
             "yahoo-finance.experimental-enrichment",
@@ -353,20 +399,11 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "census.data-api",
             ProfileActivationMode::ManualSecretImport,
-            ProfileReleaseState::RefreshRequired,
+            ProfileReleaseState::RightsLimited,
             SetupMode::ManualApiKeyImport,
             CredentialKind::ApiKey,
-            "400 requests per day",
+            "400 per day",
             &[(1, 1_000_000_000), (400, 86_400_000_000_000)][..],
-        ),
-        (
-            "eia.api-v2",
-            ProfileActivationMode::ManualSecretImport,
-            ProfileReleaseState::RefreshRequired,
-            SetupMode::ManualApiKeyImport,
-            CredentialKind::ApiKey,
-            "5,000-row maximum",
-            &[(1, 1_000_000_000)][..],
         ),
         (
             "tiingo.starter-eod-nav",
@@ -1239,12 +1276,12 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     assert_eq!(
         bls.window(0)
             .map(|window| (window.requests_per_window(), window.window_nanos())),
-        Some((50, 10_000_000_000))
+        Some((1, 1_000_000_000))
     );
     assert_eq!(
         bls.window(1)
             .map(|window| (window.requests_per_window(), window.window_nanos())),
-        Some((500, 86_400_000_000_000))
+        Some((400, 86_400_000_000_000))
     );
 
     let fred = profiles

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::DecisionApplicationError;
 use super::common::content_digest;
+use super::proposal::RequiredOption;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +50,10 @@ impl InvestmentAnalysisPublicationWire {
 
     pub(super) fn analysis_id(&self) -> [u8; 32] {
         self.analysis_id
+    }
+
+    pub(super) fn workflow_id(&self) -> &SourceIdentifier {
+        &self.workflow.workflow_id
     }
 
     pub(super) fn decode(
@@ -255,7 +260,7 @@ impl InvestmentSizingProjectionWire {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct InvestmentSizingInputsWire {
+pub(super) struct InvestmentSizingInputsWire {
     evaluated_at: Timestamp,
     execution_terms: InstrumentExecutionTerms,
     selected_mark: Money,
@@ -282,7 +287,7 @@ impl From<&InvestmentSizingInputs> for InvestmentSizingInputsWire {
 }
 
 impl InvestmentSizingInputsWire {
-    fn decode(self) -> Result<InvestmentSizingInputs, DecisionApplicationError> {
+    pub(super) fn decode(self) -> Result<InvestmentSizingInputs, DecisionApplicationError> {
         Ok(InvestmentSizingInputs::new(
             self.evaluated_at,
             self.execution_terms,
@@ -303,7 +308,8 @@ struct CandidatePortfolioSizingStateWire {
     instrument_id: InstrumentId,
     portfolio_revision: [u8; 32],
     marked_equity_at_selected_mark: Money,
-    settlement_available_cash: Money,
+    #[serde(deserialize_with = "RequiredOption::deserialize")]
+    settlement_available_cash: RequiredOption<Money>,
     current_lots: i64,
 }
 
@@ -314,7 +320,7 @@ impl From<&CandidatePortfolioSizingState> for CandidatePortfolioSizingStateWire 
             instrument_id: value.instrument_id(),
             portfolio_revision: value.portfolio_revision().bytes(),
             marked_equity_at_selected_mark: value.marked_equity_at_selected_mark(),
-            settlement_available_cash: value.settlement_available_cash(),
+            settlement_available_cash: RequiredOption(value.settlement_available_cash()),
             current_lots: value.current_lots().get(),
         }
     }
@@ -322,14 +328,25 @@ impl From<&CandidatePortfolioSizingState> for CandidatePortfolioSizingStateWire 
 
 impl CandidatePortfolioSizingStateWire {
     fn decode(self) -> Result<CandidatePortfolioSizingState, DecisionApplicationError> {
-        CandidatePortfolioSizingState::try_new(
-            self.account_id,
-            self.instrument_id,
-            PortfolioRevisionToken::from_bytes(self.portfolio_revision),
-            self.marked_equity_at_selected_mark,
-            self.settlement_available_cash,
-            QuantityLots::new(self.current_lots).map_err(invalid_state)?,
-        )
+        let revision = PortfolioRevisionToken::from_bytes(self.portfolio_revision);
+        let lots = QuantityLots::new(self.current_lots).map_err(invalid_state)?;
+        match self.settlement_available_cash.0 {
+            Some(cash) => CandidatePortfolioSizingState::try_new(
+                self.account_id,
+                self.instrument_id,
+                revision,
+                self.marked_equity_at_selected_mark,
+                cash,
+                lots,
+            ),
+            None => CandidatePortfolioSizingState::try_without_settlement_cash(
+                self.account_id,
+                self.instrument_id,
+                revision,
+                self.marked_equity_at_selected_mark,
+                lots,
+            ),
+        }
         .map_err(invalid_state)
     }
 }
@@ -459,6 +476,7 @@ impl SizingCapacityEvidenceWire {
     deny_unknown_fields
 )]
 enum CapacityRangeWire {
+    NoFeasibleLots,
     Lots { lower: i64, upper: i64 },
     Notional { lower: Money, upper: Money },
 }
@@ -466,6 +484,7 @@ enum CapacityRangeWire {
 impl From<CapacityRange> for CapacityRangeWire {
     fn from(value: CapacityRange) -> Self {
         match value {
+            CapacityRange::NoFeasibleLots => Self::NoFeasibleLots,
             CapacityRange::Lots(value) => Self::Lots {
                 lower: value.lower().get(),
                 upper: value.upper().get(),
@@ -481,6 +500,7 @@ impl From<CapacityRange> for CapacityRangeWire {
 impl CapacityRangeWire {
     fn decode(self) -> Result<CapacityRange, DecisionApplicationError> {
         match self {
+            Self::NoFeasibleLots => Ok(CapacityRange::NoFeasibleLots),
             Self::Lots { lower, upper } => Ok(CapacityRange::Lots(
                 LotRange::try_new(
                     QuantityLots::new(lower).map_err(invalid_state)?,

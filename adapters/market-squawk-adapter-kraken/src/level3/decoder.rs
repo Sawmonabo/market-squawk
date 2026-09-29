@@ -25,6 +25,7 @@ use super::messages::{
     EnvelopeKind, Heartbeat, Level3Envelope, Pong, SnapshotData, SnapshotOrder, StatusEnvelope,
     SubscribeAck, UpdateData, UpdateOrder, WireError, classify, ensure_array_bound, exact_decimal,
 };
+use crate::config::KRAKEN_PROVIDER;
 use crate::handoff::{
     KrakenAuthenticatedDiscontinuity, KrakenConnectionBinding, KrakenControlOrDiscontinuityKind,
     KrakenDiscontinuityScope, KrakenGenerationRetirement, KrakenInstrumentBinding,
@@ -520,8 +521,7 @@ impl KrakenL3Decoder {
                 .iter()
                 .zip(expected_products)
                 .any(|(binding, product)| {
-                    binding.native_symbol() != &product.symbol
-                        || binding.externally_resolved_instrument() != product.instrument
+                    !binding_matches_product(binding, &product.symbol, product.instrument)
                         || product.subscribed
                         || product.sent_subscription_request.is_some()
                 })
@@ -1254,8 +1254,7 @@ impl KrakenL3Decoder {
             || request.depth() != self.depth
             || !request.snapshot()
             || !request.instrument_bindings().iter().any(|binding| {
-                binding.native_symbol() == &product.symbol
-                    && binding.externally_resolved_instrument() == product.instrument
+                binding_matches_product(binding, &product.symbol, product.instrument)
             })
         {
             return Err(KrakenL3DecodeError::SubscriptionRejected);
@@ -1365,6 +1364,23 @@ impl KrakenL3Decoder {
             }
         }
     }
+}
+
+fn binding_matches_product(
+    binding: &KrakenInstrumentBinding,
+    symbol: &SourceIdentifier,
+    instrument: market_squawk_domain::InstrumentId,
+) -> bool {
+    binding.native_symbol() == symbol
+        && binding.provider_identity_key().source_id().as_str() == KRAKEN_PROVIDER
+        && binding
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str()
+            == symbol.as_str()
+        && binding.venue_mapping().venue_id().as_str() == KRAKEN_PROVIDER
+        && binding.venue_mapping().venue_symbol().as_str() == symbol.as_str()
+        && binding.externally_resolved_instrument() == instrument
 }
 
 fn parse_single<'a, T>(raw: &'a serde_json::value::RawValue) -> Result<T, KrakenL3DecodeError>

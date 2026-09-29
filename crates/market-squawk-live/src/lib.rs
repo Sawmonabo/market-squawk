@@ -1,6 +1,7 @@
 //! Deterministic instrument-owned live state and current execution authority.
 
 mod action;
+pub mod virtual_paper;
 mod authority;
 mod book;
 mod committed_research_export;

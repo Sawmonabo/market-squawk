@@ -77,6 +77,29 @@ pub(crate) async fn dashboard_query(
             arguments.insert("historyToken".to_owned(), json!(history_token));
             ("Market.GetHistory", arguments)
         }
+        DashboardQueryCommand::MarketSessionContext {
+            product,
+            date,
+            confirmed,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("product".to_owned(), json!(product));
+            arguments.insert("date".to_owned(), json!(date));
+            return invoke_narrow(
+                "Market.GetSessionContext",
+                arguments,
+                true,
+                confirmed,
+                &state,
+                &generation,
+            )
+            .await;
+        }
+        DashboardQueryCommand::MarketSessionRead { reference } => {
+            let mut arguments = Map::new();
+            arguments.insert("reference".to_owned(), json!(reference));
+            ("Market.ReadSessionContext", arguments)
+        }
         DashboardQueryCommand::SourceStatus { source_ids } => {
             ("Source.GetStatus", source_arguments(source_ids))
         }
@@ -1251,6 +1274,8 @@ pub(crate) async fn decision_control(
             screen_revision,
             dataset_manifest,
             as_of,
+            calendar_reference,
+            financial_profile,
         } => {
             require_confirmation(confirmed)?;
             let mut arguments = Map::new();
@@ -1261,6 +1286,11 @@ pub(crate) async fn decision_control(
                 Value::Object(dataset_manifest),
             );
             arguments.insert("asOf".to_owned(), json!(as_of));
+            arguments.insert(
+                "calendarReference".to_owned(),
+                Value::Object(calendar_reference),
+            );
+            arguments.insert("financialProfile".to_owned(), Value::Object(financial_profile));
             invoke_private_application(
                 "Decision.RunScreen",
                 arguments,
@@ -1478,17 +1508,37 @@ pub(crate) async fn paper_control(
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
     let (operation, arguments, authority) = match request {
+        PaperControlCommand::AccountPreparation => (
+            "Bot.GetAccountPreparation",
+            Map::new(),
+            InvocationAuthority::ReadOnly,
+        ),
+        PaperControlCommand::PrepareAccount { cash_choice, cost_choice, currency_choice } => {
+            let mut arguments = Map::new();
+            arguments.insert("cashChoice".to_owned(), json!(cash_choice));
+            arguments.insert("costChoice".to_owned(), json!(cost_choice));
+            arguments.insert("currencyChoice".to_owned(), json!(currency_choice));
+            ("Bot.PrepareAccount", arguments, InvocationAuthority::ReadOnly)
+        }
+        PaperControlCommand::CreateAccount { confirmation_token } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
+            ("Bot.CreateAccount", arguments, InvocationAuthority::ExactConfirmed("Bot.CreateAccount"))
+        }
         PaperControlCommand::StartPreparation => (
             "Bot.GetStartPreparation",
             Map::new(),
             InvocationAuthority::ReadOnly,
         ),
         PaperControlCommand::PrepareStart {
+            market_choice,
             cash_choice,
             cost_choice,
             mode_choice,
         } => {
             let mut arguments = Map::new();
+            arguments.insert("marketChoice".to_owned(), json!(market_choice));
             arguments.insert("cashChoice".to_owned(), json!(cash_choice));
             arguments.insert("costChoice".to_owned(), json!(cost_choice));
             arguments.insert("modeChoice".to_owned(), json!(mode_choice));
@@ -1504,11 +1554,19 @@ pub(crate) async fn paper_control(
                 InvocationAuthority::ExactConfirmed("Bot.Start"),
             )
         }
-        PaperControlCommand::Targets => (
-            "Execution.GetManualPaperTargets",
-            Map::new(),
-            InvocationAuthority::ReadOnly,
-        ),
+        PaperControlCommand::Targets {
+            analysis_action_token,
+        } => {
+            let mut arguments = Map::new();
+            if let Some(token) = analysis_action_token {
+                arguments.insert("analysisActionToken".to_owned(), json!(token));
+            }
+            (
+                "Execution.GetManualPaperTargets",
+                arguments,
+                InvocationAuthority::ReadOnly,
+            )
+        }
         PaperControlCommand::PrepareManual {
             target_token,
             side,
@@ -1644,6 +1702,33 @@ pub(crate) async fn analysis_control(
         _ => {}
     }
     let (operation, arguments, mutation) = match request {
+        AnalysisControlCommand::GetRecommendationSetup => {
+            ("Portfolio.GetRecommendationSetup", Map::new(), false)
+        }
+        AnalysisControlCommand::PreviewRecommendationSetup {
+            expected_revision,
+            account_id,
+            allocation_profile,
+        } => {
+            if expected_revision > MAXIMUM_SAFE_WEB_NUMBER {
+                return Err(DesktopCommandError::invalid_request(
+                    "The saved preference revision cannot be represented safely.",
+                ));
+            }
+            let mut arguments = Map::new();
+            arguments.insert("expectedRevision".to_owned(), json!(expected_revision));
+            arguments.insert("accountId".to_owned(), json!(account_id));
+            arguments.insert("allocationProfile".to_owned(), json!(allocation_profile));
+            ("Portfolio.PreviewRecommendationSetup", arguments, false)
+        }
+        AnalysisControlCommand::CommitRecommendationSetup {
+            preview_id,
+            preview_digest,
+        } => (
+            "Portfolio.CommitRecommendationSetup",
+            preview_arguments(preview_id, preview_digest),
+            true,
+        ),
         AnalysisControlCommand::BacktestOptions => {
             ("Analysis.GetBacktestPreparation", Map::new(), false)
         }
@@ -1655,7 +1740,14 @@ pub(crate) async fn analysis_control(
         AnalysisControlCommand::StartPreparedBacktest { confirmation_token } => {
             let mut arguments = Map::new();
             arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
-            ("Analysis.StartPreparedBacktest", arguments, true)
+            return crate::analytical_controller::start_prepared(
+                &state,
+                &generation,
+                "Analysis.StartPreparedBacktest",
+                arguments,
+                confirmed,
+            )
+            .await;
         }
         AnalysisControlCommand::FeatureDatasetOptions
         | AnalysisControlCommand::PreviewFeatureDataset { .. }
@@ -1679,11 +1771,18 @@ pub(crate) async fn backtest_products(
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
     let (operation, arguments) = match request {
-        BacktestProductCommand::List => ("Analysis.ListProductBacktests", Map::new()),
+        BacktestProductCommand::List => {
+            ("Analysis.ListProductBacktests", Map::new())
+        }
         BacktestProductCommand::Get { backtest_token } => {
             let mut arguments = Map::new();
             arguments.insert("backtestToken".to_owned(), json!(backtest_token));
             ("Analysis.GetProductBacktest", arguments)
+        }
+        BacktestProductCommand::RecommendationStudy { action_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("actionToken".to_owned(), json!(action_token));
+            ("Analysis.GetRecommendationBacktest", arguments)
         }
     };
     invoke_narrow(operation, arguments, false, false, &state, &generation).await
@@ -1717,7 +1816,14 @@ pub(crate) async fn model_control(
         ModelControlCommand::StartPreparedForecast { confirmation_token } => {
             let mut arguments = Map::new();
             arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
-            ("Model.StartPreparedForecast", arguments, true)
+            return crate::analytical_controller::start_prepared(
+                &state,
+                &generation,
+                "Model.StartPreparedForecast",
+                arguments,
+                confirmed,
+            )
+            .await;
         }
     };
     invoke_narrow(
@@ -1739,7 +1845,9 @@ pub(crate) async fn model_products(
     let generation = state.generation()?;
     let operation = match request {
         ModelProductCommand::List => "Model.ListBundles",
-        ModelProductCommand::Activity => "Model.ListProductActivity",
+        ModelProductCommand::Activity => {
+            "Model.ListProductActivity"
+        }
     };
     invoke_narrow(operation, Map::new(), false, false, &state, &generation).await
 }

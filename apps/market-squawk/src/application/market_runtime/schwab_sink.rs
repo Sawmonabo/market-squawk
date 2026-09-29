@@ -56,14 +56,15 @@ use crate::application::{
     SchwabRestQuotePostSealFailure, SchwabRestQuoteSourceHealthOutcome,
 };
 use crate::live_source::{
-    SchwabRestQuoteCurrentBridge, SchwabRestQuoteCurrentEvidence, SchwabRestQuoteCurrentInstrument,
-    SchwabRestQuoteCurrentPublication, SchwabRestQuoteCurrentRequest,
-    SchwabRestQuoteCurrentSessionBridge, SchwabRestQuoteCurrentSessionInput,
-    SchwabRestQuoteCurrentUnavailable,
+    SchwabQualifiedCurrent, SchwabRestQuoteCurrentBridge, SchwabRestQuoteCurrentEvidence,
+    SchwabRestQuoteCurrentInstrument, SchwabRestQuoteCurrentPublication,
+    SchwabRestQuoteCurrentRequest, SchwabRestQuoteCurrentSessionBridge,
+    SchwabRestQuoteCurrentSessionInput, SchwabRestQuoteCurrentUnavailable,
 };
 use crate::provider_activation::{
-    MarketInstrumentBinding, MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
-    SchwabMarketDataAccountActivation,
+    MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority,
+    SchwabMarketDataAccountActivation, SchwabQuotePublicationSelection,
+    SchwabQuoteReferenceBinding,
 };
 use crate::provider_onboarding::SchwabOAuthPublicationEpoch;
 
@@ -77,11 +78,11 @@ const QUOTE_CANONICAL_STATE_RULE_VERSION: u32 = 1;
 /// provider budget, canonical bindings, and durable research generation; none is reconstructed by
 /// the factory.
 pub(crate) struct SchwabRestQuoteCurrentRuntimeInput {
-    activation: SchwabMarketDataAccountActivation,
+    activation: Arc<SchwabMarketDataAccountActivation>,
     provider_rate: ProviderRateAuthority,
     evidence: SchwabRestQuoteSourceEvidence,
     bindings: Vec<(
-        MarketInstrumentBinding,
+        SchwabQuoteReferenceBinding,
         Option<MarketReferenceIdentityApprovalV1>,
     )>,
     reference_identity: Option<MarketReferenceIdentityAuthority>,
@@ -103,11 +104,11 @@ impl SchwabRestQuoteCurrentRuntimeInput {
         reason = "every account, rate, source, current, durable, and lifecycle authority remains explicit"
     )]
     pub(crate) fn new(
-        activation: SchwabMarketDataAccountActivation,
+        activation: Arc<SchwabMarketDataAccountActivation>,
         provider_rate: ProviderRateAuthority,
         evidence: SchwabRestQuoteSourceEvidence,
         bindings: Vec<(
-            MarketInstrumentBinding,
+            SchwabQuoteReferenceBinding,
             Option<MarketReferenceIdentityApprovalV1>,
         )>,
         reference_identity: Option<MarketReferenceIdentityAuthority>,
@@ -145,7 +146,8 @@ impl SchwabRestQuoteCurrentRuntimeInput {
 /// Started quote runtime whose worker owns polling plus exact-generation cleanup.
 pub(crate) struct SchwabRestQuoteCurrentRuntime {
     cancellation: SchwabRestQuoteRuntimeCancellation,
-    worker: tokio::task::JoinHandle<Result<(), SchwabRestQuoteSessionRuntimeError>>,
+    worker: tokio::task::JoinHandle<SchwabRestQuoteWorkerOutcome>,
+    shutdown_result: Option<Result<(), SchwabRestQuoteSessionRuntimeError>>,
 }
 
 impl std::fmt::Debug for SchwabRestQuoteCurrentRuntime {
@@ -158,13 +160,20 @@ impl std::fmt::Debug for SchwabRestQuoteCurrentRuntime {
     }
 }
 
+/// Original startup failure and the actual current/durable cleanup result.
+#[derive(Debug)]
+pub(crate) struct SchwabRestQuoteStartFailure {
+    pub(super) cause: SchwabRestQuoteSessionRuntimeError,
+    pub(super) cleanup: Result<(), SchwabRestQuoteSessionRuntimeError>,
+}
+
 impl SchwabRestQuoteCurrentRuntime {
     /// Binds every exact authority, starts polling, and returns only after a qualified current
     /// quote has entered the provider-neutral display ingress.
     pub(crate) async fn start(
         input: SchwabRestQuoteCurrentRuntimeInput,
         deadline: Instant,
-    ) -> Result<Self, SchwabRestQuoteSessionRuntimeError> {
+    ) -> Result<Self, SchwabRestQuoteStartFailure> {
         let SchwabRestQuoteCurrentRuntimeInput {
             activation,
             provider_rate,
@@ -195,13 +204,13 @@ impl SchwabRestQuoteCurrentRuntime {
             } else {
                 SchwabRestQuoteSessionRuntimeError::InvalidConfiguration
             };
-            return Err(with_cleanup(
+            return Err(start_failure(
                 source,
                 cleanup_unstarted(current, &durable).await,
             ));
         }
         if let Err(source) = current_oauth_receipt(&activation, &lifecycle, deadline).await {
-            return Err(with_cleanup(
+            return Err(start_failure(
                 source,
                 cleanup_unstarted(current, &durable).await,
             ));
@@ -211,7 +220,7 @@ impl SchwabRestQuoteCurrentRuntime {
         let validated_at = match wall_timestamp() {
             Ok(validated_at) => validated_at,
             Err(error) => {
-                return Err(with_cleanup(
+                return Err(start_failure(
                     SchwabRestQuoteRuntimeError::Sink(error).into(),
                     cleanup_unstarted(current, &durable).await,
                 ));
@@ -225,7 +234,7 @@ impl SchwabRestQuoteCurrentRuntime {
             maximum,
             true,
         ) {
-            return Err(with_cleanup(
+            return Err(start_failure(
                 SchwabRestQuoteRuntimeError::Activation(error).into(),
                 cleanup_unstarted(current, &durable).await,
             ));
@@ -238,7 +247,7 @@ impl SchwabRestQuoteCurrentRuntime {
         ) {
             Ok(schedule) => schedule,
             Err(error) => {
-                return Err(with_cleanup(
+                return Err(start_failure(
                     error.into(),
                     cleanup_unstarted(current, &durable).await,
                 ));
@@ -251,7 +260,7 @@ impl SchwabRestQuoteCurrentRuntime {
         ) {
             Ok(qualified) => qualified,
             Err(error) => {
-                return Err(with_cleanup(
+                return Err(start_failure(
                     error.into(),
                     cleanup_unstarted(current, &durable).await,
                 ));
@@ -260,7 +269,7 @@ impl SchwabRestQuoteCurrentRuntime {
         let instruments = match current_instruments(&qualified, evidence.metadata()) {
             Ok(instruments) => instruments,
             Err(error) => {
-                return Err(with_cleanup(
+                return Err(start_failure(
                     SchwabRestQuoteSessionRuntimeError::Current(error),
                     cleanup_unstarted(current, &durable).await,
                 ));
@@ -277,10 +286,14 @@ impl SchwabRestQuoteCurrentRuntime {
         .await
         {
             Ok(bridge) => Arc::new(bridge),
-            Err(error) => {
-                return Err(with_cleanup(
-                    SchwabRestQuoteSessionRuntimeError::Current(error),
+            Err((cause, current_cleanup)) => {
+                let cleanup = merge_run_cleanup(
+                    current_cleanup.map_err(SchwabRestQuoteSessionRuntimeError::Current),
                     drain_durable(&durable).await,
+                );
+                return Err(start_failure(
+                    SchwabRestQuoteSessionRuntimeError::Current(cause),
+                    cleanup,
                 ));
             }
         };
@@ -290,6 +303,7 @@ impl SchwabRestQuoteCurrentRuntime {
                 Arc::clone(&durable),
                 durable_writer,
                 current_sink,
+                Arc::clone(&activation),
             ));
         let producer = match SchwabRestQuoteProducer::try_production(
             activation,
@@ -307,7 +321,7 @@ impl SchwabRestQuoteCurrentRuntime {
             Ok(producer) => producer,
             Err(error) => {
                 let cleanup = cleanup_bridge(current_bridge, &durable).await;
-                return Err(with_cleanup(error.into(), cleanup));
+                return Err(start_failure(error.into(), cleanup));
             }
         };
         let (ready_sender, mut ready_receiver) = oneshot::channel();
@@ -337,13 +351,13 @@ impl SchwabRestQuoteCurrentRuntime {
                     Err(startup_worker_outcome(worker.await, &lifecycle))
                 } else if lifecycle.is_cancelled() {
                     let cleanup = finish_cancelled_start(worker, &lifecycle).await;
-                    Err(with_cleanup(
+                    Err(start_failure(
                         SchwabRestQuoteSessionRuntimeError::Cancelled,
                         cleanup,
                     ))
                 } else if Instant::now() >= deadline {
                     let cleanup = finish_cancelled_start(worker, &lifecycle).await;
-                    Err(with_cleanup(
+                    Err(start_failure(
                         SchwabRestQuoteSessionRuntimeError::Deadline,
                         cleanup,
                     ))
@@ -351,6 +365,7 @@ impl SchwabRestQuoteCurrentRuntime {
                     Ok(Self {
                         cancellation: SchwabRestQuoteRuntimeCancellation::new(lifecycle),
                         worker,
+                        shutdown_result: None,
                     })
                 }
             }
@@ -362,14 +377,14 @@ impl SchwabRestQuoteCurrentRuntime {
             }
             SchwabRestQuoteStartup::Cancelled => {
                 let cleanup = finish_cancelled_start(worker, &lifecycle).await;
-                Err(with_cleanup(
+                Err(start_failure(
                     SchwabRestQuoteSessionRuntimeError::Cancelled,
                     cleanup,
                 ))
             }
             SchwabRestQuoteStartup::Deadline => {
                 let cleanup = finish_cancelled_start(worker, &lifecycle).await;
-                Err(with_cleanup(
+                Err(start_failure(
                     SchwabRestQuoteSessionRuntimeError::Deadline,
                     cleanup,
                 ))
@@ -381,6 +396,56 @@ impl SchwabRestQuoteCurrentRuntime {
         !self.cancellation.token.is_cancelled() && !self.worker.is_finished()
     }
 
+    /// Retains the exact child and joined outcome when a shutdown waiter is interrupted.
+    pub(crate) async fn finish_shutdown_before(
+        &mut self,
+        deadline: std::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), market_squawk_services::ServiceError> {
+        use market_squawk_services::ServiceError;
+        self.cancellation.cancel();
+        if let Some(result) = &self.shutdown_result {
+            return result
+                .as_ref()
+                .map(|()| ())
+                .map_err(|_| ServiceError::Unavailable);
+        }
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ServiceError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(ServiceError::DeadlineExceeded)
+            }
+            result = self.finish_retained_shutdown() => result,
+        }
+    }
+
+    /// Joins under retained startup custody; ordinary waiters use the bounded finish method.
+    pub(crate) async fn finish_retained_shutdown(
+        &mut self,
+    ) -> Result<(), market_squawk_services::ServiceError> {
+        use market_squawk_services::ServiceError;
+        self.cancellation.cancel();
+        if let Some(result) = &self.shutdown_result {
+            return result
+                .as_ref()
+                .map(|()| ())
+                .map_err(|_| ServiceError::Unavailable);
+        }
+        let outcome = (&mut self.worker).await;
+        let result = worker_outcome(outcome);
+        let status = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::error!(%error, "retained account child cleanup failed");
+                Err(ServiceError::Unavailable)
+            }
+        };
+        // No await separates joining the child from retaining its terminal outcome.
+        self.shutdown_result = Some(result);
+        status
+    }
+
     /// Cancels future work and waits for registry, display, capture, and durable drains.
     pub(crate) async fn shutdown(
         mut self,
@@ -388,6 +453,9 @@ impl SchwabRestQuoteCurrentRuntime {
         deadline: Instant,
     ) -> Result<(), SchwabRestQuoteSessionRuntimeError> {
         self.cancellation.cancel();
+        if let Some(result) = self.shutdown_result.take() {
+            return result;
+        }
         let requested = tokio::select! {
             biased;
             result = &mut self.worker => return worker_outcome(result),
@@ -406,7 +474,7 @@ impl SchwabRestQuoteCurrentRuntime {
 
 enum SchwabRestQuoteStartup {
     Ready(Result<(), oneshot::error::RecvError>),
-    Worker(Result<Result<(), SchwabRestQuoteSessionRuntimeError>, tokio::task::JoinError>),
+    Worker(Result<SchwabRestQuoteWorkerOutcome, tokio::task::JoinError>),
     Cancelled,
     Deadline,
 }
@@ -477,17 +545,22 @@ async fn current_oauth_receipt(
             current.map_err(SchwabRestQuoteRuntimeError::from)?;
         }
     }
-    let oauth = activation.oauth_authority();
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(SchwabRestQuoteSessionRuntimeError::Cancelled),
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             Err(SchwabRestQuoteSessionRuntimeError::Deadline)
         }
-        receipt = oauth.current_receipt() => receipt
+        receipt = activation.current_oauth_receipt() => receipt
             .map_err(SchwabRestQuoteRuntimeError::from)
             .map_err(Into::into),
     }
+}
+
+/// A disconnected source can finish cleanup successfully; neither result substitutes for the other.
+struct SchwabRestQuoteWorkerOutcome {
+    run: Result<(), SchwabRestQuoteSessionRuntimeError>,
+    cleanup: Result<(), SchwabRestQuoteSessionRuntimeError>,
 }
 
 async fn run_current_runtime(
@@ -498,7 +571,7 @@ async fn run_current_runtime(
     mut schedule: SchwabRestQuoteAdaptiveSchedule,
     cancellation: CancellationToken,
     ready: oneshot::Sender<()>,
-) -> Result<(), SchwabRestQuoteSessionRuntimeError> {
+) -> SchwabRestQuoteWorkerOutcome {
     let _lifecycle_owner = SchwabRestQuoteRuntimeCancellation::new(cancellation.clone());
     let mut ready = Some(ready);
     let run = loop {
@@ -587,7 +660,10 @@ async fn run_current_runtime(
         Err(_retained) => Err(SchwabRestQuoteSessionRuntimeError::Ownership),
     };
     let durable_cleanup = drain_durable(&durable).await;
-    merge_run_cleanup(merge_run_cleanup(run, current_cleanup), durable_cleanup)
+    SchwabRestQuoteWorkerOutcome {
+        run,
+        cleanup: merge_run_cleanup(current_cleanup, durable_cleanup),
+    }
 }
 
 async fn wait_runtime(duration: Duration, cancellation: &CancellationToken) -> bool {
@@ -643,7 +719,7 @@ async fn drain_durable(
 }
 
 async fn finish_cancelled_start(
-    worker: tokio::task::JoinHandle<Result<(), SchwabRestQuoteSessionRuntimeError>>,
+    worker: tokio::task::JoinHandle<SchwabRestQuoteWorkerOutcome>,
     cancellation: &CancellationToken,
 ) -> Result<(), SchwabRestQuoteSessionRuntimeError> {
     cancellation.cancel();
@@ -651,22 +727,45 @@ async fn finish_cancelled_start(
 }
 
 fn startup_worker_outcome(
-    result: Result<Result<(), SchwabRestQuoteSessionRuntimeError>, tokio::task::JoinError>,
+    result: Result<SchwabRestQuoteWorkerOutcome, tokio::task::JoinError>,
     lifecycle: &CancellationToken,
-) -> SchwabRestQuoteSessionRuntimeError {
+) -> SchwabRestQuoteStartFailure {
     match result {
-        Ok(Ok(())) if lifecycle.is_cancelled() => SchwabRestQuoteSessionRuntimeError::Cancelled,
-        Ok(Ok(())) => SchwabRestQuoteSessionRuntimeError::EndedBeforeReady,
-        Ok(Err(error)) => error,
-        Err(error) => error.into(),
+        Ok(outcome) => {
+            let cause = outcome.run.err().unwrap_or_else(|| {
+                if lifecycle.is_cancelled() {
+                    SchwabRestQuoteSessionRuntimeError::Cancelled
+                } else {
+                    SchwabRestQuoteSessionRuntimeError::EndedBeforeReady
+                }
+            });
+            start_failure(cause, outcome.cleanup)
+        }
+        Err(error) => start_failure(
+            SchwabRestQuoteSessionRuntimeError::EndedBeforeReady,
+            Err(error.into()),
+        ),
     }
 }
 
+fn start_failure(
+    cause: SchwabRestQuoteSessionRuntimeError,
+    cleanup: Result<(), SchwabRestQuoteSessionRuntimeError>,
+) -> SchwabRestQuoteStartFailure {
+    SchwabRestQuoteStartFailure { cause, cleanup }
+}
+
 fn worker_outcome(
-    result: Result<Result<(), SchwabRestQuoteSessionRuntimeError>, tokio::task::JoinError>,
+    result: Result<SchwabRestQuoteWorkerOutcome, tokio::task::JoinError>,
 ) -> Result<(), SchwabRestQuoteSessionRuntimeError> {
     match result {
-        Ok(result) => result,
+        Ok(outcome) => {
+            if let Err(error) = outcome.run {
+                tracing::warn!(%error, "Schwab current quote polling ended before cleanup");
+            }
+            // Only actual current/durable cleanup can authorize retirement of this generation.
+            outcome.cleanup
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -704,6 +803,7 @@ pub(crate) struct SchwabRestQuoteSealFirstSink {
     authority: Arc<SchwabRestQuoteGenerationAuthority>,
     durable_read: SchwabRestQuoteDurableReadInstall,
     current: Arc<dyn SchwabRestQuoteCurrentBridge>,
+    activation: Option<Arc<SchwabMarketDataAccountActivation>>,
 }
 
 enum SchwabRestQuoteDurableReadInstall {
@@ -728,11 +828,13 @@ impl SchwabRestQuoteSealFirstSink {
         authority: Arc<SchwabRestQuoteGenerationAuthority>,
         durable_writer: MarketEventDurableReadWriter,
         current: Arc<dyn SchwabRestQuoteCurrentBridge>,
+        activation: Arc<SchwabMarketDataAccountActivation>,
     ) -> Self {
         Self {
             authority,
             durable_read: SchwabRestQuoteDurableReadInstall::Required(durable_writer),
             current,
+            activation: Some(activation),
         }
     }
 
@@ -745,6 +847,7 @@ impl SchwabRestQuoteSealFirstSink {
             authority,
             durable_read: SchwabRestQuoteDurableReadInstall::AuthorityBoundaryOnly,
             current,
+            activation: None,
         }
     }
 
@@ -932,8 +1035,52 @@ impl SchwabRestQuoteSealFirstSink {
                         error,
                     );
                 }
+                let current_evidence = match current_evidence {
+                    Ok(evidence) => evidence,
+                    Err(_) => {
+                        return self.accepted_failure(
+                            payload_digest,
+                            Some(sealed_receipt_digest),
+                            SchwabRestQuoteSinkError::InvalidReceipt,
+                        );
+                    }
+                };
+                let qualified = match self.qualify_current(
+                    &current_evidence,
+                    evidence,
+                    &qualification,
+                    bindings,
+                    deadline,
+                ) {
+                    Ok(qualified) => qualified,
+                    Err(_) => {
+                        return self.accepted_failure(
+                            payload_digest,
+                            Some(sealed_receipt_digest),
+                            SchwabRestQuoteSinkError::InvalidReceipt,
+                        );
+                    }
+                };
+                let selection = match SchwabQuotePublicationSelection::try_new(
+                    qualified.source_lease().clone(),
+                    qualified.selected_provider_identities().to_vec(),
+                    bindings.iter().map(|binding| binding.binding()),
+                    evidence.venue_id(),
+                    observed_at,
+                ) {
+                    Ok(selection) => selection,
+                    Err(_) => {
+                        return self.accepted_failure(
+                            payload_digest,
+                            Some(sealed_receipt_digest),
+                            SchwabRestQuoteSinkError::InvalidReceipt,
+                        );
+                    }
+                };
                 self.publish_durable(
                     publication,
+                    qualified,
+                    selection,
                     oauth_epoch,
                     observed_at,
                     connection_generation,
@@ -941,10 +1088,6 @@ impl SchwabRestQuoteSealFirstSink {
                     payload_digest,
                     sealed_receipt_digest,
                     deadline,
-                    current_evidence,
-                    evidence,
-                    &qualification,
-                    bindings,
                 )
                 .await
             }
@@ -958,6 +1101,8 @@ impl SchwabRestQuoteSealFirstSink {
     async fn publish_durable(
         &self,
         publication: Box<SchwabSealedRestQuotePublication>,
+        qualified: SchwabQualifiedCurrent,
+        selection: SchwabQuotePublicationSelection,
         oauth_epoch: SchwabOAuthPublicationEpoch,
         observed_at: Timestamp,
         connection_generation: ConnectionGeneration,
@@ -965,20 +1110,57 @@ impl SchwabRestQuoteSealFirstSink {
         payload_digest: EvidenceDigest,
         sealed_receipt_digest: EvidenceDigest,
         deadline: Instant,
-        current_evidence: Result<SchwabRestQuoteCurrentEvidence, SchwabRestQuoteCurrentUnavailable>,
-        evidence: &SchwabRestQuoteSourceEvidence,
-        qualification: &SchwabMarketDataQualification,
-        bindings: &[SchwabRestQuoteInstrumentBinding],
     ) -> Result<SchwabRestQuotePublicationReceipt, SchwabRestQuoteSinkError> {
         let oauth = oauth_epoch.receipt();
+        let identities =
+            match selection.for_events(publication.binding().batch().events(), observed_at) {
+                Ok(identities) => identities,
+                Err(_) => {
+                    return self.accepted_failure(
+                        payload_digest,
+                        Some(sealed_receipt_digest),
+                        SchwabRestQuoteSinkError::InvalidReceipt,
+                    );
+                }
+            };
+        let publication = match (*publication).with_provider_identities(identities) {
+            Ok(publication) => Box::new(publication),
+            Err(_) => {
+                return self.accepted_failure(
+                    payload_digest,
+                    Some(sealed_receipt_digest),
+                    SchwabRestQuoteSinkError::InvalidReceipt,
+                );
+            }
+        };
         let expected_count = publication.binding().record_count();
         let expected_digest = publication.binding().evidence_digest().evidence();
         let idempotency_key = publication_idempotency_key(expected_digest, oauth, payload_digest);
+        let account = match &self.activation {
+            Some(activation) => Some(
+                activation
+                    .currentness()
+                    .try_acquire_publication_authority()
+                    .map_err(|_| SchwabRestQuoteSinkError::InvalidReceipt)?,
+            ),
+            #[cfg(test)]
+            None => None,
+            #[cfg(not(test))]
+            None => {
+                return self.accepted_failure(
+                    payload_digest,
+                    Some(sealed_receipt_digest),
+                    SchwabRestQuoteSinkError::InvalidReceipt,
+                );
+            }
+        };
         let receipt = match self
             .authority
             .publish_sealed_rest_quotes(
                 publication,
                 oauth_epoch,
+                account,
+                selection,
                 observed_at,
                 idempotency_key,
                 deadline,
@@ -1048,16 +1230,7 @@ impl SchwabRestQuoteSealFirstSink {
             #[cfg(test)]
             SchwabRestQuoteDurableReadInstall::AuthorityBoundaryOnly => {}
         }
-        let current = match current_evidence {
-            Ok(current_evidence) => self.publish_current(
-                &current_evidence,
-                evidence,
-                qualification,
-                bindings,
-                deadline,
-            ),
-            Err(reason) => SchwabRestQuoteCurrentPublication::Unavailable(reason),
-        };
+        let current = self.current.publish_qualified(qualified, deadline);
         if matches!(current, SchwabRestQuoteCurrentPublication::NotApplicable)
             || current.published() != 0 && current.published() != expected_current_count
             || matches!(
@@ -1196,20 +1369,17 @@ impl SchwabRestQuoteSealFirstSink {
         )
     }
 
-    fn publish_current(
+    fn qualify_current(
         &self,
         response: &SchwabRestQuoteCurrentEvidence,
         evidence: &SchwabRestQuoteSourceEvidence,
         qualification: &SchwabMarketDataQualification,
         bindings: &[SchwabRestQuoteInstrumentBinding],
         deadline: Instant,
-    ) -> SchwabRestQuoteCurrentPublication {
-        let instruments = match current_instruments(bindings, evidence.metadata()) {
-            Ok(instruments) => instruments,
-            Err(reason) => return SchwabRestQuoteCurrentPublication::Unavailable(reason),
-        };
+    ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable> {
+        let instruments = current_instruments(bindings, evidence.metadata())?;
         self.current
-            .publish_current(SchwabRestQuoteCurrentRequest::new(
+            .qualify_current(SchwabRestQuoteCurrentRequest::new(
                 response,
                 evidence.metadata(),
                 evidence.venue_id(),
@@ -1309,11 +1479,8 @@ fn build_publication_request(
         else {
             continue;
         };
-        let provider_identity = binding
-            .binding()
-            .provider_identity()
-            .ok_or(SchwabRestQuoteSinkError::InvalidReceipt)?;
-        if provider_identity.source_id() != evidence.metadata().source_id()
+        let provider_identity = binding.binding().provider_identity();
+        if provider_identity.source_id().as_str() != "schwab-trader-api-instruments"
             || provider_identity.instrument_id() != binding.instrument_id()
         {
             return Err(SchwabRestQuoteSinkError::InvalidReceipt);
@@ -1376,7 +1543,10 @@ fn build_publication_request(
             ))
         }
         .map_err(|_error| SchwabRestQuoteSinkError::InvalidReceipt)?;
-        let terms = binding.binding().execution_terms();
+        let reference = binding
+            .binding()
+            .quote_reference(received_at)
+            .map_err(|_| SchwabRestQuoteSinkError::InvalidReceipt)?;
         let market_data = SchwabRestQuoteMarketDataEvidence::try_new(
             session_id.clone(),
             connection_generation,
@@ -1389,8 +1559,7 @@ fn build_publication_request(
             binding.instrument_id(),
             source_identifier,
             provenance,
-            terms.price_tick(),
-            terms.lot_size(),
+            reference,
             market_data,
         ));
     }
@@ -1409,11 +1578,9 @@ fn current_instruments(
         .try_reserve_exact(bindings.len())
         .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Allocation)?;
     for binding in bindings {
-        let provider_identity = binding
-            .binding()
-            .provider_identity()
-            .ok_or(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        if provider_identity.source_id() != metadata.source_id()
+        let provider_identity = binding.binding().provider_identity();
+        if metadata.source_id().as_str() != "schwab-trader-api"
+            || provider_identity.source_id().as_str() != "schwab-trader-api-instruments"
             || provider_identity.instrument_id() != binding.instrument_id()
         {
             return Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth);
@@ -1427,7 +1594,13 @@ fn current_instruments(
             provider_symbol,
             source_identifier,
             binding.instrument_id(),
-            binding.binding().execution_terms(),
+            binding
+                .binding()
+                .quote_reference(
+                    wall_timestamp()
+                        .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?,
+                )
+                .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?,
         )?);
     }
     Ok(instruments)
@@ -1489,21 +1662,24 @@ fn validate_publication(
         return Err(SchwabRestQuoteSinkError::InvalidReceipt);
     }
     for event in binding.batch().events() {
-        let MarketEvent::Quote(quote) = event else {
+        let MarketEvent::MarketDataQuote(quote) = event else {
             return Err(SchwabRestQuoteSinkError::InvalidReceipt);
         };
         let provenance = quote.provenance();
         let event_binding = provenance.binding();
         let exact_instrument = bindings.iter().any(|candidate| {
-            candidate.instrument_id() == event_binding.instrument_id()
+            Some(candidate.instrument_id()) == event_binding.instrument_id()
+                && Some(candidate.binding().provider_identity())
+                    == quote.reference().provider_identity()
+                && candidate.binding().canonical_record().revision_digest()
+                    == quote.reference().definition_digest()
+                && candidate.binding().definition().quote_currency() == quote.reference().currency()
                 && candidate
                     .binding()
                     .provider_identity()
-                    .is_some_and(|provider| {
-                        provider.source_id() == metadata.source_id()
-                            && provider.provider_instrument_id().as_str()
-                                == event_binding.source_identifier().as_str()
-                    })
+                    .provider_instrument_id()
+                    .as_str()
+                    == event_binding.source_identifier().as_str()
         });
         if !exact_instrument
             || event_binding.source_id() != metadata.source_id()
@@ -1674,6 +1850,13 @@ fn wall_timestamp() -> Result<Timestamp, SchwabRestQuoteSinkError> {
 
 fn map_publication_error(error: SchwabMarketPublicationError) -> SchwabRestQuoteSinkError {
     match error {
+        // This sink admits only Quotes. A MarketHours cause signals a wrong-family binding,
+        // including its resource variant; no calendar acquisition runs through this sink.
+        SchwabMarketPublicationError::MarketHours(
+            market_squawk_adapter_schwab::SchwabMarketHoursPublicationError::InvalidEvidence
+            | market_squawk_adapter_schwab::SchwabMarketHoursPublicationError::InvalidNativeHours
+            | market_squawk_adapter_schwab::SchwabMarketHoursPublicationError::ResourceBound,
+        ) => SchwabRestQuoteSinkError::InvalidReceipt,
         SchwabMarketPublicationError::Cancelled => SchwabRestQuoteSinkError::Cancelled,
         SchwabMarketPublicationError::Deadline => SchwabRestQuoteSinkError::Deadline,
         SchwabMarketPublicationError::AuthorityInvalid
@@ -1698,6 +1881,12 @@ fn map_publication_error(error: SchwabMarketPublicationError) -> SchwabRestQuote
 
 fn post_seal_failure(error: &SchwabMarketPublicationError) -> SchwabRestQuotePostSealFailure {
     match error {
+        // Calendar publication is outside this quote-only authority, even when its cause is a bound.
+        SchwabMarketPublicationError::MarketHours(
+            market_squawk_adapter_schwab::SchwabMarketHoursPublicationError::InvalidEvidence
+            | market_squawk_adapter_schwab::SchwabMarketHoursPublicationError::InvalidNativeHours
+            | market_squawk_adapter_schwab::SchwabMarketHoursPublicationError::ResourceBound,
+        ) => SchwabRestQuotePostSealFailure::AuthorityOrBinding,
         SchwabMarketPublicationError::Deadline => SchwabRestQuotePostSealFailure::Deadline,
         SchwabMarketPublicationError::Cancelled
         | SchwabMarketPublicationError::AuthorityRevoked

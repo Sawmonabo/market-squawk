@@ -6,10 +6,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_domain::{
-    BarTimeSemantics, BarTimestampBasis, CalendarDate, Currency, DigestAlgorithm, EvidenceDigest,
+    CalendarDate, Currency, DigestAlgorithm, EvidenceDigest,
     ExactPayloadEvidence, FundNavCompleteness, FundNavDisposition, FundNavMissingState,
-    FundNavValue, InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence,
-    MarketBarSessionKind, MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence,
+    FundNavValue, InstrumentId, MarketBarAdjustment,
+    MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence,
     SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_platform::{LocalPaths, RawCaptureRecord, SealedResearchJournalStore};
@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{
     TIINGO_APPLICATION_BYTES_PER_MONTH, TiingoAdapterError, TiingoCompletedEodHistoryCandidate,
     TiingoCompletedFundNavHistoryCandidate, TiingoCompletedHistoryCapture, TiingoDecoder,
-    TiingoEodBarTimeAuthority, TiingoEodBarTimeRequest, TiingoEodContractEvidence,
+    TiingoEodContractEvidence,
     TiingoEodExpectedSessionAuthority, TiingoEodExpectedSessionEvidence,
     TiingoEodExpectedSessionRequest, TiingoEodExpectedSessionValidationReceipt,
     TiingoEodFinancialCoverageDisposition, TiingoEodInstrumentAuthority, TiingoEodInstrumentKind,
@@ -198,40 +198,6 @@ fn completed_single_page_history(
     )?)
 }
 
-struct FixedEodTimeAuthority;
-
-impl TiingoEodBarTimeAuthority for FixedEodTimeAuthority {
-    fn validate_current(&self) -> Result<(), TiingoEodMapError> {
-        Ok(())
-    }
-
-    fn resolve(
-        &self,
-        request: &TiingoEodBarTimeRequest,
-    ) -> Result<BarTimeSemantics, TiingoEodMapError> {
-        if request.provider_date()
-            != CalendarDate::new(2026, 8, 10)
-                .map_err(|_| TiingoEodMapError::InvalidTimeAuthority)?
-        {
-            return Err(TiingoEodMapError::InvalidTimeAuthority);
-        }
-        let session = MarketBarSessionEvidence::try_new(
-            MarketBarSessionKind::Regular,
-            SourceIdentifier::try_from("xnas-session-calendar-v1")
-                .map_err(|_| TiingoEodMapError::InvalidTimeAuthority)?,
-            digest(b"xnas-session-calendar-v1"),
-        )
-        .map_err(|_| TiingoEodMapError::InvalidTimeAuthority)?;
-        BarTimeSemantics::try_new(
-            Timestamp::from_unix_nanos(40),
-            Timestamp::from_unix_nanos(50),
-            BarTimestampBasis::PeriodEnd,
-            session,
-        )
-        .map_err(|_| TiingoEodMapError::InvalidTimeAuthority)
-    }
-}
-
 struct FixedEodExpectedSessionAuthority;
 
 impl TiingoEodExpectedSessionAuthority for FixedEodExpectedSessionAuthority {
@@ -265,6 +231,12 @@ impl TiingoEodExpectedSessionAuthority for FixedEodExpectedSessionAuthority {
             Timestamp::from_unix_nanos(55),
             digest(b"xnas-session-resolution-receipt-7"),
             vec![expected_date],
+            digest(b"xnas-original-calendar-content"),
+            digest(b"xnas-original-calendar-capture"),
+            market_squawk_sources::ReviewedMarketCalendarRelationship::try_new(
+                request.venue_id().clone(), request.venue_id().clone(),
+                request.start_date(), request.end_date(),
+            ).map_err(|_| TiingoEodMapError::InvalidExpectedSessionEvidence)?,
         )
     }
 
@@ -730,7 +702,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         venue_id.clone(),
         ProviderInstrumentId::try_from(equity_ticker.as_str())?,
         equity_ticker.clone(),
-        identifier("NASDAQ")?,
+        crate::TiingoExchangeCode::try_from("NASDAQ")?,
         TiingoEodInstrumentKind::Equity,
         RevisionBoundPayloadEvidence::new(
             MetadataRevision::new(identifier("instrument-revision-8")?),
@@ -756,7 +728,6 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         sealed_metadata_capture: &equity_metadata_sealed,
         instrument: &eod_instrument,
         contract: &eod_contract,
-        bar_time_authority: &FixedEodTimeAuthority,
         ingested_at: Timestamp::from_unix_nanos(54),
     })?;
     let eod_page = match eod_page.into_publication_route() {

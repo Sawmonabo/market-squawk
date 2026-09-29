@@ -1,5 +1,7 @@
 //! Production source lifecycle authority over live and research runtime owners.
 
+mod reconnect;
+
 use std::{
     future::Future,
     num::NonZeroU64,
@@ -24,20 +26,22 @@ use crate::application::source::{
 };
 use crate::application::{
     AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
-    MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
+    MarketRuntimeRegistry, MarketSourceRuntimeGeneration, PreparedAccountStop,
     PreparedMarketProviderConfigurationRequest,
 };
-use crate::provider_activation::ProviderMarketAccount;
+use crate::provider_activation::{FredPointInTimeReadCapability, ProviderMarketAccount};
 use crate::{
     ProviderAdapterActivation, ProviderOnboardingService, ProviderPortalActivationAuthority,
+    ResearchService,
 };
 
 use super::{
     cli_provider,
     provider_activation_state::{
+        AccountAllocationCoordinates, AccountLifecycleAction, AccountStopDisposition,
         DurableActivationRecipeState, DurableProviderActivationState,
         DurableProviderActivationStateError, DurableSourceLifecyclePhase,
-        DurableSourceLifecycleRecord, DurableSourceLifecycleTransition,
+        DurableSourceLifecycleRecord, DurableSourceLifecycleTransition, PendingAccountLifecycle,
     },
 };
 
@@ -96,7 +100,9 @@ pub(crate) struct ProductionSourceLifecycleAuthority {
     activation: Arc<ProviderAdapterActivation>,
     portal: Arc<dyn ProviderPortalActivationAuthority>,
     durable: DurableProviderActivationState,
+    research: Arc<ResearchService>,
     live: Arc<MarketRuntimeRegistry>,
+    calendars: crate::application::market_calendar::CompletedMarketSessionReadCapability,
 }
 
 impl ProductionSourceLifecycleAuthority {
@@ -107,7 +113,9 @@ impl ProductionSourceLifecycleAuthority {
         activation: Arc<ProviderAdapterActivation>,
         portal: Arc<dyn ProviderPortalActivationAuthority>,
         durable: DurableProviderActivationState,
+        research: Arc<ResearchService>,
         live: Arc<MarketRuntimeRegistry>,
+        calendars: crate::application::market_calendar::CompletedMarketSessionReadCapability,
     ) -> Self {
         Self {
             paths,
@@ -115,7 +123,9 @@ impl ProductionSourceLifecycleAuthority {
             activation,
             portal,
             durable,
+            research,
             live,
+            calendars,
         }
     }
 
@@ -146,7 +156,7 @@ impl ProductionSourceLifecycleAuthority {
         for surface in LIVE_SURFACES {
             let provider = SourceIdentifier::try_from(surface)
                 .map_err(|_error| SourceLifecycleError::InvalidResult)?;
-            let record = match self.durable.source_lifecycle_record(surface) {
+            let mut record = match self.durable.source_lifecycle_record(surface) {
                 Ok(record) => record,
                 Err(error) => {
                     failures.push(LiveSourceRestoreFailure {
@@ -156,6 +166,29 @@ impl ProductionSourceLifecycleAuthority {
                     continue;
                 }
             };
+            if let Some(account_surface) = AccountMarketSurface::parse(surface)
+                && record.account().is_some_and(|pending| !pending.finished)
+            {
+                let _gate = self
+                    .lifecycle_gate_before(surface, deadline, cancellation)
+                    .await?;
+                match self
+                    .continue_account_transition(
+                        record,
+                        account_surface,
+                        deadline,
+                        cancellation,
+                        true,
+                    )
+                    .await
+                {
+                    Ok(completed) => record = completed,
+                    Err(error) => {
+                        failures.push(LiveSourceRestoreFailure { provider, error });
+                        continue;
+                    }
+                }
+            }
             match record.phase() {
                 DurableSourceLifecyclePhase::Active => active.push((provider, record)),
                 DurableSourceLifecyclePhase::Stopped
@@ -238,38 +271,22 @@ impl ProductionSourceLifecycleAuthority {
                         continue;
                     }
                 };
-                match self
-                    .live
-                    .start_account_group(request, deadline, cancellation)
-                    .await
-                    .map_err(map_live_error)
-                {
-                    Ok(evidence) => {
-                        let group_generation = validate_account_group_evidence(request, &evidence)?;
-                        match self
-                            .live
-                            .admit_account_group_reads(
-                                request,
-                                group_generation,
-                                deadline,
-                                cancellation,
-                            )
-                            .await
-                            .map_err(map_live_error)
-                        {
-                            Ok(()) => restored.push(provider),
-                            Err(error) => {
-                                let error = match self
-                                    .cleanup_account_group(request, group_generation)
-                                    .await
-                                {
-                                    Ok(()) => error,
-                                    Err(cleanup_error) => cleanup_error,
-                                };
-                                failures.push(LiveSourceRestoreFailure { provider, error });
-                            }
-                        }
-                    }
+                let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+                    provider: provider.clone(),
+                    action: SourceLifecycleAction::Start,
+                    expected_state_revision: record.revision(),
+                    expected_generation: None,
+                    expected_runtime_generation_digest: None,
+                    onboarding_session_id: Some(request.onboarding_session_id()),
+                    public_configuration_digest: Some(
+                        request.expected_public_configuration_digest(),
+                    ),
+                    reason: None,
+                    cancellation: cancellation.child_token(),
+                    deadline,
+                })?;
+                match self.execute_owned(&command).await {
+                    Ok(_) => restored.push(provider),
                     Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
                 }
             } else {
@@ -309,16 +326,30 @@ impl ProductionSourceLifecycleAuthority {
         ensure_live(command)?;
         let provider = command.provider().as_str().to_owned();
         let _mutation = self
-            .durable
-            .acquire_source_lifecycle(&provider)
-            .await
-            .map_err(map_durable_error)?;
+            .lifecycle_gate_before(&provider, command.deadline(), command.cancellation())
+            .await?;
         let command_digest = command_digest(command)?;
         let operation_id = operation_id(command_digest)?;
         let current = self
             .durable
             .source_lifecycle_record(&provider)
             .map_err(map_durable_error)?;
+        if let Some(surface) = AccountMarketSurface::parse(&provider) {
+            if command.action() != SourceLifecycleAction::Verify {
+                return self
+                    .execute_account_transition(
+                        command,
+                        surface,
+                        current,
+                        command_digest,
+                        operation_id,
+                    )
+                    .await;
+            }
+            if current.account().is_some_and(|pending| !pending.finished) {
+                return Err(SourceLifecycleError::ReconciliationRequired);
+            }
+        }
         let (target_session_id, target_public_configuration_digest) =
             self.lifecycle_transition_target(command, &current)?;
         self.preflight_runtime_lease(command, &current)?;
@@ -374,25 +405,11 @@ impl ProductionSourceLifecycleAuthority {
                     prior_runtime_verification_receipt_digest,
                     prior_credential_generation,
                 ))
-            } else if command.action() == SourceLifecycleAction::Start
-                && AccountMarketSurface::parse(command.provider().as_str()).is_some()
-            {
-                Box::pin(
-                    self.execute_account_group_start(
-                        command,
-                        AccountMarketSurface::parse(command.provider().as_str())
-                            .ok_or(SourceLifecycleError::InvalidRequest)?,
-                        prior_session_id,
-                        prior_public_configuration_digest,
-                    ),
-                )
             } else {
                 Box::pin(self.execute_live(
                     command,
                     prior_session_id,
                     prior_public_configuration_digest,
-                    prior_runtime_verification_receipt_digest,
-                    prior_credential_generation,
                 ))
             };
             execution.await
@@ -426,19 +443,10 @@ impl ProductionSourceLifecycleAuthority {
             }
         };
         if let Err(error) = ensure_live(command) {
-            let cleanup = match outcome.account_group_read_admission {
-                Some((request, group_generation)) => {
-                    self.cleanup_account_group(request, group_generation).await
-                }
-                None => Ok(()),
-            };
             let _blocked = self
                 .durable
                 .require_source_lifecycle_reconciliation(&provider, transition_digest);
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup_error) => cleanup_error,
-            });
+            return Err(error);
         }
         let record = match self.durable.complete_source_lifecycle_transition(
             &provider,
@@ -451,45 +459,12 @@ impl ProductionSourceLifecycleAuthority {
         ) {
             Ok(record) => record,
             Err(error) => {
-                let cleanup = match outcome.account_group_read_admission {
-                    Some((request, group_generation)) => {
-                        self.cleanup_account_group(request, group_generation).await
-                    }
-                    None => Ok(()),
-                };
                 let _blocked = self
                     .durable
                     .require_source_lifecycle_reconciliation(&provider, transition_digest);
-                return Err(match cleanup {
-                    Ok(()) => map_durable_error(error),
-                    Err(cleanup_error) => cleanup_error,
-                });
+                return Err(map_durable_error(error));
             }
         };
-        if let Some((request, group_generation)) = outcome.account_group_read_admission {
-            if let Err(error) = self
-                .live
-                .admit_account_group_reads(
-                    request,
-                    group_generation,
-                    command.deadline(),
-                    command.cancellation(),
-                )
-                .await
-            {
-                let cleanup = self.cleanup_account_group(request, group_generation).await;
-                let _blocked = self
-                    .durable
-                    .require_completed_source_lifecycle_reconciliation(
-                        &provider,
-                        transition_digest,
-                    );
-                return Err(match cleanup {
-                    Ok(()) => map_live_error(error),
-                    Err(cleanup_error) => cleanup_error,
-                });
-            }
-        }
         if outcome.phase == DurableSourceLifecyclePhase::Active
             && matches!(
                 command.action(),
@@ -523,6 +498,712 @@ impl ProductionSourceLifecycleAuthority {
         .await
     }
 
+    async fn lifecycle_gate_before(
+        &self,
+        provider: &str,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, SourceLifecycleError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(SourceLifecycleError::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(SourceLifecycleError::DeadlineExceeded),
+            result = self.durable.acquire_source_lifecycle(provider) => result.map_err(map_durable_error),
+        }
+    }
+
+    /// Real OAuth callback joins the same durable owner; it cannot wait while holding OAuth's
+    /// session lock for a lifecycle start that may itself need that session lock.
+    pub(super) async fn drain_schwab_oauth(
+        &self,
+        session: uuid::Uuid,
+        current_receipt: Option<market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt>,
+        purpose: crate::provider_onboarding::SchwabOAuthMarketDrainPurpose,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SourceLifecycleError> {
+        let _gate = self
+            .durable
+            .try_acquire_source_lifecycle()
+            .map_err(map_durable_error)?;
+        let deadline = self.live.cleanup_deadline().map_err(map_live_error)?;
+        let surface = AccountMarketSurface::SchwabMarketData;
+        let action = match purpose {
+            crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::ProcessShutdown => {
+                AccountLifecycleAction::OAuthProcessShutdown
+            }
+            crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::Unlink => {
+                AccountLifecycleAction::OAuthUnlink
+            }
+            crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::CredentialReplacement => {
+                AccountLifecycleAction::OAuthCredentialReplacement
+            }
+        };
+        let prepared = self
+            .live
+            .prepare_schwab_oauth_stop(session, current_receipt, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?;
+        let current = self
+            .durable
+            .source_lifecycle_record(surface.surface_id())
+            .map_err(map_durable_error)?;
+        let record = if let Some(pending) = current.account().filter(|pending| !pending.finished) {
+            if !matches!(
+                pending.action,
+                AccountLifecycleAction::OAuthProcessShutdown
+                    | AccountLifecycleAction::OAuthUnlink
+                    | AccountLifecycleAction::OAuthCredentialReplacement
+            ) || (pending.action != action
+                && action != AccountLifecycleAction::OAuthProcessShutdown)
+                || pending
+                    .predecessor
+                    .as_ref()
+                    .is_some_and(|original| original.session_id() != session)
+            {
+                return Err(SourceLifecycleError::ReconciliationRequired);
+            }
+            current
+        } else {
+            let Some((request, generation)) = prepared.predecessor() else {
+                return Ok(());
+            };
+            let mut hash = Sha256::new();
+            hash.update(b"market-squawk/source-lifecycle-oauth-drain/v1\0");
+            hash.update(session.as_bytes());
+            hash.update(generation.digest().bytes());
+            hash.update(current.revision().get().to_be_bytes());
+            hash.update([match purpose {
+                crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::ProcessShutdown => 1,
+                crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::Unlink => 2,
+                crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::CredentialReplacement => 3,
+            }]);
+            let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into());
+            let pending = PendingAccountLifecycle {
+                action,
+                predecessor: Some(AccountAllocationCoordinates::from_observed(
+                    request, generation,
+                )),
+                disposition: AccountStopDisposition::AwaitingRuntime,
+                target_session_id: Some(request.onboarding_session_id()),
+                target_configuration_sha256: Some(lower_hex(
+                    &request.expected_public_configuration_digest().bytes(),
+                )),
+                successor: None,
+                retired_successor: None,
+                successor_retirement: None,
+                finished: false,
+                // Only explicit process shutdown keeps the original desired Active choice.
+                oauth_restore_active: purpose
+                    == crate::provider_onboarding::SchwabOAuthMarketDrainPurpose::ProcessShutdown
+                    && current.phase() == DurableSourceLifecyclePhase::Active,
+            };
+            self.durable
+                .begin_account_lifecycle(
+                    surface.surface_id(),
+                    &current,
+                    operation_id(digest)?,
+                    digest,
+                    pending,
+                )
+                .map_err(map_durable_error)?
+        };
+        let record = self
+            .finish_account_predecessor(&record, surface, Some(prepared), deadline, cancellation)
+            .await?;
+        self.continue_account_transition(record, surface, deadline, cancellation, false)
+            .await?;
+        Ok(())
+    }
+
+    async fn drain_pending_account_transitions(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), SourceLifecycleError> {
+        let cancellation = CancellationToken::new();
+        let gate = tokio::time::timeout_at(
+            deadline.into(),
+            self.durable
+                .acquire_source_lifecycle(ProviderMarketAccount::AlpacaBasic.surface_id()),
+        )
+        .await
+        .map_err(|_| SourceLifecycleError::DeadlineExceeded)?
+        .map_err(map_durable_error)?;
+        let mut failure = None;
+        for surface in [
+            AccountMarketSurface::AlpacaBasic,
+            AccountMarketSurface::KrakenLevel3,
+            AccountMarketSurface::SchwabMarketData,
+        ] {
+            let current = self
+                .durable
+                .source_lifecycle_record(surface.surface_id())
+                .map_err(map_durable_error)?;
+            if current.account().is_some_and(|pending| !pending.finished) {
+                if let Err(error) = self
+                    .continue_account_transition(current, surface, deadline, &cancellation, false)
+                    .await
+                {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        drop(gate);
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Caller holds the sole lifecycle gate. Pending intent is resumed, never replaced by Retry.
+    async fn execute_account_transition(
+        &self,
+        command: &SourceLifecycleCommand,
+        surface: AccountMarketSurface,
+        current: DurableSourceLifecycleRecord,
+        digest: EvidenceDigest,
+        operation: SourceIdentifier,
+    ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
+        let provider = surface.surface_id();
+        if current.operation_id() == Some(&operation)
+            && current.command_digest() == Some(digest)
+            && current.account().is_some_and(|pending| pending.finished)
+        {
+            return self
+                .receipt_for_current(
+                    command,
+                    operation,
+                    SourceLifecycleDisposition::Replay,
+                    &current,
+                    None,
+                )
+                .await;
+        }
+        let mut record = if current.account().is_some_and(|pending| !pending.finished) {
+            if (current.operation_id() != Some(&operation)
+                || current.command_digest() != Some(digest))
+                && (command.action() != SourceLifecycleAction::Retry
+                    || command.expected_state_revision() != current.revision()
+                    || command.onboarding_session_id().is_some_and(|session| {
+                        Some(session)
+                            != current
+                                .account()
+                                .and_then(|pending| pending.target_session_id)
+                    })
+                    || command.public_configuration_digest().is_some_and(|digest| {
+                        current
+                            .account()
+                            .and_then(|pending| pending.target_configuration().ok().flatten())
+                            != Some(digest)
+                    }))
+            {
+                return Err(SourceLifecycleError::ReconciliationRequired);
+            }
+            current
+        } else {
+            if command.expected_state_revision() != current.revision() {
+                return Err(SourceLifecycleError::Conflict);
+            }
+            self.preflight_runtime_lease(command, &current)?;
+            let (session, configuration) = self.lifecycle_transition_target(command, &current)?;
+            let prepared = self
+                .live
+                .prepare_account_stop(surface, command.deadline(), command.cancellation())
+                .await
+                .map_err(map_live_error)?;
+            let observed = prepared.predecessor();
+            if let Some((actual, _)) = observed {
+                if current.runtime_verification_receipt_digest().is_some()
+                    && actual != account_group_request_from_record(surface, &current)?
+                {
+                    return Err(SourceLifecycleError::Conflict);
+                }
+            }
+            if command.expected_generation().is_some()
+                || command
+                    .expected_runtime_generation_digest()
+                    .is_some_and(|expected| {
+                        observed.map(|(_, generation)| generation.digest()) != Some(expected)
+                    })
+                || command.action() == SourceLifecycleAction::Resynchronize && observed.is_none()
+            {
+                return Err(SourceLifecycleError::Conflict);
+            }
+            let action = match command.action() {
+                SourceLifecycleAction::Start => AccountLifecycleAction::Start,
+                SourceLifecycleAction::Stop => AccountLifecycleAction::Stop,
+                SourceLifecycleAction::Retry => AccountLifecycleAction::Retry,
+                SourceLifecycleAction::Resynchronize => AccountLifecycleAction::Resynchronize,
+                SourceLifecycleAction::Reconfigure => AccountLifecycleAction::Reconfigure,
+                SourceLifecycleAction::Remove => AccountLifecycleAction::Remove,
+                SourceLifecycleAction::Verify => return Err(SourceLifecycleError::InvalidRequest),
+            };
+            let reuse = if action == AccountLifecycleAction::Start {
+                if let Some((request, _)) = observed {
+                    Some(request.onboarding_session_id()) == session
+                        && Some(request.expected_public_configuration_digest()) == configuration
+                        && self
+                            .live
+                            .verify_account_group(
+                                request,
+                                command.deadline(),
+                                command.cancellation(),
+                            )
+                            .await
+                            .map_err(map_live_error)?
+                            .is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let predecessor =
+                (!reuse)
+                    .then_some(observed)
+                    .flatten()
+                    .map(|(request, generation)| {
+                        AccountAllocationCoordinates::from_observed(request, generation)
+                    });
+            let pending = PendingAccountLifecycle {
+                action,
+                disposition: if predecessor.is_some() {
+                    AccountStopDisposition::AwaitingRuntime
+                } else {
+                    AccountStopDisposition::NoPredecessor
+                },
+                predecessor,
+                target_session_id: session,
+                target_configuration_sha256: configuration.map(|value| lower_hex(&value.bytes())),
+                successor: reuse
+                    .then_some(observed)
+                    .flatten()
+                    .map(|(request, generation)| {
+                        AccountAllocationCoordinates::from_observed(request, generation)
+                    }),
+                retired_successor: None,
+                successor_retirement: None,
+                finished: false,
+                oauth_restore_active: false,
+            };
+            let record = self
+                .durable
+                .begin_account_lifecycle(provider, &current, operation, digest, pending)
+                .map_err(map_durable_error)?;
+            // Preparation has never revoked anything. Its exact coordinates are now durable.
+            if !reuse {
+                self.finish_account_predecessor(
+                    &record,
+                    surface,
+                    Some(prepared),
+                    command.deadline(),
+                    command.cancellation(),
+                )
+                .await?
+            } else {
+                record
+            }
+        };
+        record = self
+            .continue_account_transition(
+                record,
+                surface,
+                command.deadline(),
+                command.cancellation(),
+                true,
+            )
+            .await?;
+        let operation = record
+            .operation_id()
+            .cloned()
+            .ok_or(SourceLifecycleError::InvalidResult)?;
+        self.receipt_for_current(
+            command,
+            operation,
+            SourceLifecycleDisposition::Applied,
+            &record,
+            None,
+        )
+        .await
+    }
+
+    async fn finish_account_predecessor(
+        &self,
+        record: &DurableSourceLifecycleRecord,
+        surface: AccountMarketSurface,
+        preparation: Option<PreparedAccountStop>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<DurableSourceLifecycleRecord, SourceLifecycleError> {
+        let pending = record
+            .account()
+            .ok_or(SourceLifecycleError::InvalidResult)?;
+        if pending.disposition != AccountStopDisposition::AwaitingRuntime {
+            if pending.disposition == AccountStopDisposition::NoPredecessor {
+                if let Some(prepared) = preparation {
+                    if prepared.predecessor().is_some()
+                        || self
+                            .live
+                            .consume_account_stop(prepared, deadline, cancellation)
+                            .await
+                            .map_err(map_live_error)?
+                            .is_some()
+                    {
+                        return Err(SourceLifecycleError::ReconciliationRequired);
+                    }
+                }
+            }
+            return Ok(record.clone());
+        }
+        let prepared = match preparation {
+            Some(prepared) => prepared,
+            None => self
+                .live
+                .prepare_account_stop(surface, deadline, cancellation)
+                .await
+                .map_err(map_live_error)?,
+        };
+        let (request, generation) = prepared
+            .predecessor()
+            .ok_or(SourceLifecycleError::ReconciliationRequired)?;
+        if !pending
+            .predecessor
+            .as_ref()
+            .is_some_and(|original| original.matches(request, generation))
+        {
+            return Err(SourceLifecycleError::ReconciliationRequired);
+        }
+        let receipt = self
+            .live
+            .consume_account_stop(prepared, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?
+            .ok_or(SourceLifecycleError::InvalidResult)?;
+        if pending.action == AccountLifecycleAction::Remove {
+            self.portal
+                .cancel(request.onboarding_session_id(), cancellation.child_token())
+                .await
+                .map_err(|_| SourceLifecycleError::ReconciliationRequired)?;
+        }
+        let mut committed = None;
+        self.live
+            .acknowledge_account_group_stop(
+                &receipt,
+                |receipt| {
+                    committed = Some(
+                        self.durable
+                            .acknowledge_account_predecessor(surface.surface_id(), record, receipt)
+                            .map_err(|_| market_squawk_services::ServiceError::Unavailable)?,
+                    );
+                    Ok(())
+                },
+                deadline,
+                cancellation,
+            )
+            .await
+            .map_err(map_live_error)?;
+        committed.ok_or(SourceLifecycleError::InvalidResult)
+    }
+
+    async fn continue_account_transition(
+        &self,
+        record: DurableSourceLifecycleRecord,
+        surface: AccountMarketSurface,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        start_successor: bool,
+    ) -> Result<DurableSourceLifecycleRecord, SourceLifecycleError> {
+        ensure_status_live(cancellation, deadline)?;
+        let mut record = self
+            .finish_account_predecessor(&record, surface, None, deadline, cancellation)
+            .await?;
+        let mut pending = record
+            .account()
+            .cloned()
+            .ok_or(SourceLifecycleError::InvalidResult)?;
+        if pending.finished {
+            return Ok(record);
+        }
+        match pending.action {
+            AccountLifecycleAction::Stop
+            | AccountLifecycleAction::Remove
+            | AccountLifecycleAction::OAuthProcessShutdown
+            | AccountLifecycleAction::OAuthUnlink
+            | AccountLifecycleAction::OAuthCredentialReplacement => {
+                if pending.action == AccountLifecycleAction::Remove {
+                    if let Some(session) = record.session_id().or_else(|| {
+                        pending
+                            .predecessor
+                            .as_ref()
+                            .map(AccountAllocationCoordinates::session_id)
+                    }) {
+                        self.portal
+                            .cancel(session, cancellation.child_token())
+                            .await
+                            .map_err(|_| SourceLifecycleError::ReconciliationRequired)?;
+                    }
+                }
+                pending.finished = true;
+                let phase = if pending.action == AccountLifecycleAction::Remove {
+                    DurableSourceLifecyclePhase::Removed
+                } else if pending.oauth_restore_active {
+                    DurableSourceLifecyclePhase::Active
+                } else {
+                    DurableSourceLifecyclePhase::Stopped
+                };
+                return self
+                    .durable
+                    .update_account_lifecycle(surface.surface_id(), &record, pending, phase, None)
+                    .map_err(map_durable_error);
+            }
+            AccountLifecycleAction::Start
+            | AccountLifecycleAction::Retry
+            | AccountLifecycleAction::Resynchronize
+            | AccountLifecycleAction::Reconfigure => {}
+            AccountLifecycleAction::Verify => {
+                let session = pending
+                    .target_session_id
+                    .ok_or(SourceLifecycleError::Unauthorized)?;
+                let configuration = pending
+                    .target_configuration()
+                    .map_err(map_durable_error)?
+                    .ok_or(SourceLifecycleError::Unauthorized)?;
+                let lease = self
+                    .onboarding
+                    .activation_lease(session)
+                    .or_else(|_| self.onboarding.prepared_activation_lease(session))
+                    .map_err(|_| SourceLifecycleError::Unauthorized)?;
+                let request = account_group_request_from_binding(
+                    surface,
+                    Some(session),
+                    Some(configuration),
+                    Some(&lease),
+                )?;
+                pending.finished = true;
+                return self
+                    .durable
+                    .update_account_lifecycle(
+                        surface.surface_id(),
+                        &record,
+                        pending,
+                        DurableSourceLifecyclePhase::Stopped,
+                        Some(request),
+                    )
+                    .map_err(map_durable_error);
+            }
+        }
+        if !start_successor {
+            // Preserve the user's original successor intent while joining any allocation already
+            // constructed by it. Shutdown never starts another provider runtime.
+            return self
+                .drain_account_successor(record, surface, deadline, cancellation)
+                .await;
+        }
+        let session = pending
+            .target_session_id
+            .ok_or(SourceLifecycleError::Unauthorized)?;
+        let configuration = pending
+            .target_configuration()
+            .map_err(map_durable_error)?
+            .ok_or(SourceLifecycleError::Unauthorized)?;
+        let lease = self
+            .onboarding
+            .activation_lease(session)
+            .or_else(|_| self.onboarding.prepared_activation_lease(session))
+            .map_err(|_| SourceLifecycleError::Unauthorized)?;
+        let request = account_group_request_from_binding(
+            surface,
+            Some(session),
+            Some(configuration),
+            Some(&lease),
+        )?;
+        // A previous successor can have become unhealthy while its caller was cancelled. It too
+        // must be captured, persisted, joined and acknowledged before a fresh start is admitted.
+        let observed = self
+            .live
+            .prepare_account_stop(surface, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?;
+        if let Some((actual, generation)) = observed.predecessor() {
+            if pending
+                .successor
+                .as_ref()
+                .is_some_and(|prior| !prior.matches(actual, generation))
+            {
+                return Err(SourceLifecycleError::ReconciliationRequired);
+            }
+            // Renewal can supersede a partially published successor's doctor receipt. Retire
+            // that original allocation through the same target and saved-successor checks;
+            // never ask it to impersonate the fresh request or discard its join receipt.
+            if actual != request
+                || !matches!(
+                    self.live
+                        .verify_account_group(actual, deadline, cancellation)
+                        .await,
+                    Ok(Some(_))
+                )
+            {
+                record = self
+                    .drain_account_successor(record, surface, deadline, cancellation)
+                    .await?;
+                pending = record
+                    .account()
+                    .cloned()
+                    .ok_or(SourceLifecycleError::InvalidResult)?;
+            }
+        } else if pending.successor.is_some() {
+            return Err(SourceLifecycleError::ReconciliationRequired);
+        }
+        let evidence = self
+            .live
+            .start_account_group(request, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?;
+        let generation = validate_account_group_evidence(request, &evidence)?;
+        if pending
+            .predecessor
+            .as_ref()
+            .is_some_and(|original| original.matches(request, generation))
+        {
+            return Err(SourceLifecycleError::ReconciliationRequired);
+        }
+        pending.successor = Some(AccountAllocationCoordinates::from_observed(
+            request, generation,
+        ));
+        // Persist exact successor identity before opening reads. If admission is cancelled, the
+        // pending record and registry continue to own this same allocation.
+        record = self
+            .durable
+            .update_account_lifecycle(
+                surface.surface_id(),
+                &record,
+                pending.clone(),
+                DurableSourceLifecyclePhase::Applying,
+                Some(request),
+            )
+            .map_err(map_durable_error)?;
+        self.live
+            .admit_account_group_reads(request, generation, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?;
+        if surface == AccountMarketSurface::AlpacaBasic {
+            // Authorized source activation publishes the original calendar before local paper
+            // preparation can read it. A failure retains Applying and this exact successor for
+            // Retry; opening a read-only paper dialog never acquires provider data.
+            let calendar = self.calendars
+                .preflight_current_session(deadline, cancellation.clone())
+                .await
+                .map_err(|error| {
+                    use crate::application::market_calendar::CompletedMarketSessionError;
+                    tracing::warn!(%error, stage = "alpaca_calendar_publication", "source activation calendar unavailable");
+                    match error {
+                        CompletedMarketSessionError::Cancelled => SourceLifecycleError::Cancelled,
+                        CompletedMarketSessionError::DeadlineExceeded => SourceLifecycleError::DeadlineExceeded,
+                        CompletedMarketSessionError::InvalidRequest
+                        | CompletedMarketSessionError::InvalidEvidence => SourceLifecycleError::InvalidResult,
+                        CompletedMarketSessionError::ResourceBoundExceeded
+                        | CompletedMarketSessionError::Unavailable => SourceLifecycleError::Unavailable,
+                    }
+                })?;
+            if calendar.is_none() {
+                tracing::warn!(stage = "alpaca_calendar_publication", "source activation calendar unavailable");
+                return Err(SourceLifecycleError::Unavailable);
+            }
+            ensure_status_live(cancellation, deadline)?;
+        }
+        pending.finished = true;
+        self.durable
+            .update_account_lifecycle(
+                surface.surface_id(),
+                &record,
+                pending,
+                DurableSourceLifecyclePhase::Active,
+                Some(request),
+            )
+            .map_err(map_durable_error)
+    }
+
+    async fn drain_account_successor(
+        &self,
+        record: DurableSourceLifecycleRecord,
+        surface: AccountMarketSurface,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<DurableSourceLifecycleRecord, SourceLifecycleError> {
+        let mut pending = record
+            .account()
+            .cloned()
+            .ok_or(SourceLifecycleError::InvalidResult)?;
+        let prepared = self
+            .live
+            .prepare_account_stop(surface, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?;
+        let Some((request, generation)) = prepared.predecessor() else {
+            return if pending.successor.is_none() {
+                Ok(record)
+            } else {
+                Err(SourceLifecycleError::ReconciliationRequired)
+            };
+        };
+        if Some(request.onboarding_session_id()) != pending.target_session_id
+            || Some(request.expected_public_configuration_digest())
+                != pending.target_configuration().map_err(map_durable_error)?
+            || pending
+                .successor
+                .as_ref()
+                .is_some_and(|prior| !prior.matches(request, generation))
+        {
+            return Err(SourceLifecycleError::ReconciliationRequired);
+        }
+        pending.successor = Some(AccountAllocationCoordinates::from_observed(
+            request, generation,
+        ));
+        let record = self
+            .durable
+            .update_account_lifecycle(
+                surface.surface_id(),
+                &record,
+                pending.clone(),
+                record.phase(),
+                None,
+            )
+            .map_err(map_durable_error)?;
+        let receipt = self
+            .live
+            .consume_account_stop(prepared, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?
+            .ok_or(SourceLifecycleError::InvalidResult)?;
+        let mut committed = None;
+        self.live
+            .acknowledge_account_group_stop(
+                &receipt,
+                |receipt| {
+                    if !pending.successor.as_ref().is_some_and(|original| {
+                        original.matches(receipt.request(), receipt.generation())
+                    }) {
+                        return Err(market_squawk_services::ServiceError::InvalidResult);
+                    }
+                    pending.retired_successor = pending.successor.take();
+                    pending.successor_retirement = Some(AccountStopDisposition::GracefullyDrained);
+                    committed = Some(
+                        self.durable
+                            .update_account_lifecycle(
+                                surface.surface_id(),
+                                &record,
+                                pending,
+                                record.phase(),
+                                None,
+                            )
+                            .map_err(|_| market_squawk_services::ServiceError::Unavailable)?,
+                    );
+                    Ok(())
+                },
+                deadline,
+                cancellation,
+            )
+            .await
+            .map_err(map_live_error)?;
+        committed.ok_or(SourceLifecycleError::InvalidResult)
+    }
+
     async fn status_owned(
         &self,
         provider: &SourceIdentifier,
@@ -531,15 +1212,35 @@ impl ProductionSourceLifecycleAuthority {
     ) -> Result<SourceLifecycleStatus, SourceLifecycleError> {
         ensure_status_live(cancellation, deadline)?;
         let _read = self
-            .durable
-            .acquire_source_lifecycle(provider.as_str())
-            .await
-            .map_err(map_durable_error)?;
+            .lifecycle_gate_before(provider.as_str(), deadline, cancellation)
+            .await?;
         ensure_status_live(cancellation, deadline)?;
-        let record = self
-            .durable
-            .source_lifecycle_record(provider.as_str())
-            .map_err(map_durable_error)?;
+        let record = match self.durable.source_lifecycle_record(provider.as_str()) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(provider = %provider.as_str(), %error, "source lifecycle state is unavailable");
+                ensure_status_live(cancellation, deadline)?;
+                return SourceLifecycleStatus::try_new(SourceLifecycleStatusInput {
+                    provider: provider.clone(),
+                    state_revision: NonZeroU64::MIN,
+                    state: SourceLifecycleState::Blocked,
+                    configuration_session_id: None,
+                    current_generation: None,
+                    runtime_generation_digest: None,
+                    public_configuration_digest: None,
+                    doctor: None,
+                    start_eligibility: if provider.as_str()
+                        == ProviderMarketAccount::AlpacaBasic.surface_id()
+                    {
+                        SourceStartEligibility::ReconciliationRequired
+                    } else {
+                        SourceStartEligibility::NotApplicable
+                    },
+                    blocker: Some(SourceLifecycleBlocker::Reconciliation),
+                    observed_at: system_timestamp()?,
+                });
+            }
+        };
         let (configuration_session_id, public_configuration_digest) =
             self.status_configuration_binding(provider, &record)?;
         let mut state = if record.phase() == DurableSourceLifecyclePhase::Applying {
@@ -588,10 +1289,15 @@ impl ProductionSourceLifecycleAuthority {
         } else if state == SourceLifecycleState::Active {
             match self.activation.research_runtime_generation(provider) {
                 Ok(Some(generation)) => {
-                    research = generation
+                    let digest = generation
                         .generation_digest()
-                        .map(Some)
                         .map_err(|_| SourceLifecycleError::InvalidResult)?;
+                    if self.research_selection_available(provider, digest) {
+                        research = Some(digest);
+                    } else {
+                        state = SourceLifecycleState::Blocked;
+                        blocker = Some(SourceLifecycleBlocker::Reconciliation);
+                    }
                 }
                 Ok(None) | Err(_) => {
                     state = SourceLifecycleState::Blocked;
@@ -668,77 +1374,56 @@ impl ProductionSourceLifecycleAuthority {
         if let Some(request) = prior_request {
             let deadline = self.live.cleanup_deadline().map_err(map_live_error)?;
             let cleanup = CancellationToken::new();
-            self.live
-                .stop_account_group(request, None, deadline, &cleanup)
+            let prepared = self
+                .live
+                .prepare_account_stop(request.surface(), deadline, &cleanup)
                 .await
                 .map_err(map_live_error)?;
+            if prepared
+                .predecessor()
+                .is_some_and(|(actual, _)| actual != request)
+            {
+                return Err(SourceLifecycleError::Conflict);
+            }
+            let predecessor = prepared.predecessor().map(|(actual, generation)| {
+                AccountAllocationCoordinates::from_observed(actual, generation)
+            });
+            let record = self
+                .durable
+                .source_lifecycle_record(command.provider().as_str())
+                .map_err(map_durable_error)?;
+            let pending = PendingAccountLifecycle {
+                action: AccountLifecycleAction::Verify,
+                disposition: if predecessor.is_some() {
+                    AccountStopDisposition::AwaitingRuntime
+                } else {
+                    AccountStopDisposition::NoPredecessor
+                },
+                predecessor,
+                target_session_id: Some(lease.session_id()),
+                target_configuration_sha256: Some(lower_hex(
+                    &lease.public_configuration_digest().bytes(),
+                )),
+                successor: None,
+                retired_successor: None,
+                successor_retirement: None,
+                finished: false,
+                oauth_restore_active: false,
+            };
+            let record = self
+                .durable
+                .attach_account_lifecycle(command.provider().as_str(), &record, pending)
+                .map_err(map_durable_error)?;
+            self.finish_account_predecessor(
+                &record,
+                request.surface(),
+                Some(prepared),
+                deadline,
+                &cleanup,
+            )
+            .await?;
         }
         LifecycleOutcome::stopped_with_runtime_verification(&lease)
-    }
-
-    async fn execute_account_group_start(
-        &self,
-        command: &SourceLifecycleCommand,
-        surface: AccountMarketSurface,
-        prior_session_id: Option<uuid::Uuid>,
-        prior_public_configuration_digest: Option<EvidenceDigest>,
-    ) -> Result<LifecycleOutcome, SourceLifecycleError> {
-        if command.action() != SourceLifecycleAction::Start
-            || command.provider().as_str() != surface.surface_id()
-        {
-            return Err(SourceLifecycleError::InvalidRequest);
-        }
-        let lease = match self.optional_exact_lease(command)? {
-            Some(lease) => lease,
-            None => prior_session_id
-                .and_then(|session_id| {
-                    self.onboarding
-                        .activation_lease(session_id)
-                        .or_else(|_| self.onboarding.prepared_activation_lease(session_id))
-                        .ok()
-                })
-                .ok_or(SourceLifecycleError::Unauthorized)?,
-        };
-        if lease.surface_id() != command.provider()
-            || (prior_session_id.is_some() || prior_public_configuration_digest.is_some())
-                && (prior_session_id != Some(lease.session_id())
-                    || prior_public_configuration_digest
-                        != Some(lease.public_configuration_digest()))
-        {
-            return Err(SourceLifecycleError::Conflict);
-        }
-        let request = account_group_request_from_binding(
-            surface,
-            Some(lease.session_id()),
-            Some(lease.public_configuration_digest()),
-            Some(&lease),
-        )?;
-        let startup: Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            MarketProviderGroupLifecycleEvidence,
-                            market_squawk_services::ServiceError,
-                        >,
-                    > + Send
-                    + '_,
-            >,
-        > = Box::pin(self.live.start_account_group(
-            request,
-            command.deadline(),
-            command.cancellation(),
-        ));
-        let evidence = startup.await.map_err(map_live_error)?;
-        let group_generation = validate_account_group_evidence(request, &evidence)?;
-        let mut outcome = LifecycleOutcome::active_account(
-            Some(lease.session_id()),
-            Some(lease.public_configuration_digest()),
-            None,
-            request,
-            group_generation,
-        );
-        outcome.bind_runtime_verification(&lease)?;
-        Ok(outcome)
     }
 
     async fn execute_live(
@@ -746,8 +1431,6 @@ impl ProductionSourceLifecycleAuthority {
         command: &SourceLifecycleCommand,
         prior_session_id: Option<uuid::Uuid>,
         prior_public_configuration_digest: Option<EvidenceDigest>,
-        prior_runtime_verification_receipt_digest: Option<EvidenceDigest>,
-        prior_credential_generation: Option<market_squawk_platform::SecretGeneration>,
     ) -> Result<LifecycleOutcome, SourceLifecycleError> {
         let supplied_lease = self.optional_exact_lease(command)?;
         let lease = match supplied_lease {
@@ -812,15 +1495,11 @@ impl ProductionSourceLifecycleAuthority {
             };
         if let Some(surface) = AccountMarketSurface::parse(command.provider().as_str()) {
             let mut outcome = self
-                .execute_account_group_live(
+                .verify_account_group_live(
                     command,
                     surface,
-                    prior_session_id,
-                    prior_public_configuration_digest,
                     session_id,
                     public_configuration_digest,
-                    prior_runtime_verification_receipt_digest,
-                    prior_credential_generation,
                     lease.as_ref(),
                 )
                 .await?;
@@ -933,222 +1612,35 @@ impl ProductionSourceLifecycleAuthority {
         }
     }
 
-    async fn execute_account_group_live(
+    async fn verify_account_group_live(
         &self,
         command: &SourceLifecycleCommand,
         surface: AccountMarketSurface,
-        prior_session_id: Option<uuid::Uuid>,
-        prior_public_configuration_digest: Option<EvidenceDigest>,
         session_id: Option<uuid::Uuid>,
         public_configuration_digest: Option<EvidenceDigest>,
-        prior_runtime_verification_receipt_digest: Option<EvidenceDigest>,
-        prior_credential_generation: Option<market_squawk_platform::SecretGeneration>,
         lease: Option<&crate::ProviderActivationLease>,
     ) -> Result<LifecycleOutcome, SourceLifecycleError> {
-        match command.action() {
-            SourceLifecycleAction::Start | SourceLifecycleAction::Retry => {
-                let request = account_group_request_from_binding(
-                    surface,
-                    session_id,
-                    public_configuration_digest,
-                    lease,
-                )?;
-                let evidence = self
-                    .live
-                    .start_account_group(request, command.deadline(), command.cancellation())
-                    .await
-                    .map_err(map_live_error)?;
-                let group_generation = validate_account_group_evidence(request, &evidence)?;
-                Ok(LifecycleOutcome::active_account(
-                    session_id,
-                    public_configuration_digest,
-                    None,
-                    request,
-                    group_generation,
-                ))
-            }
-            SourceLifecycleAction::Stop => {
-                let request = account_group_request_from_values(
-                    surface,
-                    prior_session_id,
-                    prior_public_configuration_digest,
-                    prior_runtime_verification_receipt_digest,
-                    prior_credential_generation,
-                )?;
-                self.stop_account_group_exact(command, request, false)
-                    .await?;
-                Ok(LifecycleOutcome::stopped_account(request))
-            }
-            SourceLifecycleAction::Resynchronize => {
-                if command.expected_generation().is_some()
-                    || command.expected_runtime_generation_digest().is_none()
-                {
-                    return Err(SourceLifecycleError::InvalidRequest);
-                }
-                let request = account_group_request_from_binding(
-                    surface,
-                    session_id,
-                    public_configuration_digest,
-                    lease,
-                )?;
-                let previous = self
-                    .stop_account_group_exact(command, request, true)
-                    .await?
-                    .ok_or(SourceLifecycleError::Unavailable)?;
-                let current = self
-                    .live
-                    .start_account_group(request, command.deadline(), command.cancellation())
-                    .await
-                    .map_err(map_live_error)?;
-                let current = validate_account_group_evidence(request, &current)?;
-                if current == previous {
-                    let cleanup = self
-                        .live
-                        .stop_account_group(
-                            request,
-                            Some(current),
-                            command.deadline(),
-                            command.cancellation(),
-                        )
-                        .await
-                        .map_err(|_error| SourceLifecycleError::ReconciliationRequired)?;
-                    if cleanup != Some(current) {
-                        return Err(SourceLifecycleError::ReconciliationRequired);
-                    }
-                    return Err(SourceLifecycleError::ReconciliationRequired);
-                }
-                Ok(LifecycleOutcome::active_account(
-                    session_id,
-                    public_configuration_digest,
-                    None,
-                    request,
-                    current,
-                ))
-            }
-            SourceLifecycleAction::Verify => {
-                let request = account_group_request_from_binding(
-                    surface,
-                    session_id,
-                    public_configuration_digest,
-                    lease,
-                )?;
-                let evidence = self
-                    .live
-                    .verify_account_group(request, command.deadline(), command.cancellation())
-                    .await
-                    .map_err(map_live_error)?
-                    .ok_or(SourceLifecycleError::Unavailable)?;
-                validate_account_group_evidence(request, &evidence)?;
-                Ok(LifecycleOutcome::active(
-                    session_id,
-                    public_configuration_digest,
-                    None,
-                ))
-            }
-            SourceLifecycleAction::Reconfigure => {
-                let request = account_group_request_from_binding(
-                    surface,
-                    session_id,
-                    public_configuration_digest,
-                    lease,
-                )?;
-                if prior_session_id.is_some() || prior_public_configuration_digest.is_some() {
-                    let prior_request = account_group_request_from_values(
-                        surface,
-                        prior_session_id,
-                        prior_public_configuration_digest,
-                        prior_runtime_verification_receipt_digest,
-                        prior_credential_generation,
-                    )?;
-                    self.stop_account_group_exact(command, prior_request, false)
-                        .await?;
-                }
-                let evidence = self
-                    .live
-                    .start_account_group(request, command.deadline(), command.cancellation())
-                    .await
-                    .map_err(map_live_error)?;
-                let group_generation = validate_account_group_evidence(request, &evidence)?;
-                Ok(LifecycleOutcome::active_account(
-                    session_id,
-                    public_configuration_digest,
-                    None,
-                    request,
-                    group_generation,
-                ))
-            }
-            SourceLifecycleAction::Remove => {
-                self.live
-                    .remove_account_group(surface, command.deadline(), command.cancellation())
-                    .await
-                    .map_err(map_live_error)?;
-                if let Some(session_id) = prior_session_id {
-                    self.portal
-                        .cancel(session_id, command.cancellation().child_token())
-                        .await
-                        .map_err(|_| SourceLifecycleError::ReconciliationRequired)?;
-                }
-                Ok(LifecycleOutcome::removed(None))
-            }
+        if command.action() != SourceLifecycleAction::Verify {
+            return Err(SourceLifecycleError::InvalidRequest);
         }
-    }
-
-    async fn stop_account_group_exact(
-        &self,
-        command: &SourceLifecycleCommand,
-        request: PreparedMarketProviderConfigurationRequest,
-        require_present: bool,
-    ) -> Result<Option<MarketRuntimeGroupGeneration>, SourceLifecycleError> {
-        let expected = match self
+        let request = account_group_request_from_binding(
+            surface,
+            session_id,
+            public_configuration_digest,
+            lease,
+        )?;
+        let evidence = self
             .live
             .verify_account_group(request, command.deadline(), command.cancellation())
             .await
-        {
-            Ok(Some(evidence)) => Some(validate_account_group_evidence(request, &evidence)?),
-            Ok(None) => None,
-            Err(market_squawk_services::ServiceError::Unavailable) if !require_present => None,
-            Err(error) => return Err(map_live_error(error)),
-        };
-        if require_present && expected.is_none() {
-            return Err(SourceLifecycleError::Unavailable);
-        }
-        if let Some(expected_digest) = command.expected_runtime_generation_digest()
-            && expected.map(MarketRuntimeGroupGeneration::digest) != Some(expected_digest)
-        {
-            return Err(SourceLifecycleError::Conflict);
-        }
-        let stopped = self
-            .live
-            .stop_account_group(
-                request,
-                expected,
-                command.deadline(),
-                command.cancellation(),
-            )
-            .await
-            .map_err(map_live_error)?;
-        if expected.is_some() && stopped != expected {
-            return Err(SourceLifecycleError::InvalidResult);
-        }
-        Ok(stopped)
-    }
-
-    async fn cleanup_account_group(
-        &self,
-        request: PreparedMarketProviderConfigurationRequest,
-        expected: MarketRuntimeGroupGeneration,
-    ) -> Result<(), SourceLifecycleError> {
-        let deadline = self.live.cleanup_deadline().map_err(map_live_error)?;
-        let cancellation = CancellationToken::new();
-        match self
-            .live
-            .stop_account_group(request, Some(expected), deadline, &cancellation)
-            .await
             .map_err(map_live_error)?
-        {
-            Some(stopped) if stopped != expected => Err(SourceLifecycleError::InvalidResult),
-            Some(_) | None => Ok(()),
-        }
+            .ok_or(SourceLifecycleError::Unavailable)?;
+        validate_account_group_evidence(request, &evidence)?;
+        Ok(LifecycleOutcome::active(
+            session_id,
+            public_configuration_digest,
+            None,
+        ))
     }
 
     async fn execute_research(
@@ -1193,8 +1685,8 @@ impl ProductionSourceLifecycleAuthority {
                     )
                     .await
                     .map_err(|_| SourceLifecycleError::Unavailable)?;
-                } else if profile.as_str() == "eia.api-v2" {
-                    cli_provider::publish_eia_activated_data(
+                } else if matches!(profile.as_str(), "eia.api-v2" | "census.data-api") {
+                    cli_provider::publish_activated_macro_data(
                         &self.activation,
                         &lease,
                         command.cancellation().child_token(),
@@ -1217,12 +1709,12 @@ impl ProductionSourceLifecycleAuthority {
                     if runtime.session_id() != retained.session_id {
                         return Err(SourceLifecycleError::Conflict);
                     }
-                    if profile.as_str() == "eia.api-v2" {
+                    if matches!(profile.as_str(), "eia.api-v2" | "census.data-api") {
                         let lease = self
                             .onboarding
                             .activation_lease(retained.session_id)
                             .map_err(|_| SourceLifecycleError::Unavailable)?;
-                        cli_provider::publish_eia_activated_data(
+                        cli_provider::publish_activated_macro_data(
                             &self.activation,
                             &lease,
                             command.cancellation().child_token(),
@@ -1546,6 +2038,44 @@ impl ProductionSourceLifecycleAuthority {
             SourceStartEligibility::ProviderUnavailable
         };
         (Some(evidence), eligibility)
+    }
+
+    /// A callable adapter cannot make a malformed or mismatched saved product selection healthy.
+    fn research_selection_available(
+        &self,
+        provider: &SourceIdentifier,
+        runtime_digest: EvidenceDigest,
+    ) -> bool {
+        let surface = provider.as_str();
+        if surface != market_squawk_sources::FRED_ALFRED_API_SURFACE_ID
+            && surface != "treasury.fiscal-data"
+            && surface != "treasury.daily-rates-xml"
+        {
+            return true;
+        }
+        let Ok(DurableActivationRecipeState::Desired(recipe)) = self.durable.load_recipe(surface)
+        else {
+            return false;
+        };
+        if recipe.runtime_generation_digest != runtime_digest {
+            return false;
+        }
+        if surface == market_squawk_sources::FRED_ALFRED_API_SURFACE_ID {
+            let Ok(dataset) = cli_provider::fred_dashboard_provider_dataset(&self.durable) else {
+                return false;
+            };
+            return FredPointInTimeReadCapability::try_new(
+                self.research.analytical_reader(),
+                dataset,
+            )
+            .is_ok();
+        }
+        if surface == "treasury.fiscal-data" {
+            return cli_provider::treasury_fiscal_release_query(&self.durable)
+                .is_ok_and(|(_, expected)| expected == runtime_digest);
+        }
+        cli_provider::treasury_daily_rate_all_history_datasets(&self.durable)
+            .is_ok_and(|(_, expected)| expected == runtime_digest)
     }
 
     fn status_configuration_binding(
@@ -1886,6 +2416,10 @@ impl std::fmt::Debug for ProductionSourceLifecycleAuthority {
 
 #[async_trait]
 impl SourceLifecycleAuthority for ProductionSourceLifecycleAuthority {
+    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), SourceLifecycleError> {
+        self.drain_pending_account_transitions(deadline).await
+    }
+
     fn supports(&self, provider: &SourceIdentifier) -> bool {
         DurableProviderActivationState::supports_source_lifecycle(provider.as_str())
     }
@@ -1932,10 +2466,6 @@ struct LifecycleOutcome {
     runtime_verification_receipt_digest: Option<EvidenceDigest>,
     credential_generation: Option<market_squawk_platform::SecretGeneration>,
     previous_generation: Option<MarketSourceRuntimeGeneration>,
-    account_group_read_admission: Option<(
-        PreparedMarketProviderConfigurationRequest,
-        MarketRuntimeGroupGeneration,
-    )>,
 }
 
 impl LifecycleOutcome {
@@ -1951,25 +2481,6 @@ impl LifecycleOutcome {
             runtime_verification_receipt_digest: None,
             credential_generation: None,
             previous_generation,
-            account_group_read_admission: None,
-        }
-    }
-
-    const fn active_account(
-        session_id: Option<uuid::Uuid>,
-        public_configuration_digest: Option<EvidenceDigest>,
-        previous_generation: Option<MarketSourceRuntimeGeneration>,
-        request: PreparedMarketProviderConfigurationRequest,
-        group_generation: MarketRuntimeGroupGeneration,
-    ) -> Self {
-        Self {
-            phase: DurableSourceLifecyclePhase::Active,
-            session_id,
-            public_configuration_digest,
-            runtime_verification_receipt_digest: None,
-            credential_generation: None,
-            previous_generation,
-            account_group_read_admission: Some((request, group_generation)),
         }
     }
 
@@ -1985,7 +2496,6 @@ impl LifecycleOutcome {
             runtime_verification_receipt_digest: None,
             credential_generation: None,
             previous_generation,
-            account_group_read_admission: None,
         }
     }
 
@@ -2005,22 +2515,7 @@ impl LifecycleOutcome {
             runtime_verification_receipt_digest: Some(lease.runtime_evidence_digest()),
             credential_generation: Some(generation),
             previous_generation: None,
-            account_group_read_admission: None,
         })
-    }
-
-    const fn stopped_account(request: PreparedMarketProviderConfigurationRequest) -> Self {
-        Self {
-            phase: DurableSourceLifecyclePhase::Stopped,
-            session_id: Some(request.onboarding_session_id()),
-            public_configuration_digest: Some(request.expected_public_configuration_digest()),
-            runtime_verification_receipt_digest: Some(
-                request.expected_runtime_verification_receipt_digest(),
-            ),
-            credential_generation: Some(request.expected_credential_generation()),
-            previous_generation: None,
-            account_group_read_admission: None,
-        }
     }
 
     fn bind_runtime_verification(
@@ -2049,7 +2544,6 @@ impl LifecycleOutcome {
             runtime_verification_receipt_digest: None,
             credential_generation: None,
             previous_generation,
-            account_group_read_admission: None,
         }
     }
 }

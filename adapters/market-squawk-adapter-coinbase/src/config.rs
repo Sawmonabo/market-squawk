@@ -11,9 +11,9 @@ use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile, CoverageTopology,
     FreshnessPolicy, HistoricalCapability, InstrumentCoverage, LiveCoverageDeclaration,
     LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, ProviderBudgetPolicy,
-    ProviderNumericPolicy, SemanticInterpretationProfile, SequenceValidationProfile,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataError,
-    SourceMetadataInput, SourceProtocolProfile,
+    ProviderIdentitySelectionEvidence, ProviderNumericPolicy, SemanticInterpretationProfile,
+    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataError, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -59,6 +59,7 @@ impl CoinbaseChannel {
 pub struct CoinbaseProductMapping {
     product: ProviderProduct,
     instrument: InstrumentId,
+    selected_public_identity: Option<ProviderIdentitySelectionEvidence>,
 }
 
 impl CoinbaseProductMapping {
@@ -75,7 +76,32 @@ impl CoinbaseProductMapping {
         Ok(Self {
             product,
             instrument,
+            selected_public_identity: None,
         })
+    }
+
+    /// Binds a catalog-selected public product projection to the configured route. The source
+    /// registry still independently selects and validates current identity before admission.
+    pub fn try_new_selected_public(
+        product: ProviderProduct,
+        instrument: InstrumentId,
+        selected: ProviderIdentitySelectionEvidence,
+    ) -> Result<Self, CoinbaseConfigError> {
+        let mut mapping = Self::try_new(product, instrument)?;
+        let native = &selected.native;
+        if native.namespace.as_str() != "coinbase-advanced-trade"
+            || native.venue.as_str() != COINBASE_VENUE
+            || native.provider_instrument_id.as_str()
+                != mapping.product.as_source_identifier().as_str()
+            || native.venue_symbol.as_str() != mapping.product.as_source_identifier().as_str()
+            || native.instrument != instrument
+            || selected.definition_digest.bytes() == [0; 32]
+            || selected.selection_digest.bytes() == [0; 32]
+        {
+            return Err(CoinbaseConfigError::SelectedPublicIdentityMismatch);
+        }
+        mapping.selected_public_identity = Some(selected);
+        Ok(mapping)
     }
 
     /// Returns the exact provider product identity.
@@ -86,6 +112,11 @@ impl CoinbaseProductMapping {
     /// Returns the mapped stable internal instrument.
     pub const fn instrument(&self) -> InstrumentId {
         self.instrument
+    }
+
+    /// Exact selected catalog revision and native coordinates for the public feed, if installed.
+    pub const fn selected_public_identity(&self) -> Option<&ProviderIdentitySelectionEvidence> {
+        self.selected_public_identity.as_ref()
     }
 }
 
@@ -403,6 +434,9 @@ fn rule(value: &str) -> Result<IntegrityRule, CoinbaseConfigError> {
 /// Coinbase configuration invariant failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CoinbaseConfigError {
+    /// Catalog-selected public coordinates do not describe the configured Coinbase route.
+    #[error("Coinbase selected public identity differs from the configured route")]
+    SelectedPublicIdentityMismatch,
     /// An identity or rule version was outside its bounded grammar.
     #[error("Coinbase configuration contains an invalid bounded identity")]
     Identity(#[from] market_squawk_domain::IdentityError),

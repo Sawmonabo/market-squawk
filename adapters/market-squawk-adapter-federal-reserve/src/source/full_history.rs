@@ -284,29 +284,67 @@ impl BoardFullHistoryOriginal {
         store: &SealedResearchJournalStore,
         control: &dyn ResearchObjectControl,
     ) -> Result<BoardFullHistorySelectedReplay, BoardFullHistoryError> {
-        let reopened = reopen_original_checkpoint(bytes, store, control)?;
-        let profile = BoardDatasetProfile::h15_treasury_constant_maturities_full_history()?;
+        checkpoint(control)?;
+        if dates.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(BoardAdapterError::InvalidContract.into());
+        }
         let descriptor = crate::h15_treasury_constant_maturities_dashboard_series()
             .iter()
             .find(|series| series.slot() == "10y")
             .ok_or_else(|| invalid(()))?;
-        let series = profile
+        let series = descriptor.canonical_macro_series_identifier()?;
+        let rows = dates.map(|date| (series.clone(), date));
+        Self::reopen_selected_checkpoint(bytes, &rows, store, control)
+    }
+
+    /// Physically authenticates the same original and reconstructs only complete partitions
+    /// covering 1–11 exact canonical H.15 series/date pairs. Duplicate pairs and unknown series
+    /// are rejected. Input order does not renumber the original series-major partition coordinates.
+    /// This is bounded read evidence, never complete publication input.
+    pub fn reopen_selected_checkpoint(
+        bytes: &[u8],
+        rows: &[(SourceIdentifier, market_squawk_domain::CalendarDate)],
+        store: &SealedResearchJournalStore,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<BoardFullHistorySelectedReplay, BoardFullHistoryError> {
+        checkpoint(control)?;
+        if !(1..=11).contains(&rows.len())
+            || rows
+                .iter()
+                .enumerate()
+                .any(|(index, row)| rows[..index].contains(row))
+        {
+            return Err(BoardAdapterError::InvalidContract.into());
+        }
+        let profile = BoardDatasetProfile::h15_treasury_constant_maturities_full_history()?;
+        let expected = profile
             .contract()
             .series_scope()
             .exact_series()
-            .and_then(|series| {
-                series
-                    .iter()
-                    .find(|series| series.series_name() == descriptor.provider_series_name())
-            })
             .ok_or_else(|| invalid(()))?;
+        let mut selected_rows = Vec::with_capacity(rows.len());
+        for (identifier, date) in rows {
+            let descriptor = crate::h15_treasury_constant_maturities_dashboard_series()
+                .iter()
+                .find(|descriptor| {
+                    descriptor
+                        .canonical_macro_series_identifier()
+                        .is_ok_and(|canonical| &canonical == identifier)
+                })
+                .ok_or(BoardAdapterError::SeriesMismatch)?;
+            let series = expected
+                .iter()
+                .find(|series| series.series_name() == descriptor.provider_series_name())
+                .ok_or_else(|| invalid(()))?;
+            selected_rows.push((series.unique_id(), *date));
+        }
+        let reopened = reopen_original_checkpoint(bytes, store, control)?;
         let selected = crate::parse::parse_csv_selected_partitions(
             profile.contract(),
             &reopened.body,
             profile.parse_limits(),
             reopened.wire.observation_count,
-            series.unique_id(),
-            dates,
+            &selected_rows,
             ROWS_PER_PARTITION,
             control,
         )?;
@@ -314,7 +352,7 @@ impl BoardFullHistoryOriginal {
             || selected.parsed.source_payload_digest() != reopened.wire.receipt.body_digest()
             || selected.parsed.observation_count() != selected.global_ordinals.len() as u64
             || selected.global_ordinals.is_empty()
-            || selected.global_ordinals.len() > 11 * ROWS_PER_PARTITION as usize
+            || selected.global_ordinals.len() > rows.len() * ROWS_PER_PARTITION as usize
         {
             return Err(invalid(()));
         }

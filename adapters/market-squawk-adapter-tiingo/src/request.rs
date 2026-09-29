@@ -1,3 +1,4 @@
+mod corporate_actions;
 use chrono::{Datelike as _, Days, NaiveDate};
 use market_squawk_domain::{CalendarDate, DigestAlgorithm, EvidenceDigest};
 use sha2::{Digest as _, Sha256};
@@ -26,6 +27,10 @@ pub enum TiingoEndpointFamily {
     LatestDailyPrices,
     /// One application-bounded historical date window.
     HistoricalDailyPrices,
+    /// Exact ticker and ex-date distribution response.
+    CorporateActionDistributions,
+    /// Complete batch split response for one exact ex-date.
+    CorporateActionSplits,
 }
 
 /// Exact financial/date scope of one request.
@@ -33,6 +38,10 @@ pub enum TiingoEndpointFamily {
 pub enum TiingoRequestScope {
     /// Per-ticker metadata and coverage lookup.
     Metadata,
+    /// One exact ticker/date distribution query.
+    Distributions { date: CalendarDate },
+    /// One exact date batch split query; ticker is the requested subject for budget identity.
+    Splits { date: CalendarDate },
     /// Most recent daily row.
     Latest,
     /// One inclusive application-created history window.
@@ -86,6 +95,9 @@ impl TiingoRequestSpec {
 
     fn build(ticker: TiingoTicker, scope: TiingoRequestScope) -> Result<Self, TiingoAdapterError> {
         let endpoint = match scope {
+            TiingoRequestScope::Distributions { .. } | TiingoRequestScope::Splits { .. } => {
+                return Err(TiingoAdapterError::RequestBuild);
+            }
             TiingoRequestScope::Metadata => TiingoEndpointFamily::Metadata,
             TiingoRequestScope::Latest => TiingoEndpointFamily::LatestDailyPrices,
             TiingoRequestScope::History { .. } => TiingoEndpointFamily::HistoricalDailyPrices,
@@ -114,6 +126,10 @@ impl TiingoRequestSpec {
         }
 
         let (max_response_bytes, max_rows) = match endpoint {
+            TiingoEndpointFamily::CorporateActionDistributions
+            | TiingoEndpointFamily::CorporateActionSplits => {
+                return Err(TiingoAdapterError::RequestBuild);
+            }
             TiingoEndpointFamily::Metadata => (METADATA_MAX_RESPONSE_BYTES, 1),
             TiingoEndpointFamily::LatestDailyPrices => (LATEST_MAX_RESPONSE_BYTES, LATEST_MAX_ROWS),
             TiingoEndpointFamily::HistoricalDailyPrices => {
@@ -170,8 +186,19 @@ impl TiingoRequestSpec {
             TiingoEndpointFamily::Metadata => 0,
             TiingoEndpointFamily::LatestDailyPrices => 1,
             TiingoEndpointFamily::HistoricalDailyPrices => 2,
+            TiingoEndpointFamily::CorporateActionDistributions => 3,
+            TiingoEndpointFamily::CorporateActionSplits => 4,
         }]);
         match &self.scope {
+            TiingoRequestScope::Distributions { date } => {
+                hash.update([3]);
+                hash.update(date.to_string().as_bytes());
+            }
+            TiingoRequestScope::Splits { date } => {
+                hash.update([4]);
+                hash.update(date.to_string().as_bytes());
+                hash.update(self.ticker.as_str().as_bytes());
+            }
             TiingoRequestScope::Metadata => hash.update([0]),
             TiingoRequestScope::Latest => hash.update([1]),
             TiingoRequestScope::History {

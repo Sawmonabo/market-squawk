@@ -18,6 +18,8 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod analysis;
+pub mod analytical_workflow;
+pub(crate) mod analytical_profile;
 pub mod backup;
 pub(crate) mod company_security_resolution;
 mod contracts;
@@ -29,7 +31,7 @@ pub mod job;
 pub mod lifecycle;
 mod live_fair_value;
 pub mod logs;
-mod market_calendar;
+pub(crate) mod market_calendar;
 mod market_runtime;
 pub(crate) mod market_selection;
 pub mod model;
@@ -37,6 +39,13 @@ pub mod operations;
 mod paper;
 pub(crate) mod recommendation;
 mod research;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+pub use research::{
+    H15InstalledAcceptance, H15InstalledAcceptanceError, H15InstalledAcceptanceRead,
+};
+pub(crate) use research::{benchmark, saved_benchmark};
+pub(crate) use research::map_current_population_error;
+pub(crate) use research::fiscal_projection::fiscal_projection_targets;
 pub mod settings;
 pub mod setup;
 pub mod source;
@@ -62,6 +71,10 @@ pub use fair_value::{
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub(crate) use market_runtime::{
+    AlpacaPublicationRuntime,
+    AlpacaOptionChainRuntime, OptionChainDemand, OptionChainDemandError, OptionChainDemandResult,
+    AccountGroupStopReceipt, AccountMarketRuntimeReconnect, PreparedAccountStop,
+    EquityPaperRouteEvidence, EquityPaperSourceBinding, EquityPaperSourceRoute,
     AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
     MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
     PreparedMarketProviderConfigurationRequest, PreparedMarketProviderConfigurationResolver,
@@ -71,19 +84,53 @@ pub(crate) use market_runtime::{
 };
 pub use paper::PaperApplicationServices;
 pub(crate) use paper::{
+    EquityPaperServices,
+    PaperStoppedBackupAuthority, PaperStoppedBackupLease, PaperAuditBackupKind,
+    PaperStoppedBackupStreamCustody,
     MarketReferenceMatchKind, MarketReferenceRecord, MarketReferenceSearchAuthority,
     MarketReferenceSearchPage, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
 };
-pub(crate) use research::RESIDENTIAL_ELECTRICITY_PRICE_DATASET;
+pub(crate) use research::{
+    PreparedProbabilityDatasetPair, ProbabilityBenchmarkSource, ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
+    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError, AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput,
+    AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector, AlpacaOptionMarketPointInTimeSelector,MACRO_CONTEXT_INDICATOR_COUNT, RESIDENTIAL_ELECTRICITY_PRICE_DATASET};
+pub(crate) use research::fiscal_projection::FiscalProjectionTarget;
+pub(crate) use research::{
+    PreparedFindPopulation, PreparedCurrentFindFeatures, PreparedCurrentFindFeaturePartition,
+    CurrentFindPartitionPreparationEvidence, CurrentFindScreenPartition,
+    HistoricalFiscalTrainingAuthority,
+    HISTORICAL_FISCAL_MAXIMUM_ORIGINS, HISTORICAL_FISCAL_MAXIMUM_PAGES,
+    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs, HistoricalFiscalJobReference,
+    HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference, HistoricalFiscalStudyBinding,
+    HistoricalFiscalForecastReadCapability, HistoricalFiscalUnavailableReference,
+    PreparedHistoricalFiscalDatasets, prepare_fixed_current_population,
+    FindPopulationExclusionReason, prepare_find_population, read_find_population,
+};
+pub(crate) use research::{
+    BoardFullHistoryApplicationError, EquityPremiumReadError, InstrumentContextRead,
+    RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
+    SelectedRecommendationBenchmark, TiingoLatestApplicationError, required_annual_source_dates,
+    map_market_definition_read_error,
+};
+pub(crate) use research::corporate_actions::{
+    ApplicableActionPlanError, ForecastOutcomeSourcePreparation,
+    map_analytical_error as map_source_analytical_error,
+    map_research_error as map_source_research_error,
+    SourceActionPreparationCapability, SourceAppliedCorporateActionPlan, SourceAppliedCorporateActionPlanReference,
+    SourceAppliedCorporateActionReadCapability,
+    PendingCurrentPriceActions,
+};
 pub(crate) use research::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
     AnalyticalForecastEvidenceReader, CoinbaseMarketApplicationOutcome,
+    CensusLiveComposition, CensusMacroApplicationClosure, CensusMacroApplicationError,
+    CensusPublicationReceipt, CensusSealFirstExtractionLimits,
     CompanyResearchReadCapability, CryptoCommittedRowIngress, CryptoMarketPublicationAuthority,
     CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
     DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
     DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
-    DatasetPreparationSelection, EiaApplicationAcquisitionLimits,
+    DatasetPreparationSelection, DatasetPreparationUse, EiaApplicationAcquisitionLimits,
     EiaLiveComposition, EiaMacroApplicationClosure, EiaMacroApplicationError,
     EiaMacroEffectiveCutoff, EiaMacroPointInTimeRequest, EiaMacroPublicationReceipt,
     EiaMacroRestartReceipt, EiaMacroRestartSelector, FeatureDatasetProductionFinalizer,
@@ -96,20 +143,25 @@ pub(crate) use research::{
     InstrumentSearchRead, InstrumentSearchRequest, KrakenMarketApplicationOutcome,
     MacroContextReadCapability, MacroFeatureVector, MarketEventDurableRead,
     MarketEventDurableReadWriter, MarketEventReadError, MarketEventRestartSelector,
-    MarketHistoryReadCapability, OptionsContextReadCapability, PreparedFeatureDatasetBuild,
+    MarketHistoryReadCapability, MarketHistoryUnavailableReason, OptionsContextAvailability,
+    OptionsContextError, OptionsContextReadCapability, OptionsContextRequest,
+    OptionsContextUnavailableReason, PreparedFeatureDatasetBuild,
     ResearchProviderPublicationOperation, ResearchProviderRuntimeMutationAuthority,
     ResearchProviderRuntimeReplacement, SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION,
     SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
     SchwabRestQuotePostSealFailure, SchwabRestQuotePublicationPackage,
-    SchwabRestQuoteSourceHealthOutcome, SecFundPublicationReceipt, SecFundamentalsResearchError,
+    SchwabRestQuoteSourceHealthOutcome, SchwabStreamerApplicationOutcome,
+    SchwabStreamerGenerationAuthority, SchwabStreamerPublicationPackage, SecFundPublicationReceipt, SecFundamentalsResearchError,
     SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
     SecFundamentalsResearchStatus, SecLiveFundApplicationError, SecLiveFundRequest,
-    SecLiveFundSource, SecResearchFamilyBinding, TreasuryApplicationClosure,
-    TreasuryLatestKnownOperation, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
-    read_macro_feature_vector,
+    SecLiveFundSource, SecResearchFamilyBinding, TiingoCompletedEodActionRead,
+    TiingoCompletedEodHistoryReference, TiingoEodHistoryPublicationReceipt,
+    TiingoHistoryApplicationError, TreasuryApplicationClosure, TreasuryLatestKnownOperation,
+    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest, read_macro_feature_vector,
 };
 pub(crate) use research::{
     BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
+    BlsMacroCapabilityState,
 };
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
@@ -516,12 +568,46 @@ impl Application {
                 service.begin_shutdown();
             }
         }
+        let mut market_finished = false;
+        let mut market_failure = dependency_failure(ServiceDomain::Market);
         for service in self.domains.services.iter().rev() {
             if matches!(
                 service.domain(),
-                ServiceDomain::Bot | ServiceDomain::Execution
-            ) || dependency_failure(service.domain()).is_some()
-            {
+                ServiceDomain::Bot | ServiceDomain::Execution | ServiceDomain::Market
+            ) {
+                continue;
+            }
+            let research_domain = matches!(
+                service.domain(),
+                ServiceDomain::Research | ServiceDomain::Fundamental | ServiceDomain::Macro
+            );
+            if research_domain && !market_finished {
+                // Higher-level shutdown barriers ran. Market still owns raw captures that
+                // need the shared research I/O worker, so drain Market before its owner.
+                market_finished = true;
+                if market_failure.is_none()
+                    && let Some(market) = self.domains.service(ServiceDomain::Market)
+                {
+                    market_failure = tokio::time::timeout_at(
+                        deadline,
+                        market.finish_shutdown(deadline.into_std()),
+                    )
+                    .await
+                    .unwrap_or(Err(ServiceError::DeadlineExceeded))
+                    .err();
+                }
+                if let Some(index) = domain_index(ServiceDomain::Market) {
+                    report.failures[index] = report.failures[index].or(market_failure);
+                }
+            }
+            let blocked = dependency_failure(service.domain())
+                .or(if research_domain { market_failure } else { None });
+            if let Some(error) = blocked {
+                // A failed Market drain may still own originals. Keep the research capture
+                // worker available for retained cleanup, and report the unmet dependency.
+                if let Some(index) = domain_index(service.domain()) {
+                    report.failures[index] = report.failures[index].or(Some(error));
+                }
                 continue;
             }
             let outcome =
@@ -879,3 +965,11 @@ mod tests {
         ))
     }
 }
+
+// BEA concrete runtime remains owned by the research ingest capability.
+pub(crate) use research::{
+    BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaLivePublicationError, BeaMacroApplicationError,
+    BeaMacroCapabilityState, BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
+    BeaRegionalLiveComposition, BeaRegionalLiveOutcome, BeaRegionalLiveRequest,
+    BeaRegionalLiveRuntime, BeaRegisteredSource,
+};

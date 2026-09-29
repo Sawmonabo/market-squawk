@@ -3137,7 +3137,7 @@ fn validate_reference_source_metadata(
         && metadata.coverage().domain() == CoverageDomain::Instruments
         && metadata.coverage().asset_classes() == [AssetClass::Option]
         && metadata.coverage().instruments().instruments().is_empty()
-        && metadata.coverage().live().is_none()
+        && metadata.coverage().live_channels().is_empty()
         && matches!(metadata.coverage().delay(), CoverageDelay::Delayed(_))
         && metadata.coverage().delivery() == delivery
         && topology_valid

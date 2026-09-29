@@ -718,6 +718,8 @@ pub enum StreamerNativeValue {
     Scalar(NativeScalar),
     Sequence(Box<[StreamerNativeValue]>),
     Fields(Box<[StreamerNestedField]>),
+    /// Closed named screener items; admitted only at field 4 of the two screener services.
+    ScreenerItems(Box<[crate::streamer_screener::SchwabStreamerScreenerItem]>),
 }
 /// One nested numeric field used by provider-native book records.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -873,10 +875,19 @@ fn parse_data(
                 let field_id = field
                     .parse::<u16>()
                     .map_err(|_| SchwabAdapterError::SchemaViolation)?;
-                fields.push(StreamerFieldEvidence {
-                    field_id,
-                    value: parse_streamer_value(value)?,
-                });
+                let value = if matches!(
+                    service,
+                    MarketDataService::ScreenerEquity | MarketDataService::ScreenerOption
+                ) && field_id == 4
+                    && !value.is_null()
+                {
+                    StreamerNativeValue::ScreenerItems(crate::streamer_screener::parse_items(
+                        value, context,
+                    )?)
+                } else {
+                    parse_streamer_value(value)?
+                };
+                fields.push(StreamerFieldEvidence { field_id, value });
             }
             parsed.push(StreamerContent {
                 key,

@@ -7,8 +7,11 @@
 //! one bounded raw/capture/native page at a time; shared durable authority must seal/checkpoint
 //! each page and own quota, schema-circuit, revision, immutable publication, and PIT selection.
 
+mod actions;
 mod authority;
 mod canonical;
+mod corporate_actions;
+pub use corporate_actions::TiingoPreparedCorporateActionsPublication;
 mod credentials;
 mod decoder;
 mod eod;
@@ -35,10 +38,10 @@ pub use canonical::{
     TiingoPendingLatestFundNavPublication, map_fund_nav_candidate,
 };
 pub use credentials::{TiingoApiToken, TiingoRequestBuilder};
-pub use decoder::{TiingoDecoder, TiingoSchemaCircuitState};
+pub use decoder::{TiingoCorporateActionReceipt, TiingoCorporateActionRow, TiingoCorporateActionValue, TiingoDecoder, TiingoSchemaCircuitState};
 pub use eod::{
-    TiingoCompletedEodHistoryCandidate, TiingoEodBarCandidate, TiingoEodBarTimeAuthority,
-    TiingoEodBarTimeRequest, TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
+    TiingoCompletedEodHistoryCandidate, TiingoEodBarCandidate,
+    TiingoEodContractEvidence, TiingoEodExpectedSessionAuthority,
     TiingoEodExpectedSessionEvidence, TiingoEodExpectedSessionRequest,
     TiingoEodExpectedSessionValidationReceipt, TiingoEodFinancialCoverageDisposition,
     TiingoEodInstrumentAuthority, TiingoEodInstrumentKind, TiingoEodMapError,
@@ -92,3 +95,12 @@ pub use request::{
 
 #[cfg(test)]
 mod tests;
+
+pub use actions::{TiingoEodCashUnitEvidence, TiingoEodActionError, TiingoEodActionFieldDisposition,
+    TiingoEodDailyActionDisposition, TiingoEodNormalizedAction, TiingoEodHistoryActionProjection,
+    TiingoEodActionReplayPage, normalize_eod_history_actions, rejoin_eod_history_actions};
+pub use publication::{TiingoPreparedEodHistoryCapture, TiingoEodHistoryPublicationError,
+    reconstruct_eod_history_mapping, verify_eod_history_native_row, verify_eod_history_native_sidecar,
+    tiingo_eod_native_schema_evidence};
+
+pub use market_squawk_sources::ProviderNativeExchangeCode as TiingoExchangeCode;

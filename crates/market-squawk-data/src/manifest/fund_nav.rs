@@ -1020,7 +1020,7 @@ pub(super) fn select_canonical_fund_nav(
                     selected_generation.schema_name, selected_generation.schema_version,
                     selected_generation.schema_fingerprint, selected_generation.content_hash,
                     publication.publication_receipt_digest
-             FROM analytical_generations AS selected_generation
+             FROM analytical_available_generations AS selected_generation
              JOIN dataset_manifests AS selected_manifest
                ON selected_manifest.manifest_id=selected_generation.anchor_manifest_id
              JOIN artifacts AS selected_artifact
@@ -1042,7 +1042,7 @@ pub(super) fn select_canonical_fund_nav(
                AND selected_generation.schema_version=?3
                AND selected_generation.schema_fingerprint=?4
                AND selected_generation.generation_kind IN ('ingest','compaction')
-               AND selected_generation.created_at_ns<=?5
+               AND selected_generation.available_at_ns<=?5
                AND selected_manifest.created_at_ns<=?5
                AND selected_artifact.created_at_ns<=?5
                AND selected_run.state='succeeded' AND selected_run.operation='persist'
@@ -1062,7 +1062,7 @@ pub(super) fn select_canonical_fund_nav(
                       publication.published_at_ns DESC,
                       publication.origin_generation_sequence DESC,
                       publication.publication_receipt_digest DESC,
-                      selected_generation.created_at_ns DESC,
+                      selected_generation.available_at_ns DESC,
                       selected_generation.generation_sequence DESC
              LIMIT 1",
             params![
@@ -1162,7 +1162,7 @@ fn ensure_unambiguous_family(
     let count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM (
              SELECT DISTINCT publication.source_family_digest
-             FROM analytical_generations AS generation
+             FROM analytical_available_generations AS generation
              JOIN analytical_generation_fund_nav_inputs AS input
                ON input.generation_sequence=generation.generation_sequence
              JOIN fund_nav_publications AS publication USING (publication_receipt_digest)
@@ -1170,7 +1170,7 @@ fn ensure_unambiguous_family(
                AND generation.schema_name=?2 AND generation.schema_version=?3
                AND generation.schema_fingerprint=?4
                AND generation.generation_kind IN ('ingest','compaction')
-               AND generation.created_at_ns<=?5
+               AND generation.available_at_ns<=?5
                AND publication.max_available_at_ns<=?5
                AND publication.max_received_at_ns<=?5
                AND publication.max_ingested_at_ns<=?5
@@ -1213,7 +1213,7 @@ fn load_fund_nav_receipt(
         .query_row(
             "SELECT publication.receipt_json
              FROM fund_nav_publications AS publication
-             JOIN analytical_generations AS generation
+             JOIN analytical_available_generations AS generation
                ON generation.generation_sequence=publication.origin_generation_sequence
              JOIN analytical_generation_source_inputs AS source_input
                ON source_input.generation_sequence=generation.generation_sequence

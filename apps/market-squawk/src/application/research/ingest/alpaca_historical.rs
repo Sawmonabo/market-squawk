@@ -1,5 +1,10 @@
 //! One generation-bound Alpaca historical source with bounded immutable click-plan admission.
 
+mod market;
+pub(crate) use market::{AlpacaMarketPublicationClosure, AlpacaMarketPublicationError,
+    AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput, AlpacaOptionMarketPublicationReceipt, AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector,
+    AlpacaOptionMarketPointInTimeSelector};
+
 use std::{
     fmt,
     future::Future,
@@ -110,6 +115,7 @@ impl AlpacaHistoricalParentGeneration {
 /// Exact immutable plan coordinates minted by one validated directory mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AlpacaHistoricalAdmittedPlan {
+    series_semantics: market_squawk_adapter_alpaca::AlpacaHistoricalSeriesSemantics,
     provider_dataset: SourceIdentifier,
     analytical_dataset: DatasetId,
     parent_digest: EvidenceDigest,
@@ -1387,6 +1393,10 @@ pub(crate) struct AlpacaHistoricalAuthorizedPlan<'receipt> {
 }
 
 impl AlpacaHistoricalAuthorizedPlan<'_> {
+    /// Original composite calendar semantics, exposed only under exact current plan authority.
+    pub(crate) const fn series_semantics(&self) -> &market_squawk_adapter_alpaca::AlpacaHistoricalSeriesSemantics {
+        &self.plan.series_semantics
+    }
     pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
         &self.plan.provider_dataset
     }
@@ -1713,6 +1723,7 @@ impl AlpacaHistoricalPlanAdmissionDirectory for AlpacaHistoricalPlanDirectoryAut
                 && record.analytical_dataset == plan.analytical_dataset
                 && record.parent_digest == plan.parent_digest
                 && record.plan_digest == plan.plan_digest
+                && record.bar_time_authority.series_semantics() == &plan.series_semantics
         }) {
             Ok(())
         } else {
@@ -2164,6 +2175,7 @@ fn hash_bytes(digest: &mut Sha256, value: &[u8]) {
 
 fn admitted_plan(record: &AlpacaHistoricalPlanRecord) -> AlpacaHistoricalAdmittedPlan {
     AlpacaHistoricalAdmittedPlan {
+        series_semantics: record.bar_time_authority.series_semantics().clone(),
         provider_dataset: record.provider_dataset.clone(),
         analytical_dataset: record.analytical_dataset.clone(),
         parent_digest: record.parent_digest,
@@ -2755,6 +2767,14 @@ mod tests {
             Ok(Self {
                 parent,
                 plan: AlpacaHistoricalAdmittedPlan {
+                    series_semantics: market_squawk_adapter_alpaca::AlpacaHistoricalSeriesSemantics::new(
+                        market_squawk_domain::BarTimestampBasis::PeriodStart,
+                        market_squawk_domain::MarketBarSessionEvidence::try_new(
+                            market_squawk_domain::MarketBarSessionKind::Regular,
+                            SourceIdentifier::try_from("fixture-original-session").map_err(|_| AlpacaHistoricalSourceSlotError::InvalidCandidate)?,
+                            EvidenceDigest::new(DigestAlgorithm::Sha256, [17;32]),
+                        ).map_err(|_| AlpacaHistoricalSourceSlotError::InvalidCandidate)?,
+                    ),
                     provider_dataset: SourceIdentifier::try_from("alpaca:test-history")
                         .map_err(|_| AlpacaHistoricalSourceSlotError::InvalidCandidate)?,
                     analytical_dataset: DatasetId::try_from("alpaca.test-history")

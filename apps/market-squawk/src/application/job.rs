@@ -2,18 +2,19 @@
 
 use std::{fmt, sync::Arc};
 
-use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_jobs::{
     AdmittedJobInput, AdmittedJobSpec, JobAttemptLimit, JobAuthority, JobAuthorityError,
     JobAuthoritySnapshot, JobConfirmation, JobContractError, JobEventPage, JobEventPageLimit,
     JobEventSequence, JobFailure, JobGeneration, JobId, JobListCursor, JobListPageLimit, JobOrigin,
-    JobRepository, JobRepositoryError, JobResultReference, JobSnapshot, JobState,
+    JobRepository, JobRepositoryError, JobResultReference, JobSnapshot, JobStartAdmission,
+    JobStartBinding, JobStartPermit, JobStartState, JobState,
 };
 use market_squawk_services::{RequestId, ToolAuthorization, ToolDescriptor, TypedToolRequest};
 use rust_decimal::Decimal;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Re-admits a `Start*` request through the exact existing terminal-operation descriptor.
 ///
@@ -47,7 +48,7 @@ pub fn terminal_request_for_start(
 }
 
 /// Immutable admission supplied by one code-owned application runner.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct JobAdmission {
     kind: SourceIdentifier,
     input: AdmittedJobInput,
@@ -117,7 +118,7 @@ pub struct JobReceipt {
 }
 
 impl JobReceipt {
-    fn from_snapshot(snapshot: &JobSnapshot) -> Self {
+    pub(crate) fn from_snapshot(snapshot: &JobSnapshot) -> Self {
         Self {
             job_id: snapshot.id(),
             generation: snapshot.generation(),
@@ -299,6 +300,28 @@ pub struct JobApplication<R: JobRepository + 'static> {
     authority: Arc<JobAuthority<R>>,
 }
 
+/// Bounded original-request reconciliation; only admitted requests expose a job.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStartView {
+    state: JobStartState,
+    job: Option<JobView>,
+}
+
+impl JobStartView {
+    /// Durable admission state; unknown never proves that a delayed handler cannot start.
+    #[must_use]
+    pub const fn state(&self) -> JobStartState {
+        self.state
+    }
+
+    /// Current generation of the original job when admission committed.
+    #[must_use]
+    pub const fn job(&self) -> Option<&JobView> {
+        self.job.as_ref()
+    }
+}
+
 impl<R: JobRepository + 'static> JobApplication<R> {
     /// Binds the exact repository and authority pair owned by the installed service.
     #[must_use]
@@ -317,17 +340,103 @@ impl<R: JobRepository + 'static> JobApplication<R> {
         request_id: RequestId,
         admitted_at: Timestamp,
     ) -> Result<JobReceipt, JobApplicationError> {
-        let spec = admission.into_spec(
-            JobId::try_from_uuid(Uuid::new_v4())?,
+        let bytes = serde_json::to_vec(&admission).map_err(|_| JobApplicationError::Contract)?;
+        let binding = JobStartBinding::new(
             origin,
             request_id,
+            admission.kind().clone(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into()),
+        );
+        match self.begin_start(&binding).await? {
+            JobStartAdmission::Execute(permit) => {
+                let result = self.start_reserved(admission, &permit, admitted_at).await;
+                if result.is_err() {
+                    self.cancel_start(&binding).await?;
+                }
+                result
+            }
+            JobStartAdmission::Existing(reconciled) => reconciled
+                .snapshot()
+                .map(JobReceipt::from_snapshot)
+                .ok_or(JobApplicationError::Authority),
+        }
+    }
+
+    /// Reserves exact original request ownership before a one-use preparation is consumed.
+    pub async fn begin_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartAdmission, JobApplicationError> {
+        self.repository
+            .begin_start(binding)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Admits immutable input under the exact previously reserved request identity.
+    pub async fn start_reserved(
+        &self,
+        admission: JobAdmission,
+        permit: &JobStartPermit,
+        admitted_at: Timestamp,
+    ) -> Result<JobReceipt, JobApplicationError> {
+        let spec = admission.into_spec(
+            permit.id(),
+            permit.binding().origin().clone(),
+            permit.binding().request_id().clone(),
             admitted_at,
         )?;
-        self.authority
-            .start(&spec)
-            .await
-            .map(|snapshot| JobReceipt::from_snapshot(&snapshot))
-            .map_err(Into::into)
+        match self.authority.start(&spec).await {
+            Ok(snapshot) => Ok(JobReceipt::from_snapshot(&snapshot)),
+            Err(error) => {
+                // The durable writer may commit before the scheduler loses its acknowledgement.
+                // Reconciliation still requires the exact immutable input and authority admitted
+                // under this permit; a caller cannot replace them on a later invocation.
+                let retained = self.repository.reconcile_start(permit.binding()).await?;
+                match retained.snapshot() {
+                    Some(snapshot)
+                        if snapshot.spec().input() == spec.input()
+                            && snapshot.spec().kind() == spec.kind()
+                            && snapshot.spec().authority() == spec.authority()
+                            && snapshot.spec().attempt_limit() == spec.attempt_limit() =>
+                    {
+                        Ok(JobReceipt::from_snapshot(snapshot))
+                    }
+                    Some(_) => Err(JobApplicationError::Contract),
+                    None => Err(error.into()),
+                }
+            }
+        }
+    }
+
+    /// Reads the exact original request without consuming preparation or admitting a job.
+    pub async fn reconcile_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartView, JobApplicationError> {
+        let reconciliation = self.repository.reconcile_start(binding).await?;
+        Ok(JobStartView {
+            state: reconciliation.state(),
+            job: reconciliation
+                .snapshot()
+                .map(JobView::from_snapshot)
+                .transpose()?,
+        })
+    }
+
+    /// Fences a delayed original request, or returns its already admitted exact job.
+    pub async fn cancel_start(
+        &self,
+        binding: &JobStartBinding,
+    ) -> Result<JobStartView, JobApplicationError> {
+        let reconciliation = self.repository.cancel_start(binding).await?;
+        Ok(JobStartView {
+            state: reconciliation.state(),
+            job: reconciliation
+                .snapshot()
+                .map(JobView::from_snapshot)
+                .transpose()?,
+        })
     }
 
     /// Returns one sanitized view for an exact stable identity and execution generation.

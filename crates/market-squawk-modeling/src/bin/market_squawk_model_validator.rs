@@ -5,7 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use market_squawk_data::{CatalogEndpointIdentity, PythonDatasetVerificationLimits, Sha256Digest};
+use market_squawk_data::{
+    CatalogEndpointIdentity, FeatureDatasetProductContract, PythonDatasetVerificationLimits,
+    Sha256Digest,
+};
 use market_squawk_domain::Timestamp;
 use market_squawk_modeling::{
     BundleMetadataRef, ControlledModelRoot, ProductionFeatureRegistry,
@@ -60,6 +63,7 @@ fn run() -> Result<String, ()> {
         Timestamp::from_unix_nanos(arguments.dataset_as_of_unix_nanos),
         Sha256Digest::new(parse_hex(&arguments.dataset_selection_sha256)?),
         catalog_identity,
+        arguments.dataset_product_contract,
     )
     .map_err(|_| ())?;
     let root = ControlledModelRoot::open_ambient(candidate_path).map_err(|_| ())?;
@@ -137,11 +141,12 @@ struct Arguments {
     dataset_as_of_unix_nanos: i64,
     dataset_selection_sha256: String,
     catalog_identity_sha256: String,
+    dataset_product_contract: FeatureDatasetProductContract,
 }
 
 fn arguments() -> Result<Arguments, ()> {
     let values = env::args().skip(1).collect::<Vec<_>>();
-    if values.len() != 22
+    if values.len() != 24
         || values[0] != "--root"
         || values[2] != "--metadata"
         || values[4] != "--metadata-sha256"
@@ -153,6 +158,7 @@ fn arguments() -> Result<Arguments, ()> {
         || values[16] != "--dataset-as-of-unix-nanos"
         || values[18] != "--dataset-selection-sha256"
         || values[20] != "--catalog-identity-sha256"
+        || values[22] != "--dataset-product-contract"
     {
         return Err(());
     }
@@ -177,6 +183,8 @@ fn arguments() -> Result<Arguments, ()> {
         dataset_as_of_unix_nanos: values[17].parse().map_err(|_| ())?,
         dataset_selection_sha256: values[19].clone(),
         catalog_identity_sha256: values[21].clone(),
+        dataset_product_contract: FeatureDatasetProductContract::from_identity(&values[23])
+            .ok_or(())?,
     })
 }
 

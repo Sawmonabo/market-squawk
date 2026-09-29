@@ -635,7 +635,12 @@ async fn selected_h15_replay_matches_complete_partitions_across_series_boundarie
             if line < 6 {
                 row.to_owned()
             } else {
-                row.replace(",4.008", &format!(",5.{:03}", line - 6))
+                let row = row.replace(",4.008", &format!(",5.{:03}", line - 6));
+                if line == 6 + 399 {
+                    row.replace(",4.010", ",ND")
+                } else {
+                    row
+                }
             }
         })
         .collect::<Vec<_>>()
@@ -797,6 +802,109 @@ async fn selected_h15_replay_matches_complete_partitions_across_series_boundarie
     {
         assert_eq!(actual_date, date);
         assert_eq!(*value, Decimal::new(expected, 3));
+    }
+    // A real curve may select different dates per maturity. Reverse request order and retain
+    // only each exact pair, including the missing 30y value in the final short partition.
+    let curve = h15_treasury_constant_maturities_dashboard_series()
+        .iter()
+        .enumerate()
+        .map(|(index, descriptor)| {
+            Ok((
+                descriptor.canonical_macro_series_identifier()?,
+                if index % 2 == 0 && index != 10 {
+                    dates[0]
+                } else {
+                    dates[10]
+                },
+            ))
+        })
+        .rev()
+        .collect::<Result<Vec<_>, BoardAdapterError>>()?;
+    let mut curve_cursor = BoardFullHistoryOriginal::reopen_selected_checkpoint(
+        &checkpoint,
+        &curve,
+        &store,
+        &control,
+    )?
+    .into_canonical_cursor();
+    let mut curve_partitions = Vec::new();
+    let mut curve_values = vec![None; curve.len()];
+    while let Some(partition) = curve_cursor.next_partition(&control)? {
+        let expected = &binding.canonical_partitions()[partition.ordinal() as usize];
+        assert_eq!(partition.range(), expected.row_range());
+        assert_eq!(partition.digest(), expected.semantic_digest());
+        for family in [
+            LogicalPartitionFamily::ProviderNative,
+            LogicalPartitionFamily::CanonicalRowMap,
+        ] {
+            let retained = binding
+                .partitions()
+                .iter()
+                .find(|candidate| {
+                    candidate.family() == family
+                        && candidate.partition_ordinal() == partition.ordinal()
+                })
+                .ok_or("missing curve native/map partition")?;
+            let mut object = store.open_verified_logical_object(retained.object(), &control)?;
+            partition.verify_retained_frames(family, &mut object, &control)?;
+        }
+        curve_partitions.push(partition.ordinal());
+        let (batch, _, _) = partition.into_parts();
+        for row in batch.records() {
+            let ResearchObservation::Macro(value) = serde_json::from_slice(row.payload())? else {
+                return Err("unexpected non-macro curve row".into());
+            };
+            if let Some(index) = curve.iter().position(|(series, date)| {
+                value.series() == series
+                    && value.context().time().effective().calendar_date_value() == Some(*date)
+            }) {
+                assert!(curve_values[index].replace(value).is_none());
+            }
+        }
+    }
+    assert_eq!(curve_partitions, [0, 3, 6, 9, 12, 15, 17]);
+    for (index, value) in curve_values.into_iter().enumerate() {
+        let value = value.ok_or("missing requested curve row")?;
+        let maturity_index = 10 - index;
+        let expected = match maturity_index {
+            10 => None,
+            8 => Some(Decimal::new(5000, 3)),
+            other => Some(Decimal::new(4000 + other as i64, 3)),
+        };
+        assert_eq!(value.value().observed_value(), expected);
+    }
+    let mut one = BoardFullHistoryOriginal::reopen_selected_checkpoint(
+        &checkpoint,
+        &curve[..1],
+        &store,
+        &control,
+    )?
+    .into_canonical_cursor();
+    let last = one
+        .next_partition(&control)?
+        .ok_or("missing single selected partition")?;
+    assert_eq!(last.ordinal(), 17);
+    assert_eq!(last.range().item_count().get(), 48);
+    assert_eq!(
+        last.digest(),
+        binding.canonical_partitions()[17].semantic_digest()
+    );
+    assert!(one.next_partition(&control)?.is_none());
+    for invalid in [
+        Vec::new(),
+        vec![curve[0].clone(); 12],
+        vec![curve[0].clone(); 2],
+        vec![(SourceIdentifier::try_from("unadmitted-series")?, dates[0])],
+    ] {
+        assert!(
+            BoardFullHistoryOriginal::reopen_selected_checkpoint(
+                &checkpoint,
+                &invalid,
+                &store,
+                &control,
+            )
+            .is_err()
+        );
     }
     let mut missing_date = dates;
     missing_date[10] = CalendarDate::new(2026, 2, 5)?;

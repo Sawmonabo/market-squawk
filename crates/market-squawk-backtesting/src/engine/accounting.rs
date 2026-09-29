@@ -2,10 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use market_squawk_data::AdjustmentStep;
+use market_squawk_data::{AdjustmentStep, CorporateActionPlan};
 use market_squawk_domain::{
-    AvailabilityEvidence, InstrumentExecutionTerms, InstrumentId, MergerConsideration, Money,
-    OrderSide, RevisionNumber, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, EvidenceDigest, InstrumentExecutionTerms, InstrumentId,
+    MergerConsideration, Money, OrderSide, RevisionNumber, SourceIdentifier, Timestamp,
 };
 use market_squawk_portfolio::{
     CashFlow, CashFlowKind, CorporateActionBinding, LedgerEntry, LedgerEntryKind, LotSelection,
@@ -23,6 +23,15 @@ pub(super) struct ShadowPortfolio {
     pub(super) cash: Money,
     positions: BTreeMap<InstrumentId, Decimal>,
     fees: Money,
+    entitlements: BTreeMap<usize, ShadowCashEntitlement>,
+}
+
+#[derive(Debug)]
+struct ShadowCashEntitlement {
+    evidence: EvidenceDigest,
+    amount: Money,
+    settlement_at: Option<Timestamp>,
+    settled: bool,
 }
 
 impl ShadowPortfolio {
@@ -31,6 +40,7 @@ impl ShadowPortfolio {
             cash: initial_cash,
             positions: BTreeMap::new(),
             fees: Money::new(Decimal::ZERO, initial_cash.currency()),
+            entitlements: BTreeMap::new(),
         }
     }
 
@@ -53,7 +63,7 @@ impl ShadowPortfolio {
                     request
                         .corporate_actions
                         .as_ref()
-                        .map_or(0, |plan| plan.steps().len()),
+                        .map_or(0, |plan| plan.steps().len().saturating_mul(2)),
                 ),
             )
             .map_err(|_| BacktestError::LimitExceeded)?;
@@ -75,18 +85,36 @@ impl ShadowPortfolio {
                     .admitted()
                     .get(step_index(step))
                     .ok_or(BacktestError::AccountingMismatch)?;
-                if action_is_available(record, as_of) {
-                    operations.push(ShadowOperation::Action { step, record });
+                if action_is_available(record, as_of, as_of) {
+                    append_action_operations(&mut operations, step, record, as_of);
                 }
             }
         }
+        Self::replay_operations(request.portfolio.initial_cash, operations)
+    }
+
+    fn replay_operations(
+        initial_cash: Money,
+        mut operations: Vec<ShadowOperation<'_>>,
+    ) -> Result<Self, BacktestError> {
         operations.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
-        let mut shadow = Self::new(request.portfolio.initial_cash);
+        let mut shadow = Self::new(initial_cash);
         for operation in operations {
             match operation {
                 ShadowOperation::Fill { fill, terms, .. } => shadow.apply(fill, terms)?,
                 ShadowOperation::Action { step, record } => {
                     shadow.apply_action(step, record)?;
+                }
+                ShadowOperation::CashSettlement { index, .. } => {
+                    let entitlement = shadow
+                        .entitlements
+                        .get_mut(&index)
+                        .ok_or(BacktestError::AccountingMismatch)?;
+                    if entitlement.settled {
+                        return Err(BacktestError::AccountingMismatch);
+                    }
+                    shadow.cash = shadow.cash.checked_add(entitlement.amount)?;
+                    entitlement.settled = true;
                 }
             }
         }
@@ -153,6 +181,17 @@ impl ShadowPortfolio {
     pub(super) fn matches_revision(&self, revision: &PortfolioRevision) -> bool {
         self.cash == revision.cash()
             && self.fees == revision.fees()
+            && self.entitlements.len() == revision.cash_entitlements().len()
+            && self
+                .entitlements
+                .values()
+                .zip(revision.cash_entitlements())
+                .all(|(left, right)| {
+                    left.evidence == right.action_evidence()
+                        && left.amount == right.amount()
+                        && left.settlement_at == right.simulated_settlement_at()
+                        && left.settled == right.settled()
+                })
             && self.positions.len() == revision.positions().len()
             && self.positions.iter().all(|(instrument, quantity)| {
                 revision
@@ -166,7 +205,7 @@ impl ShadowPortfolio {
         prices: &BTreeMap<InstrumentId, (Money, Timestamp)>,
         as_of: Timestamp,
     ) -> Result<Option<Money>, BacktestError> {
-        let mut equity = self.cash;
+        let mut equity = self.cash.checked_add(self.receivable_value()?)?;
         for (instrument, quantity) in &self.positions {
             let Some((price, stale_at)) = prices.get(instrument) else {
                 return Ok(None);
@@ -194,17 +233,24 @@ impl ShadowPortfolio {
             AdjustmentStep::Split {
                 quantity_factor, ..
             } => {
-                let factor = ratio(
-                    quantity_factor.numerator().get(),
-                    quantity_factor.denominator().get(),
-                )?;
-                self.scale_position(subject, factor)?;
+                let quantity = self
+                    .position(subject)
+                    .checked_mul(Decimal::from(quantity_factor.numerator().get()))
+                    .and_then(|value| {
+                        value.checked_div(Decimal::from(quantity_factor.denominator().get()))
+                    })
+                    .ok_or(BacktestError::AccountingMismatch)?;
+                if quantity.is_zero() {
+                    self.positions.remove(&subject);
+                } else {
+                    self.positions.insert(subject, quantity);
+                }
             }
             AdjustmentStep::CashDividend { amount, .. } => {
-                self.add_cash_for_quantity(*amount, self.position(subject))?;
+                self.accrue_cash(step, record, *amount, self.position(subject))?;
             }
             AdjustmentStep::ReturnOfCapital { amount, .. } => {
-                self.add_cash_for_quantity(*amount, self.position(subject).max(Decimal::ZERO))?;
+                self.accrue_cash(step, record, *amount, self.position(subject))?;
             }
             AdjustmentStep::Spinoff {
                 distributed_instrument,
@@ -225,7 +271,7 @@ impl ShadowPortfolio {
                 successor,
                 consideration,
                 ..
-            } => self.apply_merger(subject, *successor, *consideration)?,
+            } => self.apply_merger(step, record, subject, *successor, *consideration)?,
             AdjustmentStep::Delisting { .. } | AdjustmentStep::SymbolChange { .. } => {}
         }
         Ok(())
@@ -233,6 +279,8 @@ impl ShadowPortfolio {
 
     fn apply_merger(
         &mut self,
+        step: &AdjustmentStep,
+        record: &market_squawk_data::CorporateActionRecord,
         subject: InstrumentId,
         successor: InstrumentId,
         consideration: MergerConsideration,
@@ -250,14 +298,14 @@ impl ShadowPortfolio {
                 self.add_position(successor, converted)?;
             }
             MergerConsideration::Cash { amount } => {
-                self.add_cash_for_quantity(amount, quantity)?;
+                self.accrue_cash(step, record, amount, quantity)?;
             }
             MergerConsideration::Mixed {
                 numerator,
                 denominator,
                 cash,
             } => {
-                self.add_cash_for_quantity(cash, quantity)?;
+                self.accrue_cash(step, record, cash, quantity)?;
                 let converted = quantity
                     .checked_mul(ratio(numerator.get(), denominator.get())?)
                     .ok_or(BacktestError::AccountingMismatch)?;
@@ -267,8 +315,10 @@ impl ShadowPortfolio {
         Ok(())
     }
 
-    fn add_cash_for_quantity(
+    fn accrue_cash(
         &mut self,
+        step: &AdjustmentStep,
+        record: &market_squawk_data::CorporateActionRecord,
         amount: Money,
         quantity: Decimal,
     ) -> Result<(), BacktestError> {
@@ -276,8 +326,34 @@ impl ShadowPortfolio {
             return Err(BacktestError::AccountingMismatch);
         }
         let cash = amount.checked_mul_decimal(quantity)?;
-        self.cash = self.cash.checked_add(cash)?;
+        if self
+            .entitlements
+            .insert(
+                step_index(step),
+                ShadowCashEntitlement {
+                    evidence: record.evidence_digest(),
+                    amount: cash,
+                    settlement_at: record
+                        .application()
+                        .and_then(|value| value.simulated_cash_settlement_at()),
+                    settled: false,
+                },
+            )
+            .is_some()
+        {
+            return Err(BacktestError::AccountingMismatch);
+        }
         Ok(())
+    }
+
+    fn receivable_value(&self) -> Result<Money, BacktestError> {
+        self.entitlements
+            .values()
+            .filter(|value| !value.settled)
+            .try_fold(
+                Money::new(Decimal::ZERO, self.cash.currency()),
+                |total, value| total.checked_add(value.amount).map_err(Into::into),
+            )
     }
 
     fn scale_position(
@@ -315,8 +391,103 @@ impl ShadowPortfolio {
     }
 }
 
+/// Recommendation outcomes reuse the generic ledger's exact fill/action accounting. No pricing,
+/// dividend amount, split factor, merger consideration, or delisting proceeds are inferred here.
+pub(crate) struct RecommendationAccounting {
+    shadow: ShadowPortfolio,
+    instrument: InstrumentId,
+    delisted: bool,
+}
+
+impl RecommendationAccounting {
+    pub(crate) fn at(
+        entry: &ResearchFill,
+        terms: InstrumentExecutionTerms,
+        exit: Option<&ResearchFill>,
+        plan: &CorporateActionPlan,
+        as_of: Timestamp,
+    ) -> Result<Self, BacktestError> {
+        if entry.executed_at() > as_of
+            || as_of > plan.valuation_cutoff()
+            || exit.is_some_and(|fill| fill.executed_at() > as_of)
+        {
+            return Err(BacktestError::InvalidRequest);
+        }
+        let entry_cost = entry
+            .price()
+            .checked_mul_quantity(
+                entry.quantity(),
+                terms.price_tick(),
+                terms.lot_size(),
+                terms.quote_currency(),
+            )?
+            .checked_mul_decimal(terms.contract_multiplier())?
+            .checked_add(entry.fee())?;
+        let mut operations = Vec::new();
+        operations
+            .try_reserve_exact(plan.steps().len().saturating_mul(2).saturating_add(2))
+            .map_err(|_| BacktestError::LimitExceeded)?;
+        operations.push(ShadowOperation::Fill {
+            index: 0,
+            fill: entry,
+            terms,
+        });
+        if let Some(exit) = exit {
+            operations.push(ShadowOperation::Fill {
+                index: 1,
+                fill: exit,
+                terms,
+            });
+        }
+        let mut delisted = false;
+        for step in plan.steps() {
+            let record = plan
+                .admitted()
+                .get(step_index(step))
+                .ok_or(BacktestError::AccountingMismatch)?;
+            if action_is_available(record, plan.knowledge_cutoff(), as_of) {
+                delisted |= matches!(step, AdjustmentStep::Delisting { .. })
+                    && record.observation().context().provenance().instrument_id()
+                        == Some(terms.instrument_id());
+                append_action_operations(&mut operations, step, record, as_of);
+            }
+        }
+        Ok(Self {
+            shadow: ShadowPortfolio::replay_operations(entry_cost, operations)?,
+            instrument: terms.instrument_id(),
+            delisted,
+        })
+    }
+
+    /// Complete post-action units; a distinct unpriced successor or distributed asset stays a gap.
+    pub(crate) fn quantity(&self) -> Result<Decimal, BacktestError> {
+        if self.delisted
+            || self
+                .shadow
+                .positions
+                .keys()
+                .any(|instrument| *instrument != self.instrument)
+        {
+            return Err(BacktestError::MissingFinalPrice);
+        }
+        Ok(self.shadow.position(self.instrument))
+    }
+
+    pub(crate) fn cash(&self) -> Money {
+        self.shadow.cash
+    }
+
+    pub(crate) fn receivable_value(&self) -> Result<Money, BacktestError> {
+        self.shadow.receivable_value()
+    }
+}
+
 #[derive(Debug)]
 enum ShadowOperation<'a> {
+    CashSettlement {
+        index: usize,
+        at: Timestamp,
+    },
     Fill {
         index: usize,
         fill: &'a ResearchFill,
@@ -331,16 +502,13 @@ enum ShadowOperation<'a> {
 impl ShadowOperation<'_> {
     fn key(&self) -> (Timestamp, u8, &str, usize) {
         match self {
+            Self::CashSettlement { index, at } => (*at, 2, "", *index),
             Self::Fill { index, fill, .. } => {
                 (fill.executed_at(), 1, "backtest-research-fill", *index)
             }
             Self::Action { step, record } => (
                 record
-                    .observation()
-                    .context()
-                    .time()
-                    .effective()
-                    .exact_timestamp()
+                    .application_at()
                     .unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
                 0,
                 record
@@ -357,21 +525,53 @@ impl ShadowOperation<'_> {
 
 fn action_is_available(
     record: &market_squawk_data::CorporateActionRecord,
+    knowledge_cutoff: Timestamp,
     as_of: Timestamp,
 ) -> bool {
     let available = match record.observation().context().provenance().availability() {
-        AvailabilityEvidence::Evidenced { available_at, .. } => *available_at <= as_of,
-        AvailabilityEvidence::LocalFirstObserved { observed_at } => *observed_at <= as_of,
+        AvailabilityEvidence::Evidenced { available_at, .. } => *available_at <= knowledge_cutoff,
+        AvailabilityEvidence::LocalFirstObserved { observed_at } => {
+            *observed_at <= knowledge_cutoff
+        }
         AvailabilityEvidence::Inferred { .. } | AvailabilityEvidence::Unknown => false,
     };
     available
         && record
-            .observation()
-            .context()
-            .time()
-            .effective()
-            .exact_timestamp()
+            .application()
+            .is_none_or(|value| value.available_at() <= knowledge_cutoff)
+        && record
+            .application_at()
             .is_some_and(|effective| effective <= as_of)
+}
+
+fn append_action_operations<'a>(
+    operations: &mut Vec<ShadowOperation<'a>>,
+    step: &'a AdjustmentStep,
+    record: &'a market_squawk_data::CorporateActionRecord,
+    as_of: Timestamp,
+) {
+    operations.push(ShadowOperation::Action { step, record });
+    if matches!(
+        step,
+        AdjustmentStep::CashDividend { .. }
+            | AdjustmentStep::ReturnOfCapital { .. }
+            | AdjustmentStep::Merger {
+                consideration: MergerConsideration::Cash { .. } | MergerConsideration::Mixed { .. },
+                ..
+            }
+    ) {
+        if let Some(at) = record
+            .application()
+            .and_then(|value| value.simulated_cash_settlement_at())
+        {
+            if at <= as_of {
+                operations.push(ShadowOperation::CashSettlement {
+                    index: step_index(step),
+                    at,
+                });
+            }
+        }
+    }
 }
 
 fn step_index(step: &AdjustmentStep) -> usize {

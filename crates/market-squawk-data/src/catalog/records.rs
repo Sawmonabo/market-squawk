@@ -5,8 +5,9 @@ use std::mem::size_of;
 use std::time::Instant;
 
 use market_squawk_domain::{
-    ContractRollMapping, CorporateActionObservation, InstrumentDefinition, InstrumentId,
-    LifecycleTransition, LifecycleTransitionKind, SourceId, SymbolIdentityRecord, Timestamp,
+    AssetClass, ContractRollMapping, CorporateActionObservation, InstrumentDefinition,
+    InstrumentId, LifecycleTransition, LifecycleTransitionKind, SourceId, SymbolIdentityRecord,
+    Timestamp,
 };
 use market_squawk_sources::SourceMetadata;
 use rusqlite::{OptionalExtension as _, Transaction, params};
@@ -541,6 +542,55 @@ impl Catalog {
         self.pin_instrument_definitions_checked(instrument_ids, as_of, limit, || {
             check_instrument_definition_read(deadline, cancellation)
         })
+    }
+
+    /// Pins independently retained terms for the expected canonical asset family.
+    /// Missing or incompatible original definitions return None; malformed history remains an error.
+    pub fn pin_optional_instrument_definition_bounded(
+        &self,
+        instrument_id: InstrumentId,
+        expected_asset_class: AssetClass,
+        as_of: Timestamp,
+        limit: CatalogLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PinnedInstrumentDefinitions>, CatalogError> {
+        check_instrument_definition_read(deadline, cancellation)?;
+        self.enforce_limit(limit)?;
+        let original: Option<(String, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT definition_json, revision_digest FROM instrument_revisions
+             WHERE instrument_id=?1 AND observed_at_ns<=?2
+             ORDER BY observed_at_ns DESC, revision_digest DESC LIMIT 1",
+                params![instrument_id.to_string(), as_of.unix_nanos()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        check_instrument_definition_read(deadline, cancellation)?;
+        let Some((definition_json, stored_digest)) = original else {
+            return Ok(None);
+        };
+        let mut budget = ResultBudget::new(self.result_bytes);
+        let original: InstrumentDefinition =
+            deserialize_verified(&definition_json, &stored_digest, &mut budget)?;
+        // Validate every retained row before interpreting an incompatible family as unavailable.
+        let pinned = self.pin_instrument_definitions_bounded(
+            &[instrument_id],
+            as_of,
+            limit,
+            deadline,
+            cancellation,
+        )?;
+        if original.instrument_id() != instrument_id
+            || pinned.execution_terms_at(instrument_id, as_of) != Some(original.execution_terms())
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        if original.asset_class() != expected_asset_class {
+            return Ok(None);
+        }
+        Ok(Some(pinned))
     }
 
     fn pin_instrument_definitions_checked(

@@ -5,11 +5,11 @@ use std::path::{Component, Path};
 use std::str::FromStr;
 use std::time::Duration;
 
-use market_squawk_data::{CatalogEndpointIdentity, Sha256Digest};
+use market_squawk_data::{CatalogEndpointIdentity, FeatureDatasetProductContract, Sha256Digest};
 use market_squawk_domain::{ModelId, Timestamp};
 use market_squawk_modeling::{
     BundleId, BundleMetadataRef, MAX_MODEL_REGISTRY_GENERATIONS, ModelOutputSemantics,
-    OnnxFallbackPolicy, OnnxModelPolicy,
+    OnnxFallbackPolicy, OnnxModelPolicy, PythonDatasetAdmissionAuthority,
 };
 use market_squawk_platform::LocalAuthorityStateStore;
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,17 @@ impl StoredRuntimePolicy {
     }
 }
 
+/// Only the owning job context can attach this binding to a runtime request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct TrainingJobBinding {
+    pub(super) id: uuid::Uuid,
+    pub(super) generation: NonZeroU64,
+    pub(super) input_sha256: [u8; 32],
+    pub(super) stderr_bytes: u64,
+    pub(super) stderr_sha256: [u8; 32],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IndexAdmission {
     pub(super) candidate_directory: Box<str>,
@@ -108,6 +119,7 @@ pub(super) struct IndexAdmission {
     pub(super) authority_bytes: Box<[u8]>,
     pub(super) authority_sha256: Sha256Digest,
     pub(super) dataset_export_sha256: Sha256Digest,
+    pub(super) dataset_product_contract: FeatureDatasetProductContract,
     pub(super) dataset_as_of: Timestamp,
     pub(super) dataset_selection_sha256: Sha256Digest,
     pub(super) catalog_identity: CatalogEndpointIdentity,
@@ -119,13 +131,28 @@ pub(super) struct IndexAdmission {
     pub(super) training_environment_sha256: Sha256Digest,
     pub(super) output_binding_sha256: Sha256Digest,
     pub(super) runtime_policy: StoredRuntimePolicy,
+    pub(super) training_job: Option<TrainingJobBinding>,
 }
 
 impl IndexAdmission {
+    pub(super) fn dataset_authority(
+        &self,
+    ) -> Result<PythonDatasetAdmissionAuthority, ModelRuntimeIndexError> {
+        PythonDatasetAdmissionAuthority::try_new(
+            self.dataset_export_sha256,
+            self.dataset_as_of,
+            self.dataset_selection_sha256,
+            self.catalog_identity,
+            self.dataset_product_contract,
+        )
+        .map_err(|_| ModelRuntimeIndexError::InvalidRecord)
+    }
+
     pub(super) fn validate(&self) -> Result<(), ModelRuntimeIndexError> {
         validate_candidate_directory(&self.candidate_directory)?;
         BundleMetadataRef::try_new(&self.metadata_path, self.metadata_sha256)
             .map_err(|_| ModelRuntimeIndexError::InvalidRecord)?;
+        self.dataset_authority()?;
         if self.authority_bytes.is_empty()
             || self.authority_bytes.len() > MAXIMUM_AUTHORITY_BYTES
             || Sha256Digest::new(Sha256::digest(&self.authority_bytes).into())
@@ -151,7 +178,41 @@ impl IndexAdmission {
         {
             return Err(ModelRuntimeIndexError::InvalidRecord);
         }
+        if let Some(job) = &self.training_job {
+            if job.id.is_nil()
+                || job.input_sha256 == [0; 32]
+                || job.stderr_sha256 == [0; 32]
+                || job.stderr_bytes
+                    > market_squawk_modeling::MAX_TRAINING_WORKER_STDERR_BYTES as u64
+                || self.candidate_directory.as_ref()
+                    != format!(
+                        "models/training-{}/generation-{}/candidate",
+                        job.id, job.generation
+                    )
+            {
+                return Err(ModelRuntimeIndexError::InvalidRecord);
+            }
+        }
         Ok(())
+    }
+
+    pub(super) fn training_result_sha256(&self) -> Option<Sha256Digest> {
+        let job = self.training_job.as_ref()?;
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/model-training-result/v1\0");
+        for digest in [
+            self.metadata_sha256,
+            self.artifact_sha256,
+            self.training_run_sha256,
+            self.authority_sha256,
+            self.dataset_export_sha256,
+            self.dataset_selection_sha256,
+        ] {
+            hash.update(digest.bytes());
+        }
+        hash.update(job.stderr_bytes.to_be_bytes());
+        hash.update(job.stderr_sha256);
+        Some(Sha256Digest::new(hash.finalize().into()))
     }
 
     fn coordinate(&self) -> (&BundleId, NonZeroU64) {
@@ -352,6 +413,7 @@ struct EntryView<'a> {
     authority_hex: String,
     authority_sha256: String,
     dataset_export_sha256: String,
+    dataset_product_contract: &'static str,
     dataset_as_of_unix_nanos: i64,
     dataset_selection_sha256: String,
     catalog_identity_sha256: String,
@@ -363,6 +425,7 @@ struct EntryView<'a> {
     training_environment_sha256: String,
     output_binding_sha256: String,
     runtime_policy: RuntimePolicyView<'a>,
+    training_job: Option<&'a TrainingJobBinding>,
 }
 
 impl<'a> From<&'a IndexAdmission> for EntryView<'a> {
@@ -374,6 +437,7 @@ impl<'a> From<&'a IndexAdmission> for EntryView<'a> {
             authority_hex: encode_hex_slice(&value.authority_bytes),
             authority_sha256: encode_hex(value.authority_sha256.bytes()),
             dataset_export_sha256: encode_hex(value.dataset_export_sha256.bytes()),
+            dataset_product_contract: value.dataset_product_contract.identity(),
             dataset_as_of_unix_nanos: value.dataset_as_of.unix_nanos(),
             dataset_selection_sha256: encode_hex(value.dataset_selection_sha256.bytes()),
             catalog_identity_sha256: encode_hex(value.catalog_identity.bytes()),
@@ -385,6 +449,7 @@ impl<'a> From<&'a IndexAdmission> for EntryView<'a> {
             training_environment_sha256: encode_hex(value.training_environment_sha256.bytes()),
             output_binding_sha256: encode_hex(value.output_binding_sha256.bytes()),
             runtime_policy: RuntimePolicyView::from(&value.runtime_policy),
+            training_job: value.training_job.as_ref(),
         }
     }
 }
@@ -445,6 +510,7 @@ struct EntryWire {
     authority_hex: String,
     authority_sha256: String,
     dataset_export_sha256: String,
+    dataset_product_contract: String,
     dataset_as_of_unix_nanos: i64,
     dataset_selection_sha256: String,
     catalog_identity_sha256: String,
@@ -456,6 +522,8 @@ struct EntryWire {
     training_environment_sha256: String,
     output_binding_sha256: String,
     runtime_policy: RuntimePolicyWire,
+    #[serde(deserialize_with = "Option::deserialize")]
+    training_job: Option<TrainingJobBinding>,
 }
 
 impl EntryWire {
@@ -468,6 +536,10 @@ impl EntryWire {
             authority_bytes: decode_hex_slice(&self.authority_hex)?.into_boxed_slice(),
             authority_sha256: Sha256Digest::new(decode_hex(&self.authority_sha256)?),
             dataset_export_sha256: Sha256Digest::new(decode_hex(&self.dataset_export_sha256)?),
+            dataset_product_contract: FeatureDatasetProductContract::from_identity(
+                &self.dataset_product_contract,
+            )
+            .ok_or(ModelRuntimeIndexError::InvalidRecord)?,
             dataset_as_of: Timestamp::from_unix_nanos(self.dataset_as_of_unix_nanos),
             dataset_selection_sha256: Sha256Digest::new(decode_hex(
                 &self.dataset_selection_sha256,
@@ -489,6 +561,7 @@ impl EntryWire {
             )?),
             output_binding_sha256: Sha256Digest::new(decode_hex(&self.output_binding_sha256)?),
             runtime_policy: self.runtime_policy.into_policy(artifact_sha256)?,
+            training_job: self.training_job,
         })
     }
 }
@@ -651,6 +724,7 @@ impl IndexAdmission {
             authority_bytes,
             authority_sha256,
             dataset_export_sha256: Sha256Digest::new([5; 32]),
+            dataset_product_contract: FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
             dataset_as_of: Timestamp::from_unix_nanos(10),
             dataset_selection_sha256: Sha256Digest::new([6; 32]),
             catalog_identity,
@@ -664,6 +738,7 @@ impl IndexAdmission {
             training_environment_sha256: Sha256Digest::new([9; 32]),
             output_binding_sha256: Sha256Digest::new([10; 32]),
             runtime_policy: StoredRuntimePolicy::Native,
+            training_job: None,
         })
     }
 }

@@ -353,6 +353,7 @@ struct RegistryEntry {
     active: Option<ActiveSessionKey>,
     health_authority: Option<CurrentHealthAuthority>,
     universe_attestation: Option<InstrumentUniverseAttestation>,
+    provider_identities: Vec<CurrentProviderIdentity>,
     generation_high_water: Option<ConnectionGeneration>,
     used_revisions: Vec<MetadataRevision>,
 }
@@ -364,6 +365,184 @@ impl RegistryEntry {
             active.capture.mark_incomplete();
         }
         self.health_authority = None;
+    }
+}
+
+/// Native coordinates supplied to the catalog by trusted source composition.
+/// Values describe a requested route; constructing them grants no authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderNativeIdentityRequest {
+    /// Identity namespace, independent of the live source identifier.
+    pub namespace: SourceId,
+    /// Exact identity in that namespace.
+    pub provider_instrument_id: market_squawk_domain::ProviderInstrumentId,
+    /// Exact canonical route expected by the application.
+    pub instrument: InstrumentId,
+    /// Source-metadata feed-route venue; it need not be a canonical trading venue.
+    pub venue: VenueId,
+    /// Explicit route symbol: either the byte-exact selected provider ID or a symbol proven by
+    /// the canonical definition's exact venue mapping. No inferred or normalized alias is admitted.
+    pub venue_symbol: market_squawk_domain::VenueSymbol,
+    /// Inclusive catalog knowledge cutoff.
+    pub knowledge_at: Timestamp,
+    /// Effective identity cutoff.
+    pub effective_at: Timestamp,
+}
+
+/// Replayable evidence only; a copied projection cannot mint a current registry mapping.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdentitySelectionEvidence {
+    /// Complete native and canonical coordinates and original selection cutoffs.
+    pub native: ProviderNativeIdentityRequest,
+    /// Exact immutable definition revision.
+    pub definition_digest: market_squawk_domain::EvidenceDigest,
+    /// Exact immutable definition position.
+    pub definition_sequence: u32,
+    /// Reference assertion revision.
+    pub reference_revision: MetadataRevision,
+    /// Reference assertion payload.
+    pub reference_payload_digest: market_squawk_domain::EvidenceDigest,
+    /// First durable publication time of the selected definition.
+    pub definition_published_at: Timestamp,
+    /// Definition validity; the end is exclusive.
+    pub definition_validity: EffectiveInterval,
+    /// Provider assertion revision.
+    pub provider_revision: MetadataRevision,
+    /// Provider assertion payload.
+    pub provider_payload_digest: market_squawk_domain::EvidenceDigest,
+    /// Provider assertion validity; the end is exclusive.
+    pub provider_validity: EffectiveInterval,
+    /// Digest of the original source-qualified catalog resolution.
+    pub resolution_digest: market_squawk_domain::EvidenceDigest,
+    /// Digest of the original opaque catalog selection.
+    pub selection_digest: market_squawk_domain::EvidenceDigest,
+}
+
+impl ProviderIdentitySelectionEvidence {
+    /// Checked retained dynamic bytes for this bounded evidence projection.
+    pub fn dynamic_retained_bytes(&self) -> Option<usize> {
+        [
+            self.native.namespace.retained_bytes(),
+            self.native.provider_instrument_id.retained_bytes(),
+            self.native.venue.retained_bytes(),
+            self.native.venue_symbol.retained_bytes(),
+            self.reference_revision
+                .as_source_identifier()
+                .retained_bytes(),
+            self.provider_revision
+                .as_source_identifier()
+                .retained_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
+}
+
+/// Validation-only catalog selection installed by trusted application composition.
+///
+/// This open dependency-inversion seam is not a compiler-enforced proof against arbitrary
+/// composition code. Production installs the data catalog implementation once; adapters receive
+/// native coordinates, never a selectable verifier. Implementations must retain an opaque exact
+/// catalog selection, reject replacement/expiry, and perform no catalog I/O in `validate_at`.
+pub trait CurrentCatalogProviderIdentity: std::fmt::Debug + Send + Sync {
+    /// Immutable evidence describing the exact selection, not a minting input.
+    fn evidence(&self) -> &ProviderIdentitySelectionEvidence;
+    /// Rechecks revocation and half-open validity without catalog I/O.
+    fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError>;
+    /// Complete checked shared allocation charge, including retained selection evidence.
+    fn retained_bytes(&self) -> Result<usize, RegistryError>;
+}
+
+/// Catalog read authority fixed by composition before the registry registers any sources.
+pub trait CatalogProviderIdentityAuthority: std::fmt::Debug + Send + Sync {
+    /// Selects and verifies the exact current catalog route with bounded control-plane I/O.
+    fn select_current(
+        &self,
+        request: &ProviderNativeIdentityRequest,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<dyn CurrentCatalogProviderIdentity>, RegistryError>;
+}
+
+/// Opaque catalog selection bound privately to one exact source registration.
+///
+/// This is identity authority only. Current observations must also retain and validate their
+/// existing source session, account/authorization generation, health, capture, and budget lease.
+#[derive(Clone, Debug)]
+pub struct CurrentProviderIdentity {
+    source_id: SourceId,
+    source_revision: RevisionBoundPayloadEvidence,
+    registration: Arc<RegistrationLeaseState>,
+    selected: Arc<dyn CurrentCatalogProviderIdentity>,
+}
+
+impl CurrentProviderIdentity {
+    /// Returns replayable catalog evidence without exposing a constructor.
+    pub fn evidence(&self) -> &ProviderIdentitySelectionEvidence {
+        self.selected.evidence()
+    }
+
+    /// Returns the independently bound live source identifier.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact source metadata and authorization binding.
+    pub const fn source_revision(&self) -> &RevisionBoundPayloadEvidence {
+        &self.source_revision
+    }
+
+    /// Checks catalog replacement/expiry and source registration replacement/revocation.
+    pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
+        if !self.registration.is_current() {
+            return Err(RegistryError::StaleHandle);
+        }
+        self.selected.validate_at(at)
+    }
+
+    /// Earliest inclusive end of the catalog definition and provider assertion, when bounded.
+    /// Current source metadata, authorization, and health can only shorten this deadline.
+    pub fn inclusive_deadline(&self) -> Option<Timestamp> {
+        let evidence = self.evidence();
+        [
+            evidence.definition_validity.ends_at(),
+            evidence.provider_validity.ends_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .and_then(|end| end.checked_sub_nanos(1).ok())
+    }
+
+    /// Returns a conservative complete checked charge for retained identity authority.
+    pub fn retained_bytes(&self) -> Result<usize, RegistryError> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.source_id.retained_bytes())
+            .and_then(|size| {
+                size.checked_add(
+                    self.source_revision
+                        .metadata_revision()
+                        .as_source_identifier()
+                        .retained_bytes(),
+                )
+            })
+            .and_then(|size| {
+                size.checked_add(
+                    self.source_revision
+                        .payload_evidence()
+                        .dynamic_retained_bytes()?,
+                )
+            })
+            .and_then(|size| size.checked_add(std::mem::size_of::<RegistrationLeaseState>()))
+            .and_then(|size| {
+                size.checked_add(crate::conservative_arc_control_block_charge::<
+                    RegistrationLeaseState,
+                >())
+            })
+            .and_then(|size| size.checked_add(self.selected.retained_bytes().ok()?))
+            .ok_or(RegistryError::RetainedSizeOverflow)
     }
 }
 

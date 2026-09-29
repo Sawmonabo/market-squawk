@@ -12,6 +12,7 @@ import { PortfolioHistory } from "./portfolio-history"
 import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
 import { PortfolioPlanning } from "./portfolio-planning"
 import { PortfolioScenarios } from "./portfolio-scenarios"
+import { RecommendationSetup } from "./recommendation-setup"
 import type { PortfolioAccount } from "./portfolio-contracts"
 import { formatProductTime, portfolioDisplayName } from "./portfolio-format"
 import { DataQualityPanel, PortfolioSummary } from "./portfolio-panels"
@@ -85,6 +86,8 @@ function PortfolioWorkspace({
           Refresh
         </Button>
       </header>
+
+      <RecommendationSetup key={bootstrap.productSessionToken} transport={transport} scope={bootstrap.productSessionToken} />
 
       {!accounts.available ? (
         <UnavailablePortfolio />

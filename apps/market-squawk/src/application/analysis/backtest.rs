@@ -47,13 +47,23 @@ pub use input_authority::{
     reason = "a generic analysis consumer uses this least-authority seam after composition"
 )]
 pub(crate) use input_authority::{
+    HistoricalRecommendationAlphaProducer, HistoricalRecommendationAlphaProducerReadCapability,
+    PreparedRecommendationStudyV1,
+    RecommendationStudyPreparationInputV1,
+    HistoricalFoldTrainingAuthorityV1, HistoricalStudyDatasetPartV1,
+    HistoricalStudyPlanReadCapabilityV1, HistoricalStudyPlanReferenceV1, HistoricalStudyPlanV1,
     GovernedRecommendationBacktestEvidenceV1, GovernedRecommendationInputMaterializerV1,
-    GovernedRecommendationMaterializedInputV1,
+    GovernedRecommendationMaterializedInputV1, GovernedRecommendationSignalIssuerV1,
+    GovernedRecommendationDailyInputRegistrationReceiptV1,
 };
 pub use repository::{
     GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
     ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
     ResolvedGovernedBacktestInput,
+};
+pub(crate) use repository::{
+    GovernedRecommendationBacktestReceiptV1, GovernedRecommendationBacktestReferenceV1,
+    GovernedRecommendationBacktestRequestV1,
 };
 
 const MAXIMUM_BACKTEST_RECORD_BYTES: usize = 1024 * 1024;

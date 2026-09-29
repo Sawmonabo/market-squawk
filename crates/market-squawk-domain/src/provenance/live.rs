@@ -215,7 +215,7 @@ impl LiveProvenance {
     }
     /// Returns the stable instrument identity.
     pub const fn instrument_id(&self) -> Option<InstrumentId> {
-        Some(self.binding.instrument_id())
+        self.binding.instrument_id()
     }
     /// Returns the venue identity.
     pub const fn venue_id(&self) -> Option<&VenueId> {

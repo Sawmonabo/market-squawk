@@ -32,7 +32,6 @@ mod backtest;
 mod catalog;
 mod serialization;
 
-pub(crate) use backtest::GovernedRecommendationBacktestEvidenceV1;
 pub use backtest::{
     BacktestPreparationCatalog, BacktestPreparationDatasetInput, BacktestPreparationError,
     BacktestPreparationLimits, BacktestPreparationOptions, BacktestPreparationPreview,
@@ -55,6 +54,16 @@ pub use backtest::{
     ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
     ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
     ResolvedGovernedBacktestInput,
+};
+pub(crate) use backtest::{
+    HistoricalRecommendationAlphaProducer, HistoricalRecommendationAlphaProducerReadCapability,
+    PreparedRecommendationStudyV1,
+    RecommendationStudyPreparationInputV1,
+    HistoricalFoldTrainingAuthorityV1, HistoricalStudyDatasetPartV1,
+    HistoricalStudyPlanReadCapabilityV1, HistoricalStudyPlanReferenceV1, HistoricalStudyPlanV1,
+    GovernedRecommendationBacktestEvidenceV1, GovernedRecommendationBacktestReceiptV1,
+    GovernedRecommendationBacktestReferenceV1, GovernedRecommendationBacktestRequestV1,
+    GovernedRecommendationDailyInputRegistrationReceiptV1, GovernedRecommendationSignalIssuerV1,
 };
 pub use catalog::{
     AnalysisCatalog, AnalysisCatalogError, AnalysisDataset, AnalysisDatasetScope,
@@ -925,6 +934,19 @@ where
 
 fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
     match error {
+        AnalyticalReadError::NativeSessionControl(error) => match error {
+            market_squawk_platform::ResearchObjectControlError::Cancelled => {
+                ServiceError::Cancelled
+            }
+            market_squawk_platform::ResearchObjectControlError::DeadlineExceeded => {
+                ServiceError::DeadlineExceeded
+            }
+            market_squawk_platform::ResearchObjectControlError::Unavailable => {
+                ServiceError::Unavailable
+            }
+        },
+        AnalyticalReadError::InputEpochResultRequiresInline => ServiceError::ResourceExhausted,
+        AnalyticalReadError::InvalidInputEpoch => ServiceError::InvalidResult,
         AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
@@ -934,6 +956,7 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
         | AnalyticalReadError::InvalidFundNavLimit
         | AnalyticalReadError::InvalidFundNavDateRange
         | AnalyticalReadError::InvalidMacroSeriesAllowlist
+        | AnalyticalReadError::InvalidMacroHistoryRequest
         | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
         | AnalyticalReadError::InvalidOutcomeMarketBarWindow
         | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,

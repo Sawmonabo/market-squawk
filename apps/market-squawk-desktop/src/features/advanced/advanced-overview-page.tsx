@@ -17,6 +17,7 @@ import { formatUnixNanos } from "@/features/opportunities/format"
 import type { ProductTransport } from "@/lib/transport"
 
 import { useAnalyticalProductProjection } from "./use-analytical-profile"
+import { ProfileControls } from "./profile-controls"
 
 const workspaces = [
   {
@@ -101,6 +102,7 @@ function ReadyAdvancedOverview({
       </header>
 
       <AnalyticalProfileStatus query={profile} />
+      <ProfileControls transport={transport} scope={scope} />
 
       <section className="mt-6" aria-labelledby="advanced-workspaces">
         <div className="flex items-center gap-2">

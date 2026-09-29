@@ -5,7 +5,7 @@ use std::{fmt, sync::Arc};
 use market_squawk_domain::{
     BarTimeSemantics, BarTimestampBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
     InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence, MarketBarSessionKind,
-    MetadataRevision, SourceId, SourceIdentifier, Timestamp, VenueId,
+    MetadataRevision, SourceId, SourceIdentifier, Timestamp, TimestampedBarPeriod, VenueId,
 };
 use market_squawk_sources::{ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt};
 use sha2::{Digest as _, Sha256};
@@ -342,7 +342,7 @@ pub(crate) enum CompletedMarketSessionCurrentnessResolution {
 /// One exact completed period and the evidence needed to qualify it independently.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CompletedMarketSessionCandidate {
-    period: BarTimeSemantics,
+    period: TimestampedBarPeriod,
     calendar_effective: EffectiveInterval,
     calendar_available_at: Timestamp,
     knowledge_available_at: Timestamp,
@@ -362,6 +362,10 @@ impl CompletedMarketSessionCandidate {
         capture: &SealedProviderCaptureSetReceipt,
     ) -> Result<Self, CompletedMarketSessionError> {
         validate_capture(&capture)?;
+        let period = period
+            .timestamped_period()
+            .ok_or(CompletedMarketSessionError::InvalidEvidence)?
+            .clone();
         let latest_received_at = capture
             .capture()
             .pages()
@@ -392,7 +396,7 @@ impl CompletedMarketSessionCandidate {
         })
     }
 
-    pub(crate) const fn period(&self) -> &BarTimeSemantics {
+    pub(crate) const fn period(&self) -> &TimestampedBarPeriod {
         &self.period
     }
 
@@ -503,6 +507,13 @@ pub(crate) enum CompletedMarketSessionEvidenceAccessError {
 pub(crate) trait CompletedMarketSessionEvidenceAuthority:
     fmt::Debug + Send + Sync + 'static
 {
+    /// Returns only the exact retained series governed for this venue and timeframe.
+    fn evidence_series(
+        &self,
+        venue: &VenueId,
+        timeframe: &SourceIdentifier,
+    ) -> Option<SourceIdentifier>;
+
     fn candidate_snapshot(
         &self,
         request: &CompletedMarketSessionRequest,
@@ -533,6 +544,37 @@ impl fmt::Debug for CompletedMarketSessionAuthority {
 impl CompletedMarketSessionAuthority {
     pub(crate) const fn new(evidence: Arc<dyn CompletedMarketSessionEvidenceAuthority>) -> Self {
         Self { evidence }
+    }
+
+    pub(crate) fn request_for(
+        &self,
+        venue: &VenueId,
+        timeframe: &SourceIdentifier,
+        completion_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        evaluated_at: Timestamp,
+    ) -> Result<Option<CompletedMarketSessionRequest>, CompletedMarketSessionError> {
+        self.evidence
+            .evidence_series(venue, timeframe)
+            .map(|series| {
+                CompletedMarketSessionRequest::try_new(
+                    venue.clone(),
+                    timeframe.clone(),
+                    series,
+                    completion_cutoff,
+                    knowledge_cutoff,
+                    evaluated_at,
+                )
+            })
+            .transpose()
+    }
+
+    pub(crate) fn recheck_currentness(
+        &self,
+        identity: &CompletedMarketSessionCurrentnessIdentity,
+        evaluated_at: Timestamp,
+    ) -> CompletedMarketSessionCurrentnessResolution {
+        self.evidence.validate_currentness(identity, evaluated_at)
     }
 
     /// Selects the unique latest eligible period after identical positive pre/post currentness
@@ -692,7 +734,9 @@ impl CompletedMarketSessionAuthority {
                 ));
             };
             expires_at = expires_at.min(candidate_expires_at);
-            periods.push(candidate.period.clone());
+            periods.push(BarTimeSemantics::TimestampedPeriod(
+                candidate.period.clone(),
+            ));
         }
         if periods.is_empty() || expires_at <= request.evaluated_at {
             return Err(CompletedMarketSessionError::InvalidEvidence);
@@ -713,7 +757,7 @@ impl CompletedMarketSessionAuthority {
             periods,
             precheck,
             expires_at,
-        );
+        )?;
         Ok(CompletedMarketSessionRangeResolution::Available(receipt))
     }
 
@@ -848,7 +892,7 @@ impl CompletedMarketSessionRangeReceipt {
         periods: Vec<BarTimeSemantics>,
         currentness_receipt: CompletedMarketSessionCurrentnessReceipt,
         expires_at: Timestamp,
-    ) -> Self {
+    ) -> Result<Self, CompletedMarketSessionError> {
         let digest = completed_session_range_receipt_digest(
             &request,
             &currentness,
@@ -861,8 +905,8 @@ impl CompletedMarketSessionRangeReceipt {
             &periods,
             &currentness_receipt,
             expires_at,
-        );
-        Self {
+        )?;
+        Ok(Self {
             evidence,
             request,
             currentness,
@@ -874,7 +918,7 @@ impl CompletedMarketSessionRangeReceipt {
             currentness_receipt,
             expires_at,
             digest,
-        }
+        })
     }
 
     pub(crate) fn validate_current_at(&self, checked_at: Timestamp) -> bool {
@@ -1032,7 +1076,7 @@ impl CompletedMarketSessionReceipt {
         &self.request
     }
 
-    pub(crate) const fn period(&self) -> &BarTimeSemantics {
+    pub(crate) const fn period(&self) -> &TimestampedBarPeriod {
         &self.candidate.period
     }
 
@@ -1107,6 +1151,12 @@ pub(crate) enum CompletedMarketSessionError {
     InvalidEvidence,
     #[error("completed-session resource bound was exceeded")]
     ResourceBoundExceeded,
+    #[error("completed-session evidence is unavailable")]
+    Unavailable,
+    #[error("completed-session operation was cancelled")]
+    Cancelled,
+    #[error("completed-session operation deadline elapsed")]
+    DeadlineExceeded,
 }
 
 fn validate_snapshot(
@@ -1208,7 +1258,7 @@ fn select_range(
     selected
         .try_reserve_exact(candidates.len())
         .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?;
-    let mut previous_period: Option<&BarTimeSemantics> = None;
+    let mut previous_period: Option<&TimestampedBarPeriod> = None;
     let mut common_timestamp_basis = None;
     let mut common_session: Option<&MarketBarSessionEvidence> = None;
     for (index, candidate) in candidates.iter().enumerate() {
@@ -1407,7 +1457,7 @@ fn completed_session_range_receipt_digest(
     periods: &[BarTimeSemantics],
     currentness_receipt: &CompletedMarketSessionCurrentnessReceipt,
     expires_at: Timestamp,
-) -> EvidenceDigest {
+) -> Result<EvidenceDigest, CompletedMarketSessionError> {
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/completed-market-session-range-receipt/v1\0");
     hash_evidence(&mut digest, request.digest);
@@ -1419,12 +1469,17 @@ fn completed_session_range_receipt_digest(
     digest.update(candidate_count.to_be_bytes());
     digest.update((periods.len() as u64).to_be_bytes());
     for period in periods {
-        hash_period(&mut digest, period);
+        hash_period(
+            &mut digest,
+            period
+                .timestamped_period()
+                .ok_or(CompletedMarketSessionError::InvalidEvidence)?,
+        );
     }
     hash_sealed_capture(&mut digest, sealed_capture);
     hash_currentness_receipt(&mut digest, currentness_receipt);
     hash_timestamp(&mut digest, expires_at);
-    sha256_evidence(digest)
+    Ok(sha256_evidence(digest))
 }
 
 fn hash_currentness_identity(
@@ -1449,7 +1504,7 @@ fn hash_currentness_identity(
     hash_evidence(digest, currentness.revocation_identity);
 }
 
-fn hash_period(digest: &mut Sha256, period: &BarTimeSemantics) {
+fn hash_period(digest: &mut Sha256, period: &TimestampedBarPeriod) {
     hash_timestamp(digest, period.provider_timestamp());
     hash_timestamp(digest, period.period_start());
     hash_timestamp(digest, period.period_end_exclusive());

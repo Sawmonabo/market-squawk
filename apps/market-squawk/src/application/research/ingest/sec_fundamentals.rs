@@ -6,7 +6,7 @@
 //! manifest plus source/native/raw/company evidence required for restart. Filing XBRL enters the
 //! same path only through the adapter's opaque accession/document/taxonomy capture graph.
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,7 +28,7 @@ use market_squawk_domain::{
 };
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
-    ExtractionAuthority, ExtractionBatch, ExtractionError, ExtractionRequest,
+    DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionError, ExtractionRequest,
     ExtractionRevisionPlan, ExtractionSourceError, ProviderCaptureError, ProviderCaptureMaterial,
     ProviderNativeLineageBatch, ProviderNativeLineageImplementation, ProviderWholeCaptureToken,
     SealedProviderCaptureBinding, SealedProviderCaptureSetReceipt, SourceMetadata,
@@ -114,6 +114,147 @@ impl SecFundamentalsCoordinatorClosure {
             rights,
             bridge: SecFundamentalsApplicationBridge::new(research),
         })
+    }
+
+    /// Publishes complete company API families and one stable selected financial-report filing.
+    /// The selected filing always comes from the exact captured current submissions document.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "selected identity, extraction limits, deadlines, and live precommit authority remain explicit"
+    )]
+    pub(super) async fn acquire_and_publish_company(
+        &self,
+        cik: &str,
+        max_records: NonZeroU32,
+        max_bytes: NonZeroU64,
+        wall_deadline: Timestamp,
+        deadline: Instant,
+        precommit: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+    ) -> Result<bool, SecFundamentalsApplicationError> {
+        for dataset in [
+            SecResearchDataset::submissions(cik)?,
+            SecResearchDataset::company_facts(cik)?,
+        ] {
+            self.extraction.validate_current()?;
+            precommit.validate_precommit()?;
+            let discovery = DiscoveryRequest::try_new(
+                dataset.dataset().clone(),
+                None,
+                NonZeroU16::MIN,
+                wall_deadline,
+            )?;
+            let discovered = self
+                .source
+                .discover_with_capture(
+                    self.extraction.clone(),
+                    discovery,
+                    cancellation.child_token(),
+                )
+                .await?;
+            let (discovery, material) = discovered.into_parts();
+            let object = discovery
+                .objects()
+                .first()
+                .filter(|_| discovery.objects().len() == 1)
+                .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+                .clone();
+            let request =
+                ExtractionRequest::try_new(object, max_records, max_bytes, wall_deadline)?;
+            let sealed = self
+                .extract_and_seal_selected(request, material, cancellation.child_token(), deadline)
+                .await?;
+            self.publish(sealed, Arc::clone(&precommit), cancellation.child_token())
+                .await?;
+        }
+        self.extraction.validate_current()?;
+        precommit.validate_precommit()?;
+        let submissions = self
+            .source
+            .fetch_submissions(&self.extraction, cik, cancellation.child_token())
+            .await?;
+        let selected = submissions
+            .document()
+            .filings()
+            .iter()
+            .filter(|filing| {
+                let form = filing
+                    .form()
+                    .as_str()
+                    .strip_suffix("/A")
+                    .unwrap_or(filing.form().as_str());
+                matches!(form, "10-K" | "10-Q" | "20-F" | "40-F")
+                    && (filing.is_inline_xbrl() || filing.is_xbrl())
+                    && filing.primary_document().is_some_and(|document| {
+                        let name = document.as_str();
+                        name.ends_with(".htm") || name.ends_with(".html") || name.ends_with(".xml")
+                    })
+            })
+            .max_by_key(|filing| {
+                (
+                    filing.filed_on(),
+                    filing.accepted_at(),
+                    filing.accession().as_str(),
+                )
+            });
+        let Some(filing) = selected else {
+            // Complete API families remain usable. This refresh publishes no filing detail;
+            // the common point-in-time selector retains its existing typed availability.
+            return Ok(false);
+        };
+        let accession = filing.accession().clone();
+        let document = filing
+            .primary_document()
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?
+            .clone();
+        let filing = self
+            .source
+            .fetch_filing_document(
+                &self.extraction,
+                cik,
+                accession.as_str(),
+                document.as_str(),
+                cancellation.child_token(),
+            )
+            .await?;
+        let material = filing
+            .capture_material()?
+            .ok_or(SecFundamentalsApplicationError::InvalidSelection)?;
+        let (expected, request) = material.into_whole_seal_parts();
+        let sealed = self
+            .bridge
+            .research
+            .seal_provider_capture(request, &cancellation, deadline)
+            .await?;
+        let root = expected.try_rejoin(sealed)?.try_into_whole()?;
+        precommit.validate_precommit()?;
+        let handoff = self
+            .source
+            .fetch_filing_xbrl_capture(
+                &self.extraction,
+                submissions,
+                accession.as_str(),
+                filing,
+                root,
+                wall_deadline,
+                cancellation.child_token(),
+            )
+            .await?;
+        let sealed = self
+            .extract_and_seal_filing_xbrl(
+                handoff,
+                max_records,
+                max_bytes,
+                wall_deadline,
+                cancellation.child_token(),
+                deadline,
+            )
+            .await?;
+        let published = self.publish(sealed, precommit, cancellation).await?;
+        if !matches!(published, SecFundamentalsPublicationReceipt::FilingXbrl(_)) {
+            return Err(SecFundamentalsApplicationError::InvalidSelection);
+        }
+        Ok(true)
     }
 
     pub(crate) async fn extract_and_seal_selected(

@@ -6,7 +6,26 @@
 )]
 
 pub(crate) mod alpaca;
+pub(crate) mod context;
 mod completed_session;
+mod forecast_cohort;
+mod history;
+pub(crate) use forecast_cohort::{
+    ForecastSessionCohort, ForecastSessionCohortReference, ForecastSessionOrigin, ForecastSessionReadCapability,
+};
+mod read;
+pub use read::CompletedMarketSessionReference;
+pub(crate) use read::{
+    CompletedMarketSessionDateReceipt, CompletedMarketSessionRead,
+    CompletedMarketSessionReadCapability, TiingoCalendarExpectedSessionAuthority,
+    RetainedMarketSessionRead, RetainedMarketSessionReadCapability, RetainedMarketSessionDateReceipt,
+    tiingo_calendar_source_venue,
+};
+
+pub(crate) use history::{
+    HistoryCurrentSessionQualification, HistoryCurrentSessionStatus,
+    qualify_history_current_session,
+};
 
 pub(crate) use completed_session::{
     CompletedMarketSessionAuthority, CompletedMarketSessionCandidate,
@@ -476,7 +495,7 @@ impl MarketCalendarAuthority {
             session,
         )
         .map_err(|_| MarketCalendarError::InvalidPeriodInterval)?;
-        if semantics.provider_timestamp() != provider_timestamp {
+        if semantics.provider_timestamp() != Some(provider_timestamp) {
             return Err(MarketCalendarError::ProviderBoundaryMismatch);
         }
         if self.revoked.load(Ordering::Acquire) {
@@ -1114,18 +1133,18 @@ mod tests {
         )?;
         assert_eq!(
             regular.period_end_exclusive(),
-            Timestamp::from_unix_nanos(30)
+            Some(Timestamp::from_unix_nanos(30))
         );
         assert_eq!(
             early_close.period_end_exclusive(),
-            Timestamp::from_unix_nanos(60)
+            Some(Timestamp::from_unix_nanos(60))
         );
         assert_eq!(
-            regular.session().evidence(),
-            early_close.session().evidence()
+            regular.session().map(|session| session.evidence()),
+            early_close.session().map(|session| session.evidence())
         );
-        assert_eq!(series.timestamp_basis(), regular.timestamp_basis());
-        assert_eq!(&series.into_session(), regular.session());
+        assert_eq!(Some(series.timestamp_basis()), regular.timestamp_basis());
+        assert_eq!(Some(&series.into_session()), regular.session());
         authority.revoke();
         assert_eq!(
             authority.series_semantics_at(&venue, &timeframe, Timestamp::from_unix_nanos(150),),
@@ -1185,11 +1204,14 @@ mod tests {
         let next_new_york_midnight = Timestamp::from_unix_nanos(1_732_942_800_000_000_000);
         let produced_bar =
             produced.resolve_at(&venue, &timeframe, provider_timestamp, retrieved_at)?;
-        assert_eq!(produced_bar.period_start(), provider_timestamp);
-        assert_eq!(produced_bar.period_end_exclusive(), next_new_york_midnight);
+        assert_eq!(produced_bar.period_start(), Some(provider_timestamp));
         assert_eq!(
-            produced_bar.session().kind(),
-            MarketBarSessionKind::ProviderDefined
+            produced_bar.period_end_exclusive(),
+            Some(next_new_york_midnight)
+        );
+        assert_eq!(
+            produced_bar.session().map(|session| session.kind()),
+            Some(MarketBarSessionKind::ProviderDefined)
         );
         produced.revoke();
         assert_eq!(

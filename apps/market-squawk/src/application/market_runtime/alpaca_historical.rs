@@ -35,13 +35,17 @@ use uuid::Uuid;
 
 use crate::application::ResearchRightsAuthority;
 use crate::provider_activation::{
-    AlpacaBasicAccountActivation, ProviderAccountBinding, ProviderMarketAccount,
+    AlpacaBasicAccountActivation, ProviderAccountBinding, ProviderAccountRuntimeCurrentness,
+    ProviderMarketAccount,
 };
 
 use super::MarketRuntimeGroupGeneration;
 
 mod calendar;
-pub(crate) use calendar::AlpacaHistoricalCompositeCalendarAuthority;
+mod corporate_actions;
+pub(crate) use calendar::{
+    AlpacaHistoricalCalendarError, AlpacaHistoricalCompositeCalendarAuthority,
+};
 
 type CurrentnessFuture = Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
 type CurrentnessValidator = dyn Fn() -> CurrentnessFuture + Send + Sync + 'static;
@@ -165,6 +169,14 @@ impl AlpacaHistoricalRuntimeCapability {
 
     pub(crate) fn historical_metadata(&self) -> &SourceMetadata {
         &self.inner.historical_metadata
+    }
+
+    pub(crate) fn calendar_metadata(&self) -> &SourceMetadata {
+        &self.inner.calendar_metadata
+    }
+
+    pub(crate) fn calendar_rights(&self) -> &ResearchRightsAuthority {
+        &self.inner.calendar_rights
     }
 
     pub(crate) fn historical_request_bounds(&self) -> HttpRequestBounds {
@@ -473,6 +485,8 @@ impl AlpacaHistoricalCapabilityOwner {
         historical_metadata: SourceMetadata,
         historical_request_bounds: HttpRequestBounds,
         historical_rights: ResearchRightsAuthority,
+        calendar_metadata: SourceMetadata,
+        calendar_rights: ResearchRightsAuthority,
         cancellation: CancellationToken,
     ) -> Result<Self, ServiceError> {
         let lease = activation.lease();
@@ -495,6 +509,20 @@ impl AlpacaHistoricalCapabilityOwner {
             || public_configuration_digest.bytes() == [0; 32]
             || runtime_evidence_digest.bytes() == [0; 32]
             || lease.verification_evidence_digest() != Some(account_binding.verification_evidence())
+            || calendar_metadata.source_id() != calendar_rights.source_id()
+            || calendar_metadata.authorization() != historical_metadata.authorization()
+            || calendar_metadata.budget_policy() != historical_metadata.budget_policy()
+            || calendar_metadata.coverage().domain()
+                != market_squawk_sources::CoverageDomain::MarketCalendar
+            || calendar_metadata.provider() != historical_metadata.provider()
+            || market_squawk_adapter_alpaca::validate_alpaca_calendar_metadata(
+                &calendar_metadata,
+                historical_request_bounds,
+                activation.trading_api_environment(),
+            )
+            .is_err()
+            || calendar_metadata.capabilities().live()
+            || !calendar_metadata.capabilities().extraction()
             || historical_metadata.source_id() != historical_rights.source_id()
             || AlpacaHistoricalEquityConfig::validate_parent_metadata(
                 &historical_metadata,
@@ -534,8 +562,11 @@ impl AlpacaHistoricalCapabilityOwner {
                 historical_metadata,
                 historical_request_bounds,
                 historical_rights,
+                calendar_metadata,
+                calendar_rights,
                 currentness,
                 synchronous_currentness,
+                account_currentness: activation.currentness(),
                 accepting: AtomicBool::new(true),
                 cancellation,
                 active: AtomicUsize::new(0),
@@ -556,12 +587,17 @@ impl AlpacaHistoricalCapabilityOwner {
     pub(super) fn begin_shutdown(&self) {
         self.inner.accepting.store(false, Ordering::Release);
         self.inner.cancellation.cancel();
-        if self.inner.active.load(Ordering::Acquire) == 0 {
-            self.inner.clear_authority();
+    }
+
+    /// Original coordinates remain available only to the owner retiring this exact allocation.
+    pub(super) fn retirement_capability(&self) -> AlpacaHistoricalRuntimeCapability {
+        AlpacaHistoricalRuntimeCapability {
+            inner: Arc::clone(&self.inner),
         }
     }
 
-    pub(super) async fn shutdown(self) -> Result<(), ServiceError> {
+    /// Completes local operation cleanup after the group has drained this original history parent.
+    pub(super) async fn finish_shutdown(&mut self) -> Result<(), ServiceError> {
         self.begin_shutdown();
         while self.inner.active.load(Ordering::Acquire) != 0 {
             let notified = self.inner.idle.notified();
@@ -571,6 +607,10 @@ impl AlpacaHistoricalCapabilityOwner {
         }
         self.inner.clear_authority();
         Ok(())
+    }
+
+    pub(super) async fn shutdown(mut self) -> Result<(), ServiceError> {
+        self.finish_shutdown().await
     }
 
     pub(super) fn owns(&self, capability: &AlpacaHistoricalRuntimeCapability) -> bool {
@@ -598,8 +638,11 @@ struct AlpacaHistoricalInner {
     historical_metadata: SourceMetadata,
     historical_request_bounds: HttpRequestBounds,
     historical_rights: ResearchRightsAuthority,
+    calendar_metadata: SourceMetadata,
+    calendar_rights: ResearchRightsAuthority,
     currentness: Arc<CurrentnessValidator>,
     synchronous_currentness: Arc<SynchronousCurrentnessValidator>,
+    account_currentness: ProviderAccountRuntimeCurrentness,
     accepting: AtomicBool,
     cancellation: CancellationToken,
     active: AtomicUsize,
@@ -661,9 +704,6 @@ impl AlpacaHistoricalInner {
 
     fn finish_operation(&self) {
         if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if !self.accepting.load(Ordering::Acquire) {
-                self.clear_authority();
-            }
             self.idle.notify_one();
         }
     }

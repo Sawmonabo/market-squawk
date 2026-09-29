@@ -289,50 +289,126 @@ impl ProviderAdapterActivation {
         &self,
         context: &RequestContext,
     ) -> Result<EiaMacroPublicationReceipt, EiaProductError> {
-        let activation = self
-            .eia
-            .read()
-            .map_err(|_| EiaProductError::Unavailable)?
-            .as_ref()
-            .cloned()
-            .ok_or(EiaProductError::SetupRequired)?;
-        let onboarding = self.onboarding.try_acquire_runtime_mutation_authority()?;
-        onboarding.require_active(&activation.lease)?;
-        if self
-            .research
-            .provider_runtime_generation(activation.generation.profile())?
-            .as_ref()
-            != Some(&activation.generation)
-        {
-            return Err(EiaProductError::Unavailable);
+        let mut stage = "retained_activation";
+        let result: Result<EiaMacroPublicationReceipt, EiaProductError> = async {
+            let activation = self
+                .eia
+                .read()
+                .map_err(|_| EiaProductError::Unavailable)?
+                .as_ref()
+                .cloned()
+                .ok_or(EiaProductError::SetupRequired)?;
+            stage = "onboarding_guard";
+            let onboarding = self.onboarding.try_acquire_runtime_mutation_authority()?;
+            stage = "active_lease";
+            onboarding.require_active(&activation.lease)?;
+            stage = "runtime_generation";
+            if self
+                .research
+                .provider_runtime_generation(activation.generation.profile())?
+                .as_ref()
+                != Some(&activation.generation)
+            {
+                return Err(EiaProductError::Unavailable);
+            }
+            drop(onboarding);
+            let dataset = DatasetId::try_from(ANALYTICAL_DATASET)
+                .map_err(|_| EiaProductError::Unavailable)?;
+            stage = "acquire_seal_publish";
+            Ok(activation
+                .runtime
+                .acquire_seal_publish(
+                    dataset,
+                    activation.specification.acquisition_limits,
+                    context,
+                    |deadline, cancellation| {
+                        let onboarding = self
+                            .onboarding
+                            .try_acquire_owned_runtime_mutation_authority()
+                            .map_err(|_| EiaMacroApplicationError::AuthorityInvalid)?;
+                        let authority = EiaPublicationAuthority {
+                            onboarding,
+                            lease: activation.lease.clone(),
+                            deadline,
+                            cancellation,
+                        };
+                        authority
+                            .validate_precommit()
+                            .map_err(|_| EiaMacroApplicationError::AuthorityInvalid)?;
+                        Ok(Some(Arc::new(authority)))
+                    },
+                )
+                .await?)
         }
-        drop(onboarding);
-        let dataset =
-            DatasetId::try_from(ANALYTICAL_DATASET).map_err(|_| EiaProductError::Unavailable)?;
-        Ok(activation
-            .runtime
-            .acquire_seal_publish(
-                dataset,
-                activation.specification.acquisition_limits,
-                context,
-                |deadline, cancellation| {
-                    let onboarding = self
-                        .onboarding
-                        .try_acquire_owned_runtime_mutation_authority()
-                        .map_err(|_| EiaMacroApplicationError::AuthorityInvalid)?;
-                    let authority = EiaPublicationAuthority {
-                        onboarding,
-                        lease: activation.lease.clone(),
-                        deadline,
-                        cancellation,
+        .await;
+        match &result {
+            Ok(_) => tracing::info!("bounded energy publication completed"),
+            Err(error) => trace_eia_product_failure(stage, error),
+        }
+        result
+    }
+}
+
+// Only static outer categories and already closed adapter receipts may enter diagnostics.
+// Research/catalog failures can carry dynamic context, so their nested Debug is never logged.
+fn trace_eia_product_failure(stage: &'static str, error: &EiaProductError) {
+    let category = match error {
+        EiaProductError::SetupRequired => "setup_required",
+        EiaProductError::Unavailable => "unavailable",
+        EiaProductError::Onboarding(_) => "onboarding",
+        EiaProductError::Composition(_) => "composition",
+        EiaProductError::Application(_) => "application",
+    };
+    tracing::warn!(stage, category, "bounded energy publication failed");
+    if let EiaProductError::Onboarding(
+        error @ (crate::ProviderOnboardingError::ActivationUnavailable
+        | crate::ProviderOnboardingError::ActivationExpired
+        | crate::ProviderOnboardingError::InvalidSessionState
+        | crate::ProviderOnboardingError::OperationCancelled),
+    ) = error
+    {
+        tracing::warn!(error = ?error, "bounded energy onboarding authority failure");
+    }
+    let EiaProductError::Application(error) = error else {
+        return;
+    };
+    // Every EiaMacroApplicationError Display is a code-owned literal; inner errors are opaque.
+    tracing::warn!(classification = %error, "bounded energy publication failure class");
+    match error {
+        EiaMacroApplicationError::Adapter(error) => {
+            tracing::warn!(error = ?error, "bounded energy adapter failure");
+        }
+        EiaMacroApplicationError::Service(error) => {
+            tracing::warn!(error = ?error, "bounded energy service authority failure");
+        }
+        EiaMacroApplicationError::Lifecycle(error) => {
+            use market_squawk_adapter_eia::{EiaLifecycleError, EiaSourceTransportError};
+            match error {
+                EiaLifecycleError::Protocol(error)
+                | EiaLifecycleError::Transport(EiaSourceTransportError::Protocol(error)) => {
+                    tracing::warn!(error = ?error, "bounded energy protocol failure");
+                }
+                EiaLifecycleError::Transport(EiaSourceTransportError::HttpFailure { receipt }) => {
+                    tracing::warn!(receipt = ?receipt, "bounded energy HTTP failure");
+                }
+                EiaLifecycleError::Transport(EiaSourceTransportError::ResponseStructureLimit {
+                    receipt,
+                }) => {
+                    tracing::warn!(receipt = ?receipt, "bounded energy structure failure");
+                }
+                _ => {
+                    let category = match error {
+                        EiaLifecycleError::Cancelled => "cancelled",
+                        EiaLifecycleError::InvalidEvidence => "invalid_evidence",
+                        EiaLifecycleError::StaleActivation => "stale_activation",
+                        EiaLifecycleError::Transport(_) => "transport_authority_or_capture",
+                        EiaLifecycleError::Protocol(_) => "protocol",
                     };
-                    authority
-                        .validate_precommit()
-                        .map_err(|_| EiaMacroApplicationError::AuthorityInvalid)?;
-                    Ok(Some(Arc::new(authority)))
-                },
-            )
-            .await?)
+                    tracing::warn!(category, "bounded energy lifecycle failure");
+                }
+            }
+        }
+        _ => {}
     }
 }
 

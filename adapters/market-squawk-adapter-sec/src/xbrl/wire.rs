@@ -1,7 +1,5 @@
 //! Bounded namespace-aware XML wire helpers shared by the XBRL parser and normalizer.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use market_squawk_domain::{
     CalendarDate, XbrlAccuracy, XbrlAccuracyValue, XbrlQualifiedName, XbrlSign, XbrlText,
 };
@@ -116,14 +114,237 @@ impl ResolvedAttributes {
     }
 }
 
+/// Measures conservative XML scratch from a borrowed bounded pass before allocating the
+/// namespace-aware reader. The pass owns only the pull reader's open-name buffers and a
+/// depth-bounded stack; those are admitted first and dropped before the real parse begins.
+/// Namespace and attribute maxima come from this exact input, not the schema-wide ceiling.
+pub(super) fn parser_scratch_reservation(
+    bytes: &[u8],
+    limits: SecParserLimits,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<usize, SecXbrlError> {
+    use quick_xml::{Reader, events::Event};
+    use std::mem::size_of;
+    let overflow = || SecXbrlError::RetainedOutputLimitExceeded;
+    let depth_slots = limits.depth().checked_add(1).ok_or_else(overflow)?;
+    // A borrowed lexical upper bound precedes reader construction: every element name occurs
+    // immediately after `<` or `</` and stops at XML whitespace, `/`, or `>`. Tokens inside
+    // comments/CDATA may only overestimate it. This does not admit syntax; the real parse does.
+    let name_bound = bytes
+        .split(|byte| *byte == b'<')
+        .skip(1)
+        .map(|tail| tail.strip_prefix(b"/").unwrap_or(tail))
+        .map(|tail| {
+            tail.iter()
+                .take_while(|byte| {
+                    !matches!(
+                        **byte,
+                        b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>' | b'!' | b'?'
+                    )
+                })
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let names = name_bound
+        .checked_mul(depth_slots)
+        .ok_or_else(overflow)?
+        .min(bytes.len());
+    // Depth+1 also covers the next rejected start event, which the reader owns before returning
+    // it. Duplicate checking is disabled only in this sizing pass, avoiding a key table here.
+    let preflight = names
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(depth_slots.checked_mul(8 * size_of::<usize>())?))
+        .and_then(|n| n.checked_add(size_of::<Reader<&[u8]>>() + 256))
+        .ok_or_else(overflow)?;
+    if preflight > limits.retained_output_bytes() {
+        return Err(overflow());
+    }
+    let mut frames = Vec::<(usize, usize, usize)>::new();
+    frames
+        .try_reserve_exact(depth_slots)
+        .map_err(|_| overflow())?;
+    if frames.capacity() > depth_slots.saturating_mul(2) {
+        return Err(overflow());
+    }
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().check_end_names = false;
+    reader.config_mut().allow_unmatched_ends = true;
+    let mut open_names = 0usize;
+    let mut namespace_bytes = XML_NAMESPACE.len() + 64;
+    let mut namespace_count = 2usize;
+    let mut max_open_names = 0usize;
+    let mut max_namespace_bytes = namespace_bytes;
+    let mut max_namespace_count = namespace_count;
+    let mut max_namespace = XML_NAMESPACE.len();
+    let mut max_name = 0usize;
+    let mut max_depth = 0usize;
+    let mut max_attributes = 0usize;
+    let mut max_all_attributes = 0usize;
+    let mut max_attribute_dynamic = 0usize;
+    let mut max_decoded_attribute = 0usize;
+    let mut max_decoded_text = 0usize;
+    loop {
+        super::check_xbrl_cancelled(cancellation)?;
+        let event = reader.read_event()?;
+        let empty = matches!(&event, Event::Empty(_));
+        match event {
+            Event::Start(start) | Event::Empty(start) => {
+                let name_bytes = start.name().as_ref().len();
+                if name_bytes > limits.string_bytes() {
+                    return Err(SecXbrlError::StringLimitExceeded);
+                }
+                let mut ns_bytes = 0usize;
+                let mut ns_count = 0usize;
+                let mut attributes = 0usize;
+                let mut all_attributes = 0usize;
+                let mut dynamic = 0usize;
+                for attribute in start.attributes().with_checks(false) {
+                    let attribute = attribute?;
+                    all_attributes = all_attributes.checked_add(1).ok_or_else(overflow)?;
+                    if attribute.key.as_namespace_binding().is_some() {
+                        ns_bytes = super::checked_retained_sum([
+                            ns_bytes,
+                            attribute.key.as_ref().len(),
+                            attribute.value.len(),
+                        ])?;
+                        ns_count = ns_count.checked_add(1).ok_or_else(overflow)?;
+                        max_namespace = max_namespace.max(attribute.value.len());
+                        continue;
+                    }
+                    attributes = attributes.checked_add(1).ok_or_else(overflow)?;
+                    if attributes > MAX_ATTRIBUTES {
+                        return Err(SecXbrlError::AttributeLimitExceeded);
+                    }
+                    if attribute.key.as_ref().len() > limits.string_bytes() {
+                        return Err(SecXbrlError::StringLimitExceeded);
+                    }
+                    let decoded = reader
+                        .decoder()
+                        .encoding()
+                        .new_decoder_without_bom_handling()
+                        .max_utf8_buffer_length(attribute.value.len())
+                        .ok_or_else(overflow)?;
+                    max_decoded_attribute = max_decoded_attribute.max(decoded);
+                    dynamic = super::checked_retained_sum([
+                        dynamic,
+                        attribute
+                            .key
+                            .as_ref()
+                            .len()
+                            .checked_mul(2)
+                            .ok_or_else(overflow)?,
+                        decoded,
+                    ])?;
+                }
+                let depth = frames.len().checked_add(1).ok_or_else(overflow)?;
+                if depth > limits.depth() {
+                    return Err(SecXbrlError::DepthLimitExceeded);
+                }
+                max_depth = max_depth.max(depth);
+                max_name = max_name.max(name_bytes);
+                max_open_names =
+                    max_open_names.max(open_names.checked_add(name_bytes).ok_or_else(overflow)?);
+                max_namespace_bytes = max_namespace_bytes
+                    .max(namespace_bytes.checked_add(ns_bytes).ok_or_else(overflow)?);
+                max_namespace_count = max_namespace_count
+                    .max(namespace_count.checked_add(ns_count).ok_or_else(overflow)?);
+                max_attributes = max_attributes.max(attributes);
+                max_all_attributes = max_all_attributes.max(all_attributes);
+                max_attribute_dynamic = max_attribute_dynamic.max(dynamic);
+                if !empty {
+                    open_names = open_names.checked_add(name_bytes).ok_or_else(overflow)?;
+                    namespace_bytes = namespace_bytes.checked_add(ns_bytes).ok_or_else(overflow)?;
+                    namespace_count = namespace_count.checked_add(ns_count).ok_or_else(overflow)?;
+                    frames.push((name_bytes, ns_bytes, ns_count));
+                }
+            }
+            Event::End(end) => {
+                if end.name().as_ref().len() > limits.string_bytes() {
+                    return Err(SecXbrlError::StringLimitExceeded);
+                }
+                max_name = max_name.max(end.name().as_ref().len());
+                let (names, ns_bytes, ns_count) =
+                    frames.pop().ok_or(SecXbrlError::UnexpectedEof)?;
+                open_names -= names;
+                namespace_bytes -= ns_bytes;
+                namespace_count -= ns_count;
+            }
+            Event::Text(text) => {
+                let decoded = reader
+                    .decoder()
+                    .encoding()
+                    .new_decoder_without_bom_handling()
+                    .max_utf8_buffer_length(text.len())
+                    .ok_or_else(overflow)?;
+                max_decoded_text = max_decoded_text.max(decoded);
+            }
+            Event::CData(text) => {
+                let decoded = reader
+                    .decoder()
+                    .encoding()
+                    .new_decoder_without_bom_handling()
+                    .max_utf8_buffer_length(text.len())
+                    .ok_or_else(overflow)?;
+                max_decoded_text = max_decoded_text.max(decoded);
+            }
+            Event::DocType(_) => return Err(SecXbrlError::DoctypeForbidden),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if !frames.is_empty() {
+        return Err(SecXbrlError::UnexpectedEof);
+    }
+    // quick-xml 0.41: four machine words per namespace binding, one per open-name
+    // index, two per duplicate attribute range. Include minimum Vec capacities and
+    // the owned end-name for expand_empty_elements. These coexist with event scratch.
+    let reader_owned = super::checked_retained_sum([
+        max_open_names,
+        max_namespace_bytes,
+        max_name,
+        max_namespace_count
+            .max(4)
+            .checked_mul(4 * size_of::<usize>())
+            .ok_or_else(overflow)?,
+        max_depth
+            .max(4)
+            .checked_mul(size_of::<usize>())
+            .ok_or_else(overflow)?,
+        max_all_attributes
+            .max(4)
+            .checked_mul(2 * size_of::<usize>())
+            .ok_or_else(overflow)?,
+    ])?
+    .checked_mul(2)
+    .ok_or_else(overflow)?;
+    let attribute_owned = super::checked_retained_sum([
+        max_attributes
+            .max(4)
+            .checked_mul(size_of::<ResolvedAttribute>())
+            .ok_or_else(overflow)?,
+        max_attribute_dynamic,
+        max_attributes
+            .checked_mul(max_namespace)
+            .ok_or_else(overflow)?,
+        max_name.checked_mul(2).ok_or_else(overflow)?,
+        max_namespace,
+        max_decoded_attribute,
+    ])?
+    .checked_mul(4)
+    .ok_or_else(overflow)?;
+    // Decoding and unescaping can each own one complete text buffer. Attribute/QName
+    // resolution can also coexist with copies made by state.start before draft admission.
+    let event_owned = attribute_owned.max(max_decoded_text.checked_mul(4).ok_or_else(overflow)?);
+    super::checked_retained_sum([reader_owned, event_owned, size_of::<NsReader<&[u8]>>(), 256])
+}
+
 pub(super) fn attributes(
     reader: &NsReader<&[u8]>,
     start: &BytesStart<'_>,
     limits: SecParserLimits,
 ) -> Result<ResolvedAttributes, SecXbrlError> {
-    let mut values = Vec::new();
-    let mut expanded = BTreeSet::new();
-    let mut semantic_counts = BTreeMap::<String, usize>::new();
+    let mut values = Vec::<ResolvedAttribute>::new();
     for attribute in start.attributes() {
         if values.len() >= MAX_ATTRIBUTES {
             return Err(SecXbrlError::AttributeLimitExceeded);
@@ -139,21 +360,18 @@ pub(super) fn attributes(
         if value.len() > limits.string_bytes() {
             return Err(SecXbrlError::StringLimitExceeded);
         }
-        let expanded_key = (
-            name.namespace_uri().map(|uri| uri.as_str().to_owned()),
-            name.local_name().as_str().to_owned(),
-        );
-        if !expanded.insert(expanded_key) {
+        if values
+            .iter()
+            .any(|existing| existing.name.same_expanded_name(&name))
+        {
             return Err(SecXbrlError::DuplicateAttribute);
         }
-        if SEMANTIC_ATTRIBUTE_NAMES.contains(&name.local_name().as_str()) {
-            let count = semantic_counts
-                .entry(name.local_name().as_str().to_owned())
-                .or_insert(0);
-            *count += 1;
-            if *count > 1 {
-                return Err(SecXbrlError::AmbiguousSemanticAttribute);
-            }
+        if SEMANTIC_ATTRIBUTE_NAMES.contains(&name.local_name().as_str())
+            && values
+                .iter()
+                .any(|existing| existing.name.local_name() == name.local_name())
+        {
+            return Err(SecXbrlError::AmbiguousSemanticAttribute);
         }
         values.push(ResolvedAttribute { name, value });
     }

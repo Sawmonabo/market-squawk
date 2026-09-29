@@ -51,12 +51,31 @@ impl ResearchIoWorker {
         T: Send + 'static,
         F: FnOnce(CancellationToken) -> T + Send + 'static,
     {
+        self.run_with_job_context(None, deadline, cancellation, operation)
+            .await
+    }
+
+    /// An admitted job wrapper returns cancellation only after its original worker joins.
+    /// Runner abort can drop that wrapper; the original handle remains in this owned slot.
+    /// The same state guard owns cooperative cancellation joins; later work cannot replace it.
+    pub(super) async fn run_with_job_context<T, F>(
+        &self,
+        job_cancellation: Option<&CancellationToken>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
         let operation_cancellation = self.shutdown.child_token();
         let _cancel_on_drop = operation_cancellation.clone().drop_guard();
         let deadline = tokio::time::Instant::from_std(deadline);
         let permit = wait(
             deadline,
             cancellation,
+            job_cancellation,
             &operation_cancellation,
             Arc::clone(&self.gate).acquire_owned(),
         )
@@ -65,6 +84,7 @@ impl ResearchIoWorker {
         let mut state = wait(
             deadline,
             cancellation,
+            job_cancellation,
             &operation_cancellation,
             self.state.lock(),
         )
@@ -74,6 +94,7 @@ impl ResearchIoWorker {
         wait(
             deadline,
             cancellation,
+            job_cancellation,
             &operation_cancellation,
             state.join(),
         )
@@ -87,13 +108,36 @@ impl ResearchIoWorker {
             // durable and unreferenced for the existing startup quarantine pass.
             let _unclaimed_output = sender.send(output);
         }));
-        wait(
+        match wait(
             deadline,
             cancellation,
+            job_cancellation,
             &operation_cancellation,
             state.join(),
         )
-        .await??;
+        .await
+        {
+            Ok(joined) => joined?,
+            Err(interrupted) => {
+                operation_cancellation.cancel();
+                if job_cancellation.is_some() {
+                    // This drains already admitted work; it does not extend its operation
+                    // deadline or permit more publication. Native filesystem completion may
+                    // outlive that deadline. A dropped waiter still leaves this exact slot owned.
+                    state.join().await?;
+                }
+                return Err(interrupted);
+            }
+        }
+        if cancellation.is_cancelled()
+            || job_cancellation.is_some_and(CancellationToken::is_cancelled)
+            || operation_cancellation.is_cancelled()
+        {
+            return Err(IngestError::Cancelled.into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(IngestError::DeadlineExceeded.into());
+        }
         // Receiving a result alone cannot attest that the original thread joined. This read is
         // synchronous and occurs only after the actual JoinHandle returned successfully.
         result
@@ -146,12 +190,19 @@ impl State {
 async fn wait<T>(
     deadline: tokio::time::Instant,
     caller: &CancellationToken,
+    job: Option<&CancellationToken>,
     operation: &CancellationToken,
     future: impl Future<Output = T>,
 ) -> Result<T, ResearchServiceError> {
     tokio::select! {
         biased;
         () = caller.cancelled() => Err(IngestError::Cancelled.into()),
+        () = async {
+            match job {
+                Some(job) => job.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        } => Err(IngestError::Cancelled.into()),
         () = operation.cancelled() => Err(IngestError::Cancelled.into()),
         () = tokio::time::sleep_until(deadline) => Err(IngestError::DeadlineExceeded.into()),
         result = future => Ok(result),

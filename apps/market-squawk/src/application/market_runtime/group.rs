@@ -9,11 +9,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
+use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp, VenueId, VenueSymbol};
 use market_squawk_live::ShardKey;
 use market_squawk_platform::{AppConfig, CaptureProcessInfrastructure};
 use market_squawk_services::ServiceError;
-use market_squawk_sources::ProviderRateAuthority;
+use market_squawk_sources::{HttpRequestBounds, ProviderNativeIdentityRequest, ProviderRateAuthority};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -21,6 +21,7 @@ use crate::{
     ProviderActivationLease,
     live_source::{
         KrakenLevel3LiveRuntime,
+        ProductionCatalogSelection,
         display_market::{
             DisplayMarketActorLimits, DisplayMarketDirectory, DisplayMarketReadAdmission,
             runtime::ProductionDisplaySourceRuntime,
@@ -36,6 +37,7 @@ use crate::{
 };
 
 use super::{
+    alpaca_asset_reference::ensure_alpaca_iex_asset_reference,
     alpaca_historical::{
         AlpacaHistoricalCapabilityError, AlpacaHistoricalCapabilityOwner,
         AlpacaHistoricalRuntimeCapability,
@@ -48,7 +50,7 @@ use super::{
     generation::MarketRuntimeGroupGeneration,
     kraken::KrakenSourceDescriptor,
     schwab_current::{StartedSchwabCurrentRuntime, start_schwab_current_runtime},
-    schwab_sink::SchwabRestQuoteCurrentRuntime,
+    schwab_streamer::SchwabCurrentRuntime,
 };
 
 use crate::application::MarketEventDurableRead;
@@ -114,6 +116,34 @@ impl AccountMarketRuntimeLimits {
     }
 }
 
+/// Source-owned failure of one original constructor, distinct from the result of its cleanup.
+#[derive(Clone, Debug)]
+pub(super) struct AccountRuntimeStartFailure {
+    pub(super) cause: ServiceError,
+    pub(super) cleanup: Result<(), ServiceError>,
+}
+
+impl AccountRuntimeStartFailure {
+    /// Only for branches that have not constructed a child or registry owner.
+    pub(super) fn before_owner(cause: ServiceError) -> Self {
+        Self {
+            cause,
+            cleanup: Ok(()),
+        }
+    }
+
+    pub(super) fn after_cleanup(cause: ServiceError, cleanup: Result<(), ServiceError>) -> Self {
+        Self { cause, cleanup }
+    }
+
+    fn with_cleanup(mut self, cleanup: Result<(), ServiceError>) -> Self {
+        if self.cleanup.is_ok() {
+            self.cleanup = cleanup;
+        }
+        self
+    }
+}
+
 /// Fully started group; no child becomes registry-visible until this value is returned.
 pub(super) struct AccountMarketRuntimeGroup {
     evidence: MarketProviderGroupLifecycleEvidence,
@@ -125,6 +155,7 @@ pub(super) struct AccountMarketRuntimeGroup {
     currentness_mode: AccountCurrentnessMode,
     lifecycle: CancellationToken,
     currentness_monitor: tokio::task::JoinHandle<()>,
+    monitor_result: Option<Result<(), ServiceError>>,
     runtime: AccountMarketRuntime,
     metadata: Arc<[market_squawk_sources::SourceMetadata]>,
     routes: Arc<[ShardKey]>,
@@ -180,13 +211,15 @@ impl AccountMarketRuntimeGroup {
         lifecycle: CancellationToken,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Self, ServiceError> {
+    ) -> Result<Self, AccountRuntimeStartFailure> {
         match &prepared {
             PreparedAccountMarketRuntimeStart::Standard(prepared) => {
-                validate_resolved_configuration(request, prepared)?;
+                validate_resolved_configuration(request, prepared)
+                    .map_err(AccountRuntimeStartFailure::before_owner)?;
             }
             PreparedAccountMarketRuntimeStart::Schwab(prepared) => {
-                validate_resolved_schwab_configuration(request, prepared)?;
+                validate_resolved_schwab_configuration(request, prepared)
+                    .map_err(AccountRuntimeStartFailure::before_owner)?;
             }
         }
         let cleanup_budget = app_config.source_shutdown();
@@ -197,19 +230,22 @@ impl AccountMarketRuntimeGroup {
                     request,
                     prepared,
                     runtime_incarnation,
-                )?
+                )
+                .map_err(AccountRuntimeStartFailure::before_owner)?
             }
             PreparedAccountMarketRuntimeStart::Schwab(prepared) => {
                 MarketRuntimeGroupGeneration::try_from_schwab(
                     request,
                     prepared,
                     runtime_incarnation,
-                )?
+                )
+                .map_err(AccountRuntimeStartFailure::before_owner)?
             }
         };
         let evidence = MarketProviderGroupLifecycleEvidence {
             surface_id: SourceIdentifier::try_from(request.surface().surface_id())
-                .map_err(|_error| ServiceError::ResourceExhausted)?,
+                .map_err(|_error| ServiceError::ResourceExhausted)
+                .map_err(AccountRuntimeStartFailure::before_owner)?,
             onboarding_session_id: request.onboarding_session_id(),
             public_configuration_digest: request.expected_public_configuration_digest(),
             runtime_verification_receipt_digest: request
@@ -229,7 +265,8 @@ impl AccountMarketRuntimeGroup {
         .clone();
         let verification_expires_at = activation_lease
             .verification_expires_at()
-            .ok_or(ServiceError::Unauthorized)?;
+            .ok_or(ServiceError::Unauthorized)
+            .map_err(AccountRuntimeStartFailure::before_owner)?;
         let group_cancellation = lifecycle.child_token();
         let read_admission = DisplayMarketReadAdmission::closed();
         let context = AccountRuntimeStartContext {
@@ -241,12 +278,16 @@ impl AccountMarketRuntimeGroup {
             read_admission: read_admission.clone(),
         };
         let provider_start: Pin<
-            Box<dyn Future<Output = Result<StartedAccountMarketRuntime, ServiceError>> + Send + '_>,
+            Box<
+                dyn Future<Output = Result<StartedAccountMarketRuntime, AccountRuntimeStartFailure>>
+                    + Send
+                    + '_,
+            >,
         > = match prepared {
             PreparedAccountMarketRuntimeStart::Standard(
                 PreparedMarketProviderConfiguration::AlpacaBasic(prepared),
             ) => Box::pin(async move {
-                let (runtime, descriptors, currentness) = start_alpaca(
+                let (runtime, descriptors, currentness, metadata, routes, durable_reads) = start_alpaca(
                     prepared,
                     generation,
                     provider_activation,
@@ -266,15 +307,14 @@ impl AccountMarketRuntimeGroup {
                     kraken_descriptor: None,
                     currentness,
                     currentness_mode: AccountCurrentnessMode::PreparedOrActiveUntilAdmission,
-                    metadata: Arc::<[market_squawk_sources::SourceMetadata]>::from([]),
-                    routes: Arc::<[ShardKey]>::from([]),
-                    durable_reads: Vec::new(),
+                    metadata, routes, durable_reads,
                 })
             }),
             PreparedAccountMarketRuntimeStart::Standard(
                 PreparedMarketProviderConfiguration::KrakenLevel3(prepared),
             ) => {
-                let descriptor = KrakenSourceDescriptor::try_from_prepared(&prepared)?;
+                let descriptor = KrakenSourceDescriptor::try_from_prepared(&prepared)
+                    .map_err(AccountRuntimeStartFailure::before_owner)?;
                 Box::pin(async move {
                     let (runtime, currentness) = start_kraken(
                         prepared,
@@ -301,8 +341,10 @@ impl AccountMarketRuntimeGroup {
                 })
             }
             PreparedAccountMarketRuntimeStart::Schwab(prepared) => Box::pin(async move {
+                let account_owner = prepared.account_owner();
                 let started = start_schwab_current_runtime(
                     prepared,
+                    provider_activation.market_data_instruments(),
                     app_config,
                     provider_rate,
                     capture_process,
@@ -326,7 +368,9 @@ impl AccountMarketRuntimeGroup {
                 Ok(StartedAccountMarketRuntime {
                     runtime: AccountMarketRuntime::Schwab(SchwabRuntimeGroup {
                         current: runtime,
+                        _account_owner: account_owner,
                         display_monitor,
+                        monitor_result: None,
                     }),
                     descriptors: vec![descriptor].into_boxed_slice(),
                     kraken_descriptor: None,
@@ -339,8 +383,9 @@ impl AccountMarketRuntimeGroup {
             }),
         };
         let started = provider_start.await?;
-        let finalization: Pin<Box<dyn Future<Output = Result<Self, ServiceError>> + Send + '_>> =
-            Box::pin(Self::finish_start(context, started, deadline, cancellation));
+        let finalization: Pin<
+            Box<dyn Future<Output = Result<Self, AccountRuntimeStartFailure>> + Send + '_>,
+        > = Box::pin(Self::finish_start(context, started, deadline, cancellation));
         finalization.await
     }
 
@@ -349,7 +394,7 @@ impl AccountMarketRuntimeGroup {
         started: StartedAccountMarketRuntime,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Self, ServiceError> {
+    ) -> Result<Self, AccountRuntimeStartFailure> {
         let AccountRuntimeStartContext {
             evidence,
             activation_lease,
@@ -369,24 +414,27 @@ impl AccountMarketRuntimeGroup {
             durable_reads,
         } = started;
         if let Err(error) = ensure_before(deadline, cancellation) {
-            cleanup_account_runtime(
+            let cleanup = cleanup_account_runtime(
                 runtime,
                 &group_cancellation,
                 cleanup_budget,
                 "account-market post-start cleanup failed",
             )
             .await;
-            return Err(error);
+            return Err(AccountRuntimeStartFailure::after_cleanup(error, cleanup));
         }
         if group_cancellation.is_cancelled() || !runtime.is_healthy() {
-            cleanup_account_runtime(
+            let cleanup = cleanup_account_runtime(
                 runtime,
                 &group_cancellation,
                 cleanup_budget,
                 "unhealthy account-market startup cleanup failed",
             )
             .await;
-            return Err(ServiceError::Unavailable);
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
         }
         let current = match currentness_mode {
             AccountCurrentnessMode::PreparedOrActiveUntilAdmission => {
@@ -404,37 +452,40 @@ impl AccountMarketRuntimeGroup {
         match current {
             Ok(true) => {}
             Ok(false) => {
-                cleanup_account_runtime(
+                let cleanup = cleanup_account_runtime(
                     runtime,
                     &group_cancellation,
                     cleanup_budget,
                     "stale account-market startup cleanup failed",
                 )
                 .await;
-                return Err(ServiceError::Unauthorized);
+                return Err(AccountRuntimeStartFailure::after_cleanup(
+                    ServiceError::Unauthorized,
+                    cleanup,
+                ));
             }
             Err(error) => {
-                cleanup_account_runtime(
+                let cleanup = cleanup_account_runtime(
                     runtime,
                     &group_cancellation,
                     cleanup_budget,
                     "cancelled account-market startup cleanup failed",
                 )
                 .await;
-                return Err(error);
+                return Err(AccountRuntimeStartFailure::after_cleanup(error, cleanup));
             }
         }
         let expiry_delay = match duration_until(verification_expires_at) {
             Ok(delay) => delay,
             Err(error) => {
-                cleanup_account_runtime(
+                let cleanup = cleanup_account_runtime(
                     runtime,
                     &group_cancellation,
                     cleanup_budget,
                     "expired account-market startup cleanup failed",
                 )
                 .await;
-                return Err(error);
+                return Err(AccountRuntimeStartFailure::after_cleanup(error, cleanup));
             }
         };
         let currentness_monitor = spawn_account_currentness_monitor(
@@ -454,6 +505,7 @@ impl AccountMarketRuntimeGroup {
             currentness_mode,
             lifecycle: group_cancellation,
             currentness_monitor,
+            monitor_result: None,
             runtime,
             metadata,
             routes,
@@ -601,6 +653,43 @@ impl AccountMarketRuntimeGroup {
                 .is_some_and(|current| Arc::ptr_eq(current, descriptor))
     }
 
+    /// The retained account can issue demand only while this exact group admits healthy reads.
+    pub(super) fn schwab_account_owner(
+        &self,
+    ) -> Option<Arc<crate::provider_activation::SchwabMarketDataAccountActivation>> {
+        if !self.reads_are_admitted() {
+            return None;
+        }
+        match &self.runtime {
+            AccountMarketRuntime::Schwab(runtime) if runtime.is_healthy() => {
+                Some(Arc::clone(&runtime._account_owner))
+            }
+            _ => None,
+        }
+    }
+
+    /// Unhealthy Streamer ownership identifies the original lifecycle allocation only.
+    pub(super) fn schwab_recovery_owner(
+        &self,
+    ) -> Option<Arc<crate::provider_activation::SchwabMarketDataAccountActivation>> {
+        match &self.runtime {
+            AccountMarketRuntime::Schwab(runtime)
+                if matches!(&runtime.current, SchwabCurrentRuntime::Streamer(_)) => {
+                Some(Arc::clone(&runtime._account_owner))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn option_chain_demand_handle(&self) -> Option<super::alpaca_option_chain::OptionChainDemandHandle> {
+        if !self.is_published_healthy() { return None; }
+        match &self.runtime {
+            AccountMarketRuntime::Alpaca(runtime) => runtime.option_chain.as_ref()
+                .filter(|child| child.is_healthy()).map(|child| child.demand_handle()),
+            _ => None,
+        }
+    }
+
     pub(super) fn alpaca_historical_capability(
         &self,
     ) -> Result<Option<AlpacaHistoricalRuntimeCapability>, AlpacaHistoricalCapabilityError> {
@@ -632,37 +721,72 @@ impl AccountMarketRuntimeGroup {
         self.runtime.begin_shutdown();
     }
 
+    /// Published groups retain every child until the original history owner has drained.
+    pub(super) async fn finish_published_before(
+        &mut self,
+        source: &crate::application::AlpacaHistoricalSourceMutationAuthority,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        self.begin_shutdown();
+        if let AccountMarketRuntime::Alpaca(runtime) = &self.runtime {
+            let original = runtime.historical.retirement_capability();
+            let parent = source
+                .parent_for_runtime(&original)
+                .map_err(|_| ServiceError::InvalidResult)?;
+            let receipt = source
+                .drain_exact(parent, deadline, cancellation)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "retained account history drain failed");
+                    if cancellation.is_cancelled() {
+                        ServiceError::Cancelled
+                    } else if Instant::now() >= deadline {
+                        ServiceError::DeadlineExceeded
+                    } else {
+                        ServiceError::Unavailable
+                    }
+                })?;
+            receipt
+                .validate_retired_runtime(&original)
+                .map_err(|_| ServiceError::InvalidResult)?;
+        }
+        let mut failure = join_retained_monitor_before(
+            &mut self.currentness_monitor,
+            &mut self.monitor_result,
+            deadline,
+            cancellation,
+        )
+        .await
+        .err();
+        retain_shutdown_error(
+            &mut failure,
+            self.runtime
+                .finish_shutdown_before(deadline, cancellation)
+                .await,
+        );
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Unpublished cleanup is driven by the registry-retained startup task, never a request future.
     pub(super) async fn shutdown_before(
         self,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
-        let Self {
-            evidence: _,
-            activation_lease: _,
-            descriptors: _,
-            kraken_descriptor: _,
-            read_admission,
-            currentness: _,
-            currentness_mode: _,
-            lifecycle,
-            currentness_monitor,
-            runtime,
-            metadata: _,
-            routes: _,
-            durable_reads: _,
-        } = self;
-        read_admission.revoke();
-        lifecycle.cancel();
-        runtime.begin_shutdown();
+        let requested = ensure_before(deadline, cancellation).err();
+        self.finish_unpublished_shutdown().await?;
+        requested.map_or(Ok(()), Err)
+    }
+
+    /// Actual cleanup outcome only; request cancellation is retained separately by the caller.
+    pub(super) async fn finish_unpublished_shutdown(mut self) -> Result<(), ServiceError> {
+        self.begin_shutdown();
         let mut failure =
-            join_currentness_monitor_before(currentness_monitor, deadline, cancellation)
+            join_retained_monitor(&mut self.currentness_monitor, &mut self.monitor_result)
                 .await
                 .err();
-        retain_shutdown_error(
-            &mut failure,
-            runtime.shutdown_before(deadline, cancellation).await,
-        );
+        retain_shutdown_error(&mut failure, self.runtime.finish_retained_shutdown().await);
         failure.map_or(Ok(()), Err)
     }
 }
@@ -702,24 +826,35 @@ impl AccountMarketRuntime {
         }
     }
 
-    async fn shutdown_before(
-        self,
+    async fn finish_shutdown_before(
+        &mut self,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
         match self {
-            Self::Alpaca(runtime) => runtime.shutdown_before(deadline, cancellation).await,
+            Self::Alpaca(runtime) => runtime.finish_shutdown_before(deadline, cancellation).await,
             Self::KrakenLevel3(runtime) => {
-                await_before(deadline, cancellation, runtime.shutdown()).await
+                runtime.finish_shutdown_before(deadline, cancellation).await
             }
-            Self::Schwab(runtime) => runtime.shutdown_before(deadline, cancellation).await,
+            Self::Schwab(runtime) => runtime.finish_shutdown_before(deadline, cancellation).await,
+        }
+    }
+
+    async fn finish_retained_shutdown(&mut self) -> Result<(), ServiceError> {
+        self.begin_shutdown();
+        match self {
+            Self::Alpaca(runtime) => runtime.finish_retained_shutdown().await,
+            Self::KrakenLevel3(runtime) => runtime.finish_retained_shutdown().await,
+            Self::Schwab(runtime) => runtime.finish_retained_shutdown().await,
         }
     }
 }
 
 struct SchwabRuntimeGroup {
-    current: SchwabRestQuoteCurrentRuntime,
+    current: SchwabCurrentRuntime,
+    _account_owner: Arc<crate::provider_activation::SchwabMarketDataAccountActivation>,
     display_monitor: tokio::task::JoinHandle<()>,
+    monitor_result: Option<Result<(), ServiceError>>,
 }
 
 impl SchwabRuntimeGroup {
@@ -727,48 +862,41 @@ impl SchwabRuntimeGroup {
         self.current.is_healthy() && !self.display_monitor.is_finished()
     }
 
-    async fn shutdown_before(
-        self,
+    async fn finish_shutdown_before(
+        &mut self,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
-        let Self {
-            current,
-            mut display_monitor,
-        } = self;
-        let monitor = tokio::select! {
-            biased;
-            result = &mut display_monitor => result.map_err(|error| {
-                tracing::error!(%error, "Schwab display monitor join failed");
-                ServiceError::Unavailable
-            }),
-            () = cancellation.cancelled() => {
-                display_monitor.abort();
-                let _ = display_monitor.await;
-                Err(ServiceError::Cancelled)
-            },
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                display_monitor.abort();
-                let _ = display_monitor.await;
-                Err(ServiceError::DeadlineExceeded)
-            }
-        };
-        let current = current
-            .shutdown(cancellation, deadline)
+        let mut failure = self
+            .current
+            .finish_shutdown_before(deadline, cancellation)
             .await
-            .map_err(|error| {
-                tracing::error!(%error, "Schwab current runtime shutdown failed");
-                ServiceError::Unavailable
-            });
-        match (monitor, current) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(_), Err(_)) => Err(ServiceError::Unavailable),
-        }
+            .err();
+        retain_shutdown_error(
+            &mut failure,
+            join_retained_monitor_before(
+                &mut self.display_monitor,
+                &mut self.monitor_result,
+                deadline,
+                cancellation,
+            )
+            .await,
+        );
+        failure.map_or(Ok(()), Err)
+    }
+
+    async fn finish_retained_shutdown(&mut self) -> Result<(), ServiceError> {
+        let mut failure = self.current.finish_retained_shutdown().await.err();
+        retain_shutdown_error(
+            &mut failure,
+            join_retained_monitor(&mut self.display_monitor, &mut self.monitor_result).await,
+        );
+        failure.map_or(Ok(()), Err)
     }
 }
 
 struct AlpacaRuntimeGroup {
+    option_chain: Option<super::alpaca_option_chain::AlpacaOptionChainRuntime>,
     historical: AlpacaHistoricalCapabilityOwner,
     options: Option<ProductionDisplaySourceRuntime>,
     iex: ProductionDisplaySourceRuntime,
@@ -782,7 +910,7 @@ impl AlpacaRuntimeGroup {
             .options
             .as_ref()
             .is_none_or(ProductionDisplaySourceRuntime::is_healthy);
-        iex_healthy && options_healthy
+        iex_healthy && options_healthy && self.option_chain.as_ref().is_none_or(|runtime| runtime.is_healthy())
     }
 
     fn historical_capability(
@@ -796,36 +924,50 @@ impl AlpacaRuntimeGroup {
     }
 
     fn begin_shutdown(&self) {
+        if let Some(chain) = &self.option_chain { chain.begin_shutdown(); }
+        self.iex.begin_shutdown();
+        if let Some(options) = &self.options { options.begin_shutdown(); }
         self.historical.begin_shutdown();
     }
 
-    async fn shutdown_before(
-        self,
+    async fn finish_shutdown_before(
+        &mut self,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
-        let Self {
-            _activation,
-            historical,
-            iex,
-            options,
-        } = self;
-        let mut failure = None;
-        retain_shutdown_error(
-            &mut failure,
-            await_before(deadline, cancellation, historical.shutdown()).await,
-        );
-        if let Some(options) = options {
+        // The published caller already holds the exact coordinator drain receipt.
+        self.begin_shutdown();
+        let mut failure = await_before(deadline, cancellation, self.historical.finish_shutdown())
+            .await
+            .err();
+        if let Some(options) = self.options.as_mut() {
             retain_shutdown_error(
                 &mut failure,
-                await_before(deadline, cancellation, options.shutdown()).await,
+                options.finish_shutdown_before(deadline, cancellation).await,
             );
         }
         retain_shutdown_error(
             &mut failure,
-            await_before(deadline, cancellation, iex.shutdown()).await,
+            self.iex
+                .finish_shutdown_before(deadline, cancellation)
+                .await,
         );
-        drop(_activation);
+        if let Some(chain) = &mut self.option_chain {
+            retain_shutdown_error(&mut failure, chain.finish_shutdown_before(deadline).await);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    async fn finish_retained_shutdown(&mut self) -> Result<(), ServiceError> {
+        self.begin_shutdown();
+        let mut failure = self.historical.finish_shutdown().await.err();
+        if let Some(options) = self.options.as_mut() {
+            retain_shutdown_error(&mut failure, options.finish_retained_shutdown().await);
+        }
+        retain_shutdown_error(&mut failure, self.iex.finish_retained_shutdown().await);
+        if let Some(chain) = &mut self.option_chain {
+            retain_shutdown_error(&mut failure, chain.finish_retained_shutdown().await);
+        }
         failure.map_or(Ok(()), Err)
     }
 }
@@ -851,9 +993,13 @@ async fn start_alpaca(
         AlpacaRuntimeGroup,
         Box<[Arc<DisplaySourceDescriptor>]>,
         ProviderAccountRuntimeCurrentness,
+        Arc<[market_squawk_sources::SourceMetadata]>,
+        Arc<[ShardKey]>,
+        Vec<MarketEventDurableRead>,
     ),
-    ServiceError,
+    AccountRuntimeStartFailure,
 > {
+    let option_chain_config = prepared.option_chain_config().cloned();
     let (
         lease,
         iex_config,
@@ -861,35 +1007,29 @@ async fn start_alpaca(
         historical_metadata,
         historical_request_bounds,
         historical_rights,
+        calendar_metadata,
+        calendar_rights,
         optional,
     ) = prepared.into_parts();
-    let iex_descriptor = DisplaySourceDescriptor::try_new(
-        AccountMarketSurface::AlpacaBasic.surface_id(),
-        iex_config.metadata().clone(),
-        iex_bindings,
-    )?;
-    let (options_config, options_descriptor) = match optional {
-        Some((config, bindings)) => {
-            let descriptor = DisplaySourceDescriptor::try_new(
-                AccountMarketSurface::AlpacaBasic.surface_id(),
-                config.metadata().clone(),
-                bindings,
-            )?;
-            (Some(config), Some(descriptor))
+    let iex_config_for_mappings = iex_config.clone();
+    let options_config_for_mappings = optional.as_ref().map(|(config, _)| config.clone());
+    let mut metadata = vec![iex_config.metadata().clone()];
+    let mut routes = Vec::new();
+    for (source, bindings) in std::iter::once((iex_config.metadata(), iex_bindings.as_ref()))
+        .chain(optional.as_ref().map(|(config, bindings)| (config.metadata(), bindings.as_ref())))
+    {
+        let [venue] = source.coverage().topology().venues() else {
+            return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+        };
+        for binding in bindings {
+            routes.push(ShardKey::new(venue.clone(), binding.instrument_id()));
         }
-        None => (None, None),
-    };
-    let descriptor_count = 1_usize + usize::from(options_descriptor.is_some());
-    let mut descriptors = Vec::new();
-    descriptors
-        .try_reserve_exact(descriptor_count)
-        .map_err(|_error| ServiceError::ResourceExhausted)?;
-    descriptors.push(iex_descriptor);
-    if let Some(descriptor) = options_descriptor {
-        descriptors.push(descriptor);
     }
-    let descriptors = descriptors.into_boxed_slice();
-    let options_expected = descriptor_count == 2;
+    if let Some((config, _)) = &optional {
+        metadata.push(config.metadata().clone());
+    }
+    let options_expected = optional.is_some();
+    let options_config = options_config_for_mappings.clone();
     let mut activation_guard = StartupCancellation::new(group_cancellation.child_token());
     let mut activation = await_before(
         deadline,
@@ -901,53 +1041,272 @@ async fn start_alpaca(
             activation_guard.token(),
         ),
     )
-    .await?;
+    .await
+    .map_err(AccountRuntimeStartFailure::before_owner)?;
     activation_guard.disarm();
     let credentials = activation.credentials();
-    let historical = AlpacaHistoricalCapabilityOwner::try_new(
+    let iex_generation = provider_activation
+        .register_alpaca_publication_generation(&activation, &metadata[0])
+        .map_err(|error| {
+            tracing::error!(%error, "Alpaca IEX publication generation failed");
+            AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable)
+        })?;
+    let iex_operation = await_before(
+        deadline,
+        cancellation,
+        provider_activation.acquire_alpaca_reference_operation(
+            &iex_generation, group_cancellation.child_token(), deadline,
+        ),
+    ).await.map_err(AccountRuntimeStartFailure::before_owner)?;
+    let asset_budget = activation.asset_reference_budget()
+        .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+    let catalog_reader = provider_activation.market_data_instruments();
+    let research = provider_activation.research_service();
+    if iex_bindings.len() != iex_config_for_mappings.mappings().len() {
+        return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+    }
+    let mut iex_rebound = Vec::new();
+    let mut iex_native_mappings = Vec::new();
+    let mut iex_native_requests = Vec::new();
+    for (binding, mapping) in iex_bindings.iter().zip(iex_config_for_mappings.mappings()) {
+        if binding.instrument_id() != mapping.instrument() {
+            return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+        }
+        let before = catalog_reader.latest(binding.instrument_id(), deadline, cancellation)
+            .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?
+            .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+        let route = await_before(
+            deadline,
+            cancellation,
+            ensure_alpaca_iex_asset_reference(
+                &activation, &research, &iex_operation, &asset_budget,
+                HttpRequestBounds::default(), before, mapping.symbol(), deadline, cancellation,
+            ),
+        ).await.map_err(AccountRuntimeStartFailure::before_owner)?;
+        let rebound = binding.try_rebind_after_alpaca_reference(
+            &route.before, &route.after, &route.native, &catalog_reader,
+            deadline, cancellation,
+        ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+        iex_native_mappings.push(mapping.clone().try_with_native_identity(route.native.clone())
+            .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
+        iex_native_requests.push(route.native);
+        iex_rebound.push(rebound);
+    }
+    drop(iex_operation);
+    let iex_publication_bindings = iex_rebound.into_boxed_slice();
+    let iex_catalog = ProductionCatalogSelection::try_new(
+        catalog_reader.clone(), iex_native_requests,
+    ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+    let mut options_native_mappings = Vec::new();
+    let mut options_publication_bindings = None;
+    let mut options_catalog = None;
+    if let Some((option_config, original_bindings)) = optional.as_ref() {
+        if original_bindings.len() != option_config.mappings().len() {
+            return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+        }
+        let chain = option_chain_config.as_ref()
+            .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+        let namespace = chain.metadata().source_id();
+        let selected_at = wall_timestamp()
+            .map_err(AccountRuntimeStartFailure::before_owner)?;
+        let mut rebound = Vec::new();
+        let mut requests = Vec::new();
+        for (binding, mapping) in original_bindings.iter().zip(option_config.mappings()) {
+            if binding.instrument_id() != mapping.instrument() {
+                return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+            }
+            let record = catalog_reader.latest(binding.instrument_id(), deadline, cancellation)
+                .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?
+                .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+            let mut accepted = record.definition().provider_identities().iter()
+                .filter(|identity| identity.source_id() == namespace
+                    && record.definition().provider_identity_at(
+                        identity.source_id(), identity.provider_instrument_id(), selected_at,
+                    ) == Some(*identity));
+            let identity = accepted.next()
+                .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+            if accepted.next().is_some() {
+                return Err(AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable));
+            }
+            let native = ProviderNativeIdentityRequest {
+                namespace: identity.source_id().clone(),
+                provider_instrument_id: identity.provider_instrument_id().clone(),
+                instrument: binding.instrument_id(),
+                venue: VenueId::try_from("alpaca-indicative-options")
+                    .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult))?,
+                venue_symbol: VenueSymbol::try_from(mapping.symbol())
+                    .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult))?,
+                knowledge_at: selected_at,
+                effective_at: selected_at,
+            };
+            rebound.push(binding.try_rebind_after_alpaca_reference(
+                &record, &record, &native, &catalog_reader, deadline, cancellation,
+            ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
+            options_native_mappings.push(mapping.clone().try_with_native_identity(native.clone())
+                .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
+            requests.push(native);
+        }
+        options_catalog = Some(ProductionCatalogSelection::try_new(catalog_reader.clone(), requests)
+            .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
+        options_publication_bindings = Some(rebound.into_boxed_slice());
+    }
+    // No further catalog writes may occur between this point and source registration.
+    let iex_publication = provider_activation.bind_alpaca_publication_runtime_after_reference(
+        &activation, iex_generation, &iex_publication_bindings,
+        group_cancellation.child_token(), deadline,
+    ).map_err(|error| { tracing::error!(%error, "Alpaca IEX publication binding failed");
+        AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable) })?;
+    let mut durable_reads = vec![iex_publication.durable_read()];
+    let mut options_publication = match options_publication_bindings.as_ref() {
+        Some(bindings) => {
+            let generation = provider_activation.register_alpaca_publication_generation(
+                &activation, &metadata[1],
+            ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+            let publication = provider_activation.bind_alpaca_publication_runtime_after_reference(
+                &activation, generation, bindings, group_cancellation.child_token(), deadline,
+            ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+            durable_reads.push(publication.durable_read());
+            Some(publication)
+        }
+        None => None,
+    };
+    let iex_descriptor = DisplaySourceDescriptor::try_new(
+        AccountMarketSurface::AlpacaBasic.surface_id(), metadata[0].clone(),
+        iex_publication_bindings.clone(),
+    ).map_err(AccountRuntimeStartFailure::before_owner)?;
+    let mut descriptors = vec![iex_descriptor];
+    if let Some(bindings) = options_publication_bindings {
+        descriptors.push(DisplaySourceDescriptor::try_new(
+            AccountMarketSurface::AlpacaBasic.surface_id(), metadata[1].clone(), bindings,
+        ).map_err(AccountRuntimeStartFailure::before_owner)?);
+    }
+    let descriptors = descriptors.into_boxed_slice();
+    let mut historical = AlpacaHistoricalCapabilityOwner::try_new(
         &activation,
         group_generation,
         historical_metadata,
         historical_request_bounds,
         historical_rights,
+        calendar_metadata,
+        calendar_rights,
         group_cancellation.child_token(),
-    )?;
-    let iex_config = activation
-        .take_iex_config()
-        .ok_or(ServiceError::Unavailable)?;
+    )
+    .map_err(AccountRuntimeStartFailure::before_owner)?;
+    let iex_config = match activation.take_iex_config() {
+        Some(config) => match config.try_with_native_mappings(iex_native_mappings) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(%error, "Alpaca selected IEX mappings were rejected");
+                historical.begin_shutdown();
+                group_cancellation.cancel();
+                let cleanup = historical.finish_shutdown().await;
+                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, cleanup));
+            }
+        },
+        None => {
+            historical.begin_shutdown();
+            group_cancellation.cancel();
+            let cleanup = historical.finish_shutdown().await;
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
+        }
+    };
     let mut iex_guard = StartupCancellation::new(group_cancellation.child_token());
-    let iex = await_before(
+    let iex = match await_owned_start(
         deadline,
         cancellation,
+        iex_guard.token(),
         ProductionDisplaySourceRuntime::start_alpaca_iex_with_rate_authority(
             app_config.clone(),
             directory.clone(),
             iex_config,
             Arc::clone(&credentials),
+            iex_publication,
             actor_limits,
             read_admission.clone(),
             provider_rate.clone(),
+            iex_catalog,
+            deadline,
+            cancellation,
             iex_guard.token(),
         ),
+        |failure| {
+            tracing::error!(error = %failure.cause, "account child startup failed");
+            AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                failure.cleanup.map_err(|error| {
+                    tracing::error!(%error, "account child startup cleanup failed");
+                    ServiceError::Unavailable
+                }),
+            )
+        },
     )
-    .await?;
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(failure) => {
+            group_cancellation.cancel();
+            historical.begin_shutdown();
+            let cleanup = historical.finish_shutdown().await;
+            return Err(failure.with_cleanup(cleanup));
+        }
+    };
     iex_guard.disarm();
     let options = match activation.take_options_config() {
         Some(config) if options_expected => {
+            let config = match config.try_with_native_mappings(options_native_mappings) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::error!(%error, "Alpaca selected options mappings were rejected");
+                    historical.begin_shutdown(); group_cancellation.cancel();
+                    let history_cleanup = historical.finish_shutdown().await;
+                    let display_cleanup = cleanup_display_runtime(iex, "Alpaca options mapping cleanup").await;
+                    return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, history_cleanup.and(display_cleanup)));
+                }
+            };
+            let Some(catalog) = options_catalog.take() else {
+                historical.begin_shutdown(); group_cancellation.cancel();
+                let history_cleanup = historical.finish_shutdown().await;
+                let display_cleanup = cleanup_display_runtime(iex, "Alpaca options catalog cleanup").await;
+                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, history_cleanup.and(display_cleanup)));
+            };
+            let Some(publication) = options_publication.take() else {
+                historical.begin_shutdown(); group_cancellation.cancel();
+                let history_cleanup = historical.finish_shutdown().await;
+                let display_cleanup = cleanup_display_runtime(iex, "Alpaca missing publication cleanup").await;
+                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, history_cleanup.and(display_cleanup)));
+            };
             let mut options_guard = StartupCancellation::new(group_cancellation.child_token());
-            match await_before(
+            match await_owned_start(
                 deadline,
                 cancellation,
+                options_guard.token(),
                 ProductionDisplaySourceRuntime::start_alpaca_options_with_rate_authority(
                     app_config,
                     directory,
                     config,
                     credentials,
+                    publication,
                     actor_limits,
                     read_admission.clone(),
                     provider_rate,
+                    catalog,
+                    deadline,
+                    cancellation,
                     options_guard.token(),
                 ),
+                |failure| {
+                    tracing::error!(error = %failure.cause, "account child startup failed");
+                    AccountRuntimeStartFailure::after_cleanup(
+                        ServiceError::Unavailable,
+                        failure.cleanup.map_err(|error| {
+                            tracing::error!(%error, "account child startup cleanup failed");
+                            ServiceError::Unavailable
+                        }),
+                    )
+                },
             )
             .await
             {
@@ -958,28 +1317,59 @@ async fn start_alpaca(
                 Err(error) => {
                     historical.begin_shutdown();
                     group_cancellation.cancel();
-                    cleanup_display_runtime(iex, "Alpaca IEX partial-start cleanup").await;
-                    return Err(error);
+                    let history_cleanup = historical.finish_shutdown().await;
+                    let display_cleanup =
+                        cleanup_display_runtime(iex, "Alpaca IEX partial-start cleanup").await;
+                    return Err(error.with_cleanup(history_cleanup.and(display_cleanup)));
                 }
             }
         }
         Some(_unexpected) => {
             historical.begin_shutdown();
             group_cancellation.cancel();
-            cleanup_display_runtime(iex, "Alpaca IEX invalid-topology cleanup").await;
-            return Err(ServiceError::Unavailable);
+            let history_cleanup = historical.finish_shutdown().await;
+            let display_cleanup =
+                cleanup_display_runtime(iex, "Alpaca IEX invalid-topology cleanup").await;
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                history_cleanup.and(display_cleanup),
+            ));
         }
         None if !options_expected => None,
         None => {
             historical.begin_shutdown();
             group_cancellation.cancel();
-            cleanup_display_runtime(iex, "Alpaca IEX invalid-topology cleanup").await;
-            return Err(ServiceError::Unavailable);
+            let history_cleanup = historical.finish_shutdown().await;
+            let display_cleanup =
+                cleanup_display_runtime(iex, "Alpaca IEX invalid-topology cleanup").await;
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                history_cleanup.and(display_cleanup),
+            ));
         }
+    };
+    let option_chain = match option_chain_config {
+        Some(config) => match provider_activation.prepare_alpaca_option_chain_child(
+            &activation, config, iex_publication_bindings.into_vec(), group_cancellation.child_token(),
+        ) {
+            Ok(child) => Some(child),
+            Err(error) => {
+                tracing::error!(%error, "Alpaca option-chain child startup failed");
+                historical.begin_shutdown(); group_cancellation.cancel();
+                let mut cleanup = historical.finish_shutdown().await.err();
+                if let Some(options) = options {
+                    retain_shutdown_error(&mut cleanup, cleanup_display_runtime(options, "Alpaca chain partial-start options cleanup").await);
+                }
+                retain_shutdown_error(&mut cleanup, cleanup_display_runtime(iex, "Alpaca chain partial-start IEX cleanup").await);
+                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, cleanup.map_or(Ok(()),Err)));
+            }
+        },
+        None => None,
     };
     let currentness = activation.currentness();
     Ok((
         AlpacaRuntimeGroup {
+            option_chain,
             _activation: activation,
             historical,
             iex,
@@ -987,6 +1377,9 @@ async fn start_alpaca(
         },
         descriptors,
         currentness,
+        metadata.into(),
+        routes.into(),
+        durable_reads,
     ))
 }
 
@@ -1067,6 +1460,39 @@ where
     })
 }
 
+/// A timeout drops only this borrow. The group still owns the same unjoined monitor.
+async fn join_retained_monitor_before(
+    monitor: &mut tokio::task::JoinHandle<()>,
+    retained: &mut Option<Result<(), ServiceError>>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), ServiceError> {
+    if let Some(result) = *retained {
+        return result;
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(ServiceError::Cancelled),
+        () = tokio::time::sleep_until(deadline.into()) => Err(ServiceError::DeadlineExceeded),
+        result = join_retained_monitor(monitor, retained) => result,
+    }
+}
+
+async fn join_retained_monitor(
+    monitor: &mut tokio::task::JoinHandle<()>,
+    retained: &mut Option<Result<(), ServiceError>>,
+) -> Result<(), ServiceError> {
+    if let Some(result) = *retained {
+        return result;
+    }
+    let result = monitor.await.map_err(|error| {
+        tracing::error!(%error, "retained account monitor join failed");
+        ServiceError::Unavailable
+    });
+    *retained = Some(result);
+    result
+}
+
 async fn join_currentness_monitor_before(
     mut monitor: tokio::task::JoinHandle<()>,
     deadline: Instant,
@@ -1119,7 +1545,8 @@ async fn start_kraken(
     group_cancellation: CancellationToken,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<(KrakenLevel3LiveRuntime, ProviderAccountRuntimeCurrentness), ServiceError> {
+) -> Result<(KrakenLevel3LiveRuntime, ProviderAccountRuntimeCurrentness), AccountRuntimeStartFailure>
+{
     let (lease, credential_authority, config, instruments) = prepared.into_parts();
     let mut activation_guard = StartupCancellation::new(group_cancellation.child_token());
     let activation = await_before(
@@ -1132,13 +1559,15 @@ async fn start_kraken(
             activation_guard.token(),
         ),
     )
-    .await?;
+    .await
+    .map_err(AccountRuntimeStartFailure::before_owner)?;
     activation_guard.disarm();
     let currentness = activation.currentness();
     let mut runtime_guard = StartupCancellation::new(group_cancellation.child_token());
-    let runtime = await_before(
+    let runtime = await_owned_start(
         deadline,
         cancellation,
+        runtime_guard.token(),
         activation.start_order_level_runtime(
             app_config,
             provider_rate,
@@ -1147,34 +1576,74 @@ async fn start_kraken(
             directory,
             runtime_guard.token(),
         ),
+        |failure| {
+            tracing::error!(error = %failure.cause, "account child startup failed");
+            AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                failure.cleanup.map_err(|error| {
+                    tracing::error!(%error, "account child startup cleanup failed");
+                    ServiceError::Unavailable
+                }),
+            )
+        },
     )
     .await?;
     runtime_guard.disarm();
     Ok((runtime, currentness))
 }
 
-async fn cleanup_display_runtime(runtime: ProductionDisplaySourceRuntime, context: &'static str) {
-    if let Err(error) = runtime.shutdown().await {
+async fn cleanup_display_runtime(
+    mut runtime: ProductionDisplaySourceRuntime,
+    context: &'static str,
+) -> Result<(), ServiceError> {
+    let result = runtime.finish_retained_shutdown().await;
+    if let Err(error) = &result {
         tracing::error!(%error, context, "display child partial-start cleanup failed");
     }
+    result
 }
 
 async fn cleanup_account_runtime(
-    runtime: AccountMarketRuntime,
+    mut runtime: AccountMarketRuntime,
     lifecycle: &CancellationToken,
-    cleanup_budget: Duration,
+    _cleanup_budget: Duration,
     context: &'static str,
-) {
+) -> Result<(), ServiceError> {
     runtime.begin_shutdown();
     lifecycle.cancel();
-    let Some(deadline) = Instant::now().checked_add(cleanup_budget) else {
-        tracing::error!(context, "account-market cleanup deadline overflowed");
-        return;
-    };
-    let cleanup = CancellationToken::new();
-    if let Err(error) = runtime.shutdown_before(deadline, &cleanup).await {
+    let result = runtime.finish_retained_shutdown().await;
+    if let Err(error) = &result {
         tracing::error!(%error, context, "account-market startup cleanup failed");
     }
+    result
+}
+
+/// Only the retained startup task drives this continuation after an ordinary waiter has left.
+async fn await_owned_start<T, E, F, Map>(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    child_cancellation: CancellationToken,
+    future: F,
+    map_failure: Map,
+) -> Result<T, AccountRuntimeStartFailure>
+where
+    F: Future<Output = Result<T, E>>,
+    Map: FnOnce(E) -> AccountRuntimeStartFailure,
+{
+    tokio::pin!(future);
+    let outcome = tokio::select! {
+        biased;
+        outcome = &mut future => return outcome.map_err(map_failure),
+        () = cancellation.cancelled() => ServiceError::Cancelled,
+        () = tokio::time::sleep_until(deadline.into()) => ServiceError::DeadlineExceeded,
+    };
+    child_cancellation.cancel();
+    // Keep the original future and cleanup result; only the original request cause changes.
+    future.await.map_err(|error| {
+        let mut failure = map_failure(error);
+        failure.cause = outcome;
+        failure
+    })
 }
 
 fn retain_shutdown_error(failure: &mut Option<ServiceError>, result: Result<(), ServiceError>) {
@@ -1233,6 +1702,15 @@ fn ensure_before(deadline: Instant, cancellation: &CancellationToken) -> Result<
     } else {
         Ok(())
     }
+}
+
+fn wall_timestamp() -> Result<Timestamp, ServiceError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ServiceError::Unavailable)?
+        .as_nanos();
+    let nanos = i64::try_from(nanos).map_err(|_| ServiceError::Unavailable)?;
+    Ok(Timestamp::from_unix_nanos(nanos))
 }
 
 #[cfg(test)]

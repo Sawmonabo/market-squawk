@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use market_squawk_adapter_portfolio::{
-    BasisResolution, ReconciliationField, ReconciliationTolerance, TransactionKind,
+    ReconciliationField, ReconciliationTolerance, TransactionKind,
 };
 use market_squawk_analytics::{
     ExactDecimalScale, ExactRate, MonetaryBasis, MonetaryValue, PortfolioAllocation, Quantile,
@@ -24,7 +24,7 @@ use serde_json::{Map, Number, Value, json};
 
 use super::PortfolioApplicationServiceError;
 use super::import::hex;
-use super::model::{PortfolioReadImage, PublishedRevision};
+use super::model::{BasisResolution, PortfolioReadImage, PublishedRevision};
 use super::read::{ReadScope, product_report_result, report_result};
 
 /// Three 5% tail observations are the minimum retained evidence for the historical tail measures.
@@ -385,11 +385,18 @@ fn total_value(
         .holdings
         .iter()
         .filter(|holding| scope.admits_instrument(holding.instrument_id()))
-        .try_fold(revision.account.cash_balance(), |total, holding| {
-            total
-                .checked_add(holding.market_value())
-                .map_err(|_| PortfolioApplicationServiceError::Analytics)
-        })
+        .try_fold(
+            revision
+                .account
+                .cash_balance()
+                .checked_add(scoped_receivables(revision, scope)?)
+                .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
+            |total, holding| {
+                total
+                    .checked_add(holding.market_value())
+                    .map_err(|_| PortfolioApplicationServiceError::Analytics)
+            },
+        )
 }
 
 fn allocations(
@@ -418,7 +425,11 @@ fn currency_exposure(
 ) -> Result<Vec<Value>, PortfolioApplicationServiceError> {
     let mut totals = BTreeMap::<Currency, Money>::new();
     let cash = revision.account.cash_balance();
-    totals.insert(cash.currency(), cash);
+    totals.insert(
+        cash.currency(),
+        cash.checked_add(scoped_receivables(revision, scope)?)
+            .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
+    );
     for holding in revision
         .holdings
         .iter()
@@ -660,4 +671,23 @@ fn number(value: f64) -> Result<Value, PortfolioApplicationServiceError> {
     Number::from_f64(value)
         .map(Value::Number)
         .ok_or(PortfolioApplicationServiceError::Analytics)
+}
+
+fn scoped_receivables(
+    revision: &PublishedRevision,
+    scope: &ReadScope,
+) -> Result<Money, PortfolioApplicationServiceError> {
+    revision
+        .core
+        .cash_entitlements()
+        .iter()
+        .filter(|claim| !claim.settled() && scope.admits_instrument(claim.instrument()))
+        .try_fold(
+            Money::new(Decimal::ZERO, revision.core.base_currency()),
+            |total, claim| {
+                total
+                    .checked_add(claim.amount())
+                    .map_err(|_| PortfolioApplicationServiceError::Analytics)
+            },
+        )
 }

@@ -281,7 +281,24 @@ impl PreparedRuntime {
             NamedClient::Codex,
         ]
         .map(|client| {
-            ClientId::try_from_uuid(Uuid::new_v4())
+            // Durable work belongs to this authenticated installation/workspace actor across
+            // restarts. Authentication still provisions fresh secret bytes and admits only the
+            // current service generation; the stable non-secret ID grants no access by itself.
+            let actor = match client {
+                NamedClient::Desktop => b"desktop".as_slice(),
+                NamedClient::Cli => b"cli".as_slice(),
+                NamedClient::ClaudeCode => b"claude_code".as_slice(),
+                NamedClient::Codex => b"codex".as_slice(),
+            };
+            let client_id = crate::application::opaque_product_token(
+                b"market-squawk/installed-client-identity/v1\0",
+                &[
+                    runtime.installation_id().as_uuid().as_bytes(),
+                    runtime.workspace_id().as_uuid().as_bytes(),
+                    actor,
+                ],
+            );
+            ClientId::try_from_uuid(client_id)
                 .map(|client_id| (client_id, client))
                 .map_err(InstalledServiceError::from)
         })

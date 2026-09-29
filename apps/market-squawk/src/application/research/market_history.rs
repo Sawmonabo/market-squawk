@@ -4,6 +4,12 @@
 //! canonical instrument and financial-series policy; provider, native symbol, feed, manifest, and
 //! capture coordinates remain sealed inside [`MarketHistoryEvidenceReceipt`].
 
+mod harmonic;
+mod native_sessions;
+pub(crate) use harmonic::HarmonicHistoryEvaluation;
+
+pub(crate) mod benchmark;
+
 use std::{fmt, num::NonZeroU32, time::Instant};
 
 use market_squawk_data::{
@@ -13,8 +19,9 @@ use market_squawk_data::{
     MarketHistorySelectionPolicy, ParquetStoreError, QueryError, Sha256Digest,
 };
 use market_squawk_domain::{
-    Currency, DataQuality, InstrumentId, MarketBarAdjustment, Money, ProviderInstrumentId,
-    SourceId, SourceIdentifier, Timestamp, VenueId,
+    BarTimeSemantics, CalendarDate, Currency, DataQuality, InstrumentId, MarketBarAdjustment,
+    MarketBarObservation, Money, ProviderInstrumentId, SourceId, SourceIdentifier, Timestamp,
+    VenueId,
 };
 use market_squawk_sources::MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS;
 use rust_decimal::Decimal;
@@ -23,11 +30,17 @@ use tokio_util::sync::CancellationToken;
 /// Hard output ceiling inherited from complete-history publication.
 pub(crate) const MAX_MARKET_HISTORY_BARS: u32 = MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS as u32;
 
-/// Exact half-open financial interval requested by a product consumer.
+/// Financial range at its authentic source precision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MarketHistoryInterval {
-    start: Timestamp,
-    end_exclusive: Timestamp,
+pub(crate) enum MarketHistoryInterval {
+    Timestamped {
+        start: Timestamp,
+        end_exclusive: Timestamp,
+    },
+    NominalDates {
+        start: CalendarDate,
+        end_inclusive: CalendarDate,
+    },
 }
 
 impl MarketHistoryInterval {
@@ -38,18 +51,103 @@ impl MarketHistoryInterval {
         if start >= end_exclusive {
             return Err(MarketHistoryRequestError::InvalidInterval);
         }
-        Ok(Self {
+        Ok(Self::Timestamped {
             start,
             end_exclusive,
         })
     }
 
-    pub(crate) const fn start(self) -> Timestamp {
-        self.start
+    pub(crate) fn try_nominal_dates(
+        start: CalendarDate,
+        end_inclusive: CalendarDate,
+    ) -> Result<Self, MarketHistoryRequestError> {
+        if start > end_inclusive {
+            return Err(MarketHistoryRequestError::InvalidInterval);
+        }
+        Ok(Self::NominalDates {
+            start,
+            end_inclusive,
+        })
     }
 
-    pub(crate) const fn end_exclusive(self) -> Timestamp {
-        self.end_exclusive
+    pub(crate) const fn start(self) -> Option<Timestamp> {
+        match self {
+            Self::Timestamped { start, .. } => Some(start),
+            Self::NominalDates { .. } => None,
+        }
+    }
+
+    pub(crate) const fn end_exclusive(self) -> Option<Timestamp> {
+        match self {
+            Self::Timestamped { end_exclusive, .. } => Some(end_exclusive),
+            Self::NominalDates { .. } => None,
+        }
+    }
+
+    pub(crate) const fn nominal_dates(self) -> Option<(CalendarDate, CalendarDate)> {
+        match self {
+            Self::NominalDates {
+                start,
+                end_inclusive,
+            } => Some((start, end_inclusive)),
+            Self::Timestamped { .. } => None,
+        }
+    }
+
+    /// Timestamped provider bounds are inclusive; a nominal source retains its own date bounds.
+    fn provider_range(self) -> Option<(Timestamp, Timestamp)> {
+        match self {
+            Self::Timestamped {
+                start,
+                end_exclusive,
+            } => Some((
+                start,
+                Timestamp::from_unix_nanos(end_exclusive.unix_nanos() - 1),
+            )),
+            Self::NominalDates { .. } => None,
+        }
+    }
+
+    fn ended_by(self, cutoff: Timestamp) -> bool {
+        match self {
+            Self::Timestamped { end_exclusive, .. } => end_exclusive <= cutoff,
+            Self::NominalDates { end_inclusive, .. } => {
+                // This only bounds a date query; it does not assign an instant to a source day.
+                cutoff.utc_calendar_date()
+                    .is_ok_and(|date| end_inclusive <= date)
+            }
+        }
+    }
+
+    fn contains(self, time: &BarTimeSemantics) -> bool {
+        match self {
+            Self::Timestamped {
+                start,
+                end_exclusive,
+            } => time.timestamped_period().is_some_and(|period| {
+                period.period_start() >= start && period.period_end_exclusive() <= end_exclusive
+            }),
+            Self::NominalDates {
+                start,
+                end_inclusive,
+            } => time
+                .nominal_daily_date()
+                .is_some_and(|date| date.date() >= start && date.date() <= end_inclusive),
+        }
+    }
+
+    fn from_bars(first: &MarketBarObservation, last: &MarketBarObservation) -> Option<Self> {
+        match (first.time_semantics(), last.time_semantics()) {
+            (
+                BarTimeSemantics::TimestampedPeriod(first),
+                BarTimeSemantics::TimestampedPeriod(last),
+            ) => Self::try_new(first.period_start(), last.period_end_exclusive()).ok(),
+            (
+                BarTimeSemantics::NominalDailyDate(first),
+                BarTimeSemantics::NominalDailyDate(last),
+            ) => Self::try_nominal_dates(first.date(), last.date()).ok(),
+            _ => None,
+        }
     }
 }
 
@@ -77,6 +175,17 @@ pub(crate) enum MarketHistoryAdjustmentPolicy {
 }
 
 impl MarketHistoryAdjustmentPolicy {
+    fn selection_policy(self) -> Option<MarketHistorySelectionPolicy> {
+        match self {
+            Self::Unadjusted => Some(MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1),
+            Self::SplitAdjusted => {
+                Some(MarketHistorySelectionPolicy::COMPLETE_DAILY_SPLIT_ADJUSTED_V1)
+            }
+            Self::FullyAdjusted => Some(MarketHistorySelectionPolicy::COMPLETE_DAILY_ADJUSTED_V1),
+            _ => None,
+        }
+    }
+
     const fn canonical(self) -> MarketBarAdjustment {
         match self {
             Self::Unadjusted => MarketBarAdjustment::Raw,
@@ -150,7 +259,7 @@ impl LatestMarketHistoryReadRequest {
     fn supported_by_current_catalog_policy(&self) -> bool {
         self.timeframe == MarketHistoryTimeframe::Daily
             && self.session == MarketHistorySessionPolicy::CompletedTradingSessions
-            && self.adjustment == MarketHistoryAdjustmentPolicy::FullyAdjusted
+            && self.adjustment.selection_policy().is_some()
     }
 }
 
@@ -168,7 +277,7 @@ impl MarketHistoryReadRequest {
         knowledge_cutoff: Timestamp,
         limit: MarketHistoryReadLimit,
     ) -> Result<Self, MarketHistoryRequestError> {
-        if knowledge_cutoff < interval.end_exclusive() {
+        if !interval.ended_by(knowledge_cutoff) {
             return Err(MarketHistoryRequestError::KnowledgeBeforeIntervalEnd);
         }
         Ok(Self {
@@ -209,7 +318,7 @@ impl MarketHistoryReadRequest {
     fn supported_by_current_catalog_policy(&self) -> bool {
         self.timeframe == MarketHistoryTimeframe::Daily
             && self.session == MarketHistorySessionPolicy::CompletedTradingSessions
-            && self.adjustment == MarketHistoryAdjustmentPolicy::FullyAdjusted
+            && self.adjustment.selection_policy().is_some()
     }
 }
 
@@ -224,8 +333,7 @@ pub(crate) enum MarketHistoryRequestError {
 /// Exact provider-neutral OHLCV value returned to financial consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MarketHistoryBar {
-    period_start: Timestamp,
-    period_end_exclusive: Timestamp,
+    time_semantics: BarTimeSemantics,
     open: Money,
     high: Money,
     low: Money,
@@ -236,12 +344,23 @@ pub(crate) struct MarketHistoryBar {
 }
 
 impl MarketHistoryBar {
-    pub(crate) const fn period_start(&self) -> Timestamp {
-        self.period_start
+    pub(crate) const fn period_start(&self) -> Option<Timestamp> {
+        self.time_semantics.period_start()
     }
 
-    pub(crate) const fn period_end_exclusive(&self) -> Timestamp {
-        self.period_end_exclusive
+    pub(crate) const fn period_end_exclusive(&self) -> Option<Timestamp> {
+        self.time_semantics.period_end_exclusive()
+    }
+
+    pub(crate) const fn nominal_date(&self) -> Option<CalendarDate> {
+        match self.time_semantics.nominal_daily_date() {
+            Some(date) => Some(date.date()),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn time_semantics(&self) -> &BarTimeSemantics {
+        &self.time_semantics
     }
 
     pub(crate) const fn open(&self) -> Money {
@@ -313,6 +432,7 @@ pub(crate) struct MarketHistoryQuality {
     current_research_eligible: bool,
     point_in_time_backtest_eligible: bool,
     retrospective_training_eligible: bool,
+    realized_outcome_eligible: bool,
 }
 
 impl MarketHistoryQuality {
@@ -334,6 +454,10 @@ impl MarketHistoryQuality {
 
     pub(crate) const fn retrospective_training_eligible(self) -> bool {
         self.retrospective_training_eligible
+    }
+
+    pub(crate) const fn realized_outcome_eligible(self) -> bool {
+        self.realized_outcome_eligible
     }
 }
 
@@ -492,32 +616,83 @@ impl MarketHistoryReadCapability {
                 MarketHistoryMissingReason::PolicyNotMaterialized,
             );
         }
-        let interval = request.interval();
-        let selection = match CanonicalMarketBarHistoryRequest::try_latest(
-            request.instrument_id(),
-            interval.start(),
-            interval.end_exclusive(),
-            MarketHistorySelectionPolicy::COMPLETE_DAILY_ADJUSTED_V1,
-            request.knowledge_cutoff(),
-        ) {
-            Ok(selection) => selection,
-            Err(_error) => {
-                return MarketHistoryReadOutcome::Unavailable(
-                    MarketHistoryUnavailableReason::IntegrityUnproven,
-                );
-            }
-        };
         match self
-            .reader
-            .read_canonical_market_bar_history(selection, deadline, cancellation)
+            .read_complete_output(&request, deadline, cancellation)
             .await
         {
             Ok(Some(output)) => project_output(output, request),
             Ok(None) => MarketHistoryReadOutcome::Missing(
                 MarketHistoryMissingReason::NoCompleteWindowAtKnowledgeCutoff,
             ),
-            Err(error) => MarketHistoryReadOutcome::Unavailable(unavailable_reason(&error)),
+            Err(error) => MarketHistoryReadOutcome::Unavailable(error),
         }
+    }
+
+    /// Returns the existing sealed complete raw receipt directly to financial outcome admission.
+    /// It neither projects caller-authored bars nor qualifies these later-acquired outcomes as
+    /// historical signal information. The same canonical source selector owns this read.
+    pub(crate) async fn read_raw_outcomes(
+        &self,
+        request: MarketHistoryReadRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CompleteMarketBarHistoryOutput>, MarketHistoryUnavailableReason> {
+        if request.adjustment != MarketHistoryAdjustmentPolicy::Unadjusted
+            || !request.supported_by_current_catalog_policy()
+        {
+            return Err(MarketHistoryUnavailableReason::IntegrityUnproven);
+        }
+        let output = self
+            .read_complete_output(&request, deadline, cancellation)
+            .await?;
+        if let Some(output) = &output {
+            if !output.selection().receipt().realized_outcome_eligible() {
+                return Err(MarketHistoryUnavailableReason::IntegrityUnproven);
+            }
+            if output.bars().len() > request.limit.get() {
+                return Err(MarketHistoryUnavailableReason::CapacityExceeded);
+            }
+        }
+        Ok(output)
+    }
+
+    async fn read_complete_output(
+        &self,
+        request: &MarketHistoryReadRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CompleteMarketBarHistoryOutput>, MarketHistoryUnavailableReason> {
+        let policy = request
+            .adjustment
+            .selection_policy()
+            .ok_or(MarketHistoryUnavailableReason::IntegrityUnproven)?;
+        let selection = match request.interval {
+            MarketHistoryInterval::Timestamped {
+                start,
+                end_exclusive,
+            } => CanonicalMarketBarHistoryRequest::try_latest(
+                request.instrument_id(),
+                start,
+                Timestamp::from_unix_nanos(end_exclusive.unix_nanos() - 1),
+                policy,
+                request.knowledge_cutoff(),
+            ),
+            MarketHistoryInterval::NominalDates {
+                start,
+                end_inclusive,
+            } => CanonicalMarketBarHistoryRequest::try_latest_nominal(
+                request.instrument_id(),
+                start,
+                end_inclusive,
+                policy,
+                request.knowledge_cutoff(),
+            ),
+        }
+        .map_err(|_| MarketHistoryUnavailableReason::IntegrityUnproven)?;
+        self.reader
+            .read_canonical_market_bar_history(selection, deadline, cancellation)
+            .await
+            .map_err(|error| unavailable_reason(&error))
     }
 
     /// Selects and reads the latest complete immutable window known at the trusted cutoff.
@@ -532,9 +707,14 @@ impl MarketHistoryReadCapability {
                 MarketHistoryMissingReason::PolicyNotMaterialized,
             );
         }
+        let Some(policy) = request.adjustment.selection_policy() else {
+            return MarketHistoryReadOutcome::Missing(
+                MarketHistoryMissingReason::PolicyNotMaterialized,
+            );
+        };
         let lookup = match LatestCanonicalMarketBarHistoryWindowRequest::try_new(
             request.instrument_id,
-            MarketHistorySelectionPolicy::COMPLETE_DAILY_ADJUSTED_V1,
+            policy,
             request.knowledge_cutoff,
         ) {
             Ok(lookup) => lookup,
@@ -558,26 +738,39 @@ impl MarketHistoryReadCapability {
                 return MarketHistoryReadOutcome::Unavailable(unavailable_reason(&error));
             }
         };
-        let (start, end_exclusive) = selection.requested_range();
-        let exact_request =
-            match MarketHistoryInterval::try_new(start, end_exclusive).and_then(|interval| {
-                MarketHistoryReadRequest::try_new(
-                    request.instrument_id,
-                    interval,
-                    request.timeframe,
-                    request.session,
-                    request.adjustment,
-                    request.knowledge_cutoff,
-                    request.limit,
-                )
-            }) {
-                Ok(request) => request,
-                Err(_error) => {
-                    return MarketHistoryReadOutcome::Unavailable(
-                        MarketHistoryUnavailableReason::IntegrityUnproven,
-                    );
-                }
-            };
+        let interval = match (selection.requested_range(), selection.requested_dates()) {
+            (Some((start, end_inclusive)), None) => end_inclusive
+                .checked_add_nanos(1)
+                .ok()
+                .and_then(|end_exclusive| {
+                    MarketHistoryInterval::try_new(start, end_exclusive).ok()
+                }),
+            (None, Some((start, end_inclusive))) => {
+                MarketHistoryInterval::try_nominal_dates(start, end_inclusive).ok()
+            }
+            _ => None,
+        };
+        let Some(interval) = interval else {
+            return MarketHistoryReadOutcome::Unavailable(
+                MarketHistoryUnavailableReason::IntegrityUnproven,
+            );
+        };
+        let exact_request = match MarketHistoryReadRequest::try_new(
+            request.instrument_id,
+            interval,
+            request.timeframe,
+            request.session,
+            request.adjustment,
+            request.knowledge_cutoff,
+            request.limit,
+        ) {
+            Ok(request) => request,
+            Err(_) => {
+                return MarketHistoryReadOutcome::Unavailable(
+                    MarketHistoryUnavailableReason::IntegrityUnproven,
+                );
+            }
+        };
         match self
             .reader
             .read_canonical_market_bar_history(
@@ -617,17 +810,16 @@ fn project_output(
         && bars.len() == publication.bar_count()
         && bars.len() <= MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS
         && publication.instrument_id() == request.instrument_id()
-        && publication.requested_range() == (requested.start(), requested.end_exclusive())
+        && publication.requested_range() == requested.provider_range()
+        && publication.requested_dates() == requested.nominal_dates()
         && publication.current_research_eligible()
         && !publication.point_in_time_eligible()
         && !publication.backtest_eligible()
-        && !publication.retrospective_training_eligible()
         && bars.iter().all(|bar| {
             let period = bar.time_semantics();
             bar.context().provenance().instrument_id() == Some(request.instrument_id())
                 && bar.adjustment() == expected_adjustment
-                && period.period_start() >= requested.start()
-                && period.period_end_exclusive() <= requested.end_exclusive()
+                && requested.contains(period)
                 && bar
                     .context()
                     .provenance()
@@ -678,8 +870,7 @@ fn project_output(
     let projected = selected
         .iter()
         .map(|bar| MarketHistoryBar {
-            period_start: bar.time_semantics().period_start(),
-            period_end_exclusive: bar.time_semantics().period_end_exclusive(),
+            time_semantics: bar.time_semantics().clone(),
             open: bar.open(),
             high: bar.high(),
             low: bar.low(),
@@ -690,16 +881,18 @@ fn project_output(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    let (Some(materialized), Some(returned)) = (
+        MarketHistoryInterval::from_bars(materialized_first, materialized_last),
+        MarketHistoryInterval::from_bars(returned_first, returned_last),
+    ) else {
+        return MarketHistoryReadOutcome::Unavailable(
+            MarketHistoryUnavailableReason::IntegrityUnproven,
+        );
+    };
     let coverage = MarketHistoryCoverage {
         requested,
-        materialized: MarketHistoryInterval {
-            start: materialized_first.time_semantics().period_start(),
-            end_exclusive: materialized_last.time_semantics().period_end_exclusive(),
-        },
-        returned: MarketHistoryInterval {
-            start: returned_first.time_semantics().period_start(),
-            end_exclusive: returned_last.time_semantics().period_end_exclusive(),
-        },
+        materialized,
+        returned,
         materialized_bars: bars.len(),
         returned_bars: projected.len(),
     };
@@ -736,6 +929,7 @@ fn project_output(
             current_research_eligible: true,
             point_in_time_backtest_eligible: false,
             retrospective_training_eligible: false,
+            realized_outcome_eligible: publication.realized_outcome_eligible(),
         },
         bars: projected,
         evidence,

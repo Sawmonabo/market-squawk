@@ -1,12 +1,23 @@
 //! Lifecycle-owned paper bot and execution application services.
 
+mod account;
+mod backup;
+pub(crate) use backup::{
+    PaperAuditBackupFile, PaperAuditBackupKind, PaperStoppedBackupAuthority,
+    PaperStoppedBackupLease, PaperStoppedBackupStreamCustody,
+};
+mod equity;
 mod market;
+pub(crate) use equity::EquityPaperServices;
+use equity::PaperMarketPurpose;
 mod product;
+mod proposal_selection;
+use proposal_selection::{PaperTargetSelection, ResolvedPaperTarget};
+mod shutdown;
 mod source_runtime;
 
 use std::{
     fmt,
-    num::NonZeroU64,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,15 +30,15 @@ use market_squawk_adapter_paper::PaperExecutionSnapshot;
 use market_squawk_data::{InstrumentDefinitionReadCapability, MarketDataInstrumentReadCapability};
 use market_squawk_decisions::{InvestmentTargetSetId, TargetState, TargetStatus};
 use market_squawk_domain::{
-    BasisPoints, Currency, DigestAlgorithm, InstrumentExecutionTerms, Money, OrderId, OrderSide,
-    OrderType, PriceTicks, QuantityLots, RevisionNumber, SourceIdentifier, TimeInForce, Timestamp,
+    BasisPoints, Currency, InstrumentExecutionTerms, Money, OrderId, OrderSide, OrderType,
+    PriceTicks, QuantityLots, RevisionNumber, SourceIdentifier, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{
     AccountRiskViolation, ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason,
     ExecutionDispatchError, ExecutionState, ManualPaperDraft, ManualPaperDraftInput,
     OrderTargetReference, RiskRejectionCode,
 };
-use market_squawk_live::{ActiveLiveActionHookGroup, LiveActionHookGeneration, ShardKey};
+use market_squawk_live::{ActiveLiveActionHookGroup, ShardKey};
 use market_squawk_services::{
     RequestContext, RequestOrigin, ServiceDomain, ServiceError, ToolResultMetadata,
     TypedToolRequest, TypedToolResult,
@@ -90,6 +101,8 @@ pub struct PaperApplicationServices {
     market_data_instruments: MarketDataInstrumentReadCapability,
     reference_search: Arc<dyn market::MarketReferenceSearchAuthority>,
     market_history: MarketHistoryReadCapability,
+    product_research: Arc<crate::ResearchService>,
+    product_markets: super::market_selection::MarketInvestmentReadCapability,
 }
 
 /// Market-only candidate factory retained until durable workspace setup is available.
@@ -99,6 +112,18 @@ pub(crate) struct PortfolioCandidateResolutionFactory {
 }
 
 impl PortfolioCandidateResolutionFactory {
+    /// Applies the selected financial profile's current-mark age to the same read authority.
+    pub(crate) fn with_maximum_mark_age_nanos(
+        &self,
+        maximum_mark_age_nanos: u64,
+    ) -> Result<Self, ServiceError> {
+        Ok(Self {
+            inner: self
+                .inner
+                .with_maximum_mark_age_nanos(maximum_mark_age_nanos)?,
+        })
+    }
+
     /// Binds the exact workspace setup and immutable imported-portfolio catalog reader.
     pub(crate) fn bind(
         &self,
@@ -165,11 +190,7 @@ impl PaperRuntimeActivityAuthority for PaperRuntimeActivityControl {
                 paper_execution_active: false,
                 reconciliation_pending: false,
             }),
-            PaperState::CleanupRequired { .. } => Ok(PaperRuntimeActivitySnapshot {
-                paper_execution_active: false,
-                reconciliation_pending: true,
-            }),
-            PaperState::Starting { .. } | PaperState::Running { .. } | PaperState::Stopping => {
+            PaperState::Starting { .. } | PaperState::Running { .. } | PaperState::Stopping(_) => {
                 // The paper adapter's authoritative reconciliation fact is asynchronous. A
                 // synchronous preflight must not guess it while a runtime or transition exists.
                 Err(ServiceError::Unavailable)
@@ -189,6 +210,10 @@ impl PaperApplicationServices {
         market_data_instruments: MarketDataInstrumentReadCapability,
         reference_search: Arc<dyn MarketReferenceSearchAuthority>,
         market_history: MarketHistoryReadCapability,
+        equity: EquityPaperServices,
+        portfolio_publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
+        product_research: Arc<crate::ResearchService>,
+        product_markets: super::market_selection::MarketInvestmentReadCapability,
     ) -> Self {
         Self {
             controller: Arc::new(PaperController::new(
@@ -197,12 +222,16 @@ impl PaperApplicationServices {
                 Arc::clone(&market_runtime),
                 instrument_definitions.clone(),
                 market_data_instruments.clone(),
+                equity,
+                portfolio_publisher,
             )),
             market_runtime,
             instrument_definitions,
             market_data_instruments,
             reference_search,
             market_history,
+            product_research,
+            product_markets,
         }
     }
 
@@ -228,6 +257,8 @@ impl PaperApplicationServices {
             self.market_data_instruments.clone(),
             Arc::clone(&self.reference_search),
             self.market_history.clone(),
+            Arc::clone(&self.product_research),
+            self.product_markets.clone(),
         ))
     }
 
@@ -248,11 +279,12 @@ impl PaperApplicationServices {
     /// Returns a read-only factory without paper state, action hooks, risk, or order authority.
     pub(crate) fn candidate_resolution_factory(
         &self,
+        research: Arc<crate::research_service::ResearchService>,
     ) -> Result<PortfolioCandidateResolutionFactory, ServiceError> {
         let maximum_mark_age_nanos = u64::try_from(self.controller.config.stale_after().as_nanos())
             .map_err(|_error| ServiceError::Internal)?;
         market::ProductionPortfolioCandidateResolutionFactory::try_new(
-            Arc::clone(&self.market_runtime),
+            research,
             self.instrument_definitions.clone(),
             self.market_data_instruments.clone(),
             maximum_mark_age_nanos,
@@ -322,6 +354,9 @@ impl ApplicationDomainService for BotDomainService {
                     .status(&context, limits.maximum_result_items())
                     .await?
             }
+            "Bot.GetAccountPreparation" => self.controller.account_preparation(&context).await?,
+            "Bot.PrepareAccount" => self.controller.prepare_account(&request, &context).await?,
+            "Bot.CreateAccount" => self.controller.create_account(&request, &context).await?,
             BOT_GET_START_PREPARATION => self.controller.start_preparation(&context).await?,
             BOT_PREPARE_START => self.controller.prepare_start(&request, &context).await?,
             BOT_START => self.controller.start(&request, &context).await?,
@@ -374,7 +409,7 @@ impl ApplicationDomainService for ExecutionDomainService {
             }
             EXECUTION_GET_MANUAL_PAPER_TARGETS => {
                 self.controller
-                    .manual_paper_targets(&context, limits.maximum_result_items())
+                    .manual_paper_targets(&request, &context, limits.maximum_result_items())
                     .await?
             }
             EXECUTION_PREPARE_MANUAL_PAPER_DRAFT => {
@@ -427,6 +462,8 @@ impl ApplicationDomainService for ExecutionDomainService {
 }
 
 struct PaperController {
+    portfolio_publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
+    equity: EquityPaperServices,
     config: AppConfig,
     decisions: Arc<DecisionApplication>,
     market_runtime: Arc<MarketRuntimeRegistry>,
@@ -435,7 +472,7 @@ struct PaperController {
     accepting: AtomicBool,
     lifecycle: CancellationToken,
     // Serializes every mutation that can replace the sole live/paper runtime owner.
-    owner_gate: Mutex<()>,
+    owner_gate: Arc<Mutex<()>>,
     state: Mutex<PaperState>,
     // Session-scoped opaque handles keep execution and decision authority out of ordinary product
     // reads while still allowing an explicit follow-up cancellation or manual paper draft.
@@ -452,8 +489,12 @@ impl PaperController {
         market_runtime: Arc<MarketRuntimeRegistry>,
         instrument_definitions: InstrumentDefinitionReadCapability,
         market_data_instruments: MarketDataInstrumentReadCapability,
+        equity: EquityPaperServices,
+        portfolio_publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
     ) -> Self {
         Self {
+            portfolio_publisher,
+            equity,
             config,
             decisions,
             market_runtime,
@@ -461,7 +502,7 @@ impl PaperController {
             market_data_instruments,
             accepting: AtomicBool::new(true),
             lifecycle: CancellationToken::new(),
-            owner_gate: Mutex::new(()),
+            owner_gate: Arc::new(Mutex::new(())),
             state: Mutex::new(PaperState::Stopped {
                 last_complete: None,
             }),
@@ -482,22 +523,28 @@ impl PaperController {
                 "sessionAvailability": "ready",
                 "safeguards": "active",
             })),
-            PaperState::CleanupRequired { .. } => Ok(json!({
+            PaperState::Stopping(retained) => Ok(json!({
                 "sessionAvailability": "unavailable",
-                "safeguards": "action_needed",
+                "safeguards": if retained.requires_reconciliation() { "action_needed" } else { "active" },
             })),
-            PaperState::Starting { .. } | PaperState::Stopping => Ok(json!({
+            PaperState::Starting { .. } => Ok(json!({
                 "sessionAvailability": "unavailable",
                 "safeguards": "active",
             })),
             PaperState::Running {
-                provider: _,
                 strategy_mode,
                 runtime,
                 surface_id,
                 cancellation,
                 ..
             } => {
+                if runtime.is_virtual_equity()
+                    && self.refresh_equity(runtime, context).await.is_err()
+                {
+                    return Ok(
+                        json!({"sessionAvailability":"unavailable","safeguards":"action_needed"}),
+                    );
+                }
                 let source_healthy = self
                     .market_runtime
                     .verify(surface_id, context.deadline(), context.cancellation())
@@ -521,6 +568,7 @@ impl PaperController {
                     product::required_instruments(&snapshot, &audit, runtime.risk_limits());
                 let instruments = product::load_instruments(
                     &required,
+                    runtime,
                     &self.instrument_definitions,
                     &self.market_data_instruments,
                     context.deadline(),
@@ -548,11 +596,58 @@ impl PaperController {
                 return Err(ServiceError::InvalidRequest);
             }
         }
-        self.market_runtime
-            .select_paper_market_surface(context.deadline(), context.cancellation())
-            .await?;
-        let currency = configured_paper_currency(&self.config)?;
-        Ok(paper_start_preparation(currency)?)
+        let account = manual_paper_account_id().map_err(|_| ServiceError::Unavailable)?;
+        if self.portfolio_publisher.current_revision(account).map_err(|_| ServiceError::Unavailable)?.is_none() {
+            return Ok(json!({"availability":"account_required",
+                "message":"Create a virtual account before starting a paper session. Choose and confirm its virtual cash, reporting currency, and estimated trading costs below."}));
+        }
+        let Some((original_currency, original_cash, original_cost)) = self.original_start_choices(context).await? else {
+            return Ok(json!({"availability":"account_unavailable",
+                "message":"The saved virtual account's original cash or trading-cost settings cannot be used by this version. Keep the account and its history; no balance has been reset."}));
+        };
+        let (choices, equity_session_closed) = self.market_choices(context).await?;
+        if choices.is_empty() {
+            ensure_live(context)?;
+            return Ok(json!({
+                "availability": "market_unavailable",
+                "message": if equity_session_closed {
+                    "The stock market's regular session is closed. Try again during an open session when current quotes are available. The virtual account is preserved; no session or order was started."
+                } else {
+                    "Current market data or calendar evidence is unavailable for paper practice. Check market-data sources in Settings, then try again when current data is available. The virtual account is preserved; no session or order was started."
+                },
+            }));
+        }
+        let mut selected_currency = None;
+        for choice in &choices {
+            let purpose = PaperMarketPurpose::resolve(
+                choice["choiceToken"]
+                    .as_str()
+                    .ok_or(ServiceError::Internal)?,
+            )?;
+            let currency = self
+                .selected_currency(purpose, context.deadline(), context.cancellation())
+                .await?;
+            if selected_currency
+                .replace(currency)
+                .is_some_and(|prior| prior != currency)
+            {
+                return Err(ServiceError::Unavailable);
+            }
+        }
+        if selected_currency != Some(original_currency) {
+            return Ok(json!({"availability":"account_unavailable",
+                "message":"The saved virtual account's reporting currency does not match this market. The account and its history have been preserved."}));
+        }
+        let mut preparation = paper_start_preparation(original_currency)?;
+        let cash_token = paper_choice_token("cash", original_cash.id)?;
+        let cost_token = paper_choice_token("cost", original_cost.id)?;
+        for (field, token) in [("virtualCashChoices", cash_token), ("costChoices", cost_token)] {
+            let choices = preparation[field].as_array_mut().ok_or(ServiceError::Internal)?;
+            choices.retain(|choice| choice["choiceToken"].as_str() == Some(token.as_ref()));
+            if choices.len() != 1 { return Err(ServiceError::Internal); }
+        }
+        preparation["marketChoices"] = json!(choices);
+        Ok(preparation)
     }
 
     async fn prepare_start(
@@ -569,13 +664,27 @@ impl PaperController {
                 return Err(ServiceError::InvalidRequest);
             }
         }
-        self.market_runtime
-            .select_paper_market_surface(context.deadline(), context.cancellation())
+        let purpose = PaperMarketPurpose::resolve(required_string(request, "marketChoice")?)?;
+        self.select_market(purpose, context.deadline(), context.cancellation())
             .await?;
-        let currency = configured_paper_currency(&self.config)?;
-        let cash = resolve_paper_cash_choice(required_string(request, "cashChoice")?)?;
-        let cost = resolve_paper_cost_choice(required_string(request, "costChoice")?)?;
+        let currency = self
+            .selected_currency(purpose, context.deadline(), context.cancellation())
+            .await?;
+        let (original_currency, cash, cost) = self.original_start_choices(context).await?
+            .ok_or(ServiceError::InvalidRequest)?;
+        if currency != original_currency
+            || required_string(request, "cashChoice")? != paper_choice_token("cash", cash.id)?.as_ref()
+            || required_string(request, "costChoice")? != paper_choice_token("cost", cost.id)?.as_ref()
+        { return Err(ServiceError::InvalidRequest); }
         let mode = resolve_paper_mode_choice(required_string(request, "modeChoice")?)?;
+        if purpose == PaperMarketPurpose::Equities {
+            if mode.mode != PaperStrategyMode::Manual {
+                return Err(ServiceError::InvalidRequest);
+            }
+            if self.equity_routes(context.deadline(), context.cancellation()).await?.is_none() {
+                return Err(ServiceError::Unavailable);
+            }
+        }
         let now = current_timestamp()?;
         let expires_at = now
             .checked_add_nanos(
@@ -591,6 +700,8 @@ impl PaperController {
             .parse::<Decimal>()
             .map_err(|_error| ServiceError::Internal)?;
         let prepared = PreparedPaperStart {
+            purpose,
+            currency,
             origin,
             expires_at: expires_at_instant,
             initial_cash,
@@ -606,6 +717,8 @@ impl PaperController {
         .insert_start(prepared)?;
         Ok(json!({
             "confirmationToken": confirmation_token,
+            "marketLabel": purpose.label(),
+            "monitoringLabel": purpose.monitoring_label(),
             "expiresAt": product::timestamp(expires_at),
             "virtualCash": product::money(Money::new(initial_cash, currency)),
             "estimatedTradingCost": product::percentage(BasisPoints::new(i32::try_from(cost.basis_points).map_err(|_error| ServiceError::Internal)?)),
@@ -634,66 +747,66 @@ impl PaperController {
         .consume_start(confirmation_token, origin, Instant::now())?;
         let _owner =
             bounded_lock(&self.owner_gate, context.deadline(), context.cancellation()).await?;
-        self.start_paper_before_owned(prepared, context.deadline(), context.cancellation())
-            .await
+        self.start_paper_before_owned(prepared, context).await
     }
 
     async fn start_paper_before_owned(
         &self,
         prepared: PreparedPaperStart,
-        deadline: Instant,
-        request_cancellation: &CancellationToken,
+        context: &RequestContext,
     ) -> Result<Value, ServiceError> {
+        let deadline = context.deadline();
+        let request_cancellation = context.cancellation();
         if !self.accepting.load(Ordering::Acquire) {
             return Err(ServiceError::Unavailable);
         }
         if Instant::now() >= prepared.expires_at {
             return Err(ServiceError::InvalidRequest);
         }
+        {
+            let state = bounded_lock(&self.state, deadline, request_cancellation).await?;
+            if !matches!(&*state, PaperState::Stopped { .. }) {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
+        let (currency, cash, cost) = self.original_start_choices(context).await?
+            .ok_or(ServiceError::InvalidRequest)?;
+        if currency != prepared.currency
+            || cash.amount.parse::<Decimal>().map_err(|_| ServiceError::Internal)? != prepared.initial_cash
+            || cost.basis_points != prepared.fee_basis_points
+        { return Err(ServiceError::InvalidRequest); }
         let market_selection = self
-            .market_runtime
-            .select_paper_market_surface(deadline, request_cancellation)
+            .select_market(prepared.purpose, deadline, request_cancellation)
             .await?;
+        if self
+            .selected_currency(prepared.purpose, deadline, request_cancellation)
+            .await?
+            != prepared.currency
+        {
+            return Err(ServiceError::Unavailable);
+        }
         let provider = PaperProvider::from_selection(&market_selection)?;
         let surface_id = provider.surface_id()?;
         let onboarding_session_id = provider.onboarding_session_id();
         let strategy_mode = prepared.strategy_mode;
-        let initial_cash = prepared.initial_cash;
-        let fee_basis_points = prepared.fee_basis_points;
-        let run_id = Uuid::new_v4();
-        let run_cancellation = self.lifecycle.child_token();
-        let last_complete = {
-            let mut state = bounded_lock(&self.state, deadline, request_cancellation).await?;
-            let PaperState::Stopped { last_complete } = &*state else {
-                return Err(ServiceError::InvalidRequest);
-            };
-            let last_complete = *last_complete;
-            *state = PaperState::Starting { run_id };
-            last_complete
-        };
-        match bounded_lock(&self.product_tokens, deadline, request_cancellation).await {
-            Ok(mut tokens) => tokens.clear(),
-            Err(error) => {
-                run_cancellation.cancel();
-                self.set_stopped(last_complete).await;
-                return Err(error);
-            }
-        }
         let composition = match provider {
+            PaperProvider::VirtualEquity { .. } => Ok(self
+                .equity_composition(&prepared, deadline, request_cancellation)
+                .await?),
             PaperProvider::Public { provider, .. } => {
                 local_paper_bot_on_existing_public_market_with_strategy_mode(
                     self.config.clone(),
                     provider,
-                    initial_cash,
-                    fee_basis_points,
+                    prepared.initial_cash,
+                    prepared.fee_basis_points,
                     strategy_mode,
                 )
             }
             PaperProvider::CoinbaseDirect { .. } => {
                 local_coinbase_direct_paper_bot_on_existing_market_with_strategy_mode(
                     self.config.clone(),
-                    initial_cash,
-                    fee_basis_points,
+                    prepared.initial_cash,
+                    prepared.fee_basis_points,
                     strategy_mode,
                 )
             }
@@ -701,187 +814,99 @@ impl PaperController {
         .map_err(|error| {
             tracing::error!(%error, "paper execution composition failed");
             ServiceError::Unavailable
-        });
-        let composition = match composition {
-            Ok(composition) => composition,
-            Err(error) => {
-                run_cancellation.cancel();
-                self.set_stopped(last_complete).await;
-                return Err(error);
-            }
-        };
-        let snapshots = match self
-            .market_runtime
-            .snapshot_reader(
-                &surface_id,
-                onboarding_session_id,
-                deadline,
-                request_cancellation,
-            )
-            .await
-        {
-            Ok(snapshots) => snapshots,
-            Err(error) => {
-                run_cancellation.cancel();
-                self.set_stopped(last_complete).await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = ensure_before(deadline, request_cancellation) {
-            run_cancellation.cancel();
-            self.set_stopped(last_complete).await;
-            return Err(error);
-        }
-        let prepared = composition
-            .prepare_on_existing_live(snapshots, run_cancellation.clone())
-            .await
+        })?;
+        let composition = composition
+            .with_canonical_portfolio(self.portfolio_publisher.clone())
             .map_err(|error| {
-                tracing::error!(%error, "paper execution graph failed to start");
+                tracing::error!(%error, "canonical paper portfolio composition failed");
                 ServiceError::Unavailable
-            });
-        let (runtime, action_hooks) = match prepared {
-            Ok(prepared) => {
-                let (runtime, action_hooks) = prepared.into_parts();
-                if let Err(error) = ensure_before(deadline, request_cancellation) {
-                    run_cancellation.cancel();
-                    drop(action_hooks);
-                    let complete = bounded_runtime_shutdown(runtime).await;
-                    self.set_stopped(Some(complete)).await;
-                    return Err(error);
-                }
-                (runtime, action_hooks)
-            }
-            Err(error) => {
-                run_cancellation.cancel();
-                self.set_stopped(Some(false)).await;
-                return Err(error);
-            }
-        };
-        let prepared_hooks = match self
-            .market_runtime
-            .prepare_action_hooks(
-                &surface_id,
-                onboarding_session_id,
-                action_hooks,
-                deadline,
-                request_cancellation,
+            })?;
+        let snapshots = if prepared.purpose == PaperMarketPurpose::Equities {
+            None
+        } else {
+            Some(
+                self.market_runtime
+                    .snapshot_reader(
+                        &surface_id,
+                        onboarding_session_id,
+                        deadline,
+                        request_cancellation,
+                    )
+                    .await?,
             )
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                run_cancellation.cancel();
-                let complete = bounded_runtime_shutdown(runtime).await;
-                self.set_stopped(Some(complete)).await;
-                return Err(error);
-            }
         };
-        let hook_runtime_incarnation = prepared_hooks.runtime_incarnation();
-        let hook_generation = prepared_hooks.generation();
-        if let Err(error) = ensure_before(deadline, request_cancellation) {
-            drop(prepared_hooks);
-            run_cancellation.cancel();
-            let complete = bounded_runtime_shutdown(runtime).await;
-            let reap = self
-                .reap_action_hooks_for_cleanup(
-                    &surface_id,
-                    hook_runtime_incarnation,
-                    hook_generation,
-                )
-                .await;
-            if reap.is_err() {
-                self.set_cleanup_required(
-                    provider,
-                    surface_id,
-                    hook_runtime_incarnation,
-                    hook_generation,
-                )
-                .await;
-            } else {
-                self.set_stopped(Some(complete)).await;
+        ensure_before(deadline, request_cancellation)?;
+        bounded_lock(&self.product_tokens, deadline, request_cancellation)
+            .await?
+            .clear();
+
+        let run_id = Uuid::new_v4();
+        let run_cancellation = self.lifecycle.child_token();
+        let retained = shutdown::RetainedPaperRun::preparing(
+            composition,
+            snapshots,
+            Arc::clone(&self.market_runtime),
+            surface_id.clone(),
+            onboarding_session_id,
+            deadline,
+            run_cancellation.clone(),
+            self.config.source_shutdown(),
+            self.equity.clone(),
+            self.market_data_instruments.clone(),
+            context.clone(),
+        );
+        {
+            let mut state = bounded_lock(&self.state, deadline, request_cancellation).await?;
+            if !matches!(&*state, PaperState::Stopped { .. }) {
+                return Err(ServiceError::InvalidRequest);
             }
+            // The actual preparation future is owned before its first poll. Cancellation cannot
+            // lose a partially prepared runtime or the exact hook-installation continuation.
+            *state = PaperState::Starting {
+                run_id,
+                retained: Arc::clone(&retained),
+            };
+        }
+        let cancellation_guard = shutdown::StartCancellation::arm(Arc::clone(&retained));
+        if let Err(error) = retained.wait_ready(deadline, request_cancellation).await {
+            drop(cancellation_guard);
+            let _cleanup = self
+                .stop_paper_before_owned(self.cleanup_deadline()?, &CancellationToken::new())
+                .await;
             return Err(error);
         }
-        let active_hooks = match prepared_hooks.activate() {
-            Ok(active) => active,
-            Err(error) => {
-                run_cancellation.cancel();
-                let complete = bounded_runtime_shutdown(runtime).await;
-                let reap = self
-                    .reap_action_hooks_for_cleanup(
-                        &surface_id,
-                        hook_runtime_incarnation,
-                        hook_generation,
-                    )
-                    .await;
-                if reap.is_err() {
-                    self.set_cleanup_required(
-                        provider,
-                        surface_id,
-                        hook_runtime_incarnation,
-                        hook_generation,
-                    )
-                    .await;
-                } else {
-                    self.set_stopped(Some(complete)).await;
-                }
-                return Err(error);
-            }
-        };
-
-        let mut state = self.state.lock().await;
-        let current_start = matches!(
-            &*state,
-            PaperState::Starting {
-                run_id: current,
-                ..
-            } if *current == run_id
-        );
+        let mut state = bounded_lock(&self.state, deadline, request_cancellation).await?;
+        let current_start = matches!(&*state, PaperState::Starting { run_id: current, retained: current_retained }
+            if *current == run_id && Arc::ptr_eq(current_retained, &retained));
         if current_start
             && self.accepting.load(Ordering::Acquire)
-            && !run_cancellation.is_cancelled()
-            && runtime.source_is_healthy()
+            && ensure_before(deadline, request_cancellation).is_ok()
         {
-            *state = PaperState::Running {
-                provider,
-                surface_id,
-                strategy_mode,
-                runtime: Box::new(runtime),
-                action_hooks: active_hooks,
-                cancellation: run_cancellation,
-            };
-            drop(state);
-            return Ok(json!({
-                "sessionAvailability": "active",
-                "safeguards": "active",
-                "modeLabel": paper_mode_label(strategy_mode),
-                "message": "The virtual paper session is active. No brokerage order was placed.",
-            }));
+            if let Some((runtime, action_hooks)) = retained.take_ready() {
+                *state = PaperState::Running {
+                    surface_id,
+                    strategy_mode,
+                    runtime: Box::new(runtime),
+                    action_hooks,
+                    cancellation: run_cancellation,
+                };
+                cancellation_guard.disarm();
+                return Ok(json!({
+                    "sessionAvailability": "active",
+                    "safeguards": "active",
+                    "modeLabel": paper_mode_label(strategy_mode),
+                    "message": "The virtual paper session is active. No brokerage order was placed.",
+                }));
+            }
         }
         if current_start {
-            *state = PaperState::Stopping;
+            *state = PaperState::Stopping(Arc::clone(&retained));
         }
         drop(state);
-
-        let disabled = active_hooks.disable();
-        let hook_runtime_incarnation = disabled.runtime_incarnation();
-        let hook_generation = disabled.generation();
-        run_cancellation.cancel();
-        let complete = bounded_runtime_shutdown(runtime).await;
-        let reap = self
-            .reap_action_hooks_for_cleanup(&surface_id, hook_runtime_incarnation, hook_generation)
+        drop(cancellation_guard);
+        let _cleanup = self
+            .stop_paper_before_owned(self.cleanup_deadline()?, &CancellationToken::new())
             .await;
-        if reap.is_err() {
-            self.set_cleanup_required(
-                provider,
-                surface_id,
-                hook_runtime_incarnation,
-                hook_generation,
-            )
-            .await;
-        } else {
-            self.set_stopped(Some(complete)).await;
-        }
         Err(ServiceError::Unavailable)
     }
     async fn stop(&self, _reason: &str, context: &RequestContext) -> Result<Value, ServiceError> {
@@ -905,8 +930,11 @@ impl PaperController {
         context: &RequestContext,
         maximum_items: usize,
     ) -> Result<(Value, usize, usize), ServiceError> {
-        let Some(snapshot) = self.read_snapshot(context).await? else {
+        let Some((state, snapshot)) = self.read_snapshot(context).await? else {
             return Ok((Value::Null, 0, 0));
+        };
+        let PaperState::Running { runtime, .. } = &*state else {
+            return Err(ServiceError::Unavailable);
         };
         let available = snapshot.orders().len();
         let returned = available.min(maximum_items);
@@ -926,6 +954,7 @@ impl PaperController {
         let ids = product::execution_instruments(&snapshot);
         let instruments = product::load_instruments(
             &ids,
+            runtime,
             &self.instrument_definitions,
             &self.market_data_instruments,
             context.deadline(),
@@ -942,8 +971,11 @@ impl PaperController {
         context: &RequestContext,
         maximum_items: usize,
     ) -> Result<(Value, usize, usize), ServiceError> {
-        let Some(snapshot) = self.read_snapshot(context).await? else {
+        let Some((state, snapshot)) = self.read_snapshot(context).await? else {
             return Ok((Value::Null, 0, 0));
+        };
+        let PaperState::Running { runtime, .. } = &*state else {
+            return Err(ServiceError::Unavailable);
         };
         let available = snapshot.fills().len();
         let returned = available.min(maximum_items);
@@ -957,6 +989,7 @@ impl PaperController {
         let ids = product::execution_instruments(&snapshot);
         let instruments = product::load_instruments(
             &ids,
+            runtime,
             &self.instrument_definitions,
             &self.market_data_instruments,
             context.deadline(),
@@ -970,6 +1003,7 @@ impl PaperController {
 
     async fn manual_paper_targets(
         &self,
+        request: &TypedToolRequest,
         context: &RequestContext,
         maximum_items: usize,
     ) -> Result<(Value, usize, usize), ServiceError> {
@@ -984,6 +1018,7 @@ impl PaperController {
         else {
             return Err(ServiceError::Unavailable);
         };
+        self.refresh_equity(runtime, context).await?;
         if cancellation.is_cancelled()
             || !runtime.source_is_healthy()
             || self
@@ -999,21 +1034,30 @@ impl PaperController {
             .paper_snapshot(context.deadline(), context.cancellation())
             .await
             .map_err(map_control_error)?;
-        let entries = self
-            .decisions
-            .list_target_index(MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES)
-            .map_err(map_decision_error)?;
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(entries.len())
-            .map_err(|_error| ServiceError::ResourceExhausted)?;
-        {
-            let mut product_tokens = bounded_lock(
-                &self.product_tokens,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .await?;
+        let mut selected = Vec::new();
+        if let Some(token) = request.arguments().get("analysisActionToken") {
+            let text = token.as_str().ok_or(ServiceError::InvalidRequest)?;
+            let token = Uuid::parse_str(text).map_err(|_| ServiceError::InvalidRequest)?;
+            if token.is_nil() || token.to_string() != text {
+                return Err(ServiceError::InvalidRequest);
+            }
+            selected
+                .try_reserve_exact(1)
+                .map_err(|_| ServiceError::ResourceExhausted)?;
+            selected.push(ResolvedPaperTarget::read_generated(
+                self,
+                token,
+                required_origin(context)?,
+                now,
+            )?);
+        } else {
+            let entries = self
+                .decisions
+                .list_target_index(MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES)
+                .map_err(map_decision_error)?;
+            selected
+                .try_reserve_exact(entries.len())
+                .map_err(|_| ServiceError::ResourceExhausted)?;
             for entry in entries {
                 if entry.status() != TargetStatus::Active {
                     continue;
@@ -1022,18 +1066,37 @@ impl PaperController {
                     .decisions
                     .get_target(entry.id(), entry.revision())
                     .map_err(map_decision_error)?;
-                if !target_currently_usable(&target, now) {
-                    continue;
+                if target_currently_usable(&target, now) {
+                    selected.push(ResolvedPaperTarget::Governed(target));
                 }
+            }
+        }
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(selected.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        {
+            let mut product_tokens = bounded_lock(
+                &self.product_tokens,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await?;
+            for target in selected {
                 if sole_compatible_manual_route(runtime, &target).is_err() {
+                    if target.proposal()?.is_some() {
+                        return Err(ServiceError::Unavailable);
+                    }
                     continue;
                 }
-                let target_token = product_tokens.target_token(entry.id(), entry.revision())?;
-                let instrument_id = target.target().target().instrument_id();
-                let can_sell = runtime.risk_limits().allow_short()
-                    || paper_snapshot.positions().iter().any(|position| {
-                        position.instrument_id() == instrument_id && position.lots() > 0
-                    });
+                let instrument_id = target.instrument_id();
+                let held_lots = manual_paper_held_lots(&paper_snapshot, instrument_id)?;
+                let can_sell = held_lots > 0
+                    || (target.proposal()?.is_none() && runtime.risk_limits().allow_short());
+                if !target.permits_side(OrderSide::Buy)? && !can_sell {
+                    return Err(ServiceError::Unavailable);
+                }
+                let target_token = product_tokens.target_token(target.selection()?)?;
                 prepared.push((target, target_token, instrument_id, can_sell));
                 if prepared.len() > MAXIMUM_PRODUCT_MANUAL_PAPER_TARGETS {
                     return Err(ServiceError::ResourceExhausted);
@@ -1056,6 +1119,7 @@ impl PaperController {
         instrument_ids.dedup();
         let instruments = product::load_instruments(
             &instrument_ids,
+            runtime,
             &self.instrument_definitions,
             &self.market_data_instruments,
             context.deadline(),
@@ -1104,6 +1168,7 @@ impl PaperController {
         else {
             return Err(ServiceError::Unavailable);
         };
+        self.refresh_equity(runtime, context).await?;
         if cancellation.is_cancelled()
             || !runtime.source_is_healthy()
             || self
@@ -1115,76 +1180,57 @@ impl PaperController {
             return Err(ServiceError::Unavailable);
         }
         let now = current_timestamp()?;
-        let (target_id, target_revision) = {
-            let entries = self
-                .decisions
-                .list_target_index(MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES)
-                .map_err(map_decision_error)?;
-            let mut product_tokens = bounded_lock(
-                &self.product_tokens,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .await?;
-            let mut resolved = None;
-            for entry in &entries {
-                let candidate = product_tokens.target_token(entry.id(), entry.revision())?;
-                if candidate.as_ref() != target_token {
-                    continue;
-                }
-                if resolved
-                    .replace((entry.id().clone(), entry.revision()))
-                    .is_some()
-                {
-                    return Err(ServiceError::Unavailable);
-                }
-            }
-            resolved.ok_or(ServiceError::NotFound)?
-        };
-        let target = self.current_active_target(&target_id, target_revision, now)?;
+        let selection = bounded_lock(
+            &self.product_tokens,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .await?
+        .resolve_target(target_token)?;
+        let target = selection.reopen(self, origin, now)?;
         let manual_route = sole_compatible_manual_route(runtime, &target)?;
-        if !manual_choice_is_compatible(order_type, time_in_force) {
+        if !manual_choice_is_compatible(order_type, time_in_force) || !target.permits_side(side)? {
             return Err(ServiceError::InvalidRequest);
         }
-        if side == OrderSide::Sell && !runtime.risk_limits().allow_short() {
+        if side == OrderSide::Sell
+            && (target.proposal()?.is_some() || !runtime.risk_limits().allow_short())
+        {
             let snapshot = runtime
                 .paper_snapshot(context.deadline(), context.cancellation())
                 .await
                 .map_err(map_control_error)?;
-            if !snapshot.positions().iter().any(|position| {
-                position.instrument_id() == target.target().target().instrument_id()
-                    && position.lots() > 0
-            }) {
+            let held = manual_paper_held_lots(&snapshot, target.instrument_id())?;
+            if held <= 0 || (target.proposal()?.is_some() && quantity.get() > held) {
                 return Err(ServiceError::InvalidRequest);
             }
         }
         let route = manual_route.route();
         let terms = manual_route.execution_terms();
-        let target_core = target.target().target();
-        if target_core.reference_mark().price().currency() != terms.quote_currency() {
+        if target.currency() != terms.quote_currency() {
             return Err(ServiceError::InvalidRequest);
         }
         let limit_selection =
             selected_target_price(request, "limitTargetLevel", &target, terms, order_type)?;
         let stop_selection =
             selected_target_price(request, "stopTargetLevel", &target, terms, order_type)?;
-        let content_digest = target_core.content_identity().evidence_digest();
-        if content_digest.algorithm() != DigestAlgorithm::Sha256 {
-            return Err(ServiceError::Unavailable);
-        }
-        let target_reference = OrderTargetReference::try_new(
-            target_core.id().as_str(),
-            std::num::NonZeroU64::new(u64::from(target_core.revision().get()))
-                .ok_or(ServiceError::Unavailable)?,
-            content_digest.bytes(),
-        )
-        .map_err(|_error| ServiceError::Unavailable)?;
+        let target_reference = target.reference()?;
         let expires_at = now
             .checked_add_nanos(
                 i64::try_from(MANUAL_PAPER_DRAFT_LIFETIME.as_nanos())
                     .map_err(|_error| ServiceError::Unavailable)?,
             )
             .map_err(|_error| ServiceError::Unavailable)?;
+        let expires_at = expires_at.min(target.expires_at());
+        let lifetime = expires_at
+            .unix_nanos()
+            .checked_sub(now.unix_nanos())
+            .filter(|nanos| *nanos > 0)
+            .ok_or(ServiceError::Unavailable)?;
+        let expires_at_instant = Instant::now()
+            .checked_add(Duration::from_nanos(
+                u64::try_from(lifetime).map_err(|_| ServiceError::Unavailable)?,
+            ))
+            .ok_or(ServiceError::Unavailable)?;
         let order_id =
             OrderId::try_from(Uuid::new_v4()).map_err(|_error| ServiceError::Unavailable)?;
         let client_order_id =
@@ -1204,12 +1250,13 @@ impl PaperController {
             expires_at,
             reason_code: manual_paper_reason_code().map_err(|_error| ServiceError::Unavailable)?,
             maximum_slippage: runtime.risk_limits().maximum_slippage(),
-            target_reference,
+            target_reference: target_reference.clone(),
         })
         .map_err(|_error| ServiceError::InvalidRequest)?;
-        let instrument_id = target_core.instrument_id();
+        let instrument_id = target.instrument_id();
         let instruments = product::load_instruments(
             &[instrument_id],
+            runtime,
             &self.instrument_definitions,
             &self.market_data_instruments,
             context.deadline(),
@@ -1218,12 +1265,11 @@ impl PaperController {
         let instrument = product::instrument(&instruments, instrument_id)?;
         let prepared = PreparedManualPaper {
             origin,
-            expires_at: Instant::now()
-                .checked_add(MANUAL_PAPER_DRAFT_LIFETIME)
-                .ok_or(ServiceError::Unavailable)?,
-            target_id,
-            target_revision,
-            target_sha256: content_digest.bytes(),
+            expires_at: expires_at_instant,
+            selection,
+            target_reference,
+            side,
+            quantity,
             route: route.clone(),
             terms,
             maximum_order_notional: runtime.risk_limits().maximum_order_notional(),
@@ -1243,6 +1289,7 @@ impl PaperController {
                 &confirmation_token,
                 expires_at,
                 instrument,
+                &target,
                 side,
                 order_type,
                 quantity,
@@ -1285,7 +1332,7 @@ impl PaperController {
             return Err(ServiceError::Unavailable);
         };
         if cancellation.is_cancelled()
-            || !runtime.source_is_healthy()
+            || (!runtime.is_virtual_equity() && !runtime.source_is_healthy())
             || self
                 .market_runtime
                 .verify(surface_id, context.deadline(), context.cancellation())
@@ -1294,23 +1341,26 @@ impl PaperController {
         {
             return Err(ServiceError::Unavailable);
         }
-        let target = self.current_active_target(
-            &prepared.target_id,
-            prepared.target_revision,
-            current_timestamp()?,
-        )?;
-        let digest = target
-            .target()
-            .target()
-            .content_identity()
-            .evidence_digest();
-        if digest.algorithm() != DigestAlgorithm::Sha256
-            || digest.bytes() != prepared.target_sha256
+        let target = prepared
+            .selection
+            .reopen(self, origin, current_timestamp()?)?;
+        if target.reference()? != prepared.target_reference
+            || !target.permits_side(prepared.side)?
             || runtime.risk_limits().maximum_order_notional() != prepared.maximum_order_notional
             || runtime.risk_limits().maximum_slippage() != prepared.maximum_slippage
             || runtime.risk_limits().allow_short() != prepared.allow_short
         {
             return Err(ServiceError::InvalidRequest);
+        }
+        if prepared.side == OrderSide::Sell && target.proposal()?.is_some() {
+            let snapshot = runtime
+                .paper_snapshot(context.deadline(), context.cancellation())
+                .await
+                .map_err(map_control_error)?;
+            if manual_paper_held_lots(&snapshot, target.instrument_id())? < prepared.quantity.get()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
         }
         let mut matched_route = None;
         for candidate in runtime.manual_paper_routes() {
@@ -1324,8 +1374,30 @@ impl PaperController {
         }
         let route = matched_route.ok_or(ServiceError::InvalidRequest)?;
         runtime
-            .try_submit_manual_paper_draft(route.route(), prepared.draft)
-            .map_err(map_manual_paper_ingress_error)?;
+            .refresh_virtual_equity_before_ingress(
+                &self.market_runtime,
+                &self.equity.actions,
+                &self.market_data_instruments,
+                context,
+                || {
+                    ensure_live(context)?;
+                    if Instant::now() >= prepared.expires_at {
+                        return Err(ServiceError::InvalidRequest);
+                    }
+                    let current = prepared
+                        .selection
+                        .reopen(self, origin, current_timestamp()?)?;
+                    if current.reference()? != prepared.target_reference
+                        || !current.permits_side(prepared.side)?
+                    {
+                        return Err(ServiceError::InvalidRequest);
+                    }
+                    runtime
+                        .try_submit_manual_paper_draft(route.route(), prepared.draft)
+                        .map_err(map_manual_paper_ingress_error)
+                },
+            )
+            .await?;
         Ok((
             json!({
                 "accepted": true,
@@ -1368,7 +1440,13 @@ impl PaperController {
     async fn read_snapshot(
         &self,
         context: &RequestContext,
-    ) -> Result<Option<PaperExecutionSnapshot>, ServiceError> {
+    ) -> Result<
+        Option<(
+            tokio::sync::MutexGuard<'_, PaperState>,
+            PaperExecutionSnapshot,
+        )>,
+        ServiceError,
+    > {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
         let (runtime, surface_id, cancellation) = match &*state {
@@ -1379,12 +1457,11 @@ impl PaperController {
                 cancellation,
                 ..
             } => (runtime, surface_id, cancellation),
-            PaperState::CleanupRequired { .. }
-            | PaperState::Starting { .. }
-            | PaperState::Stopping => {
+            PaperState::Starting { .. } | PaperState::Stopping(_) => {
                 return Err(ServiceError::Unavailable);
             }
         };
+        self.refresh_equity(runtime, context).await?;
         if cancellation.is_cancelled()
             || !runtime.source_is_healthy()
             || self
@@ -1399,7 +1476,7 @@ impl PaperController {
             .paper_snapshot(context.deadline(), context.cancellation())
             .await
             .map_err(map_control_error)?;
-        Ok(Some(snapshot))
+        Ok(Some((state, snapshot)))
     }
 
     async fn cancel(
@@ -1418,13 +1495,16 @@ impl PaperController {
         else {
             return Err(ServiceError::Unavailable);
         };
+        // Cancelling an existing virtual order does not acquire new market or execution authority.
+        // A stale or removed quote source must not prevent this risk-reducing local operation.
         if cancellation.is_cancelled()
-            || !runtime.source_is_healthy()
-            || self
-                .market_runtime
-                .verify(surface_id, context.deadline(), context.cancellation())
-                .await?
-                .is_none()
+            || (!runtime.is_virtual_equity()
+                && (!runtime.source_is_healthy()
+                    || self
+                        .market_runtime
+                        .verify(surface_id, context.deadline(), context.cancellation())
+                        .await?
+                        .is_none()))
         {
             return Err(ServiceError::Unavailable);
         }
@@ -1496,6 +1576,7 @@ impl PaperController {
 
     fn begin_shutdown(&self) {
         self.accepting.store(false, Ordering::Release);
+        self.lifecycle.cancel();
     }
 
     async fn stop_paper_before_owned(
@@ -1504,82 +1585,61 @@ impl PaperController {
         cancellation: &CancellationToken,
     ) -> Result<bool, ServiceError> {
         ensure_before(deadline, cancellation)?;
-        let mut state = bounded_lock(&self.state, deadline, cancellation).await?;
-        match std::mem::replace(&mut *state, PaperState::Stopping) {
-            PaperState::Stopped { last_complete } => {
-                *state = PaperState::Stopped { last_complete };
-                Ok(last_complete.unwrap_or(true))
-            }
-            PaperState::CleanupRequired {
-                provider,
-                surface_id,
-                runtime_incarnation,
-                hook_generation,
-            } => {
-                drop(state);
-                match self
-                    .reap_action_hooks_for_cleanup(
-                        &surface_id,
-                        runtime_incarnation,
-                        hook_generation,
-                    )
-                    .await
-                {
-                    Ok(_receipt) => {
-                        self.set_stopped(Some(true)).await;
-                        Ok(true)
-                    }
-                    Err(error) => {
-                        self.set_cleanup_required(
-                            provider,
-                            surface_id,
-                            runtime_incarnation,
-                            hook_generation,
-                        )
-                        .await;
-                        Err(error)
-                    }
+        let retained = {
+            let mut state = bounded_lock(&self.state, deadline, cancellation).await?;
+            match &*state {
+                PaperState::Stopped { last_complete } => return Ok(last_complete.unwrap_or(true)),
+                PaperState::Starting { retained, .. } | PaperState::Stopping(retained) => {
+                    let retained = Arc::clone(retained);
+                    *state = PaperState::Stopping(Arc::clone(&retained));
+                    retained
                 }
-            }
-            PaperState::Running {
-                provider,
-                surface_id,
-                runtime,
-                action_hooks,
-                cancellation: run_cancellation,
-                ..
-            } => {
-                let disabled = action_hooks.disable();
-                let runtime_incarnation = disabled.runtime_incarnation();
-                let hook_generation = disabled.generation();
-                run_cancellation.cancel();
-                drop(state);
-                let complete = bounded_runtime_shutdown(*runtime).await;
-                let reap = self
-                    .reap_action_hooks_for_cleanup(
-                        &surface_id,
-                        runtime_incarnation,
-                        hook_generation,
-                    )
-                    .await;
-                if let Err(error) = reap {
-                    self.set_cleanup_required(
-                        provider,
+                PaperState::Running { .. } => {
+                    // Replacement and retention are synchronous under the existing owner/state
+                    // gates. No await can expose the temporary value or drop the actual runtime.
+                    let running = std::mem::replace(
+                        &mut *state,
+                        PaperState::Stopped {
+                            last_complete: Some(false),
+                        },
+                    );
+                    let PaperState::Running {
                         surface_id,
-                        runtime_incarnation,
-                        hook_generation,
-                    )
-                    .await;
-                    return Err(error);
+                        runtime,
+                        action_hooks,
+                        cancellation: run_cancellation,
+                        ..
+                    } = running
+                    else {
+                        return Err(ServiceError::Unavailable);
+                    };
+                    let retained = shutdown::RetainedPaperRun::running(
+                        *runtime,
+                        action_hooks,
+                        surface_id,
+                        run_cancellation,
+                        Arc::clone(&self.market_runtime),
+                        self.config.source_shutdown(),
+                    );
+                    *state = PaperState::Stopping(Arc::clone(&retained));
+                    retained
                 }
-                self.set_stopped(Some(complete)).await;
-                Ok(complete)
             }
-            other @ (PaperState::Starting { .. } | PaperState::Stopping) => {
-                *state = other;
-                Err(ServiceError::Unavailable)
+        };
+        let complete = retained.finish_shutdown(deadline, cancellation).await?;
+        if complete {
+            let mut state = bounded_lock(&self.state, deadline, cancellation).await?;
+            if matches!(&*state, PaperState::Stopping(current) if Arc::ptr_eq(current, &retained)) {
+                *state = PaperState::Stopped {
+                    last_complete: Some(true),
+                };
+            } else {
+                return Err(ServiceError::Unavailable);
             }
         }
+        // An incomplete actual report remains owned and visible in Stopping. Subsequent callers
+        // resume this same continuation or exact hook cleanup; they cannot repeat a checkpoint.
+        Ok(complete)
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
@@ -1589,62 +1649,22 @@ impl PaperController {
             return result;
         }
         let _owner = bounded_lock(&self.owner_gate, deadline, &cleanup).await?;
-        let paper = self.stop_paper_before_owned(deadline, &cleanup).await;
-        let sources = self.market_runtime.finish_shutdown(deadline).await;
-        let result = match (paper, sources) {
-            (Ok(true), Ok(())) => Ok(()),
-            (Ok(false), Ok(())) => Err(ServiceError::Unavailable),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(_paper), Err(_sources)) => Err(ServiceError::Unavailable),
+        let result = match self.stop_paper_before_owned(deadline, &cleanup).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ServiceError::Unavailable),
+            Err(error) => Err(error),
         };
-        *shutdown = Some(result);
+        // MarketDomainService owns registry teardown after this retained paper barrier succeeds.
+        if result.is_ok() {
+            *shutdown = Some(result);
+        }
         result
-    }
-
-    async fn set_cleanup_required(
-        &self,
-        provider: PaperProvider,
-        surface_id: SourceIdentifier,
-        runtime_incarnation: NonZeroU64,
-        hook_generation: LiveActionHookGeneration,
-    ) {
-        *self.state.lock().await = PaperState::CleanupRequired {
-            provider,
-            surface_id,
-            runtime_incarnation,
-            hook_generation,
-        };
-    }
-
-    async fn set_stopped(&self, complete: Option<bool>) {
-        *self.state.lock().await = PaperState::Stopped {
-            last_complete: complete,
-        };
     }
 
     fn cleanup_deadline(&self) -> Result<Instant, ServiceError> {
         Instant::now()
             .checked_add(self.config.source_shutdown())
             .ok_or(ServiceError::Unavailable)
-    }
-
-    async fn reap_action_hooks_for_cleanup(
-        &self,
-        surface_id: &SourceIdentifier,
-        runtime_incarnation: NonZeroU64,
-        hook_generation: LiveActionHookGeneration,
-    ) -> Result<(), ServiceError> {
-        let cleanup = CancellationToken::new();
-        self.market_runtime
-            .reap_action_hooks(
-                surface_id,
-                runtime_incarnation,
-                hook_generation,
-                self.cleanup_deadline()?,
-                &cleanup,
-            )
-            .await
-            .map(|_receipt| ())
     }
 }
 
@@ -1773,7 +1793,7 @@ const fn manual_choice_is_compatible(order_type: OrderType, time_in_force: TimeI
 fn selected_target_price(
     request: &TypedToolRequest,
     field: &str,
-    target: &TargetState,
+    target: &ResolvedPaperTarget,
     terms: market_squawk_domain::InstrumentExecutionTerms,
     order_type: OrderType,
 ) -> Result<Option<(TargetLadderSelector, PriceTicks)>, ServiceError> {
@@ -1790,7 +1810,7 @@ fn selected_target_price(
         return Ok(None);
     };
     let selector = TargetLadderSelector::parse(selector)?;
-    let price = selector.price(target);
+    let price = target.price(selector)?;
     if price.currency() != terms.quote_currency() {
         return Err(ServiceError::InvalidRequest);
     }
@@ -1805,20 +1825,19 @@ fn target_currently_usable(target: &TargetState, now: Timestamp) -> bool {
         && now < target.target().target().expires_at()
 }
 
-/// Resolves the only active manual route that can trade an exact governed target.
+/// Resolves the only active manual route matching the original selected decision.
 ///
 /// A target never chooses a venue. More than one compatible route is ambiguous and therefore
 /// rejected rather than resolved by an incidental route order.
 fn sole_compatible_manual_route<'a>(
     runtime: &'a ProductionPaperBotRuntime,
-    target: &TargetState,
+    target: &ResolvedPaperTarget,
 ) -> Result<&'a crate::paper_bot::ManualPaperRoute, ServiceError> {
-    let target_core = target.target().target();
-    let reference_currency = target_core.reference_mark().price().currency();
+    let reference_currency = target.currency();
     let mut compatible = None;
     for route in runtime.manual_paper_routes() {
         let terms = route.execution_terms();
-        if route.route().instrument() != target_core.instrument_id()
+        if route.route().instrument() != target.instrument_id()
             || terms.quote_currency() != reference_currency
         {
             continue;
@@ -1828,6 +1847,21 @@ fn sole_compatible_manual_route<'a>(
         }
     }
     compatible.ok_or(ServiceError::InvalidRequest)
+}
+
+fn manual_paper_held_lots(
+    snapshot: &PaperExecutionSnapshot,
+    instrument: market_squawk_domain::InstrumentId,
+) -> Result<i64, ServiceError> {
+    let account = manual_paper_account_id().map_err(|_| ServiceError::Unavailable)?;
+    let mut matching = snapshot.positions().iter().filter(|position| {
+        position.instrument_id() == instrument && position.account_id() == account
+    });
+    let lots = matching.next().map_or(0, |position| position.lots());
+    if matching.next().is_some() {
+        return Err(ServiceError::Unavailable);
+    }
+    Ok(lots)
 }
 
 fn current_timestamp() -> Result<Timestamp, ServiceError> {
@@ -2006,6 +2040,7 @@ fn paper_start_preparation(currency: Currency) -> Result<Value, ServiceError> {
         return Err(ServiceError::Unavailable);
     }
     Ok(json!({
+        "availability": "ready",
         "virtualCashChoices": cash,
         "costChoices": costs,
         "modeChoices": modes,
@@ -2054,6 +2089,7 @@ fn manual_paper_preview(
     confirmation_token: &str,
     expires_at: Timestamp,
     instrument: &product::ProductInstrument,
+    target: &ResolvedPaperTarget,
     side: OrderSide,
     order_type: OrderType,
     quantity: QuantityLots,
@@ -2078,6 +2114,7 @@ fn manual_paper_preview(
         "confirmationToken": confirmation_token,
         "expiresAt": product::timestamp(expires_at),
         "investment": product::investment(instrument),
+        "provenance": product::manual_provenance(target)?,
         "direction": match side { OrderSide::Buy => "Buy", OrderSide::Sell => "Sell" },
         "orderApproach": match order_type { OrderType::Market => "Market", OrderType::Limit => "Limit", OrderType::Stop => "Stop", OrderType::StopLimit => "Stop limit" },
         "quantity": product::quantity(quantity, terms)?,
@@ -2136,7 +2173,6 @@ impl fmt::Debug for PaperController {
 impl Drop for PaperController {
     fn drop(&mut self) {
         self.begin_shutdown();
-        self.lifecycle.cancel();
     }
 }
 
@@ -2144,24 +2180,18 @@ enum PaperState {
     Stopped {
         last_complete: Option<bool>,
     },
-    CleanupRequired {
-        provider: PaperProvider,
-        surface_id: SourceIdentifier,
-        runtime_incarnation: NonZeroU64,
-        hook_generation: LiveActionHookGeneration,
-    },
     Starting {
         run_id: Uuid,
+        retained: Arc<shutdown::RetainedPaperRun>,
     },
     Running {
-        provider: PaperProvider,
         surface_id: SourceIdentifier,
         strategy_mode: PaperStrategyMode,
         runtime: Box<ProductionPaperBotRuntime>,
-        action_hooks: ActiveLiveActionHookGroup,
+        action_hooks: Option<ActiveLiveActionHookGroup>,
         cancellation: CancellationToken,
     },
-    Stopping,
+    Stopping(Arc<shutdown::RetainedPaperRun>),
 }
 
 #[derive(Default)]
@@ -2169,6 +2199,7 @@ struct ProductAuthorityTokens {
     orders: Vec<ProductOrderToken>,
     targets: Vec<ProductTargetToken>,
     start_preparations: Vec<ProductStartPreparation>,
+    account_preparations: Vec<account::ProductAccountPreparation>,
     manual_preparations: Vec<ProductManualPreparation>,
 }
 
@@ -2179,11 +2210,12 @@ struct ProductOrderToken {
 
 struct ProductTargetToken {
     token: Box<str>,
-    target_id: InvestmentTargetSetId,
-    revision: RevisionNumber,
+    selection: PaperTargetSelection,
 }
 
 struct PreparedPaperStart {
+    purpose: PaperMarketPurpose,
+    currency: Currency,
     origin: RequestOrigin,
     expires_at: Instant,
     initial_cash: Decimal,
@@ -2199,9 +2231,10 @@ struct ProductStartPreparation {
 struct PreparedManualPaper {
     origin: RequestOrigin,
     expires_at: Instant,
-    target_id: InvestmentTargetSetId,
-    target_revision: RevisionNumber,
-    target_sha256: [u8; 32],
+    selection: PaperTargetSelection,
+    target_reference: OrderTargetReference,
+    side: OrderSide,
+    quantity: QuantityLots,
     route: ShardKey,
     terms: InstrumentExecutionTerms,
     maximum_order_notional: Money,
@@ -2220,6 +2253,7 @@ impl ProductAuthorityTokens {
         self.orders.clear();
         self.targets.clear();
         self.start_preparations.clear();
+        self.account_preparations.clear();
         self.manual_preparations.clear();
     }
 
@@ -2298,6 +2332,8 @@ impl ProductAuthorityTokens {
     }
 
     fn prune_preparations(&mut self, now: Instant) {
+        self.account_preparations
+            .retain(|entry| entry.prepared.expires_at > now);
         self.start_preparations
             .retain(|entry| entry.prepared.expires_at > now);
         self.manual_preparations
@@ -2323,9 +2359,13 @@ impl ProductAuthorityTokens {
             )
             .map_err(|_| ServiceError::ResourceExhausted)?;
             if !self
-                .start_preparations
+                .account_preparations
                 .iter()
                 .any(|entry| entry.token == token)
+                && !self
+                    .start_preparations
+                    .iter()
+                    .any(|entry| entry.token == token)
                 && !self
                     .manual_preparations
                     .iter()
@@ -2373,15 +2413,11 @@ impl ProductAuthorityTokens {
         Ok(token)
     }
 
-    fn target_token(
-        &mut self,
-        target_id: &InvestmentTargetSetId,
-        revision: RevisionNumber,
-    ) -> Result<Box<str>, ServiceError> {
+    fn target_token(&mut self, selection: PaperTargetSelection) -> Result<Box<str>, ServiceError> {
         if let Some(existing) = self
             .targets
             .iter()
-            .find(|binding| binding.target_id == *target_id && binding.revision == revision)
+            .find(|binding| binding.selection == selection)
         {
             return Ok(existing.token.clone());
         }
@@ -2390,27 +2426,32 @@ impl ProductAuthorityTokens {
         }
         self.targets
             .try_reserve(1)
-            .map_err(|_error| ServiceError::ResourceExhausted)?;
-        let revision_text = revision.get().to_string();
-        let token = super::opaque_product_text_token(
-            "paper_target_",
-            b"market-squawk/product-paper-target/v1\0",
-            &[target_id.as_str().as_bytes(), revision_text.as_bytes()],
-            512,
-        )
-        .map_err(|_| ServiceError::ResourceExhausted)?;
-        if self.targets.iter().any(|binding| {
-            binding.token == token
-                && (binding.target_id != *target_id || binding.revision != revision)
-        }) {
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        let token = selection.token()?;
+        if self
+            .targets
+            .iter()
+            .any(|binding| binding.token == token && binding.selection != selection)
+        {
             return Err(ServiceError::Unavailable);
         }
         self.targets.push(ProductTargetToken {
             token: token.clone(),
-            target_id: target_id.clone(),
-            revision,
+            selection,
         });
         Ok(token)
+    }
+
+    fn resolve_target(&self, token: &str) -> Result<PaperTargetSelection, ServiceError> {
+        let mut matches = self
+            .targets
+            .iter()
+            .filter(|binding| binding.token.as_ref() == token);
+        let selected = matches.next().ok_or(ServiceError::NotFound)?;
+        if matches.next().is_some() {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(selected.selection.clone())
     }
 }
 
@@ -2430,12 +2471,11 @@ fn unique_preparation_index(
     resolved.ok_or(ServiceError::NotFound)
 }
 
-async fn bounded_runtime_shutdown(runtime: ProductionPaperBotRuntime) -> bool {
-    runtime.shutdown().await.is_complete()
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(super) enum PaperProvider {
+    VirtualEquity {
+        provider_session_id: Uuid,
+    },
     Public {
         provider: ProductionSourceProvider,
         onboarding_session_id: Uuid,
@@ -2451,6 +2491,14 @@ impl PaperProvider {
             .onboarding_session_id()
             .ok_or(ServiceError::Unavailable)?;
         match selection.surface_id().as_str() {
+            value
+                if value
+                    == super::market_runtime::AccountMarketSurface::AlpacaBasic.surface_id() =>
+            {
+                Ok(Self::VirtualEquity {
+                    provider_session_id: session_id,
+                })
+            }
             COINBASE_PUBLIC_SURFACE_ID => Ok(Self::Public {
                 provider: ProductionSourceProvider::Coinbase,
                 onboarding_session_id: session_id,
@@ -2468,6 +2516,9 @@ impl PaperProvider {
 
     fn surface_id(self) -> Result<SourceIdentifier, ServiceError> {
         let value = match self {
+            Self::VirtualEquity { .. } => {
+                super::market_runtime::AccountMarketSurface::AlpacaBasic.surface_id()
+            }
             Self::Public {
                 provider: ProductionSourceProvider::Coinbase,
                 ..
@@ -2488,6 +2539,9 @@ impl PaperProvider {
                 ..
             } => Some(onboarding_session_id),
             Self::CoinbaseDirect {
+                provider_session_id,
+            }
+            | Self::VirtualEquity {
                 provider_session_id,
             } => Some(provider_session_id),
         }
@@ -2551,7 +2605,40 @@ fn map_control_error(error: crate::paper_bot::ProductionPaperControlError) -> Se
             market_squawk_adapter_paper::PaperControlError::Adapter(error) => {
                 map_adapter_error(error)
             }
-            market_squawk_adapter_paper::PaperControlError::Closed
+            market_squawk_adapter_paper::PaperControlError::CorporateAction(error) => {
+                use market_squawk_adapter_paper::PaperLedgerError;
+
+                match error {
+                    PaperLedgerError::Capacity => ServiceError::ResourceExhausted,
+                    PaperLedgerError::InvalidConfiguration
+                    | PaperLedgerError::InvalidBootstrap
+                    | PaperLedgerError::UnknownAccountOrCurrency
+                    | PaperLedgerError::UnknownOrder
+                    | PaperLedgerError::DuplicateOrder
+                    | PaperLedgerError::InvalidQuantityOrPrice
+                    | PaperLedgerError::ExposureUnderflow
+                    | PaperLedgerError::TermsMismatch
+                    | PaperLedgerError::FeeCurrencyMismatch
+                    | PaperLedgerError::Overfill
+                    | PaperLedgerError::ReservationExceeded
+                    | PaperLedgerError::FeeExceedsNotional
+                    | PaperLedgerError::InvalidMark
+                    | PaperLedgerError::MarkRegression
+                    | PaperLedgerError::InvalidActionEvidence
+                    | PaperLedgerError::InvalidRecovery
+                    | PaperLedgerError::Fee(_) => ServiceError::InvalidResult,
+                    PaperLedgerError::InsufficientCash
+                    | PaperLedgerError::InsufficientPosition
+                    | PaperLedgerError::InsufficientCapital
+                    | PaperLedgerError::UnsupportedSettlement
+                    | PaperLedgerError::Overflow
+                    | PaperLedgerError::StaleMark
+                    | PaperLedgerError::FractionalActionInventory
+                    | PaperLedgerError::UnsupportedAction => ServiceError::Unavailable,
+                }
+            }
+            market_squawk_adapter_paper::PaperControlError::FinancialStateAdvanced
+            | market_squawk_adapter_paper::PaperControlError::Closed
             | market_squawk_adapter_paper::PaperControlError::WorkerFailed
             | market_squawk_adapter_paper::PaperControlError::ShutdownIncomplete
             | market_squawk_adapter_paper::PaperControlError::RecoveryInitializationUnavailable => {

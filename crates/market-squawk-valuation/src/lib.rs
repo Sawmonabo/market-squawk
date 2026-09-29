@@ -53,6 +53,15 @@ macro_rules! digest_id {
 /// Typed construction, classification, workflow, and bounded-service failures.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum FairValueError {
+    /// Request cancellation ended the source read or recovery operation.
+    #[error("fair-value operation was cancelled")]
+    Cancelled,
+    /// The actual request deadline elapsed during source read or recovery.
+    #[error("fair-value operation deadline elapsed")]
+    DeadlineExceeded,
+    /// An underlying bounded authority exhausted capacity without reporting exact counts.
+    #[error("fair-value operation resource capacity is exhausted")]
+    ResourceExhausted,
     /// A bounded actor identity is empty, too long, or contains forbidden characters.
     #[error("fair-value actor identity is invalid")]
     InvalidActorId,
@@ -161,6 +170,7 @@ mod approval;
 mod assessment;
 mod automatic;
 mod evidence;
+mod macro_assumptions;
 mod measurement;
 mod persistence;
 mod rules;
@@ -173,20 +183,35 @@ pub use approval::{
 };
 pub use assessment::{InputUseAssessment, InputUseAssessmentHash};
 pub use automatic::{
-    AutomaticValuationAssumption, AutomaticValuationAssumptionKind, AutomaticValuationCalculation,
-    AutomaticValuationConflict, AutomaticValuationError, AutomaticValuationIdentity,
-    AutomaticValuationInput, AutomaticValuationInputSetIdentity, AutomaticValuationIntermediate,
+    AnnualEquityArithmetic, AnnualEquityPremiumArithmetic, AutomaticValuationAssumption,
+    AutomaticValuationAssumptionKind, AutomaticValuationAttemptAudit,
+    AutomaticValuationCalculation, AutomaticValuationConflict, AutomaticValuationError,
+    AutomaticValuationFailure, AutomaticValuationForecastPurpose,
+    AutomaticValuationForecastReadAudit, AutomaticValuationIdentity, AutomaticValuationInput,
+    AutomaticValuationInputSetIdentity, AutomaticValuationIntermediate,
     AutomaticValuationIntermediateKind, AutomaticValuationMethod, AutomaticValuationMethodReceipt,
-    AutomaticValuationRange, AutomaticValuationUnavailable, AutomaticValuationUncertainty,
-    ComparableCompaniesValuationRequest, ComparableCompanyInput, DcfCashFlow,
-    DiscountedCashFlowValuationRequest, ForecastDistributionPoint,
-    ForecastDistributionValuationRequest, PointInTimeValuationInput, ResidualIncomePeriod,
+    AutomaticValuationMethodSetAudit, AutomaticValuationRange, CurrentShareValuationProjection,
+    AutomaticValuationRecommendationAudit, AutomaticValuationRecommendationOutcome,
+    AutomaticValuationResultAudit, AutomaticValuationStage, AutomaticValuationUnavailable,
+    AutomaticValuationUncertainty, ComparableCompaniesValuationRequest, ComparableCompanyInput,
+    ComparablePeerArithmetic, ComparableValueArithmetic, DcfCashFlow, DcfTerminalGrowthAudit,
+    DcfTerminalGrowthPolicy, DiscountedCashFlowValuationRequest, EQUITY_PREMIUM_ESTIMATOR,
+    EQUITY_PREMIUM_SAMPLE_YEARS, ForecastDistributionPoint, ForecastDistributionValuationRequest,
+    ForecastOutcomeArithmetic, ForecastValueArithmetic, ModeledGovernmentAnnualReturn,
+    PointInTimeValuationInput, ResidualIncomePeriod, ResidualIncomeTerminalAudit,
+    ResidualIncomeTerminalConvention, ResidualIncomeTerminalReceipt,
     ResidualIncomeValuationRequest, ValuationArithmeticPolicy, ValuationRightsReceipt,
     calculate_comparable_companies, calculate_discounted_cash_flow,
     calculate_forecast_distribution, calculate_residual_income,
 };
 pub use evidence::{
     EvidenceOrigin, EvidenceVerification, FairValueEvidence, FairValueEvidenceHash,
+    ForecastValuationEvidence, ForecastValuationOriginIdentity, ForecastValuationReference,
+    ForecastValuationResolver, ForecastValuationSource, ForecastValuationValueSelection,
+};
+pub use macro_assumptions::{
+    FinancialModelMacroAssumptions, MacroRateMaturity, MacroRateReferenceEvidence,
+    automatic_assumptions_identity,
 };
 pub use measurement::{
     ActorId, CommittedMarketInputRequest, InputId, InputInstrumentRelation, InputObservability,

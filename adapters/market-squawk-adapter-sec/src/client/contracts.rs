@@ -176,6 +176,7 @@ impl SecObjectLocator {
 #[derive(Clone, Debug)]
 pub struct RetrievedSecBytes {
     pub(super) bytes: Bytes,
+    retained_body_bytes: usize,
     pub(super) evidence: EvidenceDigest,
     pub(super) received_at: Timestamp,
     pub(super) availability: AvailabilityEvidence,
@@ -185,6 +186,29 @@ pub struct RetrievedSecBytes {
 }
 
 impl RetrievedSecBytes {
+    pub(crate) fn checked_retained_bytes(&self) -> Result<usize, SecClientError> {
+        let availability = match &self.availability {
+            AvailabilityEvidence::Evidenced { evidence, .. } => evidence.retained_bytes(),
+            AvailabilityEvidence::Inferred { method, .. } => method.retained_bytes(),
+            _ => 0,
+        };
+        let receipt = self
+            .capture_receipt
+            .as_ref()
+            .map(ProviderCaptureSetReceipt::checked_plain_retained_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        // Keep the observed Vec capacity across its immutable Bytes conversion. The two Bytes
+        // headers conservatively cover the shared backing control block on the pinned toolchain.
+        std::mem::size_of::<Self>()
+            .checked_add(self.retained_body_bytes)
+            .and_then(|n| n.checked_add(2 * std::mem::size_of::<Bytes>()))
+            .and_then(|n| n.checked_add(self.locator.as_ref().map_or(0, String::capacity)))
+            .and_then(|n| n.checked_add(availability))
+            .and_then(|n| n.checked_add(receipt))
+            .ok_or(SecClientError::ResponseTooLarge)
+    }
+
     /// Returns exact decoded response bytes persisted in the raw store.
     pub fn bytes(&self) -> &Bytes {
         &self.bytes
@@ -257,6 +281,7 @@ impl RetrievedSecBytes {
         retrieval_revision: u64,
     ) -> Self {
         Self {
+            retained_body_bytes: bytes.capacity(),
             bytes: Bytes::from(bytes),
             evidence,
             received_at,
@@ -276,6 +301,7 @@ impl RetrievedSecBytes {
         capture_receipt: ProviderCaptureSetReceipt,
     ) -> Self {
         Self {
+            retained_body_bytes: bytes.capacity(),
             bytes: Bytes::from(bytes),
             evidence,
             received_at: first_observed_at,
@@ -292,6 +318,7 @@ impl RetrievedSecBytes {
         received_at: Timestamp,
     ) -> Self {
         Self {
+            retained_body_bytes: bytes.len(),
             bytes: Bytes::copy_from_slice(bytes),
             evidence,
             received_at,
@@ -308,6 +335,7 @@ impl RetrievedSecBytes {
         available_at: Timestamp,
     ) -> Self {
         Self {
+            retained_body_bytes: bytes.capacity(),
             bytes: Bytes::from(bytes),
             evidence,
             received_at: available_at,
@@ -334,6 +362,26 @@ pub struct RetrievedSubmissions {
 }
 
 impl RetrievedSubmissions {
+    pub(crate) fn checked_retained_bytes(&self) -> Result<usize, SecClientError> {
+        let mut retained = std::mem::size_of::<Self>()
+            .checked_add(self.document.checked_retained_bytes()?)
+            .and_then(|n| {
+                n.checked_add(
+                    self.components
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<RetrievedSecBytes>())?,
+                )
+            })
+            .and_then(|n| n.checked_add(self.raw.checked_retained_bytes().ok()?))
+            .ok_or(SecClientError::ResponseTooLarge)?;
+        for component in &self.components {
+            retained = retained
+                .checked_add(component.checked_retained_bytes()?)
+                .ok_or(SecClientError::ResponseTooLarge)?;
+        }
+        Ok(retained)
+    }
+
     pub(crate) fn new(
         document: SubmissionsDocument,
         raw: RetrievedSecBytes,
@@ -418,6 +466,7 @@ impl RetrievedCompanyFacts {
         Ok(Self {
             document,
             raw: RetrievedSecBytes {
+                retained_body_bytes: bytes.capacity(),
                 bytes: Bytes::from(bytes),
                 evidence,
                 received_at,

@@ -64,7 +64,8 @@ const ONE_SECOND_NANOS: u64 = 1_000_000_000;
 const ONE_DAY_NANOS: u64 = 86_400_000_000_000;
 
 /// One exact provider annotation coordinate used by a reviewed missing-value interpretation.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusAnnotationMatch {
     variable: SourceIdentifier,
     raw: String,
@@ -106,7 +107,8 @@ impl CensusAnnotationMatch {
 /// The canonical marker must be the exact text of one member annotation and its reason must be
 /// that member's exact annotation-variable identity. Other annotations remain in the publication
 /// binding, so this mapping never erases evidence even when several provider flags are present.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusAnnotatedMissingRule {
     annotations: Box<[CensusAnnotationMatch]>,
     missing: MacroMissingValue,
@@ -170,7 +172,8 @@ impl CensusAnnotatedMissingRule {
 }
 
 /// One explicit provider-variable to canonical macro-series mapping.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusVariableMapping {
     provider_variable: SourceIdentifier,
     series_namespace: SourceIdentifier,
@@ -257,8 +260,9 @@ impl CensusVariableMapping {
 }
 
 /// Exact rule for obtaining a canonical effective coordinate.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "coordinate")]
+#[serde(deny_unknown_fields)]
 pub enum CensusEffectiveTimePolicy {
     /// Every response row must carry a supported `time` value.
     RequireReportedTime,
@@ -351,6 +355,102 @@ impl CensusDatasetContract {
         })
     }
 
+    /// Revalidates retained query, mapping and effective-time evidence through the original constructors.
+    pub fn validate(&self) -> Result<(), CensusSourceError> {
+        let query: CensusDataQuery = serde_json::from_value(
+            serde_json::to_value(&self.query).map_err(|_| CensusSourceError::Protocol)?,
+        )
+        .map_err(|_| CensusSourceError::Protocol)?;
+        let mut mappings = Vec::with_capacity(self.mappings.len());
+        for mapping in self.mappings.values() {
+            let mut rules = Vec::with_capacity(mapping.annotated_missing_rules.len());
+            for rule in mapping.annotated_missing_rules.iter() {
+                let annotations = rule
+                    .annotations
+                    .iter()
+                    .map(|annotation| {
+                        CensusAnnotationMatch::try_new(
+                            annotation.variable.clone(),
+                            annotation.raw.clone(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                rules.push(CensusAnnotatedMissingRule::try_new(
+                    annotations,
+                    rule.missing.clone(),
+                )?);
+            }
+            mappings.push(CensusVariableMapping::try_new_with_annotated_missing(
+                mapping.provider_variable.clone(),
+                mapping.series_namespace.clone(),
+                mapping.unit.clone(),
+                rules,
+            )?);
+        }
+        if Self::try_new(query, mappings, self.effective_time.clone())? != *self {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_publication_binding(
+        &self,
+        binding: &crate::CensusCanonicalObservationBinding,
+    ) -> Result<(), CensusSourceError> {
+        let mapping = self
+            .mapping(binding.provider_variable())
+            .ok_or(CensusSourceError::Protocol)?;
+        let time_matches = match self.effective_time_policy() {
+            CensusEffectiveTimePolicy::Fixed(coordinate) => {
+                binding.reported_time().is_none() && coordinate == binding.effective_time()
+            }
+            CensusEffectiveTimePolicy::RequireReportedTime => binding.reported_time().is_some(),
+        };
+        let geography = crate::CensusGeographyValue::from_retained_json(
+            &serde_json::to_value(binding.geography()).map_err(|_| CensusSourceError::Protocol)?,
+        )?;
+        if geography != *binding.geography()
+            || binding.row_digest().bytes()
+                != crate::response::row_digest(
+                    &self.query,
+                    binding.provider_variable(),
+                    binding.value_state(),
+                    binding.geography(),
+                    binding.predicates(),
+                    binding.reported_time(),
+                    binding.metadata_digest().bytes(),
+                )?
+            || binding.family_digest().bytes()
+                != crate::response::family_digest(
+                    &self.query,
+                    binding.provider_variable(),
+                    binding.geography(),
+                    binding.predicates(),
+                    binding.reported_time(),
+                )?
+            || binding.dataset() != self.query.dataset()
+            || !time_matches
+            || binding.canonical_unit() != mapping.unit()
+            || binding.canonical_series()
+                != &scoped_series_coordinate(
+                    mapping.series_namespace(),
+                    binding.dataset().path(),
+                    binding.provider_variable(),
+                    binding.geography(),
+                    binding.predicates(),
+                )?
+            || binding.canonical_source_identifier().as_str()
+                != format!(
+                    "census:v1:family:{}:content:{}",
+                    lower_hex(binding.family_digest().bytes()),
+                    lower_hex(binding.content_digest().bytes())
+                )
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(())
+    }
+
     /// Returns the exact provider-query dataset identity used by extraction requests.
     pub const fn dataset_id(&self) -> &SourceIdentifier {
         &self.dataset_id
@@ -386,6 +486,30 @@ impl CensusDatasetContract {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for CensusDatasetContract {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let decode = || -> Result<Self, CensusSourceError> {
+            let field = |name: &str| value.get(name).cloned().ok_or(CensusSourceError::Protocol);
+            let mappings: BTreeMap<SourceIdentifier, CensusVariableMapping> =
+                serde_json::from_value(field("mappings")?)
+                    .map_err(|_| CensusSourceError::Protocol)?;
+            let contract = Self::try_new(
+                serde_json::from_value(field("query")?).map_err(|_| CensusSourceError::Protocol)?,
+                mappings.into_values(),
+                serde_json::from_value(field("effective_time")?)
+                    .map_err(|_| CensusSourceError::Protocol)?,
+            )?;
+            contract.validate()?;
+            if serde_json::to_value(&contract).map_err(|_| CensusSourceError::Protocol)? != value {
+                return Err(CensusSourceError::Protocol);
+            }
+            Ok(contract)
+        };
+        decode().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Bounded immutable set of admitted Census query contracts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CensusSourceConfig {
@@ -411,6 +535,9 @@ impl CensusSourceConfig {
             .any(|pair| pair[0].dataset_id == pair[1].dataset_id)
         {
             return Err(CensusSourceError::InvalidConfiguration);
+        }
+        for contract in &contracts {
+            contract.validate()?;
         }
         let configuration_digest = census_configuration_digest(&contracts, parse_limits)?;
         Ok(Self {
@@ -1284,7 +1411,11 @@ impl CensusSource {
                     deadline,
                     cancellation.clone(),
                 )
-                .await?;
+                .await
+                .inspect_err(|error| {
+                    trace_census_extraction_failure("metadata_fetch", error);
+                    tracing::warn!(kind = ?std::mem::discriminant(request.kind()), "Census metadata request failed");
+                })?;
             let document = match CensusDiscoveryDocument::parse(
                 request,
                 &response.body,
@@ -1293,6 +1424,12 @@ impl CensusSource {
                 Ok(document) => document,
                 Err(error) => {
                     self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        stage = "metadata_parse",
+                        kind = ?std::mem::discriminant(request.kind()),
+                        cause = ?std::mem::discriminant(&error),
+                        "Census acquisition failed"
+                    );
                     return Err(map_adapter_error(error));
                 }
             };
@@ -1319,8 +1456,9 @@ impl CensusSource {
                 latency: response.latency,
             });
         }
-        if let Err(error) = validate_metadata_bundle(contract, &documents) {
+        if let Err(error) = validate_metadata_bundle(contract, &documents, self.effective_parse_limits()) {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+            trace_census_failure("metadata_admission", &error);
             return Err(map_source_error(error));
         }
         let content_digest = metadata_bundle_digest(contract, &documents);
@@ -1364,7 +1502,8 @@ impl CensusSource {
                 deadline,
                 cancellation,
             )
-            .await?;
+            .await
+            .inspect_err(|error| trace_census_extraction_failure("data_fetch", error))?;
         let provisional_clocks = CensusClocks::local_first_observed(
             response.received_at,
             response.received_at,
@@ -1384,6 +1523,7 @@ impl CensusSource {
             Ok(page) => page,
             Err(error) => {
                 self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                trace_census_failure("data_parse", &error);
                 return Err(map_adapter_error(error));
             }
         };
@@ -1439,12 +1579,15 @@ impl CensusSource {
     ) -> Result<CensusDatasetAcquisition, ExtractionSourceError> {
         let metadata = self
             .acquire_metadata(authority, provider_dataset, deadline, cancellation.clone())
-            .await?;
+            .await
+            .inspect_err(|error| trace_census_extraction_failure("metadata_acquisition", error))?;
         let data = self
             .acquire_data(authority, &metadata, deadline, cancellation)
-            .await?;
+            .await
+            .inspect_err(|error| trace_census_extraction_failure("data_acquisition", error))?;
         if !data.page().completeness().is_complete() {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+            trace_census_failure("data_incomplete", &SourceError::InvalidProtocolState);
             return Err(invalid_protocol());
         }
         let telemetry = metadata
@@ -1722,6 +1865,7 @@ impl CensusSource {
             Ok(response) => response,
             Err(error) => {
                 self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                trace_census_failure("transport", &error);
                 return Err(map_source_error(error));
             }
         };
@@ -1735,6 +1879,14 @@ impl CensusSource {
         if let Err(error) = in_flight.validate_response_size(response_bytes) {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
             return Err(error.into());
+        }
+        if response.status != 200 || response.key_error {
+            tracing::warn!(
+                stage = "response_status",
+                status = response.status,
+                key_error = response.key_error,
+                "Census acquisition failed"
+            );
         }
         if response.key_error {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
@@ -1774,10 +1926,12 @@ impl CensusSource {
             || !content_type_is_json(response.content_type.as_deref())
         {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+            trace_census_failure("response_media", &SourceError::InvalidProtocolState);
             return Err(invalid_protocol());
         }
         if response.body.is_empty() {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+            trace_census_failure("response_empty", &SourceError::InvalidProtocolState);
             return Err(invalid_protocol());
         }
         let body_digest = evidence_digest(sha256(&response.body));
@@ -1971,6 +2125,7 @@ fn discovery_evidence(document: &CensusDiscoveryDocument) -> &CensusMetadataEvid
 fn validate_metadata_bundle(
     contract: &CensusDatasetContract,
     documents: &[CensusCapturedDiscovery],
+    limits: CensusParseLimits,
 ) -> Result<(), CensusSourceError> {
     if documents.len() != contract.metadata_requests().len()
         || documents
@@ -2071,6 +2226,52 @@ fn validate_metadata_bundle(
     {
         return Err(CensusSourceError::Protocol);
     }
+    // QWI documents positive limits as category cardinalities, and time as an
+    // alternative to separate year/quarter predicates. Other datasets keep their
+    // existing admission rules until their native semantics are established.
+    let dataset = contract.query().dataset();
+    let qwi = dataset.vintage() == CensusDatasetVintage::TimeSeries
+        && matches!(dataset.path(), [family, endpoint]
+            if family == "qwi" && matches!(endpoint.as_str(), "sa" | "se" | "rh"));
+    let qwi_time = qwi && contract.query().time().is_some();
+    if qwi_time {
+        let valid_point = |point| {
+            matches!(
+                point,
+                crate::CensusTimePoint::Year { .. } | crate::CensusTimePoint::Quarter { .. }
+            )
+        };
+        let valid_time = match contract.query().time().ok_or(CensusSourceError::Protocol)? {
+            crate::CensusTimePredicate::At { point } => valid_point(point),
+            crate::CensusTimePredicate::From { start } => valid_point(start),
+            crate::CensusTimePredicate::To { end } => valid_point(end),
+            crate::CensusTimePredicate::Range { start, end } => {
+                valid_point(start) && valid_point(end)
+            }
+        };
+        if !valid_time || predicate_coordinates.contains("year") || predicate_coordinates.contains("quarter") {
+            return Err(CensusSourceError::Protocol);
+        }
+    }
+    let supplied_by_time = |variable: &crate::CensusVariableMetadata| {
+        qwi_time
+            && matches!(variable.name().as_str(), "year" | "quarter")
+            && variable.predicate_type() == &CensusPredicateType::Integer
+    };
+    if qwi {
+        // Count every selected column and the full declared category sizes, not
+        // only requested predicate values. Overflow and native/parser excess fail closed.
+        let ceiling = u64::try_from(limits.max_cells()).map_err(|_| CensusSourceError::Protocol)?.min(400_000);
+        let mut cells = u64::try_from(get_coordinates.len()).map_err(|_| CensusSourceError::Protocol)?;
+        for coordinate in &get_coordinates {
+            let variable = selected_variables.get(coordinate).ok_or(CensusSourceError::Protocol)?;
+            let cardinality = variable.provider_limit().filter(|limit| *limit != 0).unwrap_or(1);
+            cells = cells.checked_mul(cardinality).ok_or(CensusSourceError::Protocol)?;
+            if cells > ceiling {
+                return Err(CensusSourceError::Protocol);
+            }
+        }
+    }
     let is_predicate_coordinate = |variable: &crate::CensusVariableMetadata| match (
         variable.predicate_type(),
         contract.query().geography(),
@@ -2095,12 +2296,13 @@ fn validate_metadata_bundle(
         let in_get = get_coordinates.contains(variable.name().as_str());
         let in_predicate = is_predicate_coordinate(variable);
         let referenced = in_get || in_predicate;
-        if referenced && variable.provider_limit().is_some_and(|limit| limit != 0) {
+        if !qwi && referenced && variable.provider_limit().is_some_and(|limit| limit != 0) {
             return Err(CensusSourceError::Protocol);
         }
         match variable.required() {
             CensusRequiredVariable::Required => {
-                if usize::from(in_get) + usize::from(in_predicate) != 1 {
+                let occurrences = usize::from(in_get) + usize::from(in_predicate);
+                if occurrences != 1 && !(occurrences == 0 && supplied_by_time(variable)) {
                     return Err(CensusSourceError::Protocol);
                 }
             }
@@ -2122,7 +2324,7 @@ fn validate_metadata_bundle(
     for variable in full_variables.variables() {
         let in_get = get_coordinates.contains(variable.name().as_str());
         let in_predicate = is_predicate_coordinate(variable);
-        if (in_get
+        if !qwi && (in_get
             || in_predicate
             || matches!(
                 variable.required(),
@@ -2134,7 +2336,8 @@ fn validate_metadata_bundle(
         }
         match variable.required() {
             CensusRequiredVariable::Required => {
-                if usize::from(in_get) + usize::from(in_predicate) != 1 {
+                let occurrences = usize::from(in_get) + usize::from(in_predicate);
+                if occurrences != 1 && !(occurrences == 0 && supplied_by_time(variable)) {
                     return Err(CensusSourceError::Protocol);
                 }
             }
@@ -2599,6 +2802,9 @@ fn census_native_lineage(
         batch,
     )
     .map_err(|_| invalid_protocol())?;
+    native_lineage
+        .try_set_batch_sidecar(plan)
+        .map_err(|_| invalid_protocol())?;
     for observation in plan.observations() {
         native_lineage
             .try_push(&CensusNativeLineageRowV1 {
@@ -2615,6 +2821,82 @@ fn census_native_lineage(
             .map_err(|_| invalid_protocol())?;
     }
     native_lineage.finish().map_err(|_| invalid_protocol())
+}
+
+impl crate::CensusPublicationPlan {
+    /// Verifies selected canonical meaning against the original durable response plan.
+    /// Catalog-selected revision numbers remain owned by the existing revision authority.
+    pub fn validate_canonical_observation(
+        &self,
+        ordinal: usize,
+        observation: &MacroObservation,
+    ) -> Result<(), CensusSourceError> {
+        let binding = self
+            .observations()
+            .get(ordinal)
+            .ok_or(CensusSourceError::Protocol)?;
+        let mapping = self
+            .dataset_contract()
+            .mapping(binding.provider_variable())
+            .ok_or(CensusSourceError::Protocol)?;
+        let provenance = observation.context().provenance();
+        let value_matches = match binding.value_state() {
+            CensusValueState::Observed { value } => {
+                observation.value().observed_value() == Some(canonical_decimal(value)?)
+            }
+            CensusValueState::Missing {
+                reason,
+                annotations,
+            } => {
+                observation.value().missing_value()
+                    == Some(&canonical_missing(mapping, *reason, annotations)?)
+            }
+            _ => false,
+        };
+        if !value_matches
+            || observation.series() != binding.canonical_series()
+            || observation.unit() != binding.canonical_unit()
+            || observation.context().time().effective() != binding.effective_time()
+            || provenance.source_id() != self.source_id()
+            || provenance.source_identifier() != binding.canonical_source_identifier()
+            || provenance.received_at() != binding.clocks().received_at()
+            || provenance.ingested_at() != binding.clocks().ingested_at()
+            || provenance.availability().conservative_available_at()
+                != binding.clocks().availability().conservative_available_at()
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(())
+    }
+
+    /// Checks a verified original row against its exact response-wide publication binding.
+    /// This does not grant catalog, read, or acquisition authority.
+    pub fn validate_native_row(
+        &self,
+        ordinal: usize,
+        payload: &[u8],
+    ) -> Result<(), CensusSourceError> {
+        let observation = self
+            .observations()
+            .get(ordinal)
+            .ok_or(CensusSourceError::Protocol)?;
+        let expected = serde_json::to_vec(&CensusNativeLineageRowV1 {
+            dataset: observation.dataset(),
+            provider_variable: observation.provider_variable(),
+            label: observation.variable_label(),
+            concept: observation.concept(),
+            group: observation.group(),
+            geography: observation.geography(),
+            predicates: observation.predicates(),
+            reported_time: observation.reported_time(),
+            value_state: observation.value_state(),
+        })
+        .map_err(|_| CensusSourceError::Protocol)?;
+        if expected != payload {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(())
+    }
 }
 
 fn combined_capture_material(
@@ -2659,7 +2941,7 @@ fn census_capture_graph_identity_from_receipts(
     let mut digest = Sha256::new();
     crate::update_digest_component(
         &mut digest,
-        b"market-squawk/census-metadata-data-request-graph/v1",
+        b"market-squawk/census-metadata-data-request-graph/v2",
     );
     crate::update_digest_component(&mut digest, metadata.source_id().as_str().as_bytes());
     crate::update_digest_component(
@@ -2686,7 +2968,7 @@ fn census_capture_graph_identity_from_receipts(
         }
         crate::update_digest_component(&mut digest, &receipt.request_set_identity().bytes());
         crate::update_digest_component(&mut digest, &receipt.content_digest().bytes());
-        crate::update_digest_component(&mut digest, &receipt.observation_digest().bytes());
+        // The sealed receipt retains its receive clock; it is not part of source content.
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
@@ -2987,11 +3269,27 @@ fn scoped_series(
     mapping: &CensusVariableMapping,
     observation: &crate::CensusObservation,
 ) -> Result<SourceIdentifier, CensusSourceError> {
-    let stable_scope = serde_json::to_vec(&(
+    scoped_series_coordinate(
+        mapping.series_namespace(),
         observation.dataset().path(),
         observation.variable(),
-        observation.geography().canonical_row_identity_digest(),
+        observation.geography(),
         observation.predicates(),
+    )
+}
+
+fn scoped_series_coordinate(
+    namespace: &SourceIdentifier,
+    path: &[String],
+    variable: &SourceIdentifier,
+    geography: &crate::CensusGeographyValue,
+    predicates: &[crate::CensusPredicateValue],
+) -> Result<SourceIdentifier, CensusSourceError> {
+    let stable_scope = serde_json::to_vec(&(
+        path,
+        variable,
+        geography.canonical_row_identity_digest(),
+        predicates,
     ))
     .map_err(|_| CensusSourceError::Protocol)?;
     let mut digest = Sha256::new();
@@ -3003,10 +3301,353 @@ fn scoped_series(
     let stable_scope_digest: [u8; 32] = digest.finalize().into();
     SourceIdentifier::try_from(format!(
         "{}:scope:{}",
-        mapping.series_namespace(),
+        namespace,
         lower_hex(stable_scope_digest)
     ))
     .map_err(|_| CensusSourceError::Protocol)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RetainedCensusVintage {
+    Year(u16),
+    TimeSeries,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedCensusDataset {
+    vintage: RetainedCensusVintage,
+    path: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedCensusPredicate {
+    variable: SourceIdentifier,
+    predicate_type: serde_json::Value,
+    values: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "precision", deny_unknown_fields)]
+enum RetainedCensusTime {
+    Year {
+        year: u16,
+    },
+    Month {
+        year: u16,
+        month: u8,
+    },
+    Quarter {
+        year: u16,
+        quarter: u8,
+    },
+    CalendarDate {
+        date: market_squawk_domain::CalendarDate,
+    },
+    ProviderPeriod {
+        value: SourceIdentifier,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedCensusMacroRow {
+    dataset: RetainedCensusDataset,
+    provider_variable: SourceIdentifier,
+    label: String,
+    concept: Option<String>,
+    group: Option<SourceIdentifier>,
+    geography: serde_json::Value,
+    predicates: Vec<RetainedCensusPredicate>,
+    reported_time: Option<RetainedCensusTime>,
+    value_state: serde_json::Value,
+}
+
+/// Exact provider coordinate recovered from one verified original Census native row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CensusNativeMacroCoordinate {
+    series: SourceIdentifier,
+    dataset: crate::CensusDataset,
+    variable: SourceIdentifier,
+    geography: crate::CensusGeographyValue,
+    predicates: Box<[crate::CensusPredicateValue]>,
+    reported_time: Option<crate::CensusReportedTime>,
+    label: String,
+}
+
+impl CensusNativeMacroCoordinate {
+    /// Returns the neutral series for the namespace supplied at decode time.
+    pub const fn series(&self) -> &SourceIdentifier {
+        &self.series
+    }
+
+    /// Reuses the publication identity for another configured mapping namespace.
+    pub fn series_for_namespace(
+        &self,
+        namespace: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, CensusSourceError> {
+        scoped_series_coordinate(
+            namespace,
+            self.dataset.path(),
+            &self.variable,
+            &self.geography,
+            &self.predicates,
+        )
+    }
+
+    /// Returns the exact provider dataset and vintage.
+    pub const fn dataset(&self) -> &crate::CensusDataset {
+        &self.dataset
+    }
+
+    /// Returns the provider variable.
+    pub const fn variable(&self) -> &SourceIdentifier {
+        &self.variable
+    }
+
+    /// Returns the exact row geography.
+    pub const fn geography(&self) -> &crate::CensusGeographyValue {
+        &self.geography
+    }
+
+    /// Returns exact non-geographic row coordinates.
+    pub fn predicates(&self) -> &[crate::CensusPredicateValue] {
+        &self.predicates
+    }
+
+    /// Returns the provider period at its original precision.
+    pub const fn reported_time(&self) -> Option<&crate::CensusReportedTime> {
+        self.reported_time.as_ref()
+    }
+
+    /// Returns the source label of the provider variable.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// Decodes a bounded original native row and recomputes its neutral series identity.
+/// The caller must first verify the sealed original generation and compare `series()`
+/// with the selected canonical observation; this decoder does not grant read authority.
+pub fn decode_census_native_macro_coordinate(
+    payload: &[u8],
+    series_namespace: &SourceIdentifier,
+) -> Result<CensusNativeMacroCoordinate, CensusSourceError> {
+    if payload.is_empty() || payload.len() > 64 * 1024 {
+        return Err(CensusSourceError::Protocol);
+    }
+    let raw: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|_| CensusSourceError::Protocol)?;
+    let required = [
+        "dataset", "provider_variable", "label", "concept", "group", "geography",
+        "predicates", "reported_time", "value_state",
+    ];
+    if raw.as_object().is_none_or(|fields| {
+        fields.len() != required.len() || required.iter().any(|key| !fields.contains_key(*key))
+    }) {
+        return Err(CensusSourceError::Protocol);
+    }
+    let row: RetainedCensusMacroRow =
+        serde_json::from_value(raw.clone()).map_err(|_| CensusSourceError::Protocol)?;
+    let RetainedCensusMacroRow {
+        dataset: retained_dataset,
+        provider_variable: variable,
+        label,
+        concept: _,
+        group: _,
+        geography: retained_geography,
+        predicates: retained_predicates,
+        reported_time: retained_time,
+        value_state,
+    } = row;
+    if label.is_empty()
+        || label.len() > CensusParseLimits::default().max_string_bytes()
+        || label.chars().any(char::is_control)
+        || !value_state.is_object()
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    let path = retained_dataset.path.join("/");
+    let dataset = match retained_dataset.vintage {
+        RetainedCensusVintage::Year(year) => crate::CensusDataset::try_new(year, &path)
+            .map_err(|_| CensusSourceError::Protocol)?,
+        RetainedCensusVintage::TimeSeries => crate::CensusDataset::try_time_series(&path)
+            .map_err(|_| CensusSourceError::Protocol)?,
+    };
+    if raw.get("dataset")
+        != Some(&serde_json::to_value(&dataset).map_err(|_| CensusSourceError::Protocol)?)
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    let geography = crate::CensusGeographyValue::from_retained_json(&retained_geography)
+        .map_err(|_| CensusSourceError::Protocol)?;
+    let mut predicates = Vec::new();
+    let mut seen = BTreeSet::new();
+    for retained in retained_predicates {
+        if !seen.insert(retained.variable.clone()) {
+            return Err(CensusSourceError::Protocol);
+        }
+        let predicate_type = [
+            CensusPredicateType::String,
+            CensusPredicateType::Integer,
+            CensusPredicateType::Float,
+        ]
+        .into_iter()
+        .find(|kind| serde_json::to_value(kind).is_ok_and(|value| value == retained.predicate_type))
+        .ok_or(CensusSourceError::Protocol)?;
+        let predicate = crate::CensusPredicate::try_new(
+            retained.variable.as_str(),
+            predicate_type,
+            &retained.values,
+        )
+        .map_err(|_| CensusSourceError::Protocol)?;
+        let coordinate = crate::CensusPredicateValue::from_validated_predicate(&predicate);
+        if !coordinate.is_exact() {
+            return Err(CensusSourceError::Protocol);
+        }
+        predicates.push(coordinate);
+    }
+    if raw.get("predicates")
+        != Some(&serde_json::to_value(&predicates).map_err(|_| CensusSourceError::Protocol)?)
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    let reported_time = match retained_time {
+        None => None,
+        Some(RetainedCensusTime::Year { year }) if (1000..=9999).contains(&year) => {
+            Some(crate::CensusReportedTime::Year { year })
+        }
+        Some(RetainedCensusTime::Month { year, month })
+            if (1000..=9999).contains(&year) && (1..=12).contains(&month) =>
+        {
+            Some(crate::CensusReportedTime::Month { year, month })
+        }
+        Some(RetainedCensusTime::Quarter { year, quarter })
+            if (1000..=9999).contains(&year) && (1..=4).contains(&quarter) =>
+        {
+            Some(crate::CensusReportedTime::Quarter { year, quarter })
+        }
+        Some(RetainedCensusTime::CalendarDate { date }) => {
+            Some(crate::CensusReportedTime::CalendarDate { date })
+        }
+        Some(RetainedCensusTime::ProviderPeriod { value }) => {
+            Some(crate::CensusReportedTime::ProviderPeriod { value })
+        }
+        Some(_) => return Err(CensusSourceError::Protocol),
+    };
+    if raw.get("reported_time")
+        != Some(&serde_json::to_value(&reported_time).map_err(|_| CensusSourceError::Protocol)?)
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    let series = scoped_series_coordinate(
+        series_namespace,
+        dataset.path(),
+        &variable,
+        &geography,
+        &predicates,
+    )?;
+    Ok(CensusNativeMacroCoordinate {
+        series,
+        dataset,
+        variable,
+        geography,
+        predicates: predicates.into_boxed_slice(),
+        reported_time,
+        label,
+    })
+}
+
+/// Identifies the admitted QWI dataset family before bounded per-series neutral selection.
+/// This does not grant read authority; callers must already hold verified original lineage.
+pub fn census_native_is_qwi_dataset(payload: &[u8]) -> Result<bool, CensusSourceError> {
+    if payload.is_empty() || payload.len() > 64 * 1024 {
+        return Err(CensusSourceError::Protocol);
+    }
+    let row: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|_| CensusSourceError::Protocol)?;
+    let dataset = crate::CensusDataset::try_time_series("qwi/sa")?;
+    let expected = serde_json::to_value(dataset).map_err(|_| CensusSourceError::Protocol)?;
+    Ok(row.get("dataset") == Some(&expected))
+}
+
+/// Decodes the retained California total beginning-of-quarter employment coordinate.
+/// The original canonical identity uses the same helper as publication, never a display alias.
+pub fn decode_census_qwi_employment_series(
+    payload: &[u8],
+) -> Result<Option<SourceIdentifier>, CensusSourceError> {
+    if payload.is_empty() || payload.len() > 64 * 1024 {
+        return Err(CensusSourceError::Protocol);
+    }
+    let row: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|_| CensusSourceError::Protocol)?;
+    let expected_predicates = vec![
+        crate::CensusPredicateValue::from_validated_predicate(&crate::CensusPredicate::try_new(
+            "agegrp",
+            crate::CensusPredicateType::String,
+            ["A00"],
+        )?),
+        crate::CensusPredicateValue::from_validated_predicate(&crate::CensusPredicate::try_new(
+            "sex",
+            crate::CensusPredicateType::String,
+            ["0"],
+        )?),
+    ];
+    let dataset = crate::CensusDataset::try_time_series("qwi/sa")?;
+    let geography = crate::CensusGeographyValue::Standard {
+        scope: crate::CensusGeographyScope::Aggregate,
+        components: vec![crate::response::CensusGeographyComponent::retained_state(
+            "06",
+        )?],
+        fully_qualified_geoid: None,
+        name: None,
+    };
+    let expected_geography =
+        serde_json::to_value(&geography).map_err(|_| CensusSourceError::Protocol)?;
+    let expected_dataset =
+        serde_json::to_value(&dataset).map_err(|_| CensusSourceError::Protocol)?;
+    let expected_predicate_value =
+        serde_json::to_value(&expected_predicates).map_err(|_| CensusSourceError::Protocol)?;
+    if row.get("dataset") != Some(&expected_dataset)
+        || row
+            .get("provider_variable")
+            .and_then(serde_json::Value::as_str)
+            != Some("Emp")
+        || row.get("predicates") != Some(&expected_predicate_value)
+        || row.pointer("/geography/kind") != expected_geography.get("kind")
+        || row.pointer("/geography/scope") != expected_geography.get("scope")
+        || row.pointer("/geography/components") != expected_geography.get("components")
+    {
+        return Ok(None);
+    }
+    if row
+        .pointer("/reported_time/precision")
+        .and_then(serde_json::Value::as_str)
+        != Some("quarter")
+        || !row
+            .pointer("/reported_time/year")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|year| (1000..=9999).contains(&year))
+        || !row
+            .pointer("/reported_time/quarter")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|quarter| (1..=4).contains(&quarter))
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    let namespace = SourceIdentifier::try_from("macro.employment.beginning-quarter")
+        .map_err(|_| CensusSourceError::Protocol)?;
+    let variable = SourceIdentifier::try_from("Emp").map_err(|_| CensusSourceError::Protocol)?;
+    scoped_series_coordinate(
+        &namespace,
+        dataset.path(),
+        &variable,
+        &geography,
+        &expected_predicates,
+    )
+    .map(Some)
 }
 
 fn parse_lower_hex(value: &str) -> Result<[u8; 32], ExtractionSourceError> {
@@ -3036,6 +3677,22 @@ fn lower_hex(bytes: [u8; 32]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+// Diagnostics are restricted to code-owned stages and enum discriminants, never payloads.
+fn trace_census_failure<T>(stage: &'static str, error: &T) {
+    tracing::warn!(stage, cause = ?std::mem::discriminant(error), "Census acquisition failed");
+}
+
+fn trace_census_extraction_failure(stage: &'static str, error: &ExtractionSourceError) {
+    match error {
+        ExtractionSourceError::Source(cause) => trace_census_failure(stage, cause),
+        ExtractionSourceError::Contract(cause) => trace_census_failure(stage, cause),
+        ExtractionSourceError::Authority(cause) => trace_census_failure(stage, cause),
+        ExtractionSourceError::DeadlineExceeded | ExtractionSourceError::Cancelled => {
+            trace_census_failure(stage, error);
+        }
+    }
 }
 
 fn invalid_protocol() -> ExtractionSourceError {

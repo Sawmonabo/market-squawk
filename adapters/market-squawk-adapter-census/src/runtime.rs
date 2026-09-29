@@ -299,15 +299,16 @@ fn validate_doctor_capture(
 }
 
 /// Exact role and order of one raw response needed by a Census publication.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "ordinal")]
+#[serde(deny_unknown_fields)]
 pub enum CensusCaptureRole {
     /// One complete ordered graph: public metadata responses followed by credentialed data.
     CompleteMetadataAndDataGraph,
 }
 
 /// One exact raw-capture dependency that must be sealed before canonical publication.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CensusCaptureBinding {
     ordinal: u32,
@@ -363,7 +364,7 @@ impl CensusCaptureBinding {
 }
 
 /// Full provider identity bound to one ordered canonical macro observation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CensusCanonicalObservationBinding {
     canonical_ordinal: u64,
@@ -543,7 +544,7 @@ impl CensusCanonicalObservationBinding {
 
 /// All exact raw, native-identity, canonical, and shared-quota evidence required before
 /// publishing one immutable Census generation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CensusPublicationPlan {
     schema_version: u16,
@@ -557,6 +558,11 @@ pub struct CensusPublicationPlan {
     metadata_bundle_digest: EvidenceDigest,
     data_response_digest: EvidenceDigest,
     extraction_content_digest: EvidenceDigest,
+    dataset_contract: CensusDatasetContract,
+    response_header: Box<[SourceIdentifier]>,
+    response_accounting: crate::CensusResponseAccounting,
+    response_clocks: CensusClocks,
+    response_pagination: crate::CensusPagination,
     prepared_at: Timestamp,
     captures: Box<[CensusCaptureBinding]>,
     observations: Box<[CensusCanonicalObservationBinding]>,
@@ -564,6 +570,176 @@ pub struct CensusPublicationPlan {
 }
 
 impl CensusPublicationPlan {
+    /// Returns the exact acquisition contract retained with this immutable publication.
+    pub const fn dataset_contract(&self) -> &CensusDatasetContract {
+        &self.dataset_contract
+    }
+
+    /// Returns the full returned response header, including noncanonical columns.
+    pub fn response_header(&self) -> &[SourceIdentifier] {
+        &self.response_header
+    }
+
+    /// Returns provider-wide accounting; canonical rows can be a strict mapped subset.
+    pub const fn response_accounting(&self) -> &crate::CensusResponseAccounting {
+        &self.response_accounting
+    }
+
+    /// Returns the response-wide local receipt, decode, ingestion, and availability clocks.
+    pub const fn response_clocks(&self) -> &CensusClocks {
+        &self.response_clocks
+    }
+
+    /// Returns the complete single-response data pagination contract.
+    pub const fn response_pagination(&self) -> crate::CensusPagination {
+        self.response_pagination
+    }
+
+    /// Reopens value-only evidence from the existing digest-bound native batch sidecar.
+    /// The caller must first physically verify the original capture binding through the catalog.
+    /// This never constructs a publication candidate, capture token, or live source authority.
+    pub fn try_from_retained_payload(
+        payload: &[u8],
+        capture: &ProviderCaptureSetReceipt,
+        extraction_content_digest: EvidenceDigest,
+    ) -> Result<Self, CensusSourceError> {
+        if payload.is_empty()
+            || payload.len() > market_squawk_sources::MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        let plan: Self =
+            serde_json::from_slice(payload).map_err(|_| CensusSourceError::Protocol)?;
+        plan.validate()?;
+        plan.validate_retained_capture(capture, extraction_content_digest)?;
+        Ok(plan)
+    }
+
+    /// Verifies unchanged publication meaning across independently validated acquisitions.
+    ///
+    /// Each plan must be reopened against its own retained capture and extraction identity before
+    /// comparison. Only local acquisition clocks and the identities derived from those clocks may
+    /// differ; this value-only comparison grants no live capture, rights, or publication authority.
+    pub fn validate_reobservation_of(mut self, original: &Self) -> Result<(), CensusSourceError> {
+        self.validate()?;
+        original.validate()?;
+        if self.captures.len() != original.captures.len()
+            || self.observations.len() != original.observations.len()
+            || self.prepared_at < original.prepared_at
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        validate_reobservation_clocks(&self.response_clocks, &original.response_clocks)?;
+        for (fresh, retained) in self.captures.iter_mut().zip(original.captures.iter()) {
+            if fresh.received_at < retained.received_at {
+                return Err(CensusSourceError::Protocol);
+            }
+            fresh.received_at = retained.received_at;
+            fresh.observation_digest = retained.observation_digest;
+        }
+        for (fresh, retained) in self
+            .observations
+            .iter_mut()
+            .zip(original.observations.iter())
+        {
+            validate_reobservation_clocks(&fresh.clocks, &retained.clocks)?;
+            fresh.clocks = retained.clocks.clone();
+        }
+        // Normalize only validated acquisition evidence in this consumed temporary value. Whole
+        // plan equality retains every stable field, including fields added to the plan later.
+        self.response_clocks = original.response_clocks.clone();
+        self.prepared_at = original.prepared_at;
+        self.extraction_content_digest = original.extraction_content_digest;
+        self.publication_identity = original.publication_identity;
+        if self != *original {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(())
+    }
+
+    fn validate_retained_capture(
+        &self,
+        capture: &ProviderCaptureSetReceipt,
+        extraction_content_digest: EvidenceDigest,
+    ) -> Result<(), CensusSourceError> {
+        let expected = self.captures.first().ok_or(CensusSourceError::Protocol)?;
+        let metadata = self.dataset_contract.metadata_requests();
+        if capture.source_id() != &self.source_id
+            || capture.metadata_revision().as_source_identifier() != &self.metadata_revision
+            || capture.dataset() != &self.provider_dataset
+            || capture.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            || capture.request_set_identity() != expected.request_digest
+            || capture.content_digest() != expected.content_digest
+            || capture.observation_digest() != expected.observation_digest
+            || capture.total_body_bytes() != expected.response_bytes
+            || capture.request_graph_components().len() != metadata.len() + 1
+            || capture.pages().len() != metadata.len() + 1
+            || capture.pages().len() != expected.component_count as usize
+            || extraction_content_digest != self.extraction_content_digest
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        let mut metadata_hash = Sha256::new();
+        metadata_hash.update(b"market-squawk/census-metadata-bundle/v1");
+        metadata_hash.update(self.dataset_contract.query().request_digest());
+        metadata_hash.update((metadata.len() as u64).to_be_bytes());
+        for (index, (component, page)) in capture
+            .request_graph_components()
+            .iter()
+            .zip(capture.pages())
+            .enumerate()
+        {
+            let request_digest = metadata
+                .get(index)
+                .map(|request| evidence_digest(request.request_digest()))
+                .unwrap_or(self.query_digest);
+            if component.source_id() != &self.source_id
+                || component.metadata_revision().as_source_identifier() != &self.metadata_revision
+                || component.dataset() != &self.provider_dataset
+                || component.ordinal() as usize != index
+                || component.first_page_ordinal() as usize != index
+                || component.page_count().get() != 1
+                || component.request_set_identity() != request_digest
+                || page.request_identity() != request_digest
+            {
+                return Err(CensusSourceError::Protocol);
+            }
+            if index < metadata.len() {
+                metadata_hash.update(request_digest.bytes());
+                metadata_hash.update(page.body_digest().bytes());
+            }
+        }
+        let data = capture.pages().last().ok_or(CensusSourceError::Protocol)?;
+        let variable_metadata_index = if self
+            .dataset_contract
+            .query()
+            .selection()
+            .group_id()
+            .is_some()
+        {
+            3
+        } else {
+            2
+        };
+        let variable_metadata_digest = capture
+            .pages()
+            .get(variable_metadata_index)
+            .ok_or(CensusSourceError::Protocol)?
+            .body_digest();
+        if evidence_digest(metadata_hash.finalize().into()) != self.metadata_bundle_digest
+            || data.body_digest() != self.data_response_digest
+            || data.received_at() != expected.received_at
+            || data.received_at() != self.response_clocks.received_at()
+            || self
+                .observations
+                .iter()
+                .any(|row| row.metadata_digest() != variable_metadata_digest)
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(())
+    }
+
     /// Returns source identity.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
@@ -631,7 +807,29 @@ impl CensusPublicationPlan {
 
     /// Recomputes the complete plan identity and structural ordering.
     pub fn validate(&self) -> Result<(), CensusSourceError> {
-        if self.schema_version != CENSUS_RUNTIME_SCHEMA_VERSION
+        self.dataset_contract.validate()?;
+        self.response_accounting
+            .validate_complete(self.response_header.len(), self.observations.len())?;
+        if self.dataset_contract.dataset_id() != &self.provider_dataset
+            || self.dataset_contract.analytical_dataset_id() != &self.analytical_dataset
+            || evidence_digest(self.dataset_contract.query().request_digest()) != self.query_digest
+            || self.response_pagination
+                != (crate::CensusPagination::SingleResponse { request_count: 1 })
+            || self.response_clocks.ingested_at() != self.prepared_at
+            || self.observations.iter().any(|binding| {
+                binding.clocks() != &self.response_clocks
+                    || self
+                        .dataset_contract
+                        .validate_publication_binding(binding)
+                        .is_err()
+            })
+            || self
+                .response_header
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.response_header.len()
+            || self.schema_version != CENSUS_RUNTIME_SCHEMA_VERSION
             || self.captures.len() != 1
             || self.observations.is_empty()
             || self.captures[0].role != CensusCaptureRole::CompleteMetadataAndDataGraph
@@ -707,6 +905,20 @@ impl CensusPublicationCandidate {
             .persisted_segment_receipt(0)
             .ok_or(CensusSourceError::Protocol)?;
         validate_sealed_capture(&plan, sealed_capture, &activation)?;
+        let retained = native_lineage
+            .batch_sidecar()
+            .ok_or(CensusSourceError::Protocol)?;
+        if serde_json::to_vec(&plan)
+            .map_err(|_| CensusSourceError::Protocol)?
+            .as_slice()
+            != retained.semantic_payload()
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        plan.validate_retained_capture(sealed_capture.capture(), plan.extraction_content_digest)?;
+        for (ordinal, row) in native_lineage.rows().iter().enumerate() {
+            plan.validate_native_row(ordinal, row.semantic_payload())?;
+        }
         let canonical_schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
             .map_err(|_| CensusSourceError::Protocol)?;
         let canonical_schema_version = SchemaVersion::CURRENT;
@@ -869,6 +1081,32 @@ impl CensusPublicationCandidate {
     }
 }
 
+fn validate_reobservation_clocks(
+    fresh: &CensusClocks,
+    original: &CensusClocks,
+) -> Result<(), CensusSourceError> {
+    let (
+        market_squawk_domain::AvailabilityEvidence::LocalFirstObserved {
+            observed_at: fresh_at,
+        },
+        market_squawk_domain::AvailabilityEvidence::LocalFirstObserved {
+            observed_at: original_at,
+        },
+    ) = (fresh.availability(), original.availability())
+    else {
+        return Err(CensusSourceError::Protocol);
+    };
+    if *fresh_at != fresh.received_at()
+        || *original_at != original.received_at()
+        || fresh.received_at() < original.received_at()
+        || fresh.decoded_at() < original.decoded_at()
+        || fresh.ingested_at() < original.ingested_at()
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    Ok(())
+}
+
 fn valid_publication_binding(
     plan: &CensusPublicationPlan,
     binding: &CensusCanonicalObservationBinding,
@@ -878,6 +1116,7 @@ fn valid_publication_binding(
         .first()
         .is_some_and(|first| binding.dataset() == first.dataset())
         && binding.geography().scope() != CensusGeographyScope::Unknown
+        && binding.predicates().iter().all(CensusPredicateValue::is_exact)
         && binding.family_digest().algorithm() == DigestAlgorithm::Sha256
         && binding.family_digest().bytes() != [0; 32]
         && binding.content_digest().algorithm() == DigestAlgorithm::Sha256
@@ -1186,6 +1425,16 @@ pub(crate) fn build_publication_plan(
         metadata_bundle_digest: evidence_digest(acquisition.metadata().content_digest()),
         data_response_digest: evidence_digest(acquisition.data().page().response_payload_digest()),
         extraction_content_digest: extraction.digest(),
+        dataset_contract: contract.clone(),
+        response_header: acquisition
+            .data()
+            .page()
+            .header()
+            .to_vec()
+            .into_boxed_slice(),
+        response_accounting: acquisition.data().page().accounting().clone(),
+        response_clocks: acquisition.data().page().clocks().clone(),
+        response_pagination: acquisition.data().page().pagination(),
         prepared_at: acquisition.data().page().clocks().ingested_at(),
         captures: capture_bindings,
         observations,
@@ -1211,6 +1460,11 @@ fn publication_identity(plan: &CensusPublicationPlan) -> Result<EvidenceDigest, 
         metadata_bundle_digest: EvidenceDigest,
         data_response_digest: EvidenceDigest,
         extraction_content_digest: EvidenceDigest,
+        dataset_contract: &'a CensusDatasetContract,
+        response_header: &'a [SourceIdentifier],
+        response_accounting: &'a crate::CensusResponseAccounting,
+        response_clocks: &'a CensusClocks,
+        response_pagination: crate::CensusPagination,
         prepared_at: Timestamp,
         captures: &'a [CensusCaptureBinding],
         observations: &'a [CensusCanonicalObservationBinding],
@@ -1229,6 +1483,11 @@ fn publication_identity(plan: &CensusPublicationPlan) -> Result<EvidenceDigest, 
             metadata_bundle_digest: plan.metadata_bundle_digest,
             data_response_digest: plan.data_response_digest,
             extraction_content_digest: plan.extraction_content_digest,
+            dataset_contract: &plan.dataset_contract,
+            response_header: &plan.response_header,
+            response_accounting: &plan.response_accounting,
+            response_clocks: &plan.response_clocks,
+            response_pagination: plan.response_pagination,
             prepared_at: plan.prepared_at,
             captures: &plan.captures,
             observations: &plan.observations,

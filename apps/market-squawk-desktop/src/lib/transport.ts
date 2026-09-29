@@ -2,6 +2,7 @@ import type {
   AnalyticalControllerRequest,
   AnalyticalControllerResponse,
 } from "@/features/advanced/analytical-profile-contracts"
+import type { MarketSessionReference, MarketSessionRequest } from "@/features/markets/market-product"
 import type {
   ApplicationResult,
   DesktopBootstrap,
@@ -71,6 +72,8 @@ export type ProductQuery =
       categories?: ProductLookupCategory[]
     }
   | { query: "marketOverview"; pageToken?: string }
+  | ({ query: "marketSessionContext"; confirmed: boolean } & MarketSessionRequest)
+  | { query: "marketSessionRead"; reference: MarketSessionReference }
   | { query: "analysisSettings" }
   | { query: "marketUniverse"; text: string; pageToken?: string }
   | {
@@ -296,9 +299,32 @@ export type ModelProductRequest =
 export type BacktestProductRequest =
   | { action: "list" }
   | { action: "get"; backtestToken: string }
+  | { action: "recommendationStudy"; actionToken: string }
+
+export type RecommendationSetupRequest =
+  | { action: "status" }
+  | {
+      action: "preview"
+      expectedRevision: number
+      accountId: string
+      allocationProfile: {
+        preferredPositionWeightLowerBps: number
+        preferredPositionWeightUpperBps: number
+        minimumCashReserve: { amount: string; currency: string }
+        maximumDownsideLossBpsOfMarkedEquity: number
+        availableInvestmentHorizonDays: number
+      }
+    }
+  | { action: "commit"; previewId: string; previewDigest: string }
+
 
 export interface ProductTransport {
+  recommendationSetup(request: RecommendationSetupRequest, confirmed?: boolean): Promise<ApplicationResult>
   query(request: ProductQuery): Promise<ApplicationResult>
+  analyticalController(
+    request: AnalyticalControllerRequest,
+    confirmed?: boolean,
+  ): Promise<AnalyticalControllerResponse>
   modelProducts(request: ModelProductRequest): Promise<ApplicationResult>
   backtestProducts(request: BacktestProductRequest): Promise<ApplicationResult>
   datasetPreparation(
@@ -372,10 +398,6 @@ export interface SystemTransport {
     confirmed?: boolean,
   ): Promise<InstallationControlResult>
   systemQuery(request: SystemQuery): Promise<NativeEvidenceApplicationResult>
-  analyticalController(
-    request: AnalyticalControllerRequest,
-    confirmed?: boolean,
-  ): Promise<AnalyticalControllerResponse>
   researchControl(
     request: ResearchControlRequest,
     confirmed?: boolean,
@@ -559,6 +581,8 @@ export type DecisionControlRequest =
       screenRevision: number
       datasetManifest: Record<string, unknown>
       asOf: string
+      calendarReference: Record<string, unknown>
+      financialProfile: Record<string, unknown>
     }
   | { action: "prepareDossier"; draft: Record<string, unknown> }
   | { action: "createDossier"; receiptId: string }
@@ -635,9 +659,13 @@ export type FairValueControlRequest =
     }
 
 export type PaperControlRequest =
+  | { action: "accountPreparation" }
+  | { action: "prepareAccount"; cashChoice: string; costChoice: string; currencyChoice: string }
+  | { action: "createAccount"; confirmationToken: string }
   | { action: "startPreparation" }
   | {
       action: "prepareStart"
+      marketChoice: string
       cashChoice: string
       costChoice: string
       modeChoice: string
@@ -659,7 +687,7 @@ export type ManualPaperTargetLevel =
   | "upside"
 
 export type ManualPaperRequest =
-  | { action: "targets" }
+  | { action: "targets"; analysisActionToken?: string }
   | {
       action: "prepareManual"
       targetToken: string

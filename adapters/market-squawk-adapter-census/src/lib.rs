@@ -24,7 +24,7 @@ pub use discovery::{
 pub use doctor::{
     CENSUS_DOCTOR_MAX_RESPONSE_BYTES, CENSUS_DOCTOR_TIMEOUT, CensusDoctorOutput,
     CensusDoctorRateHeaderEvidence, CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope,
-    CensusPendingDoctorSeal,
+    CensusPendingDoctorSeal, doctor_query as census_doctor_query, validate_census_doctor_response,
 };
 pub use policy::{CensusRateDeclarationError, census_provider_rate_declaration};
 pub use query::{
@@ -54,6 +54,8 @@ pub use source::{
     CensusSourceError, CensusSourceTelemetry, CensusVariableMapping,
     MAX_CENSUS_ANNOTATED_MISSING_RULES, MAX_CENSUS_ANNOTATION_RULE_BYTES,
     MAX_CENSUS_ANNOTATIONS_PER_RULE, MAX_CENSUS_CONFIGURED_DATASETS, census_api_endpoint_rules,
+    census_native_is_qwi_dataset, decode_census_native_macro_coordinate,
+    decode_census_qwi_employment_series, CensusNativeMacroCoordinate,
 };
 
 /// A Census contract, request, metadata, or response failure.

@@ -14,8 +14,9 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_bea::{
-    BeaDoctorAdmissionEvidence, BeaProviderQuotaDeclaration, BeaPublicationCandidate,
-    BeaPublicationError, BeaRequiredSharedSettlement, BeaSource, BeaSourceError,
+    BeaDoctorAdmissionEvidence, BeaDoctorRefreshDisposition, BeaProviderQuotaDeclaration,
+    BeaPublicationCandidate, BeaPublicationError, BeaRequiredSharedSettlement,
+    BeaSealedDiscoveryAdmission, BeaSource, BeaSourceError,
 };
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
@@ -27,12 +28,15 @@ use market_squawk_data::{
     ProviderMacroPlanSemantics, QueryLimits, SourceOperation,
 };
 use market_squawk_domain::{EvidenceDigest, ResearchPeriod, SourceId, SourceIdentifier, Timestamp};
-use market_squawk_services::{RequestContext, ServiceError};
+use market_squawk_services::{
+    RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolResult,
+};
 use market_squawk_sources::{
     DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRequest,
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
     ProviderNativeLineageImplementation, SourceMetadata, SourceMetadataProvider,
 };
+use serde_json::json;
 use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -59,7 +63,6 @@ pub(crate) struct BeaRegionalLiveRequest {
     seal_deadline: Instant,
     maximum_records: NonZeroU32,
     maximum_canonical_bytes: NonZeroU64,
-    series_allowlist: AnalyticalMacroSeriesAllowlist,
     knowledge_cutoff: Timestamp,
     effective_period_cutoff: ResearchPeriod,
     query_limits: QueryLimits,
@@ -79,7 +82,6 @@ impl BeaRegionalLiveRequest {
         seal_deadline: Instant,
         maximum_records: NonZeroU32,
         maximum_canonical_bytes: NonZeroU64,
-        series_allowlist: AnalyticalMacroSeriesAllowlist,
         knowledge_cutoff: Timestamp,
         effective_period_cutoff: ResearchPeriod,
         query_limits: QueryLimits,
@@ -92,7 +94,6 @@ impl BeaRegionalLiveRequest {
             seal_deadline,
             maximum_records,
             maximum_canonical_bytes,
-            series_allowlist,
             knowledge_cutoff,
             effective_period_cutoff,
             query_limits,
@@ -120,6 +121,7 @@ impl BeaRegionalLiveComposition {
         Ok(Self {
             registered_source: BeaRegisteredSource {
                 source: Arc::clone(&source),
+                generation: generation.clone(),
             },
             runtime: BeaRegionalLiveRuntime {
                 coordinator,
@@ -149,6 +151,21 @@ impl std::fmt::Debug for BeaRegionalLiveComposition {
 /// Registry-facing wrapper sharing the exact concrete source with the rich BEA runtime.
 pub(crate) struct BeaRegisteredSource {
     source: Arc<BeaSource>,
+    generation: ResearchProviderRuntimeGeneration,
+}
+
+impl BeaRegisteredSource {
+    pub(super) const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.generation
+    }
+}
+
+/// Original nonclone source admission moved into the existing single-use receipt owner.
+/// The paired expiry comes from the exact doctor commitment checked after physical sealing.
+#[derive(Debug)]
+pub(super) struct BeaRetainedDiscovery {
+    pub(super) admission: BeaSealedDiscoveryAdmission,
+    pub(super) expires_at: Timestamp,
 }
 
 impl std::fmt::Debug for BeaRegisteredSource {
@@ -187,6 +204,13 @@ impl ExtractionSource for BeaRegisteredSource {
 }
 
 impl ManagedResearchExtractionSource for BeaRegisteredSource {
+    fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
+        let [contract] = self.source.config().contracts() else {
+            return None;
+        };
+        Some(contract.dataset_id())
+    }
+
     fn rights_subject(
         &self,
         dataset: &SourceIdentifier,
@@ -231,6 +255,14 @@ impl ManagedResearchExtractionSource for BeaRegisteredSource {
             .map(Some)
             .map_err(|_error| ResearchRevisionPlanError)
     }
+}
+
+/// Original metadata coordinates embedded in the physically verified native batch sidecar.
+#[derive(serde::Deserialize)]
+struct BeaMetadataCaptureIdentity {
+    metadata_capture_observation_digest: [u8; 32],
+    metadata_sealed_receipt_digest: [u8; 32],
+    metadata_physical_receipt_digest: [u8; 32],
 }
 
 /// Application-owned BEA physical sealing, publication, and typed-read coordinator.
@@ -284,7 +316,8 @@ impl BeaMacroApplicationClosure {
         source: &BeaSource,
         authority: &ExtractionAuthority,
         provider_dataset: &SourceIdentifier,
-        acquisition_deadline: Timestamp,
+        doctor_deadline: Timestamp,
+        required_through: Timestamp,
         seal_deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<BeaDoctorActivationState, BeaMacroApplicationError> {
@@ -294,11 +327,21 @@ impl BeaMacroApplicationClosure {
                 BeaUnavailableDto::invalid_quota(quota),
             ));
         }
+        if let Some(admission) =
+            source.current_doctor_admission(provider_dataset, required_through)?
+        {
+            return Ok(BeaDoctorActivationState::Available(
+                BeaDoctorActivationDto {
+                    admission,
+                    refresh: BeaDoctorRefreshDisposition::ReusedCurrent,
+                },
+            ));
+        }
         let doctor = source
             .doctor(
                 authority,
                 provider_dataset,
-                acquisition_deadline,
+                doctor_deadline,
                 cancellation.clone(),
             )
             .await?;
@@ -319,9 +362,9 @@ impl BeaMacroApplicationClosure {
         {
             return Err(BeaMacroApplicationError::DoctorAuthorityMismatch);
         }
-        source.activate_doctor(Arc::clone(&admission))?;
+        let refresh = source.activate_doctor(Arc::clone(&admission))?;
         Ok(BeaDoctorActivationState::Available(
-            BeaDoctorActivationDto { admission },
+            BeaDoctorActivationDto { admission, refresh },
         ))
     }
 
@@ -332,6 +375,7 @@ impl BeaMacroApplicationClosure {
         persist_reservation: IngestReservation,
         application_precommit_authority: Arc<dyn IngestPrecommitAuthority>,
         cancellation: CancellationToken,
+        additional: Option<&dyn super::ResearchIngestCommitAuthority>,
     ) -> Result<BeaMacroPlanPublication, BeaMacroApplicationError> {
         application_precommit_authority.validate_precommit()?;
         let BeaPreparedRegionalMacroPlan {
@@ -348,6 +392,9 @@ impl BeaMacroApplicationClosure {
                 application_precommit_authority,
             )
             .await?;
+        if let Some(additional) = additional {
+            additional.commit_succeeded();
+        }
         let restart_selector = receipt.restart_selector();
         let reopened = self
             .research
@@ -357,6 +404,74 @@ impl BeaMacroApplicationClosure {
             return Err(BeaMacroApplicationError::RestartVerificationMismatch);
         }
         Ok(BeaMacroPlanPublication { receipt, reopened })
+    }
+
+    async fn verify_original_captures(
+        &self,
+        manifest: market_squawk_data::DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), BeaMacroApplicationError> {
+        self.research
+            .read_provider_capture_generation(
+                manifest,
+                deadline,
+                cancellation,
+                move |generation, _store, _control, _analytical, cancellation| {
+                    if cancellation.is_cancelled() {
+                        return Err(IngestError::Cancelled.into());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(IngestError::DeadlineExceeded.into());
+                    }
+                    if generation.objects().is_empty() {
+                        return Err(IngestError::InvalidProviderMacroPlan.into());
+                    }
+                    for object in generation.objects() {
+                        if object.inputs().is_empty() {
+                            return Err(IngestError::InvalidProviderMacroPlan.into());
+                        }
+                        for input in object.inputs() {
+                            if cancellation.is_cancelled() {
+                                return Err(IngestError::Cancelled.into());
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(IngestError::DeadlineExceeded.into());
+                            }
+                            let native = input.binding().native_lineage();
+                            if native.implementation() != "bea_regional_v1" {
+                                return Err(IngestError::InvalidProviderMacroPlan.into());
+                            }
+                            let identity: BeaMetadataCaptureIdentity = serde_json::from_slice(
+                                native
+                                    .batch_sidecar_semantic_payload()
+                                    .ok_or(IngestError::InvalidProviderMacroPlan)?,
+                            )
+                            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+                            let metadata = input
+                                .metadata_capture()
+                                .ok_or(IngestError::InvalidProviderMacroPlan)?;
+                            let physical = input
+                                .metadata_physical_claim()
+                                .ok_or(IngestError::InvalidProviderMacroPlan)?;
+                            let sealed = input
+                                .metadata_sealed_receipt_digest()
+                                .ok_or(IngestError::InvalidProviderMacroPlan)?;
+                            if metadata.observation_digest().bytes()
+                                != identity.metadata_capture_observation_digest
+                                || physical.physical_receipt_digest().bytes()
+                                    != identity.metadata_physical_receipt_digest
+                                || sealed.bytes() != identity.metadata_sealed_receipt_digest
+                            {
+                                return Err(IngestError::InvalidProviderMacroPlan.into());
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     /// Reopens one exact generation and performs the fixed provider-period PIT read.
@@ -384,6 +499,8 @@ impl BeaMacroApplicationClosure {
         {
             return Err(BeaMacroApplicationError::RestartVerificationMismatch);
         }
+        self.verify_original_captures(restart_selector.manifest().clone(), deadline, &cancellation)
+            .await?;
         let output = self
             .research
             .analytical_reader()
@@ -409,6 +526,24 @@ impl BeaMacroApplicationClosure {
     }
 }
 
+impl ProductionResearchIngestCoordinator {
+    /// Reopens one exact BEA generation through the application-owned research service.
+    ///
+    /// This is deliberately credential-free: restart consumers supply only the immutable
+    /// selector and fixed typed point-in-time request assembled by the provider activation lane.
+    pub(crate) async fn read_bea_provider_period_latest_known(
+        &self,
+        request: BeaProviderPeriodLatestKnownRequest,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<BeaMacroCapabilityState, BeaMacroApplicationError> {
+        BeaMacroApplicationClosure::new(Arc::clone(&self.research))
+            .read_provider_period_latest_known(request, limits, deadline, cancellation)
+            .await
+    }
+}
+
 /// Callable BEA Regional source through exact raw sealing, immutable publication, and PIT read.
 pub(crate) struct BeaRegionalLiveRuntime {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
@@ -420,10 +555,11 @@ pub(crate) struct BeaRegionalLiveRuntime {
 impl BeaRegionalLiveRuntime {
     /// Runs one complete bounded Regional producer-to-consumer journey.
     ///
-    /// Metadata and data requests use only the registry-minted extraction authority. Both the
-    /// doctor graph and the publication graph are physically sealed before they can authorize the
-    /// next transition. Canonicalization remains adapter-owned, so provider publication,
-    /// effective, availability, and receipt clocks pass through unchanged. Success is returned
+    /// Metadata and data requests use only the registry-minted extraction authority. A current
+    /// sealed metadata admission is reused without a provider call; each publication then acquires
+    /// and seals exactly one fresh observation response. Canonicalization remains adapter-owned,
+    /// so provider publication, effective, availability, and receipt clocks pass through unchanged.
+    /// Success is returned
     /// only after the exact immutable manifest reopens and its provider-period PIT read completes.
     pub(crate) async fn publish_and_read(
         &self,
@@ -456,6 +592,7 @@ impl BeaRegionalLiveRuntime {
                 &operation.extraction(),
                 &request.provider_dataset,
                 doctor_deadline,
+                acquisition_deadline,
                 seal_deadline,
                 cancellation.clone(),
             )
@@ -467,10 +604,10 @@ impl BeaRegionalLiveRuntime {
         {
             return Err(BeaLivePublicationError::SourceGenerationMismatch);
         }
+        let (doctor_admission, refresh) = doctor.into_parts();
         operation.ensure_live()?;
         ensure_not_cancelled(&cancellation)?;
-
-        let discovery = DiscoveryRequest::try_new(
+        let discovery_request = DiscoveryRequest::try_new(
             request.provider_dataset.clone(),
             None,
             NonZeroU16::MIN,
@@ -478,11 +615,15 @@ impl BeaRegionalLiveRuntime {
         )?;
         let discovered = self
             .source
-            .discover_captured(operation.extraction(), discovery, cancellation.clone())
+            .discover_captured(
+                operation.extraction(),
+                discovery_request,
+                cancellation.clone(),
+            )
             .await?;
         let (pending_discovery, seal_request) = discovered.into_sealing_parts()?;
-        // The provider response completed before this point. Preserve the exact response graph
-        // even when caller cancellation races the bounded physical seal.
+        // The provider response completed before this point. Preserve its exact raw evidence even
+        // when caller cancellation races the bounded physical seal.
         let raw_seal = CancellationToken::new();
         let sealed = self
             .coordinator
@@ -508,13 +649,24 @@ impl BeaRegionalLiveRuntime {
             admission,
             cancellation.clone(),
         )?;
+        if doctor_admission.admission_digest()
+            != candidate.rejoin_coordinates().doctor_admission_digest()
+        {
+            return Err(BeaLivePublicationError::CandidateMismatch);
+        }
         validate_candidate_authority(
             self.source.as_ref(),
             &self.generation,
             &request.provider_dataset,
             &candidate,
         )?;
-        let prepared = BeaPreparedRegionalMacroPlan::try_from_candidate(candidate)?;
+        let prepared = BeaPreparedRegionalMacroPlan::try_from_candidate(
+            candidate,
+            self.coordinator.research.as_ref(),
+            seal_deadline,
+            &cancellation,
+        )
+        .await?;
         if prepared.source_id() != self.generation.metadata().source_id()
             || prepared.provider_dataset() != &request.provider_dataset
             || prepared.source_binding_digest() != self.source.source_binding().binding_digest()
@@ -523,6 +675,8 @@ impl BeaRegionalLiveRuntime {
         }
         operation.ensure_live()?;
         let publication_digest = prepared.publication_digest();
+        let published_series = prepared.published_series();
+        let series_allowlists = prepared.series_allowlists().to_vec();
         let observed_at = system_timestamp()?;
         let reservation = reserve_publication(
             self.coordinator.as_ref(),
@@ -542,39 +696,54 @@ impl BeaRegionalLiveRuntime {
                 reservation,
                 operation.publication_authority(),
                 cancellation.clone(),
+                None,
             )
             .await?;
         operation.ensure_live()?;
         ensure_not_cancelled(&cancellation)?;
 
-        let read_request = BeaProviderPeriodLatestKnownRequest::try_new(
-            publication.restart_selector(),
-            request.series_allowlist,
-            request.knowledge_cutoff,
-            request.effective_period_cutoff,
-        )?;
-        let state = self
-            .closure
-            .read_provider_period_latest_known(
-                read_request,
-                request.query_limits,
-                request.query_deadline.min(operation.operation_deadline()),
-                cancellation,
-            )
-            .await?;
-        let BeaMacroCapabilityState::Available(read) = state else {
-            return Err(BeaLivePublicationError::ReadUnavailable);
-        };
-        if read.restart_selector().manifest() != publication.receipt().manifest()
-            || read.source_id() != self.generation.metadata().source_id()
-        {
-            return Err(BeaLivePublicationError::RestartMismatch);
+        let mut reads = Vec::new();
+        reads
+            .try_reserve_exact(series_allowlists.len())
+            .map_err(|_| BeaLivePublicationError::Capacity)?;
+        for series_allowlist in &series_allowlists {
+            operation.ensure_live()?;
+            ensure_not_cancelled(&cancellation)?;
+            let read_request = BeaProviderPeriodLatestKnownRequest::try_new(
+                publication.restart_selector(),
+                series_allowlist.clone(),
+                request.knowledge_cutoff,
+                request.effective_period_cutoff.clone(),
+            )?;
+            let state = self
+                .closure
+                .read_provider_period_latest_known(
+                    read_request,
+                    request.query_limits,
+                    request.query_deadline.min(operation.operation_deadline()),
+                    cancellation.clone(),
+                )
+                .await?;
+            let BeaMacroCapabilityState::Available(read) = state else {
+                return Err(BeaLivePublicationError::ReadUnavailable);
+            };
+            if read.restart_selector().manifest() != publication.receipt().manifest()
+                || read.source_id() != self.generation.metadata().source_id()
+            {
+                return Err(BeaLivePublicationError::RestartMismatch);
+            }
+            reads.push(read);
         }
+        operation.ensure_live()?;
+        ensure_not_cancelled(&cancellation)?;
         Ok(BeaRegionalLiveOutcome {
             source_binding_digest,
+            doctor_refresh: refresh,
+            published_series,
+            series_allowlists,
             publication_digest,
             publication,
-            read,
+            reads,
         })
     }
 }
@@ -600,20 +769,50 @@ struct BeaPreparedRegionalMacroPlan {
     analytical_dataset: DatasetId,
     provider_dataset: SourceIdentifier,
     source_binding_digest: EvidenceDigest,
+    published_series: usize,
+    series_allowlists: Vec<AnalyticalMacroSeriesAllowlist>,
     publication_input: ProviderMacroPlanPublicationInput,
 }
 
 impl BeaPreparedRegionalMacroPlan {
-    fn try_from_candidate(
+    async fn try_from_candidate(
         candidate: BeaPublicationCandidate,
+        research: &ResearchService,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<Self, BeaMacroApplicationError> {
         candidate.validate()?;
+        let mut series = candidate
+            .observations()
+            .iter()
+            .map(|observation| observation.observation().series().clone())
+            .collect::<Vec<_>>();
+        series.sort_unstable();
+        series.dedup();
+        let published_series = series.len();
+        // Each existing reader admits at most 32 series. Enumerate the complete, ordered
+        // publication set without dropping any series or widening an individual read.
+        if series.is_empty() {
+            return Err(BeaMacroApplicationError::InvalidReadResult);
+        }
+        let series_allowlists = series
+            .chunks(32)
+            .map(|batch| {
+                AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(batch.to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let coordinates = candidate.rejoin_coordinates().clone();
         let analytical_dataset = DatasetId::try_from(coordinates.analytical_dataset_id().as_str())
             .map_err(|_error| IngestError::InvalidProviderMacroPlan)?;
         let provider_dataset = coordinates.dataset_id().clone();
         let source_binding_digest = coordinates.source_binding_digest();
-        let publication_input = try_into_provider_macro_plan_publication_input(candidate)?;
+        let publication_input = try_into_provider_macro_plan_publication_input(
+            candidate,
+            research,
+            deadline,
+            cancellation,
+        )
+        .await?;
         if publication_input.source_id() != coordinates.source_id()
             || publication_input.metadata_revision() != coordinates.metadata_revision()
             || publication_input.provider_dataset() != &provider_dataset
@@ -626,6 +825,8 @@ impl BeaPreparedRegionalMacroPlan {
             analytical_dataset,
             provider_dataset,
             source_binding_digest,
+            published_series,
+            series_allowlists,
             publication_input,
         })
     }
@@ -649,21 +850,47 @@ impl BeaPreparedRegionalMacroPlan {
     const fn analytical_dataset(&self) -> &DatasetId {
         &self.analytical_dataset
     }
+
+    fn series_allowlists(&self) -> &[AnalyticalMacroSeriesAllowlist] {
+        &self.series_allowlists
+    }
+
+    const fn published_series(&self) -> usize {
+        self.published_series
+    }
 }
 
 /// Exact immutable BEA Regional generation and provider-period rows from the live journey.
 #[derive(Debug)]
 pub(crate) struct BeaRegionalLiveOutcome {
     source_binding_digest: EvidenceDigest,
+    doctor_refresh: BeaDoctorRefreshDisposition,
+    published_series: usize,
+    series_allowlists: Vec<AnalyticalMacroSeriesAllowlist>,
     publication_digest: EvidenceDigest,
     publication: BeaMacroPlanPublication,
-    read: BeaProviderPeriodLatestKnownDto,
+    reads: Vec<BeaProviderPeriodLatestKnownDto>,
 }
 
 impl BeaRegionalLiveOutcome {
     /// Returns the exact non-secret source/configuration/credential/quota binding.
     pub(crate) const fn source_binding_digest(&self) -> EvidenceDigest {
         self.source_binding_digest
+    }
+
+    /// Returns whether metadata admission was reused, activated, expired, or drift-refreshed.
+    pub(crate) const fn doctor_refresh(&self) -> BeaDoctorRefreshDisposition {
+        self.doctor_refresh
+    }
+
+    /// Returns the exact bounded series selection used by the typed restart-safe read.
+    pub(crate) fn series_allowlists(&self) -> &[AnalyticalMacroSeriesAllowlist] {
+        &self.series_allowlists
+    }
+
+    /// Returns distinct series retained in the immutable publication before focused read bounds.
+    pub(crate) const fn published_series(&self) -> usize {
+        self.published_series
     }
 
     /// Returns the exact payload identity bound into the persist reservation.
@@ -677,8 +904,8 @@ impl BeaRegionalLiveOutcome {
     }
 
     /// Returns exact provider-period rows selected from the reopened immutable generation.
-    pub(crate) const fn read(&self) -> &BeaProviderPeriodLatestKnownDto {
-        &self.read
+    pub(crate) fn reads(&self) -> &[BeaProviderPeriodLatestKnownDto] {
+        &self.reads
     }
 }
 
@@ -874,9 +1101,12 @@ fn complete_shared_quota_declaration(declaration: &BeaProviderQuotaDeclaration) 
 }
 
 /// Consumes one BEA canonical/native/raw handoff into the shared atomic macro-plan input.
-fn try_into_provider_macro_plan_publication_input(
+async fn try_into_provider_macro_plan_publication_input(
     candidate: BeaPublicationCandidate,
-) -> Result<ProviderMacroPlanPublicationInput, IngestError> {
+    research: &ResearchService,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<ProviderMacroPlanPublicationInput, BeaMacroApplicationError> {
     candidate
         .validate()
         .map_err(|_error| IngestError::InvalidProviderMacroPlan)?;
@@ -885,12 +1115,16 @@ fn try_into_provider_macro_plan_publication_input(
     let expected_total_rows = coordinates.row_count();
     let analytical_dataset = DatasetId::try_from(coordinates.analytical_dataset_id().as_str())
         .map_err(|_error| IngestError::InvalidProviderMacroPlan)?;
-    let (_, revisions, sealed_capture) = candidate.into_shared_publication_parts().into_parts();
+    let (_, revisions, sealed_capture, metadata_capture) =
+        candidate.into_shared_publication_parts().into_parts();
+    let metadata = research
+        .verify_provider_macro_metadata_capture(metadata_capture, cancellation, deadline)
+        .await?;
     let native_lineage = sealed_capture.native_lineage();
     if native_lineage.schema().implementation()
         != ProviderNativeLineageImplementation::BeaRegionalV1
     {
-        return Err(IngestError::InvalidProviderMacroPlan);
+        return Err(IngestError::InvalidProviderMacroPlan.into());
     }
     let sidecar = native_lineage
         .batch_sidecar()
@@ -911,13 +1145,14 @@ fn try_into_provider_macro_plan_publication_input(
         semantics,
         sealed_capture,
         revisions,
-    )?;
-    ProviderMacroPlanPublicationInput::try_new(
+    )?
+    .with_metadata_capture(metadata)?;
+    Ok(ProviderMacroPlanPublicationInput::try_new(
         analytical_dataset,
         completion_digest,
         expected_total_rows,
         vec![chunk],
-    )
+    )?)
 }
 
 /// Protected doctor result after shared settlement, physical sealing, and process activation.
@@ -933,6 +1168,7 @@ pub(crate) enum BeaDoctorActivationState {
 #[derive(Debug)]
 pub(crate) struct BeaDoctorActivationDto {
     admission: Arc<BeaDoctorAdmissionEvidence>,
+    refresh: BeaDoctorRefreshDisposition,
 }
 
 impl BeaDoctorActivationDto {
@@ -949,6 +1185,13 @@ impl BeaDoctorActivationDto {
     /// Returns the exact successful page/byte receipt bound to consuming shared settlements.
     pub(crate) fn doctor_receipt_digest(&self) -> EvidenceDigest {
         self.admission.doctor_receipt_digest()
+    }
+
+    /// Consumes the current metadata admission and its explicit refresh disposition.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (Arc<BeaDoctorAdmissionEvidence>, BeaDoctorRefreshDisposition) {
+        (self.admission, self.refresh)
     }
 }
 
@@ -1257,4 +1500,490 @@ pub(crate) enum BeaLivePublicationError {
     /// The process wall clock cannot produce a trusted persistence coordinate.
     #[error("BEA Regional publication trusted time is unavailable")]
     TrustedTimeUnavailable,
+}
+
+impl ProductionResearchIngestCoordinator {
+    /// Reads only the exact currently registered typed allocation; it cannot create a capability.
+    pub(super) fn registered_bea_source(
+        &self,
+        profile: &SourceIdentifier,
+        expected_admission: Option<&super::ResearchProviderAdmission>,
+    ) -> Result<Option<Arc<BeaRegisteredSource>>, ServiceError> {
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| ServiceError::Unavailable)?;
+        if authority.registry.is_none() {
+            return Err(ServiceError::Unavailable);
+        }
+        let registered = authority
+            .sources
+            .get(profile)
+            .ok_or(ServiceError::NotFound)?;
+        registered
+            .admission
+            .ensure_live()
+            .map_err(|_| ServiceError::Unavailable)?;
+        if expected_admission.is_some_and(|expected| !registered.admission.matches(expected)) {
+            return Err(ServiceError::Unavailable);
+        }
+        match &registered.typed_capability {
+            super::RegisteredTypedSourceCapability::BeaRegional(source) => {
+                if registered.generation.as_ref() != Some(&source.generation)
+                    || registered.metadata != *source.metadata()
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                Ok(Some(Arc::clone(source)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn acquire_bea_operation(
+        &self,
+        source: &Arc<BeaRegisteredSource>,
+        dataset: &SourceIdentifier,
+        context: &RequestContext,
+        deadline: Instant,
+    ) -> Result<ProviderMacroOperationAuthority, ServiceError> {
+        let (operation, capability) = self
+            .acquire_provider_macro_operation_with_registered_capability(
+                &source.generation,
+                dataset,
+                context,
+                deadline,
+            )
+            .await?;
+        let super::RegisteredTypedSourceCapability::BeaRegional(registered) = capability else {
+            return Err(ServiceError::Unavailable);
+        };
+        if !Arc::ptr_eq(source, &registered) {
+            return Err(ServiceError::Unavailable);
+        }
+        validate_source_generation(&source.source, &source.generation)
+            .map_err(map_bea_live_error)?;
+        validate_operation_generation(&source.source, &source.generation, dataset, &operation)
+            .map_err(map_bea_live_error)?;
+        ensure_bea_operation(&operation, context)?;
+        Ok(operation)
+    }
+
+    pub(super) async fn discover_bea_registered(
+        &self,
+        source: Arc<BeaRegisteredSource>,
+        request: DiscoveryRequest,
+        context: &RequestContext,
+        deadline: Instant,
+    ) -> Result<super::ManagedDiscovery, ServiceError> {
+        let operation = self
+            .acquire_bea_operation(&source, request.dataset(), context, deadline)
+            .await
+            .inspect_err(|error| record_bea_service_diagnostic("operation_admission", *error))?;
+        let closure = BeaMacroApplicationClosure::new(Arc::clone(&self.research));
+        let result = async {
+            let doctor = closure
+                .acquire_seal_and_activate_doctor(
+                    &source.source,
+                    &operation.extraction(),
+                    request.dataset(),
+                    request.deadline(),
+                    request.deadline(),
+                    operation.operation_deadline(),
+                    operation.cancellation().clone(),
+                )
+                .await
+                .map_err(map_bea_application_error)
+                .inspect_err(|error| record_bea_service_diagnostic("doctor", *error))?;
+            let BeaDoctorActivationState::Available(doctor) = doctor else {
+                record_bea_service_diagnostic("doctor_admission", ServiceError::Unavailable);
+                return Err(ServiceError::Unavailable);
+            };
+            let (doctor, _) = doctor.into_parts();
+            ensure_bea_operation(&operation, context)?;
+            let captured = source
+                .source
+                .discover_captured(
+                    operation.extraction(),
+                    request,
+                    operation.cancellation().clone(),
+                )
+                .await
+                .map_err(map_bea_extraction_error)
+                .inspect_err(|error| record_bea_service_diagnostic("discovery", *error))?;
+            let (pending, seal_request) = captured
+                .into_sealing_parts()
+                .map_err(map_bea_source_error)?;
+            // Preserve the original completed response under its original bounded seal owner.
+            let seal_cancellation = CancellationToken::new();
+            let sealed = self
+                .research
+                .seal_provider_capture(
+                    seal_request,
+                    &seal_cancellation,
+                    operation.operation_deadline(),
+                )
+                .await
+                .map_err(map_bea_research_error)
+                .inspect_err(|error| record_bea_service_diagnostic("discovery_seal", *error))?;
+            let admission = pending
+                .try_rejoin(sealed)
+                .map_err(|_| ServiceError::InvalidResult)?;
+            ensure_bea_operation(&operation, context)?;
+            if admission.doctor_admission_digest() != doctor.admission_digest() {
+                return Err(ServiceError::Unavailable);
+            }
+            let batch = admission.batch().clone();
+            Ok(super::ManagedDiscovery {
+                batch,
+                capture_material: None,
+                bea: Some(BeaRetainedDiscovery {
+                    admission,
+                    expires_at: doctor.expires_at(),
+                }),
+            })
+        }
+        .await;
+        ensure_bea_operation(&operation, context)?;
+        result
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact single-use selection, original controls and job commit authority remain explicit"
+    )]
+    pub(super) async fn ingest_bea_selected(
+        &self,
+        source: Arc<BeaRegisteredSource>,
+        receipt: &str,
+        dataset: &SourceIdentifier,
+        object_id: &SourceIdentifier,
+        context: &RequestContext,
+        limits: ServiceLimits,
+        additional: Option<Arc<dyn super::ResearchIngestCommitAuthority>>,
+        deadline: Instant,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let operation = self
+            .acquire_bea_operation(&source, dataset, context, deadline)
+            .await?;
+        let selected = {
+            let mut authority = self
+                .authority
+                .lock()
+                .map_err(|_| ServiceError::Unavailable)?;
+            authority.consume_discovery_selection(
+                receipt,
+                source.generation.profile(),
+                dataset,
+                object_id,
+                Instant::now(),
+                super::system_timestamp()?,
+            )?
+        };
+        // The same registration is held by the operation's genuine publication lease. The moved
+        // source token is never reconstructed from its public object or a saved digest.
+        let retained = selected.bea.ok_or(ServiceError::InvalidResult)?;
+        if selected.capture_material.is_some()
+            || !selected
+                .admission
+                .admits_generation(&source.generation)
+                .map_err(|_| ServiceError::Unavailable)?
+            || selected.metadata != *source.metadata()
+            || retained.admission.batch().objects() != [selected.object.clone()]
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        let result = async {
+            ensure_bea_operation(&operation, context)?;
+            let extraction = ExtractionRequest::try_new(
+                selected.object, self.limits.records, self.limits.bytes, operation.provider_deadline()?,
+            ).map_err(|_| ServiceError::InvalidRequest)?;
+            // No doctor refresh or second provider request at ingestion: consume the exact original
+            // admission, then recheck the source's current doctor and all graph commitments.
+            let candidate = source.source.extract_sealed_discovery(
+                operation.extraction(), extraction, retained.admission, operation.cancellation().clone(),
+            ).map_err(map_bea_extraction_error)?;
+            validate_candidate_authority(&source.source, &source.generation, dataset, &candidate)
+                .map_err(map_bea_live_error)?;
+            let prepared = BeaPreparedRegionalMacroPlan::try_from_candidate(
+                candidate, &self.research, operation.operation_deadline(), operation.cancellation(),
+            ).await.map_err(map_bea_application_error)?;
+            ensure_bea_operation(&operation, context)?;
+            let payload_digest = prepared.publication_digest();
+            let reservation = reserve_publication(
+                self, &source.generation, &operation, prepared.analytical_dataset(), dataset,
+                payload_digest, super::system_timestamp()?,
+            ).await.map_err(map_bea_live_error)?;
+            let provider: Arc<dyn IngestPrecommitAuthority> = Arc::new(BeaOperationPrecommit {
+                provider: operation.publication_authority(),
+                caller: context.cancellation().clone(),
+                cancellation: operation.cancellation().clone(),
+                deadline: operation.operation_deadline(),
+            });
+            let precommit: Arc<dyn IngestPrecommitAuthority> = match &additional {
+                Some(additional) => Arc::new(super::ChainedIngestPrecommitAuthority {
+                    provider, additional: additional.clone(),
+                }),
+                None => provider,
+            };
+            let closure = BeaMacroApplicationClosure::new(Arc::clone(&self.research));
+            let publication = closure.commit_prepared_candidate(
+                prepared, reservation, precommit, operation.cancellation().clone(), additional.as_deref(),
+            ).await.map_err(map_bea_application_error)?;
+            closure.verify_original_captures(
+                publication.receipt().manifest().clone(), operation.operation_deadline(), operation.cancellation(),
+            ).await.map_err(map_bea_application_error)?;
+            let manifest = publication.receipt().manifest();
+            let plan = publication.reopened().plan();
+            let metadata = ToolResultMetadata::try_complete(json!({
+                "sourceId": source.metadata().source_id(), "provider": source.metadata().provider(),
+                "profile": source.generation.profile(), "providerDataset": dataset, "objectId": object_id,
+                "metadataRevision": source.metadata().revision(), "payloadDigest": super::encode_hex(payload_digest.bytes()),
+                "manifest": super::manifest_value(manifest),
+            }), json!({
+                "qualityCeiling": source.metadata().quality_ceiling(),
+                "recordLevelProvenance": true, "executionEligible": false,
+            })).map_err(|_| ServiceError::InvalidResult)?;
+            TypedToolResult::try_new(json!({
+                "manifest": super::manifest_value(manifest), "rowCount": plan.row_count(),
+                "totalBytes": plan.total_bytes(), "objectCount": plan.objects().len(),
+                "lineageDigest": super::encode_hex(plan.lineage_digest().bytes()),
+            }), 1, metadata, limits).map_err(|_| ServiceError::InvalidResult)
+        }.await;
+        ensure_bea_operation(&operation, context)?;
+        result
+    }
+}
+
+fn ensure_bea_operation(
+    operation: &ProviderMacroOperationAuthority,
+    context: &RequestContext,
+) -> Result<(), ServiceError> {
+    if context.cancellation().is_cancelled() {
+        return Err(ServiceError::Cancelled);
+    }
+    operation.ensure_live()?;
+    if operation.cancellation().is_cancelled() {
+        return Err(ServiceError::Unavailable);
+    }
+    Ok(())
+}
+
+fn record_bea_service_diagnostic(stage: &'static str, error: ServiceError) {
+    let diagnostic = super::ProviderOperationDiagnostic::from_service(
+        super::ProviderOperationPhase::Discovery,
+        error,
+    );
+    tracing::warn!(stage, diagnostic = ?diagnostic, "BEA discovery failed");
+}
+
+fn map_bea_extraction_error(error: ExtractionSourceError) -> ServiceError {
+    let diagnostic = super::ProviderOperationDiagnostic::from_extraction(
+        super::ProviderOperationPhase::Extraction,
+        error.clone(),
+    );
+    tracing::warn!(
+        stage = "provider_acquisition",
+        diagnostic = ?diagnostic,
+        "BEA discovery failed"
+    );
+    use market_squawk_sources::{ExtractionAuthorityError, SourceError};
+    match error {
+        ExtractionSourceError::Source(
+            SourceError::TrustedTimeUnavailable | SourceError::TrustedTimeDiscontinuity,
+        )
+        | ExtractionSourceError::Authority(
+            ExtractionAuthorityError::TrustedTimeUnavailable
+            | ExtractionAuthorityError::TrustedTimeDiscontinuous,
+        ) => ServiceError::Internal,
+        error => super::ProviderOperationDiagnostic::from_extraction(
+            super::ProviderOperationPhase::Extraction,
+            error,
+        )
+        .service_error(),
+    }
+}
+
+fn map_bea_source_error(error: BeaSourceError) -> ServiceError {
+    match error {
+        BeaSourceError::Cancelled
+        | BeaSourceError::Adapter(market_squawk_adapter_bea::BeaError::SanitizationCancelled) => {
+            ServiceError::Cancelled
+        }
+        BeaSourceError::DeadlineExceeded
+        | BeaSourceError::Adapter(
+            market_squawk_adapter_bea::BeaError::SanitizationDeadlineExceeded,
+        ) => ServiceError::DeadlineExceeded,
+        BeaSourceError::BodyTooLarge | BeaSourceError::Allocation => {
+            ServiceError::ResourceExhausted
+        }
+        BeaSourceError::Clock
+        | BeaSourceError::Adapter(
+            market_squawk_adapter_bea::BeaError::SanitizationClockUnavailable,
+        ) => ServiceError::Internal,
+        BeaSourceError::InvalidMetadata
+        | BeaSourceError::InvalidConfiguration
+        | BeaSourceError::Protocol
+        | BeaSourceError::Adapter(_)
+        | BeaSourceError::Capture(_)
+        | BeaSourceError::RawCapture(_) => ServiceError::InvalidResult,
+        BeaSourceError::Network
+        | BeaSourceError::Authority
+        | BeaSourceError::StaleDoctorAdmission => ServiceError::Unavailable,
+    }
+}
+
+fn map_bea_application_error(error: BeaMacroApplicationError) -> ServiceError {
+    match error {
+        BeaMacroApplicationError::Adapter(error) => map_bea_source_error(error),
+        BeaMacroApplicationError::Extraction(error) => map_bea_extraction_error(error),
+        BeaMacroApplicationError::ResearchService(error) => map_bea_research_error(error),
+        BeaMacroApplicationError::Ingest(error) => map_bea_ingest_error(error),
+        BeaMacroApplicationError::Doctor(market_squawk_adapter_bea::BeaDoctorError::Expired) => {
+            ServiceError::Unavailable
+        }
+        BeaMacroApplicationError::AnalyticalRead(AnalyticalReadError::NativeSessionControl(
+            error,
+        )) => map_bea_object_control_error(error),
+        BeaMacroApplicationError::AnalyticalRead(AnalyticalReadError::Query(
+            market_squawk_data::QueryError::Artifact(error),
+        )) => super::super::source_errors::map_parquet_error(error),
+        BeaMacroApplicationError::AnalyticalRead(AnalyticalReadError::Query(
+            market_squawk_data::QueryError::Catalog(error),
+        )) => super::super::map_catalog_error(error),
+        BeaMacroApplicationError::AnalyticalRead(error) => super::super::map_read_error(error),
+        BeaMacroApplicationError::Doctor(_)
+        | BeaMacroApplicationError::Publication(_)
+        | BeaMacroApplicationError::RestartVerificationMismatch
+        | BeaMacroApplicationError::DoctorAuthorityMismatch
+        | BeaMacroApplicationError::InvalidReadResult => ServiceError::InvalidResult,
+    }
+}
+
+fn map_bea_live_error(error: BeaLivePublicationError) -> ServiceError {
+    match error {
+        BeaLivePublicationError::Service(error) => error,
+        BeaLivePublicationError::Adapter(error) => map_bea_source_error(error),
+        BeaLivePublicationError::Application(error) => map_bea_application_error(error),
+        BeaLivePublicationError::Extraction(error) => map_bea_extraction_error(error),
+        BeaLivePublicationError::Research(error) => map_bea_research_error(error),
+        BeaLivePublicationError::Ingest(error) => map_bea_ingest_error(error),
+        BeaLivePublicationError::Cancelled => ServiceError::Cancelled,
+        BeaLivePublicationError::Capacity => ServiceError::ResourceExhausted,
+        BeaLivePublicationError::TrustedTimeUnavailable
+        | BeaLivePublicationError::Composition(
+            ResearchIngestCompositionError::TrustedTimeUnavailable,
+        ) => ServiceError::Internal,
+        BeaLivePublicationError::Composition(_)
+        | BeaLivePublicationError::SourceGenerationMismatch
+        | BeaLivePublicationError::DoctorUnavailable
+        | BeaLivePublicationError::ReadUnavailable => ServiceError::Unavailable,
+        BeaLivePublicationError::RegionalContractRequired
+        | BeaLivePublicationError::ExtractionContract(_) => ServiceError::InvalidRequest,
+        BeaLivePublicationError::Seal(_)
+        | BeaLivePublicationError::IngestIdentity(_)
+        | BeaLivePublicationError::Publication(_)
+        | BeaLivePublicationError::CandidateMismatch
+        | BeaLivePublicationError::RestartMismatch => ServiceError::InvalidResult,
+    }
+}
+
+impl BeaMacroApplicationError {
+    /// Preserves source-owned failure and original control semantics for all application callers.
+    pub(crate) fn into_service_error(self) -> ServiceError {
+        map_bea_application_error(self)
+    }
+}
+
+impl BeaLivePublicationError {
+    /// Projects the same backend error at neutral ingestion and installed activation boundaries.
+    pub(crate) fn into_service_error(self) -> ServiceError {
+        map_bea_live_error(self)
+    }
+}
+
+fn map_bea_ingest_error(error: IngestError) -> ServiceError {
+    match error {
+        IngestError::SealedProviderCapture(
+            market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(error),
+        ) => map_bea_object_control_error(error),
+        error => super::ProviderOperationDiagnostic::new(
+            super::ProviderOperationPhase::RawSeal,
+            super::classify_ingest_error(error),
+        )
+        .service_error(),
+    }
+}
+
+fn map_bea_research_error(error: ResearchServiceError) -> ServiceError {
+    match error {
+        ResearchServiceError::Ingest(error) => map_bea_ingest_error(error),
+        ResearchServiceError::ProviderOnboarding(
+            crate::ProviderOnboardingError::OperationCancelled,
+        ) => ServiceError::Cancelled,
+        ResearchServiceError::ProviderOnboarding(
+            crate::ProviderOnboardingError::ProbeDeadlineExceeded,
+        ) => ServiceError::DeadlineExceeded,
+        ResearchServiceError::ProviderOnboarding(crate::ProviderOnboardingError::Clock) => {
+            ServiceError::Internal
+        }
+        ResearchServiceError::ProviderCaptureStore(
+            market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(error),
+        ) => map_bea_object_control_error(error),
+        ResearchServiceError::Manifest(error) => super::super::map_manifest_error(error),
+        ResearchServiceError::Catalog(error) => super::super::map_catalog_error(error),
+        error => super::map_research_error(error),
+    }
+}
+
+fn map_bea_object_control_error(
+    error: market_squawk_platform::ResearchObjectControlError,
+) -> ServiceError {
+    match error {
+        market_squawk_platform::ResearchObjectControlError::Cancelled => ServiceError::Cancelled,
+        market_squawk_platform::ResearchObjectControlError::DeadlineExceeded => {
+            ServiceError::DeadlineExceeded
+        }
+        market_squawk_platform::ResearchObjectControlError::Unavailable => ServiceError::Internal,
+    }
+}
+
+/// Original operation controls checked synchronously at the existing catalog commit boundary.
+/// The provider lease and optional job authority remain the authorities that authorize publication.
+#[derive(Debug)]
+struct BeaOperationPrecommit {
+    provider: Arc<dyn IngestPrecommitAuthority>,
+    caller: CancellationToken,
+    cancellation: CancellationToken,
+    deadline: Instant,
+}
+
+impl BeaOperationPrecommit {
+    fn validate_controls(&self) -> Result<(), IngestError> {
+        if self.caller.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(IngestError::DeadlineExceeded);
+        }
+        if self.cancellation.is_cancelled() {
+            return Err(IngestError::PublicationAuthorityRevoked);
+        }
+        Ok(())
+    }
+}
+
+impl IngestPrecommitAuthority for BeaOperationPrecommit {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        self.validate_controls()?;
+        self.provider.validate_precommit()
+    }
+
+    fn validate_catalog_precommit(
+        &self,
+        catalog: &market_squawk_data::CatalogAuthority,
+    ) -> Result<(), IngestError> {
+        self.validate_controls()?;
+        self.provider.validate_catalog_precommit(catalog)
+    }
 }

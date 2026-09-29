@@ -28,6 +28,7 @@ import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { ProductCapability } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
+import { formatLosslessInteger, formatUnixNanos } from "@/features/opportunities/format"
 
 import {
   newestBacktests,
@@ -36,12 +37,14 @@ import {
   parseBacktestPreparationPreview,
   parseBacktestResult,
   parseBacktestStart,
+  parseRecommendationBacktest,
   type BacktestActivity,
   type BacktestPreparationOptions,
   type BacktestPreparationPreview,
   type BacktestPreparationSelection,
   type BacktestResult,
   type CompletedBacktest,
+  type RecommendationBacktest,
 } from "./contracts"
 
 const PREPARATION_CAPABILITIES = [
@@ -50,6 +53,239 @@ const PREPARATION_CAPABILITIES = [
 ] as const
 const CONTROL_CLASS =
   "h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+
+export function RecommendationStudyPanel({
+  actionToken,
+  transport,
+  scope,
+}: {
+  actionToken: string
+  transport: ProductTransport
+  scope: ProductScope
+}) {
+  const [opened, setOpened] = React.useState(false)
+  const study = useQuery({
+    queryKey: productKeys.operation(scope, "backtest", "Analysis.GetRecommendationBacktest", { actionToken }),
+    enabled: opened,
+    retry: false,
+    queryFn: async () => parseRecommendationBacktest(
+      await transport.backtestProducts({ action: "recommendationStudy", actionToken }),
+    ),
+  })
+  return (
+    <section className="mt-6 rounded-lg border border-border p-4">
+      <h3 className="text-sm font-semibold">Saved historical study</h3>
+      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+        Open the study used by this analysis to review simulated results, comparisons, costs,
+        and every included or incomplete observation.
+      </p>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className="mt-3"
+        disabled={opened && study.isFetching}
+        onClick={() => opened ? void study.refetch() : setOpened(true)}
+      >
+        {opened ? "Refresh saved study" : "Open saved study"}
+      </Button>
+      {opened && study.isPending ? <Loading label="Opening the saved study…" /> : null}
+      {opened && study.isError ? (
+        <Unavailable
+          title="This saved study could not be opened"
+          detail="Its complete historical evidence could not be retrieved. Try refreshing the saved study."
+        />
+      ) : null}
+      {opened && study.isSuccess ? <RecommendationStudyReport report={study.data} /> : null}
+    </section>
+  )
+}
+
+function RecommendationStudyReport({ report }: { report: RecommendationBacktest }) {
+  const aggregate = report.aggregate
+  const methodology = report.methodology
+  const assumptions = report.executionAssumptions
+  return (
+    <div className="mt-5 grid gap-5">
+      <div className="rounded-lg border border-border bg-background/25 p-3 text-xs leading-5">
+        <p className="font-semibold">
+          {report.studyBasis === "historical_as_known"
+            ? "Simulation using information known at the time"
+            : "Historical simulation using later data"}
+        </p>
+        <p className="mt-1 text-muted-foreground">
+          {report.studyBasis === "historical_as_known"
+            ? "Inputs were qualified as known at the historical decision times. These are simulated results."
+            : "This study uses a fixed copy of historical data available later. Its results do not establish what could have been achieved with information known at the time."}
+        </p>
+        {report.studyLimitations.length > 0 ? (
+          <ul className="mt-2 list-disc space-y-1 pl-4">
+            {report.studyLimitations.map((limitation) => (
+              <li key={limitation}>{STUDY_LIMITATION_LABELS[limitation]}</li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+
+      {aggregate.status === "available" ? (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            <Metric label="Mean return after costs" value={studyPercent(aggregate.meanCostAdjustedReturn)} />
+            <Metric label="Worst maximum drawdown" value={studyPercent(aggregate.worstMaximumDrawdown)} />
+            <Metric label="Positive test periods" value={studyPercent(aggregate.positiveFoldStability)} />
+          </div>
+          <dl className="grid gap-3 sm:grid-cols-3">
+            <Fact label="Completed observations in result" value={formatLosslessInteger(aggregate.observationCount)} />
+            <Fact label="Independent test periods" value={formatLosslessInteger(aggregate.independentFoldCount)} />
+            <Fact label="Periods with positive returns" value={formatLosslessInteger(aggregate.positiveFoldCount)} />
+          </dl>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <StudyComparison title="Main comparison" result={aggregate.benchmark} />
+            <StudyComparison title="Accompanying comparison" result={aggregate.accompanyingBenchmark} />
+          </div>
+        </>
+      ) : (
+        <Unavailable title="An aggregate result is unavailable" detail={STUDY_AGGREGATE_REASONS[aggregate.reason]} />
+      )}
+
+      <div>
+        <h4 className="text-sm font-semibold">Observation coverage</h4>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          These counts retain no-action decisions and incomplete outcomes. Comparison counts
+          overlap the investment counts; they are not additional observations.
+        </p>
+        <StudyPopulation population={report.population} />
+      </div>
+
+      <details className="rounded-lg border border-border p-3">
+        <summary className="cursor-pointer text-sm font-medium">Individual historical test periods</summary>
+        <div className="mt-3 grid gap-3">
+          {report.folds.map((fold, index) => (
+            <details key={fold.foldId} className="rounded border border-border p-3">
+              <summary className="cursor-pointer text-xs font-medium">Test period {index + 1}</summary>
+              <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+                <Fact label="Starts" value={formatUnixNanos(fold.startsAtUnixNanos)} />
+                <Fact label="Ends" value={formatUnixNanos(fold.endsAtUnixNanos)} />
+              </dl>
+              <StudyPopulation population={fold.population} />
+            </details>
+          ))}
+        </div>
+      </details>
+
+      <details className="rounded-lg border border-border p-3">
+        <summary className="cursor-pointer text-sm font-medium">Simulation assumptions and dates</summary>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          <Fact label="Reporting currency" value={methodology.reportingCurrency} />
+          <Fact label="Target horizon" value="365 elapsed days from the forecast’s financial starting point" />
+          <Fact label="Decision delay" value={methodology.decisionLagNanos === null ? "Not specified" : `${formatStudyDecimal(methodology.decisionLagNanos, -9)} seconds`} />
+          <Fact label="Execution prices" value={methodology.executionBasis === "completed-daily-bar" ? "Completed daily closing prices" : "Observed quotes and available size"} />
+          <Fact label="Simulated order timing" value={methodology.fillTiming === "next-eligible-completed-bar-close" ? "Next eligible completed daily close" : "Next eligible market observation"} />
+          <Fact label="Participation measured against" value={methodology.participationBasis === "completed-bar-traded-volume" ? "Daily traded volume" : "Observed available size"} />
+          <Fact label="Assumed full spread" value={methodology.assumedFullSpreadBasisPoints === null ? "Observed spread" : `${formatStudyDecimal(methodology.assumedFullSpreadBasisPoints, -2)}%`} />
+          <Fact label="Fees on each trade leg" value={`${formatStudyDecimal(assumptions.feeBasisPointsPerLeg, -2)}%`} />
+          <Fact label="Slippage on each trade leg" value={`${formatStudyDecimal(assumptions.slippageBasisPointsPerLeg, -2)}%`} />
+          <Fact label="Maximum additional random slippage" value={`${formatStudyDecimal(assumptions.maximumRandomSlippageBasisPointsPerLeg, -2)}%`} />
+          <Fact label="Maximum participation" value={`${formatStudyDecimal(assumptions.maximumParticipationBasisPoints, -2)}%`} />
+          <Fact label="Execution delay" value={`${formatStudyDecimal(assumptions.latencyNanos, -9)} seconds`} />
+          <Fact label="Partial fills" value={assumptions.allowPartialFills ? "Allowed" : "Not allowed"} />
+          <Fact label="Historical data snapshot" value={formatUnixNanos(report.snapshotAsOfUnixNanos)} />
+          <Fact label="Simulation stops at" value={formatUnixNanos(report.simulationCutoffUnixNanos)} />
+          <Fact label="Calculated" value={formatUnixNanos(report.evaluatedAtUnixNanos)} />
+          <Fact label="Published" value={formatUnixNanos(report.publishedAtUnixNanos)} />
+          <Fact label="Available for analysis from" value={formatUnixNanos(report.availableAtUnixNanos)} />
+          <Fact label="Analytical use expires" value={formatUnixNanos(report.expiresAtUnixNanos)} />
+        </dl>
+        <p className="mt-3 text-xs leading-5 text-muted-foreground">
+          The study uses unadjusted trading prices with recorded corporate actions.
+          Distributions are treated as cash entitlements without reinvestment.
+          Simulated costs are applied before prices are rounded against the trade.
+          The saved report remains readable after its analytical use expires.
+        </p>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">{methodology.distributionTiming}</p>
+        {methodology.executionLimitations.length > 0 ? (
+          <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-5 text-muted-foreground">
+            {methodology.executionLimitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
+          </ul>
+        ) : null}
+      </details>
+    </div>
+  )
+}
+
+function StudyComparison({ title, result }: {
+  title: string
+  result: Extract<RecommendationBacktest["aggregate"], { status: "available" }>["benchmark"]
+}) {
+  return (
+    <div className="rounded-lg border border-border p-3">
+      <h4 className="text-sm font-semibold">{title}</h4>
+      {result.status === "available" ? (
+        <dl className="mt-3 grid gap-3">
+          <Fact label="Comparison mean return after costs" value={studyPercent(result.meanCostAdjustedReturn)} />
+          <Fact label="Investment’s mean excess return" value={studyPercent(result.meanExcessReturn)} />
+        </dl>
+      ) : <p className="mt-2 text-xs text-muted-foreground">A complete comparison result is unavailable.</p>}
+    </div>
+  )
+}
+
+const STUDY_POPULATION_LABELS = {
+  totalSignals: "All historical decisions",
+  completedSubjectAndBenchmark: "Investment and main comparison completed",
+  noAction: "No action",
+  unavailable: "Decision unavailable",
+  censoredTargetAfterCutoff: "Target beyond simulation cutoff",
+  censoredOutsideFold: "Target outside its test period",
+  entryUnfilled: "Entry unfilled",
+  exitUnfilled: "Exit unfilled",
+  benchmarkUnavailable: "Main comparison unavailable",
+  completedSubject: "Investment completed",
+  accompanyingBenchmarkCompleted: "Accompanying comparison completed",
+  accompanyingBenchmarkUnavailable: "Accompanying comparison unavailable",
+} satisfies Record<keyof RecommendationBacktest["population"], string>
+
+function StudyPopulation({ population }: { population: RecommendationBacktest["population"] }) {
+  return (
+    <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+      {Object.entries(STUDY_POPULATION_LABELS).map(([key, label]) => (
+        <Fact key={key} label={label} value={formatLosslessInteger(population[key as keyof typeof population])} />
+      ))}
+    </dl>
+  )
+}
+
+const STUDY_LIMITATION_LABELS = {
+  historical_revision_coverage_unproven: "The complete history of data revisions has not been established.",
+  later_vintage_inputs: "Some inputs became available after the historical decisions being simulated.",
+  present_day_fixed_cohort: "The investment group was fixed using present-day membership, which may omit past failures or former members.",
+  simulated_availability: "Historical availability is simulated rather than established from recorded publication times.",
+} satisfies Record<RecommendationBacktest["studyLimitations"][number], string>
+
+const STUDY_AGGREGATE_REASONS = {
+  "truncated-signal-population": "The complete population of historical decisions was not retained.",
+  "incomplete-declared-entry": "One or more declared entries could not be completed.",
+  "missing-completed-observation-in-fold": "At least one historical test period has no completed observation.",
+} satisfies Record<Extract<RecommendationBacktest["aggregate"], { status: "unavailable" }>["reason"], string>
+
+function studyPercent(value: string): string {
+  return `${formatStudyDecimal(value, 2)}%`
+}
+
+/** Changes display units by moving the decimal point; no financial metric is calculated here. */
+function formatStudyDecimal(value: string, places: number): string {
+  const negative = value.startsWith("-")
+  const magnitude = negative ? value.slice(1) : value
+  const separator = magnitude.indexOf(".")
+  const whole = separator < 0 ? magnitude : magnitude.slice(0, separator)
+  const fraction = separator < 0 ? "" : magnitude.slice(separator + 1)
+  const digits = whole + fraction
+  const position = whole.length + places
+  const integer = (position <= 0 ? "0" : digits.slice(0, position).padEnd(position, "0")).replace(/^0+(?=\d)/, "")
+  const decimal = (position <= 0 ? "0".repeat(-position) + digits : digits.slice(position)).replace(/0+$/, "")
+  const sign = negative && /[1-9]/.test(integer + decimal) ? "-" : ""
+  return `${sign}${integer}${decimal ? `.${decimal}` : ""}`
+}
 
 export function BacktestsPage() {
   const product = useProduct()

@@ -23,6 +23,7 @@ pub(crate) enum RawRecordWire {
         account_id: String,
         currency: String,
         cash_balance: String,
+        settlement_available_cash: Option<String>,
         as_of_unix_nanos: String,
     },
     Holding {

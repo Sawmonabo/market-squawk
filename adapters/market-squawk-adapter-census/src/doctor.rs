@@ -267,7 +267,11 @@ impl CensusDoctorOutput {
     }
 }
 
-pub(crate) fn doctor_query() -> Result<CensusDataQuery, CensusSourceError> {
+/// Builds the fixed, key-free ACS query shared by credential and publication doctors.
+///
+/// # Errors
+/// Returns an error if the code-owned dataset, variables, or geography are invalid.
+pub fn doctor_query() -> Result<CensusDataQuery, CensusSourceError> {
     Ok(CensusDataQuery::try_new(
         CensusDataset::try_new(2024, "acs/acs1")?,
         CensusSelection::variables(["NAME", "B01001_001E"])?,
@@ -301,31 +305,7 @@ pub(crate) fn build_doctor_report(
     {
         return Err(CensusSourceError::Protocol);
     }
-    let matrix = serde_json::from_slice::<Value>(body)
-        .map_err(|_| CensusSourceError::Protocol)?
-        .as_array()
-        .cloned()
-        .ok_or(CensusSourceError::Protocol)?;
-    if matrix.len() != 2 {
-        return Err(CensusSourceError::Protocol);
-    }
-    let header = matrix[0].as_array().ok_or(CensusSourceError::Protocol)?;
-    let row = matrix[1].as_array().ok_or(CensusSourceError::Protocol)?;
-    if header.len() != 3
-        || row.len() != 3
-        || header[0].as_str() != Some("NAME")
-        || header[1].as_str() != Some("B01001_001E")
-        || header[2].as_str() != Some("us")
-        || row[0].as_str() != Some("United States")
-        || row[2].as_str() != Some("1")
-    {
-        return Err(CensusSourceError::Protocol);
-    }
-    let population = row[1]
-        .as_str()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or(CensusSourceError::Protocol)?;
+    let population = validate_census_doctor_response(body)?;
     let budget = metadata
         .budget_policy()
         .ok_or(CensusSourceError::InvalidMetadata)?;
@@ -379,6 +359,44 @@ pub(crate) fn build_doctor_report(
     };
     report.report_digest = report_digest(&report)?;
     Ok(report)
+}
+
+/// Validates the exact bounded ACS population matrix used by the credential doctor.
+///
+/// This proves only the fixed doctor response, not configured dataset metadata or publication.
+///
+/// # Errors
+/// Rejects oversized, malformed, incomplete, or semantically different responses.
+pub fn validate_census_doctor_response(body: &[u8]) -> Result<u64, CensusSourceError> {
+    if body.len() > CENSUS_DOCTOR_MAX_RESPONSE_BYTES {
+        return Err(CensusSourceError::Protocol);
+    }
+    let matrix = serde_json::from_slice::<Value>(body)
+        .map_err(|_| CensusSourceError::Protocol)?
+        .as_array()
+        .cloned()
+        .ok_or(CensusSourceError::Protocol)?;
+    if matrix.len() != 2 {
+        return Err(CensusSourceError::Protocol);
+    }
+    let header = matrix[0].as_array().ok_or(CensusSourceError::Protocol)?;
+    let row = matrix[1].as_array().ok_or(CensusSourceError::Protocol)?;
+    if header.len() != 3
+        || row.len() != 3
+        || header[0].as_str() != Some("NAME")
+        || header[1].as_str() != Some("B01001_001E")
+        || header[2].as_str() != Some("us")
+        || row[0].as_str() != Some("United States")
+        || row[2].as_str() != Some("1")
+    {
+        return Err(CensusSourceError::Protocol);
+    }
+    let population = row[1]
+        .as_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or(CensusSourceError::Protocol)?;
+    Ok(population)
 }
 
 fn report_digest(report: &CensusDoctorReport) -> Result<EvidenceDigest, CensusSourceError> {

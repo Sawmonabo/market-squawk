@@ -394,7 +394,177 @@ fn bundle_hashes_and_resource_bounds_are_checked_before_use() -> TestResult {
     *byte = b'8';
     fs::write(fixture.training_run_path(), bytes)?;
     assert_fixture_error(fixture, BundleError::TrainingRunHashMismatch)?;
+
+    let calibrated =
+        with_direct_calibration(valid_fixture("native_linear", 1, 1, |_, _| {})?, false)?;
+    let admitted = calibrated.load()?;
+    let calibration = admitted
+        .metadata()
+        .forecast_calibration()
+        .ok_or("calibration absent")?;
+    assert_eq!(calibration.window().observations().get(), 2);
+    assert_eq!(
+        calibration
+            .coverage_evaluation(Timestamp::from_unix_nanos(600))
+            .ok_or("evaluation absent")?
+            .realized()[0]
+            .covered(),
+        0
+    );
+    assert_eq!(
+        calibration
+            .coverage_evaluation(Timestamp::from_unix_nanos(600))
+            .ok_or("evaluation absent")?
+            .realized()[0]
+            .total()
+            .get(),
+        1
+    );
+    assert_eq!(
+        admitted.forecast_residuals_bytes().map(<[u8]>::len),
+        Some(24)
+    );
+    let distribution = admitted
+        .forecast_residual_distribution()
+        .ok_or("direct residual distribution absent")?;
+    assert_eq!(distribution.validation_observations().get(), 2);
+    assert_eq!(
+        distribution
+            .masses()
+            .iter()
+            .map(|point| (point.offset(), point.probability_ppm().get()))
+            .collect::<Vec<_>>(),
+        vec![(-0.2, 500_000), (0.1, 500_000)],
+    );
+    assert_eq!(
+        distribution,
+        calibrated
+            .load()?
+            .forecast_residual_distribution()
+            .ok_or("reopened residual distribution absent")?
+    );
+    assert_fixture_error(
+        with_direct_calibration(valid_fixture("native_linear", 1, 1, |_, _| {})?, true)?,
+        BundleError::InvalidForecastCalibration,
+    )?;
+    #[cfg(feature = "onnx-tract")]
+    {
+        let manifest: Value = serde_json::from_str(include_str!("../fixtures/onnx/manifest.json"))?;
+        let encoded = manifest["models"][0]["model_hex"]
+            .as_str()
+            .ok_or("ONNX fixture absent")?;
+        let graph = encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                Ok::<_, Box<dyn Error>>(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?)
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let onnx = with_direct_calibration(valid_onnx_fixture(&graph)?, false)?.load()?;
+        assert_eq!(
+            onnx.forecast_residuals_bytes(),
+            admitted.forecast_residuals_bytes()
+        );
+        assert_eq!(
+            onnx.forecast_policy_bytes(),
+            admitted.forecast_policy_bytes()
+        );
+    }
     Ok(())
+}
+
+fn with_direct_calibration(mut fixture: Fixture, forged_coverage: bool) -> TestResult<Fixture> {
+    let residuals = [-0.2_f64, 0.1, 0.5]
+        .into_iter()
+        .flat_map(f64::to_le_bytes)
+        .collect::<Vec<_>>();
+    let realized = [0, 1, 2]
+        .map(|_| json!({"covered": u64::from(forged_coverage), "total": 1}));
+    let bands = [5_000, 8_000, 9_500].map(|coverage| json!({
+        "target_coverage_basis_points": coverage,
+        "lower_offset": -0.2,
+        "upper_offset": 0.1
+    }));
+    let policy = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "kind": "residual_quantile",
+        "method": "residual_quantile",
+        "fit_window": {"start_unix_nanos": 30, "end_unix_nanos": 400, "observations": 2},
+        "coverage_evaluation": {"window": {"start_unix_nanos": 400, "end_unix_nanos": 600, "observations": 1}, "realized": realized},
+        "dependence_assumptions": "Frozen fit; validation then held-out test residuals; dependent targets.",
+        "residuals_sha256": hex(sha256(&residuals)),
+        "bands": bands
+    }))?;
+    let references = json!({
+        "residuals": {"path": "calibration/residuals.f64le", "sha256": hex(sha256(&residuals)), "size_bytes": residuals.len()},
+        "policy": {"path": "calibration/policy.json", "sha256": hex(sha256(&policy)), "size_bytes": policy.len()}
+    });
+    let mut metadata: Value =
+        serde_json::from_slice(&fs::read(fixture.temporary.path().join("bundle.json"))?)?;
+    let mut run: Value = serde_json::from_slice(&fs::read(fixture.training_run_path())?)?;
+    metadata["label"]["name"] = json!("research.fixed-horizon-forward-return");
+    metadata["output_statistic"]["statistic"] = json!("model_estimated_conditional_mean");
+    metadata["output_statistic"]["target"] = json!({"kind": "fixed_horizon_terminal", "horizon_nanos": 10, "origin_basis": "completed_bar_close"});
+    metadata["forecast_calibration"] = references.clone();
+    run["forecast_calibration"] = references;
+    run["trial"]["label"] = metadata["label"].clone();
+    run["trial"]["output_statistic"] = metadata["output_statistic"].clone();
+    run["trial_sha256"] = json!(hex(sha256(&serde_json::to_vec(&run["trial"])?)));
+    let run = serde_json::to_vec(&run)?;
+    metadata["training_run"]["sha256"] = json!(hex(sha256(&run)));
+    metadata["training_run"]["size_bytes"] = json!(run.len());
+    let metadata = serde_json::to_vec(&metadata)?;
+    let label = FeatureLabelComponentSpec::try_new(
+        ComponentKind::Label,
+        ComponentScope::Instrument,
+        CorporateActionSensitivity::RequiresAdjustment,
+        "research.fixed-horizon-forward-return",
+        NonZeroU32::MIN,
+    )?;
+    let binding = ForecastOutputBinding::try_from_admitted_model(
+        ModelOutputSemantics::Regression,
+        ForecastMeasurement::Return,
+        ForecastCentralStatistic::ModelEstimatedConditionalMean,
+        ForecastTargetMeaning::FixedHorizonTerminal {
+            horizon_nanos: NonZeroU64::new(10).ok_or("horizon absent")?,
+            origin_basis: market_squawk_data::FixedHorizonOriginBasis::CompletedBarClose,
+        },
+        ForecastTransform::Identity,
+        ForecastTransform::Identity,
+        ForecastTrainingObjective::SquaredError,
+        ForecastEstimatorProfile::SealedDirectLeastSquaresV1,
+        label.clone(),
+    )?;
+    let prior = &fixture.expectations;
+    fixture.expectations = BundleExpectations::try_new_with_output_binding(
+        prior.model_id(),
+        prior.bundle_id().clone(),
+        prior.bundle_version(),
+        prior.dataset().clone(),
+        prior.universe_id().clone(),
+        prior.training_period(),
+        label,
+        prior.training_code_revision(),
+        prior.training_environment_hash(),
+        Sha256Digest::new(sha256(&metadata)),
+        prior.artifact_hash(),
+        Sha256Digest::new(sha256(&run)),
+        binding,
+    )?;
+    fs::create_dir(fixture.temporary.path().join("calibration"))?;
+    fs::write(
+        fixture.temporary.path().join("calibration/residuals.f64le"),
+        residuals,
+    )?;
+    fs::write(
+        fixture.temporary.path().join("calibration/policy.json"),
+        policy,
+    )?;
+    fs::write(fixture.training_run_path(), run)?;
+    fs::write(fixture.temporary.path().join("bundle.json"), &metadata)?;
+    fixture.reference =
+        BundleMetadataRef::try_new("bundle.json", Sha256Digest::new(sha256(&metadata)))?;
+    Ok(fixture)
 }
 
 fn assert_fixture_error(fixture: Fixture, expected: BundleError) -> TestResult {
@@ -473,6 +643,13 @@ fn valid_fixture_with_identity(
         Timestamp::from_unix_nanos(600),
         NonZeroU64::new(30)
             .ok_or_else(|| std::io::Error::other("selected rows must be nonzero"))?,
+        market_squawk_data::ChronologicalSplitPolicy::try_new(
+            Timestamp::from_unix_nanos(20),
+            Timestamp::from_unix_nanos(399),
+            Timestamp::from_unix_nanos(599),
+        )?,
+        None,
+        None,
     )?;
     let universe = UniverseId::try_from("liquid-us-equities")?;
     let period = TrainingPeriod::try_new(
@@ -591,6 +768,22 @@ fn valid_fixture_with_identity(
     } else {
         json!({"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0})
     };
+    let split_boundaries_unix_nanos = expectations
+        .dataset()
+        .split_policy()
+        .timestamp_boundaries()
+        .ok_or_else(|| std::io::Error::other("fixture split must use exact times"))?
+        .map(Timestamp::unix_nanos);
+    let training_start_unix_nanos = expectations
+        .training_period()
+        .start()
+        .ok_or_else(|| std::io::Error::other("fixture training start must be exact"))?
+        .unix_nanos();
+    let training_end_unix_nanos = expectations
+        .training_period()
+        .end()
+        .ok_or_else(|| std::io::Error::other("fixture training end must be exact"))?
+        .unix_nanos();
     let mut metadata = json!({
         "schema_version": 9,
         "bundle_id": bundle_id,
@@ -623,12 +816,14 @@ fn valid_fixture_with_identity(
             "export_sha256": hex(expectations.dataset().export_digest().bytes()),
             "selection_sha256": hex(expectations.dataset().selection_digest().bytes()),
             "selection_as_of_unix_nanos": expectations.dataset().selection_as_of().unix_nanos(),
-            "selected_component_rows": expectations.dataset().selected_component_rows().get()
+            "selected_component_rows": expectations.dataset().selected_component_rows().get(),
+            "study": null,
+            "split_boundaries_unix_nanos": split_boundaries_unix_nanos
         },
         "training_universe_id": expectations.universe_id().as_str(),
         "training_period": {
-            "start_unix_nanos": expectations.training_period().start().unix_nanos(),
-            "end_unix_nanos": expectations.training_period().end().unix_nanos()
+            "start_unix_nanos": training_start_unix_nanos,
+            "end_unix_nanos": training_end_unix_nanos
         },
         "label": {
             "kind": "label",

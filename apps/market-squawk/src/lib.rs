@@ -43,6 +43,16 @@ pub mod journal {
     pub use market_squawk_platform::{JournalError, JournalReader, JournalWriter};
 }
 
+pub use application::analytical_profile::{
+    AnalyticalProfileComponentFamily, AnalyticalProfileComponentReceipt,
+    AnalyticalProfileConfiguration, AnalyticalProfileResolution,
+};
+pub use application::market_calendar::CompletedMarketSessionReference;
+pub use application::market_selection::MarketInvestmentReadReference;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+pub use application::{
+    H15InstalledAcceptance, H15InstalledAcceptanceError, H15InstalledAcceptanceRead,
+};
 pub use backtest_service::{
     BacktestExperimentPlan, PinnedBacktestInput, ProductionBacktestService,
     ProductionBacktestServiceError,
@@ -84,11 +94,13 @@ pub use paper_bot::{
     ProductionPaperCheckpointEvidence,
 };
 pub use portfolio_application::{
-    PortfolioApplicationLimitInput, PortfolioApplicationLimits, PortfolioApplicationService,
-    PortfolioApplicationServiceError, PortfolioFairValueReadCapability,
+    PortfolioAnalysisReadReference, PortfolioApplicationLimitInput, PortfolioApplicationLimits,
+    PortfolioApplicationService, PortfolioApplicationServiceError,
+    PortfolioFairValueReadCapability,
 };
 pub use provider_activation::{
-    ActivatedResearchProvider, BlsAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,
+    ActivatedResearchProvider, BlsAdapterActivation, CensusAdapterActivation,
+    CensusRequestConfiguration, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,
     CoinbaseDirectAccountActivation, CoinbaseDirectActivationSpecError,
     CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
     CoinbaseDirectRuntimeAdmission, EiaAdapterActivation, FredAdapterActivation,

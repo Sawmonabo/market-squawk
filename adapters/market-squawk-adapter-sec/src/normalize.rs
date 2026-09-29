@@ -59,15 +59,17 @@ impl SecXbrlNativeLineage {
     pub(crate) fn try_into_provider_native_lineage(
         self,
         batch: &ExtractionBatch,
+        maximum_retained_bytes: usize,
     ) -> Result<ProviderNativeLineageBatch, ProviderNativeLineageError> {
         if batch.records().len() != self.numeric_fact_count
             || self.numeric_occurrence_ids.len() != self.numeric_fact_count
         {
             return Err(ProviderNativeLineageError::AlignmentMismatch);
         }
-        let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+        let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new_bounded(
             ProviderNativeLineageImplementation::SecEdgarV1,
             batch,
+            maximum_retained_bytes,
         )?;
         native_lineage.try_set_batch_sidecar(&SecFilingXbrlNativeBatchV1 {
             version: 1,
@@ -313,9 +315,14 @@ pub(crate) struct SecFilingXbrlNormalization {
     numeric_occurrence_ids: Vec<SourceIdentifier>,
     nonnumeric_occurrences: Vec<XbrlNonnumericOccurrence>,
     native_lineage_retained_bytes: u64,
+    working_set_retained_bytes: usize,
 }
 
 impl SecFilingXbrlNormalization {
+    pub(crate) const fn working_set_retained_bytes(&self) -> usize {
+        self.working_set_retained_bytes
+    }
+
     /// Produces one canonical numeric fact at a time so parsed and canonical families do not grow
     /// simultaneously as full vectors.
     pub(crate) fn try_next_observation(
@@ -443,6 +450,7 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
     payload_digest: EvidenceDigest,
     received_at: Timestamp,
     ingested_at: Timestamp,
+    maximum_retained_bytes: usize,
     cancellation: &CancellationToken,
 ) -> Result<SecFilingXbrlNormalization, SecNormalizationError> {
     check_cancelled(cancellation)?;
@@ -493,10 +501,41 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
         .provider_identity_at(source_id, &provider_id, received_at)
         .ok_or(SecNormalizationError::InstrumentUnresolved)?
         .instrument_id();
-    let mut ordinals = Vec::new();
+    // Charge the parsed family and a second copy for the largest in-flight normalized fact,
+    // then every prospective vector slot and owned identifier before allocating them.
+    let occurrence_dynamic = document
+        .numeric_facts()
+        .iter()
+        .try_fold(0usize, |total, fact| {
+            total.checked_add(fact.evidence().occurrence_id().retained_bytes())
+        })
+        .ok_or(SecNormalizationError::AllocationFailed)?;
+    let slot_bytes = document
+        .numeric_facts()
+        .len()
+        .checked_mul(size_of::<FamilyOrdinal>() + size_of::<SourceIdentifier>())
+        .and_then(|n| n.checked_mul(2))
+        .ok_or(SecNormalizationError::AllocationFailed)?;
+    let working_set_retained_bytes = document
+        .retained_output_upper_bound()
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(slot_bytes))
+        .and_then(|n| n.checked_add(occurrence_dynamic.checked_mul(2)?))
+        .and_then(|n| n.checked_add(dataset.checked_dynamic_retained_bytes()?.checked_mul(2)?))
+        .and_then(|n| n.checked_add(source_id.retained_bytes()))
+        .and_then(|n| n.checked_add(SEC_XBRL_OCCURRENCE_ORDER_RULESET.len()))
+        .and_then(|n| n.checked_add(size_of::<SecFilingXbrlNormalization>()))
+        .ok_or(SecNormalizationError::AllocationFailed)?;
+    if working_set_retained_bytes > maximum_retained_bytes {
+        return Err(SecNormalizationError::AllocationFailed);
+    }
+    let mut ordinals = Vec::<FamilyOrdinal>::new();
     ordinals
         .try_reserve_exact(document.numeric_facts().len())
         .map_err(|_| SecNormalizationError::AllocationFailed)?;
+    if ordinals.capacity() > document.numeric_facts().len().saturating_mul(2) {
+        return Err(SecNormalizationError::AllocationFailed);
+    }
     for original_index in 0..document.numeric_facts().len() {
         check_cancelled(cancellation)?;
         ordinals.push(FamilyOrdinal {
@@ -536,10 +575,13 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
     check_cancelled(cancellation)?;
     ordinals.sort_unstable_by_key(|assignment| assignment.original_index);
     check_cancelled(cancellation)?;
-    let mut numeric_occurrence_ids = Vec::new();
+    let mut numeric_occurrence_ids = Vec::<SourceIdentifier>::new();
     numeric_occurrence_ids
         .try_reserve_exact(document.numeric_facts().len())
         .map_err(|_| SecNormalizationError::AllocationFailed)?;
+    if numeric_occurrence_ids.capacity() > document.numeric_facts().len().saturating_mul(2) {
+        return Err(SecNormalizationError::AllocationFailed);
+    }
     for fact in document.numeric_facts() {
         check_cancelled(cancellation)?;
         numeric_occurrence_ids.push(fact.evidence().occurrence_id().clone());
@@ -591,6 +633,7 @@ pub(crate) fn normalize_filing_xbrl_with_cancellation(
         numeric_occurrence_ids,
         nonnumeric_occurrences,
         native_lineage_retained_bytes,
+        working_set_retained_bytes,
     })
 }
 

@@ -109,6 +109,49 @@ const GEOGRAPHIES_RESPONSE: &[u8] = br#"{
   }]
 }"#;
 
+#[test]
+fn global_catalog_skips_bounded_timeless_entries_without_inventing_vintage() -> TestResult {
+    let contract = contract()?;
+    let request = &contract.metadata_requests()[0];
+    let limits = CensusParseLimits::default();
+    let mut body: serde_json::Value = serde_json::from_slice(DATASET_RESPONSE)?;
+    body["dataset"].as_array_mut().ok_or("dataset array")?.push(serde_json::json!({
+        "c_dataset": ["unrelated", "catalog"],
+        "distribution": [{"format": "API", "accessURL": "https://api.census.gov/data"}]
+    }));
+    let bytes = serde_json::to_vec(&body)?;
+    let CensusDiscoveryDocument::Datasets(catalog) =
+        CensusDiscoveryDocument::parse(request, &bytes, limits)?
+    else {
+        return Err("dataset catalog expected".into());
+    };
+    assert_eq!(catalog.datasets().len(), 1);
+    assert_eq!(catalog.datasets()[0].dataset(), contract.query().dataset());
+    assert_eq!(catalog.evidence().returned_entries(), 2);
+    assert_eq!(catalog.evidence().payload_digest(), sha256(&bytes));
+
+    let vintage_request = crate::CensusDiscoveryRequest::try_new(
+        crate::CensusDiscoveryKind::VintageDatasets { vintage: 2024 },
+    )?;
+    let timeless_only = serde_json::json!({"dataset": [body["dataset"][1].clone()]});
+    assert!(CensusDiscoveryDocument::parse(
+        &vintage_request, &serde_json::to_vec(&timeless_only)?, limits,
+    ).is_err());
+
+    let mut invalid = body.clone();
+    invalid["dataset"][1]["c_isTimeseries"] = serde_json::json!(true);
+    assert!(CensusDiscoveryDocument::parse(
+        request, &serde_json::to_vec(&invalid)?, limits,
+    ).is_err());
+
+    body["dataset"][1]["distribution"].as_array_mut()
+        .ok_or("distribution array")?.push(serde_json::json!({"format": 42}));
+    assert!(CensusDiscoveryDocument::parse(
+        request, &serde_json::to_vec(&body)?, limits,
+    ).is_err());
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ScriptedTransport {
     expected_url: String,
@@ -241,6 +284,22 @@ async fn authorized_transport_samples_processing_clock_after_complete_parse_and_
     let decoded_at = now.checked_add_nanos(1)?;
     let ingested_at = now.checked_add_nanos(2)?;
     let contract = contract()?;
+    let fixed_contract = CensusDatasetContract::try_new(
+        CensusDataQuery::try_new(
+            CensusDataset::try_new(2024, "acs/acs1")?,
+            contract.query().selection().clone(),
+            Vec::new(),
+            contract.query().geography().clone(),
+            None,
+        )?,
+        contract.mappings().cloned(),
+        CensusEffectiveTimePolicy::Fixed(ResearchTemporalCoordinate::calendar_date(
+            market_squawk_domain::CalendarDate::new(2024, 12, 31)?,
+        )),
+    )?;
+    let restored_fixed: CensusDatasetContract =
+        serde_json::from_slice(&serde_json::to_vec(&fixed_contract)?)?;
+    assert_eq!(restored_fixed, fixed_contract);
     let config = CensusSourceConfig::try_new(
         [contract.clone()],
         CensusParseLimits::try_new(1024 * 1024, 100, 100, 10_000, 1_000, 4_096)?,
@@ -506,6 +565,34 @@ async fn authorized_transport_samples_processing_clock_after_complete_parse_and_
     )?;
     let publication_candidate =
         CensusPublicationCandidate::try_new(publication_plan, sealed_capture_binding, activation)?;
+    let sidecar = publication_candidate
+        .native_lineage()
+        .batch_sidecar()
+        .ok_or("missing Census plan")?;
+    let restored = crate::CensusPublicationPlan::try_from_retained_payload(
+        sidecar.semantic_payload(),
+        publication_candidate
+            .sealed_capture_binding()
+            .capture_evidence(),
+        expected_extraction_content,
+    )?;
+    assert_eq!(&restored, publication_candidate.plan());
+    restored.validate_native_row(
+        0,
+        publication_candidate.native_lineage().rows()[0].semantic_payload(),
+    )?;
+    let mut changed: serde_json::Value = serde_json::from_slice(sidecar.semantic_payload())?;
+    changed["response_accounting"]["returned_rows"] = serde_json::json!(99);
+    assert!(
+        crate::CensusPublicationPlan::try_from_retained_payload(
+            &serde_json::to_vec(&changed)?,
+            publication_candidate
+                .sealed_capture_binding()
+                .capture_evidence(),
+            expected_extraction_content,
+        )
+        .is_err()
+    );
     let native_semantics: serde_json::Value = serde_json::from_slice(
         publication_candidate.native_lineage().rows()[0].semantic_payload(),
     )?;
@@ -635,6 +722,238 @@ async fn authorized_transport_samples_processing_clock_after_complete_parse_and_
     Ok(())
 }
 
+#[test]
+fn reobservation_preserves_complete_plan_meaning_and_rejects_clock_regression() -> TestResult {
+    let now = system_timestamp()?;
+    let contract = contract()?;
+    let config = CensusSourceConfig::try_new([contract.clone()], CensusParseLimits::default())?;
+    let metadata = source_metadata(
+        now,
+        SourceIdentifier::try_from("census-test-key-record")?,
+        &config,
+    )?;
+    let temporary = TemporaryDirectory::new();
+    let paths = LocalPaths::prepare(temporary.path())?;
+    let store = paths.sealed_research_journal_store()?;
+    let clocks = |receive, decode, ingest| -> TestResult<CensusClocks> {
+        Ok(CensusClocks::local_first_observed(
+            now.checked_add_nanos(receive)?,
+            now.checked_add_nanos(decode)?,
+            now.checked_add_nanos(ingest)?,
+        )?)
+    };
+    let original =
+        reobservation_binding(&metadata, &config, &contract, clocks(0, 10, 20)?, &store)?;
+    let fresh = reobservation_binding(&metadata, &config, &contract, clocks(30, 40, 50)?, &store)?;
+    let original_plan = reopen_reobservation_plan(&original)?;
+    let fresh_plan = reopen_reobservation_plan(&fresh)?;
+    assert_eq!(
+        original.capture_evidence().content_digest(),
+        fresh.capture_evidence().content_digest()
+    );
+    assert_ne!(
+        original.capture_evidence().observation_digest(),
+        fresh.capture_evidence().observation_digest()
+    );
+    assert_ne!(original.evidence_digest(), fresh.evidence_digest());
+    assert_ne!(
+        original_plan.extraction_content_digest(),
+        fresh_plan.extraction_content_digest()
+    );
+    assert_ne!(
+        original_plan.publication_identity(),
+        fresh_plan.publication_identity()
+    );
+    assert_eq!(
+        original.native_lineage().rows()[0].semantic_payload(),
+        fresh.native_lineage().rows()[0].semantic_payload()
+    );
+    fresh_plan
+        .clone()
+        .validate_reobservation_of(&original_plan)?;
+    original_plan
+        .clone()
+        .validate_reobservation_of(&original_plan)?;
+    assert!(
+        original_plan
+            .clone()
+            .validate_reobservation_of(&fresh_plan)
+            .is_err()
+    );
+    assert!(
+        crate::CensusPublicationPlan::try_from_retained_payload(
+            fresh
+                .native_lineage()
+                .batch_sidecar()
+                .ok_or("missing plan")?
+                .semantic_payload(),
+            original.capture_evidence(),
+            original.content_identity().digest(),
+        )
+        .is_err()
+    );
+
+    let mut corrupted = serde_json::to_value(&fresh_plan)?;
+    corrupted["publication_identity"] = serde_json::to_value(evidence_digest([7; 32]))?;
+    let corrupted: crate::CensusPublicationPlan = serde_json::from_value(corrupted)?;
+    assert!(corrupted.validate_reobservation_of(&original_plan).is_err());
+
+    // Configuration is response-wide meaning absent from the native row bytes. Build another
+    // fully valid plan over the same bodies rather than testing only a stale publication hash.
+    let changed_config = CensusSourceConfig::try_new(
+        [contract.clone()],
+        CensusParseLimits::try_new(1024 * 1024, 100, 100, 10_000, 1_000, 4_096)?,
+    )?;
+    let changed = reobservation_binding(
+        &metadata,
+        &changed_config,
+        &contract,
+        clocks(60, 70, 80)?,
+        &store,
+    )?;
+    assert_eq!(
+        original.capture_evidence().content_digest(),
+        changed.capture_evidence().content_digest()
+    );
+    assert_eq!(
+        original.native_lineage().rows()[0].semantic_payload(),
+        changed.native_lineage().rows()[0].semantic_payload()
+    );
+    let changed_plan = reopen_reobservation_plan(&changed)?;
+    assert_ne!(
+        original_plan.configuration_digest(),
+        changed_plan.configuration_digest()
+    );
+    assert!(
+        changed_plan
+            .validate_reobservation_of(&original_plan)
+            .is_err()
+    );
+
+    // The new receipt and ingestion advance, but decode regresses relative to the creating plan.
+    // Both individual acquisitions retain valid receive <= decode <= ingestion chronology.
+    let regressed =
+        reobservation_binding(&metadata, &config, &contract, clocks(1, 5, 25)?, &store)?;
+    assert!(
+        reopen_reobservation_plan(&regressed)?
+            .validate_reobservation_of(&original_plan)
+            .is_err()
+    );
+    Ok(())
+}
+
+fn reobservation_binding(
+    metadata: &SourceMetadata,
+    config: &CensusSourceConfig,
+    contract: &CensusDatasetContract,
+    clocks: CensusClocks,
+    store: &market_squawk_platform::SealedResearchJournalStore,
+) -> TestResult<SealedProviderCaptureBinding> {
+    let received_at = clocks.received_at();
+    let bundle = metadata_bundle(metadata, contract, received_at)?;
+    let page = CensusDataPage::parse(
+        contract.query(),
+        bundle.selected_variables()?,
+        &bundle.geography_admission(contract.query())?,
+        DATA_RESPONSE,
+        CensusParseLimits::default(),
+        clocks,
+    )?;
+    let acquisition = CensusDatasetAcquisition {
+        metadata: bundle,
+        data: CensusCapturedData {
+            body: Bytes::from_static(DATA_RESPONSE),
+            page,
+            capture: capture_receipt(
+                metadata,
+                contract.dataset_id().clone(),
+                contract.query().request_digest(),
+                DATA_RESPONSE,
+                received_at,
+            )?,
+            telemetry: CensusSourceTelemetry::default(),
+        },
+        telemetry: CensusSourceTelemetry::default(),
+    };
+    let material = combined_capture_material(metadata, contract, &acquisition)?;
+    let deadline = received_at.checked_add_nanos(60_000_000_000)?;
+    let discovery = DiscoveryRequest::try_new(
+        contract.dataset_id().clone(),
+        None,
+        NonZeroU16::MIN,
+        deadline,
+    )?;
+    let object = source_object(
+        metadata,
+        &discovery,
+        contract,
+        &acquisition,
+        material.receipt(),
+    )?;
+    let request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(10).ok_or("row bound")?,
+        NonZeroU64::new(1024 * 1024).ok_or("byte bound")?,
+        deadline,
+    )?;
+    let output = extraction_output(
+        metadata,
+        config,
+        &request,
+        contract,
+        acquisition,
+        material.receipt(),
+    )?;
+    let (batch, _, plan, _) = output.into_parts();
+    let native = census_native_lineage(&plan, &batch)?;
+    let data_page = u16::try_from(
+        material
+            .receipt()
+            .pages()
+            .len()
+            .checked_sub(1)
+            .ok_or("data page")?,
+    )?;
+    let rows = vec![data_page; batch.records().len()];
+    let (expectation, seal) = material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal.seal(store)?)?
+        .try_into_whole()?;
+    Ok(SealedProviderCaptureBinding::try_whole(
+        token, batch, native, rows,
+    )?)
+}
+
+fn reopen_reobservation_plan(
+    binding: &SealedProviderCaptureBinding,
+) -> TestResult<crate::CensusPublicationPlan> {
+    binding.validate()?;
+    let plan = crate::CensusPublicationPlan::try_from_retained_payload(
+        binding
+            .native_lineage()
+            .batch_sidecar()
+            .ok_or("missing plan")?
+            .semantic_payload(),
+        binding.capture_evidence(),
+        binding.content_identity().digest(),
+    )?;
+    for (ordinal, (row, record)) in binding
+        .native_lineage()
+        .rows()
+        .iter()
+        .zip(binding.batch().records())
+        .enumerate()
+    {
+        plan.validate_native_row(ordinal, row.semantic_payload())?;
+        let ResearchObservation::Macro(observation) = serde_json::from_slice(record.payload())?
+        else {
+            return Err("expected macro row".into());
+        };
+        plan.validate_canonical_observation(ordinal, &observation)?;
+    }
+    Ok(plan)
+}
+
 fn contract() -> TestResult<CensusDatasetContract> {
     let dataset = CensusDataset::try_time_series("economic/fixture")?;
     let query = CensusDataQuery::try_new(
@@ -688,7 +1007,7 @@ fn metadata_bundle(
             latency: Duration::from_millis(1),
         });
     }
-    validate_metadata_bundle(contract, &documents)?;
+    validate_metadata_bundle(contract, &documents, CensusParseLimits::default())?;
     Ok(CensusMetadataBundle {
         dataset_id: contract.dataset_id().clone(),
         query_digest: contract.query().request_digest(),
@@ -696,6 +1015,65 @@ fn metadata_bundle(
         documents,
         telemetry: CensusSourceTelemetry::default(),
     })
+}
+
+#[test]
+fn metadata_data_graph_identity_reuses_equal_content_after_a_later_capture() -> TestResult {
+    let now = system_timestamp()?;
+    let later = now.checked_add_nanos(1)?;
+    let contract = contract()?;
+    let config = CensusSourceConfig::try_new([contract.clone()], CensusParseLimits::default())?;
+    let metadata = source_metadata(
+        now,
+        SourceIdentifier::try_from("census-test-key-record")?,
+        &config,
+    )?;
+    let first_metadata = metadata_bundle(&metadata, &contract, now)?;
+    let later_metadata = metadata_bundle(&metadata, &contract, later)?;
+    let first_data = capture_receipt(
+        &metadata,
+        contract.dataset_id().clone(),
+        contract.query().request_digest(),
+        DATA_RESPONSE,
+        now,
+    )?;
+    let later_data = capture_receipt(
+        &metadata,
+        contract.dataset_id().clone(),
+        contract.query().request_digest(),
+        DATA_RESPONSE,
+        later,
+    )?;
+    let changed_data = capture_receipt(
+        &metadata,
+        contract.dataset_id().clone(),
+        contract.query().request_digest(),
+        br#"[["CENSUS_VALUE"],["43"]]"#,
+        later,
+    )?;
+    let identity = |bundle: &CensusMetadataBundle, data: &ProviderCaptureSetReceipt| {
+        let mut receipts = bundle
+            .documents()
+            .iter()
+            .map(CensusCapturedDiscovery::capture)
+            .collect::<Vec<_>>();
+        receipts.push(data);
+        census_capture_graph_identity_from_receipts(&metadata, &contract, &receipts)
+    };
+    assert_ne!(
+        first_data.observation_digest(),
+        later_data.observation_digest()
+    );
+    assert_eq!(first_data.content_digest(), later_data.content_digest());
+    assert_eq!(
+        identity(&first_metadata, &first_data)?,
+        identity(&later_metadata, &later_data)?
+    );
+    assert_ne!(
+        identity(&first_metadata, &first_data)?,
+        identity(&later_metadata, &changed_data)?
+    );
+    Ok(())
 }
 
 fn capture_receipt(

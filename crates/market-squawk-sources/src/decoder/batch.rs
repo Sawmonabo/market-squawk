@@ -1,9 +1,59 @@
+/// Untrusted provider-native identity coordinates carried by a decoder.
+///
+/// These values describe the wire instrument; only the installed catalog authority can validate
+/// their relationship to the independent canonical route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderNativeInstrumentIdentity {
+    namespace: market_squawk_domain::SourceId,
+    provider_instrument_id: market_squawk_domain::ProviderInstrumentId,
+    venue_symbol: market_squawk_domain::VenueSymbol,
+}
+
+impl ProviderNativeInstrumentIdentity {
+    /// Retains exact native coordinates without granting identity authority.
+    pub const fn new(
+        namespace: market_squawk_domain::SourceId,
+        provider_instrument_id: market_squawk_domain::ProviderInstrumentId,
+        venue_symbol: market_squawk_domain::VenueSymbol,
+    ) -> Self {
+        Self {
+            namespace,
+            provider_instrument_id,
+            venue_symbol,
+        }
+    }
+
+    /// Returns the provider identity namespace, independent of the live source ID.
+    pub const fn namespace(&self) -> &market_squawk_domain::SourceId {
+        &self.namespace
+    }
+
+    /// Returns the exact provider instrument identity.
+    pub const fn provider_instrument_id(&self) -> &market_squawk_domain::ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the independent venue-native symbol.
+    pub const fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
+        &self.venue_symbol
+    }
+
+    fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
+        checked_sum([
+            self.namespace.retained_bytes(),
+            self.provider_instrument_id.retained_bytes(),
+            self.venue_symbol.retained_bytes(),
+        ])
+    }
+}
+
 /// Bounded provider-normalized observation that has not yet mutated live state.
 #[derive(Clone, Debug)]
 pub struct ProviderNormalizedObservation {
     source_identifier: SourceIdentifier,
     venue: VenueId,
     instrument: InstrumentId,
+    native_identity: ProviderNativeInstrumentIdentity,
     timestamp: ProviderTimestampEvidence,
     sequence: ProviderSequenceEvidence,
     snapshot: ProviderSnapshotEvidence,
@@ -25,6 +75,7 @@ impl ProviderNormalizedObservation {
         source_identifier: SourceIdentifier,
         venue: VenueId,
         instrument: InstrumentId,
+        native_identity: ProviderNativeInstrumentIdentity,
         timestamp: ProviderTimestampEvidence,
         sequence: ProviderSequenceEvidence,
         snapshot: ProviderSnapshotEvidence,
@@ -32,6 +83,13 @@ impl ProviderNormalizedObservation {
         payload: ProviderObservationPayload,
     ) -> Result<Self, DecodeError> {
         let event_class = payload.event_class();
+        // Observational chart/cohort families have no current-price decoder representation.
+        if matches!(
+            event_class,
+            LiveEventClass::Chart | LiveEventClass::Screener
+        ) {
+            return Err(DecodeError::InvalidProviderEvidence);
+        }
         let valid_state_relation = if event_class.requires_book_state() {
             matches!(
                 snapshot,
@@ -48,6 +106,7 @@ impl ProviderNormalizedObservation {
             source_identifier,
             venue,
             instrument,
+            native_identity,
             timestamp,
             sequence,
             snapshot,
@@ -69,6 +128,11 @@ impl ProviderNormalizedObservation {
     /// Returns the resolved internal instrument.
     pub const fn instrument(&self) -> InstrumentId {
         self.instrument
+    }
+
+    /// Returns the untrusted native identity to match against the catalog-selected route.
+    pub const fn native_identity(&self) -> &ProviderNativeInstrumentIdentity {
+        &self.native_identity
     }
 
     /// Returns the provider event class.
@@ -139,6 +203,7 @@ impl ProviderNormalizedObservation {
         checked_sum([
             self.source_identifier.retained_bytes(),
             self.venue.retained_bytes(),
+            self.native_identity.dynamic_retained_bytes()?,
             timestamp_rule,
             sequence_dynamic_retained_bytes(&self.sequence),
             snapshot_bytes,
@@ -168,6 +233,15 @@ impl DecodedProviderBatch {
         observations: Vec<ProviderNormalizedObservation>,
     ) -> Result<Self, DecodeError> {
         let observations = bounded_provider_observations(observations)?;
+        for observation in observations.as_slice() {
+            if let ProviderObservationPayload::Quote { bid, ask } = &observation.payload {
+                for level in bid.iter().chain(ask.iter()) {
+                    if let Some(original) = level.accumulated_evidence() {
+                        original.validate(&evidence, observation)?;
+                    }
+                }
+            }
+        }
         Ok(Self {
             evidence,
             observations,

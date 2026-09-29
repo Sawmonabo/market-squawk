@@ -259,6 +259,21 @@ fn ensure_live(
 
 fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectionError {
     match error {
+        AnalyticalReadError::NativeSessionControl(error) => match error {
+            market_squawk_platform::ResearchObjectControlError::Cancelled => {
+                FairValueProducerSelectionError::Cancelled
+            }
+            market_squawk_platform::ResearchObjectControlError::DeadlineExceeded => {
+                FairValueProducerSelectionError::DeadlineExceeded
+            }
+            market_squawk_platform::ResearchObjectControlError::Unavailable => {
+                FairValueProducerSelectionError::Unavailable
+            }
+        },
+        AnalyticalReadError::InputEpochResultRequiresInline => {
+            FairValueProducerSelectionError::ResourceExhausted
+        }
+        AnalyticalReadError::InvalidInputEpoch => FairValueProducerSelectionError::InvalidSelection,
         AnalyticalReadError::Query(QueryError::Cancelled) => {
             FairValueProducerSelectionError::Cancelled
         }
@@ -311,6 +326,7 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
         | AnalyticalReadError::MacroSnapshotRevisionConflict
         | AnalyticalReadError::MacroSnapshotIncomplete
         | AnalyticalReadError::InvalidMacroSnapshotResult
+        | AnalyticalReadError::InvalidMacroHistoryRequest
         | AnalyticalReadError::Query(_) => FairValueProducerSelectionError::Internal,
     }
 }

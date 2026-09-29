@@ -1,6 +1,10 @@
 //! Bounded, source-neutral provider response capture receipts.
 
 mod market_event;
+mod date_windows;
+mod calendar_relationship;
+pub use calendar_relationship::ReviewedMarketCalendarRelationship;
+pub use date_windows::{CompleteMarketBarDateWindowsV1, CompleteMarketBarDateWindowsInputV1, CompleteMarketBarDateWindowV1, CompleteMarketBarDateSessionV1, RetainedMarketHistoryNormalizationV1, RetainedMarketHistoryNativeCoverageV1, RetainedMarketHistoryCashUnitV1, MarketHistoryCashUnitStatus, ProviderNativeExchangeCode, RetainedMarketHistoryCalendarV1};
 
 pub use market_event::{
     MAX_PROVIDER_MARKET_EVENT_BATCH_BYTES, MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS,
@@ -13,6 +17,7 @@ pub use market_event::{
     ProviderResponseMarketEventBindingDigest, ProviderResponseMarketEventRowFrameEvidence,
     SealedProviderCompositeResponseEventBinding, SealedProviderEventMicrobatchBinding,
     SealedProviderPublicationBinding, SealedProviderResponseMarketEventBinding,
+    validate_provider_market_event_binding_metadata,
     verify_provider_market_event_native_lineage_batch_evidence,
 };
 
@@ -337,6 +342,8 @@ impl<'de> Deserialize<'de> for CompleteMarketBarHistoryV1 {
 pub enum ProviderCaptureSemanticBinding {
     /// Exact requested and expected daily market-bar history coordinates.
     CompleteMarketBarHistoryV1(CompleteMarketBarHistoryV1),
+    /// Complete source-native nominal daily date windows and original normalization evidence.
+    CompleteMarketBarDateWindowsV1(CompleteMarketBarDateWindowsV1),
 }
 
 /// One independently complete request component retained inside an ordered request graph.
@@ -585,6 +592,59 @@ pub struct ProviderCaptureSetReceipt {
 }
 
 impl ProviderCaptureSetReceipt {
+    /// Returns checked deep retained bytes for captures without an optional market-history semantic.
+    ///
+    /// This covers standalone responses and complete plain request graphs. Semantic market-history
+    /// overlays are rejected instead of reporting an incomplete allocation count.
+    pub fn checked_plain_retained_bytes(&self) -> Result<usize, ProviderCaptureError> {
+        if self.semantic_binding.is_some() {
+            return Err(ProviderCaptureError::MaterialBindingMismatch);
+        }
+        let overflow = || ProviderCaptureError::ByteLimitExceeded {
+            max: MAX_PROVIDER_CAPTURE_BYTES,
+        };
+        let mut retained = size_of::<Self>()
+            .checked_add(self.source_id.retained_bytes())
+            .and_then(|n| {
+                n.checked_add(
+                    self.metadata_revision
+                        .as_source_identifier()
+                        .retained_bytes(),
+                )
+            })
+            .and_then(|n| n.checked_add(self.dataset.retained_bytes()))
+            .and_then(|n| {
+                n.checked_add(
+                    self.pages
+                        .len()
+                        .checked_mul(size_of::<ProviderCapturePageReceipt>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    self.request_graph_components
+                        .len()
+                        .checked_mul(size_of::<ProviderCaptureRequestGraphComponent>())?,
+                )
+            })
+            .ok_or_else(overflow)?;
+        for component in &self.request_graph_components {
+            retained = retained
+                .checked_add(component.source_id.retained_bytes())
+                .and_then(|n| {
+                    n.checked_add(
+                        component
+                            .metadata_revision
+                            .as_source_identifier()
+                            .retained_bytes(),
+                    )
+                })
+                .and_then(|n| n.checked_add(component.dataset.retained_bytes()))
+                .ok_or_else(overflow)?;
+        }
+        Ok(retained)
+    }
+
     /// Validates ordering, page-token continuity, terminal state, and aggregate bounds.
     pub fn try_new(
         source_id: SourceId,
@@ -674,6 +734,9 @@ impl ProviderCaptureSetReceipt {
                         request_set_identity,
                         &request_graph_components,
                     )?;
+                    if let ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) = semantic_binding {
+                        binding.validate_capture_pages(&pages)?;
+                    }
                 }
             }
         }
@@ -836,6 +899,25 @@ pub struct ProviderCaptureMaterial {
 }
 
 impl ProviderCaptureMaterial {
+    /// Returns complete checked deep retained bytes for a plain response/request graph.
+    ///
+    /// Raw records use their owning payload's retained-allocation formula; payload length alone
+    /// cannot establish this bound. Shared allocations are conservatively charged once per record.
+    pub fn checked_plain_retained_bytes(&self) -> Result<usize, ProviderCaptureError> {
+        let overflow = || ProviderCaptureError::ByteLimitExceeded {
+            max: MAX_PROVIDER_CAPTURE_BYTES,
+        };
+        let mut retained = size_of::<Self>()
+            .checked_add(self.receipt.checked_plain_retained_bytes()?)
+            .ok_or_else(overflow)?;
+        for record in &self.records {
+            retained = retained
+                .checked_add(record.checked_retained_bytes().map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+        }
+        Ok(retained)
+    }
+
     /// Binds one completed capture receipt to its exact ordered raw response records.
     pub fn try_new(
         receipt: ProviderCaptureSetReceipt,
@@ -963,6 +1045,7 @@ impl ProviderCaptureMaterial {
             ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => {
                 binding.graph_purpose()
             }
+            ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => binding.graph_purpose(),
         };
         let request_set_identity = semantic_material_request_graph_identity(
             &owner_source_id,
@@ -1636,6 +1719,59 @@ pub struct ProviderCaptureSealRequest {
 }
 
 impl ProviderCaptureSealRequest {
+    /// Returns checked deep retained bytes for a plain response or live-event seal request.
+    ///
+    /// Counts receipt allocations, exact raw-record backing, and the process-local witness.
+    /// Shared allocations are conservatively charged per owner. Response captures with a
+    /// market-history semantic overlay are rejected, rather than returning an incomplete size.
+    pub fn checked_plain_retained_bytes(&self) -> Result<usize, ProviderCaptureError> {
+        let overflow = || ProviderCaptureError::ByteLimitExceeded {
+            max: MAX_PROVIDER_CAPTURE_BYTES,
+        };
+        let (receipt_bytes, records) = match &self.payload {
+            ProviderCaptureSealPayload::ResponseSet { receipt, records } => {
+                (receipt.checked_plain_retained_bytes()?, records)
+            }
+            ProviderCaptureSealPayload::EventMicrobatch { receipt, records } => {
+                let retained = size_of::<ProviderEventMicrobatchReceipt>()
+                    .checked_add(receipt.source_id.retained_bytes())
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            receipt
+                                .metadata_revision
+                                .as_source_identifier()
+                                .retained_bytes(),
+                        )
+                    })
+                    .and_then(|bytes| bytes.checked_add(receipt.dataset.retained_bytes()))
+                    .and_then(|bytes| bytes.checked_add(receipt.stream_identity.retained_bytes()))
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            receipt
+                                .frames
+                                .len()
+                                .checked_mul(size_of::<ProviderEventMicrobatchFrameReceipt>())?,
+                        )
+                    })
+                    .ok_or_else(overflow)?;
+                (retained, records)
+            }
+        };
+        // The boxed record slots are included in each record's owning retained-size formula.
+        // Count the witness Arc allocation even though the noncloneable expectation shares it.
+        let mut retained = size_of::<Self>()
+            .checked_add(receipt_bytes)
+            .and_then(|bytes| bytes.checked_add(size_of::<ProviderCaptureSealWitness>()))
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+            .ok_or_else(overflow)?;
+        for record in records {
+            retained = retained
+                .checked_add(record.checked_retained_bytes().map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+        }
+        Ok(retained)
+    }
+
     /// Seals the exact records and moves the private process-local witness into the result.
     ///
     /// Production composition exposes this operation only through `ResearchService`; adapter tests
@@ -2133,6 +2269,57 @@ pub struct ProviderOrderedCaptureSegments {
 }
 
 impl ProviderOrderedCaptureSegments {
+    /// Consumes original one-page seals into a typed complete request graph without copying or
+    /// resealing provider bodies. Original component content and observation identities survive.
+    pub fn try_rejoin_request_graph(
+        dataset: SourceIdentifier,
+        segments: Vec<ProviderWholeCaptureToken>,
+        semantic_binding: ProviderCaptureSemanticBinding,
+    ) -> Result<Self, ProviderCaptureError> {
+        if !(2..=MAX_PROVIDER_CAPTURE_PAGES).contains(&segments.len()) {
+            return Err(ProviderCaptureError::RequestGraphInvalid);
+        }
+        let first = segments.first().ok_or(ProviderCaptureError::RequestGraphInvalid)?.persisted_receipt().capture();
+        let source_id = first.source_id().clone();
+        let metadata_revision = first.metadata_revision().clone();
+        let mut pages = Vec::new();
+        let mut components = Vec::new();
+        pages.try_reserve_exact(segments.len()).map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        components.try_reserve_exact(segments.len()).map_err(|_| ProviderCaptureError::AllocationFailed)?;
+        for (index, segment) in segments.iter().enumerate() {
+            let capture = segment.persisted_receipt().capture();
+            let [page] = capture.pages() else { return Err(ProviderCaptureError::RequestGraphInvalid); };
+            if capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse {
+                return Err(ProviderCaptureError::NestedRequestGraph);
+            }
+            let ordinal = u16::try_from(index).map_err(|_| ProviderCaptureError::RequestGraphInvalid)?;
+            pages.push(page.with_ordinal(ordinal));
+            components.push(ProviderCaptureRequestGraphComponent {
+                ordinal,
+                source_id: capture.source_id().clone(),
+                metadata_revision: capture.metadata_revision().clone(),
+                dataset: capture.dataset().clone(),
+                request_set_identity: capture.request_set_identity(),
+                terminal: capture.terminal(),
+                first_page_ordinal: ordinal,
+                page_count: NonZeroU16::MIN,
+                total_body_bytes: capture.total_body_bytes(),
+                content_digest: capture.content_digest(),
+                observation_digest: capture.observation_digest(),
+            });
+        }
+        let purpose = match &semantic_binding {
+            ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => binding.graph_purpose(),
+            ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => binding.graph_purpose(),
+        };
+        let identity = semantic_request_graph_identity(&source_id, &metadata_revision, &dataset, purpose, &components);
+        let capture = ProviderCaptureSetReceipt::try_new_with_request_graph(
+            source_id, metadata_revision, dataset, identity,
+            ProviderCaptureTerminalDisposition::CompleteRequestGraph, pages, components, Some(semantic_binding),
+        )?;
+        Self::try_rejoin(capture, segments)
+    }
+
     /// Consumes exact standalone page tokens into one ordered logical multi-segment capture.
     pub fn try_rejoin(
         root_capture: ProviderCaptureSetReceipt,
@@ -2141,13 +2328,15 @@ impl ProviderOrderedCaptureSegments {
         if segments.is_empty()
             || segments.len() != root_capture.pages().len()
             || segments.len() > MAX_PROVIDER_CAPTURE_PAGES
-            || root_capture.terminal()
-                != ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+            || !matches!(root_capture.terminal(),
+                ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+                | ProviderCaptureTerminalDisposition::CompleteRequestGraph)
         {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
         for (ordinal, (root_page, token)) in root_capture.pages().iter().zip(&segments).enumerate()
         {
+            validate_ordered_graph_component(&root_capture, ordinal, token.persisted_receipt().capture())?;
             let ordinal =
                 u16::try_from(ordinal).map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
             let sealed = token.persisted_receipt();
@@ -2219,6 +2408,32 @@ impl ProviderOrderedCaptureSegments {
             .get(ordinal)
             .map(ProviderWholeCaptureToken::persisted_receipt)
     }
+}
+
+fn validate_ordered_graph_component(
+    root: &ProviderCaptureSetReceipt,
+    ordinal: usize,
+    standalone: &ProviderCaptureSetReceipt,
+) -> Result<(), ProviderCaptureError> {
+    if root.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph {
+        return Ok(());
+    }
+    let component = root.request_graph_components().get(ordinal)
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    if usize::from(component.ordinal()) != ordinal
+        || usize::from(component.first_page_ordinal()) != ordinal
+        || component.page_count().get() != 1
+        || component.source_id() != standalone.source_id()
+        || component.metadata_revision() != standalone.metadata_revision()
+        || component.dataset() != standalone.dataset()
+        || component.request_set_identity() != standalone.request_set_identity()
+        || component.terminal() != standalone.terminal()
+        || component.content_digest() != standalone.content_digest()
+        || component.observation_digest() != standalone.observation_digest()
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    Ok(())
 }
 
 fn ordered_provider_capture_segments_digest(
@@ -2912,8 +3127,9 @@ fn validate_provider_capture_binding_evidence(
             Some((first, end))
         }
         (ProviderCaptureScope::Whole, ProviderCaptureBindingLayout::OrderedSegments) => {
-            if root_capture.terminal()
-                != ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+            if !matches!(root_capture.terminal(),
+                ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage
+                | ProviderCaptureTerminalDisposition::CompleteRequestGraph)
                 || physical_claims.len() != root_capture.pages().len()
             {
                 return Err(ProviderCaptureError::SealedBindingMismatch);
@@ -2947,6 +3163,15 @@ fn validate_provider_capture_binding_evidence(
         }
         ProviderCaptureBindingLayout::OrderedSegments => {
             for (page, physical) in root_capture.pages().iter().zip(physical_claims) {
+                if root_capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph {
+                    let component = root_capture.request_graph_components().get(usize::from(page.ordinal()))
+                        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+                    if component.ordinal() != page.ordinal() || component.first_page_ordinal() != page.ordinal()
+                        || component.page_count().get() != 1
+                        || component.content_digest() != physical.capture_content_digest
+                        || component.observation_digest() != physical.capture_observation_digest
+                    { return Err(ProviderCaptureError::SealedBindingMismatch); }
+                }
                 let [frame] = physical.claim.frames() else {
                     return Err(ProviderCaptureError::SealedBindingMismatch);
                 };
@@ -3226,6 +3451,7 @@ fn validate_ordered_capture(
         let ordinal =
             u16::try_from(ordinal).map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
         let sealed = segment.persisted_receipt();
+        validate_ordered_graph_component(capture, usize::from(ordinal), sealed.capture())?;
         let [segment_page] = sealed.capture().pages() else {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         };
@@ -3659,7 +3885,31 @@ fn validate_semantic_graph_binding(
     request_set_identity: EvidenceDigest,
     components: &[ProviderCaptureRequestGraphComponent],
 ) -> Result<(), ProviderCaptureError> {
-    let ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) = semantic_binding;
+    let binding = match semantic_binding {
+        ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => binding,
+        ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => {
+            if components.len() != binding.windows().len() + 1
+                || &binding.normalization().source_contract_revision != metadata_revision
+                || request_set_identity != semantic_request_graph_identity(
+                    source_id, metadata_revision, dataset, binding.graph_purpose(), components)
+            {
+                return Err(ProviderCaptureError::RequestGraphInvalid);
+            }
+            for (index, component) in components.iter().enumerate() {
+                if component.ordinal as usize != index
+                    || component.first_page_ordinal as usize != index
+                    || component.page_count.get() != 1
+                    || component.source_id != *source_id
+                    || component.metadata_revision != *metadata_revision
+                    || component.terminal != ProviderCaptureTerminalDisposition::StandaloneResponse
+                    || index > 0 && component.request_set_identity != binding.windows()[index - 1].request_identity
+                {
+                    return Err(ProviderCaptureError::RequestGraphInvalid);
+                }
+            }
+            return Ok(());
+        }
+    };
     let market_bar_component = components
         .get(usize::from(binding.market_bar_component_ordinal))
         .ok_or(ProviderCaptureError::RequestGraphInvalid)?;
@@ -3936,7 +4186,15 @@ fn request_graph_content_digest(
 }
 
 fn hash_semantic_binding(hash: &mut Sha256, semantic_binding: &ProviderCaptureSemanticBinding) {
-    let ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) = semantic_binding;
+    let binding = match semantic_binding {
+        ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => binding,
+        ProviderCaptureSemanticBinding::CompleteMarketBarDateWindowsV1(binding) => {
+            hash.update([2]);
+            hash.update(b"complete_market_bar_date_windows_v1");
+            binding.hash_into(hash);
+            return;
+        }
+    };
     hash.update([1]);
     hash.update(b"complete_market_bar_history_v1");
     hash.update(binding.requested_start.unix_nanos().to_be_bytes());
@@ -4416,7 +4674,9 @@ mod tests {
         let temporary = TemporaryDirectory::new();
         let paths = LocalPaths::prepare(temporary.path())?;
         let store = paths.sealed_research_journal_store()?;
+        let graph_retained_bytes = graph.checked_plain_retained_bytes()?;
         let (graph_expectation, graph_seal_request) = graph.into_component_seal_parts()?;
+        assert!(graph_seal_request.checked_plain_retained_bytes()? >= graph_retained_bytes);
         let sealed = graph_seal_request.seal(&store)?;
         let mut component_tokens = graph_expectation
             .try_rejoin(sealed)?
@@ -4600,6 +4860,45 @@ mod tests {
             "provider-native-row"
         );
         native_lineage.validate(&component_batch)?;
+        assert!(matches!(
+            ProviderNativeLineageBatchBuilder::try_new_bounded(
+                ProviderNativeLineageImplementation::BlsTimeseriesV1,
+                &component_batch,
+                1,
+            ),
+            Err(ProviderNativeLineageError::BatchByteLimitExceeded { max: 1 })
+        ));
+        let mut measured_native = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::BlsTimeseriesV1,
+            &component_batch,
+        )?;
+        measured_native.try_push(&"provider-native-row")?;
+        let native_admission = measured_native.runtime_retained_bytes();
+        drop(measured_native);
+        let mut bounded_native = ProviderNativeLineageBatchBuilder::try_new_bounded(
+            ProviderNativeLineageImplementation::BlsTimeseriesV1,
+            &component_batch,
+            native_admission,
+        )?;
+        bounded_native.try_push(&"provider-native-row")?;
+        assert!(bounded_native.runtime_retained_bytes() <= native_admission);
+        let bounded_native = bounded_native.finish()?;
+        assert_eq!(bounded_native.batch_digest(), native_lineage.batch_digest());
+        let mut bounded_native = ProviderNativeLineageBatchBuilder::try_new_bounded(
+            ProviderNativeLineageImplementation::BlsTimeseriesV1,
+            &component_batch,
+            native_admission,
+        )?;
+        assert!(matches!(
+            bounded_native.try_push(&"provider-native-row-with-extra-bytes"),
+            Err(ProviderNativeLineageError::RowByteLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            bounded_native.try_set_batch_sidecar(&"x".repeat(native_admission)),
+            Err(ProviderNativeLineageError::SidecarByteLimitExceeded { .. })
+                | Err(ProviderNativeLineageError::BatchByteLimitExceeded { .. })
+        ));
+
         let incomplete_native_lineage = ProviderNativeLineageBatchBuilder::try_new(
             ProviderNativeLineageImplementation::BlsTimeseriesV1,
             &component_batch,
@@ -4648,7 +4947,12 @@ mod tests {
             event_records,
         )?;
         let expected_event_receipt = event_material.receipt().clone();
+        let event_payload_bytes = event_material.receipt().total_payload_bytes();
         let (event_expectation, event_seal_request) = event_material.into_sealing_parts();
+        assert!(
+            u64::try_from(event_seal_request.checked_plain_retained_bytes()?)?
+                > event_payload_bytes
+        );
         let event_token = event_expectation.try_rejoin(event_seal_request.seal(&store)?)?;
         assert_eq!(
             event_token.persisted_receipt().capture(),

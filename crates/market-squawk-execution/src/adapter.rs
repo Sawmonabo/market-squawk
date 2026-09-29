@@ -12,13 +12,14 @@ use std::pin::Pin;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::virtual_paper::ExecutionEvidence;
 use market_squawk_domain::{
     AccountId, AggressorSide, ApprovalId, BasisPoints, ClientOrderId, ConnectionGeneration,
     InstrumentExecutionTerms, LiveEventClass, LiveEvidenceBinding, MarketEvent, ModelId, Money,
     OrderId, OrderReasonCode, OrderSide, OrderType, PriceTicks, QualificationAssessmentId,
     QuantityLots, StrategyId, TimeInForce, Timestamp,
 };
-use market_squawk_live::{CommittedActionContext, ConsumedLiveEvidence};
+use market_squawk_live::CommittedActionContext;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -45,7 +46,7 @@ pub struct DispatchOrder {
     intent: OrderIntent,
     market: ExecutionMarketReference,
     execution_price_bound: ExecutionPriceBound,
-    evidence: ConsumedLiveEvidence,
+    evidence: ExecutionEvidence,
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     submitted_at: Timestamp,
@@ -55,6 +56,11 @@ pub struct DispatchOrder {
 }
 
 impl DispatchOrder {
+    /// Virtual simulation purpose is immutable through risk and dispatch.
+    pub const fn is_virtual_paper(&self) -> bool {
+        self.evidence.is_virtual_paper()
+    }
+
     /// Returns the one-use approval identity consumed by dispatch.
     pub const fn approval_id(&self) -> ApprovalId {
         self.approval_id
@@ -244,7 +250,7 @@ pub(crate) const fn dispatch_order_from_approval(
     intent: OrderIntent,
     market: ExecutionMarketReference,
     execution_price_bound: ExecutionPriceBound,
-    evidence: ConsumedLiveEvidence,
+    evidence: ExecutionEvidence,
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     submitted_at: Timestamp,
@@ -732,6 +738,34 @@ pub struct ExecutionMarketUpdate {
 }
 
 impl ExecutionMarketUpdate {
+    pub(crate) fn from_virtual_paper(
+        authority: &market_squawk_live::virtual_paper::ConsumedVirtualPaperAuthority,
+        market: ExecutionMarketReference,
+    ) -> Self {
+        let mut venue = Sha256::new();
+        venue.update(b"market-squawk/execution-market-venue/v1\0");
+        venue.update(authority.binding().venue_id().as_str().as_bytes());
+        let mut assessment = Sha256::new();
+        assessment.update(b"market-squawk/qualification-assessment\0");
+        assessment.update(
+            authority
+                .assessment_id()
+                .as_source_identifier()
+                .as_str()
+                .as_bytes(),
+        );
+        Self {
+            market,
+            assessment_digest: assessment.finalize().into(),
+            venue_digest: venue.finalize().into(),
+            connection_generation: authority.binding().connection_generation(),
+            event_class: LiveEventClass::Quote,
+            trade_price: None,
+            trade_quantity: None,
+            aggressor_side: None,
+        }
+    }
+
     pub(crate) fn from_committed_context(
         context: &CommittedActionContext<'_>,
         market: ExecutionMarketReference,
@@ -748,6 +782,11 @@ impl ExecutionMarketUpdate {
         let binding = match context.event() {
             MarketEvent::Trade(event) => event.provenance().binding(),
             MarketEvent::Quote(event) => event.provenance().binding(),
+            MarketEvent::MarketDataQuote(event) => event.provenance().binding(),
+            MarketEvent::MarketDataTrade(event) => event.provenance().binding(),
+            MarketEvent::MarketDataBook(event) => event.provenance().binding(),
+            MarketEvent::MarketDataChart(event) => event.provenance().binding(),
+            MarketEvent::MarketDataScreener(event) => event.provenance().binding(),
             MarketEvent::BookSnapshot(event) => event.provenance().binding(),
             MarketEvent::BookDelta(event) => event.provenance().binding(),
             MarketEvent::Auction(event) => event.provenance().binding(),
@@ -765,9 +804,16 @@ impl ExecutionMarketUpdate {
                 Some(trade.quantity()),
                 Some(trade.aggressor_side()),
             ),
-            MarketEvent::Quote(_) => (LiveEventClass::Quote, None, None, None),
-            MarketEvent::BookSnapshot(_) => (LiveEventClass::BookSnapshot, None, None, None),
+            MarketEvent::MarketDataTrade(_) => (LiveEventClass::Trade, None, None, None),
+            MarketEvent::Quote(_) | MarketEvent::MarketDataQuote(_) => {
+                (LiveEventClass::Quote, None, None, None)
+            }
+            MarketEvent::MarketDataBook(_) | MarketEvent::BookSnapshot(_) => {
+                (LiveEventClass::BookSnapshot, None, None, None)
+            }
             MarketEvent::BookDelta(_) => (LiveEventClass::BookDelta, None, None, None),
+            MarketEvent::MarketDataChart(_) => (LiveEventClass::Chart, None, None, None),
+            MarketEvent::MarketDataScreener(_) => (LiveEventClass::Screener, None, None, None),
             MarketEvent::Auction(_) => (LiveEventClass::Auction, None, None, None),
             MarketEvent::TradingHalt(_) => (LiveEventClass::TradingHalt, None, None, None),
             MarketEvent::InstrumentStatus(_) => {
@@ -853,6 +899,11 @@ pub enum ExecutionMarketSinkError {
 
 /// Replaceable backend contract reachable only with a dispatcher-created order.
 pub trait ExecutionAdapter: Send + Sync + std::fmt::Debug + 'static {
+    /// Only a virtual ledger adapter may opt in. Brokerage adapters remain fail closed.
+    fn accepts_virtual_paper(&self) -> bool {
+        false
+    }
+
     /// Returns whether every attempt is cooperatively bounded by [`ExecutionOperation`].
     ///
     /// The default is fail-closed isolation in a reaper-owned task. An adapter may return `true`

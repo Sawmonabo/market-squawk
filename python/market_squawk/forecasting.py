@@ -1,8 +1,9 @@
 """Bounded deterministic multi-horizon research forecasting.
 
-This module deliberately does not share the live scalar-decision path.  It owns
-lag/cutoff orchestration, temporal validation, and optional interval evidence;
-the fitted sklearn estimator remains the only object exported to ONNX.
+This advanced training procedure owns lag orchestration, chronological fitting,
+and interval evidence. Its fitted linear predictor is exported to the existing
+admitted ONNX runtime. Row-index outputs remain research diagnostics until the
+same target contract admits genuine economic coordinates and horizon evidence.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import math
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from sklearn.base import clone
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.multioutput import MultiOutputRegressor, RegressorChain
@@ -72,12 +72,23 @@ class ForecastSpecification:
 
 
 @dataclass(frozen=True)
+class ForecastChronology:
+    """Predeclared economic/knowledge coordinates for every retained observation."""
+
+    origins: tuple[int, ...]
+    label_ends: tuple[int, ...]
+    partition_ends: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
 class IntervalBand:
     """One finite interval and its observed marginal validation coverage."""
 
     target_coverage: float
     lower: tuple[float, ...]
     upper: tuple[float, ...]
+    lower_offset: float
+    upper_offset: float
     realized_covered: int
     realized_total: int
 
@@ -90,6 +101,10 @@ class IntervalEvidence:
     method: str
     calibration_start_index: int
     calibration_end_index: int
+    evaluation_start_index: int
+    evaluation_end_index: int
+    calibration_observations: int
+    evaluation_observations: int
     dependence_assumptions: str
     bands: tuple[IntervalBand, ...]
     residuals_bytes: bytes
@@ -130,6 +145,7 @@ def fit_forecast(
     observed: Sequence[float],
     specification: ForecastSpecification,
     *,
+    chronology: ForecastChronology,
     exogenous: Sequence[Sequence[float]] | None = None,
     future_exogenous: Sequence[Sequence[float]] | None = None,
     quantile_intervals: bool = True,
@@ -144,6 +160,11 @@ def fit_forecast(
     """
 
     spec = _validate_specification(specification)
+    if conformal_method is not None:
+        try:
+            conformal_method = ConformalMethod(conformal_method)
+        except ValueError as error:
+            raise ForecastValidationError("conformal method is unsupported") from error
     values = _finite_matrix(observed, "observed values", one_dimensional=True).reshape(-1)
     if len(values) > MAX_FORECAST_OBSERVATIONS:
         raise ForecastValidationError("observation count exceeds its hard bound")
@@ -165,22 +186,40 @@ def fit_forecast(
     if x.size + y.size > MAX_FORECAST_CELLS:
         raise ForecastValidationError("forecast matrix exceeds its retained-cell bound")
 
-    validation_predictions, validation_actuals, selection = _rolling_origin(x, y, origins, spec)
+    train, calibration, evaluation, label_ends = _partition_origins(origins, chronology, len(values), spec)
+    _, _, selection = _rolling_origin(
+        x[train], y[train], origins[train], spec, chronology, label_ends[train])
     estimator = _estimator(spec)
-    estimator.fit(x, _fit_targets(y, spec.strategy))
-    central = _future_path(estimator, values, external, future, spec)
+    estimator.fit(x[train], _fit_targets(y[train], spec.strategy))
+    calibrators = None
+    resampling = None
+    if conformal_method is not None:
+        if not dependence_assumptions:
+            raise ForecastValidationError("conformal dependence assumptions are required")
+        estimator, calibrators, resampling = _fit_mapie_estimators(
+            estimator, x[train], y[train], spec, ConformalMethod(conformal_method)
+        )
+    onnx = _export_onnx(estimator, x[train])
+    predictor = _SerializedPredictor(onnx)
+    central = _future_path(predictor, values, external, future, spec)
     _finite_vector(central, "central forecast")
 
-    residuals = validation_actuals - validation_predictions
+    calibration_predictions = _origin_predictions(predictor, values, external, origins[calibration], x[calibration], spec)
+    evaluation_predictions = _origin_predictions(predictor, values, external, origins[evaluation], x[evaluation], spec)
+    residuals = y[calibration] - calibration_predictions
+    evaluation_residuals = y[evaluation] - evaluation_predictions
     quantile = (
         _residual_intervals(
             central,
             residuals,
+            evaluation_residuals,
             IntervalKind.QUANTILE,
-            "empirical_absolute_residual_quantiles",
-            "rolling-origin residuals are treated as marginal empirical errors; coverage is not a per-observation guarantee",
-            int(origins[0]),
-            int(origins[-1] + 1),
+            "residual_quantile",
+            "Train-only serialized model; calibration-only empirical offsets; untouched test coverage; overlapping targets remain dependent.",
+            int(origins[calibration[0]]),
+            int(origins[calibration[-1]] + 1),
+            int(origins[evaluation[0]]),
+            int(origins[evaluation[-1]] + 1),
         )
         if quantile_intervals
         else None
@@ -190,18 +229,20 @@ def fit_forecast(
         if not dependence_assumptions:
             raise ForecastValidationError("conformal dependence assumptions are required")
         conformal = _mapie_intervals(
-            x,
-            y,
+            calibrators,
             central,
-            validation_predictions,
-            validation_actuals,
-            origins,
+            residuals,
+            evaluation_residuals,
+            x[calibration],
+            y[calibration],
+            origins[calibration],
+            origins[evaluation],
+            predictor,
             spec,
             conformal_method,
-            dependence_assumptions,
+            "Train-only bootstrap mean EnbPI or single-center ACI; exact serialized predictor. ACI seeds scores on the first calibration half and adapts on the second, then freezes. Shared offsets envelope calibrated outputs and include zero. Recursive calibration is one-step; untouched pooled-horizon coverage is empirical, not simultaneous or profit probability. " + dependence_assumptions,
         )
 
-    onnx = _export_onnx(estimator, x)
     parameters = {
         "strategy": spec.strategy.value,
         "horizons": list(spec.horizons),
@@ -209,6 +250,15 @@ def fit_forecast(
         "ridge_alpha": spec.ridge_alpha,
         "rolling_splits": spec.rolling_splits,
         "seed": spec.seed,
+        "partition_ends": list(chronology.partition_ends),
+        "horizon_origin": "next_index_after_last_observed",
+        "conformal_method": conformal_method.value if conformal_method is not None else None,
+        "conformal_center": "oob_weighted_bootstrap_mean" if conformal_method is ConformalMethod.ENBPI else "single_fitted_model",
+        "bootstrap_aggregation": "oob_weighted_mean" if conformal_method is ConformalMethod.ENBPI else None,
+        "resampling_block_length": resampling[0] if resampling is not None else None,
+        "resampling_count": resampling[1] if resampling is not None else None,
+        "resampling_overlapping": False if resampling is not None else None,
+        "resampling_seed": spec.seed if resampling is not None else None,
     }
     versions = {
         name: importlib.metadata.version(name)
@@ -252,6 +302,8 @@ def _validate_specification(value: ForecastSpecification) -> ForecastSpecificati
         raise ForecastValidationError("forecast lags must be unique increasing positive offsets")
     if not isinstance(value.seed, int) or isinstance(value.seed, bool) or not 0 <= value.seed < 2**32:
         raise ForecastValidationError("forecast seed is invalid")
+    if strategy is ForecastStrategy.RECURSIVE and value.horizons[0] != 1:
+        raise ForecastValidationError("recursive forecasting requires its fitted one-step horizon")
     if not 2 <= value.rolling_splits <= MAX_ROLLING_SPLITS:
         raise ForecastValidationError("rolling-origin split count is invalid")
     if not math.isfinite(value.ridge_alpha) or value.ridge_alpha < 0.0:
@@ -278,6 +330,96 @@ def _finite_matrix(values: Any, name: str, *, one_dimensional: bool = False) -> 
     return result
 
 
+def _partition_origins(origins, chronology, observations, spec):
+    if (not isinstance(chronology, ForecastChronology)
+            or len(chronology.origins) != observations or len(chronology.label_ends) != observations
+            or len(chronology.partition_ends) != 3
+            or any(type(value) is not int or not -(2**63) <= value < 2**63
+                   for values in (chronology.origins, chronology.label_ends, chronology.partition_ends)
+                   for value in values)
+            or any(left >= right for left, right in zip(chronology.origins, chronology.origins[1:]))
+            or any(left >= right for left, right in zip(chronology.partition_ends, chronology.partition_ends[1:]))):
+        raise ForecastValidationError("forecast chronology is invalid")
+    partitions = [[], [], []]
+    ends = []
+    for row, origin in enumerate(origins):
+        coordinate = chronology.origins[int(origin)]
+        terminal = max(chronology.label_ends[int(origin + horizon - 1)] for horizon in spec.horizons)
+        ends.append(terminal)
+        if any(chronology.label_ends[int(origin - lag)] > coordinate for lag in spec.lags):
+            continue
+        if (spec.strategy is ForecastStrategy.RECURSIVE
+                and any(max(chronology.label_ends[
+                    int(origin-lag):min(int(origin), int(origin-lag)+max(spec.horizons))
+                ]) > coordinate for lag in spec.lags)):
+            continue
+        for partition, end in enumerate(chronology.partition_ends):
+            if coordinate <= end:
+                if terminal <= end:
+                    partitions[partition].append(row)
+                break
+    if any(not values for values in partitions) or len(partitions[1]) < 2:
+        raise ForecastValidationError("purged train/calibration/evaluation populations are insufficient")
+    return *(np.asarray(values, dtype=np.int64) for values in partitions), np.asarray(ends, dtype=np.int64)
+
+
+class _SerializedPredictor:
+    """Execute the exact exported graph for central and held-out inference."""
+
+    def __init__(self, encoded: bytes):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        self._evaluator = ReferenceEvaluator(onnx.load_model_from_string(encoded))
+        self._input = self._evaluator.input_names[0]
+
+    def predict(self, features):
+        encoded = np.asarray(features, dtype=np.float32)
+        _finite_vector(encoded.reshape(-1), "serialized forecast inputs")
+        try:
+            output = self._evaluator.run(None, {self._input: encoded})
+        except Exception as error:
+            raise ForecastValidationError("serialized forecast evaluation failed") from error
+        if len(output) != 1:
+            raise ForecastValidationError("serialized forecast output count differs")
+        result = np.asarray(output[0], dtype=np.float64)
+        _finite_vector(result.reshape(-1), "serialized forecast output")
+        return result
+
+
+class _SerializedMapieCenter:
+    """Exact graph representation of the admitted MAPIE center.
+
+    EnbPI's fixed mean of linear bootstrap members is collapsed algebraically
+    before export. ACI uses the single fitted model. Both return the same center
+    to MAPIE's bounds/adaptation and to actual retained residual evaluation.
+    """
+
+    def __init__(self, predictor, output, ensemble):
+        self.predictor = predictor
+        self.output = output
+        self.ensemble = ensemble
+
+    def predict(self, features, ensemble=False, return_multi_pred=True, **_parameters):
+        if ensemble != self.ensemble:
+            raise ForecastValidationError("MAPIE prediction center differs from the exported policy")
+        result = self.predictor.predict(features)
+        point = np.asarray(result).reshape(len(features), -1)[:, self.output]
+        if not return_multi_pred:
+            return point
+        return point, point[:, np.newaxis], point[:, np.newaxis]
+
+
+def _origin_predictions(estimator, values, external, origins, features, spec):
+    if spec.strategy is not ForecastStrategy.RECURSIVE:
+        return np.asarray(estimator.predict(features), dtype=np.float64).reshape(len(origins), len(spec.horizons))
+    predictions = []
+    for origin in origins:
+        # Only the origin's exogenous state is available to this recursive path.
+        future = np.repeat(external[int(origin):int(origin)+1], max(spec.horizons), axis=0)
+        predictions.append(_future_path(estimator, values[:int(origin)], external[:int(origin)], future, spec))
+    return np.asarray(predictions, dtype=np.float64)
+
+
 def _optional_features(
     values: Sequence[Sequence[float]] | None,
     rows: int,
@@ -299,7 +441,7 @@ def _supervised(
     spec: ForecastSpecification,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     first_origin = max(spec.lags)
-    final_origin = len(values) - max(spec.horizons)
+    final_origin = len(values) - max(spec.horizons) + 1
     if final_origin <= first_origin:
         raise ForecastValidationError("history is shorter than the lag and horizon contract")
     origins = np.arange(first_origin, final_origin, dtype=np.int64)
@@ -311,7 +453,7 @@ def _supervised(
         dtype=np.float64,
     )
     y = np.asarray(
-        [[values[origin + horizon] for horizon in spec.horizons] for origin in origins],
+        [[values[origin + horizon - 1] for horizon in spec.horizons] for origin in origins],
         dtype=np.float64,
     )
     return x, y, origins
@@ -337,22 +479,27 @@ def _rolling_origin(
     y: np.ndarray,
     origins: np.ndarray,
     spec: ForecastSpecification,
+    chronology: ForecastChronology,
+    label_ends: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, RollingOriginEvidence]:
     predicted: list[np.ndarray] = []
     actual: list[np.ndarray] = []
     selections: list[Mapping[str, Any]] = []
     splitter = TimeSeriesSplit(n_splits=spec.rolling_splits)
     for fold, (train, validation) in enumerate(splitter.split(x)):
+        train = train[label_ends[train] < chronology.origins[int(origins[validation[0]])]]
+        if len(train) <= x.shape[1]:
+            raise ForecastValidationError("purged rolling-origin prefix is insufficient")
         estimator = _estimator(spec)
         estimator.fit(x[train], _fit_targets(y[train], spec.strategy))
         if spec.strategy is ForecastStrategy.RECURSIVE:
             one = np.asarray(estimator.predict(x[validation]), dtype=np.float64).reshape(-1, 1)
-            fold_prediction = np.repeat(one, len(spec.horizons), axis=1)
+            fold_prediction = one
         else:
             fold_prediction = np.asarray(estimator.predict(x[validation]), dtype=np.float64)
         _finite_vector(fold_prediction.reshape(-1), "rolling-origin predictions")
         predicted.append(fold_prediction)
-        actual.append(y[validation])
+        actual.append(y[validation, :1] if spec.strategy is ForecastStrategy.RECURSIVE else y[validation])
         selections.append(
             {
                 "fold": fold,
@@ -392,7 +539,7 @@ def _future_path(estimator, values, external, future, spec) -> np.ndarray:
             [[*(history[len(history) - lag] for lag in spec.lags), *future[step - 1]]],
             dtype=np.float64,
         )
-        prediction = float(estimator.predict(feature)[0])
+        prediction = float(np.asarray(estimator.predict(feature)).reshape(-1)[0])
         if not math.isfinite(prediction):
             raise ForecastValidationError("recursive forecast is nonfinite")
         history.append(prediction)
@@ -404,11 +551,14 @@ def _future_path(estimator, values, external, future, spec) -> np.ndarray:
 def _residual_intervals(
     central: np.ndarray,
     residuals: np.ndarray,
+    evaluation_residuals: np.ndarray,
     kind: IntervalKind,
     method: str,
     assumptions: str,
     start: int,
     end: int,
+    evaluation_start: int,
+    evaluation_end: int,
 ) -> IntervalEvidence:
     absolute = np.abs(residuals.reshape(-1))
     widths = np.quantile(absolute, TARGET_COVERAGES, method="higher")
@@ -416,101 +566,164 @@ def _residual_intervals(
     for coverage, width in zip(TARGET_COVERAGES, widths, strict=True):
         lower = central - float(width)
         upper = central + float(width)
-        covered = int(np.count_nonzero(absolute <= width))
+        covered = int(np.count_nonzero(np.abs(evaluation_residuals.reshape(-1)) <= width))
         bands.append(
             IntervalBand(
                 coverage,
                 tuple(float(value) for value in lower),
                 tuple(float(value) for value in upper),
+                -float(width),
+                float(width),
                 covered,
-                int(absolute.size),
+                int(evaluation_residuals.size),
             )
         )
-    return _interval_evidence(kind, method, start, end, assumptions, bands, residuals)
+    return _interval_evidence(kind, method, start, end, evaluation_start, evaluation_end, assumptions, bands, residuals, evaluation_residuals)
 
 
-def _mapie_intervals(
-    x,
-    y,
-    central,
-    validation_predictions,
-    validation_actuals,
-    origins,
-    spec,
-    method,
-    assumptions,
-) -> IntervalEvidence:
+def _linear_parameters(estimator, spec, feature_count):
+    """Collapse only fitted linear models; chaining is an affine composition."""
+    if spec.strategy is ForecastStrategy.DIRECT:
+        return np.vstack([member.coef_ for member in estimator.estimators_]), np.asarray([member.intercept_ for member in estimator.estimators_])
+    if spec.strategy is ForecastStrategy.CHAINED:
+        coefficients, intercepts = [], []
+        if list(estimator.order_) != list(range(len(estimator.estimators_))):
+            raise ForecastValidationError("linear chain order differs from the fitted policy")
+        for index, member in enumerate(estimator.estimators_):
+            coefficient = np.asarray(member.coef_[:feature_count], dtype=np.float64).copy()
+            intercept = float(member.intercept_)
+            if index:
+                previous = np.asarray(member.coef_[feature_count:], dtype=np.float64)
+                coefficient += previous @ np.asarray(coefficients)
+                intercept += float(previous @ np.asarray(intercepts))
+            coefficients.append(coefficient)
+            intercepts.append(intercept)
+        return np.asarray(coefficients), np.asarray(intercepts)
+    return np.asarray(estimator.coef_).reshape(-1, feature_count), np.asarray(estimator.intercept_).reshape(-1)
+
+
+def _linear_estimator(coefficients, intercepts, *, scalar=False):
+    coefficients = np.asarray(coefficients, dtype=np.float64)
+    intercepts = np.asarray(intercepts, dtype=np.float64)
+    _finite_vector(coefficients.reshape(-1), "fitted linear coefficients")
+    _finite_vector(intercepts.reshape(-1), "fitted linear intercepts")
+    estimator = Ridge(solver="svd")
+    estimator.n_features_in_ = coefficients.shape[1]
+    estimator.coef_ = coefficients[0].copy() if scalar else coefficients.copy()
+    estimator.intercept_ = float(intercepts[0]) if scalar else intercepts.copy()
+    return estimator
+
+
+def _fit_mapie_estimators(estimator, x, y, spec, method):
     from mapie.regression import TimeSeriesRegressor
     from mapie.subsample import BlockBootstrap
 
-    estimator = Ridge(alpha=spec.ridge_alpha, solver="svd")
+    outputs = 1 if spec.strategy is ForecastStrategy.RECURSIVE else y.shape[1]
     block_length = max(1, int(math.sqrt(len(x))))
-    cv = BlockBootstrap(
-        n_resamplings=min(30, max(2, len(x) // block_length)),
-        length=block_length,
-        overlapping=False,
-        random_state=spec.seed,
-    )
-    calibrator = TimeSeriesRegressor(
-        estimator=estimator,
-        method=method.value,
-        cv=cv,
-        n_jobs=1,
-        agg_function="mean",
-        random_state=spec.seed,
-    )
-    # MAPIE's maintained time-series regressor is scalar.  The admitted policy
-    # calibrates the first horizon, then applies its marginal residual offsets to
-    # every central point; that dependence limitation is retained verbatim.
-    calibrator.fit(x, y[:, 0])
-    feature = x[-1:].copy()
-    _, bounds = calibrator.predict(
-        feature,
-        ensemble=True,
-        confidence_level=list(TARGET_COVERAGES),
-        optimize_beta=False,
-        allow_infinite_bounds=False,
-    )
-    bounds = np.asarray(bounds, dtype=np.float64)
-    if bounds.shape != (1, 2, 3) or not np.isfinite(bounds).all():
-        raise ForecastValidationError("MAPIE returned an unsupported interval shape")
-    predicted_first = float(calibrator.predict(feature)[0])
-    lower_offsets = bounds[0, 0, :] - predicted_first
-    upper_offsets = bounds[0, 1, :] - predicted_first
-    residuals = validation_actuals - validation_predictions
-    first_residuals = residuals[:, 0]
+    resamplings = min(30, max(2, len(x) // block_length))
+    if (resamplings * outputs * (x.shape[1] + 1)
+            + outputs * len(x) * resamplings > MAX_FORECAST_CELLS):
+        raise ForecastValidationError("MAPIE fitted members exceed the retained-cell bound")
+    cv = BlockBootstrap(n_resamplings=resamplings, length=block_length,
+                        overlapping=False, random_state=spec.seed)
+    fitted_coefficients, fitted_intercepts = _linear_parameters(estimator, spec, x.shape[1])
+    chain_members = None
+    if spec.strategy is ForecastStrategy.CHAINED and method is ConformalMethod.ENBPI:
+        chain_members = []
+        for train, _ in cv.split(x, y[:, 0]):
+            member = _estimator(spec)
+            member.fit(x[train], y[train])
+            chain_members.append(_linear_parameters(member, spec, x.shape[1]))
+    calibrators, coefficients, intercepts = [], [], []
+    for output in range(outputs):
+        calibrator = TimeSeriesRegressor(
+            estimator=Ridge(alpha=spec.ridge_alpha, solver="svd"),
+            method=method.value, cv=cv, n_jobs=1, agg_function="mean", random_state=spec.seed,
+        )
+        calibrator.fit(x, y[:, output])
+        calibrator.estimator_.single_estimator_ = _linear_estimator(
+            fitted_coefficients[output:output+1], fitted_intercepts[output:output+1], scalar=True
+        )
+        if chain_members is not None:
+            calibrator.estimator_.estimators_ = [
+                _linear_estimator(coef[output:output+1], intercept[output:output+1], scalar=True)
+                for coef, intercept in chain_members
+            ]
+        if method is ConformalMethod.ENBPI:
+            # MAPIE first averages the OOB members selected by each training row,
+            # then averages those row aggregates. The fixed mask induces these
+            # exact member weights; a uniform member mean would be different.
+            mask = np.nan_to_num(calibrator.estimator_.k_, nan=0.0)
+            counts = np.sum(mask, axis=1)
+            eligible = counts > 0
+            if not np.any(eligible):
+                raise ForecastValidationError("bootstrap produced no out-of-bag aggregate")
+            weights = np.mean(mask[eligible] / counts[eligible, np.newaxis], axis=0)
+            members = calibrator.estimator_.estimators_
+            coefficient = weights @ np.asarray([member.coef_ for member in members])
+            intercept = float(weights @ np.asarray([member.intercept_ for member in members]))
+        else:
+            coefficient = fitted_coefficients[output]
+            intercept = float(fitted_intercepts[output])
+        collapsed = x @ coefficient + intercept
+        actual = np.asarray(calibrator.predict(x, ensemble=method is ConformalMethod.ENBPI))
+        tolerance = np.finfo(np.float64).eps * max(64, x.shape[1] * resamplings * 8)
+        if not np.allclose(collapsed, actual, rtol=tolerance, atol=tolerance):
+            raise ForecastValidationError("MAPIE center is not the exported linear mean")
+        coefficients.append(coefficient)
+        intercepts.append(intercept)
+        calibrators.append(calibrator)
+    return _linear_estimator(coefficients, intercepts, scalar=spec.strategy is ForecastStrategy.RECURSIVE), calibrators, (block_length, resamplings)
+
+
+def _mapie_intervals(
+    calibrators, central, calibration_residuals, evaluation_residuals,
+    calibration_x, calibration_y, calibration_origins, evaluation_origins,
+    predictor, spec, method, assumptions,
+) -> IntervalEvidence:
+    lower_offsets, upper_offsets = np.zeros(3), np.zeros(3)
+    for output, calibrator in enumerate(calibrators):
+        ensemble = method is ConformalMethod.ENBPI
+        # The fitted method is unchanged. This is the exact exported affine
+        # representation of its verified ensemble/single center, so float32
+        # runtime quantization is also present during adaptation and scoring.
+        calibrator.estimator_ = _SerializedMapieCenter(predictor, output, ensemble)
+        score_count = len(calibration_x) // 2 if method is ConformalMethod.ACI else len(calibration_x)
+        calibrator.conformity_scores_ = np.asarray(calibration_residuals[:score_count, output], dtype=np.float64).copy()
+        if method is ConformalMethod.ACI:
+            calibrator.adapt_conformal_inference(
+                calibration_x[score_count:], calibration_y[score_count:, output], gamma=0.01,
+                confidence_level=list(TARGET_COVERAGES), ensemble=False,
+            )
+        feature = calibration_x[-1:].copy()
+        point, bounds = calibrator.predict(
+            feature, ensemble=ensemble, confidence_level=list(TARGET_COVERAGES),
+            optimize_beta=False, allow_infinite_bounds=False,
+        )
+        bounds = np.asarray(bounds, dtype=np.float64)
+        if bounds.shape != (1, 2, 3) or not np.isfinite(bounds).all():
+            raise ForecastValidationError("MAPIE returned an unsupported interval shape")
+        lower_offsets = np.minimum(lower_offsets, bounds[0, 0, :] - float(point[0]))
+        upper_offsets = np.maximum(upper_offsets, bounds[0, 1, :] - float(point[0]))
+    residuals = evaluation_residuals.reshape(-1)
     bands = []
     for index, coverage in enumerate(TARGET_COVERAGES):
-        lower = central + float(lower_offsets[index])
-        upper = central + float(upper_offsets[index])
-        covered = int(
-            np.count_nonzero(
-                (first_residuals >= lower_offsets[index])
-                & (first_residuals <= upper_offsets[index])
-            )
-        )
-        bands.append(
-            IntervalBand(
-                coverage,
-                tuple(float(value) for value in lower),
-                tuple(float(value) for value in upper),
-                covered,
-                int(first_residuals.size),
-            )
-        )
+        lower, upper = float(lower_offsets[index]), float(upper_offsets[index])
+        covered = int(np.count_nonzero((residuals >= lower) & (residuals <= upper)))
+        bands.append(IntervalBand(
+            coverage, tuple(float(value) for value in central + lower),
+            tuple(float(value) for value in central + upper), lower, upper, covered, int(residuals.size),
+        ))
     return _interval_evidence(
-        IntervalKind.CONFORMAL,
-        f"mapie_{method.value}",
-        int(origins[0]),
-        int(origins[-1] + 1),
-        assumptions,
-        bands,
-        first_residuals,
+        IntervalKind.CONFORMAL, f"mapie_{method.value}",
+        int(calibration_origins[0]), int(calibration_origins[-1] + 1),
+        int(evaluation_origins[0]), int(evaluation_origins[-1] + 1),
+        assumptions, bands, calibration_residuals[:, :len(calibrators)], residuals,
     )
 
 
-def _interval_evidence(kind, method, start, end, assumptions, bands, residuals):
-    if not assumptions or any(ord(character) < 32 for character in assumptions):
+def _interval_evidence(kind, method, start, end, evaluation_start, evaluation_end, assumptions, bands, residuals, evaluation_residuals):
+    if not assumptions or len(assumptions.encode("utf-8")) > 512 or any(ord(character) < 32 for character in assumptions):
         raise ForecastValidationError("interval dependence assumptions are invalid")
     previous_lower = None
     previous_upper = None
@@ -522,7 +735,7 @@ def _interval_evidence(kind, method, start, end, assumptions, bands, residuals):
         if previous_lower is not None and (np.any(lower > previous_lower) or np.any(upper < previous_upper)):
             raise ForecastValidationError("interval values are not nested")
         previous_lower, previous_upper = lower, upper
-    residuals_bytes = np.asarray(residuals, dtype="<f8").tobytes(order="C")
+    residuals_bytes = np.concatenate((np.asarray(residuals).reshape(-1), np.asarray(evaluation_residuals).reshape(-1))).astype("<f8").tobytes(order="C")
     policy = _canonical_json(
         {
             "schema_version": 1,
@@ -531,6 +744,8 @@ def _interval_evidence(kind, method, start, end, assumptions, bands, residuals):
             "target_coverages": list(TARGET_COVERAGES),
             "calibration_start_index": start,
             "calibration_end_index": end,
+            "evaluation_start_index": evaluation_start,
+            "evaluation_end_index": evaluation_end,
             "dependence_assumptions": assumptions,
         }
     )
@@ -539,6 +754,10 @@ def _interval_evidence(kind, method, start, end, assumptions, bands, residuals):
         method,
         start,
         end,
+        evaluation_start,
+        evaluation_end,
+        int(residuals.size),
+        int(evaluation_residuals.size),
         assumptions,
         tuple(bands),
         residuals_bytes,
@@ -568,6 +787,7 @@ def _spec_mapping(spec: ForecastSpecification) -> Mapping[str, Any]:
     return {
         "strategy": spec.strategy.value,
         "horizons": list(spec.horizons),
+        "horizon_origin": "next_index_after_last_observed",
         "lags": list(spec.lags),
         "observed_cutoff_unix_nanos": spec.observed_cutoff_unix_nanos,
         "seed": spec.seed,

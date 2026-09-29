@@ -28,6 +28,137 @@ use market_squawk_sources::{
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+/// Deterministic selection for registry/processor tests, not real catalog evidence.
+/// Real catalog selection, replacement, and restart are exercised in data/adapter tests.
+/// Only the explicitly installed native routes can pass this test composition seam.
+pub(crate) fn register_fixture_source(
+    metadata: SourceMetadata,
+    routes: &[(market_squawk_domain::InstrumentId, &str)],
+    registered_at: Timestamp,
+) -> TestResult<(
+    market_squawk_sources::AuthoritativeSourceRegistry,
+    market_squawk_sources::RegisteredSource,
+)> {
+    use market_squawk_sources::{
+        AuthoritativeSourceRegistry, ProviderIdentitySelectionEvidence,
+        ProviderNativeIdentityRequest,
+    };
+    let selected_at = now_timestamp()?;
+    let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+    let mut selections = Vec::new();
+    for (instrument, symbol) in routes {
+        selections.push(std::sync::Arc::new(FixtureIdentitySelection(
+            ProviderIdentitySelectionEvidence {
+                native: ProviderNativeIdentityRequest {
+                    namespace: SourceId::try_from("coinbase-advanced-trade")?,
+                    provider_instrument_id: market_squawk_domain::ProviderInstrumentId::try_from(
+                        *symbol,
+                    )?,
+                    instrument: *instrument,
+                    venue: VenueId::try_from("coinbase")?,
+                    venue_symbol: market_squawk_domain::VenueSymbol::try_from(*symbol)?,
+                    knowledge_at: selected_at,
+                    effective_at: selected_at,
+                },
+                definition_digest: exact_evidence(31).content_digest(),
+                definition_sequence: 1,
+                reference_revision: MetadataRevision::new(source_identifier(
+                    "fixture-reference-v1",
+                )?),
+                reference_payload_digest: exact_evidence(32).content_digest(),
+                definition_published_at: selected_at,
+                definition_validity: validity,
+                provider_revision: MetadataRevision::new(source_identifier("fixture-provider-v1")?),
+                provider_payload_digest: exact_evidence(33).content_digest(),
+                provider_validity: validity,
+                resolution_digest: exact_evidence(34).content_digest(),
+                selection_digest: exact_evidence(35).content_digest(),
+            },
+        )));
+    }
+    let requests = selections
+        .iter()
+        .map(|selected| selected.0.native.clone())
+        .collect::<Vec<_>>();
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?
+        .with_provider_identity_authority(std::sync::Arc::new(FixtureIdentityCatalog(
+            selections,
+        )))?;
+    let registered = registry.register(metadata, registered_at)?;
+    registry.record_provider_identities(
+        &registered,
+        &requests,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+        &tokio_util::sync::CancellationToken::new(),
+    )?;
+    Ok((registry, registered))
+}
+
+#[derive(Debug)]
+struct FixtureIdentityCatalog(Vec<std::sync::Arc<FixtureIdentitySelection>>);
+
+impl market_squawk_sources::CatalogProviderIdentityAuthority for FixtureIdentityCatalog {
+    fn select_current(
+        &self,
+        request: &market_squawk_sources::ProviderNativeIdentityRequest,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        std::sync::Arc<dyn market_squawk_sources::CurrentCatalogProviderIdentity>,
+        market_squawk_sources::RegistryError,
+    > {
+        use market_squawk_sources::RegistryError;
+        if cancellation.is_cancelled() {
+            return Err(RegistryError::ProviderIdentitySelectionCancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RegistryError::ProviderIdentitySelectionDeadlineExceeded);
+        }
+        let mut matches = self
+            .0
+            .iter()
+            .filter(|selected| selected.0.native == *request);
+        let selected = matches.next().ok_or(RegistryError::LiveScopeNotCovered)?;
+        if matches.next().is_some() {
+            return Err(RegistryError::LiveScopeNotCovered);
+        }
+        Ok(selected.clone())
+    }
+}
+
+#[derive(Debug)]
+struct FixtureIdentitySelection(market_squawk_sources::ProviderIdentitySelectionEvidence);
+
+impl market_squawk_sources::CurrentCatalogProviderIdentity for FixtureIdentitySelection {
+    fn evidence(&self) -> &market_squawk_sources::ProviderIdentitySelectionEvidence {
+        &self.0
+    }
+
+    fn validate_at(&self, at: Timestamp) -> Result<(), market_squawk_sources::RegistryError> {
+        if at < self.0.definition_published_at
+            || [self.0.definition_validity, self.0.provider_validity]
+                .into_iter()
+                .any(|validity| {
+                    at < validity.starts_at() || validity.ends_at().is_some_and(|end| at >= end)
+                })
+        {
+            return Err(market_squawk_sources::RegistryError::StaleHandle);
+        }
+        Ok(())
+    }
+
+    fn retained_bytes(&self) -> Result<usize, market_squawk_sources::RegistryError> {
+        std::mem::size_of::<Self>()
+            .checked_add(
+                self.0
+                    .dynamic_retained_bytes()
+                    .ok_or(market_squawk_sources::RegistryError::RetainedSizeOverflow)?,
+            )
+            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or(market_squawk_sources::RegistryError::RetainedSizeOverflow)
+    }
+}
+
 pub(crate) fn acquire_budget(budget: &SharedProviderBudget) -> BudgetDecision {
     match budget.try_reserve_request() {
         BudgetReservationDecision::Ready(reservation) => match reservation.commit_dispatch() {

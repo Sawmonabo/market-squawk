@@ -17,6 +17,8 @@ pub(in crate::application::decision) struct RecoveryContext {
     candidates: BTreeMap<String, CandidateRecord>,
     screen_job_inputs: BTreeMap<String, ScreenJobPlan>,
     maximum_screen_job_inputs: usize,
+    current_find: BTreeMap<uuid::Uuid, super::super::current_find::CurrentFindRecoverySummary>,
+    current_find_source_pages: BTreeMap<String, super::super::current_find::CurrentFindSourcePageReference>,
 }
 
 impl RecoveryContext {
@@ -30,6 +32,8 @@ impl RecoveryContext {
             registry: ProductionFeatureRegistry::try_new()
                 .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?,
             candidates: BTreeMap::new(),
+            current_find: BTreeMap::new(),
+            current_find_source_pages: BTreeMap::new(),
             screen_job_inputs: BTreeMap::new(),
             maximum_screen_job_inputs,
         })
@@ -52,6 +56,72 @@ impl RecoveryContext {
             .map_err(|_error| DecisionApplicationError::InvalidPersistentState)
     }
 
+    /// Source-dependent bundles await the existing retained readers before ordered authority replay.
+    pub(in crate::application::decision) async fn apply_with_replay(
+        &mut self,
+        authority: &mut DecisionAuthority,
+        kind: i64,
+        key: &str,
+        payload: &[u8],
+        replay: &super::super::current_share::CurrentShareReplayCapability,
+        context: &market_squawk_services::RequestContext,
+    ) -> Result<(), DecisionApplicationError> {
+        let envelope: WireEnvelope = serde_json::from_slice(payload)
+            .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+        if envelope.version != WIRE_VERSION || envelope.record.kind() != kind {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        if let WireRecord::PreparedPublishedInvestmentAnalysis(wire) = envelope.record {
+            if wire.has_current_share_projection() {
+                if wire.key()? != key { return Err(DecisionApplicationError::InvalidPersistentState); }
+                let candidate = if let Some((candidate_id, run_id)) = wire.candidate_reference()? {
+                    let (run, candidate) = authority.get_candidate(&candidate_id)?;
+                    if run.id() != &run_id { return Err(DecisionApplicationError::InvalidPersistentState); }
+                    let screen = authority.get_screen(run.screen().id(), run.screen().revision())?;
+                    Some((screen.clone(), run.clone(), candidate.clone()))
+                } else { None };
+                let recovered = wire.decode_with_replay(
+                    candidate.as_ref().map(|(screen, run, candidate)| (screen, run, candidate)), replay, context,
+                ).await?;
+                return ensure_appended(authority.replay_prepared_published_investment_analysis(recovered)?);
+            }
+        }
+        self.apply(authority, kind, key, payload)
+    }
+
+    /// A backup's source authority is the unchanged live owner; exact encoding binds each row.
+    pub(in crate::application::decision) fn apply_with_retained(
+        &mut self,
+        authority: &mut DecisionAuthority,
+        retained: &DecisionAuthority,
+        kind: i64,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<(), DecisionApplicationError> {
+        let envelope: WireEnvelope = serde_json::from_slice(payload)
+            .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+        if envelope.version != WIRE_VERSION || envelope.record.kind() != kind {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        match envelope.record {
+            WireRecord::PreparedPublishedInvestmentAnalysis(wire) if wire.has_current_share_projection() => {
+                let value = retained.get_prepared_published_investment_analysis(wire.analysis_id()?)?;
+                if wire.key()? != key || super::prepared_published_investment_analysis(value)?.payload != payload {
+                    return Err(DecisionApplicationError::InvalidPersistentState);
+                }
+                ensure_appended(authority.replay_prepared_published_investment_analysis(value.clone())?)
+            }
+            WireRecord::InvestmentProposal(wire) if wire.has_current_share_projection() => {
+                let value = retained.get_investment_proposal(wire.analysis_id()?)?;
+                if wire.key()? != key || super::investment_proposal(value)?.payload != payload {
+                    return Err(DecisionApplicationError::InvalidPersistentState);
+                }
+                ensure_appended(authority.replay_investment_proposal(value.clone())?)
+            }
+            _ => self.apply(authority, kind, key, payload),
+        }
+    }
+
     fn apply_inner(
         &mut self,
         authority: &mut DecisionAuthority,
@@ -65,6 +135,45 @@ impl RecoveryContext {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
         match envelope.record {
+            WireRecord::CurrentFindCustody(record) => {
+                if record.key() != key || super::current_find_custody(&record)?.payload != payload {
+                    return Err(DecisionApplicationError::InvalidPersistentState);
+                }
+                super::super::current_find::recover(&record, &mut self.current_find, &mut self.current_find_source_pages)?;
+                match record.as_ref() {
+                    super::super::current_find::CurrentFindCustodyRecord::MemberUnavailable(
+                        value,
+                    ) => value.validate_authority(authority)?,
+                    super::super::current_find::CurrentFindCustodyRecord::Results(value) => {
+                        value.validate_authority(authority)?;
+                    }
+                    _ => {}
+                }
+                if let super::super::current_find::CurrentFindCustodyRecord::Screen(record) =
+                    record.as_ref()
+                {
+                    let parent = self
+                        .current_find
+                        .get(&record.preparation_id)
+                        .ok_or(DecisionApplicationError::InvalidPersistentState)?;
+                    let plan = self
+                        .screen_job_inputs
+                        .get(&record.run_id)
+                        .ok_or(DecisionApplicationError::InvalidPersistentState)?;
+                    let admitted = plan
+                        .admitted()
+                        .map_err(|_| DecisionApplicationError::InvalidPersistentState)?;
+                    if admitted.input_identity() != &record.input_identity
+                        || admitted.input_digest() != record.input_digest
+                        || admitted.population_member_count() != parent.population_count
+                        || plan.run().universe_identity().evidence_digest().bytes()
+                            != parent.population_content_digest
+                    {
+                        return Err(DecisionApplicationError::InvalidPersistentState);
+                    }
+                }
+                Ok(())
+            }
             WireRecord::Screen(wire) => {
                 if wire.key() != key {
                     return Err(DecisionApplicationError::InvalidPersistentState);
@@ -165,29 +274,32 @@ impl RecoveryContext {
                 if wire.key()? != key {
                     return Err(DecisionApplicationError::InvalidPersistentState);
                 }
-                ensure_appended(authority.append_investment_proposal(wire.decode()?)?)
+                ensure_appended(authority.replay_investment_proposal(wire.decode()?)?)
             }
             WireRecord::PreparedPublishedInvestmentAnalysis(wire) => {
                 let wire = *wire;
                 if wire.key()? != key {
                     return Err(DecisionApplicationError::InvalidPersistentState);
                 }
-                let candidate_id = wire.candidate_id()?;
-                let screen_run_id = wire.screen_run_id()?;
-                // Append order is authority: a bundle never buffers or recreates its candidate.
-                // An out-of-order row therefore fails closed at this exact lookup.
-                let (run, candidate) = authority.get_candidate(&candidate_id)?;
-                if run.id() != &screen_run_id {
-                    return Err(DecisionApplicationError::InvalidPersistentState);
-                }
-                let run = run.clone();
-                let candidate = candidate.clone();
-                let screen = authority
-                    .get_screen(run.screen().id(), run.screen().revision())?
-                    .clone();
-                ensure_appended(authority.append_prepared_published_investment_analysis(
-                    wire.decode(&screen, &run, &candidate)?,
-                )?)
+                let candidate =
+                    if let Some((candidate_id, screen_run_id)) = wire.candidate_reference()? {
+                        // Append order remains authority when a real saved-screen candidate is bound.
+                        let (run, candidate) = authority.get_candidate(&candidate_id)?;
+                        if run.id() != &screen_run_id {
+                            return Err(DecisionApplicationError::InvalidPersistentState);
+                        }
+                        let screen =
+                            authority.get_screen(run.screen().id(), run.screen().revision())?;
+                        Some((screen.clone(), run.clone(), candidate.clone()))
+                    } else {
+                        None
+                    };
+                let recovered = wire.decode(
+                    candidate
+                        .as_ref()
+                        .map(|(screen, run, candidate)| (screen, run, candidate)),
+                )?;
+                ensure_appended(authority.replay_prepared_published_investment_analysis(recovered)?)
             }
             WireRecord::InvestmentAnalysisPublication(wire) => {
                 if wire.key() != key {

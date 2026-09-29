@@ -63,7 +63,14 @@ impl CoinbaseCapturedPublicationIngress {
         };
         self.sender
             .try_send(input)
-            .map_err(mpsc::error::TrySendError::into_inner)
+            .map_err(|error| {
+                let reason = match &error {
+                    mpsc::error::TrySendError::Full(_) => "full",
+                    mpsc::error::TrySendError::Closed(_) => "closed",
+                };
+                tracing::warn!(reason, "Coinbase durable publication queue rejected input");
+                error.into_inner()
+            })
     }
 
     pub(in crate::live_source) fn try_submit_direct(
@@ -79,7 +86,14 @@ impl CoinbaseCapturedPublicationIngress {
         };
         self.sender
             .try_send(input)
-            .map_err(mpsc::error::TrySendError::into_inner)
+            .map_err(|error| {
+                let reason = match &error {
+                    mpsc::error::TrySendError::Full(_) => "full",
+                    mpsc::error::TrySendError::Closed(_) => "closed",
+                };
+                tracing::warn!(reason, "Coinbase durable publication queue rejected input");
+                error.into_inner()
+            })
     }
 }
 

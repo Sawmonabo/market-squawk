@@ -1,8 +1,8 @@
 //! Durable typed live-event publication evidence and composite snapshot/event edges.
 
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, InstrumentId, LiveEventClass, LiveProvenance, MarketEvent,
-    Timestamp,
+    DigestAlgorithm, EvidenceDigest, InstrumentId, LiveEventClass, LiveEvidenceScope,
+    LiveProvenance, MarketEvent, ProviderChannel, ProviderProduct, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchRawClaim};
 use market_squawk_sources::{
@@ -33,7 +33,7 @@ const MAX_EVENT_NATIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EVENT_CLAIM_JSON_BYTES: usize = 2 * 1024 * 1024;
 const EVENT_ROW_MAPPING_DIGEST_DOMAIN: &[u8] = b"market-squawk/provider-event-binding/row-map/v1";
 const EVENT_SELECTION_COORDINATE_DIGEST_DOMAIN: &[u8] =
-    b"market-squawk/provider-market-event-selection-coordinate/v1";
+    b"market-squawk/provider-market-event-selection-coordinate/v2";
 #[allow(
     dead_code,
     reason = "Wave A freezes the bounded catalog surface consumed by the later selector"
@@ -61,7 +61,9 @@ pub(crate) struct ProviderMarketEventSelectionCandidate {
     component_row_ordinal: u32,
     canonical_event_digest: EvidenceDigest,
     source_id: Box<str>,
-    instrument_id: InstrumentId,
+    scope: LiveEvidenceScope,
+    provider_product: ProviderProduct,
+    provider_channel: ProviderChannel,
     venue_id: Box<str>,
     event_kind: LiveEventClass,
     source_timestamp: Option<Timestamp>,
@@ -111,8 +113,30 @@ impl ProviderMarketEventSelectionCandidate {
         &self.source_id
     }
 
-    pub(crate) const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
+    pub(crate) const fn scope(&self) -> &LiveEvidenceScope {
+        &self.scope
+    }
+
+    pub(crate) const fn provider_product(&self) -> &ProviderProduct {
+        &self.provider_product
+    }
+
+    pub(crate) const fn provider_channel(&self) -> &ProviderChannel {
+        &self.provider_channel
+    }
+
+    fn instrument_id(&self) -> Option<InstrumentId> {
+        match &self.scope {
+            LiveEvidenceScope::Instrument(id) => Some(*id),
+            LiveEvidenceScope::SourceCohort(_) => None,
+        }
+    }
+
+    fn cohort_key(&self) -> Option<&str> {
+        match &self.scope {
+            LiveEvidenceScope::SourceCohort(key) => Some(key.as_str()),
+            LiveEvidenceScope::Instrument(_) => None,
+        }
     }
 
     pub(crate) fn venue_id(&self) -> &str {
@@ -166,7 +190,9 @@ impl ProviderMarketEventSelectionCandidate {
         let payload = serde_json::to_vec(event)?;
         if sha256_evidence(&payload) != self.canonical_event_digest
             || provenance.source_id().as_str() != self.source_id.as_ref()
-            || provenance.instrument_id() != Some(self.instrument_id)
+            || provenance.binding().scope() != &self.scope
+            || provenance.binding().provider_product() != &self.provider_product
+            || provenance.binding().provider_channel() != &self.provider_channel
             || provenance.venue_id().map(|value| value.as_str()) != Some(self.venue_id.as_ref())
             || event_kind != self.event_kind
             || provenance.source_timestamp() != self.source_timestamp
@@ -183,7 +209,12 @@ impl ProviderMarketEventSelectionCandidate {
     }
 
     fn verify_integrity(&self) -> Result<(), CatalogError> {
-        if self.publication_row_ordinal >= 128
+        if matches!(&self.scope, LiveEvidenceScope::SourceCohort(_))
+            != (self.event_kind == LiveEventClass::Screener)
+            || self
+                .cohort_key()
+                .is_some_and(|key| key != self.provider_event_id.as_ref())
+            || self.publication_row_ordinal >= 128
             || self.component_row_ordinal
                 >= u32::try_from(MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS)
                     .map_err(|_| CatalogError::InvalidRecord)?
@@ -219,12 +250,15 @@ impl ProviderMarketEventSelectionCandidate {
 
 #[derive(Clone, Debug)]
 struct PreparedProviderMarketEventSelectionRow {
+    binding: market_squawk_domain::LiveEvidenceBinding,
     component_kind: &'static str,
     component_binding_digest: EvidenceDigest,
     component_row_ordinal: u32,
     canonical_event_digest: EvidenceDigest,
     source_id: Box<str>,
-    instrument_id: InstrumentId,
+    scope: LiveEvidenceScope,
+    provider_product: ProviderProduct,
+    provider_channel: ProviderChannel,
     venue_id: Box<str>,
     event_kind: LiveEventClass,
     source_timestamp: Option<Timestamp>,
@@ -234,6 +268,7 @@ struct PreparedProviderMarketEventSelectionRow {
     connection_generation: u64,
     source_sequence: Option<u64>,
     provider_event_id: Box<str>,
+    market_data_references: Vec<market_squawk_domain::MarketDataReference>,
 }
 
 impl PreparedProviderMarketEventSelectionRow {
@@ -253,14 +288,16 @@ impl PreparedProviderMarketEventSelectionRow {
             return Err(CatalogError::ProviderEventMismatch);
         }
         let prepared = Self {
+            binding: provenance.binding().clone(),
+            market_data_references: market_event_references(event)?,
             component_kind,
             component_binding_digest,
             component_row_ordinal,
             canonical_event_digest,
             source_id: provenance.source_id().as_str().into(),
-            instrument_id: provenance
-                .instrument_id()
-                .ok_or(CatalogError::ProviderEventMismatch)?,
+            scope: provenance.binding().scope().clone(),
+            provider_product: provenance.binding().provider_product().clone(),
+            provider_channel: provenance.binding().provider_channel().clone(),
             venue_id: provenance
                 .venue_id()
                 .ok_or(CatalogError::ProviderEventMismatch)?
@@ -299,7 +336,9 @@ impl PreparedProviderMarketEventSelectionRow {
             component_row_ordinal: self.component_row_ordinal,
             canonical_event_digest: self.canonical_event_digest,
             source_id: self.source_id.clone(),
-            instrument_id: self.instrument_id,
+            scope: self.scope.clone(),
+            provider_product: self.provider_product.clone(),
+            provider_channel: self.provider_channel.clone(),
             venue_id: self.venue_id.clone(),
             event_kind: self.event_kind,
             source_timestamp: self.source_timestamp,
@@ -324,6 +363,7 @@ pub struct PersistedProviderEventBindingRow {
     canonical_row_ordinal: u32,
     canonical_event_digest: EvidenceDigest,
     native_semantic_payload: Vec<u8>,
+    identity_selection: Option<Vec<u8>>,
     native_semantic_digest: EvidenceDigest,
     event_frame_ordinal: u16,
     physical_frame_ordinal: u32,
@@ -349,6 +389,11 @@ impl PersistedProviderEventBindingRow {
     /// Returns exact bounded provider-native row semantics.
     pub fn native_semantic_payload(&self) -> &[u8] {
         &self.native_semantic_payload
+    }
+
+    /// Returns exact catalog selection evidence, never current process authority.
+    pub fn identity_selection(&self) -> Option<&[u8]> {
+        self.identity_selection.as_deref()
     }
 
     /// Returns SHA-256 of the exact provider-native row semantics.
@@ -550,6 +595,9 @@ impl PersistedProviderEventBindingEvidence {
         for (ordinal, row) in self.rows.iter().enumerate() {
             native_bytes = native_bytes
                 .checked_add(row.native_semantic_payload.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(row.identity_selection.as_ref().map_or(0, Vec::len))
+                })
                 .ok_or(CatalogError::ProviderEventMismatch)?;
             if native_bytes > MAX_EVENT_NATIVE_BYTES
                 || row.canonical_row_ordinal
@@ -592,6 +640,7 @@ impl PersistedProviderEventBindingEvidence {
                     &row.native_semantic_payload,
                     row.native_semantic_digest,
                 )
+                .and_then(|native| native.with_identity_selection(row.identity_selection()))
                 .map_err(|_| CatalogError::ProviderEventMismatch)?,
             );
             row_frames.push(
@@ -659,6 +708,7 @@ pub struct PersistedProviderResponseMarketEventBindingRow {
     canonical_row_ordinal: u32,
     canonical_event_digest: EvidenceDigest,
     native_semantic_payload: Vec<u8>,
+    identity_selection: Option<Vec<u8>>,
     native_semantic_digest: EvidenceDigest,
     capture_page_ordinal: u16,
     physical_frame_ordinal: u32,
@@ -676,6 +726,11 @@ impl PersistedProviderResponseMarketEventBindingRow {
     }
     pub fn native_semantic_payload(&self) -> &[u8] {
         &self.native_semantic_payload
+    }
+
+    /// Returns exact catalog selection evidence, never current process authority.
+    pub fn identity_selection(&self) -> Option<&[u8]> {
+        self.identity_selection.as_deref()
     }
     pub const fn native_semantic_digest(&self) -> EvidenceDigest {
         self.native_semantic_digest
@@ -783,6 +838,9 @@ impl PersistedProviderResponseMarketEventBindingEvidence {
         for (ordinal, row) in self.rows.iter().enumerate() {
             native_bytes = native_bytes
                 .checked_add(row.native_semantic_payload.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(row.identity_selection.as_ref().map_or(0, Vec::len))
+                })
                 .ok_or(CatalogError::ProviderEventMismatch)?;
             if native_bytes > MAX_EVENT_NATIVE_BYTES
                 || row.canonical_row_ordinal
@@ -821,6 +879,7 @@ impl PersistedProviderResponseMarketEventBindingEvidence {
                     &row.native_semantic_payload,
                     row.native_semantic_digest,
                 )
+                .and_then(|native| native.with_identity_selection(row.identity_selection()))
                 .map_err(|_| CatalogError::ProviderEventMismatch)?,
             );
             row_frames.push(
@@ -889,6 +948,17 @@ pub enum PersistedProviderPublicationEvidence {
 }
 
 impl PersistedProviderPublicationEvidence {
+    pub(crate) fn identity_selections(&self) -> impl Iterator<Item = Option<&[u8]>> {
+        self.response()
+            .into_iter()
+            .flat_map(|response| response.rows.iter().map(|row| row.identity_selection()))
+            .chain(
+                self.event()
+                    .into_iter()
+                    .flat_map(|event| event.rows.iter().map(|row| row.identity_selection())),
+            )
+    }
+
     /// Returns the kind-qualified publication digest retained by a run/generation.
     pub const fn publication_digest(&self) -> EvidenceDigest {
         match self {
@@ -973,6 +1043,62 @@ pub(crate) enum PreparedProviderPublicationBinding {
 }
 
 impl PreparedProviderPublicationBinding {
+    /// Revalidates original selection and current catalog pointers under the existing writer lock.
+    pub(crate) fn validate_current_identities(
+        &self,
+        authority: &crate::CatalogAuthority,
+        at: Timestamp,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), crate::MarketDataInstrumentCatalogError> {
+        let (response, event) = match self {
+            Self::ResponseMarketEvent(value) => (Some(&value.evidence), None),
+            Self::EventMicrobatch(value) => (None, Some(&value.evidence)),
+            Self::CompositeResponseEvent {
+                response, event, ..
+            } => (Some(&response.evidence), Some(&event.evidence)),
+        };
+        let rows = response
+            .into_iter()
+            .flat_map(|value| {
+                value.rows.iter().map(move |row| {
+                    (
+                        value.native_lineage.implementation.as_str(),
+                        row.identity_selection(),
+                    )
+                })
+            })
+            .chain(event.into_iter().flat_map(|value| {
+                value.rows.iter().map(move |row| {
+                    (
+                        value.native_lineage.implementation.as_str(),
+                        row.identity_selection(),
+                    )
+                })
+            }));
+        for (implementation, payload) in rows {
+            let Some(payload) = payload else {
+                // These instrument-owned live crypto paths require a committed native selection.
+                // Other provider families retain their distinct qualification rules and scopes.
+                if matches!(
+                    implementation,
+                    "coinbase_advanced_trade_v1" | "coinbase_exchange_direct_v1" | "kraken_spot_v1"
+                ) {
+                    return Err(crate::MarketDataInstrumentCatalogError::SourceIdentityConflict);
+                }
+                continue;
+            };
+            let selection = serde_json::from_slice(payload)?;
+            authority.require_current_provider_identity_in_catalog(
+                &selection,
+                at,
+                deadline,
+                cancellation,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_from_live(
         binding: &SealedProviderPublicationBinding,
     ) -> Result<Self, CatalogError> {
@@ -1101,6 +1227,9 @@ impl PreparedProviderResponseMarketEventBinding {
         {
             native_bytes = native_bytes
                 .checked_add(native_row.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(native.identity_selection(ordinal).map_or(0, <[u8]>::len))
+                })
                 .ok_or(CatalogError::ProviderEventMismatch)?;
             if native_bytes > MAX_EVENT_NATIVE_BYTES {
                 return Err(CatalogError::ResultByteLimitExceeded);
@@ -1120,6 +1249,7 @@ impl PreparedProviderResponseMarketEventBinding {
                 canonical_row_ordinal,
                 canonical_event_digest,
                 native_semantic_payload: native_payload,
+                identity_selection: copy_identity_selection(native.identity_selection(ordinal))?,
                 native_semantic_digest: native
                     .row_digest(ordinal)
                     .ok_or(CatalogError::ProviderEventMismatch)?,
@@ -1211,6 +1341,9 @@ impl PreparedProviderEventBinding {
         {
             native_bytes = native_bytes
                 .checked_add(native_row.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(native.identity_selection(ordinal).map_or(0, <[u8]>::len))
+                })
                 .ok_or(CatalogError::ProviderEventMismatch)?;
             if native_bytes > MAX_EVENT_NATIVE_BYTES {
                 return Err(CatalogError::ResultByteLimitExceeded);
@@ -1230,6 +1363,7 @@ impl PreparedProviderEventBinding {
                 canonical_row_ordinal,
                 canonical_event_digest,
                 native_semantic_payload: native_payload,
+                identity_selection: copy_identity_selection(native.identity_selection(ordinal))?,
                 native_semantic_digest: native
                     .row_digest(ordinal)
                     .ok_or(CatalogError::ProviderEventMismatch)?,
@@ -1353,7 +1487,7 @@ impl Catalog {
                     canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
                     source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
                     connection_generation_be, source_sequence_be, provider_event_id,
-                    coordinate_digest
+                    coordinate_digest, cohort_key, provider_product, provider_channel
              FROM provider_market_event_selection_index
              WHERE publication_digest=?1
              ORDER BY publication_row_ordinal
@@ -1481,7 +1615,7 @@ const PROVIDER_MARKET_EVENT_SELECTION_COLUMNS: &str =
      component_kind, component_binding_digest, component_row_ordinal,
      canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
      source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
-     connection_generation_be, source_sequence_be, provider_event_id, coordinate_digest";
+     connection_generation_be, source_sequence_be, provider_event_id, coordinate_digest, cohort_key, provider_product, provider_channel";
 
 #[allow(
     dead_code,
@@ -1572,7 +1706,23 @@ fn load_provider_market_event_selection_coordinate(
 fn load_provider_market_event_selection_candidate(
     row: &Row<'_>,
 ) -> Result<ProviderMarketEventSelectionCandidate, rusqlite::Error> {
-    let instrument_bytes: [u8; 16] = row.get(8)?;
+    let instrument_bytes: Option<[u8; 16]> = row.get(8)?;
+    let cohort: Option<String> = row.get(19)?;
+    let scope = match (instrument_bytes, cohort) {
+        (Some(bytes), None) => LiveEvidenceScope::Instrument(
+            InstrumentId::try_from(Uuid::from_bytes(bytes))
+                .map_err(|_| catalog_error_as_sql_conversion(CatalogError::CorruptCatalog))?,
+        ),
+        (None, Some(key)) => LiveEvidenceScope::SourceCohort(
+            SourceIdentifier::try_from(key)
+                .map_err(|_| catalog_error_as_sql_conversion(CatalogError::CorruptCatalog))?,
+        ),
+        _ => {
+            return Err(catalog_error_as_sql_conversion(
+                CatalogError::CorruptCatalog,
+            ));
+        }
+    };
     let connection_generation = u64::from_be_bytes(row.get(15)?);
     let source_sequence = parse_source_sequence(row.get(16)?);
     let event_kind_name: String = row.get(10)?;
@@ -1590,8 +1740,15 @@ fn load_provider_market_event_selection_candidate(
         canonical_event_digest: parse_digest(1, &row.get::<_, Vec<u8>>(6)?)
             .map_err(catalog_error_as_sql_conversion)?,
         source_id: row.get::<_, String>(7)?.into_boxed_str(),
-        instrument_id: InstrumentId::try_from(Uuid::from_bytes(instrument_bytes))
-            .map_err(|_| catalog_error_as_sql_conversion(CatalogError::CorruptCatalog))?,
+        scope,
+        provider_product: ProviderProduct::new(
+            SourceIdentifier::try_from(row.get::<_, String>(20)?)
+                .map_err(|_| catalog_error_as_sql_conversion(CatalogError::CorruptCatalog))?,
+        ),
+        provider_channel: ProviderChannel::new(
+            SourceIdentifier::try_from(row.get::<_, String>(21)?)
+                .map_err(|_| catalog_error_as_sql_conversion(CatalogError::CorruptCatalog))?,
+        ),
         venue_id: row.get::<_, String>(9)?.into_boxed_str(),
         event_kind: parse_market_event_kind(&event_kind_name)
             .map_err(catalog_error_as_sql_conversion)?,
@@ -1645,6 +1802,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 "response_market_event",
                 0,
                 &response.selection_rows,
+                recorded_at,
             )?;
         }
         PreparedProviderPublicationBinding::EventMicrobatch(event) => {
@@ -1667,6 +1825,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 "event_microbatch",
                 0,
                 &event.selection_rows,
+                recorded_at,
             )?;
         }
         PreparedProviderPublicationBinding::CompositeResponseEvent {
@@ -1713,6 +1872,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 "composite_response_event",
                 0,
                 &response.selection_rows,
+                recorded_at,
             )?;
             retain_provider_market_event_selection_rows(
                 connection,
@@ -1721,6 +1881,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 u32::try_from(*response_row_count)
                     .map_err(|_| CatalogError::ProviderEventMismatch)?,
                 &event.selection_rows,
+                recorded_at,
             )?;
         }
     }
@@ -1763,14 +1924,76 @@ fn prepared_provider_publication_row_count(
     }
 }
 
+/// Rejoins the exact immutable canonical reference under the existing publication transaction.
+/// The indexed current pointer and full definition are checked together without catalog reentry.
+fn require_current_market_data_reference(
+    connection: &Connection,
+    reference: &market_squawk_domain::MarketDataReference,
+    received_at: Timestamp,
+    recorded_at: Timestamp,
+) -> Result<(), CatalogError> {
+    let row: Option<(Option<String>, i64)> = connection.query_row(
+        "SELECT CASE WHEN length(CAST(revisions.definition_json AS BLOB)) <= ?3 THEN revisions.definition_json ELSE NULL END,
+                revisions.published_at_ns
+         FROM market_data_instrument_current AS current_
+         JOIN market_data_instrument_revisions AS revisions ON revisions.revision_digest=current_.revision_digest
+         WHERE current_.instrument_id=?1 AND current_.revision_digest=?2 LIMIT 1",
+        params![reference.instrument_id().to_string(), digest_bytes(reference.definition_digest()), to_i64(MAX_EVENT_CLAIM_JSON_BYTES)?],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((Some(json), published_at)) = row else {
+        return Err(CatalogError::ProviderEventMismatch);
+    };
+    if sha256_evidence(json.as_bytes()) != reference.definition_digest()
+        || published_at > received_at.unix_nanos()
+        || received_at > recorded_at
+    {
+        return Err(CatalogError::ProviderEventMismatch);
+    }
+    let definition: market_squawk_domain::MarketDataInstrumentDefinition =
+        serde_json::from_str(&json)?;
+    for at in [received_at, recorded_at] {
+        reference
+            .validate_definition_at(&definition, at)
+            .map_err(|_| CatalogError::ProviderEventMismatch)?;
+    }
+    Ok(())
+}
+
 fn retain_provider_market_event_selection_rows(
     connection: &Connection,
     publication_digest: EvidenceDigest,
     publication_kind: &'static str,
     first_publication_row_ordinal: u32,
     rows: &[PreparedProviderMarketEventSelectionRow],
+    recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
+    let first = rows.first().ok_or(CatalogError::ProviderEventMismatch)?;
+    let (metadata_digest, metadata_json): (Vec<u8>, String) = connection.query_row(
+        "SELECT revision.revision_digest, revision.metadata_json
+         FROM sources AS source JOIN source_revisions AS revision
+           ON revision.source_id=source.source_id
+          AND revision.revision_digest=source.current_revision_digest
+         WHERE source.source_id=?1",
+        [first.source_id.as_ref()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let metadata = checked_event_source_metadata(&metadata_digest, &metadata_json)?;
     for (offset, row) in rows.iter().enumerate() {
+        market_squawk_sources::validate_provider_market_event_binding_metadata(
+            &row.binding,
+            row.received_at,
+            &metadata,
+        )
+        .map_err(|_| CatalogError::ProviderEventMismatch)?;
+        for reference in &row.market_data_references {
+            require_current_market_data_reference(
+                connection,
+                reference,
+                row.received_at,
+                recorded_at,
+            )?;
+        }
         let publication_row_ordinal = first_publication_row_ordinal
             .checked_add(u32::try_from(offset).map_err(|_| CatalogError::ProviderEventMismatch)?)
             .ok_or(CatalogError::ProviderEventMismatch)?;
@@ -1786,9 +2009,9 @@ fn retain_provider_market_event_selection_rows(
               canonical_event_digest, source_id, instrument_id, venue_id, event_kind,
               source_timestamp_ns, received_at_ns, available_at_ns, ingested_at_ns,
               connection_generation_be, source_sequence_be, provider_event_id,
-              coordinate_digest)
+              coordinate_digest, cohort_key, provider_product, provider_channel)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 digest_bytes(candidate.publication_digest),
                 candidate.publication_kind.as_ref(),
@@ -1798,7 +2021,9 @@ fn retain_provider_market_event_selection_rows(
                 i64::from(candidate.component_row_ordinal),
                 digest_bytes(candidate.canonical_event_digest),
                 candidate.source_id.as_ref(),
-                candidate.instrument_id.as_uuid().as_bytes().as_slice(),
+                candidate
+                    .instrument_id()
+                    .map(|id| id.as_uuid().as_bytes().to_vec()),
                 candidate.venue_id.as_ref(),
                 market_event_kind_name(candidate.event_kind),
                 candidate.source_timestamp.map(Timestamp::unix_nanos),
@@ -1809,6 +2034,9 @@ fn retain_provider_market_event_selection_rows(
                 source_sequence_blob(candidate.source_sequence),
                 candidate.provider_event_id.as_ref(),
                 digest_bytes(candidate.coordinate_digest),
+                candidate.cohort_key(),
+                candidate.provider_product.as_source_identifier().as_str(),
+                candidate.provider_channel.as_source_identifier().as_str(),
             ],
         )?;
         if inserted > 1 {
@@ -2084,8 +2312,8 @@ fn insert_response_event_binding(
              (response_event_binding_digest, capture_observation_digest,
               canonical_row_ordinal, canonical_event_digest, native_semantic_payload,
               native_semantic_digest, capture_page_ordinal, physical_frame_ordinal,
-              payload_digest, received_at_ns, source_sequence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              payload_digest, received_at_ns, source_sequence, identity_selection)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 digest_bytes(evidence.binding_digest),
                 digest_bytes(evidence.capture.observation_digest()),
@@ -2098,6 +2326,7 @@ fn insert_response_event_binding(
                 digest_bytes(row.payload_digest),
                 row.received_at.unix_nanos(),
                 source_sequence_blob(row.source_sequence),
+                row.identity_selection.as_deref(),
             ],
         )?;
     }
@@ -2151,7 +2380,7 @@ pub(super) fn require_raw_claim_capacity(
     Ok(())
 }
 
-fn insert_journal_claim(
+pub(super) fn insert_journal_claim(
     connection: &Connection,
     claim_digest: EvidenceDigest,
     claim: &SealedResearchJournalSegmentClaim,
@@ -2323,8 +2552,8 @@ fn insert_event_binding(
              (event_binding_digest, event_observation_digest, canonical_row_ordinal,
               canonical_event_digest, native_semantic_payload, native_semantic_digest,
               event_frame_ordinal, physical_frame_ordinal, event_id, connection_id,
-              payload_digest, exchange_at_ns, received_at_ns, source_sequence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              payload_digest, exchange_at_ns, received_at_ns, source_sequence, identity_selection)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 digest_bytes(evidence.binding_digest),
                 digest_bytes(evidence.capture.observation_digest()),
@@ -2340,6 +2569,7 @@ fn insert_event_binding(
                 row.exchange_at.map(Timestamp::unix_nanos),
                 row.received_at.unix_nanos(),
                 source_sequence_blob(row.source_sequence),
+                row.identity_selection.as_deref(),
             ],
         )?;
     }
@@ -2579,7 +2809,7 @@ fn load_provider_response_event_binding_evidence(
     let mut statement = connection.prepare(
         "SELECT canonical_row_ordinal, canonical_event_digest, native_semantic_payload,
                 native_semantic_digest, capture_page_ordinal, physical_frame_ordinal,
-                payload_digest, received_at_ns, source_sequence
+                payload_digest, received_at_ns, source_sequence, identity_selection
          FROM provider_response_market_event_binding_rows
          WHERE response_event_binding_digest=?1 ORDER BY canonical_row_ordinal",
     )?;
@@ -2590,8 +2820,10 @@ fn load_provider_response_event_binding_evidence(
             return Err(CatalogError::ResultRowLimitExceeded);
         }
         let native_payload: Vec<u8> = row.get(2)?;
+        let identity_selection: Option<Vec<u8>> = row.get(9)?;
         native_bytes = native_bytes
             .checked_add(native_payload.len())
+            .and_then(|bytes| bytes.checked_add(identity_selection.as_ref().map_or(0, Vec::len)))
             .ok_or(CatalogError::CorruptCatalog)?;
         if native_bytes > MAX_EVENT_NATIVE_BYTES {
             return Err(CatalogError::ResultByteLimitExceeded);
@@ -2609,6 +2841,7 @@ fn load_provider_response_event_binding_evidence(
             payload_digest: parse_digest(1, &row.get::<_, Vec<u8>>(6)?)?,
             received_at: Timestamp::from_unix_nanos(row.get(7)?),
             source_sequence: parse_source_sequence(row.get(8)?),
+            identity_selection,
         });
     }
     if rows.len() != row_count {
@@ -2729,7 +2962,7 @@ fn load_provider_event_binding_evidence(
         "SELECT canonical_row_ordinal, canonical_event_digest, native_semantic_payload,
                 native_semantic_digest, event_frame_ordinal, physical_frame_ordinal,
                 event_id, connection_id, payload_digest, exchange_at_ns, received_at_ns,
-                source_sequence
+                source_sequence, identity_selection
          FROM provider_event_binding_rows WHERE event_binding_digest=?1
          ORDER BY canonical_row_ordinal",
     )?;
@@ -2740,8 +2973,10 @@ fn load_provider_event_binding_evidence(
             return Err(CatalogError::ResultRowLimitExceeded);
         }
         let native_payload: Vec<u8> = row.get(2)?;
+        let identity_selection: Option<Vec<u8>> = row.get(12)?;
         native_bytes = native_bytes
             .checked_add(native_payload.len())
+            .and_then(|bytes| bytes.checked_add(identity_selection.as_ref().map_or(0, Vec::len)))
             .ok_or(CatalogError::CorruptCatalog)?;
         if native_bytes > MAX_EVENT_NATIVE_BYTES {
             return Err(CatalogError::ResultByteLimitExceeded);
@@ -2770,6 +3005,7 @@ fn load_provider_event_binding_evidence(
                 .map(Timestamp::from_unix_nanos),
             received_at: Timestamp::from_unix_nanos(row.get(10)?),
             source_sequence: parse_source_sequence(row.get(11)?),
+            identity_selection,
         });
     }
     if rows.len() != row_count {
@@ -2827,6 +3063,13 @@ fn event_row_mapping_digest(
         hash.update(row.canonical_row_ordinal.to_be_bytes());
         hash.update(row.canonical_event_digest.bytes());
         hash.update(row.native_semantic_digest.bytes());
+        match row.identity_selection() {
+            Some(payload) => {
+                hash.update([1]);
+                hash_field(&mut hash, payload)?;
+            }
+            None => hash.update([0]),
+        }
         hash.update(row.event_frame_ordinal.to_be_bytes());
         hash.update(row.physical_frame_ordinal.to_be_bytes());
         hash.update(row.event_id);
@@ -2871,6 +3114,13 @@ fn response_event_row_mapping_digest(
         hash.update(row.canonical_row_ordinal.to_be_bytes());
         hash.update(row.canonical_event_digest.bytes());
         hash.update(row.native_semantic_digest.bytes());
+        match row.identity_selection() {
+            Some(payload) => {
+                hash.update([1]);
+                hash_field(&mut hash, payload)?;
+            }
+            None => hash.update([0]),
+        }
         hash.update(row.capture_page_ordinal.to_be_bytes());
         hash.update(row.physical_frame_ordinal.to_be_bytes());
         hash.update(row.payload_digest.bytes());
@@ -2902,7 +3152,32 @@ fn provider_market_event_selection_coordinate_digest(
     hash.update(candidate.component_row_ordinal.to_be_bytes());
     hash.update(candidate.canonical_event_digest.bytes());
     hash_field(&mut hash, candidate.source_id.as_bytes())?;
-    hash.update(candidate.instrument_id.as_uuid().as_bytes());
+    match &candidate.scope {
+        LiveEvidenceScope::Instrument(id) => {
+            hash.update([1]);
+            hash.update(id.as_uuid().as_bytes());
+        }
+        LiveEvidenceScope::SourceCohort(key) => {
+            hash.update([2]);
+            hash_field(&mut hash, key.as_str().as_bytes())?;
+        }
+    }
+    hash_field(
+        &mut hash,
+        candidate
+            .provider_product
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    hash_field(
+        &mut hash,
+        candidate
+            .provider_channel
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
     hash_field(&mut hash, candidate.venue_id.as_bytes())?;
     hash_field(
         &mut hash,
@@ -2960,6 +3235,11 @@ const fn market_event_provenance(event: &MarketEvent) -> &LiveProvenance {
     match event {
         MarketEvent::Trade(value) => value.provenance(),
         MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::MarketDataQuote(value) => value.provenance(),
+        MarketEvent::MarketDataTrade(value) => value.provenance(),
+        MarketEvent::MarketDataBook(value) => value.provenance(),
+        MarketEvent::MarketDataChart(value) => value.provenance(),
+        MarketEvent::MarketDataScreener(value) => value.provenance(),
         MarketEvent::BookSnapshot(value) => value.provenance(),
         MarketEvent::BookDelta(value) => value.provenance(),
         MarketEvent::Auction(value) => value.provenance(),
@@ -2971,8 +3251,8 @@ const fn market_event_provenance(event: &MarketEvent) -> &LiveProvenance {
 
 const fn market_event_kind_and_sequence(event: &MarketEvent) -> (LiveEventClass, Option<u64>) {
     match event {
-        MarketEvent::Trade(_) => (LiveEventClass::Trade, None),
-        MarketEvent::Quote(_) => (LiveEventClass::Quote, None),
+        MarketEvent::Trade(_) | MarketEvent::MarketDataTrade(_) => (LiveEventClass::Trade, None),
+        MarketEvent::Quote(_) | MarketEvent::MarketDataQuote(_) => (LiveEventClass::Quote, None),
         MarketEvent::BookSnapshot(value) => (
             LiveEventClass::BookSnapshot,
             match value.sequence() {
@@ -2987,6 +3267,9 @@ const fn market_event_kind_and_sequence(event: &MarketEvent) -> (LiveEventClass,
                 None => None,
             },
         ),
+        MarketEvent::MarketDataBook(_) => (LiveEventClass::BookSnapshot, None),
+        MarketEvent::MarketDataChart(_) => (LiveEventClass::Chart, None),
+        MarketEvent::MarketDataScreener(_) => (LiveEventClass::Screener, None),
         MarketEvent::Auction(_) => (LiveEventClass::Auction, None),
         MarketEvent::TradingHalt(_) => (LiveEventClass::TradingHalt, None),
         MarketEvent::InstrumentStatus(_) => (LiveEventClass::InstrumentStatus, None),
@@ -3004,6 +3287,8 @@ const fn market_event_kind_name(event_kind: LiveEventClass) -> &'static str {
         LiveEventClass::TradingHalt => "trading_halt",
         LiveEventClass::InstrumentStatus => "instrument_status",
         LiveEventClass::CorporateAction => "corporate_action",
+        LiveEventClass::Chart => "chart",
+        LiveEventClass::Screener => "screener",
     }
 }
 
@@ -3017,6 +3302,8 @@ fn parse_market_event_kind(value: &str) -> Result<LiveEventClass, CatalogError> 
         "trading_halt" => Ok(LiveEventClass::TradingHalt),
         "instrument_status" => Ok(LiveEventClass::InstrumentStatus),
         "corporate_action" => Ok(LiveEventClass::CorporateAction),
+        "chart" => Ok(LiveEventClass::Chart),
+        "screener" => Ok(LiveEventClass::Screener),
         _ => Err(CatalogError::CorruptCatalog),
     }
 }
@@ -3141,4 +3428,142 @@ where
     i64: TryFrom<T>,
 {
     i64::try_from(value).map_err(|_| CatalogError::InvalidRecord)
+}
+
+fn checked_event_source_metadata(
+    digest: &[u8],
+    json: &str,
+) -> Result<SourceMetadata, CatalogError> {
+    if json.len() > MAX_EVENT_CLAIM_JSON_BYTES || digest != sha256(json.as_bytes()) {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(serde_json::from_str(json)?)
+}
+
+impl Catalog {
+    /// Revalidates original source/channel/scope authority against the immutable capture revision.
+    pub(crate) fn validate_provider_market_event_metadata(
+        &self,
+        events: &[MarketEvent],
+        evidence: &PersistedProviderPublicationEvidence,
+    ) -> Result<(), CatalogError> {
+        evidence.verify_integrity()?;
+        let response_count = evidence
+            .response()
+            .map_or(0, |value| value.canonical_event_count());
+        let expected = response_count
+            .checked_add(
+                evidence
+                    .event()
+                    .map_or(0, |value| value.canonical_event_count()),
+            )
+            .ok_or(CatalogError::ProviderEventMismatch)?;
+        if events.len() != expected {
+            return Err(CatalogError::ProviderEventMismatch);
+        }
+        if let Some(response) = evidence.response() {
+            let capture = response.capture();
+            let (digest, json): (Vec<u8>, String) = self.connection.query_row(
+                "SELECT capture.source_revision_digest, revision.metadata_json
+                 FROM provider_raw_observations AS capture JOIN source_revisions AS revision
+                   ON revision.source_id=capture.source_id
+                  AND revision.revision_digest=capture.source_revision_digest
+                 WHERE capture.capture_observation_digest=?1",
+                [digest_bytes(capture.observation_digest())],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let metadata = checked_event_source_metadata(&digest, &json)?;
+            if metadata.source_id() != capture.source_id()
+                || metadata.revision() != capture.metadata_revision()
+            {
+                return Err(CatalogError::ProviderEventMismatch);
+            }
+            for event in &events[..response_count] {
+                let provenance = market_event_provenance(event);
+                market_squawk_sources::validate_provider_market_event_binding_metadata(
+                    provenance.binding(),
+                    provenance.received_at(),
+                    &metadata,
+                )
+                .map_err(|_| CatalogError::ProviderEventMismatch)?;
+            }
+        }
+        if let Some(event) = evidence.event() {
+            let capture = event.capture();
+            let (digest, json): (Vec<u8>, String) = self.connection.query_row(
+                "SELECT capture.source_revision_digest, revision.metadata_json
+                 FROM provider_event_microbatches AS capture JOIN source_revisions AS revision
+                   ON revision.source_id=capture.source_id
+                  AND revision.revision_digest=capture.source_revision_digest
+                 WHERE capture.event_observation_digest=?1",
+                [digest_bytes(capture.observation_digest())],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let metadata = checked_event_source_metadata(&digest, &json)?;
+            if metadata.source_id() != capture.source_id()
+                || metadata.revision() != capture.metadata_revision()
+            {
+                return Err(CatalogError::ProviderEventMismatch);
+            }
+            for event in &events[response_count..] {
+                let provenance = market_event_provenance(event);
+                market_squawk_sources::validate_provider_market_event_binding_metadata(
+                    provenance.binding(),
+                    provenance.received_at(),
+                    &metadata,
+                )
+                .map_err(|_| CatalogError::ProviderEventMismatch)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn market_event_references(
+    event: &MarketEvent,
+) -> Result<Vec<market_squawk_domain::MarketDataReference>, CatalogError> {
+    let mut references = Vec::new();
+    if let MarketEvent::MarketDataScreener(value) = event {
+        references
+            .try_reserve_exact(value.input().items.len())
+            .map_err(|_| CatalogError::Allocation)?;
+        for item in &value.input().items {
+            if let Some(reference) = &item.reference {
+                references.push(reference.clone());
+            }
+        }
+    } else {
+        let reference = match event {
+            MarketEvent::MarketDataQuote(value) => Some(value.reference()),
+            MarketEvent::MarketDataTrade(value) => Some(value.reference()),
+            MarketEvent::MarketDataBook(value) => Some(value.reference()),
+            MarketEvent::MarketDataChart(value) => Some(value.reference()),
+            _ => None,
+        };
+        if let Some(reference) = reference {
+            references
+                .try_reserve_exact(1)
+                .map_err(|_| CatalogError::Allocation)?;
+            references.push(reference.clone());
+        }
+    }
+    Ok(references)
+}
+
+fn copy_identity_selection(payload: Option<&[u8]>) -> Result<Option<Vec<u8>>, CatalogError> {
+    payload
+        .map(|payload| {
+            if payload.is_empty()
+                || payload.len() > market_squawk_sources::MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES
+            {
+                return Err(CatalogError::ResultByteLimitExceeded);
+            }
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(payload.len())
+                .map_err(|_| CatalogError::Allocation)?;
+            bytes.extend_from_slice(payload);
+            Ok(bytes)
+        })
+        .transpose()
 }

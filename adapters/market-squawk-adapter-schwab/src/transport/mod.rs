@@ -44,10 +44,12 @@ pub use streamer::{
     RawStreamerFrameKind, SchwabPendingStreamerCapture, SchwabSealedStreamerCapture,
     SchwabStreamerConnection, SchwabStreamerConnectionControl,
     SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
-    SchwabStreamerConnector, SchwabStreamerDesiredStateSendError, SchwabStreamerDesiredStateSender,
-    SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence, SchwabStreamerServiceResponseEvidence,
-    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt,
-    StreamerRunExit,
+    SchwabStreamerConnectionPermit, SchwabStreamerConnector, SchwabStreamerDesiredStateSendError,
+    SchwabStreamerDesiredStateSender, SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence,
+    SchwabStreamerRequestAcknowledgement, SchwabStreamerRequestPermit,
+    SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent,
+    SchwabStreamerServiceResponseEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
+    StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit,
 };
 #[cfg(test)]
 pub(crate) use streamer::{

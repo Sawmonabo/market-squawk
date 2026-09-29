@@ -142,7 +142,7 @@ pub async fn recover_one<R: JobRepository + ?Sized, J: JobRunner + ?Sized>(
     if orphaned.state() == JobState::Queued {
         return Ok(orphaned.clone());
     }
-    apply_recovery_disposition(repository, orphaned, runner.recover(orphaned), at).await
+    apply_recovery_disposition(repository, orphaned, runner.recover(orphaned).await, at).await
 }
 
 async fn apply_recovery_disposition<R: JobRepository + ?Sized>(
@@ -513,8 +513,11 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
                     .runners
                     .get(orphaned.spec().kind())
                     .ok_or(JobAuthorityError::UnknownKind)?;
-                let disposition =
-                    (orphaned.state() != JobState::Queued).then(|| runner.recover(orphaned));
+                let disposition = if orphaned.state() == JobState::Queued {
+                    None
+                } else {
+                    Some(runner.recover(orphaned).await)
+                };
                 let needs_queue = orphaned.state() == JobState::Queued
                     || matches!(
                         &disposition,

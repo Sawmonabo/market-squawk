@@ -12,6 +12,7 @@ mod direct;
 mod direct_transport;
 mod market_handoff;
 mod publication;
+mod reference;
 mod source;
 
 pub use config::{
@@ -25,6 +26,8 @@ pub use direct::{
     CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder,
     CoinbaseDirectHmacSigner, CoinbaseDirectLimits, CoinbaseDirectNonBookEvent,
     CoinbaseDirectNonBookKind, CoinbaseDirectProductError, CoinbaseDirectProductEvidence,
+    CoinbaseDirectProductReferenceEvidence,
+    CoinbaseDirectProductReferenceProfile,
     CoinbaseDirectReceivedLifecycle, CoinbaseDirectSequencedEvent, CoinbaseDirectSigningCapability,
     CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
     CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseDirectTpslTriggeredLifecycle,
@@ -33,11 +36,13 @@ pub use direct::{
 pub use direct_transport::{
     CoinbaseDirectOrderLevelPayload, CoinbaseDirectOrderLevelPublicationError,
     CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput, CoinbaseDirectOutputAdmission,
-    CoinbaseDirectPublicationError, CoinbaseDirectPublicationKind, CoinbaseDirectSession,
-    CoinbaseDirectSessionError,
+    CoinbaseDirectProductPreflight, CoinbaseDirectProductPreflightCompletion,
+    CoinbaseDirectProductPreflightFreshness, CoinbaseDirectPublicationError,
+    CoinbaseDirectPublicationKind, CoinbaseDirectSession, CoinbaseDirectSessionError,
 };
 pub use market_handoff::{
-    CoinbaseDirectInitialMarketLineage, CoinbaseDirectReplayFrame, CoinbaseDirectTradeEvidence,
+    CoinbaseDirectInitialMarketLineage, CoinbaseDirectReplayFrame,
+    CoinbaseDirectSuccessorMarketLineage, CoinbaseDirectTradeEvidence,
     CoinbaseMarketChannel, CoinbaseMarketContinuity, CoinbaseMarketDecodeOutcome,
     CoinbaseMarketFeed, CoinbaseMarketHandoff, CoinbaseMarketHandoffError,
     CoinbaseMarketHandoffEvidence, CoinbaseMarketRawLineage,
@@ -53,3 +58,5 @@ pub use publication::{
     CoinbaseSealedMarketPublication, CoinbaseSealedRawMarketPublication,
 };
 pub use source::CoinbaseExchangeSource;
+
+pub use reference::{COINBASE_PUBLIC_PRODUCT_ENDPOINT, CoinbasePublicProductReference, CoinbasePublicProductReferenceError, MAX_COINBASE_PUBLIC_PRODUCT_BYTES};

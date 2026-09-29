@@ -4,10 +4,10 @@
 | --- | --- |
 | Document type | Selected-provider target and evidence contract |
 | Audience | Operators, financial-data engineers, quantitative researchers, application integrators, and reviewers |
-| Status | Optional owner-enabled provider; bounded authenticated evidence exists; no Schwab adapter or product composition ships yet |
-| Evidence cutoff | 2026-08-11, America/New_York |
-| Audit basis | `3a2f24ddbe88a886d9ba6458dd141774e3716a9d` plus the preserved working-tree overlay |
-| Refresh gate | Re-freeze the authenticated OpenAPI/schema, repeat regular-session capacity and reconnect measurements, and pass the acceptance chain below before implementation can be called available |
+| Status | Unreleased V1 integration candidate: adapter and activation code exist; installed live Schwab acceptance is unverified |
+| Evidence cutoff | 2026-09-23, America/New_York |
+| Audit basis | `ea2982b1458f03a676aebf1f12d4135844e77ea0` plus the uncommitted V1 integration tree; this is not an approved release head |
+| Refresh gate | Establish a fresh authorized OAuth session, verify daily-history semantics and the installed restart journey, then pass the acceptance chain below |
 
 Numeric and contractual statements use the evidence labels defined in the
 [provider index](README.md).
@@ -74,6 +74,14 @@ Streamer bootstrap is intentionally narrow:
 | **RUNTIME-MEASURED VALUE** | `GET /markets` and `GET /markets/{market_id}` | Market-hours evidence |
 | **RUNTIME-MEASURED VALUE** | `GET /instruments` | Symbol-description and fundamental/reference search |
 | **RUNTIME-MEASURED VALUE** | `GET /instruments/{cusip_id}` | CUSIP-addressed instrument detail |
+
+The [human-readable Market Data Production specification](https://developer.schwab.com/products/trader-api--individual/details/specifications/Market%20Data%20Production)
+confirms `GET /pricehistory` accepts `frequencyType=daily` with `frequency=1`, describes
+`datetime` in epoch milliseconds, and lists `datetimeISO8601` as a date field in the `Candle`
+schema. Its example response omits the ISO field. It does not define split or dividend adjustment
+or say which instant a daily candle timestamp represents. The current adapter therefore captures
+and parses history but rejects canonical daily-bar publication as `SemanticsUnverified`; app keys
+alone cannot replace an authorized OAuth session for a live comparison.
 
 The currently selected Streamer services are:
 
@@ -181,12 +189,12 @@ configuration, storage, scheduler, or frontend data path.
 
 | Seam | Current status and required integration |
 | --- | --- |
-| Provider onboarding and secret store | No Schwab profile/adapter currently exists; add OAuth session activation through the existing onboarding and protected session authorities |
-| Shared provider rate authority | Reuse `crates/market-squawk-sources/src/policy/provider_rate.rs` and `crates/market-squawk-data/src/provider_rate.rs` |
-| Live source and capture | Add one Schwab controller/decoder behind `apps/market-squawk/src/live_source/provider.rs` and the existing bounded capture path |
-| Canonical schemas | Map through `crates/market-squawk-data/src/schema.rs` and `crates/market-squawk-domain/src/market.rs`; version the Streamer field dictionary |
-| Runtime composition | Add typed activation and group ownership under `apps/market-squawk/src/provider_activation/` and the Market runtime |
-| Product reads | Add provider-independent typed reads; never expose raw Schwab JSON or socket frames to Desktop |
+| Provider onboarding and secret store | OAuth and doctor activation code exists in `apps/market-squawk/src/provider_onboarding/` and `provider_activation/schwab.rs`; no current installed OAuth session was available for this review |
+| Shared provider rate authority | Schwab REST and Streamer rate wrappers exist under `apps/market-squawk/src/provider_rate/`; full live capacity evidence remains open |
+| Live source and capture | REST and Streamer adapter/capture code exists in `adapters/market-squawk-adapter-schwab/`; installed live acceptance remains open |
+| Canonical schemas | Quote, option, and market-event paths are present in the V1 candidate; daily price history remains unclassified and cannot publish canonical daily bars |
+| Runtime composition | Typed activation code exists under `apps/market-squawk/src/provider_activation/`; full installed shutdown/restart has not been proven |
+| Product reads | Keep ordinary reads provider-independent and prove Desktop/CLI/MCP behavior from the installed service before marking this seam complete |
 
 ## Doctor and end-to-end acceptance gates
 
@@ -217,8 +225,11 @@ Availability requires all of:
 - Numeric Streamer symbol/service ceilings, replay behavior, and book completeness are unpublished.
 - Book-field semantics, sequence recovery, corrections, and every asset-family clock need
   versioned fixture coverage.
-- No Schwab adapter, scheduler lane, canonical mapper, typed application read, or frontend
-  composition currently ships.
+- Daily Price History's adjustment and daily date/time semantics remain unverified. The current
+  parser retains `datetime` but not `datetimeISO8601`; a live response must establish whether the
+  date field is supplied before relying on it.
+- No current installed OAuth session or complete Schwab installed shutdown/restart evidence was
+  available at the September 23 review.
 
 ## First-party sources
 
@@ -227,7 +238,7 @@ Availability requires all of:
 - [OAuth restart versus refresh token](https://developer.schwab.com/user-guides/apis-and-apps/oauth-restart-vs-refresh-token)
 - [Callback URL requirements](https://developer.schwab.com/user-guides/apis-and-apps/app-callback-url-requirements)
 - [Trader API production documentation](https://contentdelivery.schwab.com/api/content/rtcontent/asset/retail-trader-api-production--trader-api--individual--documentation)
-- [Market-data production documentation](https://contentdelivery.schwab.com/api/content/rtcontent/asset/market-data-production--trader-api--individual--documentation)
+- [Market Data Production specifications](https://developer.schwab.com/products/trader-api--individual/details/specifications/Market%20Data%20Production)
 
 ## Related maintained contracts
 

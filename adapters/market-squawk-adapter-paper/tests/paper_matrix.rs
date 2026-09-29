@@ -56,7 +56,7 @@ async fn oversized_combined_event_capacity_is_rejected_before_tokio_construction
         maximum_latency_nanos: 0,
         cancel_latency_nanos: 0,
         maximum_mark_age_nanos: 1_000_000_000,
-        day_session_calendar: calendar,
+        session_policy: market_squawk_adapter_paper::PaperExecutionSessionPolicy::Venue(calendar),
         maximum_participation_basis_points: 10_000,
         impact_basis_points_per_level: 0,
         reporting_currency: usd,

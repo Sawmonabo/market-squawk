@@ -44,7 +44,8 @@ pub use config::{
     CoinbaseSourceConfig, ConfigError, ConfigOrigin, ConfigOverrides, ConfigProvenance,
     ConfigSetting, ConfigSources, EffectiveConfig, EffectiveConfigView, EffectiveSettingView,
     KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation, KrakenConfigurationError,
-    KrakenInstrumentMapping, KrakenSourceConfig, SecretError, SecretProvider, SecretReference,
+    KrakenInstrumentMapping, KrakenSourceConfig, RECOMMENDED_PUBLIC_BTC_USD_INSTRUMENT_ID,
+    SecretError, SecretProvider, SecretReference,
     SecretValue,
 };
 pub use input::{

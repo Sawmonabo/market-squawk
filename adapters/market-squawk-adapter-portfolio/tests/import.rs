@@ -68,7 +68,11 @@ fn preview_normalizes_without_promoting_raw_or_active_source_state() -> TestResu
 
 #[test]
 fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_data() -> TestResult {
-    let fixture: FixtureManifest = serde_json::from_slice(FIXTURE)?;
+    let mut fixture: FixtureManifest = serde_json::from_slice(FIXTURE)?;
+    let mut account_payload: serde_json::Value =
+        serde_json::from_str(&fixture.records[0].payload)?;
+    account_payload["record"]["settlement_available_cash"] = serde_json::json!("-125.25");
+    fixture.records[0].payload = serde_json::to_string(&account_payload)?;
     let batch = batch(&fixture.records, "portfolio-statement")?;
     let credential = SecretReference::try_from("keyring:brokerage-account-token")?;
     let archive = tempfile::tempdir()?;
@@ -113,6 +117,58 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
     );
     assert_eq!(imported.accounts()[0].currency().as_str(), "USD");
     assert_eq!(imported.accounts()[0].as_of().unix_nanos(), 100);
+    let settled_cash = imported.accounts()[0]
+        .settlement_available_cash()
+        .ok_or("supplied settled cash absent")?;
+    assert_eq!(settled_cash.amount().to_string(), "-125.25");
+    assert_eq!(settled_cash.currency(), imported.accounts()[0].currency());
+    assert_eq!(
+        imported.accounts()[0].source_reference(),
+        first.source_reference()
+    );
+    assert_eq!(imported.accounts()[1].settlement_available_cash(), None);
+    let expected_accounts = imported.accounts().to_vec();
+
+    let canonical = imported
+        .normalized_batch()
+        .records()
+        .iter()
+        .map(|record| serde_json::from_slice::<ResearchObservation>(record.payload()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let settled_scalars = canonical
+        .iter()
+        .filter_map(|observation| match observation {
+            ResearchObservation::AlternativeData(value)
+                if value.dataset().as_str() == "portfolio-accounts"
+                    && value.field().as_str() == "settlement_available_cash" =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(settled_scalars.len(), 1);
+    let settled_scalar = settled_scalars[0];
+    assert_eq!(settled_scalar.value(), settled_cash.amount());
+    assert_eq!(
+        settled_scalar.unit().map(SourceIdentifier::as_str),
+        Some("USD")
+    );
+    let balance_scalar = canonical
+        .iter()
+        .find_map(|observation| match observation {
+            ResearchObservation::AlternativeData(value)
+                if value.dataset().as_str() == "portfolio-accounts"
+                    && value.field().as_str() == "cash_balance"
+                    && value.context().provenance().source_identifier().as_str()
+                        == "account-taxable" =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .ok_or("original account cash balance scalar absent")?;
+    assert_eq!(settled_scalar.context(), balance_scalar.context());
     assert_eq!(
         imported.holdings()[0].instrument_id(),
         "11111111-1111-4111-8111-111111111111".parse::<InstrumentId>()?
@@ -200,6 +256,7 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
 
     let replayed = source.import_batch(&batch)?;
     assert_eq!(replayed.disposition(), ImportDisposition::Replay);
+    assert_eq!(replayed.accounts(), expected_accounts.as_slice());
     assert_eq!(source.raw_records().len(), fixture.records.len());
     assert_eq!(
         extraction_batch_digest(replayed.normalized_batch())?,
@@ -222,8 +279,13 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
         PortfolioImportLimits::standard(),
     )?;
     assert_eq!(restarted.raw_records().len(), fixture.records.len());
+    assert_eq!(
+        restarted.raw_records()[0].bytes().as_ref(),
+        fixture.records[0].payload.as_bytes()
+    );
     let restarted_replay = restarted.import_batch(&batch)?;
     assert_eq!(restarted_replay.disposition(), ImportDisposition::Replay);
+    assert_eq!(restarted_replay.accounts(), expected_accounts.as_slice());
     assert_eq!(
         extraction_batch_digest(restarted_replay.normalized_batch())?,
         normalized_digest
@@ -371,9 +433,12 @@ fn observation_revision(observation: &ResearchObservation) -> RevisionNumber {
         ResearchObservation::Fundamental(value) => value.context().time().revision(),
         ResearchObservation::Macro(value) => value.context().time().revision(),
         ResearchObservation::MarketBar(value) => value.context().time().revision(),
+        ResearchObservation::FundNav(value) => value.context().time().revision(),
+        ResearchObservation::MarketCalendar(value) => value.context().time().revision(),
         ResearchObservation::PortfolioPosition(value) => value.context().time().revision(),
         ResearchObservation::Transaction(value) => value.context().time().revision(),
         ResearchObservation::CorporateAction(value) => value.context().time().revision(),
+        ResearchObservation::CorporateActionSource(value) => value.context().time().revision(),
         ResearchObservation::AlternativeData(value) => value.context().time().revision(),
         ResearchObservation::UniverseMembership(value) => value.context().time().revision(),
     }

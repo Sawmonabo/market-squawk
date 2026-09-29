@@ -100,6 +100,16 @@ fn app_config_with_overrides(overrides: ConfigOverrides) -> TestResult<AppConfig
         "effective_from_unix_nanos":1700000000000000000,
         "effective_until_unix_nanos":1900000000000000000
       },
+      "reference_authorization":{
+        "mode":"public_interface",
+        "provider":"coinbase-exchange",
+        "basis":"market-squawk-reviewed-coinbase-product-reference",
+        "evidence_sha256":"6d6be28e5a9484c6bbfa75041b382cdaf2bbe387237d1cc4168aa02b59d58bd7",
+        "evidence_reference":"https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product",
+        "evidence_version":"reviewed-2026-09-23",
+        "effective_from_unix_nanos":1700000000000000000,
+        "effective_until_unix_nanos":1900000000000000000
+      },
       "instruments":[{
         "product":"BTC-USD",
         "instrument_id":"4c74ab95-53b9-42ad-9b66-0ed403b88fed",

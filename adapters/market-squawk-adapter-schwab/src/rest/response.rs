@@ -872,6 +872,8 @@ pub struct MarketHours {
     pub date: Box<str>,
     pub is_open: bool,
     pub category: NativeField<Box<str>>,
+    /// Distinguishes omitted, null and reported sessionHours before flattening.
+    pub session_presence: NativeField<()>,
     pub sessions: Box<[NativeFieldEntry<Box<str>>]>,
 }
 
@@ -890,6 +892,15 @@ pub fn parse_market_hours_response(
             let date = remove_required_text(&mut hours, "date")?;
             let is_open = remove_required_bool(&mut hours, "isOpen")?;
             let category = remove_native_text(&mut hours, "category")?;
+            let session_presence = match hours.get("sessionHours") {
+                None => NativeField::Absent,
+                Some(Value::Null) => NativeField::Null,
+                Some(Value::Object(_)) => NativeField::Value(()),
+                Some(_) => return Err(SchwabAdapterError::SchemaViolation),
+            };
+            if matches!(session_presence, NativeField::Null) {
+                hours.remove("sessionHours");
+            }
             let sessions = parse_named_scalar_block(
                 &mut hours,
                 "sessionHours",
@@ -903,6 +914,7 @@ pub fn parse_market_hours_response(
                 date: date.into_boxed_str(),
                 is_open,
                 category,
+                session_presence,
                 sessions,
             });
         }

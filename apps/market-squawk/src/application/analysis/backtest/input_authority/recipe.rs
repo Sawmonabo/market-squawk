@@ -1,6 +1,7 @@
 //! Canonical immutable governed-backtest recipes and their expected authority evidence.
 
 mod corporate_actions;
+mod daily_history;
 mod manifest;
 mod policy;
 
@@ -11,7 +12,8 @@ use market_squawk_backtesting::{
     ResearchExecutionAssumptionsInput,
 };
 use market_squawk_data::{
-    CatalogLimit, DatasetManifestRef, DatasetSchemaRegistry, QueryLimits, QueryRequest,
+    CatalogLimit, CompleteMarketBarHistoryOutput, DatasetManifestRef, DatasetSchemaRegistry,
+    QueryLimits, QueryRequest,
 };
 use market_squawk_domain::{InstrumentId, SourceId, SourceIdentifier, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,7 @@ pub use corporate_actions::GovernedBacktestCorporateActionsInput;
 pub use policy::{GovernedBacktestPortfolioSeedInput, GovernedBacktestQueryLimitsInput};
 
 use corporate_actions::CorporateActionsWire;
+pub(super) use daily_history::DailyHistoryWire;
 use manifest::ManifestWire;
 pub(in crate::application::analysis::backtest::input_authority) use manifest::{
     ManifestAuthorityWire, sort_manifest_authorities, validate_manifest_authorities,
@@ -37,6 +40,7 @@ use policy::{
 const INPUT_RECIPE_SCHEMA_VERSION: u16 = 1;
 const INPUT_REGISTRATION_SCHEMA_VERSION: u16 = 1;
 const MAX_INLINE_QUERY_BYTES: u64 = 256 * 1024;
+const MAX_STUDY_QUERY_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Maximum accepted encoded size of one governed-backtest registration request.
 pub const MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
@@ -203,6 +207,7 @@ impl RegistrationRecipe {
             limits: BacktestLimitsWire::try_from_input(input.limits)?,
             experiment: ExperimentWire::try_from_plan(input.experiment)?,
             cohort: input.cohort.map(CohortWire::try_from_input).transpose()?,
+            daily_history: None,
         };
         wire.validate()?;
         Ok(Self { wire })
@@ -218,6 +223,32 @@ impl RegistrationRecipe {
         };
         recipe.validate()?;
         Ok(recipe)
+    }
+
+    /// Only sealed durable complete-history outputs can add realized daily outcomes. This
+    /// internal extension is unavailable through the public registration JSON contract.
+    pub(super) fn with_daily_history(
+        mut self,
+        histories: &[CompleteMarketBarHistoryOutput],
+        admitted_at: Timestamp,
+        source_action_reference: crate::application::research::corporate_actions::SourceAppliedCorporateActionPlanReference,
+    ) -> Result<Self, RecipeError> {
+        if self.wire.daily_history.is_some() || self.wire.cohort.is_some() {
+            return Err(RecipeError::Invalid);
+        }
+        self.wire.query_limits = self
+            .wire
+            .query_limits
+            .for_study(self.wire.limits.into_input()?.max_retained_bytes)?;
+        self.wire.table_name = "observations".into();
+        self.wire.sql = "SELECT * FROM observations WHERE component_kind = 1 ORDER BY decision_at, instrument_id, example_id, component_name, component_version".into();
+        self.wire.daily_history = Some(DailyHistoryWire::from_outputs(
+            histories,
+            admitted_at,
+            source_action_reference,
+        )?);
+        self.wire.validate()?;
+        Ok(self)
     }
 
     pub(super) fn core(&self) -> &InputCoreWire {
@@ -311,6 +342,8 @@ pub(super) struct InputCoreWire {
     experiment: ExperimentWire,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cohort: Option<CohortWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daily_history: Option<DailyHistoryWire>,
 }
 
 impl InputCoreWire {
@@ -322,7 +355,12 @@ impl InputCoreWire {
         self.query_limits()?;
         if manifest.schema() != &expected_schema
             || !valid_table_name(&self.table_name)
-            || self.query_limits.max_bytes() > MAX_INLINE_QUERY_BYTES
+            || self.query_limits.max_bytes()
+                > if self.daily_history.is_some() {
+                    MAX_STUDY_QUERY_BYTES
+                } else {
+                    MAX_INLINE_QUERY_BYTES
+                }
             || self.instruments.is_empty()
             || !strictly_ordered(&self.instruments)
             || self.sources.is_empty()
@@ -339,6 +377,22 @@ impl InputCoreWire {
         self.limits()?;
         self.experiment()?;
         self.cohort()?;
+        if let Some(history) = &self.daily_history {
+            if self.cohort.is_some() {
+                return Err(RecipeError::Invalid);
+            }
+            if self.query_limits
+                != self
+                    .query_limits
+                    .for_study(self.limits.into_input()?.max_retained_bytes)?
+                || self.table_name != "observations"
+                || self.sql
+                    != "SELECT * FROM observations WHERE component_kind = 1 ORDER BY decision_at, instrument_id, example_id, component_name, component_version"
+            {
+                return Err(RecipeError::Invalid);
+            }
+            history.validate(self)?;
+        }
         Ok(())
     }
 
@@ -346,6 +400,9 @@ impl InputCoreWire {
         self,
     ) -> Result<GovernedBacktestInputRegistrationInput, RecipeError> {
         self.validate()?;
+        if self.daily_history.is_some() {
+            return Err(RecipeError::Invalid);
+        }
         let manifest = self.manifest.to_manifest()?;
         let query_limits = self.query_limits.into_input()?;
         let execution_assumptions = self.execution_assumptions.into_input()?;
@@ -408,6 +465,10 @@ impl InputCoreWire {
 
     pub(super) fn definition_as_of(&self) -> Timestamp {
         Timestamp::from_unix_nanos(self.ends_at_unix_nanos)
+    }
+
+    pub(super) const fn daily_history(&self) -> Option<&DailyHistoryWire> {
+        self.daily_history.as_ref()
     }
 
     pub(super) fn execution_assumptions(
@@ -828,12 +889,20 @@ impl ExpectedEvidence {
         input: &PinnedBacktestInput,
         manifests: Vec<ManifestAuthorityWire>,
     ) -> Self {
+        Self::from_query(&input.query, &input.instrument_definitions, manifests)
+    }
+
+    pub(super) fn from_query(
+        query: &market_squawk_data::PinnedQueryOutput,
+        definitions: &market_squawk_data::PinnedInstrumentDefinitions,
+        manifests: Vec<ManifestAuthorityWire>,
+    ) -> Self {
         Self {
-            query_identity: input.query.query_identity().bytes(),
-            object_graph_digest: input.query.object_graph_digest().bytes(),
-            result_digest: input.query.result_digest().bytes(),
-            definition_content_identity: input.instrument_definitions.content_identity().bytes(),
-            definition_audit_identity: input.instrument_definitions.audit_identity().bytes(),
+            query_identity: query.query_identity().bytes(),
+            object_graph_digest: query.object_graph_digest().bytes(),
+            result_digest: query.result_digest().bytes(),
+            definition_content_identity: definitions.content_identity().bytes(),
+            definition_audit_identity: definitions.audit_identity().bytes(),
             manifests,
             cohort_members: Vec::new(),
         }

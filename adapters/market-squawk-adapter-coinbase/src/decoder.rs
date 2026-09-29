@@ -10,6 +10,7 @@ use market_squawk_sources::{
     DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction, DecoderEvidence,
     IgnoredFrameReason, ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel,
     ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ProviderIdentitySelectionEvidence, ProviderNativeInstrumentIdentity,
     ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
     ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
     QuarantineReason, ResynchronizationReason, SourceMetadata, SourceMetadataProvider,
@@ -53,6 +54,7 @@ pub struct CoinbaseExchangeDecoder {
     max_frame_bytes: usize,
     product: ProviderProduct,
     configured_instrument: InstrumentId,
+    selected_public_identity: Option<ProviderIdentitySelectionEvidence>,
     request_set_digest: EvidenceDigest,
     subscription_digest: EvidenceDigest,
     last_market_coordinates: Option<CoinbasePublicMarketCoordinates>,
@@ -151,6 +153,7 @@ impl CoinbaseExchangeDecoder {
             max_frame_bytes: config.transport_limits().max_frame_bytes(),
             product,
             configured_instrument,
+            selected_public_identity: mapping.selected_public_identity().cloned(),
             request_set_digest,
             subscription_digest,
             last_market_coordinates: None,
@@ -323,6 +326,7 @@ impl CoinbaseExchangeDecoder {
             // for this message and therefore owns observation-level freshness.
             observations.push(observation_input(
                 format!("l2-{}-{index}-{}", wire.sequence_num, event.product_id),
+                event.product_id,
                 instrument,
                 ProviderTimestampEvidence::Provided {
                     value: envelope_at,
@@ -426,6 +430,7 @@ impl CoinbaseExchangeDecoder {
                 };
                 observations.push(observation_input(
                     trade.trade_id,
+                    trade.product_id,
                     instrument,
                     ProviderTimestampEvidence::Provided {
                         value: timestamp,
@@ -594,6 +599,19 @@ impl CoinbaseExchangeDecoder {
     }
 
     fn data(&self, evidence: DecoderEvidence, inputs: Vec<ObservationInput>) -> DecodeOutcome {
+        let Some(selected) = &self.selected_public_identity else {
+            return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+        };
+        let native = &selected.native;
+        if native.namespace.as_str() != "coinbase-advanced-trade"
+            || native.venue != self.venue
+            || native.instrument != self.configured_instrument
+            || native.provider_instrument_id.as_str()
+                != self.product.as_source_identifier().as_str()
+            || native.venue_symbol.as_str() != self.product.as_source_identifier().as_str()
+        {
+            return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+        }
         let mut observations = Vec::new();
         if observations.try_reserve_exact(inputs.len()).is_err() {
             return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
@@ -609,10 +627,21 @@ impl CoinbaseExchangeDecoder {
                     );
                 }
             };
+            if input.product_id != native.provider_instrument_id.as_str()
+                || input.instrument != native.instrument
+            {
+                return quarantine(evidence, QuarantineReason::WrongProduct, None);
+            }
+            let native_identity = ProviderNativeInstrumentIdentity::new(
+                native.namespace.clone(),
+                native.provider_instrument_id.clone(),
+                native.venue_symbol.clone(),
+            );
             let observation = match ProviderNormalizedObservation::try_new(
                 source_identifier,
                 self.venue.clone(),
                 input.instrument,
+                native_identity,
                 input.timestamp,
                 ProviderSequenceEvidence::Unsupported {
                     rule: self.sequence_rule.clone(),
@@ -664,7 +693,7 @@ impl CoinbaseExchangeDecoder {
         let (outcome, coordinates) = self.decode_with_market_coordinates(frame)?;
         match (outcome, coordinates) {
             (DecodeOutcome::Data(typed_batch), Some(coordinates)) => {
-                let handoff = CoinbaseMarketHandoff::try_new(
+                let mut handoff = CoinbaseMarketHandoff::try_new(
                     CoinbaseMarketHandoffInput {
                         feed: CoinbaseMarketFeed::AdvancedTradePublic,
                         channel: coordinates.channel,
@@ -687,6 +716,13 @@ impl CoinbaseExchangeDecoder {
                     typed_batch,
                 )
                 .map_err(|_error| DecodeInternalError::InvariantViolation)?;
+                let selected = self
+                    .selected_public_identity
+                    .clone()
+                    .ok_or(DecodeInternalError::InvariantViolation)?;
+                handoff
+                    .bind_selected_public_identity(selected)
+                    .map_err(|_error| DecodeInternalError::InvariantViolation)?;
                 Ok(CoinbaseMarketDecodeOutcome::Market(handoff))
             }
             (DecodeOutcome::Data(_), None) | (_, Some(_)) => {
@@ -705,6 +741,7 @@ impl SourceMetadataProvider for CoinbaseExchangeDecoder {
 
 struct ObservationInput {
     source_identifier: String,
+    product_id: String,
     instrument: InstrumentId,
     timestamp: ProviderTimestampEvidence,
     snapshot: ProviderSnapshotEvidence,
@@ -713,6 +750,7 @@ struct ObservationInput {
 
 fn observation_input(
     source_identifier: String,
+    product_id: String,
     instrument: InstrumentId,
     timestamp: ProviderTimestampEvidence,
     snapshot: ProviderSnapshotEvidence,
@@ -720,6 +758,7 @@ fn observation_input(
 ) -> ObservationInput {
     ObservationInput {
         source_identifier,
+        product_id,
         instrument,
         timestamp,
         snapshot,

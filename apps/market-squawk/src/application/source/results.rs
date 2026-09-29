@@ -178,6 +178,8 @@ fn source_timestamp_freshness_value(value: SourceTimestampFreshness) -> Value {
 
 fn coverage_delay_value(value: CoverageDelay) -> Value {
     match value {
+        CoverageDelay::NotApplicable => json!({"kind": "not_applicable"}),
+        CoverageDelay::Unknown => json!({"kind": "unknown"}),
         CoverageDelay::RealTime => json!({"kind": "real_time"}),
         CoverageDelay::Delayed(nanos) => {
             json!({"kind": "delayed", "value": nanos.to_string()})

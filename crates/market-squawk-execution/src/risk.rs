@@ -809,6 +809,41 @@ impl RiskService {
         intent: OrderIntent,
         market: &ExecutionMarketReference,
     ) -> RiskOutcome {
+        self.evaluate_authority(
+            || {
+                authority_gate
+                    .consume(capability)
+                    .map(crate::virtual_paper::ExecutionAuthority::Live)
+                    .map_err(|_| ())
+            },
+            intent,
+            market,
+        )
+    }
+
+    pub(crate) fn evaluate_virtual_paper(
+        &mut self,
+        authority: market_squawk_live::virtual_paper::ConsumedVirtualPaperAuthority,
+        intent: OrderIntent,
+        market: &ExecutionMarketReference,
+    ) -> RiskOutcome {
+        self.evaluate_authority(
+            || {
+                Ok(crate::virtual_paper::ExecutionAuthority::VirtualPaper(
+                    authority,
+                ))
+            },
+            intent,
+            market,
+        )
+    }
+
+    fn evaluate_authority(
+        &mut self,
+        consume: impl FnOnce() -> Result<crate::virtual_paper::ExecutionAuthority, ()>,
+        intent: OrderIntent,
+        market: &ExecutionMarketReference,
+    ) -> RiskOutcome {
         let order_id = intent.order_id();
         let approval_id = match ApprovalId::try_from(order_id.as_uuid()) {
             Ok(approval_id) => approval_id,
@@ -848,7 +883,7 @@ impl RiskService {
                 return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
             }
         };
-        let authority = match authority_gate.consume(capability) {
+        let authority = match consume() {
             Ok(authority) => authority,
             Err(_) => {
                 let reasons = [RiskRejectionCode::Authority];
@@ -879,7 +914,10 @@ impl RiskService {
         if now.wall.unix_nanos() < previous {
             reasons.push(RiskRejectionCode::ClockRollback);
         }
-        if authority.validate_current().is_err() {
+        if authority.validate_current().is_err()
+            || authority.is_virtual_paper() != intent.is_virtual_paper()
+            || authority.is_virtual_paper() != market.is_virtual_paper()
+        {
             reasons.push(RiskRejectionCode::Authority);
         }
         if now.wall > self.config.policy_valid_until {

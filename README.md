@@ -156,15 +156,15 @@ use the [installation runbook](docs/operations/installation-and-bootstrap.md).
 
 ### Set up a first source
 
-The desktop guides this flow. From the CLI, Treasury Fiscal Data is a practical first source
-because it requires no provider account or API key:
+Open **Settings → Connections → Set up connections**. Select a saved provider to verify or
+resume its existing credential and data selection. If credentials exist only in an owner-prepared
+file, choose **Use an existing credential file**; no signup or re-entry is needed for saved values.
 
-```bash
-"$MSQ" source setup treasury.fiscal-data --confirm
-```
+Treasury Fiscal Data is a practical first source because it needs no account or key. Select it,
+prepare the connection, then choose **Verify and connect**. Settings shows retained import progress;
+the installed service continues admitted background work when the window closes.
 
-Keep the launching terminal open while the protected temporary setup page is active. Then verify
-the local source state:
+Read the same saved source state from the CLI:
 
 ```bash
 "$MSQ" source status treasury.fiscal-data
@@ -288,7 +288,7 @@ lockfile. Crates are grouped by product responsibility:
 
 | Path | Responsibility |
 | --- | --- |
-| `apps/market-squawk/` | CLI, application composition, local portal, and process lifecycle |
+| `apps/market-squawk/` | CLI, installed service, native onboarding authority, and process lifecycle |
 | `apps/market-squawk-desktop/` | Tauri 2 desktop shell, bounded presentation bridge, and React interface |
 | `crates/` | Shared domain, live, storage, analytics, modeling, portfolio, execution, valuation, services, and MCP |
 | `adapters/` | Provider, file, portfolio, and paper-execution boundaries |

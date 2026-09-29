@@ -74,6 +74,10 @@ impl CoinbasePublicationSupervisor {
                 raw_cancellation,
             )
             .await;
+            match &outcome {
+                Err(error) => trace_publication_worker_failure("raw", error),
+                Ok(()) => tracing::info!(worker = "raw", cancelled = raw_terminal.is_cancelled(), "Coinbase publication worker stopped"),
+            }
             raw_terminal.cancel();
             outcome
         });
@@ -86,6 +90,10 @@ impl CoinbasePublicationSupervisor {
                 let outcome =
                     run_committed_worker(&mut receiver, committed_ingress, committed_cancellation)
                         .await;
+                match &outcome {
+                    Err(error) => trace_publication_worker_failure("committed", error),
+                    Ok(()) => tracing::info!(worker = "committed", cancelled = committed_terminal.is_cancelled(), "Coinbase publication worker stopped"),
+                }
                 committed_terminal.cancel();
                 outcome
             }));
@@ -114,50 +122,73 @@ impl CoinbasePublicationSupervisor {
         deadline: Instant,
     ) -> Result<(), CoinbasePublicationSupervisorError> {
         self.cancellation.cancel();
-        let mut expiry = self
-            .expiry
-            .take()
-            .ok_or(CoinbasePublicationSupervisorError::PublicationWorkerOwnership)?;
-        let mut raw = self
-            .raw
-            .take()
-            .ok_or(CoinbasePublicationSupervisorError::PublicationWorkerOwnership)?;
-        let mut committed = std::mem::take(&mut self.committed);
-        if committed.is_empty() {
-            return Err(CoinbasePublicationSupervisorError::PublicationWorkerOwnership);
-        }
-        let joined = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-            (&mut expiry)
-                .await
-                .map_err(CoinbasePublicationSupervisorError::Task)?;
-            (&mut raw)
-                .await
-                .map_err(CoinbasePublicationSupervisorError::Task)??;
-            for task in &mut committed {
-                task.await
-                    .map_err(CoinbasePublicationSupervisorError::Task)??;
+        let mut failure =
+            if self.expiry.is_none() || self.raw.is_none() || self.committed.is_empty() {
+                Some(CoinbasePublicationSupervisorError::PublicationWorkerOwnership)
+            } else {
+                None
+            };
+        // Handles remain owned by self across every suspension. Cancelling this shutdown future
+        // therefore still runs Drop's abort path for every task not yet joined.
+        if tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.join_workers(&mut failure),
+        )
+        .await
+        .is_err()
+        {
+            if failure.is_none() {
+                failure = Some(CoinbasePublicationSupervisorError::ShutdownDeadline);
             }
-            Ok::<(), CoinbasePublicationSupervisorError>(())
-        })
-        .await;
-        match joined {
-            Ok(outcome) => outcome?,
-            Err(_elapsed) => {
-                expiry.abort();
-                raw.abort();
-                for task in &committed {
-                    task.abort();
-                }
-                let _expiry = expiry.await;
-                let _raw = raw.await;
-                for task in committed {
-                    let _committed = task.await;
-                }
-                return Err(CoinbasePublicationSupervisorError::ShutdownDeadline);
+            if let Some(task) = self.expiry.as_ref() {
+                task.abort();
             }
+            if let Some(task) = self.raw.as_ref() {
+                task.abort();
+            }
+            for task in &self.committed {
+                task.abort();
+            }
+            // Only still-owned handles remain. Never await a previously completed JoinHandle
+            // again, and never replace the original worker failure with an abort result.
+            self.join_workers(&mut failure).await;
         }
         self.authority.take();
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn join_workers(&mut self, failure: &mut Option<CoinbasePublicationSupervisorError>) {
+        if let Some(task) = self.expiry.as_mut() {
+            let outcome = task.await.map_err(CoinbasePublicationSupervisorError::Task);
+            self.expiry.take();
+            if failure.is_none() {
+                *failure = outcome.err();
+            }
+        }
+        if let Some(task) = self.raw.as_mut() {
+            let outcome = task
+                .await
+                .map_err(CoinbasePublicationSupervisorError::Task)
+                .and_then(|outcome| outcome);
+            self.raw.take();
+            if failure.is_none() {
+                *failure = outcome.err();
+            }
+        }
+        while let Some(task) = self.committed.first_mut() {
+            let outcome = task
+                .await
+                .map_err(CoinbasePublicationSupervisorError::Task)
+                .and_then(|outcome| outcome);
+            // The await has completed; removing this original handle cannot detach a worker.
+            drop(self.committed.remove(0));
+            if failure.is_none() {
+                *failure = outcome.err();
+            }
+        }
     }
 }
 
@@ -191,6 +222,7 @@ async fn run_raw_worker(
 ) -> Result<(), CoinbasePublicationSupervisorError> {
     let mut open = true;
     let mut inflight = FuturesUnordered::new();
+    let mut direct_head = None;
     while open || !inflight.is_empty() {
         tokio::select! {
             biased;
@@ -202,6 +234,15 @@ async fn run_raw_worker(
             },
             input = receiver.recv(), if open && inflight.len() < maximum_inflight.get() => {
                 match input {
+                    Some(CoinbaseCapturedPublicationInput::Direct { handoff, context, observed_at }) => {
+                        // Only cold Direct publication is serial. Live admission never awaits this.
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => break,
+                            outcome = publish_direct(handoff, context, observed_at, &mut direct_head,
+                                &pending, &authority, &durable_writer, &cancellation) => outcome?,
+                        }
+                    }
                     Some(input) => inflight.push(publish_raw(
                         input,
                         pending.clone(),
@@ -261,23 +302,8 @@ async fn publish_raw(
                 )
                 .await?
         }
-        CoinbaseCapturedPublicationInput::Direct {
-            handoff,
-            context,
-            observed_at,
-        } => {
-            let idempotency = coinbase_direct_idempotency_key(&handoff)?;
-            pending
-                .publish_coinbase_direct_when_committed(
-                    publication.as_ref(),
-                    handoff,
-                    context,
-                    authority.analytical_dataset().clone(),
-                    idempotency,
-                    observed_at,
-                    authority.precommit_authority(),
-                )
-                .await?
+        CoinbaseCapturedPublicationInput::Direct { .. } => {
+            return Err(CoinbasePublicationSupervisorError::InvalidTopology);
         }
     };
     if let CoinbaseMarketApplicationOutcome::Published(receipt) = outcome {
@@ -286,17 +312,141 @@ async fn publish_raw(
     Ok(())
 }
 
+/// Compact evidence retained only after the exact physical/canonical publication commits.
+/// The original snapshot is represented by its coordinate digest, never copied body bytes.
+struct DirectCommittedHead {
+    snapshot_coordinate: market_squawk_domain::EvidenceDigest,
+    terminal: market_squawk_domain::SequenceNumber,
+    decoder: market_squawk_sources::DecoderEvidence,
+    physical_connection: [u8; 16],
+    publication_digest: market_squawk_domain::EvidenceDigest,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "existing cold owner retains explicit authority, commit and cancellation ownership"
+)]
+async fn publish_direct(
+    handoff: market_squawk_adapter_coinbase::CoinbaseMarketHandoff,
+    mut context: market_squawk_adapter_coinbase::CoinbaseMarketPublicationContext,
+    observed_at: market_squawk_domain::Timestamp,
+    head: &mut Option<DirectCommittedHead>,
+    pending: &CryptoPendingFrameIngress,
+    authority: &CryptoMarketPublicationAuthority,
+    durable_writer: &MarketEventDurableReadWriter,
+    cancellation: &CancellationToken,
+) -> Result<(), CoinbasePublicationSupervisorError> {
+    use market_squawk_adapter_coinbase::{CoinbaseMarketContinuity, CoinbaseMarketRawLineage};
+    authority.validate_precommit()?;
+    if cancellation.is_cancelled() {
+        return Err(CoinbasePublicationSupervisorError::Cancelled);
+    }
+    let decoder = handoff.typed_batch().evidence().clone();
+    decoder
+        .currentness_lease()
+        .validate_current()
+        .map_err(|_| CoinbasePublicationSupervisorError::CommittedCoordinates)?;
+    let terminal =
+        market_squawk_domain::SequenceNumber::new(handoff.evidence().continuity().terminal());
+    let snapshot_coordinate = match handoff.raw_lineage() {
+        CoinbaseMarketRawLineage::DirectInitial(lineage) => {
+            if head.as_ref().is_some_and(|previous| {
+                previous
+                    .decoder
+                    .binding()
+                    .shares_allocation_with(decoder.binding())
+            }) {
+                return Err(CoinbasePublicationSupervisorError::CommittedCoordinates);
+            }
+            lineage.snapshot().receipt().coordinate_digest()
+        }
+        CoinbaseMarketRawLineage::DirectSuccessor(lineage) => {
+            let previous = head
+                .as_ref()
+                .ok_or(CoinbasePublicationSupervisorError::CommittedCoordinates)?;
+            let CoinbaseMarketContinuity::CapturedContiguous { predecessor, .. } =
+                handoff.evidence().continuity()
+            else {
+                return Err(CoinbasePublicationSupervisorError::CommittedCoordinates);
+            };
+            if previous.terminal != predecessor
+                || previous.snapshot_coordinate != lineage.snapshot().coordinate_digest()
+                || previous.physical_connection != context.physical().connection_id()
+                || previous.decoder.frame_id() != lineage.predecessor().frame_id()
+                || previous.decoder.payload_digest() != lineage.predecessor().payload_digest()
+                || previous.decoder.received_at() != lineage.predecessor().received_at()
+                || !previous
+                    .decoder
+                    .binding()
+                    .shares_allocation_with(decoder.binding())
+                || !previous
+                    .decoder
+                    .currentness_lease()
+                    .shares_authority_with(decoder.currentness_lease())
+            {
+                return Err(CoinbasePublicationSupervisorError::CommittedCoordinates);
+            }
+            context
+                .bind_direct_predecessor(previous.publication_digest)
+                .map_err(CryptoMarketPublicationError::from)?;
+            previous.snapshot_coordinate
+        }
+        CoinbaseMarketRawLineage::AdvancedTrade(_) => {
+            return Err(CoinbasePublicationSupervisorError::InvalidTopology);
+        }
+    };
+    let physical_connection = context.physical().connection_id();
+    let idempotency = coinbase_direct_idempotency_key(&handoff)?;
+    let outcome = pending
+        .publish_coinbase_direct_when_committed(
+            authority.publication().as_ref(),
+            handoff,
+            context,
+            authority.analytical_dataset().clone(),
+            idempotency,
+            observed_at,
+            authority.precommit_authority(),
+        )
+        .await?;
+    let CoinbaseMarketApplicationOutcome::Published(receipt) = outcome else {
+        // Raw-only/abstention cannot become a committed predecessor for queued successors.
+        return Err(CoinbasePublicationSupervisorError::CommittedCoordinates);
+    };
+    authority.validate_precommit()?;
+    if cancellation.is_cancelled() {
+        return Err(CoinbasePublicationSupervisorError::Cancelled);
+    }
+    let publication_digest = receipt.restart_selector().publication_digest();
+    if !durable_writer.retain(receipt).await? {
+        return Err(CoinbasePublicationSupervisorError::CommittedCoordinates);
+    }
+    decoder
+        .currentness_lease()
+        .validate_current()
+        .map_err(|_| CoinbasePublicationSupervisorError::CommittedCoordinates)?;
+    *head = Some(DirectCommittedHead {
+        snapshot_coordinate,
+        terminal,
+        decoder,
+        physical_connection,
+        publication_digest,
+    });
+    Ok(())
+}
+
 fn coinbase_direct_idempotency_key(
     handoff: &market_squawk_adapter_coinbase::CoinbaseMarketHandoff,
 ) -> Result<String, CryptoMarketPublicationError> {
-    let market_squawk_adapter_coinbase::CoinbaseMarketRawLineage::DirectInitial(lineage) =
-        handoff.raw_lineage()
-    else {
-        return Err(CryptoMarketPublicationError::FamilyMismatch);
+    let (snapshot, frames) = match handoff.raw_lineage() {
+        market_squawk_adapter_coinbase::CoinbaseMarketRawLineage::DirectInitial(lineage) => {
+            (lineage.snapshot().receipt(), lineage.replay())
+        }
+        market_squawk_adapter_coinbase::CoinbaseMarketRawLineage::DirectSuccessor(lineage) => {
+            (lineage.snapshot(), lineage.frames())
+        }
+        _ => return Err(CryptoMarketPublicationError::FamilyMismatch),
     };
-    let snapshot = lineage.snapshot().receipt();
-    let terminal = lineage
-        .replay()
+    let terminal = frames
         .last()
         .ok_or(CryptoMarketPublicationError::FamilyMismatch)?;
     let source = handoff
@@ -317,7 +467,13 @@ fn coinbase_direct_idempotency_key(
     key.push('-');
     key.push_str(&generation.to_string());
     key.push('-');
-    append_hex(&mut key, snapshot.body_digest().bytes());
+    let snapshot_identity = match handoff.raw_lineage() {
+        market_squawk_adapter_coinbase::CoinbaseMarketRawLineage::DirectInitial(_) => {
+            snapshot.body_digest()
+        }
+        _ => snapshot.coordinate_digest(),
+    };
+    append_hex(&mut key, snapshot_identity.bytes());
     key.push('-');
     key.push_str(&terminal.sequence().get().to_string());
     key.push('-');
@@ -404,4 +560,36 @@ pub(in crate::live_source) enum CoinbasePublicationSupervisorError {
     Ingest(#[from] market_squawk_data::IngestError),
     #[error(transparent)]
     Authority(#[from] crate::application::ResearchIngestCompositionError),
+}
+
+// Only code-owned variant names cross this diagnostic boundary, never provider material.
+fn trace_publication_worker_failure(worker: &'static str, error: &CoinbasePublicationSupervisorError) {
+    let category = match error {
+        CoinbasePublicationSupervisorError::Cancelled => "cancelled",
+        CoinbasePublicationSupervisorError::PublicationWorkerOwnership => "worker_ownership",
+        CoinbasePublicationSupervisorError::InvalidTopology => "invalid_topology",
+        CoinbasePublicationSupervisorError::Allocation => "allocation",
+        CoinbasePublicationSupervisorError::DeadlineRange => "deadline_range",
+        CoinbasePublicationSupervisorError::CommittedCoordinates => "committed_coordinates",
+        CoinbasePublicationSupervisorError::ShutdownDeadline => "shutdown_deadline",
+        CoinbasePublicationSupervisorError::Task(_) => "task",
+        CoinbasePublicationSupervisorError::Publication(error) => match error {
+            CryptoMarketPublicationError::AuthorityInvalid => "publication_authority_invalid",
+            CryptoMarketPublicationError::FamilyMismatch => "publication_family_mismatch",
+            CryptoMarketPublicationError::RendezvousUnavailable => "publication_rendezvous_unavailable",
+            CryptoMarketPublicationError::Coinbase(_) => "publication_coinbase",
+            CryptoMarketPublicationError::Kraken(_) => "publication_kraken",
+            CryptoMarketPublicationError::Research(_) => "publication_research",
+            CryptoMarketPublicationError::Ingest(_) => "publication_ingest",
+            CryptoMarketPublicationError::Capture(_) => "publication_capture",
+            CryptoMarketPublicationError::RawCapture(_) => "publication_raw_capture",
+            CryptoMarketPublicationError::Rights(_) => "publication_rights",
+            CryptoMarketPublicationError::Service(_) => "publication_service",
+            CryptoMarketPublicationError::MarketEventRead(_) => "publication_market_event_read",
+        },
+        CoinbasePublicationSupervisorError::DurableRead(_) => "durable_read",
+        CoinbasePublicationSupervisorError::Ingest(_) => "ingest",
+        CoinbasePublicationSupervisorError::Authority(_) => "authority",
+    };
+    tracing::warn!(worker, category, "Coinbase publication worker failed");
 }

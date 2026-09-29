@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Context as _;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-use chrono::{Datelike as _, NaiveDate};
+use chrono::{Datelike as _, NaiveDate, SecondsFormat, Utc};
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use clap::{Parser as _, error::ErrorKind};
 use futures_util::FutureExt as _;
@@ -21,7 +21,8 @@ use market_squawk::service::{
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk::{
-    BoardInstalledFixtureBundle, cli::Cli, local_product::execute_installed_cli_command,
+    BoardInstalledFixtureBundle, H15InstalledAcceptance, H15InstalledAcceptanceRead, cli::Cli,
+    local_product::execute_installed_cli_command,
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk_adapter_federal_reserve::{
@@ -31,7 +32,9 @@ use market_squawk_adapter_federal_reserve::{
     BoardScriptedTransportFactory,
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-use market_squawk_domain::Timestamp;
+use market_squawk_data::BoardFullHistoryPublicationReference;
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use market_squawk_domain::{CalendarDate, Timestamp};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, LocalPaths, SecretStore,
@@ -148,6 +151,8 @@ async fn run_installed_service_authority_scenario(
     )
     .await
     .context("start initial installed service with Board fixture")?;
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let board_acceptance = service.h15_installed_acceptance();
     #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
     let service = InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets))
         .await
@@ -248,9 +253,15 @@ async fn run_installed_service_authority_scenario(
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
         {
             board_evidence = Some(
-                exercise_installed_board_vertical(&desktop, &cli, temporary.path(), &board_fixture)
-                    .await
-                    .context("exercise installed Federal Reserve Board vertical")?,
+                exercise_installed_board_vertical(
+                    &desktop,
+                    &cli,
+                    temporary.path(),
+                    &board_fixture,
+                    &board_acceptance,
+                )
+                .await
+                .context("exercise installed Federal Reserve Board vertical")?,
             );
         }
 
@@ -355,6 +366,8 @@ async fn run_installed_service_authority_scenario(
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     let board_counters_before_restart = board_fixture.transport_counters();
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    drop(board_acceptance);
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     let restarted = InstalledService::start_with_secret_store_and_board_fixture(
         config.clone(),
         Arc::clone(&secrets),
@@ -362,6 +375,8 @@ async fn run_installed_service_authority_scenario(
     )
     .await
     .context("restart installed service with durable Board composition")?;
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    let restarted_board_acceptance = restarted.h15_installed_acceptance();
     #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
     let restarted = InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets))
         .await
@@ -394,6 +409,14 @@ async fn run_installed_service_authority_scenario(
         )
         .await
         .context("verify durable Federal Reserve Board state after restart")?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        assert_installed_full_history_restored(
+            &restarted_desktop,
+            &restarted_board_acceptance,
+            &board_evidence.full_history,
+        )
+        .await
+        .context("verify native full-history and neutral investment evidence after restart")?;
         let restarted_real_alpaca_evidence = match real_alpaca_evidence.as_ref() {
             Some(initial) => Some(
                 assert_real_alpaca_restored(&restarted_desktop, initial)
@@ -450,6 +473,15 @@ async fn run_installed_service_authority_scenario(
         )
         .await
         .context("exercise reactivated Codex relay")?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        assert_installed_full_history_later_publication(
+            &restarted_desktop,
+            &board_fixture,
+            &restarted_board_acceptance,
+            &board_evidence.full_history,
+        )
+        .await
+        .context("verify later genuine full-history publication without backdating")?;
         Ok::<(), anyhow::Error>(())
     }))
     .catch_unwind()
@@ -1268,6 +1300,7 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
         "selected Alpaca connection generation",
     )?;
     let source_id = required_nonempty_string(&selected["sourceId"], "selected Alpaca source")?;
+    assert_eq!(source_id, "alpaca-basic-iex-current-v1");
     let observation = &row["marketObservation"];
     assert_eq!(observation["availability"], "unavailable");
     assert_eq!(
@@ -1359,8 +1392,19 @@ struct InstalledBoardEvidence {
     history_artifact: Value,
     dashboard_stable: Value,
     macro_context: InstalledMacroContextEvidence,
+    full_history: InstalledFullHistoryEvidence,
     msj: Vec<InstalledBoardFileEvidence>,
     parquet: Vec<InstalledBoardFileEvidence>,
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+#[derive(Debug)]
+struct InstalledFullHistoryEvidence {
+    session_id: String,
+    publication: BoardFullHistoryPublicationReference,
+    read: H15InstalledAcceptanceRead,
+    public_arguments: Value,
+    public_stable: Value,
 }
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -1388,16 +1432,30 @@ fn installed_board_fixture() -> TestResult<BoardInstalledFixtureBundle> {
         Duration::from_millis(1),
     )
     .context("construct exact 11-series by 100-date rolling Board production response")?;
-    let transport = BoardScriptedTransportFactory::try_new(doctor, production)
-        .context("validate separate Board doctor and production responses")?;
+    let first_history = installed_board_full_history_dates(2026, 8, 10, 101)?;
+    let second_history = installed_board_full_history_dates(2026, 8, 11, 102)?;
+    let first_history = BoardScriptedCsvResponse::try_new(
+        installed_board_csv(&first_history, true)?,
+        Duration::from_millis(1),
+    )?;
+    let second_history = BoardScriptedCsvResponse::try_new(
+        installed_board_csv(&second_history, false)?,
+        Duration::from_millis(1),
+    )?;
+    let transport = BoardScriptedTransportFactory::try_new_with_full_history(
+        [doctor.clone(), doctor],
+        production,
+        [first_history, second_history],
+    )
+    .context("validate disjoint Board doctor, rolling, and full-history responses")?;
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("observe initial Board provider-rate wall clock")?;
     let unix_nanos = i64::try_from(elapsed.as_nanos())
         .context("convert initial Board provider-rate wall clock")?;
     let initial_wall_clock = unix_nanos
-        .checked_sub(60_000_000_000)
-        .context("place the Board provider-rate fixture exactly one minute before real time")?;
+        .checked_sub(120_000_000_000)
+        .context("place the Board provider-rate fixture two requests before real time")?;
     Ok(BoardInstalledFixtureBundle::new(
         transport,
         Timestamp::from_unix_nanos(initial_wall_clock),
@@ -1419,6 +1477,31 @@ fn installed_board_rolling_dates() -> TestResult<Vec<String>> {
         date = date
             .pred_opt()
             .context("walk backward through rolling Board fixture dates")?;
+    }
+    dates.reverse();
+    Ok(dates)
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn installed_board_full_history_dates(
+    year: i32,
+    month: u32,
+    day: u32,
+    count: usize,
+) -> TestResult<Vec<String>> {
+    let mut date = NaiveDate::from_ymd_opt(year, month, day)
+        .context("construct full-history Board fixture date")?;
+    let mut dates = Vec::new();
+    dates
+        .try_reserve_exact(count)
+        .context("reserve full-history Board fixture dates")?;
+    while dates.len() < count {
+        if date.weekday().number_from_monday() <= 5 {
+            dates.push(date.to_string());
+        }
+        date = date
+            .pred_opt()
+            .context("walk backward through full-history Board dates")?;
     }
     dates.reverse();
     Ok(dates)
@@ -1510,6 +1593,7 @@ async fn exercise_installed_board_vertical(
     cli: &LoopbackApplicationClient,
     installation_root: &Path,
     fixture: &BoardInstalledFixtureBundle,
+    acceptance: &H15InstalledAcceptance,
 ) -> TestResult<InstalledBoardEvidence> {
     let board_profile = installed_board_profile()?;
     let board_provider_dataset = board_profile.dataset().as_str();
@@ -1622,6 +1706,17 @@ async fn exercise_installed_board_vertical(
     fixture
         .advance_provider_clock(Duration::from_secs(60))
         .context("advance the shared Board provider clock by exactly one minute")?;
+    let full_history = capture_installed_full_history(
+        client,
+        fixture,
+        acceptance,
+        session_id,
+        board_analytical_dataset,
+    )
+    .await?;
+    fixture
+        .advance_provider_clock(Duration::from_secs(60))
+        .context("admit rolling Board request after full-history acquisition")?;
     let discovery_response = client
         .invoke_operation(
             RequestId::try_string("installed-board-discover-after-minute")
@@ -1756,12 +1851,14 @@ async fn exercise_installed_board_vertical(
         &before_parquet,
         installed_file_evidence(installation_root, "parquet")?,
     );
-    assert_eq!(msj.len(), 1, "expected one new sealed Board MSJ1 object");
+    assert!(!msj.is_empty(), "expected sealed Board original evidence");
     assert!(
         !parquet.is_empty(),
         "expected durable Board Parquet evidence"
     );
-    assert_file_magic(installation_root, &msj[0], b"MSJ1", None)?;
+    for file in &msj {
+        assert_file_magic(installation_root, file, b"MSJ1", None)?;
+    }
     for file in &parquet {
         assert_file_magic(installation_root, file, b"PAR1", Some(b"PAR1"))?;
     }
@@ -1771,9 +1868,243 @@ async fn exercise_installed_board_vertical(
         history_artifact,
         dashboard_stable,
         macro_context,
+        full_history,
         msj,
         parquet,
     })
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn capture_installed_full_history(
+    client: &LoopbackApplicationClient,
+    fixture: &BoardInstalledFixtureBundle,
+    acceptance: &H15InstalledAcceptance,
+    session_id: &str,
+    rolling_dataset: &str,
+) -> TestResult<InstalledFullHistoryEvidence> {
+    let full_dataset = acceptance.full_history_dataset()?;
+    assert_ne!(full_dataset, rolling_dataset);
+    assert_eq!(fixture.transport_counters().production_responses(), 0);
+    let absent = client
+        .invoke_operation(
+            RequestId::try_string("installed-board-rolling-absent-before-full-history")?,
+            "Research.GetManifest",
+            json!({"dataset": rolling_dataset,
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        absent.result()["ok"],
+        false,
+        "rolling generation existed before full-history publication: {}",
+        absent.result()
+    );
+
+    let publication = acceptance
+        .publish()
+        .await
+        .context("publish first official full-history response through registered source")?;
+    assert_eq!(publication.manifest().dataset_id().as_str(), full_dataset);
+    assert_eq!(fixture.transport_counters().full_history_responses(), 1);
+    assert_eq!(fixture.transport_counters().production_responses(), 0);
+    let cutoff = Utc::now();
+    let knowledge_cutoff = Timestamp::from_unix_nanos(
+        cutoff
+            .timestamp_nanos_opt()
+            .context("represent first publication cutoff")?,
+    );
+    let effective_date_cutoff = CalendarDate::new(2026, 8, 10)?;
+    let public_arguments = json!({
+        "knowledgeCutoff": cutoff.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        "effectiveDateCutoff": effective_date_cutoff.to_string(),
+    });
+    let public =
+        installed_macro_context(client, "full-history-first", public_arguments.clone()).await?;
+    assert_installed_macro_context(&public)?;
+    let read = acceptance
+        .read(knowledge_cutoff, effective_date_cutoff)
+        .await?;
+    assert_eq!(read.consumed_parents, vec![publication.manifest().clone()]);
+    assert_eq!(
+        read.selected_native_binding,
+        Some(publication.binding_digest())
+    );
+    assert_eq!(read.investment_parents, read.consumed_parents);
+    assert!(read.investment_digest.is_some());
+    assert_full_history_matches_public(&read, &public)?;
+    assert!(public["investmentContext"]["availability"] == "available");
+    let manifest = invoke_installed_board(
+        client,
+        "full-history-manifest",
+        "Research.GetManifest",
+        json!({"dataset": full_dataset,
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576}}),
+    )
+    .await?;
+    assert_eq!(manifest["manifest"]["datasetId"], full_dataset);
+    assert_eq!(fixture.transport_counters().production_responses(), 0);
+    Ok(InstalledFullHistoryEvidence {
+        session_id: session_id.to_owned(),
+        publication,
+        read,
+        public_arguments,
+        public_stable: stable_installed_macro_context(&public),
+    })
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+fn assert_full_history_matches_public(
+    read: &H15InstalledAcceptanceRead,
+    public: &Value,
+) -> TestResult {
+    let rows = public["observations"]
+        .as_array()
+        .context("neutral Macro observations absent")?;
+    assert_eq!(rows.len(), 15);
+    assert_eq!(read.selected_observations.len(), 12);
+    for ((indicator, internal), row) in read.selected_observations.iter().take(11).zip(rows) {
+        assert_eq!(row["indicatorId"], indicator.as_str());
+        let internal = internal
+            .as_ref()
+            .context("full-history rate was unavailable")?;
+        if let Some(value) = internal.get("value") {
+            assert_eq!(row["availability"], "available");
+            assert_eq!(row["value"]["decimal"], *value);
+        } else {
+            assert!(internal.get("missing").is_some());
+            assert_eq!(row["availability"], "missing");
+            assert_eq!(row["value"]["state"], "missing");
+        }
+    }
+    let (ten_year, thirty_year) = read
+        .valuation_yields
+        .as_ref()
+        .context("full-history selection omitted derived valuation yields")?;
+    let refs = public["investmentContext"]["governmentYieldReferences"]
+        .as_array()
+        .context("public investment context omitted valuation yields")?;
+    assert_eq!(refs[0]["annualPercent"], ten_year.as_str());
+    assert_eq!(refs[1]["annualPercent"], thirty_year.as_str());
+    Ok(())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn assert_installed_full_history_restored(
+    client: &LoopbackApplicationClient,
+    acceptance: &H15InstalledAcceptance,
+    first: &InstalledFullHistoryEvidence,
+) -> TestResult {
+    let read = acceptance
+        .read(
+            first.read.knowledge_cutoff,
+            first.read.effective_date_cutoff,
+        )
+        .await?;
+    assert_eq!(read, first.read);
+    assert_eq!(
+        read.consumed_parents,
+        vec![first.publication.manifest().clone()]
+    );
+    assert_eq!(
+        read.selected_native_binding,
+        Some(first.publication.binding_digest())
+    );
+    let public = installed_macro_context(
+        client,
+        "full-history-restored",
+        first.public_arguments.clone(),
+    )
+    .await?;
+    assert_eq!(stable_installed_macro_context(&public), first.public_stable);
+    assert_full_history_matches_public(&read, &public)?;
+    Ok(())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn assert_installed_full_history_later_publication(
+    client: &LoopbackApplicationClient,
+    fixture: &BoardInstalledFixtureBundle,
+    acceptance: &H15InstalledAcceptance,
+    first: &InstalledFullHistoryEvidence,
+) -> TestResult {
+    fixture.advance_provider_clock(Duration::from_secs(60))?;
+    let activated = invoke_installed_board(
+        client,
+        "full-history-reactivate",
+        "Source.Onboarding.Apply",
+        json!({
+            "request": {"action": "activate", "sessionId": first.session_id,
+                "request": {"kind": "federal_reserve_board_h15"}},
+            "confirm": true,
+        }),
+    )
+    .await?;
+    assert_eq!(activated["outcome"], "completed");
+    assert_eq!(fixture.transport_counters().doctor_responses(), 2);
+    fixture.advance_provider_clock(Duration::from_secs(60))?;
+    let second = acceptance
+        .publish()
+        .await
+        .context("publish later official full-history response through reactivated source")?;
+    assert_ne!(second.manifest(), first.publication.manifest());
+    assert_ne!(second.binding_digest(), first.publication.binding_digest());
+    assert_ne!(
+        second.original_digest(),
+        first.publication.original_digest()
+    );
+    assert_eq!(fixture.transport_counters().full_history_responses(), 2);
+    let original = acceptance
+        .read(
+            first.read.knowledge_cutoff,
+            first.read.effective_date_cutoff,
+        )
+        .await?;
+    assert_eq!(
+        original, first.read,
+        "later publication changed an earlier cutoff"
+    );
+    assert_eq!(
+        original.selected_native_binding,
+        Some(first.publication.binding_digest())
+    );
+    let original_public = installed_macro_context(
+        client,
+        "full-history-original-after-later",
+        first.public_arguments.clone(),
+    )
+    .await?;
+    assert_eq!(
+        stable_installed_macro_context(&original_public),
+        first.public_stable
+    );
+
+    let cutoff = Utc::now();
+    let knowledge_cutoff = Timestamp::from_unix_nanos(
+        cutoff
+            .timestamp_nanos_opt()
+            .context("represent later publication cutoff")?,
+    );
+    let effective_date_cutoff = CalendarDate::new(2026, 8, 11)?;
+    let arguments = json!({
+        "knowledgeCutoff": cutoff.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        "effectiveDateCutoff": effective_date_cutoff.to_string(),
+    });
+    let public = installed_macro_context(client, "full-history-later", arguments).await?;
+    let read = acceptance
+        .read(knowledge_cutoff, effective_date_cutoff)
+        .await?;
+    assert_eq!(read.consumed_parents, vec![second.manifest().clone()]);
+    assert_eq!(read.selected_native_binding, Some(second.binding_digest()));
+    assert_eq!(read.investment_parents, read.consumed_parents);
+    assert_ne!(read.consumed_digest, first.read.consumed_digest);
+    assert_ne!(read.investment_digest, first.read.investment_digest);
+    assert_eq!(public["coverage"]["observed"], 11);
+    assert_eq!(public["coverage"]["missing"], 0);
+    assert_eq!(public["observations"][9]["availability"], "available");
+    assert_full_history_matches_public(&read, &public)?;
+    Ok(())
 }
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -1944,7 +2275,7 @@ async fn installed_macro_context(
     request_suffix: &str,
     mut arguments: Value,
 ) -> TestResult<Value> {
-    arguments["resultLimits"] = json!({"maximumItems": 13, "maximumBytes": 1_048_576});
+    arguments["resultLimits"] = json!({"maximumItems": 15, "maximumBytes": 1_048_576});
     invoke_installed_board(
         client,
         &format!("economic-context-{request_suffix}"),
@@ -2008,14 +2339,14 @@ fn assert_installed_cli_rejects_unpaired_macro_cutoff(
 fn assert_installed_macro_context(context: &Value) -> TestResult {
     assert_eq!(context["availability"], "partial");
     assert_eq!(context["selection"]["complete"], false);
-    assert_eq!(context["coverage"]["requested"], 13);
+    assert_eq!(context["coverage"]["requested"], 15);
     assert_eq!(context["coverage"]["observed"], 10);
     assert_eq!(context["coverage"]["missing"], 1);
-    assert_eq!(context["coverage"]["unavailable"], 2);
+    assert_eq!(context["coverage"]["unavailable"], 4);
     let observations = context["observations"]
         .as_array()
         .context("economic context omitted its observations")?;
-    assert_eq!(observations.len(), 13);
+    assert_eq!(observations.len(), 15);
     assert_eq!(observations[0]["indicatorId"], "us-government-yield-1m");
     assert_eq!(observations[9]["indicatorId"], "us-government-yield-20y");
     assert_eq!(observations[9]["availability"], "missing");
@@ -2068,7 +2399,7 @@ fn assert_installed_macro_context_matches_dashboard(
         .as_array()
         .context("manifest-bound rate dashboard omitted its observations")?;
     assert_eq!(dashboard_observations.len(), 11);
-    assert_eq!(context_observations.len(), 13);
+    assert_eq!(context_observations.len(), 15);
     for (dashboard_observation, context_observation) in dashboard_observations
         .iter()
         .zip(context_observations.iter())
@@ -2118,6 +2449,7 @@ fn stable_installed_macro_context(context: &Value) -> Value {
         "confidence": context["confidence"],
         "coverage": context["coverage"],
         "observations": context["observations"],
+        "investmentContext": context["investmentContext"],
     })
 }
 
@@ -2130,6 +2462,7 @@ fn stable_current_installed_macro_context(context: &Value) -> Value {
         "confidence": context["confidence"],
         "coverage": context["coverage"],
         "observations": context["observations"],
+        "investmentContext": context["investmentContext"],
     })
 }
 
@@ -3079,7 +3412,7 @@ async fn exercise_installed_relay_with_gate(
     );
     if let Some(expected) = macro_context {
         let mut arguments = expected.arguments.clone();
-        arguments["resultLimits"] = json!({"maximumItems": 13, "maximumBytes": 1_048_576});
+        arguments["resultLimits"] = json!({"maximumItems": 15, "maximumBytes": 1_048_576});
         write_message(
             &mut peer_writer,
             json!({
@@ -3257,8 +3590,8 @@ where
         document["metadata"],
         json!({
             "completeness": "complete",
-            "returnedItems": 12,
-            "availableItems": 12,
+            "returnedItems": 15,
+            "availableItems": 15,
         })
     );
     assert_installed_macro_context(&document["data"])?;
@@ -3271,8 +3604,8 @@ where
         "data": stable_current_installed_macro_context(&expected.stable),
         "metadata": {
             "completeness": "complete",
-            "returnedItems": 12,
-            "availableItems": 12,
+            "returnedItems": 15,
+            "availableItems": 15,
         },
     });
     assert_eq!(
@@ -3298,4 +3631,324 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     Ok(serde_json::from_str(&line)?)
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum ExactPublicCryptoFixture {
+    Coinbase,
+    Kraken,
+}
+
+#[cfg(debug_assertions)]
+impl ExactPublicCryptoFixture {
+    const fn surface(self) -> &'static str {
+        match self {
+            Self::Coinbase => "coinbase.public-market-data",
+            Self::Kraken => "kraken.spot-public-market-data",
+        }
+    }
+
+    const fn config_env(self) -> &'static str {
+        match self {
+            Self::Coinbase => "MARKET_SQUAWK_COINBASE_JSON",
+            Self::Kraken => "MARKET_SQUAWK_KRAKEN_JSON",
+        }
+    }
+
+    const fn path_env(self) -> &'static str {
+        match self {
+            Self::Coinbase => "MARKET_SQUAWK_TEST_COINBASE_JSON_PATH",
+            Self::Kraken => "MARKET_SQUAWK_TEST_KRAKEN_JSON_PATH",
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+struct ExactPublicCryptoInput {
+    fixture: ExactPublicCryptoFixture,
+    json: String,
+    instrument_id: market_squawk_domain::InstrumentId,
+    venue_id: market_squawk_domain::VenueId,
+    symbol: String,
+}
+
+#[cfg(debug_assertions)]
+impl ExactPublicCryptoInput {
+    fn load(fixture: ExactPublicCryptoFixture) -> TestResult<Self> {
+        let path = PathBuf::from(std::env::var_os(fixture.path_env()).with_context(|| {
+            format!(
+                "set {} to an absolute reviewed public-source JSON path",
+                fixture.path_env()
+            )
+        })?);
+        if !path.is_absolute() {
+            anyhow::bail!("{} must be absolute", fixture.path_env());
+        }
+        let json = std::fs::read_to_string(&path)
+            .with_context(|| format!("read reviewed crypto configuration {}", path.display()))?;
+        let value: Value = serde_json::from_str(&json)?;
+        let instrument = match fixture {
+            ExactPublicCryptoFixture::Coinbase => {
+                let rows = value["instruments"]
+                    .as_array()
+                    .context("Coinbase exact proof requires an instruments array")?;
+                if rows.len() != 1 {
+                    anyhow::bail!("Coinbase exact proof requires one configured product");
+                }
+                &rows[0]
+            }
+            ExactPublicCryptoFixture::Kraken => &value["instrument"],
+        };
+        let symbol_field = match fixture {
+            ExactPublicCryptoFixture::Coinbase => "product",
+            ExactPublicCryptoFixture::Kraken => "symbol",
+        };
+        Ok(Self {
+            fixture,
+            json,
+            instrument_id: required_uuid_string(&instrument["instrument_id"], "crypto instrument")?
+                .parse()?,
+            venue_id: market_squawk_domain::VenueId::try_from(
+                required_nonempty_string(&instrument["venue"], "crypto venue")?.as_str(),
+            )?,
+            symbol: required_nonempty_string(&instrument[symbol_field], "crypto provider symbol")?,
+        })
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[ignore = "requires both reviewed public-source JSON files and authorized live Coinbase/Kraken access"]
+fn installed_public_crypto_exact_publication_reopens_after_restart() -> TestResult {
+    let scenario = std::thread::Builder::new()
+        .name("market-squawk-installed-public-crypto-exact".to_owned())
+        .stack_size(INSTALLED_SERVICE_MAIN_STACK_BYTES)
+        .spawn(|| -> TestResult {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    for fixture in [
+                        ExactPublicCryptoFixture::Coinbase,
+                        ExactPublicCryptoFixture::Kraken,
+                    ] {
+                        installed_public_crypto_exact_journey(ExactPublicCryptoInput::load(
+                            fixture,
+                        )?)
+                        .await?;
+                    }
+                    Ok(())
+                })
+        })?;
+    scenario
+        .join()
+        .map_err(|_| anyhow::anyhow!("installed public crypto exact proof thread panicked"))?
+}
+
+#[cfg(debug_assertions)]
+async fn installed_public_crypto_exact_journey(input: ExactPublicCryptoInput) -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let environment = BTreeMap::from([(
+        OsString::from(input.fixture.config_env()),
+        OsString::from(input.json.as_str()),
+    )]);
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &environment,
+        ConfigOverrides {
+            data_dir: Some(temporary.path().join("product")),
+            source_shutdown_ms: Some(60_000),
+            ..ConfigOverrides::default()
+        },
+    ))?;
+    let secrets: Arc<dyn SecretStore> = Arc::new(EncryptedFileSecretStore::try_open(
+        temporary.path().join("runtime-secrets"),
+        SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())?,
+    )?);
+    let connector = InstalledServiceConnector::try_new_at_installation_root(
+        &config,
+        temporary.path().join(".market-squawk-installed-service"),
+    )?;
+    let service =
+        InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets)).await?;
+    let initial_reader = service.crypto_installed_publication_reader();
+    let initial_shutdown = CancellationToken::new();
+    let initial_task = tokio::spawn(service.run(initial_shutdown.clone()));
+    let initial = async {
+        let desktop = connector.connect_with_timeout(
+            NamedClient::Desktop,
+            Some("tauri://localhost".to_owned()),
+            Duration::from_secs(120),
+        )?;
+        let registered = invoke_exact_public_crypto(&desktop, "register", 0, "Source.Register", json!({
+            "provider": input.fixture.surface(),
+            "sourceCoverage": [input.fixture.surface()],
+            "confirm": true,
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+        })).await?;
+        assert_eq!(registered["profile"]["id"], input.fixture.surface());
+        let started = invoke_exact_public_crypto(&desktop, "start", 0, "Source.Onboarding.Apply", json!({
+            "request": {"action": "start", "surfaceId": input.fixture.surface()},
+            "confirm": true,
+        })).await?;
+        assert_eq!(started["outcome"], "completed", "{started}");
+        let session = required_uuid_string(&started["value"]["session_id"], "crypto onboarding session")?;
+        let activated = invoke_exact_public_crypto(&desktop, "activate", 0, "Source.Onboarding.Apply", json!({
+            "request": {"action": "activate", "sessionId": session, "request": {"kind": "source"}},
+            "confirm": true,
+        })).await?;
+        assert_eq!(activated["outcome"], "completed", "{activated}");
+        assert_eq!(activated["value"]["profile"], input.fixture.surface());
+        wait_for_exact_public_crypto_publication(&desktop, &initial_reader, &input).await
+    }.await;
+    initial_shutdown.cancel();
+    let initial_run = initial_task
+        .await
+        .context("join first installed crypto service")?;
+    let (probe, before) = initial?;
+    assert_eq!(initial_run?, InstalledServiceRunOutcome::Stopped);
+    assert!(!before.events().is_empty());
+    assert_eq!(before.manifest(), probe.manifest());
+    assert_eq!(before.publication_digest(), probe.publication_digest());
+    assert_eq!(before.source_id(), probe.source_id());
+    drop(initial_reader);
+
+    let restarted = InstalledService::start_with_secret_store(config, Arc::clone(&secrets)).await?;
+    let restarted_reader = restarted.crypto_installed_publication_reader();
+    let restarted_shutdown = CancellationToken::new();
+    let restarted_task = tokio::spawn(restarted.run(restarted_shutdown.clone()));
+    let reopened = async {
+        let desktop = connector.connect_with_timeout(
+            NamedClient::Desktop,
+            Some("tauri://localhost".to_owned()),
+            Duration::from_secs(120),
+        )?;
+        desktop.bootstrap(CancellationToken::new()).await?;
+        tokio::time::timeout(Duration::from_secs(30), probe.reopen(&restarted_reader))
+            .await
+            .context("exact crypto reopen after installed restart timed out")?
+    }
+    .await;
+    restarted_shutdown.cancel();
+    let restarted_run = restarted_task
+        .await
+        .context("join restarted installed crypto service")?;
+    let after = reopened?;
+    assert_eq!(restarted_run?, InstalledServiceRunOutcome::Stopped);
+    assert_eq!(
+        after, before,
+        "restarted typed events or publication coordinate changed"
+    );
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+async fn invoke_exact_public_crypto(
+    client: &LoopbackApplicationClient,
+    phase: &str,
+    attempt: u64,
+    operation: &'static str,
+    arguments: Value,
+) -> TestResult<Value> {
+    let response = client
+        .invoke_operation(
+            RequestId::try_string(format!("crypto-exact-{phase}-{attempt}"))?,
+            operation,
+            arguments,
+            Duration::from_secs(120),
+            CancellationToken::new(),
+        )
+        .await?;
+    if response.result()["ok"] != true {
+        anyhow::bail!("{operation} failed: {}", response.result());
+    }
+    Ok(response.result()["value"]["data"].clone())
+}
+
+#[cfg(debug_assertions)]
+async fn wait_for_exact_public_crypto_publication(
+    client: &LoopbackApplicationClient,
+    reader: &market_squawk::service::CryptoInstalledPublicationReader,
+    input: &ExactPublicCryptoInput,
+) -> TestResult<(
+    market_squawk::service::CryptoInstalledPublicationProbe,
+    market_squawk::service::CryptoInstalledTypedRead,
+)> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut attempt = 0_u64;
+    let mut last_error = None;
+    loop {
+        let result = async {
+            let feed = invoke_exact_public_crypto(
+                client,
+                "selected-feed",
+                attempt,
+                "Market.GetUnifiedFeed",
+                json!({
+                    "sourceCoverage": [input.fixture.surface()],
+                    "instrumentIds": [input.instrument_id.to_string()],
+                    "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+                }),
+            )
+            .await?;
+            let rows = feed
+                .as_array()
+                .context("crypto unified feed was not an array")?;
+            let row = exactly_one_value(rows, |row| {
+                row["instrumentId"] == input.instrument_id.to_string()
+            })
+            .context("crypto unified feed omitted configured canonical instrument")?;
+            assert_eq!(row["assetClass"], "crypto");
+            assert_eq!(row["symbol"], input.symbol);
+            assert_eq!(row["symbolVenueId"], input.venue_id.as_str());
+            assert_eq!(row["referenceEvidence"].is_object(), true);
+            required_nonempty_string(
+                &row["referenceRevision"],
+                "selected official reference revision",
+            )?;
+            let selected = &row["selectedSource"];
+            assert_eq!(selected["surfaceId"], input.fixture.surface());
+            assert_eq!(selected["venueId"], input.venue_id.as_str());
+            assert_eq!(selected["rights"]["state"], "admitted");
+            assert_eq!(selected["freshness"]["freshAtSelection"], true);
+            let source_id =
+                required_nonempty_string(&selected["sourceId"], "selected crypto source")?;
+            let generation = canonical_positive_u64(
+                &selected["integrity"]["connectionGeneration"],
+                "selected crypto generation",
+            )?;
+            let probe = reader
+                .crypto_installed_publication_probe(
+                    input.fixture.surface(),
+                    &source_id,
+                    input.instrument_id,
+                    &input.venue_id,
+                    generation,
+                )
+                .await?
+                .context("selected crypto source has not committed a publication")?;
+            let read = tokio::time::timeout(Duration::from_secs(30), probe.reopen(reader))
+                .await
+                .context("exact crypto pre-restart read timed out")??;
+            Ok::<_, anyhow::Error>((probe, read))
+        }
+        .await;
+        match result {
+            Ok(proof) => return Ok(proof),
+            Err(error) if Instant::now() >= deadline => {
+                let prior = last_error.as_ref().unwrap_or(&error);
+                anyhow::bail!(
+                    "{} exact publication missed deadline; prior: {prior:#}; final: {error:#}",
+                    input.fixture.surface()
+                );
+            }
+            Err(error) => last_error = Some(error),
+        }
+        attempt = attempt
+            .checked_add(1)
+            .context("advance crypto publication proof attempt")?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }

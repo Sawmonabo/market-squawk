@@ -270,6 +270,25 @@ pub struct CurrentSourceAuthorityLease {
 }
 
 impl CurrentSourceAuthorityLease {
+    /// Revalidates a selected identity together with source, capture, health and budget authority.
+    /// A fresh sealed clock sample prevents a retained event timestamp from extending identity
+    /// validity. This does not grant observation or mutation authority to either input alone.
+    pub fn validate_provider_identity_at(
+        &self,
+        identity: &CurrentProviderIdentity,
+        at: Timestamp,
+    ) -> Result<(), RegistryError> {
+        if identity.source_id() != self.binding.source_id()
+            || identity.source_revision().metadata_revision() != self.binding.metadata_revision()
+        {
+            return Err(RegistryError::HandleTransplanted);
+        }
+        self.validate_at(at)?;
+        let trusted = self.clock.observe()?;
+        identity.validate_at(trusted.wall())?;
+        identity.validate_at(at)
+    }
+
     /// Revalidates current generation, health epoch, capture, and inclusive deadline in O(1).
     ///
     /// `at` is the processor-owned wall-clock projection for the event being admitted. The
@@ -643,6 +662,9 @@ impl CurrentLivePolicy {
 #[derive(Debug)]
 pub struct CurrentProviderObservation {
     key: CurrentBatchKey,
+    provider_identity: CurrentProviderIdentity,
+    row_ordinal: usize,
+    row_count: usize,
     evidence: CurrentObservationEvidence,
     observation: crate::ProviderNormalizedObservation,
     policy: CurrentLivePolicy,
@@ -650,6 +672,27 @@ pub struct CurrentProviderObservation {
 }
 
 impl CurrentProviderObservation {
+    /// Revalidates both exact catalog identity and current source authority at use time.
+    pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
+        self.authority
+            .validate_provider_identity_at(&self.provider_identity, at)
+    }
+
+    /// Returns the opaque catalog-selected identity bound to this source registration.
+    pub const fn provider_identity(&self) -> &CurrentProviderIdentity {
+        &self.provider_identity
+    }
+
+    /// Returns the original normalized ordinal before route grouping.
+    pub const fn row_ordinal(&self) -> usize {
+        self.row_ordinal
+    }
+
+    /// Returns the complete normalized source-object count before route grouping.
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
     /// Returns the deterministic venue/instrument routing key.
     pub const fn key(&self) -> &CurrentBatchKey {
         &self.key
@@ -732,7 +775,11 @@ impl CurrentDecodedProviderBatch {
     /// Fails after source/capture degradation, generation rollover, health revision, or deadline
     /// expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
-        self.authority.validate_at(at)
+        self.authority.validate_at(at)?;
+        for observation in &self.observations {
+            observation.validate_at(at)?;
+        }
+        Ok(())
     }
 
     /// Consumes the homogeneous routing batch in original provider wire order.

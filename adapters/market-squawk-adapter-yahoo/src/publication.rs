@@ -397,7 +397,9 @@ impl<'a> HistoricalAccumulator<'a> {
             .venue_id
             .as_ref()
             .ok_or(YahooPublicationBridgeError::InvalidCanonicalAuthority)?;
-        let provider_timestamp = time_semantics.provider_timestamp();
+        let provider_timestamp = time_semantics
+            .provider_timestamp()
+            .ok_or(YahooPublicationBridgeError::InvalidCanonicalAuthority)?;
         if provider_timestamp.unix_nanos()
             != native_bar
                 .timestamp_unix_seconds
@@ -994,7 +996,7 @@ impl YahooSealedPublication {
             .map_err(|_| YahooPublicationBridgeError::InvalidCanonicalOutput)?;
         let (_, token, _, _, _) = self.into_parts();
         let sealed =
-            SealedProviderOptionMarketBinding::try_new(token, batch, native, vec![0; row_count])?;
+            SealedProviderOptionMarketBinding::try_new(token, batch, native, vec![0; row_count], Vec::new())?;
         sealed.validate()?;
         Ok(YahooOptionPublicationOutcome::Published(
             YahooSealedOptionPublication {

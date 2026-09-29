@@ -3,8 +3,6 @@
 mod archive;
 mod fund_publication;
 mod model;
-mod native_query;
-mod query;
 
 pub use archive::{
     SecBulkLogicalPublicationHandoff, SecBulkLogicalRow, SecBulkLogicalRowLineage,
@@ -24,34 +22,17 @@ pub use fund_publication::{
 pub use model::{
     SEC_BULK_CATALOG_SNAPSHOT_DATE, SEC_NCEN_SCHEMA_EFFECTIVE_DATE, SEC_NCEN_SCHEMA_VERSION,
     SEC_NPORT_SCHEMA_EFFECTIVE_DATE, SEC_NPORT_SCHEMA_VERSION, SecAuthoritativeIdentifierNamespace,
-    SecBulkActivationEvidence, SecBulkCandidatePublicationPermit, SecBulkCapture,
-    SecBulkCatalogSnapshot, SecBulkColumnContract, SecBulkCoverage, SecBulkDeclaredTableContract,
-    SecBulkDoctorReport, SecBulkDoctorState, SecBulkFamily, SecBulkJoinCoordinate,
-    SecBulkJoinDomain, SecBulkKeyField, SecBulkLayoutManifest, SecBulkMediaKind, SecBulkNativeRow,
-    SecBulkNativeRowMembership, SecBulkNotRepresentedReason, SecBulkNumericAttribute,
-    SecBulkProjectionDisposition, SecBulkProviderProjection, SecBulkRelatedRowsState,
-    SecBulkRelatedTableRows, SecBulkRepresentationState, SecBulkSchemaIdentity, SecBulkSelection,
-    SecBulkTableKind, SecBulkTablePresence, SecBulkTableReceipt, SecBulkTransportEvidence,
-    SecBulkTypedField, SecBulkTypedValue, SecFilingChronology, SecFundHoldingCandidate,
-    SecFundHoldingCandidatesQuery, SecFundIdentityResolution, SecGovernedIdentityReceipt,
-    SecHoldingInstrumentResolution, SecHoldingResolutionState, SecNcenEtfRow,
-    SecNcenFundMetadataCandidate, SecNcenFundMetadataQuery, SecNcenFundRow, SecNcenRegistrantRow,
-    SecNcenSecurityExchangeRow, SecNcenSubmissionRow, SecNportFundRow, SecNportHoldingRow,
-    SecNportHoldingSupplementSet, SecNportIdentifierRow, SecNportRegistrantRow,
-    SecNportSubmissionRow, SecQuarter,
-};
-pub use native_query::{
-    SecBulkNativeGenerationReceipt, SecBulkNativeJoinFilter, SecBulkNativePublicationSession,
-    SecBulkNativePublishedGeneration, SecBulkNativeQueryCursor, SecBulkNativeQueryPage,
-    query_native_rows, query_native_rows_by_joins, query_nport_holding_supplements,
-    recover_native_generation, recover_native_generation_from_receipt,
-};
-pub use query::{
-    SecBulkCandidateGenerationReceipt, SecBulkPublicationSession, SecBulkPublishedGeneration,
-    SecBulkPublishedRecord, SecBulkQueryCompleteness, SecBulkQueryCursor, SecBulkQueryLimits,
-    SecBulkQueryPage, query_fund_holding_candidates, query_ncen_fund_metadata,
-    recover_bulk_candidate_generation_from_receipt, recover_fund_holding_candidate_generation,
-    recover_ncen_generation,
+    SecBulkActivationEvidence, SecBulkCapture, SecBulkCatalogSnapshot, SecBulkColumnContract,
+    SecBulkCoverage, SecBulkDeclaredTableContract, SecBulkDoctorReport, SecBulkDoctorState,
+    SecBulkFamily, SecBulkJoinCoordinate, SecBulkJoinDomain, SecBulkKeyField,
+    SecBulkLayoutManifest, SecBulkMediaKind, SecBulkNativeRow, SecBulkNotRepresentedReason,
+    SecBulkNumericAttribute, SecBulkProjectionDisposition, SecBulkProviderProjection,
+    SecBulkRepresentationState, SecBulkSchemaIdentity, SecBulkSelection, SecBulkTableKind,
+    SecBulkTablePresence, SecBulkTableReceipt, SecBulkTransportEvidence, SecBulkTypedField,
+    SecBulkTypedValue, SecGovernedIdentityReceipt, SecNcenEtfRow, SecNcenFundRow,
+    SecNcenRegistrantRow, SecNcenSecurityExchangeRow, SecNcenSubmissionRow, SecNportFundRow,
+    SecNportHoldingRow, SecNportIdentifierRow, SecNportRegistrantRow, SecNportSubmissionRow,
+    SecQuarter,
 };
 
 use thiserror::Error;

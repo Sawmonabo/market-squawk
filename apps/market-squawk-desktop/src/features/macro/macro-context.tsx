@@ -99,9 +99,9 @@ export function MacroContext({ bootstrap, transport }: MacroContextProps) {
           <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
             Economic context
           </p>
-          <h2 className="mt-2 text-xl font-semibold">Rates, labor and energy prices</h2>
+          <h2 className="mt-2 text-xl font-semibold">Rates, labor, income and energy prices</h2>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Use rates, unemployment and household energy prices to understand the environment around an
+            Use rates, unemployment, regional income and household energy prices to understand the environment around an
             investment. These indicators are research context, not trading prices or a standalone
             buy or sell signal.
           </p>
@@ -143,6 +143,13 @@ export function MacroContext({ bootstrap, transport }: MacroContextProps) {
           detail="Unemployment helps frame household demand, business conditions, and recession risk."
           observations={data.observations.filter(
             (observation) => observation.category === "labor_market",
+          )}
+        />
+        <IndicatorSection
+          title="Regional income"
+          detail="Annual personal income helps describe the scale of regional household income."
+          observations={data.observations.filter(
+            (observation) => observation.category === "income",
           )}
         />
         <IndicatorSection
@@ -302,7 +309,10 @@ function IndicatorCard({ observation }: { observation: MacroContextObservation }
       )}
       <dl className="mt-4 grid gap-3 border-t border-border pt-4">
         <MacroEvidenceFact
-          label={observation.category === "energy_prices" ? "Effective month" : "Effective date"}
+          label={observation.frequency === "annual" ? "Effective year"
+            : observation.frequency === "quarterly" ? "Effective quarter"
+              : observation.frequency === "monthly" && observation.effectiveDate === null
+                ? "Effective month" : "Effective date"}
           value={observation.effectivePeriod ?? observation.effectiveDate ?? "Not available"}
         />
         <MacroEvidenceFact

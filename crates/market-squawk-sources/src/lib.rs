@@ -51,19 +51,23 @@ pub use decoder::{
     ControlFrameKind, DecodeError, DecodeInternalError, DecodeOutcome, DecodedControlFrame,
     DecodedIgnoredFrame, DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction,
     DecoderEvidence, IgnoredFrameReason, MAX_DECODED_BOOK_ITEMS, MAX_DECODED_EVENTS, MarketDecoder,
-    ProviderAggressorEvidence, ProviderBookChange, ProviderBookDeltaPayload, ProviderBookLevel,
-    ProviderBookSide, ProviderBookSnapshotPayload, ProviderChecksumEvidence, ProviderDecimalLexeme,
-    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
-    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderStatusEvidence,
-    ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
+    ProviderAccumulatedQuoteEvidence, ProviderAggressorEvidence, ProviderBookChange,
+    ProviderBookDeltaPayload, ProviderBookLevel, ProviderBookSide, ProviderBookSnapshotPayload,
+    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNativeInstrumentIdentity,
+    ProviderNormalizedObservation,
+    ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderQuoteFieldOrigin,
+    ProviderQuoteSizeUnit, ProviderSequenceEvidence, ProviderSnapshotEvidence,
+    ProviderStatusEvidence, ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
 };
 pub use direct_order_book::{
     DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectPublishedBook,
     DirectPublishedLevel, DirectSyncPhase,
 };
 pub use extraction::{
+    ProviderOptionContractReferenceRow, ProviderOptionContractReferenceDependency,
+    MAX_OPTION_REFERENCE_DEPENDENCIES, MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, CanonicalObservationFamily,
-    CanonicalObservationPayload, CanonicalPartitionExpectation, CompleteMarketBarHistoryV1,
+    CanonicalObservationPayload, CanonicalPartitionExpectation, CompleteMarketBarHistoryV1, CompleteMarketBarDateWindowsV1, CompleteMarketBarDateWindowsInputV1, CompleteMarketBarDateWindowV1, CompleteMarketBarDateSessionV1, RetainedMarketHistoryNormalizationV1, RetainedMarketHistoryNativeCoverageV1, RetainedMarketHistoryCashUnitV1, MarketHistoryCashUnitStatus, ProviderNativeExchangeCode, ReviewedMarketCalendarRelationship, RetainedMarketHistoryCalendarV1,
     DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId, ExtractionAuthorityError,
     ExtractionBatch, ExtractionBatchAccumulator, ExtractionContentIdentity, ExtractionError,
     ExtractionRecord, ExtractionRedirectPermit, ExtractionRequest, ExtractionRequestId,
@@ -127,6 +131,7 @@ pub use extraction::{
     SealedProviderOptionMarketBinding, SealedProviderPublicationBinding,
     SealedProviderResponseMarketEventBinding, SourceObject, SourceObjectCaptureIdentity,
     StagedLogicalItemCoordinate, payload_matches_exact_evidence,
+    validate_provider_market_event_binding_metadata,
     verify_provider_market_event_native_lineage_batch_evidence,
     verify_provider_native_lineage_batch_evidence,
 };
@@ -216,6 +221,8 @@ pub use policy::{
     RedirectAuthorization, RetryAfter, SharedProviderBudget, apply_http_retry_after,
 };
 pub use registry::{
+    CatalogProviderIdentityAuthority, CurrentCatalogProviderIdentity, CurrentProviderIdentity,
+    ProviderIdentitySelectionEvidence, ProviderNativeIdentityRequest,
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,
     CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy, CurrentDecodedProviderBatch,
     CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthRecording,

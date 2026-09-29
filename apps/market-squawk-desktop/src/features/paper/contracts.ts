@@ -207,8 +207,17 @@ const stopResultSchema = z
   })
   .strict()
 const productChoiceTokenSchema = actionTokenSchema
-const startPreparationSchema = z
+const marketLabelSchema = z.enum(["Stocks and funds", "Digital assets"])
+const monitoringLabelSchema = z.string().min(1).max(1_000)
+const readyStartPreparationSchema = z
   .object({
+    availability: z.literal("ready"),
+    marketChoices: z.array(z.object({
+      choiceToken: productChoiceTokenSchema,
+      label: marketLabelSchema,
+      monitoringLabel: monitoringLabelSchema,
+      modeChoices: z.array(productChoiceTokenSchema).min(1).max(2),
+    }).strict()).min(1).max(2),
     virtualCashChoices: z
       .array(
         z
@@ -220,7 +229,7 @@ const startPreparationSchema = z
           })
           .strict(),
       )
-      .length(3),
+      .length(1),
     costChoices: z
       .array(
         z
@@ -232,7 +241,7 @@ const startPreparationSchema = z
           })
           .strict(),
       )
-      .length(3),
+      .length(1),
     modeChoices: z
       .array(
         z
@@ -246,9 +255,82 @@ const startPreparationSchema = z
       .length(2),
   })
   .strict()
+const startPreparationSchema = z.discriminatedUnion("availability", [
+  readyStartPreparationSchema,
+  z.object({
+    availability: z.literal("account_required"),
+    message: z.string().min(1).max(1_000),
+  }).strict(),
+  z.object({
+    availability: z.literal("account_unavailable"),
+    message: z.string().min(1).max(1_000),
+  }).strict(),
+  z.object({
+    availability: z.literal("market_unavailable"),
+    message: z.string().min(1).max(1_000),
+  }).strict(),
+])
+const accountPreparationSchema = z.discriminatedUnion("availability", [
+  z.object({
+    availability: z.literal("ready"),
+    accountLabel: z.string().min(1).max(256),
+    virtualCashChoices: z.array(readyStartPreparationSchema.shape.virtualCashChoices.element).length(3),
+    costChoices: z.array(readyStartPreparationSchema.shape.costChoices.element).length(3),
+    currencyChoices: z.array(z.object({
+      choiceToken: productChoiceTokenSchema,
+      label: z.string().min(1).max(96),
+      currency: z.string().regex(/^[A-Z]{3}$/),
+    }).strict()).length(1),
+    safeguards: z.array(z.string().min(1).max(1_000)).length(3),
+  }).strict(),
+  z.object({
+    availability: z.literal("already_created"),
+    accountLabel: z.string().min(1).max(256),
+    message: productTextSchema,
+  }).strict(),
+  z.object({ availability: z.literal("unavailable"), message: productTextSchema }).strict(),
+])
+const accountPreviewSchema = z.object({
+  confirmationToken: actionTokenSchema,
+  expiresAt: timestampSchema,
+  accountLabel: z.string().min(1).max(256),
+  virtualCash: moneySchema,
+  estimatedTradingCost: percentageSchema,
+  safeguards: z.array(z.string().min(1).max(1_000)).length(3),
+}).strict()
+const accountCreatedSchema = z.object({
+  accountCreated: z.literal(true),
+  sessionAvailability: z.literal("stopped"),
+  message: productTextSchema,
+}).strict()
+export type PaperAccountPreparation = z.infer<typeof accountPreparationSchema>
+export type PaperAccountPreview = z.infer<typeof accountPreviewSchema>
+
+export function parsePaperAccountPreparation(result: ApplicationResult): PaperAccountPreparation {
+  requireCompleteAction(result)
+  const value = accountPreparationSchema.parse(result.data)
+  if (value.availability === "ready") {
+    const tokens = [...value.virtualCashChoices, ...value.costChoices, ...value.currencyChoices].map((choice) => choice.choiceToken)
+    if (new Set(tokens).size !== tokens.length) throw new Error("Practice account choices are inconsistent.")
+  }
+  return value
+}
+
+export function parsePaperAccountPreview(result: ApplicationResult): PaperAccountPreview {
+  requireCompleteAction(result)
+  return accountPreviewSchema.parse(result.data)
+}
+
+export function parsePaperAccountCreated(result: ApplicationResult): string {
+  requireCompleteAction(result)
+  return accountCreatedSchema.parse(result.data).message
+}
+
 const startPreviewSchema = z
   .object({
     confirmationToken: actionTokenSchema,
+    marketLabel: marketLabelSchema,
+    monitoringLabel: monitoringLabelSchema,
     expiresAt: timestampSchema,
     virtualCash: moneySchema,
     estimatedTradingCost: percentageSchema,
@@ -311,7 +393,17 @@ export function parsePaperFills(result: ApplicationResult): PaperResult<PaperFil
 
 export function parsePaperStartPreparation(result: ApplicationResult): PaperStartPreparation {
   requireCompleteAction(result)
-  return startPreparationSchema.parse(result.data)
+  const prepared = startPreparationSchema.parse(result.data)
+  if (prepared.availability !== "ready") return prepared
+  const modes = new Set(prepared.modeChoices.map((choice) => choice.choiceToken))
+  if (modes.size !== prepared.modeChoices.length
+    || new Set(prepared.marketChoices.map((choice) => choice.choiceToken)).size !== prepared.marketChoices.length
+    || new Set(prepared.marketChoices.map((choice) => choice.label)).size !== prepared.marketChoices.length
+    || prepared.marketChoices.some((choice) => new Set(choice.modeChoices).size !== choice.modeChoices.length
+      || choice.modeChoices.some((token) => !modes.has(token)))) {
+    throw new Error("Paper market choices are inconsistent.")
+  }
+  return prepared
 }
 
 export function parsePaperStartPreview(result: ApplicationResult): PaperStartPreview {

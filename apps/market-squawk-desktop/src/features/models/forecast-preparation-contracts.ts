@@ -1,5 +1,6 @@
 import { z } from "zod"
 
+import { jobReceiptSchema } from "@/features/backup/contracts"
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
 import type { ApplicationResult } from "@/lib/schemas"
 
@@ -76,9 +77,7 @@ const forecastPreparationPreviewSchema = z
   })
   .strict()
 
-const forecastStartResultSchema = z
-  .object({ state: z.literal("queued") })
-  .strict()
+const forecastStartResultSchema = jobReceiptSchema.strict()
 
 export type ForecastPreparationOptions = z.infer<
   typeof forecastPreparationOptionsSchema
@@ -89,9 +88,7 @@ export type ForecastPreparationHorizon = ForecastPreparationHistory["horizons"][
 export type ForecastPreparationPreview = z.infer<
   typeof forecastPreparationPreviewSchema
 >
-export interface ForecastStartResult {
-  state: "queued"
-}
+export type ForecastStartResult = z.infer<typeof forecastStartResultSchema>
 
 export interface ForecastPreparationSelection {
   modelToken: string
@@ -127,5 +124,5 @@ export function parseForecastStart(
   if (!parsed.success) {
     throw new Error("This forecast cannot be started right now.")
   }
-  return { state: "queued" }
+  return parsed.data
 }

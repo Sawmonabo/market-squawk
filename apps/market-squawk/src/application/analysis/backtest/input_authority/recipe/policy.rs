@@ -97,6 +97,19 @@ impl QueryLimitsWire {
         })
     }
 
+    /// Study-only output budget is derived from this request's existing worker and retained
+    /// limits. Generic query caps and default worker memory are unchanged.
+    pub(super) fn for_study(mut self, retained_bytes: usize) -> Result<Self, RecipeError> {
+        self.max_bytes = self
+            .max_memory_bytes
+            .checked_div(2)
+            .ok_or(RecipeError::Invalid)?
+            .min(u64::try_from(retained_bytes).map_err(|_| RecipeError::Invalid)? / 2)
+            .min(128 * 1024 * 1024);
+        self.build()?;
+        Ok(self)
+    }
+
     pub(super) const fn max_bytes(self) -> u64 {
         self.max_bytes
     }

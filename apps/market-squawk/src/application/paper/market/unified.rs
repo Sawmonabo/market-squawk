@@ -1350,6 +1350,11 @@ pub(super) const fn market_event_provenance(
     match event {
         MarketEvent::Trade(event) => event.provenance(),
         MarketEvent::Quote(event) => event.provenance(),
+        MarketEvent::MarketDataQuote(event) => event.provenance(),
+        MarketEvent::MarketDataTrade(event) => event.provenance(),
+        MarketEvent::MarketDataBook(event) => event.provenance(),
+        MarketEvent::MarketDataChart(event) => event.provenance(),
+        MarketEvent::MarketDataScreener(event) => event.provenance(),
         MarketEvent::BookSnapshot(event) => event.provenance(),
         MarketEvent::BookDelta(event) => event.provenance(),
         MarketEvent::Auction(event) => event.provenance(),
@@ -1548,6 +1553,8 @@ fn display_candidate_depth(
 
 const fn display_timing(delay: CoverageDelay) -> ObservationTiming {
     match delay {
+        CoverageDelay::NotApplicable => ObservationTiming::Stored,
+        CoverageDelay::Unknown => ObservationTiming::Unknown,
         CoverageDelay::RealTime => ObservationTiming::RealTime,
         CoverageDelay::Delayed(_) => ObservationTiming::Delayed,
     }
@@ -2292,6 +2299,7 @@ fn product_market_state(
         match (is_fresh, capabilities.quality()) {
             (false, _) | (_, DataQuality::Stale) => "stale",
             _ => match capabilities.timing() {
+                ObservationTiming::Unknown => "unavailable",
                 ObservationTiming::RealTime => "live",
                 ObservationTiming::Delayed => "delayed",
                 ObservationTiming::EndOfDay => "end_of_day",
@@ -3176,6 +3184,8 @@ fn stringify_u64_field(
 
 fn coverage_delay_value(value: CoverageDelay) -> Value {
     match value {
+        CoverageDelay::NotApplicable => json!({"kind": "not_applicable"}),
+        CoverageDelay::Unknown => json!({"kind": "unknown"}),
         CoverageDelay::RealTime => json!({"kind": "real_time"}),
         CoverageDelay::Delayed(nanos) => {
             json!({"kind": "delayed", "value": nanos.to_string()})
@@ -3675,7 +3685,7 @@ fn source_metadata_evidence(metadata: &SourceMetadata) -> Value {
             "assetClasses": coverage.asset_classes(),
             "topology": coverage.topology(),
             "instruments": coverage.instruments(),
-            "live": coverage.live(),
+            "live": coverage.live_channels(),
             "delay": coverage_delay_value(coverage.delay()),
             "delivery": coverage.delivery()
         }
@@ -3876,6 +3886,7 @@ fn availability_label(selected: SelectedMarketSource<'_>) -> &'static str {
         return "Stale";
     }
     match selected.candidate().capabilities().timing() {
+        ObservationTiming::Unknown => "Unknown timing",
         ObservationTiming::RealTime => "Live",
         ObservationTiming::Delayed => "Delayed",
         ObservationTiming::EndOfDay => "End of day",
@@ -3916,6 +3927,7 @@ const fn selection_class(class: SelectionClass) -> &'static str {
 
 const fn timing_name(timing: ObservationTiming) -> &'static str {
     match timing {
+        ObservationTiming::Unknown => "unknown",
         ObservationTiming::RealTime => "real_time",
         ObservationTiming::Delayed => "delayed",
         ObservationTiming::EndOfDay => "end_of_day",

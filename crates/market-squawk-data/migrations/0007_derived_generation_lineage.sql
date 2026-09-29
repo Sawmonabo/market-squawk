@@ -42,6 +42,13 @@ CREATE TABLE analytical_generations (
                 X'0000000000000000000000000000000000000000000000000000000000000000'
         )
     ),
+    atomic_provider_macro_plan_json TEXT CHECK (
+        atomic_provider_macro_plan_json IS NULL OR (
+            generation_kind = 'ingest'
+            AND length(CAST(atomic_provider_macro_plan_json AS BLOB)) BETWEEN 1 AND 4096
+            AND json_valid(atomic_provider_macro_plan_json)
+        )
+    ),
     created_at_ns INTEGER NOT NULL,
     UNIQUE (dataset_id, manifest_version),
     UNIQUE (dataset_id, content_hash),

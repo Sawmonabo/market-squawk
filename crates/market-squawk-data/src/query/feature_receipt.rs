@@ -20,7 +20,7 @@ use crate::DatasetManifestRef;
 
 const EXAMPLE_ID_COLUMN: usize = 0;
 const INSTRUMENT_ID_COLUMN: usize = 1;
-const CUTOFF_AT_COLUMN: usize = 2;
+const SOURCE_SELECTION_AS_OF_COLUMN: usize = 2;
 const COMPONENT_KIND_COLUMN: usize = 3;
 const COMPONENT_NAME_COLUMN: usize = 4;
 const COMPONENT_VERSION_COLUMN: usize = 5;
@@ -44,7 +44,7 @@ pub struct PinnedFeatureMonetaryValue {
     row: usize,
     example_id: SourceIdentifier,
     instrument_id: InstrumentId,
-    cutoff_at: Timestamp,
+    source_selection_as_of: Timestamp,
     component_name: String,
     component_version: NonZeroU32,
     mantissa: i128,
@@ -73,7 +73,7 @@ impl PinnedFeatureMonetaryValue {
             SourceIdentifier::try_from(required_fixed_text(batch, EXAMPLE_ID_COLUMN, row)?)
                 .map_err(|_| QueryError::InvalidMonetaryCell)?;
         let instrument_id = required_instrument(batch, INSTRUMENT_ID_COLUMN, row)?;
-        let cutoff_at = required_timestamp(batch, CUTOFF_AT_COLUMN, row)?;
+        let source_selection_as_of = required_timestamp(batch, SOURCE_SELECTION_AS_OF_COLUMN, row)?;
         let component_name = required_fixed_text(batch, COMPONENT_NAME_COLUMN, row)?.to_owned();
         let versions = array::<UInt32Array>(batch, COMPONENT_VERSION_COLUMN)?;
         let component_version =
@@ -117,7 +117,7 @@ impl PinnedFeatureMonetaryValue {
             row: selected_row,
             example_id,
             instrument_id,
-            cutoff_at,
+            source_selection_as_of,
             component_name,
             component_version,
             mantissa,
@@ -179,8 +179,8 @@ impl PinnedFeatureMonetaryValue {
     }
 
     /// Returns the point-in-time feature cutoff.
-    pub const fn cutoff_at(&self) -> Timestamp {
-        self.cutoff_at
+    pub const fn source_selection_as_of(&self) -> Timestamp {
+        self.source_selection_as_of
     }
 
     /// Returns the canonical feature name read from the row.

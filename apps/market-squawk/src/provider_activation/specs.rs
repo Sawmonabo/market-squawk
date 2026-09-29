@@ -18,7 +18,9 @@ use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresenta
 use market_squawk_adapter_treasury::TreasurySourceConfig;
 use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
 use market_squawk_data::ImportedUserInputEvidence;
-use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct, SourceIdentifier};
+use market_squawk_domain::{
+    InstrumentId, ProviderIdentityRegistry, ProviderProduct, SourceIdentifier,
+};
 use market_squawk_live::LiveRouteConfig;
 use market_squawk_platform::{
     BoundedInput, ControlledImportInputRoot, LocalAuthorityStateStore, SecretReference,
@@ -190,6 +192,7 @@ pub struct SecAdapterActivation {
     pub(super) representations: SecRepresentationRegistry,
     pub(super) identities: ProviderIdentityRegistry,
     pub(super) parser_limits: SecParserLimits,
+    pub(super) selected_companies: Vec<(SourceIdentifier, InstrumentId)>,
 }
 
 impl SecAdapterActivation {
@@ -201,6 +204,7 @@ impl SecAdapterActivation {
         representations: SecRepresentationRegistry,
         identities: ProviderIdentityRegistry,
         parser_limits: SecParserLimits,
+        selected_companies: Vec<(SourceIdentifier, InstrumentId)>,
     ) -> Self {
         Self {
             metadata,
@@ -208,6 +212,7 @@ impl SecAdapterActivation {
             representations,
             identities,
             parser_limits,
+            selected_companies,
         }
     }
 }
@@ -262,6 +267,30 @@ impl TiingoAdapterActivation {
 pub struct BlsAdapterActivation {
     pub(super) metadata: SourceMetadata,
     pub(super) configuration: BlsAdapterConfiguration,
+}
+
+/// Exact protected metadata and code-owned dataset identity for the BEA Regional lane.
+#[derive(Debug)]
+pub struct BeaAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+    provider_dataset: SourceIdentifier,
+}
+
+impl BeaAdapterActivation {
+    /// Retains only non-secret activation authority. The BEA user ID is resolved from the active
+    /// onboarding lease when the foreground activation or replacement is admitted.
+    #[must_use]
+    pub fn new(metadata: SourceMetadata, provider_dataset: SourceIdentifier) -> Self {
+        Self {
+            metadata,
+            provider_dataset,
+        }
+    }
+
+    /// Returns the exact code-owned Regional contract identity bound to this activation.
+    pub(crate) const fn provider_dataset_identifier(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
 }
 
 /// Public BLS retains the exact adapter configuration; registered BLS defers secret binding.
@@ -547,6 +576,10 @@ pub enum ProviderAdapterActivationRequest {
     Sec(SecAdapterActivation),
     /// BLS public-v1 or registered-v2 research extraction.
     Bls(BlsAdapterActivation),
+    /// Protected metadata-admitted BEA Regional extraction.
+    Bea(BeaAdapterActivation),
+    /// Protected metadata-admitted Census acquisition and canonical period publication.
+    Census(super::CensusAdapterActivation),
     /// Protected route acquisition and durable canonical macro publication.
     Eia(super::EiaAdapterActivation),
     /// Treasury Fiscal Data or daily-rate XML extraction.
@@ -571,7 +604,9 @@ impl ProviderAdapterActivationRequest {
     /// Returns the exact provider discovery identity retained by this activation request.
     pub(crate) fn provider_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         match self {
+            Self::Bea(specification) => Some(specification.provider_dataset_identifier()),
             Self::Bls(specification) => specification.provider_dataset_identifier(),
+            Self::Census(specification) => Some(specification.provider_dataset_identifier()),
             Self::Eia(specification) => Some(specification.provider_dataset_identifier()),
             Self::Board(specification) => Some(specification.provider_dataset_identifier()),
             Self::Fred(specification) => Some(specification.provider_dataset_identifier()),
@@ -591,6 +626,9 @@ impl ProviderAdapterActivationRequest {
 /// Provider activation or adapter construction failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderAdapterActivationError {
+    /// BEA retains the original typed source, control, and publication failure.
+    #[error(transparent)]
+    Bea(#[from] super::bea::BeaProductError),
     /// The request kind does not match the exact active onboarding surface.
     #[error("provider activation request does not match the active surface")]
     SurfaceMismatch,

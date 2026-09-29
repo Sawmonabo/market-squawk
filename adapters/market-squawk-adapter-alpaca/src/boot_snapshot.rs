@@ -1,16 +1,18 @@
 //! Sealed authenticated bootstrap for the configured Alpaca IEX live symbol set.
 
 use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use market_squawk_domain::SourceIdentifier;
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, ApiEndpointRule, BudgetDispatchDecision, BudgetReservationDecision,
-    HttpRequestBounds, PathScope, QueryParameterRule, QuerySensitivity, RawMarketSink,
-    SharedProviderBudget, SourceError, TransportFrameKind, apply_http_retry_after,
+    HttpRequestBounds, PathScope, QueryParameterRule, QuerySensitivity, RawMarketFrame,
+    RawMarketSink, SharedProviderBudget, SourceError, TransportFrameKind, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, RETRY_AFTER};
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -19,7 +21,7 @@ use crate::config::{
     AlpacaIexBootSnapshotPolicy, AlpacaInstrumentMapping, AlpacaTransportLimits,
 };
 use crate::historical_calendar::{
-    authenticated_bounded_get, hardened_client, singleton_bounded_header,
+    authenticated_bounded_get_with_completion, hardened_client, singleton_bounded_header,
 };
 use crate::{AlpacaCredentials, AlpacaError};
 
@@ -29,6 +31,50 @@ const MAX_SYMBOL_QUERY_BYTES: usize =
 const MAX_ENCODED_QUERY_BYTES: u16 = 2_048;
 const MAX_HEADER_BYTES: usize = 128;
 const USER_AGENT: &str = "market-squawk/0.1 alpaca-iex-live-bootstrap";
+
+/// One bounded transport-owned response rendezvous for the first frame of a generation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AlpacaIexBootSnapshotHandoff(Arc<Mutex<Option<AlpacaIexBootSnapshotEvidence>>>);
+
+#[derive(Debug)]
+pub(crate) struct AlpacaIexBootSnapshotEvidence {
+    pub(crate) frame: RawMarketFrame,
+    pub(crate) request_identity: EvidenceDigest,
+    pub(crate) http_status: u16,
+}
+
+impl AlpacaIexBootSnapshotHandoff {
+    pub(crate) fn publish(
+        &self,
+        evidence: AlpacaIexBootSnapshotEvidence,
+    ) -> Result<(), SourceError> {
+        let mut slot = self
+            .0
+            .try_lock()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        if slot.is_some() {
+            return Err(SourceError::InvalidProtocolState);
+        }
+        *slot = Some(evidence);
+        Ok(())
+    }
+
+    pub(crate) fn take(
+        &self,
+        frame: &RawMarketFrame,
+    ) -> Result<AlpacaIexBootSnapshotEvidence, AlpacaError> {
+        let evidence = self
+            .0
+            .try_lock()
+            .map_err(|_| AlpacaError::Protocol)?
+            .take()
+            .ok_or(AlpacaError::Protocol)?;
+        if evidence.frame != *frame || frame.frame_id().get() != 1 {
+            return Err(AlpacaError::Protocol);
+        }
+        Ok(evidence)
+    }
+}
 
 /// Code-owned request coordinates for one configured IEX snapshot bootstrap.
 #[derive(Clone, Debug)]
@@ -153,6 +199,7 @@ impl AlpacaIexBootSnapshotContract {
 pub(crate) struct AlpacaIexBootSnapshotTransport {
     contract: AlpacaIexBootSnapshotContract,
     client: reqwest::Client,
+    publication_handoff: Option<AlpacaIexBootSnapshotHandoff>,
 }
 
 impl AlpacaIexBootSnapshotTransport {
@@ -160,7 +207,12 @@ impl AlpacaIexBootSnapshotTransport {
         Ok(Self {
             contract: contract.clone(),
             client: hardened_client(contract.request_bounds(), USER_AGENT)?,
+            publication_handoff: None,
         })
+    }
+
+    pub(crate) fn install_publication_handoff(&mut self, handoff: AlpacaIexBootSnapshotHandoff) {
+        self.publication_handoff = Some(handoff);
     }
 
     #[allow(
@@ -211,7 +263,8 @@ impl AlpacaIexBootSnapshotTransport {
                 return Err(SourceError::BudgetUnavailable { reason });
             }
         };
-        let response = authenticated_bounded_get(
+        let complete_frame = authority.frames_mut()?.try_reserve_capture_frame()?;
+        let (frame, status, headers) = authenticated_bounded_get_with_completion(
             &self.client,
             credentials,
             &self.contract.url,
@@ -219,6 +272,13 @@ impl AlpacaIexBootSnapshotTransport {
             self.contract.maximum_body_bytes(),
             deadline,
             cancellation,
+            |status, headers, body| {
+                // This is the original HTTP completion clock and custody boundary. Nothing that
+                // can reject an otherwise received response runs before this bounded enqueue.
+                let frame = complete_frame(TransportFrameKind::Text, Bytes::from(body))?;
+                sink.try_capture_for_publication(&frame)?;
+                Ok::<_, SourceError>((frame, status, headers))
+            },
         )
         .await
         .map_err(|error| {
@@ -228,20 +288,19 @@ impl AlpacaIexBootSnapshotTransport {
                 sink_deadline,
                 self.contract.maximum_body_bytes(),
             )
-        })?;
-        validate_rate_headers(&response.headers)?;
-        let retry_after =
-            singleton_bounded_header(&response.headers, RETRY_AFTER, MAX_HEADER_BYTES)
-                .map_err(|_| SourceError::InvalidProtocolState)?;
-        if response.status == 429 || response.status >= 500 {
+        })??;
+        validate_rate_headers(&headers)?;
+        let retry_after = singleton_bounded_header(&headers, RETRY_AFTER, MAX_HEADER_BYTES)
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        if status == 429 || status >= 500 {
             let refusal = apply_http_retry_after(budget, retry_after.as_deref(), 1_000);
             permit.release();
             return Err(SourceError::from_applied_budget_refusal(refusal));
         }
-        if matches!(response.status, 401 | 403) {
+        if matches!(status, 401 | 403) {
             return Err(SourceError::Unauthorized);
         }
-        if response.status != 200 || !is_exact_json_content_type(&response.headers)? {
+        if status != 200 || !is_exact_json_content_type(&headers)? {
             return Err(SourceError::InvalidProtocolState);
         }
         budget
@@ -253,14 +312,24 @@ impl AlpacaIexBootSnapshotTransport {
         }
         ensure_before_deadline(sink, sink_deadline, deadline)?;
         authority.validate_current()?;
-        let frame = authority
-            .frames_mut()?
-            .try_frame(TransportFrameKind::Text, Bytes::from(response.body))?;
         if frame.frame_id().get() != 1 {
             return Err(SourceError::InvalidProtocolState);
         }
         ensure_before_deadline(sink, sink_deadline, deadline)?;
-        sink.try_publish(frame)?;
+        if let Some(handoff) = &self.publication_handoff {
+            let mut digest = Sha256::new();
+            digest.update(b"market-squawk/alpaca-iex-bootstrap-request/v1\0");
+            digest.update(self.contract.target().as_bytes());
+            handoff.publish(AlpacaIexBootSnapshotEvidence {
+                frame: frame.clone(),
+                request_identity: EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    digest.finalize().into(),
+                ),
+                http_status: status,
+            })?;
+        }
+        sink.try_publish_captured(frame)?;
         Ok(())
     }
 }

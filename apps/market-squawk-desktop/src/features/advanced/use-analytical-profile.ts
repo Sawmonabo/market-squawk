@@ -22,3 +22,21 @@ export function useAnalyticalProductProjection(
     },
   })
 }
+
+export function useAnalyticalControllerStatus(
+  transport: Pick<ProductTransport, "analyticalController">,
+  scope: ProductScope,
+) {
+  return useQuery({
+    queryKey: productKeys.operation(scope, "analysis", "Desktop.AnalyticalProfiles", {}),
+    queryFn: async () => {
+      const response = await transport.analyticalController({ action: "status" })
+      if (response.kind !== "status") throw new Error("Analysis settings could not be opened.")
+      return response
+    },
+    refetchInterval: (query) => query.state.data?.workflows.some((workflow) =>
+      workflow.state === "waiting" || workflow.state === "in_progress" || workflow.state === "cancelling",
+    ) ? 1_500 : false,
+    refetchIntervalInBackground: false,
+  })
+}

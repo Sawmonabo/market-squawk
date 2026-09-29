@@ -17,7 +17,15 @@ pub(super) fn initialize(
 ) -> Result<(), JobRepositoryError> {
     let connection = open_writer(location, config)?;
     initialize_schema(&connection)?;
-    verify_database(&connection)
+    verify_database(&connection)?;
+    // The exclusive process lease proves old preparation handlers cannot admit after restart.
+    connection
+        .execute(
+            "UPDATE job_start_requests SET state = 1 WHERE state = 0",
+            [],
+        )
+        .map_err(map_sql)?;
+    Ok(())
 }
 
 pub(super) fn initialize_schema(connection: &Connection) -> Result<(), JobRepositoryError> {
@@ -53,6 +61,15 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), JobReposi
                     event_json BLOB NOT NULL,
                     PRIMARY KEY (job_id, generation, sequence),
                     FOREIGN KEY (job_id, generation) REFERENCES jobs(job_id, generation)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE job_start_requests (
+                    workspace TEXT NOT NULL,
+                    client TEXT NOT NULL,
+                    request_id BLOB NOT NULL CHECK (length(request_id) <= 8192),
+                    job_id BLOB NOT NULL UNIQUE CHECK (length(job_id) = 16),
+                    state INTEGER NOT NULL CHECK (state BETWEEN 0 AND 2),
+                    request_json BLOB NOT NULL CHECK (length(request_json) <= 16384),
+                    PRIMARY KEY (workspace, client, request_id)
                  ) WITHOUT ROWID;
                  PRAGMA application_id = 1297305930;
                  PRAGMA user_version = 1;
@@ -129,6 +146,20 @@ pub(super) fn writer_loop(
     let mut shutdown_reply = None;
     while let Some(command) = receiver.blocking_recv() {
         match command {
+            WriteCommand::BeginStart { binding, reply } => {
+                let result = connection
+                    .as_ref()
+                    .map_err(|error| *error)
+                    .and_then(|connection| super::start::begin(connection, &binding));
+                let _ignored = reply.send(result);
+            }
+            WriteCommand::CancelStart { binding, reply } => {
+                let result = connection
+                    .as_ref()
+                    .map_err(|error| *error)
+                    .and_then(|connection| super::start::cancel(connection, &binding));
+                let _ignored = reply.send(result);
+            }
             WriteCommand::Create { spec, reply } => {
                 let result = connection
                     .as_ref()
@@ -226,7 +257,9 @@ fn create_snapshot(
         false,
     )
     .map_err(|_| JobRepositoryError::InvalidState)?;
-    let changed = connection
+    let transaction = connection.unchecked_transaction().map_err(map_sql)?;
+    super::start::admit(&transaction, spec)?;
+    let changed = transaction
         .execute(
             "INSERT OR IGNORE INTO jobs
              (job_id, generation, sequence, state, snapshot_json) VALUES (?1, ?2, 0, 0, ?3)",
@@ -238,6 +271,7 @@ fn create_snapshot(
         )
         .map_err(map_sql)?;
     if changed == 1 {
+        transaction.commit().map_err(map_sql)?;
         Ok(snapshot)
     } else {
         Err(JobRepositoryError::Conflict)

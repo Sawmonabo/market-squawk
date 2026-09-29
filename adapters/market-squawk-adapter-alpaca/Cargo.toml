@@ -18,6 +18,7 @@ scripted-historical-transport-fixture = []
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 futures-util.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-platform.workspace = true

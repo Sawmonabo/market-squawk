@@ -91,8 +91,29 @@ pub(crate) struct KrakenLevel3LiveRuntime {
     cancellation: CancellationToken,
     healthy: Arc<AtomicBool>,
     current_keys: watch::Receiver<Arc<[OrderLevelBookKey]>>,
-    supervisor: tokio::task::JoinHandle<Result<(), KrakenLevel3RuntimeError>>,
-    shutdown_deadline: Duration,
+    supervisor: tokio::task::JoinHandle<KrakenRunOutcome>,
+    shutdown_result: Option<Result<(), KrakenLevel3RuntimeError>>,
+}
+
+#[derive(Debug)]
+struct KrakenRunOutcome {
+    run: Result<(), KrakenLevel3RuntimeError>,
+    cleanup: Result<(), KrakenLevel3RuntimeError>,
+}
+
+#[derive(Debug)]
+pub(crate) struct KrakenLevel3StartFailure {
+    pub(crate) cause: KrakenLevel3RuntimeError,
+    pub(crate) cleanup: Result<(), KrakenLevel3RuntimeError>,
+}
+
+impl KrakenLevel3StartFailure {
+    fn before_owner(cause: impl Into<KrakenLevel3RuntimeError>) -> Self {
+        Self {
+            cause: cause.into(),
+            cleanup: Ok(()),
+        }
+    }
 }
 
 impl KrakenLevel3LiveRuntime {
@@ -114,19 +135,57 @@ impl KrakenLevel3LiveRuntime {
             .cloned()
     }
 
-    /// Cancels the account owner and waits for exact-generation cleanup.
-    pub(crate) async fn shutdown(mut self) -> Result<(), KrakenLevel3RuntimeError> {
+    /// Retains the exact child and joined outcome when a shutdown waiter is interrupted.
+    pub(crate) async fn finish_shutdown_before(
+        &mut self,
+        deadline: std::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), market_squawk_services::ServiceError> {
+        use market_squawk_services::ServiceError;
         self.cancellation.cancel();
-        match tokio::time::timeout(self.shutdown_deadline, &mut self.supervisor).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(KrakenLevel3RuntimeError::SupervisorTask(error)),
-            Err(_elapsed) => {
-                self.supervisor.abort();
-                let _aborted = (&mut self.supervisor).await;
-                Err(KrakenLevel3RuntimeError::ShutdownDeadline)
+        if let Some(result) = &self.shutdown_result {
+            return result
+                .as_ref()
+                .map(|()| ())
+                .map_err(|_| ServiceError::Unavailable);
+        }
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ServiceError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(ServiceError::DeadlineExceeded)
             }
+            result = self.finish_retained_shutdown() => result,
         }
     }
+
+    /// Joins under retained startup custody; ordinary waiters use the bounded finish method.
+    pub(crate) async fn finish_retained_shutdown(
+        &mut self,
+    ) -> Result<(), market_squawk_services::ServiceError> {
+        use market_squawk_services::ServiceError;
+        self.cancellation.cancel();
+        if let Some(result) = &self.shutdown_result {
+            return result
+                .as_ref()
+                .map(|()| ())
+                .map_err(|_| ServiceError::Unavailable);
+        }
+        let outcome = (&mut self.supervisor).await;
+        let result = kraken_cleanup_outcome(outcome);
+        let status = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::error!(%error, "retained account child cleanup failed");
+                Err(ServiceError::Unavailable)
+            }
+        };
+        // No await separates joining the child from retaining its terminal outcome.
+        self.shutdown_result = Some(result);
+        status
+    }
+
+
 }
 
 impl Drop for KrakenLevel3LiveRuntime {
@@ -149,13 +208,16 @@ impl KrakenL3AccountActivation {
         instruments: Box<[MarketInstrumentBinding]>,
         directory: OrderLevelDirectory,
         cancellation: CancellationToken,
-    ) -> Result<KrakenLevel3LiveRuntime, KrakenLevel3RuntimeError> {
-        self.require_current().await?;
+    ) -> Result<KrakenLevel3LiveRuntime, KrakenLevel3StartFailure> {
+        self.require_current()
+            .await
+            .map_err(KrakenLevel3StartFailure::before_owner)?;
         let config = self
             .take_config()
-            .ok_or(KrakenLevel3RuntimeError::ActivationTopology)?;
-        let specs = validate_instruments(&config, instruments)?;
-        let shutdown_deadline = app_config.source_shutdown();
+            .ok_or(KrakenLevel3RuntimeError::ActivationTopology)
+            .map_err(KrakenLevel3StartFailure::before_owner)?;
+        let specs = validate_instruments(&config, instruments)
+            .map_err(KrakenLevel3StartFailure::before_owner)?;
         let (keys_sender, keys_receiver) = watch::channel(Arc::<[OrderLevelBookKey]>::from([]));
         let (startup_sender, startup_receiver) = oneshot::channel();
         let healthy = Arc::new(AtomicBool::new(false));
@@ -187,7 +249,7 @@ impl KrakenL3AccountActivation {
                     healthy,
                     current_keys: keys_receiver,
                     supervisor,
-                    shutdown_deadline,
+                    shutdown_result: None,
                 }),
                 Err(_closed) => map_supervisor_outcome(supervisor.await),
             },
@@ -251,53 +313,63 @@ async fn run_registry_owner(
     healthy: Arc<AtomicBool>,
     cancellation: CancellationToken,
     startup: oneshot::Sender<()>,
-) -> Result<(), KrakenLevel3RuntimeError> {
-    let paths = LocalPaths::prepare(app_config.data_dir())?;
-    let authority_store = LocalAuthorityStateStore::try_open(
-        paths
-            .control_root()?
-            .root()
-            .join(SOURCE_AUTHORITY_ROOT)
-            .join(activation.account_binding().subject().as_str())
-            .join(config.metadata().source_id().as_str()),
-    )?;
-    let resolver: Arc<dyn AuthorizationSubjectResolver> = Arc::new(provider_rate.clone());
-    let mut registry =
-        AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
-            authority_store,
-            resolver,
-            provider_rate,
+) -> KrakenRunOutcome {
+    // Failures before registry construction have no generation or physical source child to drain.
+    let registry = (|| -> Result<AuthoritativeSourceRegistry, KrakenLevel3RuntimeError> {
+        let paths = LocalPaths::prepare(app_config.data_dir())?;
+        let authority_store = LocalAuthorityStateStore::try_open(
+            paths
+                .control_root()?
+                .root()
+                .join(SOURCE_AUTHORITY_ROOT)
+                .join(activation.account_binding().subject().as_str())
+                .join(config.metadata().source_id().as_str()),
         )?;
-    let registered =
-        registry.register_or_resume_exact(config.metadata().clone(), system_timestamp()?)?;
-    let backoff = registry.provider_backoff_authority(&registered)?;
-    let run = run_generation_loop(
-        &activation,
-        &config,
-        &specs,
-        &app_config,
-        capture_process,
-        &directory,
-        &keys,
-        &healthy,
-        &mut registry,
-        &registered,
-        &backoff,
-        &cancellation,
-        startup,
-    )
+        let resolver: Arc<dyn AuthorizationSubjectResolver> = Arc::new(provider_rate.clone());
+        Ok(AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+            authority_store, resolver, provider_rate,
+        )?)
+    })();
+    let mut registry = match registry {
+        Ok(registry) => registry,
+        Err(cause) => {
+            return KrakenRunOutcome {
+                run: Err(cause),
+                cleanup: Ok(()),
+            };
+        }
+    };
+    let mut cleanup_failure = None;
+    let run = async {
+        let registered =
+            registry.register_or_resume_exact(config.metadata().clone(), system_timestamp()?)?;
+        let backoff = registry.provider_backoff_authority(&registered)?;
+        run_generation_loop(
+            &activation,
+            &config,
+            &specs,
+            &app_config,
+            capture_process,
+            &directory,
+            &keys,
+            &healthy,
+            &mut registry,
+            &registered,
+            &backoff,
+            &cancellation,
+            startup,
+            &mut cleanup_failure,
+        )
+        .await
+    }
     .await;
-    drop(backoff);
-    drop(registered);
-    let shutdown = registry.shutdown();
-    match (run, shutdown) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Err(primary), Err(shutdown)) => Err(KrakenLevel3RuntimeError::RunShutdown {
-            primary: Box::new(primary),
-            shutdown,
-        }),
+    retain_cleanup(
+        &mut cleanup_failure,
+        registry.shutdown().map_err(Into::into),
+    );
+    KrakenRunOutcome {
+        run,
+        cleanup: cleanup_failure.map_or(Ok(()), Err),
     }
 }
 
@@ -319,6 +391,7 @@ async fn run_generation_loop(
     backoff: &ProviderBackoffAuthority,
     cancellation: &CancellationToken,
     startup: oneshot::Sender<()>,
+    cleanup_failure: &mut Option<KrakenLevel3RuntimeError>,
 ) -> Result<(), KrakenLevel3RuntimeError> {
     let mut startup = Some(startup);
     loop {
@@ -338,10 +411,14 @@ async fn run_generation_loop(
             registered,
             cancellation.child_token(),
             &mut startup,
+            cleanup_failure,
         )
         .await;
         healthy.store(false, Ordering::Release);
         keys.send_replace(Arc::from([]));
+        if cleanup_failure.is_some() {
+            return result.and(Err(KrakenLevel3RuntimeError::CleanupIncomplete));
+        }
         match result {
             Ok(()) if cancellation.is_cancelled() => return Ok(()),
             Ok(()) => return Err(KrakenLevel3RuntimeError::SourceExited),
@@ -377,6 +454,7 @@ async fn run_generation(
     registered: &market_squawk_sources::RegisteredSource,
     cancellation: CancellationToken,
     startup: &mut Option<oneshot::Sender<()>>,
+    cleanup_failure: &mut Option<KrakenLevel3RuntimeError>,
 ) -> Result<(), KrakenLevel3RuntimeError> {
     let started_at = system_timestamp()?;
     let session = registry.begin_next_session(
@@ -425,7 +503,15 @@ async fn run_generation(
             .try_start(config.metadata())?;
         let generation = source.generation();
         actors = Some(
-            register_generation_actors(directory, config, specs, generation, &cancellation).await?,
+            register_generation_actors(
+                directory,
+                config,
+                specs,
+                generation,
+                &cancellation,
+                cleanup_failure,
+            )
+            .await?,
         );
         let token = activation
             .acquire_websocket_token(cancellation.clone())
@@ -522,15 +608,10 @@ async fn run_generation(
             shutdown_capture_writer(writer, app_config.capture_shutdown()).await,
         );
     }
-    match (run, cleanup) {
-        (Ok(()), None) => Ok(()),
-        (Err(error), None) => Err(error),
-        (Ok(()), Some(error)) => Err(error),
-        (Err(primary), Some(cleanup)) => Err(KrakenLevel3RuntimeError::RunCleanup {
-            primary: Box::new(primary),
-            cleanup: Box::new(cleanup),
-        }),
+    if let Some(error) = cleanup {
+        retain_cleanup(cleanup_failure, Err(error));
     }
+    run
 }
 
 #[derive(Clone, Debug)]
@@ -1012,6 +1093,7 @@ async fn register_generation_actors(
     specs: &[InstrumentSpec],
     generation: market_squawk_domain::ConnectionGeneration,
     cancellation: &CancellationToken,
+    cleanup_failure: &mut Option<KrakenLevel3RuntimeError>,
 ) -> Result<GenerationActors, KrakenLevel3RuntimeError> {
     let mut registrations: Vec<OrderLevelRegistration> = Vec::new();
     registrations
@@ -1054,13 +1136,11 @@ async fn register_generation_actors(
             Ok(registration) => registration,
             Err(error) => {
                 let primary = KrakenLevel3RuntimeError::Directory(error);
-                return match cleanup_registrations(directory, registrations).await {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => Err(KrakenLevel3RuntimeError::RunCleanup {
-                        primary: Box::new(primary),
-                        cleanup: Box::new(cleanup),
-                    }),
-                };
+                retain_cleanup(
+                    cleanup_failure,
+                    cleanup_registrations(directory, registrations).await,
+                );
+                return Err(primary);
             }
         };
         registrations.push(registration);
@@ -1409,11 +1489,33 @@ fn retain_cleanup(
 }
 
 fn map_supervisor_outcome(
-    outcome: Result<Result<(), KrakenLevel3RuntimeError>, JoinError>,
-) -> Result<KrakenLevel3LiveRuntime, KrakenLevel3RuntimeError> {
+    outcome: Result<KrakenRunOutcome, JoinError>,
+) -> Result<KrakenLevel3LiveRuntime, KrakenLevel3StartFailure> {
+    Err(match outcome {
+        Ok(outcome) => KrakenLevel3StartFailure {
+            cause: outcome
+                .run
+                .err()
+                .unwrap_or(KrakenLevel3RuntimeError::SupervisorExitedBeforeStartup),
+            cleanup: outcome.cleanup,
+        },
+        Err(error) => KrakenLevel3StartFailure {
+            cause: KrakenLevel3RuntimeError::SupervisorExitedBeforeStartup,
+            cleanup: Err(KrakenLevel3RuntimeError::SupervisorTask(error)),
+        },
+    })
+}
+
+fn kraken_cleanup_outcome(
+    outcome: Result<KrakenRunOutcome, JoinError>,
+) -> Result<(), KrakenLevel3RuntimeError> {
     match outcome {
-        Ok(Ok(())) => Err(KrakenLevel3RuntimeError::SupervisorExitedBeforeStartup),
-        Ok(Err(error)) => Err(error),
+        Ok(outcome) => {
+            if let Err(error) = outcome.run {
+                tracing::warn!(%error, "Kraken source ended before original cleanup");
+            }
+            outcome.cleanup
+        }
         Err(error) => Err(KrakenLevel3RuntimeError::SupervisorTask(error)),
     }
 }
@@ -1464,8 +1566,8 @@ pub(crate) enum KrakenLevel3RuntimeError {
     StartupObserverDropped,
     #[error("Kraken level-3 supervisor exited before startup")]
     SupervisorExitedBeforeStartup,
-    #[error("Kraken level-3 supervisor shutdown deadline elapsed")]
-    ShutdownDeadline,
+    #[error("Kraken original generation cleanup failed")]
+    CleanupIncomplete,
     #[error("Kraken level-3 capture owner is missing")]
     CaptureOwnerMissing,
     #[error("Kraken level-3 capture shutdown was incomplete")]
@@ -1482,16 +1584,6 @@ pub(crate) enum KrakenLevel3RuntimeError {
     SupervisorTask(JoinError),
     #[error("Kraken level-3 provider budget is unavailable: {0:?}")]
     BudgetUnavailable(BudgetUnavailableReason),
-    #[error("Kraken level-3 generation and cleanup both failed")]
-    RunCleanup {
-        primary: Box<Self>,
-        cleanup: Box<Self>,
-    },
-    #[error("Kraken level-3 runtime and registry shutdown both failed")]
-    RunShutdown {
-        primary: Box<Self>,
-        shutdown: RegistryError,
-    },
     #[error(transparent)]
     Activation(#[from] KrakenL3ActivationError),
     #[error(transparent)]

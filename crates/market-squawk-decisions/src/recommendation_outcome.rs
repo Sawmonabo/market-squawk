@@ -6,13 +6,17 @@
 
 use std::num::NonZeroU32;
 
-use market_squawk_domain::{AccountId, Money, RevisionNumber, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    AccountId, DigestAlgorithm, EvidenceDigest, Money, RevisionNumber, SourceIdentifier, Timestamp,
+};
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    DecisionContentDigest, InvestmentAnalysisId, InvestmentProposalDecision, InvestmentProposalId,
-    NoActionReason, ProposalExecutionEligibility, ProposalUnavailableReason, RecommendationAction,
+    DecisionContentDigest, ExactPositionScale, InvestmentAnalysisId, InvestmentOutcomeProjection,
+    InvestmentProjectionError, InvestmentProposalDecision, InvestmentProposalId,
+    InvestmentSizingInputs, InvestmentSizingProjection, NoActionReason,
+    ProposalExecutionEligibility, ProposalUnavailableReason, RecommendationAction,
     RecommendationDerivationDigest, RecommendationEvidenceDigest, RecommendationPolicyDigest,
     SelectedCandidateAnalysisEvidence,
 };
@@ -21,6 +25,8 @@ use crate::{
 pub const INVESTMENT_ANALYSIS_PUBLICATION_SCHEMA_VERSION: u16 = 1;
 /// Current schema for immutable typed investment-analysis explanations.
 pub const INVESTMENT_ANALYSIS_EXPLANATION_SCHEMA_VERSION: u16 = 1;
+/// Maximum canonical generation-request bytes retained as opaque audit provenance.
+pub const MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES: usize = 65_536;
 /// Current schema for realized recommendation-outcome status records.
 pub const RECOMMENDATION_OUTCOME_STATUS_SCHEMA_VERSION: u16 = 1;
 /// Code-owned minimum completed observations before a group performance mean is displayed.
@@ -83,6 +89,8 @@ pub enum RecommendationOutcomeError {
     InvalidPrice,
     /// A status was incompatible with the generated, no-action, or unavailable analysis family.
     InvalidStatus,
+    /// The authenticated workspace or bounded opaque generation-request provenance is invalid.
+    InvalidRequestProvenance,
     /// Checked exact-decimal or count arithmetic failed.
     Arithmetic,
 }
@@ -95,6 +103,7 @@ impl std::fmt::Display for RecommendationOutcomeError {
             Self::InvalidTimeOrder => "recommendation outcome time ordering is invalid",
             Self::InvalidPrice => "recommendation outcome price is invalid",
             Self::InvalidStatus => "recommendation outcome status is invalid",
+            Self::InvalidRequestProvenance => "investment request provenance is invalid",
             Self::Arithmetic => "recommendation outcome arithmetic failed",
         })
     }
@@ -215,7 +224,7 @@ impl PublishedInvestmentAnalysis {
         workflow: InvestmentAnalysisWorkflowReference,
         published_at: Timestamp,
     ) -> Result<Self, RecommendationOutcomeError> {
-        if published_at < decision.evidence().as_of() {
+        if published_at < decision.evidence().admitted_at() {
             return Err(RecommendationOutcomeError::InvalidTimeOrder);
         }
         let mut value = Self {
@@ -347,7 +356,7 @@ pub struct InvestmentAnalysisExplanation {
     policy_digest: RecommendationPolicyDigest,
     evidence_digest: RecommendationEvidenceDigest,
     derivation_digest: Option<RecommendationDerivationDigest>,
-    selected_candidate_evidence_digest: DecisionContentDigest,
+    selected_candidate_evidence_digest: Option<DecisionContentDigest>,
     conclusion: InvestmentAnalysisConclusion,
     execution_eligibility: ProposalExecutionEligibility,
 }
@@ -356,12 +365,14 @@ impl InvestmentAnalysisExplanation {
     /// Derives the sole V1 typed explanation from an authoritative decision and exact candidate.
     pub fn try_new(
         decision: &InvestmentProposalDecision,
-        selected_candidate: &SelectedCandidateAnalysisEvidence,
+        selected_candidate: Option<&SelectedCandidateAnalysisEvidence>,
     ) -> Result<Self, RecommendationOutcomeError> {
-        if decision.evidence().selected_candidate() != Some(selected_candidate)
-            || decision.evidence().instrument_id() != selected_candidate.instrument_id()
-            || selected_candidate.as_of() > decision.evidence().as_of()
-            || selected_candidate.selected_at() > decision.evidence().as_of()
+        if decision.evidence().selected_candidate() != selected_candidate
+            || selected_candidate.is_some_and(|candidate| {
+                decision.evidence().instrument_id() != candidate.instrument_id()
+                    || candidate.as_of() > decision.evidence().as_of()
+                    || candidate.selected_at() > decision.evidence().as_of()
+            })
         {
             return Err(RecommendationOutcomeError::BindingMismatch);
         }
@@ -383,7 +394,8 @@ impl InvestmentAnalysisExplanation {
             policy_digest: decision.policy_digest(),
             evidence_digest: decision.evidence_digest(),
             derivation_digest: decision.derivation_digest(),
-            selected_candidate_evidence_digest: selected_candidate.evidence_digest(),
+            selected_candidate_evidence_digest: selected_candidate
+                .map(SelectedCandidateAnalysisEvidence::evidence_digest),
             conclusion,
             execution_eligibility: ProposalExecutionEligibility::ResearchOnlyExecutionIneligible,
         };
@@ -435,7 +447,7 @@ impl InvestmentAnalysisExplanation {
 
     /// Returns the exact selected-candidate evidence commitment.
     #[must_use]
-    pub const fn selected_candidate_evidence_digest(&self) -> DecisionContentDigest {
+    pub const fn selected_candidate_evidence_digest(&self) -> Option<DecisionContentDigest> {
         self.selected_candidate_evidence_digest
     }
 
@@ -452,37 +464,212 @@ impl InvestmentAnalysisExplanation {
     }
 }
 
+/// Opaque audit provenance for one authenticated, application-validated generation request.
+///
+/// The application owns the closed request schema and canonical serialization. These bytes carry
+/// no financial, source-read, execution, or transport authority and are never interpreted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvestmentAnalysisRequestProvenance {
+    workspace_id: [u8; 16],
+    canonical_request: Box<[u8]>,
+    request_digest: DecisionContentDigest,
+}
+
+impl InvestmentAnalysisRequestProvenance {
+    /// Binds one nonzero authenticated workspace to bounded exact canonical request bytes.
+    pub fn try_new(
+        workspace_id: [u8; 16],
+        canonical_request: Box<[u8]>,
+    ) -> Result<Self, RecommendationOutcomeError> {
+        if workspace_id == [0; 16]
+            || canonical_request.is_empty()
+            || canonical_request.len() > MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES
+        {
+            return Err(RecommendationOutcomeError::InvalidRequestProvenance);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/investment-generation-request/v1\0");
+        hash.update(workspace_id);
+        hash.update(&canonical_request);
+        let request_digest = DecisionContentDigest::try_new(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            hash.finalize().into(),
+        ))
+        .map_err(|_| RecommendationOutcomeError::ReservedIdentity)?;
+        Ok(Self {
+            workspace_id,
+            canonical_request,
+            request_digest,
+        })
+    }
+
+    /// Returns the original authenticated workspace coordinate.
+    #[must_use]
+    pub const fn workspace_id(&self) -> [u8; 16] {
+        self.workspace_id
+    }
+
+    /// Returns the opaque original request for application-owned schema validation and audit.
+    #[must_use]
+    pub fn canonical_request(&self) -> &[u8] {
+        &self.canonical_request
+    }
+
+    /// Returns the recomputed commitment to the workspace and exact request bytes.
+    #[must_use]
+    pub const fn request_digest(&self) -> DecisionContentDigest {
+        self.request_digest
+    }
+}
+
 /// One immutable proposal, candidate explanation, and publication committed as a single record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedPublishedInvestmentAnalysis {
     decision: InvestmentProposalDecision,
-    selected_candidate: SelectedCandidateAnalysisEvidence,
+    selected_candidate: Option<SelectedCandidateAnalysisEvidence>,
     explanation: InvestmentAnalysisExplanation,
     publication: PublishedInvestmentAnalysis,
+    request_provenance: Option<InvestmentAnalysisRequestProvenance>,
+    outcome_projection: Option<InvestmentOutcomeProjection>,
+    sizing_inputs: Option<InvestmentSizingInputs>,
+    sizing_projection: Option<InvestmentSizingProjection>,
 }
 
 impl PreparedPublishedInvestmentAnalysis {
     /// Constructs a generic atomic publication bundle from pure, exact references.
     pub fn try_new(
         decision: InvestmentProposalDecision,
-        selected_candidate: SelectedCandidateAnalysisEvidence,
+        selected_candidate: Option<SelectedCandidateAnalysisEvidence>,
         analytical_profile: AnalyticalProfileBindingReference,
         workflow: InvestmentAnalysisWorkflowReference,
         published_at: Timestamp,
     ) -> Result<Self, RecommendationOutcomeError> {
-        let explanation = InvestmentAnalysisExplanation::try_new(&decision, &selected_candidate)?;
+        let explanation =
+            InvestmentAnalysisExplanation::try_new(&decision, selected_candidate.as_ref())?;
         let publication = PublishedInvestmentAnalysis::try_new(
             &decision,
             analytical_profile,
             workflow,
             published_at,
         )?;
+        let outcome_projection = match &decision {
+            InvestmentProposalDecision::Generated(proposal) => Some(
+                InvestmentOutcomeProjection::try_from_proposal(proposal, None)
+                    .map_err(|_| RecommendationOutcomeError::BindingMismatch)?,
+            ),
+            InvestmentProposalDecision::NoAction(_)
+            | InvestmentProposalDecision::Unavailable(_) => None,
+        };
         Ok(Self {
             decision,
             selected_candidate,
             explanation,
             publication,
+            request_provenance: None,
+            outcome_projection,
+            sizing_inputs: None,
+            sizing_projection: None,
         })
+    }
+
+    /// Constructs an installed generation publication with mandatory authenticated request audit.
+    pub fn try_from_generated_request(
+        decision: InvestmentProposalDecision,
+        selected_candidate: Option<SelectedCandidateAnalysisEvidence>,
+        analytical_profile: AnalyticalProfileBindingReference,
+        workflow: InvestmentAnalysisWorkflowReference,
+        request_provenance: InvestmentAnalysisRequestProvenance,
+        published_at: Timestamp,
+    ) -> Result<Self, RecommendationOutcomeError> {
+        let mut bundle = Self::try_new(
+            decision,
+            selected_candidate,
+            analytical_profile,
+            workflow,
+            published_at,
+        )?;
+        bundle.request_provenance = Some(request_provenance);
+        Ok(bundle)
+    }
+
+    /// Derives sizing inside the immutable publication from source-owned exact inputs.
+    ///
+    /// Statistical price ranges may be off the execution tick. Such inputs remain retained for
+    /// exact recovery but cannot yield an execution-lot sizing result. Other binding failures reject
+    /// the publication. A current holding scales outcomes only when its exact terms admit them.
+    pub fn try_with_sizing_inputs(
+        mut self,
+        inputs: InvestmentSizingInputs,
+    ) -> Result<Self, RecommendationOutcomeError> {
+        let InvestmentProposalDecision::Generated(proposal) = &self.decision else {
+            return Err(RecommendationOutcomeError::InvalidStatus);
+        };
+        if inputs.evaluated_at() != self.publication.published_at() {
+            return Err(RecommendationOutcomeError::InvalidTimeOrder);
+        }
+        self.outcome_projection = Some(
+            InvestmentOutcomeProjection::try_from_proposal(proposal, None)
+                .map_err(|_| RecommendationOutcomeError::BindingMismatch)?,
+        );
+        let sizing = match InvestmentSizingProjection::try_from_proposal(proposal, inputs.clone()) {
+            Ok(value) => Some(value),
+            Err(InvestmentProjectionError::PriceNotOnExecutionTick) => None,
+            Err(_) => return Err(RecommendationOutcomeError::BindingMismatch),
+        };
+        if inputs.portfolio().current_lots().get() > 0 {
+            match InvestmentOutcomeProjection::try_from_proposal(
+                proposal,
+                Some(ExactPositionScale::new(
+                    inputs.execution_terms(),
+                    inputs.portfolio().current_lots(),
+                )),
+            ) {
+                Ok(value) => self.outcome_projection = Some(value),
+                Err(InvestmentProjectionError::PriceNotOnExecutionTick) => {}
+                Err(_) => return Err(RecommendationOutcomeError::BindingMismatch),
+            }
+        }
+        self.sizing_inputs = Some(inputs);
+        self.sizing_projection = sizing;
+        Ok(self)
+    }
+
+    /// Returns the saved exact outcome ranges and conditional-mean return, when generated.
+    #[must_use]
+    pub const fn outcome_projection(&self) -> Option<&InvestmentOutcomeProjection> {
+        self.outcome_projection.as_ref()
+    }
+
+    /// Returns all source-owned sizing inputs, including inputs incompatible with execution ticks.
+    #[must_use]
+    pub const fn sizing_inputs(&self) -> Option<&InvestmentSizingInputs> {
+        self.sizing_inputs.as_ref()
+    }
+
+    /// Returns the saved sizing constraints and their explicit capacity gaps.
+    #[must_use]
+    pub const fn sizing_projection(&self) -> Option<&InvestmentSizingProjection> {
+        self.sizing_projection.as_ref()
+    }
+
+    /// Returns the exact price-scale incompatibility when admitted source inputs cannot be sized.
+    #[must_use]
+    pub fn sizing_price_scale_unavailable(&self) -> bool {
+        self.sizing_inputs.is_some() && self.sizing_projection.is_none()
+    }
+
+    /// Returns the authenticated installed request commitment, when this was a generated request.
+    #[must_use]
+    pub fn request_digest(&self) -> Option<DecisionContentDigest> {
+        self.request_provenance
+            .as_ref()
+            .map(InvestmentAnalysisRequestProvenance::request_digest)
+    }
+
+    /// Returns original installed request audit; direct transport-neutral preparation has none.
+    #[must_use]
+    pub const fn request_provenance(&self) -> Option<&InvestmentAnalysisRequestProvenance> {
+        self.request_provenance.as_ref()
     }
 
     /// Returns the immutable generated, no-action, or unavailable decision.
@@ -493,8 +680,8 @@ impl PreparedPublishedInvestmentAnalysis {
 
     /// Returns the exact retained candidate binding.
     #[must_use]
-    pub const fn selected_candidate(&self) -> &SelectedCandidateAnalysisEvidence {
-        &self.selected_candidate
+    pub const fn selected_candidate(&self) -> Option<&SelectedCandidateAnalysisEvidence> {
+        self.selected_candidate.as_ref()
     }
 
     /// Returns the derived typed explanation.
@@ -1437,7 +1624,12 @@ fn investment_analysis_explanation_digest(
             .derivation_digest
             .map(RecommendationDerivationDigest::bytes),
     );
-    digest_hash(&mut hash, value.selected_candidate_evidence_digest);
+    option_digest(
+        &mut hash,
+        value
+            .selected_candidate_evidence_digest
+            .map(|digest| digest.evidence_digest().bytes()),
+    );
     match value.conclusion {
         InvestmentAnalysisConclusion::Generated(action) => {
             hash.update([0, action_tag(action)]);
@@ -1515,16 +1707,20 @@ const fn no_action_reason_tag(value: NoActionReason) -> u8 {
     match value {
         NoActionReason::ConflictingForecastAndValuation => 0,
         NoActionReason::BacktestBelowPolicy => 1,
-        NoActionReason::LiquidityBelowPolicy => 2,
-        NoActionReason::PortfolioRiskBelowPolicy => 3,
-        NoActionReason::ConfidenceBelowPolicy => 4,
-        NoActionReason::PositionStateNotActionable => 5,
-        NoActionReason::GeneratedPriceOrderCollapsed => 6,
+        NoActionReason::OutOfSampleBelowPolicy => 2,
+        NoActionReason::LiquidityBelowPolicy => 3,
+        NoActionReason::PortfolioRiskBelowPolicy => 4,
+        NoActionReason::ConfidenceBelowPolicy => 5,
+        NoActionReason::PositionStateNotActionable => 6,
+        NoActionReason::GeneratedPriceOrderCollapsed => 7,
+        NoActionReason::LiquidityCapacityUnavailable => 8,
+        NoActionReason::ConfidenceUnavailable => 9,
     }
 }
 
 const fn proposal_unavailable_reason_tag(value: ProposalUnavailableReason) -> u16 {
     match value {
+        ProposalUnavailableReason::UnprovenCurrentShareUnits => 22,
         ProposalUnavailableReason::MissingEvidence(_) => 0,
         ProposalUnavailableReason::InstrumentMismatch { .. } => 1,
         ProposalUnavailableReason::CurrencyMismatch { .. } => 2,
@@ -1535,12 +1731,18 @@ const fn proposal_unavailable_reason_tag(value: ProposalUnavailableReason) -> u1
         ProposalUnavailableReason::RejectedQuality { .. } => 7,
         ProposalUnavailableReason::ForecastHorizonMismatch { .. } => 8,
         ProposalUnavailableReason::ValuationHorizonMismatch { .. } => 9,
-        ProposalUnavailableReason::BacktestHorizonMismatch { .. } => 10,
-        ProposalUnavailableReason::InsufficientForecastOutcomes { .. } => 11,
-        ProposalUnavailableReason::UnsupportedForecastCoverage { .. } => 12,
-        ProposalUnavailableReason::InsufficientBacktestObservations { .. } => 13,
-        ProposalUnavailableReason::InsufficientBacktestTrials { .. } => 14,
-        ProposalUnavailableReason::ReservedPortfolioRevision => 15,
+        ProposalUnavailableReason::FinancialModelHorizonMismatch { .. } => 10,
+        ProposalUnavailableReason::BacktestHorizonMismatch { .. } => 11,
+        ProposalUnavailableReason::OutOfSampleHorizonMismatch { .. } => 12,
+        ProposalUnavailableReason::FinancialModelValuationMismatch => 13,
+        ProposalUnavailableReason::OutOfSampleBacktestMismatch => 14,
+        ProposalUnavailableReason::InsufficientForecastOutcomes { .. } => 15,
+        ProposalUnavailableReason::UnsupportedForecastCoverage { .. } => 16,
+        ProposalUnavailableReason::InsufficientBacktestObservations { .. } => 17,
+        ProposalUnavailableReason::InsufficientBacktestTrials { .. } => 18,
+        ProposalUnavailableReason::ReservedPortfolioRevision => 19,
+        ProposalUnavailableReason::ForecastCalibrationBelowPolicy { .. } => 20,
+        ProposalUnavailableReason::HistoricalStudyBasisNotAllowed { .. } => 21,
     }
 }
 

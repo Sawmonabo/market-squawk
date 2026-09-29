@@ -1,5 +1,7 @@
 //! Receipt-required final admission of exact feature datasets for product and model use.
 
+use super::{CurrentPopulationInputUnavailable, DatasetPopulationBasis};
+use crate::DatasetPopulationPartition;
 use std::cmp::Ordering;
 use std::io;
 use std::num::NonZeroU32;
@@ -287,6 +289,11 @@ pub(crate) struct FeatureDatasetProductionReceiptExpectation<'a> {
     pub(crate) policy_digest: Sha256Digest,
     pub(crate) universe_digest: Sha256Digest,
     pub(crate) universe_id: &'a str,
+    pub(crate) population_basis: DatasetPopulationBasis,
+    pub(crate) population_member_count: usize,
+    pub(crate) population_unavailable: &'a [CurrentPopulationInputUnavailable],
+    pub(crate) population_partition: Option<&'a DatasetPopulationPartition>,
+    pub(crate) population_source_use: Option<&'a crate::DatasetPopulationSourceUse>,
     pub(crate) output_group_id: [u8; 32],
     pub(crate) final_output_rights_id: [u8; 32],
     pub(crate) export_sha256: Sha256Digest,
@@ -314,6 +321,9 @@ pub(super) fn register(
     {
         return Err(DatasetBuildError::InvalidRequest);
     }
+    let deadline = std::time::Instant::now()
+        .checked_add(request.limits().max_duration())
+        .ok_or(DatasetBuildError::DeadlineExceeded)?;
     validate_request_dataset(builder, request, dataset)?;
     let final_output_rights =
         build::authorize_existing_output(builder, request, dataset.pinned(), cancellation)?;
@@ -358,6 +368,13 @@ pub(super) fn register(
             }
             if now >= research_use_expires_at {
                 return Err(PythonDatasetCatalogError::ResearchAuthorizationExpired);
+            }
+            if let Some(source_use) = dataset.population_source_use() {
+                source_use
+                    .validate_current(transaction, research_use, deadline, cancellation)
+                    .map_err(|error| {
+                        PythonDatasetCatalogError::PopulationResearchUse(Box::new(error))
+                    })?;
             }
             validate_fresh_research_authorization(
                 transaction,
@@ -409,6 +426,11 @@ pub(super) fn register(
                 policy_digest: dataset.policy_digest(),
                 universe_digest: dataset.universe_digest(),
                 universe_id: request.inputs().universe_id().as_str(),
+                population_basis: dataset.population_basis(),
+                population_member_count: dataset.population_member_count(),
+                population_unavailable: dataset.population_unavailable(),
+                population_partition: dataset.population_partition(),
+                population_source_use: dataset.population_source_use(),
                 output_group_id,
                 final_output_rights_id: final_output_rights.rights_id(),
                 export_sha256,
@@ -565,6 +587,17 @@ fn validate_request_dataset(
         || request.policy_digest() != dataset.policy_digest()
         || request.universe_digest() != dataset.universe_digest()
         || request.inputs().universe_id() != &dataset.universe_id
+        || request.inputs().population_basis() != dataset.population_basis()
+        || request.inputs().population_member_count() != dataset.population_member_count()
+        || request.inputs().population_unavailable() != dataset.population_unavailable()
+        || request.inputs().population_partition() != dataset.population_partition()
+        || request
+            .inputs()
+            .current_population()
+            .map(|population| population.source_use(request.intended_use()))
+            .transpose()?
+            .as_ref()
+            != dataset.population_source_use()
         || request.policy().split() != dataset.split_policy
         || request.policy().point_in_time() != dataset.point_in_time_policy
         || request.policy().missing_values() != dataset.missing_value_policy
@@ -1051,6 +1084,11 @@ fn validate_retained_admission(
         policy_digest: stable.policy_digest,
         universe_digest: stable.universe_digest,
         universe_id: stable.universe_id,
+        population_basis: stable.population_basis,
+        population_member_count: stable.population_member_count,
+        population_unavailable: stable.population_unavailable,
+        population_partition: stable.population_partition,
+        population_source_use: stable.population_source_use,
         output_group_id: stable.output_group_id,
         final_output_rights_id: array_32(&retained.final_output_rights_id)?,
         export_sha256: stable.export_sha256,
@@ -1107,6 +1145,11 @@ fn encode_receipt(
             policy_sha256: hex(stable.policy_digest.bytes())?,
             universe_id: fallible_owned(stable.universe_id, crate::UniverseId::MAX_LENGTH)?,
             universe_sha256: hex(stable.universe_digest.bytes())?,
+            population_basis: stable.population_basis,
+            population_member_count: stable.population_member_count,
+            population_unavailable: stable.population_unavailable.to_vec(),
+            population_partition: stable.population_partition.cloned(),
+            population_source_use: stable.population_source_use.cloned(),
         },
         output_group_sha256: hex(stable.output_group_id)?,
         output_authorization: OutputAuthorizationWire {
@@ -1138,6 +1181,11 @@ fn encode_receipt(
         policy_digest: stable.policy_digest,
         universe_digest: stable.universe_digest,
         universe_id: stable.universe_id,
+        population_basis: stable.population_basis,
+        population_member_count: stable.population_member_count,
+        population_unavailable: stable.population_unavailable,
+        population_partition: stable.population_partition,
+        population_source_use: stable.population_source_use,
         output_group_id: stable.output_group_id,
         final_output_rights_id: stable.final_output_rights_id,
         export_sha256: stable.export_sha256,
@@ -1174,6 +1222,23 @@ fn production_identity(
     hash.update(expectation.policy_digest.bytes());
     put_str(&mut hash, expectation.universe_id);
     hash.update(expectation.universe_digest.bytes());
+    hash.update([expectation.population_basis as u8]);
+    put_len(&mut hash, expectation.population_member_count);
+    if let Some(partition) = expectation.population_partition {
+        hash.update([1]);
+        hash.update(partition.partition_digest());
+    } else {
+        hash.update([0]);
+    }
+    hash.update([u8::from(expectation.population_source_use.is_some())]);
+    if let Some(source_use) = expectation.population_source_use {
+        hash.update(source_use.digest());
+    }
+    put_len(&mut hash, expectation.population_unavailable.len());
+    for value in expectation.population_unavailable {
+        hash.update(value.instrument_id().as_uuid().as_bytes());
+        hash.update([value.reason() as u8]);
+    }
     hash.update(expectation.output_group_id);
     hash.update(expectation.export_sha256.bytes());
     hash.update(producer_evidence.identity.bytes());
@@ -1248,6 +1313,25 @@ struct DatasetWire {
     policy_sha256: String,
     universe_id: String,
     universe_sha256: String,
+    population_basis: DatasetPopulationBasis,
+    population_member_count: usize,
+    population_unavailable: Vec<CurrentPopulationInputUnavailable>,
+    #[serde(deserialize_with = "required_population_partition")]
+    population_partition: Option<DatasetPopulationPartition>,
+    #[serde(deserialize_with = "required_population_source_use")]
+    population_source_use: Option<crate::DatasetPopulationSourceUse>,
+}
+
+fn required_population_source_use<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::DatasetPopulationSourceUse>, D::Error> {
+    Option::<crate::DatasetPopulationSourceUse>::deserialize(deserializer)
+}
+
+fn required_population_partition<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DatasetPopulationPartition>, D::Error> {
+    Option::<DatasetPopulationPartition>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1372,6 +1456,11 @@ fn dataset_wire_matches(
         && parse_sha256(&wire.policy_sha256).ok() == Some(expectation.policy_digest)
         && wire.universe_id == expectation.universe_id
         && parse_sha256(&wire.universe_sha256).ok() == Some(expectation.universe_digest)
+        && wire.population_basis == expectation.population_basis
+        && wire.population_member_count == expectation.population_member_count
+        && wire.population_unavailable == expectation.population_unavailable
+        && wire.population_partition.as_ref() == expectation.population_partition
+        && wire.population_source_use.as_ref() == expectation.population_source_use
 }
 
 fn parse_research_use(value: &str) -> Result<ResearchUse, PythonDatasetCatalogError> {

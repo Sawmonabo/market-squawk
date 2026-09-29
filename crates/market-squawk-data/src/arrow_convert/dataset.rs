@@ -220,6 +220,8 @@ fn validate_feature_label_batch(batch: &RecordBatch) -> Result<(), ArrowConversi
             units.is_null(row) || padded_text(units, row).is_ok_and(canonical_unit);
         let missing_is_canonical = !has_missing
             || padded_text(missing, row).is_ok_and(|value| canonical_identifier(value, 256));
+        crate::python_dataset::canonical_row(batch, row)
+            .map_err(|_| ArrowConversionError::InvalidFeatureLabelRow)?;
         if !canonical_identifier(example_id, 256)
             || !instrument_is_canonical
             || !canonical_identifier(component_name, 256)

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use market_squawk_adapter_portfolio::{BasisResolution, LotMethod, TransactionKind};
+use market_squawk_adapter_portfolio::{LotMethod, TransactionKind};
 use market_squawk_domain::{AccountId, InstrumentId, Money, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::analytics;
 use super::import::hex;
-use super::model::{PortfolioReadImage, PublishedRevision};
+use super::model::{BasisResolution, PortfolioReadImage, PortfolioTransaction, PublishedRevision};
 use super::{PortfolioApplicationLimits, PortfolioApplicationServiceError};
 
 pub(super) struct ReadScope {
@@ -615,9 +615,7 @@ pub(super) fn snapshot_token(revision: &PublishedRevision) -> String {
     .to_string()
 }
 
-fn transaction_token(
-    transaction: &market_squawk_adapter_portfolio::PortfolioTransaction,
-) -> String {
+fn transaction_token(transaction: &PortfolioTransaction) -> String {
     Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!(

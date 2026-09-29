@@ -9,10 +9,12 @@ use thiserror::Error;
 
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
+mod availability;
 mod catalog;
 mod fund_nav;
 mod market_history;
 
+pub(crate) use self::availability::finalize_generation_availability;
 #[cfg(feature = "release-evidence")]
 pub use self::catalog::benchmark_support::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
@@ -38,7 +40,7 @@ pub use self::market_history::{
     CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
     CompleteMarketBarHistorySelection, LatestCanonicalMarketBarHistoryWindowRequest,
     LatestCanonicalMarketBarHistoryWindowSelection, MarketBarHistoryPublicationReceipt,
-    MarketHistorySelectionPolicy,
+    MarketHistoryPriceSurfaceRequirement, MarketHistorySelectionPolicy,
 };
 pub(crate) use self::market_history::{
     MarketBarHistoryPublicationCandidate, propagate_generation_market_bar_history_inputs,

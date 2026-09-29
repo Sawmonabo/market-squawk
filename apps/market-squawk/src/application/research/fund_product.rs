@@ -834,6 +834,12 @@ pub(crate) fn project_fund_product(
     let instrument_id = request.fund_instrument_id();
     let knowledge_cutoff = request.knowledge_at();
     let nav = project_nav(instrument_id, knowledge_cutoff, nav)?;
+    let nav_known_at = match &nav {
+        FundNavProduct::Reported { available_at, .. } => Some(*available_at),
+        FundNavProduct::Missing { .. }
+        | FundNavProduct::Conflict { .. }
+        | FundNavProduct::Unavailable => None,
+    };
     let annual = classify_annual(instrument_id, knowledge_cutoff, reads.annual.outcome())?;
     let annual_product = project_annual_information(annual, &mut budget)?;
 
@@ -898,6 +904,8 @@ pub(crate) fn project_fund_product(
             ))
         }
     }?;
+    result.clocks.latest_fund_information_known_at =
+        latest_timestamp(result.clocks.latest_fund_information_known_at, nav_known_at);
     result.bind_display_identities(instrument_id, identity, holding_identities, &mut budget)?;
     ensure_fund_product_serialized_bound(&result)?;
     Ok(result)

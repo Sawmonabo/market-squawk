@@ -355,10 +355,17 @@ pub enum ProviderPortalActivationRequest {
     },
     /// Complete published history across all five official Treasury daily-rate XML families.
     TreasuryDailyRates,
+    /// Exact BEA Regional state-income selection from embedded Connections.
+    BeaRegional { provider_dataset: SourceIdentifier },
     /// FRED/ALFRED using one exact configured series and vintage interval.
     FredAlfred {
         /// Exact provider discovery dataset retained through restart and immutable reads.
         provider_dataset: SourceIdentifier,
+    },
+    /// Exact metadata-admitted Census dataset, variables, geography, and temporal coordinates.
+    Census {
+        /// Secret-free native selection; the API key stays in the protected credential store.
+        configuration: crate::provider_activation::CensusRequestConfiguration,
     },
     /// Bounded monthly US residential electricity prices, preserving native units and periods.
     EiaElectricityPrice {

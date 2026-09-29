@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query"
 import { AlertTriangle, CalendarClock, ChartNoAxesCombined, ShieldCheck } from "lucide-react"
 
+import { MarketPriceChart } from "@/components/charts/market-price-chart"
+
 import { productKeys } from "@/app/query-client"
 import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
@@ -128,7 +130,7 @@ export function ForecastReview({
             detailAvailable={detailAvailable}
             detailLoading={detail.isPending && selected !== null}
             detailError={detail.isError ? "Forecast details are unavailable right now." : null}
-            outcomes={outcomes.data?.outcomes ?? []}
+            outcomes={outcomes.data?.forecastToken === selected?.forecastToken ? outcomes.data?.outcomes ?? [] : []}
             outcomesAvailable={outcomesAvailable}
             outcomesLoading={outcomes.isPending && selected !== null}
             outcomesError={outcomes.isError ? "Forecast outcomes are unavailable right now." : null}
@@ -151,7 +153,7 @@ function SummaryEvidence({ summary }: { summary: ForecastSummary }) {
         <Fact label="Currency" value={summary.target.currencyCode} />
       ) : null}
       <Fact label="Horizon" value={summary.horizon.label} />
-      <Fact label="Observed through" value={formatTimestamp(summary.observedThroughUnixNanos)} />
+      <Fact label="Observed through" value={formatObservedThrough(summary.observedThroughUnixNanos)} />
       <Fact label="Created" value={formatTimestamp(summary.createdAtUnixNanos)} />
       <Fact label="Expires" value={formatTimestamp(summary.expiresAtUnixNanos)} />
       <Fact
@@ -161,7 +163,7 @@ function SummaryEvidence({ summary }: { summary: ForecastSummary }) {
       <Fact label="Point-in-time inputs" value={evidenceLevelLabel(summary.modelEvidence.pitInputs)} />
       <Fact label="Held-out evaluation" value={evidenceLevelLabel(summary.modelEvidence.outOfSample)} />
       <Fact label="Horizon alignment" value={evidenceLevelLabel(summary.modelEvidence.horizonAlignment)} />
-      <Fact label="Calibration" value={calibrationStateLabel(summary.modelEvidence.calibration)} />
+      <Fact label="Calibration" value={calibrationStateLabel(summary.modelEvidence.calibration, summary.target.valueKind === "probability")} />
       <Fact label="Evidence meaning" value={summary.modelEvidence.interpretation} />
       <Fact label="Historical observations" value={summary.historicalObservationCount.toLocaleString()} />
       <Fact label="Use" value="Investment research only" />
@@ -231,7 +233,7 @@ function ForecastDetail({
       </div>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <MiniFact icon={ChartNoAxesCombined} label="Forecast points" value={detail.estimates.length.toLocaleString()} />
-        <MiniFact icon={CalendarClock} label="Information through" value={formatTimestamp(detail.observedThroughUnixNanos)} />
+        <MiniFact icon={CalendarClock} label="Information through" value={formatObservedThrough(detail.observedThroughUnixNanos)} />
         <MiniFact icon={CalendarClock} label="Valid until" value={formatTimestamp(detail.expiresAtUnixNanos)} />
         <MiniFact
           icon={ShieldCheck}
@@ -248,6 +250,33 @@ function ForecastDetail({
         />
       </div>
 
+      {detail.target.valueKind === "probability" ? <ProbabilityEventEvidence vintage={detail} />
+        : detail.target.valueKind !== "financial_amount" ? <MarketPriceChart
+        key={detail.forecastToken}
+        title={`${detail.target.label}: history and forecast`}
+        unit={detail.target.currencyCode ?? detail.target.unitLabel}
+        cutoffUnixNanos={detail.observedThroughUnixNanos}
+        observed={detail.observedHistory.map((point) => ({
+          timeUnixNanos: point.observedAtUnixNanos,
+          value: point.value.exact,
+          quality: "Recorded forecast input",
+        }))}
+        forecast={detail.estimates.flatMap((point) => {
+          if (point.targetAtUnixNanos === null) return []
+          const outcome = outcomeByTarget.get(point.targetAtUnixNanos)
+          return [{
+            timeUnixNanos: point.targetAtUnixNanos,
+            central: point.central.exact,
+            ...(detail.calibration && point.ranges ? {
+              interval50: [point.ranges.likely.lower.exact, point.ranges.likely.upper.exact] as const,
+              interval80: [point.ranges.wider.lower.exact, point.ranges.wider.upper.exact] as const,
+              interval95: [point.ranges.stress.lower.exact, point.ranges.stress.upper.exact] as const,
+            } : {}),
+            ...(outcome ? { actual: outcome.actual.exact } : {}),
+          }]
+        })}
+      /> : <Unavailable text="This forecast uses financial reporting periods. Exact period estimates are shown below; no daily price path is implied." />}
+
       <CalibrationEvidence vintage={detail} />
       <DriftMonitoring vintage={detail} />
 
@@ -258,24 +287,28 @@ function ForecastDetail({
           </caption>
           <thead className="bg-background/35 text-[10px] uppercase tracking-wider text-muted-foreground">
             <tr>
-              <th className="px-3 py-2 font-medium">Target time</th>
-              <th className="px-3 py-2 font-medium">Central</th>
-              <th className="px-3 py-2 font-medium">Likely range</th>
-              <th className="px-3 py-2 font-medium">Wider range</th>
-              <th className="px-3 py-2 font-medium">Stress range</th>
+              <th className="px-3 py-2 font-medium">Target time or reporting period</th>
+              <th className="px-3 py-2 font-medium">{detail.target.valueKind === "probability" ? "Estimated probability" : "Central"}</th>
+              {detail.target.valueKind !== "probability" ? <>
+                <th className="px-3 py-2 font-medium">Likely range</th>
+                <th className="px-3 py-2 font-medium">Wider range</th>
+                <th className="px-3 py-2 font-medium">Stress range</th>
+              </> : null}
               <th className="px-3 py-2 font-medium">Actual outcome</th>
             </tr>
           </thead>
           <tbody>
-            {detail.estimates.map((point) => {
-              const outcome = outcomeByTarget.get(point.targetAtUnixNanos)
+            {detail.estimates.map((point, index) => {
+              const outcome = point.targetAtUnixNanos === null ? undefined : outcomeByTarget.get(point.targetAtUnixNanos)
               return (
-                <tr key={`${point.targetAtUnixNanos}:${point.central.exact}`} className="border-t border-border">
-                  <td className="px-3 py-2 text-muted-foreground">{formatTimestamp(point.targetAtUnixNanos)}</td>
+                <tr key={`${point.targetAtUnixNanos ?? point.financialTarget?.ordinal}:${index}`} className="border-t border-border">
+                  <td className="px-3 py-2 text-muted-foreground">{formatForecastCoordinate(point)}</td>
                   <td className="px-3 py-2 font-mono">{point.central.formatted}</td>
-                  <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.likely)}</td>
-                  <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.wider)}</td>
-                  <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.stress)}</td>
+                  {detail.target.valueKind !== "probability" ? <>
+                    <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.likely)}</td>
+                    <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.wider)}</td>
+                    <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.stress)}</td>
+                  </> : null}
                   <td className="px-3 py-2 font-mono">
                     {outcome ? (
                       outcome.actual.formatted
@@ -346,6 +379,7 @@ function DriftMonitoring({ vintage }: { vintage: ForecastVintage }) {
 }
 
 function CalibrationEvidence({ vintage }: { vintage: ForecastVintage }) {
+  if (vintage.target.valueKind === "probability") return <ProbabilityCalibrationEvidence vintage={vintage} />
   const calibration = vintage.calibration
   if (!calibration) {
     return (
@@ -366,11 +400,14 @@ function CalibrationEvidence({ vintage }: { vintage: ForecastVintage }) {
               {band.targetCoveragePercent.formatted} target
             </p>
             <p className="mt-1 font-mono text-sm">
-              {band.realizedCovered.toLocaleString()} / {band.realizedTotal.toLocaleString()} realized
+              Fitted interval target
             </p>
           </div>
         ))}
       </div>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+        Calibration window: {formatCalibrationWindow(calibration.window)}.
+      </p>
       <p className="mt-3 text-xs leading-5 text-muted-foreground">
         {calibration.interpretation}. {calibration.assumptions}
       </p>
@@ -447,12 +484,13 @@ function evidenceLevelLabel(
 
 function calibrationStateLabel(
   state: ForecastSummary["modelEvidence"]["calibration"],
+  probability = false,
 ): string {
   switch (state) {
     case "calibrated":
-      return "Calibrated ranges available"
+      return probability ? "Probability calibration available" : "Calibrated ranges available"
     case "limited":
-      return "Limited; ranges may be unavailable"
+      return probability ? "Limited probability evidence" : "Limited; ranges may be unavailable"
     case "unavailable":
       return "Unavailable"
   }
@@ -492,9 +530,99 @@ function targetKindLabel(
   switch (valueKind) {
     case "market_price":
       return "Market price"
+    case "financial_amount":
+      return "Financial reporting amount"
     case "percentage_return":
       return "Percentage return"
     case "probability":
       return "Probability"
   }
+}
+
+function formatObservedThrough(value: string | null): string {
+  return value === null ? "Reporting period; no exact observation time" : formatTimestamp(value)
+}
+function formatCalendarDate(value: { year: number; month: number; day: number }): string {
+  return `${String(value.year).padStart(4, "0")}-${String(value.month).padStart(2, "0")}-${String(value.day).padStart(2, "0")}`
+}
+function formatForecastCoordinate(point: ForecastVintage["estimates"][number]): string {
+  if (point.targetAtUnixNanos !== null) return formatTimestamp(point.targetAtUnixNanos)
+  const target = point.financialTarget
+  if (!target) return "Reporting period unavailable"
+  const period = target.period
+  if (!period) return `Reporting period ${target.ordinal}; exact dates unavailable`
+  return period.kind === "instant" ? formatCalendarDate(period.instant)
+    : `${formatCalendarDate(period.start)} – ${formatCalendarDate(period.end)}`
+}
+function formatCalibrationWindow(window: NonNullable<ForecastVintage["calibration"]>["window"]): string {
+  return window.kind === "exact_time" ? `${formatTimestamp(window.start)} – ${formatTimestamp(window.end)}`
+    : `${formatCalendarDate(window.start)} – ${formatCalendarDate(window.end)} (reporting dates)`
+}
+
+function ProbabilityEventEvidence({ vintage }: { vintage: ForecastVintage }) {
+  const event = vintage.target.event
+  if (!event) return <Unavailable text="The event definition is unavailable." />
+  const definition = event.definition
+  const title = definition.kind === "price_higher" ? "Chance of a higher price"
+    : definition.kind === "benchmark_outperformance" ? "Chance of beating the selected benchmark"
+      : "Chance of profit after modeled trading costs"
+  return <section className="rounded-lg border border-primary/25 bg-primary/5 p-4">
+    <h3 className="text-sm font-semibold">{title}</h3>
+    <p className="mt-2 text-xs leading-5 text-muted-foreground">{vintage.target.meaning}</p>
+    <dl className="mt-4 grid gap-3 sm:grid-cols-2">
+      {vintage.estimates.map((point, index) => <Fact key={index} label={formatForecastCoordinate(point)} value={point.central.formatted} mono />)}
+    </dl>
+    <p className="mt-3 text-xs leading-5 text-muted-foreground">This is the chance of the named event over {vintage.horizon.label.toLowerCase()}. It is separate from expected percentage gain or a future price range.</p>
+    <details className="mt-4 rounded-md border border-border bg-background/25 p-3 text-xs">
+      <summary className="cursor-pointer font-medium">Saved event assumptions</summary>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+        <Fact label="Starting observation" value={event.originBasis === "completed_bar_close" ? "Completed price bar"
+          : event.originBasis === "named_session_close_for_nominal_daily_bar" ? "Recorded close of the named trading session" : "Exact recorded observation"} />
+        <Fact label="Horizon" value={vintage.horizon.label} />
+        {definition.kind === "benchmark_outperformance" ? <Fact label="Selected benchmark identifier" value={definition.benchmarkInstrumentId} /> : null}
+        {definition.kind === "profit_after_costs" ? <>
+          <Fact label="Trade size" value={`${definition.policy.quantity_lots} lots`} />
+          <Fact label="Reporting currency" value={definition.policy.reporting_currency} />
+          <Fact label="Fee per fill" value={`${definition.policy.fee_basis_points} basis points`} />
+          <Fact label="Modeled slippage" value={`${definition.policy.slippage_basis_points} basis points`} />
+          <Fact label="Maximum additional slippage" value={`${definition.policy.maximum_random_slippage_basis_points} basis points`} />
+          <Fact label="Maximum trading participation" value={`${definition.policy.maximum_participation_basis_points} basis points`} />
+          <Fact label="Partial fills" value={definition.policy.allow_partial_fills ? "Allowed" : "Not allowed"} />
+          <Fact label="Execution evidence" value={definition.policy.execution_basis === "completed_daily_bar" ? "Completed daily bars" : "Observed quotes and depth"} />
+          {definition.policy.daily_bar_assumed_spread_basis_points !== null ? <Fact label="Assumed daily-bar spread" value={`${definition.policy.daily_bar_assumed_spread_basis_points} basis points`} /> : null}
+          <Fact label="Profit definition" value="Positive total wealth from the long round trip after modeled costs, including distributions and unpaid entitlements." />
+        </> : null}
+      </dl>
+    </details>
+  </section>
+}
+function ProbabilityCalibrationEvidence({ vintage }: { vintage: ForecastVintage }) {
+  const calibration = vintage.probabilityCalibration
+  if (!calibration) return <Unavailable text="Probability calibration evidence is unavailable for this forecast." />
+  return <section className="rounded-lg border border-blue-400/25 bg-blue-400/5 p-4">
+    <h3 className="text-sm font-semibold text-blue-200">Probability calibration and held-out outcomes</h3>
+    <p className="mt-2 text-xs leading-5 text-muted-foreground">These results evaluate predictions against completed events on a separate chronological evaluation period. They are not price ranges or a guarantee that this event will occur.</p>
+    <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+      {([['Training', calibration.trainWindow], ['Calibration', calibration.calibrationWindow], ['Held-out evaluation', calibration.evaluationWindow]] as const).map(([label, window]) => <Fact key={label} label={label}
+        value={`${formatTimestamp(window.start)} – ${formatTimestamp(window.end)} · ${window.observationCount.toLocaleString()} observations`} />)}
+      <Fact label="Brier score" value={String(calibration.brierScore)} mono />
+      <Fact label="Log loss" value={String(calibration.logLoss)} mono />
+    </dl>
+    <p className="mt-3 text-xs leading-5 text-muted-foreground">Brier score and log loss measure prediction error; lower values indicate less error on these held-out outcomes.</p>
+    <details className="mt-4 rounded-md border border-border bg-background/25 p-3">
+      <summary className="cursor-pointer text-xs font-medium">Reliability by prediction group</summary>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <caption className="mb-2 text-left text-muted-foreground">Original evaluation groups; empty groups remain unavailable.</caption>
+          <thead><tr><th className="p-2 font-medium">Group</th><th className="p-2 font-medium">Outcomes</th><th className="p-2 font-medium">Mean predicted probability</th><th className="p-2 font-medium">Observed event frequency</th></tr></thead>
+          <tbody>{calibration.reliabilityBins.map((bin, index) => <tr key={index} className="border-t border-border">
+            <td className="p-2">{index + 1}</td><td className="p-2">{bin.observationCount.toLocaleString()}</td>
+            <td className="p-2 font-mono">{bin.meanProbability === null ? "Unavailable" : String(bin.meanProbability)}</td>
+            <td className="p-2 font-mono">{bin.observedFrequency === null ? "Unavailable" : String(bin.observedFrequency)}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <p className="mt-3 text-xs text-muted-foreground">Probabilities and frequencies in this table use the 0–1 scale.</p>
+    </details>
+  </section>
 }

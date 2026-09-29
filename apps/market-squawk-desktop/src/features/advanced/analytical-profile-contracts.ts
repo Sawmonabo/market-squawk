@@ -16,7 +16,7 @@ export const analyticalProductProjectionSchema = z
     label: z.string().min(1).max(64),
     kind: z.enum(["recommended", "custom"]),
     activatedAt: unixNanosSchema,
-    workflowAvailability: z.literal("unavailable"),
+    workflowAvailability: z.enum(["available", "unavailable"]),
     nextAction: z.string().min(1).max(256),
   })
   .strict()
@@ -37,6 +37,36 @@ const profileValidationSchema = z
   })
   .strict()
 
+const preferenceFieldSchema = z.object({
+  key: z.string().min(1).max(128),
+  label: z.string().min(1).max(96),
+  group: z.string().min(1).max(64),
+  value: z.string().min(1).max(32),
+  unit: z.enum(["", "%", "seconds", "daily returns"]),
+  choices: z.array(z.object({ value: z.string().min(1).max(64), label: z.string().min(1).max(64) }).strict()).max(5),
+}).strict()
+
+const financialPreferencesSchema = z.object({
+  coverage: z.enum(["stocks_and_etfs", "stocks"]),
+  modelChoice: z.string().min(1).max(64),
+  allowRetrospectiveStudies: z.boolean(),
+  fields: z.array(preferenceFieldSchema).max(64),
+}).strict()
+
+const benchmarkChoiceSchema = z.object({
+  instrumentId: z.string().uuid(),
+  displayName: z.string().min(1).max(512),
+  symbol: z.string().min(1).max(32),
+  comparisonDescription: z.string().min(1).max(521),
+  isDefault: z.boolean(),
+}).strict()
+
+const profileOptionsSchema = z.object({
+  benchmarkChoices: z.array(benchmarkChoiceSchema).max(3),
+  modelChoices: z.array(z.object({ token: z.string().min(1).max(64), label: z.string().min(1).max(256) }).strict()).min(1).max(1_001),
+  fixedSettings: z.array(z.object({ label: z.string().min(1).max(64), value: z.string().min(1).max(256), explanation: z.string().min(1).max(1_024) }).strict()).max(8),
+}).strict()
+
 export const analyticalProfileSchema = z
   .object({
     profileToken: profileTokenSchema,
@@ -48,13 +78,16 @@ export const analyticalProfileSchema = z
     validation: profileValidationSchema,
     validationToken: validationTokenSchema.nullable(),
     activationToken: activationTokenSchema.nullable(),
-    differencesFromRecommended: z.array(profileDifferenceSchema).max(10),
+    differencesFromRecommended: z.array(profileDifferenceSchema).max(11),
     createdAt: unixNanosSchema,
     updatedAt: unixNanosSchema,
     activatedAt: unixNanosSchema.nullable(),
     canValidate: z.boolean(),
     canActivate: z.boolean(),
     canRestoreRecommended: z.boolean(),
+    canEdit: z.boolean(),
+    analysisScope: z.enum(["focused", "balanced", "broad"]),
+    financialPreferences: financialPreferencesSchema,
   })
   .strict()
 
@@ -62,7 +95,8 @@ const coverageSchema = z
   .object({
     completeness: z.enum(["complete", "partial"]),
     searched: z.number().int().nonnegative(),
-    completeEvidence: z.number().int().nonnegative(),
+    population: z.number().int().nonnegative(),
+    inputUnavailable: z.number().int().nonnegative(),
     excluded: z.number().int().nonnegative(),
     deeplyAnalyzed: z.number().int().nonnegative(),
     generated: z.number().int().nonnegative(),
@@ -70,6 +104,17 @@ const coverageSchema = z
     unavailable: z.number().int().nonnegative(),
   })
   .strict()
+
+const missingEvidenceSchema = z.enum([
+  "current_market", "interest_rate_history", "benchmark_history",
+  "investment_history", "corporate_actions", "equity_premium",
+])
+const unavailableMemberSchema = z.object({
+  candidateId: z.string().min(1).max(256),
+  reason: z.enum(["identity_unavailable", "source_evidence_unavailable"]),
+  missingEvidence: z.array(missingEvidenceSchema).max(6),
+}).strict()
+export type MissingInvestmentEvidence = z.infer<typeof missingEvidenceSchema>
 
 const workflowSchema = z
   .object({
@@ -82,6 +127,8 @@ const workflowSchema = z
     state: z.enum([
       "waiting",
       "in_progress",
+      "paused",
+      "cancelling",
       "complete",
       "cancelled",
       "unavailable",
@@ -96,15 +143,20 @@ const workflowSchema = z
           "complete",
           "unavailable",
         ]),
-        completedSteps: z.number().int().nonnegative().max(64),
+        completedSteps: z.number().int().nonnegative().max(8_192),
         waitingForBackgroundWork: z.boolean(),
       })
       .strict(),
     coverage: coverageSchema.nullable(),
     resultCount: z.number().int().nonnegative().max(128),
+    resultActionTokens: z.array(z.string().uuid()).max(128),
+    resultOrdering: z.enum(["estimated_gain_descending", "unavailable_incomparable_horizons"]).nullable(),
+    unavailableMembers: z.array(unavailableMemberSchema).max(32),
     startedAt: unixNanosSchema,
     updatedAt: unixNanosSchema,
     explanation: z.string().min(1).max(256).nullable(),
+    canCancel: z.boolean(),
+    canResume: z.boolean(),
   })
   .strict()
 
@@ -123,7 +175,7 @@ const profileHistoryEntrySchema = z
       "recommended_restored",
     ]),
     recordedAt: unixNanosSchema,
-    differencesFromRecommended: z.array(profileDifferenceSchema).max(10),
+    differencesFromRecommended: z.array(profileDifferenceSchema).max(11),
   })
   .strict()
 
@@ -135,17 +187,30 @@ export const analyticalControllerStatusSchema = z
     workflows: z.array(workflowSchema).max(256),
     workflowAvailability: z
       .object({
-        state: z.literal("unavailable"),
+        state: z.enum(["available", "unavailable"]),
         explanation: z.string().min(1).max(512),
         nextAction: z.string().min(1).max(256),
       })
       .strict(),
     canCreateCustomProfile: z.boolean(),
+    profileRecoveryNotice: z.string().min(1).max(512).nullable(),
   })
   .strict()
 
+const coverageCursorSchema = z.object({ partition: z.number().int().nonnegative().max(65_535).nullable(), offset: z.number().int().nonnegative().max(65_536) }).strict()
+const coverageReasonSchema = z.object({
+  instrumentId: z.string().uuid(),
+  reason: z.enum(["no_effective_canonical_definition", "outside_profile_asset_scope",
+    "missing_official_listing", "ambiguous_official_listing", "source_history_unavailable", "required_feature_unavailable",
+    "source_rights_unavailable", "freshness_unavailable", "calendar_unavailable"]),
+}).strict()
+export type WorkflowCoverageCursor = z.infer<typeof coverageCursorSchema>
+
 export const analyticalControllerResponseSchema = z.discriminatedUnion("kind", [
   analyticalControllerStatusSchema,
+  z.object({ kind: z.literal("workflow_coverage"), workflowToken: workflowTokenSchema, rows: z.array(coverageReasonSchema).max(64), nextAfter: coverageCursorSchema.nullable() }).strict(),
+  z.object({ kind: z.literal("profile_options"), options: profileOptionsSchema }).strict(),
+  z.object({ kind: z.literal("workflow"), workflow: workflowSchema }).strict(),
   z.object({ kind: z.literal("profile"), profile: analyticalProfileSchema }).strict(),
   z.object({ kind: z.literal("validation"), profile: analyticalProfileSchema }).strict(),
   z
@@ -154,7 +219,7 @@ export const analyticalControllerResponseSchema = z.discriminatedUnion("kind", [
       recommendedProfile: analyticalProfileSchema,
       selectedProfile: analyticalProfileSchema,
       equivalent: z.boolean(),
-      differences: z.array(profileDifferenceSchema).max(10),
+      differences: z.array(profileDifferenceSchema).max(11),
     })
     .strict(),
   z
@@ -184,10 +249,25 @@ export type AnalyticalControllerStatus = z.infer<
 export type AnalyticalControllerResponse = z.infer<
   typeof analyticalControllerResponseSchema
 >
+export type AnalyticalProfile = z.infer<typeof analyticalProfileSchema>
+export type FinancialPreferences = z.infer<typeof financialPreferencesSchema>
+export type ProfileOptions = z.infer<typeof profileOptionsSchema>
+export type FinancialPreferencesInput = Pick<FinancialPreferences, "coverage" | "modelChoice" | "allowRetrospectiveStudies"> & {
+  fields: Array<{ key: string; value: string }>
+}
 
 export type AnalyticalControllerRequest =
   | { action: "status" }
+  | { action: "profileOptions" }
   | { action: "copyRecommended"; displayName: string }
+  | {
+      action: "updateProfile"
+      profileToken: string
+      profileStateToken: string
+      displayName: string
+      analysisScope: AnalyticalProfile["analysisScope"]
+      financialPreferences: FinancialPreferencesInput
+    }
   | {
       action: "validateProfile"
       profileToken: string
@@ -199,6 +279,12 @@ export type AnalyticalControllerRequest =
       profileToken: string
       profileStateToken: string
       validationToken: string
+      activationToken: string
     }
   | { action: "restoreRecommended"; activationToken: string }
   | { action: "history"; afterToken?: string; limit: number }
+  | { action: "findOpportunities"; benchmarkInstrumentId?: string }
+  | { action: "analyzeInvestment"; selectionToken: string; benchmarkInstrumentId?: string }
+  | { action: "resumeWorkflow"; workflowToken: string }
+  | { action: "cancelWorkflow"; workflowToken: string }
+  | { action: "workflowCoverage"; workflowToken: string; after?: WorkflowCoverageCursor }

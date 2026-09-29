@@ -25,13 +25,13 @@ use market_squawk_data::{
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, InstrumentId, MetadataRevision, Money,
     OccOptionIdentity, OptionComponent, OptionComponentState, OptionExerciseStyle, OptionKind,
-    OptionSettlementKind, OptionSnapshotObservation, ProviderChannel, ProviderProduct,
-    QuantityLots, SourceId, SourceIdentifier, Timestamp, VenueId,
+    OptionSettlementKind, OptionSnapshotObservation, ProviderChannel, ProviderProduct, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
-    OptionExpirationRange, OptionMarketBatchDisposition, OptionMarketBatchKind,
-    OptionMarketCompleteness, OptionMarketCursorState, OptionMarketRequestFilter,
-    OptionStrikeRange,
+    MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS, OptionExpirationRange, OptionMarketBatchDisposition,
+    OptionMarketBatchKind, OptionMarketCompleteness, OptionMarketCursorState,
+    OptionMarketRequestFilter, OptionStrikeRange,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
@@ -42,9 +42,9 @@ use crate::ResearchService;
 
 const MAX_OPTIONS_CONTEXT_DATASETS: usize = 16;
 const MAX_OPTIONS_CONTEXT_CONTRACTS: usize = 512;
-const MAX_OPTIONS_CONTEXT_CANDIDATES: usize = 4_096;
+const MAX_OPTIONS_CONTEXT_CANDIDATES: usize = 32_000;
 const OPTIONS_CONTEXT_COMPONENTS: u16 = 16;
-const OPTIONS_CONTEXT_QUERY_DOMAIN: &[u8] = b"market-squawk/options-context/query/v1";
+const OPTIONS_CONTEXT_QUERY_DOMAIN: &[u8] = b"market-squawk/options-context/query/v2";
 const OPTIONS_CONTEXT_RECEIPT_DOMAIN: &[u8] = b"market-squawk/options-context/receipt/v1";
 
 /// Fixed provider-neutral request for one underlying's option research context.
@@ -55,7 +55,7 @@ pub(crate) struct OptionsContextRequest {
     knowledge_cutoff: Timestamp,
     effective_cutoff: Timestamp,
     expiration_range: OptionExpirationRange,
-    strike_range: OptionStrikeRange,
+    strike_range: Option<OptionStrikeRange>,
     maximum_contracts: NonZeroU16,
 }
 
@@ -72,6 +72,46 @@ impl OptionsContextRequest {
         effective_cutoff: Timestamp,
         expiration_range: OptionExpirationRange,
         strike_range: OptionStrikeRange,
+        maximum_contracts: NonZeroU16,
+    ) -> Result<Self, OptionsContextError> {
+        Self::try_new_with_strike_range(
+            underlying_instrument_id,
+            valuation_at,
+            knowledge_cutoff,
+            effective_cutoff,
+            expiration_range,
+            Some(strike_range),
+            maximum_contracts,
+        )
+    }
+
+    /// Reads a complete expiration window with a separately bounded returned contract count.
+    pub(crate) fn try_all_strikes(
+        underlying_instrument_id: InstrumentId,
+        valuation_at: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_cutoff: Timestamp,
+        expiration_range: OptionExpirationRange,
+        maximum_contracts: NonZeroU16,
+    ) -> Result<Self, OptionsContextError> {
+        Self::try_new_with_strike_range(
+            underlying_instrument_id,
+            valuation_at,
+            knowledge_cutoff,
+            effective_cutoff,
+            expiration_range,
+            None,
+            maximum_contracts,
+        )
+    }
+
+    fn try_new_with_strike_range(
+        underlying_instrument_id: InstrumentId,
+        valuation_at: Timestamp,
+        knowledge_cutoff: Timestamp,
+        effective_cutoff: Timestamp,
+        expiration_range: OptionExpirationRange,
+        strike_range: Option<OptionStrikeRange>,
         maximum_contracts: NonZeroU16,
     ) -> Result<Self, OptionsContextError> {
         if effective_cutoff > knowledge_cutoff
@@ -111,7 +151,7 @@ impl OptionsContextRequest {
         self.expiration_range
     }
 
-    pub(crate) const fn strike_range(&self) -> OptionStrikeRange {
+    pub(crate) const fn strike_range(&self) -> Option<OptionStrikeRange> {
         self.strike_range
     }
 
@@ -217,9 +257,11 @@ impl OptionsContextReadCapability {
             OptionsObservationReadAvailability::Ready(_) => {}
         }
 
-        let filter = OptionMarketRequestFilter::try_new(
+        // Source publications retain the complete expiration-window chain. Strike is a
+        // bounded product projection, not part of the immutable provider request scope.
+        let source_filter = OptionMarketRequestFilter::try_new(
             Some(request.expiration_range),
-            Some(request.strike_range),
+            None,
             None,
             Vec::new(),
         )
@@ -242,9 +284,9 @@ impl OptionsContextReadCapability {
                 dataset.clone(),
                 request.underlying_instrument_id,
                 OptionMarketBatchKind::Snapshots,
-                &filter,
+                &source_filter,
                 request.knowledge_cutoff,
-                usize::from(request.maximum_contracts.get()),
+                MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS,
             )
             .map_err(|_error| OptionsContextError::InvalidRequest)?;
             let Some(selection) = self
@@ -263,7 +305,7 @@ impl OptionsContextReadCapability {
             check_control(deadline, cancellation)?;
             let batch_index = u16::try_from(batch_evidence.len())
                 .map_err(|_error| OptionsContextError::CapacityExceeded)?;
-            validate_selection(request, &filter, &selection)?;
+            validate_selection(request, &source_filter, &selection)?;
             let batch = selection.batch();
             let snapshots = batch
                 .snapshots()
@@ -274,6 +316,15 @@ impl OptionsContextReadCapability {
                 .ok_or(OptionsContextError::CapacityExceeded)?;
 
             for snapshot in snapshots {
+                if let Some(range) = request.strike_range {
+                    let strike = snapshot.terms().strike();
+                    if strike.currency() != range.minimum().currency()
+                        || strike.amount() < range.minimum().amount()
+                        || strike.amount() > range.maximum().amount()
+                    {
+                        continue;
+                    }
+                }
                 candidate_count = candidate_count
                     .checked_add(1)
                     .ok_or(OptionsContextError::CapacityExceeded)?;
@@ -647,11 +698,11 @@ impl OptionsObservationClocks {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OptionsContractMetrics {
     pub(crate) bid_price: OptionsContextValue<Money>,
-    pub(crate) bid_size: OptionsContextValue<QuantityLots>,
+    pub(crate) bid_size: OptionsContextValue<u64>,
     pub(crate) ask_price: OptionsContextValue<Money>,
-    pub(crate) ask_size: OptionsContextValue<QuantityLots>,
+    pub(crate) ask_size: OptionsContextValue<u64>,
     pub(crate) last_price: OptionsContextValue<Money>,
-    pub(crate) last_size: OptionsContextValue<QuantityLots>,
+    pub(crate) last_size: OptionsContextValue<u64>,
     pub(crate) mark_price: OptionsContextValue<Money>,
     pub(crate) volume: OptionsContextValue<u64>,
     pub(crate) open_interest: OptionsContextValue<u64>,
@@ -799,7 +850,7 @@ pub(crate) struct OptionsContext {
     knowledge_cutoff: Timestamp,
     effective_cutoff: Timestamp,
     expiration_range: OptionExpirationRange,
-    strike_range: OptionStrikeRange,
+    strike_range: Option<OptionStrikeRange>,
     availability: OptionsContextAvailability,
     contracts: Box<[OptionsContextContract]>,
     quality: OptionsContextQuality,
@@ -878,7 +929,7 @@ impl OptionsContext {
         self.expiration_range
     }
 
-    pub(crate) const fn strike_range(&self) -> OptionStrikeRange {
+    pub(crate) const fn strike_range(&self) -> Option<OptionStrikeRange> {
         self.strike_range
     }
 
@@ -1133,13 +1184,9 @@ fn validate_selection(
     for snapshot in snapshots {
         let terms = snapshot.terms();
         let expiration = terms.expiration();
-        let strike = terms.strike();
         if terms.underlying_instrument_id() != request.underlying_instrument_id
             || expiration < request.expiration_range.start()
             || expiration > request.expiration_range.end()
-            || strike.currency() != request.strike_range.minimum().currency()
-            || strike.amount() < request.strike_range.minimum().amount()
-            || strike.amount() > request.strike_range.maximum().amount()
         {
             return Err(OptionsContextError::InvalidEvidence);
         }
@@ -1467,8 +1514,13 @@ fn request_digest(request: &OptionsContextRequest) -> Result<EvidenceDigest, Opt
     digest.update(request.effective_cutoff.unix_nanos().to_be_bytes());
     hash_date(&mut digest, request.expiration_range.start());
     hash_date(&mut digest, request.expiration_range.end());
-    hash_money(&mut digest, request.strike_range.minimum())?;
-    hash_money(&mut digest, request.strike_range.maximum())?;
+    if let Some(range) = request.strike_range {
+        digest.update([1]);
+        hash_money(&mut digest, range.minimum())?;
+        hash_money(&mut digest, range.maximum())?;
+    } else {
+        digest.update([0]);
+    }
     digest.update(request.maximum_contracts.get().to_be_bytes());
     Ok(sha256_evidence(digest))
 }
@@ -1722,9 +1774,40 @@ fn check_control(
 }
 
 fn map_ingest_error(error: IngestError) -> OptionsContextError {
+    use market_squawk_data::{ArrowConversionError, ManifestCatalogError, ParquetStoreError};
+    use market_squawk_platform::ResearchObjectControlError;
+
     match error {
-        IngestError::Cancelled => OptionsContextError::Cancelled,
-        IngestError::DeadlineExceeded => OptionsContextError::DeadlineExceeded,
+        IngestError::Cancelled
+        | IngestError::Arrow(ArrowConversionError::ObjectControl(
+            ResearchObjectControlError::Cancelled,
+        ))
+        | IngestError::Manifest(ManifestCatalogError::Cancelled)
+        | IngestError::Parquet(ParquetStoreError::Cancelled) => OptionsContextError::Cancelled,
+        IngestError::DeadlineExceeded
+        | IngestError::Arrow(ArrowConversionError::ObjectControl(
+            ResearchObjectControlError::DeadlineExceeded,
+        ))
+        | IngestError::Manifest(ManifestCatalogError::DeadlineExceeded)
+        | IngestError::Parquet(
+            ParquetStoreError::ReadDeadlineExceeded | ParquetStoreError::RecoveryDeadlineExceeded,
+        ) => OptionsContextError::DeadlineExceeded,
+        IngestError::Parquet(
+            ParquetStoreError::ReadLimitExceeded
+            | ParquetStoreError::BlockingTaskLimitExceeded
+            | ParquetStoreError::SizeOverflow,
+        ) => OptionsContextError::CapacityExceeded,
+        IngestError::ProviderCaptureRequired
+        | IngestError::Arrow(_)
+        | IngestError::Manifest(
+            ManifestCatalogError::CorruptCatalog | ManifestCatalogError::GenerationConflict,
+        )
+        | IngestError::Parquet(
+            ParquetStoreError::ObjectMetadataMismatch
+            | ParquetStoreError::ContentAddressConflict
+            | ParquetStoreError::Arrow(_)
+            | ParquetStoreError::Parquet(_),
+        ) => OptionsContextError::InvalidEvidence,
         _ => OptionsContextError::AnalyticalEvidenceUnavailable,
     }
 }

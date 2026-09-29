@@ -154,6 +154,7 @@ struct Payload {
     snapshots: Vec<SnapshotRecord>,
     events: Vec<EventRecord>,
     latest_generations: Vec<GenerationIdentity>,
+    start_requests: Vec<super::start::StartRequestRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,6 +294,7 @@ pub(super) fn capture(
         });
     }
     drop(statement);
+    let start_requests = super::start::capture(&transaction)?;
     transaction.commit().map_err(map_sql)?;
 
     let latest_generations = latest_generations(&snapshots)?;
@@ -310,6 +312,7 @@ pub(super) fn capture(
         snapshots,
         events,
         latest_generations,
+        start_requests,
     };
     validate_payload(&payload, Some((backup_id, backup_generation, backup_kind)))?;
     encode_envelope(payload)
@@ -389,7 +392,40 @@ fn validate_payload(
     {
         return Err(JobRepositoryError::InvalidState);
     }
+    validate_start_requests(payload)?;
     replay(payload, active_backup)
+}
+
+fn validate_start_requests(payload: &Payload) -> Result<(), JobRepositoryError> {
+    if payload.start_requests.len() > super::start::MAXIMUM_START_REQUESTS {
+        return Err(JobRepositoryError::InvalidState);
+    }
+    let mut previous = None;
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(payload.start_requests.len())
+        .map_err(|_| JobRepositoryError::Unavailable)?;
+    for record in &payload.start_requests {
+        let key = record.key()?;
+        if previous.as_ref().is_some_and(|previous| previous >= &key) {
+            return Err(JobRepositoryError::InvalidState);
+        }
+        previous = Some(key);
+        ids.push(record.job_id());
+        let snapshot = payload
+            .snapshots
+            .binary_search_by_key(&(record.job_id(), 1), |snapshot| {
+                (snapshot.identity.job_id, snapshot.identity.generation)
+            })
+            .ok()
+            .map(|index| payload.snapshots[index].snapshot.clone().try_into())
+            .transpose()?;
+        record.verify_spec(snapshot.as_ref().map(JobSnapshot::spec))?;
+    }
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(JobRepositoryError::InvalidState);
+    }
+    Ok(())
 }
 
 fn replay(
@@ -603,7 +639,7 @@ pub(super) fn verify_database(connection: &Connection) -> Result<(), JobReposito
         .map_err(map_sql)?;
     if application_id != JOB_DATABASE_APPLICATION_ID
         || user_version != SCHEMA_VERSION
-        || objects.as_deref() != Some("table:job_events,table:jobs")
+        || objects.as_deref() != Some("table:job_events,table:job_start_requests,table:jobs")
         || integrity != "ok"
         || foreign_key_violation.is_some()
     {
@@ -613,6 +649,85 @@ pub(super) fn verify_database(connection: &Connection) -> Result<(), JobReposito
 }
 
 impl SqliteJobRepository {
+    /// Returns the exact deduplicated immutable inputs for one owner-selected job kind.
+    /// The complete canonical envelope and replayed ledger are verified before inventory is exposed.
+    pub fn validated_backup_inputs(
+        encoded: &[u8],
+        kind: &SourceIdentifier,
+        input_authority: &SourceIdentifier,
+    ) -> Result<(JobsAndReceiptsBackupBinding, Vec<crate::AdmittedJobInput>), JobRepositoryError>
+    {
+        let envelope = decode_envelope(encoded)?;
+        let mut inputs = std::collections::BTreeMap::new();
+        for record in envelope.payload.snapshots {
+            let snapshot: JobSnapshot = record.snapshot.try_into()?;
+            if snapshot.spec().kind() != kind {
+                continue;
+            }
+            let input = snapshot.spec().input();
+            if input.authority() != input_authority {
+                return Err(JobRepositoryError::InvalidState);
+            }
+            match inputs.get(input.identity()) {
+                Some(existing) if existing != input => {
+                    return Err(JobRepositoryError::InvalidState);
+                }
+                Some(_) => {}
+                None => {
+                    inputs.insert(input.identity().clone(), input.clone());
+                }
+            }
+        }
+        Ok((envelope.payload.binding, inputs.into_values().collect()))
+    }
+
+    /// Inventories exact completed result artifacts only after full canonical ledger replay.
+    pub fn validated_backup_result_artifacts(
+        encoded: &[u8],
+        kind: &SourceIdentifier,
+        result_authority: &SourceIdentifier,
+        maximum_artifacts: std::num::NonZeroUsize,
+    ) -> Result<
+        (
+            JobsAndReceiptsBackupBinding,
+            Vec<market_squawk_services::ArtifactReference>,
+        ),
+        JobRepositoryError,
+    > {
+        let envelope = decode_envelope(encoded)?;
+        let mut artifacts: Vec<market_squawk_services::ArtifactReference> = Vec::new();
+        for record in envelope.payload.snapshots {
+            let snapshot: JobSnapshot = record.snapshot.try_into()?;
+            if snapshot.spec().kind() != kind || snapshot.state() != JobState::Completed {
+                continue;
+            }
+            let result = snapshot
+                .terminal_result()
+                .ok_or(JobRepositoryError::InvalidState)?;
+            if result.authority() != result_authority {
+                return Err(JobRepositoryError::InvalidState);
+            }
+            for artifact in result.artifacts() {
+                match artifacts.binary_search_by(|existing| existing.id().cmp(artifact.id())) {
+                    Ok(index) if artifacts[index] != *artifact => {
+                        return Err(JobRepositoryError::InvalidState);
+                    }
+                    Ok(_) => {}
+                    Err(index) => {
+                        if artifacts.len() >= maximum_artifacts.get() {
+                            return Err(JobRepositoryError::InvalidState);
+                        }
+                        artifacts
+                            .try_reserve_exact(1)
+                            .map_err(|_| JobRepositoryError::Unavailable)?;
+                        artifacts.insert(index, artifact.clone());
+                    }
+                }
+            }
+        }
+        Ok((envelope.payload.binding, artifacts))
+    }
+
     /// Restores one validated logical export only into an absent database and absent sidecars.
     pub async fn restore_fresh(
         location: JobDatabaseLocation,
@@ -673,6 +788,9 @@ fn restore_fresh_blocking(
                 ],
             )
             .map_err(map_sql)?;
+    }
+    for record in &envelope.payload.start_requests {
+        super::start::insert_record(&transaction, record)?;
     }
     transaction.commit().map_err(map_sql)?;
     verify_database(&connection)?;

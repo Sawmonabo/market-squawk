@@ -2,7 +2,11 @@
 
 mod backup;
 mod codec;
+pub(crate) mod current_find;
+pub(crate) mod current_share;
+pub(crate) mod find_results;
 pub(crate) mod dossier_preparation;
+pub(crate) mod investment_request;
 mod persistence;
 pub(crate) mod recommendation;
 pub(crate) mod screen_workflow;
@@ -13,14 +17,17 @@ use std::{collections::BTreeMap, fmt, sync::Mutex, time::Instant};
 
 use market_squawk_decisions::{
     AnalyticalProfileBindingReference, AppendOutcome, CandidateAssessment, CandidateInput,
-    CurrentScreenPage, DecisionAuthority, DecisionDossier, DecisionRepository,
-    DecisionRepositoryError, DecisionRepositoryLimits, InvestmentAnalysisCurrentIndexEntry,
-    InvestmentAnalysisId, InvestmentOutcomeProjection, InvestmentProposalDecision,
+    CurrentScreenPage, DecisionAuthority, DecisionContentDigest, DecisionDossier,
+    DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits,
+    InvestmentAnalysisCurrentIndexEntry, InvestmentAnalysisEvidence, InvestmentAnalysisId,
+    InvestmentAnalysisRequestProvenance, InvestmentAnalysisWorkflowReference,
+    InvestmentOutcomeProjection, InvestmentProposalAuthority, InvestmentProposalDecision,
     InvestmentProposalId, InvestmentProposalIndexEntry, InvestmentSizingProjection,
     InvestmentTargetSetId, PreparedPublishedInvestmentAnalysis, PublishedInvestmentAnalysis,
-    RecommendationOutcomeStatusRecord, RecommendationTrackRecord, SavedScreen, ScreenExecution,
-    ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry, TargetInvalidation, TargetReview,
-    TargetState, TargetStatus,
+    RecommendationOutcomeStatusRecord, RecommendationPolicy, RecommendationTrackRecord,
+    SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId,
+    SelectedCandidateAnalysisEvidence, StagedPublishedInvestmentAnalysisAppend, TargetIndexEntry,
+    TargetInvalidation, TargetReview, TargetState, TargetStatus,
 };
 use market_squawk_domain::{EvidenceDigest, RevisionNumber, SourceIdentifier, Timestamp};
 use market_squawk_platform::DecisionDatabaseLocation;
@@ -28,6 +35,8 @@ use uuid::Uuid;
 
 use super::opaque_product_token;
 
+pub use self::codec::RecommendationPolicyParametersWire;
+pub(crate) use codec::{decode_harmonic_history_audit, encode_harmonic_history_audit};
 use self::codec::{EncodedRecord, RecoveryContext};
 use self::persistence::DecisionJournal;
 
@@ -100,6 +109,7 @@ struct DecisionState {
     screen_job_inputs: BTreeMap<String, screen_workflow::ScreenJobPlan>,
     limits: DecisionRepositoryLimits,
     backup_retained: bool,
+    source_replay_deferred: bool,
     poisoned: bool,
 }
 
@@ -123,6 +133,7 @@ pub(crate) struct InvestmentAnalysisRead {
     pub(crate) current: Option<InvestmentAnalysisCurrentIndexEntry>,
     pub(crate) outcome_projection: Option<InvestmentOutcomeProjection>,
     pub(crate) sizing_projection: Option<InvestmentSizingProjection>,
+    pub(crate) sizing_price_scale_unavailable: bool,
 }
 
 const INVESTMENT_ANALYSIS_PRODUCT_TOKEN_DOMAIN: &[u8] =
@@ -162,9 +173,46 @@ impl DecisionApplication {
                 screen_job_inputs,
                 limits,
                 backup_retained: false,
+                source_replay_deferred: false,
                 poisoned: false,
             }),
         })
+    }
+
+    /// Installed recovery reopens each projected decision from exact local source artifacts.
+    /// Optional source-read unavailability retains journal custody but exposes no partial authority.
+    /// Restoring source access and explicitly reopening the application retries the same full replay;
+    /// no background task, new writer or scalar fallback is introduced.
+    pub(crate) async fn open_with_current_share_replay(
+        location: DecisionDatabaseLocation,
+        limits: DecisionRepositoryLimits,
+        replay: &current_share::CurrentShareReplayCapability,
+        context: &market_squawk_services::RequestContext,
+    ) -> Result<Self, DecisionApplicationError> {
+        let mut journal = DecisionJournal::open(location, limits)?;
+        let mut authority = DecisionAuthority::new(DecisionRepository::try_new(limits)?);
+        let mut recovery = RecoveryContext::try_new(limits.maximum_screen_runs())?;
+        let replayed = journal.recover_with_replay(&mut authority, &mut recovery, replay, context).await?;
+        Self::from_source_recovery(journal, limits, authority, recovery, replayed)
+    }
+
+    fn from_source_recovery(
+        journal: DecisionJournal,
+        limits: DecisionRepositoryLimits,
+        mut authority: DecisionAuthority,
+        mut recovery: RecoveryContext,
+        replayed: Option<[u8; 32]>,
+    ) -> Result<Self, DecisionApplicationError> {
+        let source_replay_deferred = replayed.is_none();
+        if source_replay_deferred {
+            authority = DecisionAuthority::new(DecisionRepository::try_new(limits)?);
+            recovery = RecoveryContext::try_new(limits.maximum_screen_runs())?;
+        }
+        Ok(Self { state: Mutex::new(DecisionState {
+            authority, journal, preparation: target_preparation::TargetPreparationAuthority::default(),
+            dossier_preparation: dossier_preparation::DossierPreparationAuthority::default(),
+            screen_job_inputs: recovery.into_screen_job_inputs(), limits, backup_retained: false, source_replay_deferred, poisoned: false,
+        }) })
     }
 
     /// `Decision.SaveScreen` typed implementation. The call returns only after WAL commit.
@@ -202,6 +250,70 @@ impl DecisionApplication {
         Ok(execution)
     }
 
+    /// Admits actual price-movement screening over every original current source partition.
+    /// The client selects only bounded discovery breadth; ranking remains the shared evaluator.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "original source and lifecycle authorities remain explicit"
+    )]
+    pub(crate) async fn prepare_current_find_screen_job(
+        &self,
+        partitions: Box<[super::research::CurrentFindScreenPartition]>,
+        maximum_candidates: usize,
+        calendar: super::market_calendar::CompletedMarketSessionRead,
+        profile: super::analytical_profile::ValidatedAnalyticalProfile,
+        research: std::sync::Arc<crate::ResearchService>,
+        selected_at: Timestamp,
+        deadline: Instant,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AdmittedScreenJob, ScreenWorkflowError> {
+        screen_workflow::ensure_screen_control(deadline, &cancellation)?;
+        let first = partitions
+            .first()
+            .ok_or(ScreenWorkflowError::DatasetUnavailable)?;
+        if first.population_reference().maximum_deep_analyses() != maximum_candidates {
+            return Err(ScreenWorkflowError::InvalidRequest);
+        }
+        let as_of = first.partition().population().membership_as_of();
+        let registry = market_squawk_modeling::ProductionFeatureRegistry::try_new()
+            .map_err(|_| ScreenWorkflowError::DatasetUnavailable)?;
+        let screen = screen_workflow::prepare_price_movement_find_screen(
+            &partitions,
+            maximum_candidates,
+            registry.feature_registry(),
+        )?;
+        let id = screen.revision().id().clone();
+        let revision = screen.revision().revision();
+        self.save_screen(None, screen)?;
+        let reader = research.analytical_reader();
+        self.prepare_screen_job(
+            ScreenJobRequest::new(
+                id,
+                revision,
+                screen_workflow::ScreenDatasetSelection::CurrentFind(partitions),
+                as_of,
+                calendar,
+                profile,
+                research,
+            ),
+            &reader,
+            selected_at,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Reopens the exact persisted input receipt and complete source coverage after restart.
+    pub(crate) fn prepared_screen_admission(
+        &self,
+        input_identity: &SourceIdentifier,
+        input_digest: EvidenceDigest,
+    ) -> Result<AdmittedScreenJob, ScreenWorkflowError> {
+        let state = self.reader()?;
+        resolve_screen_job_plan(&state, input_identity, input_digest)?.admitted()
+    }
+
     /// Resolves one retained screen and exact feature generation, derives all candidate inputs,
     /// and commits the immutable job input before returning an admission locator.
     pub async fn prepare_screen_job(
@@ -212,6 +324,7 @@ impl DecisionApplication {
         deadline: Instant,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<AdmittedScreenJob, ScreenWorkflowError> {
+        screen_workflow::ensure_screen_control(deadline, &cancellation)?;
         let screen = self
             .get_screen(request.screen_id(), request.screen_revision())
             .map_err(|error| match error {
@@ -252,12 +365,13 @@ impl DecisionApplication {
             reader,
             selected_at,
             deadline,
-            cancellation,
+            cancellation.clone(),
         )
         .await?;
         let encoded = codec::screen_job_input(&plan)?;
         let admitted = plan.admitted()?;
         let mut state = self.writer()?;
+        screen_workflow::validate_publication_control(&plan, deadline, &cancellation)?;
         let authoritative_screen = state
             .authority
             .get_screen(plan.run().screen().id(), plan.run().screen().revision())
@@ -283,6 +397,7 @@ impl DecisionApplication {
         {
             return Err(ScreenWorkflowError::Conflict);
         }
+        screen_workflow::validate_publication_control(&plan, deadline, &cancellation)?;
         match state.journal.append(&encoded) {
             Ok(AppendOutcome::Appended) => {
                 state
@@ -636,10 +751,16 @@ impl DecisionApplication {
     /// This typed composition boundary accepts neither raw financial scalars nor caller-selected
     /// recommendation fields. It grants no generation, workflow, sizing, order, or execution
     /// authority and is deliberately not registered as a service, MCP, or Desktop operation.
+    /// Source-dependent current-share projections require an atomic generated-request bundle,
+    /// whose canonical source references allow physical restart replay. This method accepts only
+    /// source-independent records and rejects projected evidence before any durable mutation.
     pub fn append_investment_proposal(
         &self,
         decision: InvestmentProposalDecision,
     ) -> Result<AppendOutcome, DecisionApplicationError> {
+        if decision.evidence().current_share_projection().is_some() {
+            return Err(DecisionRepositoryError::EvidenceMismatch.into());
+        }
         let encoded = codec::investment_proposal(&decision)?;
         let mut state = self.writer()?;
         let outcome = state.authority.append_investment_proposal(decision)?;
@@ -659,47 +780,149 @@ impl DecisionApplication {
         persist_outcome(&mut state, &encoded, outcome)
     }
 
-    /// Atomically persists one selected-candidate decision, explanation, and publication.
+    /// Reads an exact previously committed generation before resolving expiring input references.
+    ///
+    /// The backend computes the request commitment from the authenticated, decoded request. A
+    /// changed workflow revision/content or request under the same workflow identity conflicts.
+    pub(crate) fn get_generated_investment_analysis(
+        &self,
+        workflow: &InvestmentAnalysisWorkflowReference,
+        request_digest: DecisionContentDigest,
+    ) -> Result<Option<PreparedPublishedInvestmentAnalysis>, DecisionApplicationError> {
+        Ok(self
+            .reader()?
+            .authority
+            .repository()
+            .generated_investment_analysis(workflow, request_digest)?
+            .cloned())
+    }
+
+    /// Reopens a selected candidate and its exact screen/run parents under one reader lock.
+    pub(crate) fn resolve_selected_candidate(
+        &self,
+        candidate_id: &market_squawk_decisions::CandidateId,
+        run_id: &ScreenRunId,
+        expected_digest: DecisionContentDigest,
+    ) -> Result<SelectedCandidateAnalysisEvidence, DecisionApplicationError> {
+        let state = self.reader()?;
+        let repository = state.authority.repository();
+        let (run, candidate) = repository
+            .candidate(candidate_id)
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        if run.id() != run_id {
+            return Err(DecisionRepositoryError::EvidenceMismatch.into());
+        }
+        let screen = repository
+            .screen(run.screen().id(), run.screen().revision())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        let selected = SelectedCandidateAnalysisEvidence::try_new(screen, run, candidate)
+            .map_err(|_| DecisionRepositoryError::EvidenceMismatch)?;
+        if selected.evidence_digest() != expected_digest {
+            return Err(DecisionRepositoryError::EvidenceMismatch.into());
+        }
+        Ok(selected)
+    }
+
+    /// Generates and durably commits the sole complete result for an authenticated exact request.
+    ///
+    /// Production callers resolve source-owned references only after the saved lookup above. The
+    /// writer repeats that lookup before generation, so concurrent identical requests return the
+    /// first committed bundle even when their actual admission times differ. Cancellation fences
+    /// new publication; a committed bundle remains available for acknowledgment recovery.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact evidence, policy, publication identity and request lifetime remain explicit"
+    )]
+    pub(crate) fn generate_published_investment_analysis(
+        &self,
+        evidence: InvestmentAnalysisEvidence,
+        policy: RecommendationPolicy,
+        analytical_profile: AnalyticalProfileBindingReference,
+        workflow: InvestmentAnalysisWorkflowReference,
+        request_provenance: InvestmentAnalysisRequestProvenance,
+        sizing_inputs: Option<market_squawk_decisions::InvestmentSizingInputs>,
+        deadline: Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<PreparedPublishedInvestmentAnalysis, DecisionApplicationError> {
+        let request_digest = request_provenance.request_digest();
+        let mut state = self.writer()?;
+        if let Some(saved) = state
+            .authority
+            .repository()
+            .generated_investment_analysis(&workflow, request_digest)?
+        {
+            return Ok(saved.clone());
+        }
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err(DecisionApplicationError::Unavailable);
+        }
+        let published_at = evidence.admitted_at();
+        let selected_candidate = evidence.selected_candidate().cloned();
+        let decision = InvestmentProposalAuthority::generate(evidence, policy).map_err(|_| {
+            DecisionApplicationError::Repository(DecisionRepositoryError::EvidenceMismatch)
+        })?;
+        let bundle = PreparedPublishedInvestmentAnalysis::try_from_generated_request(
+            decision,
+            selected_candidate,
+            analytical_profile,
+            workflow,
+            request_provenance,
+            published_at,
+        )
+        .map_err(|_| {
+            DecisionApplicationError::Repository(DecisionRepositoryError::EvidenceMismatch)
+        })?;
+        let bundle = match (bundle.decision(), sizing_inputs) {
+            (InvestmentProposalDecision::Generated(_), Some(inputs)) => bundle
+                .try_with_sizing_inputs(inputs)
+                .map_err(|_| DecisionRepositoryError::EvidenceMismatch)?,
+            _ => bundle,
+        };
+        investment_request::validate_request_publication(
+            bundle
+                .request_provenance()
+                .ok_or(DecisionRepositoryError::EvidenceMismatch)?
+                .canonical_request(),
+            &bundle,
+        )
+        .map_err(|_| DecisionRepositoryError::EvidenceMismatch)?;
+        let encoded = codec::prepared_published_investment_analysis(&bundle)?;
+        let staged = state
+            .authority
+            .stage_prepared_published_investment_analysis(bundle.clone())?;
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err(DecisionApplicationError::Unavailable);
+        }
+        persist_prepared_bundle(&mut state, &encoded, staged)?;
+        Ok(bundle)
+    }
+
+    /// Atomically persists one decision, explanation, and publication, with its optional real candidate.
     ///
     /// Domain validation is staged before SQLite commit and installs into memory only after the
     /// single immutable bundle row is durable. A post-commit staging divergence poisons the live
     /// writer; canonical restart recovery then replays the complete row or none of it.
+    /// Current-share projections must retain their authenticated generation request provenance.
     pub fn append_prepared_published_investment_analysis(
         &self,
         bundle: PreparedPublishedInvestmentAnalysis,
     ) -> Result<AppendOutcome, DecisionApplicationError> {
+        if bundle.decision().evidence().current_share_projection().is_some() && bundle.request_provenance().is_none() {
+            return Err(DecisionRepositoryError::EvidenceMismatch.into());
+        }
+        if let Some(provenance) = bundle.request_provenance() {
+            investment_request::validate_request_publication(
+                provenance.canonical_request(),
+                &bundle,
+            )
+            .map_err(|_| DecisionRepositoryError::EvidenceMismatch)?;
+        }
         let encoded = codec::prepared_published_investment_analysis(&bundle)?;
         let mut state = self.writer()?;
         let staged = state
             .authority
             .stage_prepared_published_investment_analysis(bundle)?;
-        let expected = staged.outcome();
-        let persisted = match state.journal.append(&encoded) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                state.poisoned = true;
-                return Err(error);
-            }
-        };
-        if persisted != expected {
-            state.poisoned = true;
-            return Err(DecisionApplicationError::InvalidPersistentState);
-        }
-        let committed = match state
-            .authority
-            .commit_staged_published_investment_analysis(staged)
-        {
-            Ok(outcome) => outcome,
-            Err(_error) => {
-                state.poisoned = true;
-                return Err(DecisionApplicationError::InvalidPersistentState);
-            }
-        };
-        if committed != persisted {
-            state.poisoned = true;
-            return Err(DecisionApplicationError::InvalidPersistentState);
-        }
-        Ok(committed)
+        persist_prepared_bundle(&mut state, &encoded, staged)
     }
 
     /// Persists one deterministic proposal-bound outcome projection sidecar.
@@ -836,11 +1059,15 @@ impl DecisionApplication {
                         .cloned(),
                 )
             });
+        let sizing_price_scale_unavailable = repository
+            .prepared_published_investment_analysis(analysis_id)
+            .is_some_and(|bundle| bundle.sizing_price_scale_unavailable());
         Ok(InvestmentAnalysisRead {
             decision,
             current,
             outcome_projection,
             sizing_projection,
+            sizing_price_scale_unavailable,
         })
     }
 
@@ -1004,7 +1231,7 @@ impl DecisionApplication {
             .state
             .lock()
             .map_err(|_error| DecisionApplicationError::Unavailable)?;
-        if state.poisoned || state.backup_retained {
+        if state.poisoned || state.source_replay_deferred || state.backup_retained {
             Err(DecisionApplicationError::Unavailable)
         } else {
             Ok(state)
@@ -1016,7 +1243,7 @@ impl DecisionApplication {
             .state
             .lock()
             .map_err(|_error| DecisionApplicationError::Unavailable)?;
-        if state.poisoned {
+        if state.poisoned || state.source_replay_deferred {
             Err(DecisionApplicationError::Unavailable)
         } else {
             Ok(state)
@@ -1039,6 +1266,40 @@ fn resolve_screen_job_plan<'a>(
     Ok(plan)
 }
 
+fn persist_prepared_bundle(
+    state: &mut DecisionState,
+    encoded: &EncodedRecord,
+    staged: StagedPublishedInvestmentAnalysisAppend,
+) -> Result<AppendOutcome, DecisionApplicationError> {
+    let expected = staged.outcome();
+    let persisted = match state.journal.append(encoded) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.poisoned = true;
+            return Err(error);
+        }
+    };
+    if persisted != expected {
+        state.poisoned = true;
+        return Err(DecisionApplicationError::InvalidPersistentState);
+    }
+    let committed = match state
+        .authority
+        .commit_staged_published_investment_analysis(staged)
+    {
+        Ok(outcome) => outcome,
+        Err(_error) => {
+            state.poisoned = true;
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+    };
+    if committed != persisted {
+        state.poisoned = true;
+        return Err(DecisionApplicationError::InvalidPersistentState);
+    }
+    Ok(committed)
+}
+
 fn persist_outcome(
     state: &mut DecisionState,
     encoded: &EncodedRecord,
@@ -1054,5 +1315,60 @@ fn persist_outcome(
             state.poisoned = true;
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod source_recovery_tests {
+    use super::*;
+    use std::{num::NonZeroUsize, sync::Arc};
+    use market_squawk_analytics::{FeatureOutputType, StatisticalF64};
+    use market_squawk_decisions::{AsOfSemantics, ComparisonOperator, NullPolicy, RankingDirection,
+        ScreenConstraints, ScreenFeatureBinding, ScreenPredicate, ScreenRanking, ScreenRevision};
+    use market_squawk_domain::{DataQuality, DigestAlgorithm};
+
+    #[test]
+    fn unavailable_source_retains_journal_without_exposing_partial_or_empty_authority()
+        -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = market_squawk_platform::LocalPaths::prepare(directory.path().join("workspace"))?;
+        let location = paths.control_root()?.decision_database_location();
+        let limits = DecisionRepositoryLimits::try_new(4, 4, 4, 4, 4, 4, 4, 4)?;
+        let registry = market_squawk_modeling::ProductionFeatureRegistry::try_new()?;
+        let metadata = registry.feature_registry().entries().find(|entry|
+            entry.is_point_in_time_compatible() && entry.output_type() == FeatureOutputType::StatisticalF64)
+            .ok_or("screen feature")?;
+        let binding = ScreenFeatureBinding::new(metadata.key().clone(), metadata.semantic_digest());
+        let screen = SavedScreen::try_new(
+            ScreenRevision::new(ScreenId::try_new("screen.source-recovery")?, RevisionNumber::new(1)?),
+            DecisionContentDigest::try_new(EvidenceDigest::new(DigestAlgorithm::Sha256, [41;32]))?,
+            AsOfSemantics::AvailableAtOrBeforeCutoff,
+            vec![ScreenPredicate::new(binding.clone(), ComparisonOperator::GreaterThan,
+                StatisticalF64::try_new(0.75)?, NullPolicy::Include)],
+            ScreenRanking::new(binding, RankingDirection::Ascending), NonZeroUsize::MIN,
+            ScreenConstraints::try_new(StatisticalF64::try_new(0.85)?, StatisticalF64::try_new(1200.0)?,
+                vec![DataQuality::OfficialDelayed])?, registry.feature_registry(),
+        )?;
+        let initial = DecisionApplication::open(location.clone(), limits)?;
+        initial.save_screen(None, screen.clone())?;
+        drop(initial);
+        let journal = DecisionJournal::open(location.clone(), limits)?;
+        let mut authority = DecisionAuthority::new(DecisionRepository::try_new(limits)?);
+        let mut recovery = RecoveryContext::try_new(limits.maximum_screen_runs())?;
+        journal.recover(&mut authority, &mut recovery)?;
+        assert!(authority.repository().current_screen(screen.revision().id()).is_some());
+        // Inject the source-unavailable outcome at the recovery/owner boundary. No source seal
+        // is created: even the successfully replayed prefix must not escape this deferred owner.
+        let deferred = Arc::new(DecisionApplication::from_source_recovery(journal, limits, authority, recovery, None)?);
+        assert!(matches!(deferred.list_investment_proposal_index(1), Err(DecisionApplicationError::Unavailable)));
+        assert!(matches!(deferred.get_current_screen(screen.revision().id()), Err(DecisionApplicationError::Unavailable)));
+        assert!(matches!(deferred.save_screen(None, screen.clone()), Err(DecisionApplicationError::Unavailable)));
+        assert!(matches!(deferred.source_recipe_artifacts(), Err(DecisionApplicationError::Unavailable)));
+        assert!(matches!(deferred.retain_backup(), Err(DecisionApplicationError::Unavailable)));
+        assert!(DecisionApplication::open(location.clone(), limits).is_err());
+        drop(deferred);
+        let reopened = DecisionApplication::open(location, limits)?;
+        assert_eq!(reopened.get_current_screen(screen.revision().id())?, screen);
+        Ok(())
     }
 }

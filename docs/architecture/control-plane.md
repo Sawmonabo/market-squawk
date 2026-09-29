@@ -185,7 +185,9 @@ holds the Desktop credential, calls the private application route, applies fixed
 ceilings plus a deadline, and returns redacted typed failures. The WebView never receives the
 service token or direct network authority. Provider setup uses a separate tagged command with
 explicit confirmation and the durable onboarding/activation authorities. The system browser
-receives only an exact code-owned official-provider URL or a validated loopback portal URL.
+receives only exact code-owned official-provider URLs. Setup stays in Settings → Connections;
+private installed-client operations reuse the durable session, saved recipe, and credential owner.
+The provider OAuth callback transport remains scoped to authorization and serves no setup website.
 
 ### MCP request
 

@@ -1,31 +1,55 @@
-//! Evidence-closed, deterministic automatic valuation calculation prerequisites.
+//! Evidence-closed, deterministic automatic valuation calculations.
 //!
 //! This module deliberately stops before fair-value measurement construction. A completed
 //! calculation is research-only: it is not a crate::ValuationMeasurement, classification,
-//! approval, recommendation, position, order, or execution authority. A future serialized adapter
-//! must create a genuine derived crate::ValuationInput before the existing measurement,
+//! approval, recommendation, position, order, or execution authority. The serialized adapter
+//! creates a genuine derived crate::ValuationInput before the existing measurement,
 //! classification, independent-approval, and latest-valid-selection authorities may be used.
 
 use std::num::{NonZeroU32, NonZeroU64};
 
 use market_squawk_data::{
-    CompanySecurityIdentityDisposition, CompanySecurityIdentitySelectionReceipt, ResearchUse,
-    ResearchUseDecisionDigest, ResearchUseGraphDigest, ResearchUsePermit,
+    AuthorizedResearchUse, CompanySecurityIdentityDisposition,
+    CompanySecurityIdentitySelectionReceipt, DatasetManifestRef, FinancialAmountBasis,
+    FinancialAmountRole, ResearchUse, ResearchUseDecisionDigest, ResearchUseGraphDigest,
 };
 use market_squawk_domain::{
-    AccountId, Currency, DigestAlgorithm, EvidenceDigest, IdentifierEntitlement, InstrumentId,
-    Money, RoundingPolicy, Timestamp,
+    AccountId, Currency, DigestAlgorithm, EvidenceDigest, FundamentalCadence, FundamentalPeriod,
+    IdentifierEntitlement, InstrumentId, Money, RoundingPolicy, Timestamp,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use thiserror::Error;
 
 use crate::{
-    ActorId, CanonicalHasher, EvidenceOrigin, EvidenceVerification, InputId,
-    InputInstrumentRelation, ValuationAmount, ValuationAmountBasis, ValuationInput,
+    ActorId, CanonicalHasher, EvidenceOrigin, EvidenceVerification, FinancialModelMacroAssumptions,
+    ForecastValuationValueSelection, InputId, InputInstrumentRelation, ValuationAmount,
+    ValuationAmountBasis, ValuationInput,
 };
+
+mod current_share;
+pub use current_share::CurrentShareValuationProjection;
+
+mod equity_premium;
+pub use equity_premium::{
+    AnnualEquityPremiumArithmetic, EQUITY_PREMIUM_ESTIMATOR, EQUITY_PREMIUM_SAMPLE_YEARS,
+    ModeledGovernmentAnnualReturn,
+};
+mod method_set;
+pub use method_set::{
+    AutomaticValuationAttemptAudit, AutomaticValuationFailure, AutomaticValuationForecastPurpose,
+    AutomaticValuationForecastReadAudit, AutomaticValuationMethodSetAudit,
+    AutomaticValuationRecommendationAudit, AutomaticValuationRecommendationOutcome,
+    AutomaticValuationResultAudit, AutomaticValuationStage, DcfTerminalGrowthAudit,
+    ResidualIncomeTerminalAudit,
+};
+mod terminal;
+pub use terminal::DcfTerminalGrowthPolicy;
+mod residual;
+pub use residual::{ResidualIncomeTerminalConvention, ResidualIncomeTerminalReceipt};
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_METHOD_INPUTS: usize = 512;
+const MAX_INPUT_MANIFESTS: usize = 4096;
 const MAX_ASSUMPTIONS: usize = 128;
 const MAX_DCF_PERIODS: usize = 128;
 const MAX_COMPARABLES: usize = 256;
@@ -162,15 +186,28 @@ impl PointInTimeValuationInput {
         expires_at: Timestamp,
     ) -> Result<Self, AutomaticValuationError> {
         let evidence = input.evidence();
+        let forecast_source = match evidence.origin() {
+            EvidenceOrigin::ForecastDistribution { evidence } => Some(evidence.source()),
+            _ => None,
+        };
+        let publication_ceiling =
+            forecast_source.map_or(knowledge_at, |source| source.reference().selected_at());
         if !valid_sha256(selection_receipt)
             || evidence.verification() != EvidenceVerification::Verified
             || !evidence.producer_verification_is_current_at(knowledge_at)
             || evidence.available_at().is_none()
             || evidence
                 .available_at()
-                .is_some_and(|available_at| available_at > knowledge_at)
-            || evidence.ingested_at() > knowledge_at
+                .is_some_and(|available_at| available_at > publication_ceiling)
+            || evidence.ingested_at() > publication_ceiling
+            || forecast_source.is_some_and(|source| {
+                source.reference().knowledge_at() != knowledge_at
+                    || source.distribution().expires_at() < expires_at
+            })
             || expires_at <= knowledge_at
+            || evidence
+                .automatic_selection_binding()
+                .is_some_and(|binding| binding != (selection_receipt, knowledge_at))
         {
             return Err(AutomaticValuationError::InvalidContract);
         }
@@ -224,6 +261,8 @@ pub enum AutomaticValuationAssumptionKind {
     UncertaintyLower,
     /// Upper uncertainty amount in the calculation output unit.
     UncertaintyUpper,
+    /// Explicit annual perpetual growth of common-equity cash flow after the final forecast year.
+    TerminalGrowth,
 }
 
 /// Evidence-bound, finite-lived, caller-supplied economic assumption.
@@ -327,41 +366,47 @@ impl AutomaticValuationUncertainty {
 /// Single-use local-analysis authority retained until calculation completes.
 #[derive(Debug)]
 pub struct ValuationRightsReceipt {
-    permit: ResearchUsePermit,
-    decision_digest: ResearchUseDecisionDigest,
-    graph_digest: ResearchUseGraphDigest,
-    expires_at: Timestamp,
+    authorization: AuthorizedResearchUse,
 }
 
 impl ValuationRightsReceipt {
-    /// Consumes a catalog-issued permit into this one calculation request.
-    pub fn try_from_permit(permit: ResearchUsePermit) -> Result<Self, AutomaticValuationError> {
-        if permit.research_use() != ResearchUse::LocalAnalysis {
+    /// Retains the catalog-authenticated graph and its single-use calculation authority.
+    pub fn try_from_authorization(
+        authorization: AuthorizedResearchUse,
+    ) -> Result<Self, AutomaticValuationError> {
+        if authorization.research_use() != ResearchUse::LocalAnalysis {
             return Err(AutomaticValuationError::Unavailable(
                 AutomaticValuationUnavailable::Rights,
             ));
         }
-        Ok(Self {
-            decision_digest: permit.decision_digest(),
-            graph_digest: permit.graph_digest(),
-            expires_at: permit.expires_at(),
-            permit,
-        })
+        Ok(Self { authorization })
     }
 
     /// Returns the durable authorization decision identity.
     pub const fn decision_digest(&self) -> ResearchUseDecisionDigest {
-        self.decision_digest
+        self.authorization.decision_digest()
     }
 
     /// Returns the exact transitive source graph identity.
     pub const fn graph_digest(&self) -> ResearchUseGraphDigest {
-        self.graph_digest
+        self.authorization.graph().digest()
     }
 
     /// Returns exclusive permit expiry.
     pub const fn expires_at(&self) -> Timestamp {
-        self.expires_at
+        self.authorization.expires_at()
+    }
+
+    fn admits(&self, input: &ValuationInput) -> bool {
+        let manifests = automatic_input_manifests(input);
+        !manifests.is_empty()
+            && manifests.iter().all(|manifest| {
+                self.authorization
+                    .graph()
+                    .nodes()
+                    .iter()
+                    .any(|node| node.manifest() == manifest)
+            })
     }
 }
 
@@ -408,16 +453,19 @@ pub struct DcfCashFlow {
 /// Complete discounted-cash-flow request.
 #[derive(Debug)]
 pub struct DiscountedCashFlowValuationRequest {
+    /// Exact count of equal financial periods per year; the supplied rate is per such period.
+    /// Annual cash flows and annual rates use one, without assuming a fixed civil-year duration.
+    pub periods_per_year: NonZeroU32,
     /// Shared identity, rights, current-market, unit, and time coordinates.
     pub common: AutomaticValuationInput,
     /// Explicit cash-flow forecast; the calculator performs no forecasting.
     pub cash_flows: Vec<DcfCashFlow>,
-    /// Caller-supplied per-period discount rate.
-    pub discount_rate: AutomaticValuationAssumption,
+    /// Exact annual government reference and independently evidenced equity risk premium.
+    pub macro_assumptions: FinancialModelMacroAssumptions,
     /// One-based terminal period.
     pub terminal_period: NonZeroU32,
-    /// Explicit producer-derived terminal value; no growth rate is inferred.
-    pub terminal_value: PointInTimeValuationInput,
+    /// Genuine next-period common FCFE (N+1); it is not also an explicit flow at N.
+    pub terminal_cash_flow: PointInTimeValuationInput,
     /// Evidence-bound uncertainty bounds.
     pub uncertainty: AutomaticValuationUncertainty,
 }
@@ -452,6 +500,131 @@ pub struct ComparableCompaniesValuationRequest {
     pub uncertainty: AutomaticValuationUncertainty,
 }
 
+/// One checked peer contribution. This arithmetic result grants no source or approval authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComparablePeerArithmetic {
+    multiple: Decimal,
+    weight: Decimal,
+    contribution: Decimal,
+}
+
+impl ComparablePeerArithmetic {
+    /// Exact peer value divided by its selected metric.
+    pub const fn multiple(self) -> Decimal {
+        self.multiple
+    }
+    /// Exact parts-per-million weight represented as a decimal.
+    pub const fn weight(self) -> Decimal {
+        self.weight
+    }
+    /// Exact weighted multiple before final output rounding.
+    pub const fn contribution(self) -> Decimal {
+        self.contribution
+    }
+}
+
+/// Shared comparable-method arithmetic, independent of accounting and study admission clocks.
+///
+/// Callers must authenticate their inputs separately. This value contains no evidence receipt,
+/// historical qualification, or approval and cannot construct an accounting valuation input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComparableValueArithmetic {
+    peers: Box<[ComparablePeerArithmetic]>,
+    weighted_multiple: Decimal,
+    raw_value: Decimal,
+    lower: Decimal,
+    upper: Decimal,
+}
+
+impl ComparableValueArithmetic {
+    /// Evaluates `(peer value, peer metric, weight ppm)` in the supplied deterministic order.
+    pub fn calculate(
+        subject_metric: Decimal,
+        peers: &[(Decimal, Decimal, u32)],
+    ) -> Result<Self, AutomaticValuationError> {
+        if peers.is_empty() || peers.len() > MAX_COMPARABLES {
+            return Err(AutomaticValuationError::Unavailable(
+                AutomaticValuationUnavailable::MethodInput,
+            ));
+        }
+        let mut calculations = reserved_vec(peers.len())?;
+        let mut weighted_multiple = Decimal::ZERO;
+        let mut weight_sum = 0_u32;
+        let mut lower: Option<Decimal> = None;
+        let mut upper: Option<Decimal> = None;
+        for &(value, metric, weight_ppm) in peers {
+            if weight_ppm == 0 || weight_ppm > PROBABILITY_PARTS_PER_MILLION {
+                return Err(AutomaticValuationError::Conflict(
+                    AutomaticValuationConflict::PeerSet,
+                ));
+            }
+            if metric == Decimal::ZERO {
+                return Err(AutomaticValuationError::Unavailable(
+                    AutomaticValuationUnavailable::MethodInput,
+                ));
+            }
+            let weight = probability_decimal(weight_ppm)?;
+            let multiple = value
+                .checked_div(metric)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            let contribution = multiple
+                .checked_mul(weight)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            weighted_multiple = weighted_multiple
+                .checked_add(contribution)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            weight_sum = weight_sum
+                .checked_add(weight_ppm)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            let implied = subject_metric
+                .checked_mul(multiple)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            lower = Some(lower.map_or(implied, |prior| prior.min(implied)));
+            upper = Some(upper.map_or(implied, |prior| prior.max(implied)));
+            calculations.push(ComparablePeerArithmetic {
+                multiple,
+                weight,
+                contribution,
+            });
+        }
+        if weight_sum != PROBABILITY_PARTS_PER_MILLION {
+            return Err(AutomaticValuationError::Conflict(
+                AutomaticValuationConflict::ProbabilityMass,
+            ));
+        }
+        Ok(Self {
+            peers: calculations.into_boxed_slice(),
+            weighted_multiple,
+            raw_value: subject_metric
+                .checked_mul(weighted_multiple)
+                .ok_or(AutomaticValuationError::Arithmetic)?,
+            lower: lower.ok_or(AutomaticValuationError::InvalidContract)?,
+            upper: upper.ok_or(AutomaticValuationError::InvalidContract)?,
+        })
+    }
+
+    /// Original ordered peer arithmetic for retained method intermediates.
+    pub fn peers(&self) -> &[ComparablePeerArithmetic] {
+        &self.peers
+    }
+    /// Exact sum of the peer contributions.
+    pub const fn weighted_multiple(&self) -> Decimal {
+        self.weighted_multiple
+    }
+    /// Exact subject metric multiplied by the weighted peer multiple.
+    pub const fn raw_value(&self) -> Decimal {
+        self.raw_value
+    }
+    /// Smallest observed peer-implied subject value, before outward rounding.
+    pub const fn lower(&self) -> Decimal {
+        self.lower
+    }
+    /// Largest observed peer-implied subject value, before outward rounding.
+    pub const fn upper(&self) -> Decimal {
+        self.upper
+    }
+}
+
 /// One explicitly forecast residual-income period.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResidualIncomePeriod {
@@ -466,14 +639,17 @@ pub struct ResidualIncomePeriod {
 /// Complete residual-income request.
 #[derive(Debug)]
 pub struct ResidualIncomeValuationRequest {
+    /// Exact count of equal financial periods per year; the supplied rate is per such period.
+    /// Annual cash flows and annual rates use one, without assuming a fixed civil-year duration.
+    pub periods_per_year: NonZeroU32,
     /// Shared identity, rights, current-market, unit, and time coordinates.
     pub common: AutomaticValuationInput,
     /// Exact current book value.
     pub current_book_value: PointInTimeValuationInput,
     /// Explicit forecast periods; the calculator performs no forecasting.
     pub periods: Vec<ResidualIncomePeriod>,
-    /// Caller-supplied per-period cost of equity.
-    pub cost_of_equity: AutomaticValuationAssumption,
+    /// Exact annual government reference and independently evidenced equity risk premium.
+    pub macro_assumptions: FinancialModelMacroAssumptions,
     /// Evidence-bound uncertainty bounds.
     pub uncertainty: AutomaticValuationUncertainty,
 }
@@ -541,6 +717,42 @@ pub struct AutomaticValuationIntermediate {
 }
 
 impl AutomaticValuationIntermediate {
+    /// Restores material operands for complete receipt recovery.
+    ///
+    /// This does not admit a calculation. The enclosing receipt must recompute every operand,
+    /// intermediate result, output amount, and canonical identity before accepting this value.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "durable arithmetic operands remain explicit"
+    )]
+    pub(crate) fn try_recover(
+        kind: AutomaticValuationIntermediateKind,
+        sequence: u32,
+        instrument_id: InstrumentId,
+        primary_input: InputId,
+        secondary_input: Option<InputId>,
+        amount: Decimal,
+        adjustment: Decimal,
+        factor: Decimal,
+        result: Decimal,
+        evidence: EvidenceDigest,
+    ) -> Result<Self, AutomaticValuationError> {
+        if sequence == 0 || !valid_sha256(evidence) {
+            return Err(AutomaticValuationError::InvalidContract);
+        }
+        Ok(intermediate(
+            kind,
+            sequence,
+            instrument_id,
+            primary_input,
+            secondary_input,
+            amount,
+            adjustment,
+            factor,
+            result,
+            evidence,
+        ))
+    }
     /// Returns the method-specific calculation role.
     pub const fn kind(&self) -> AutomaticValuationIntermediateKind {
         self.kind
@@ -592,6 +804,27 @@ pub struct AutomaticValuationRange {
 }
 
 impl AutomaticValuationRange {
+    /// Restores an ordered, same-currency, same-scale result in one economic unit.
+    pub fn try_new(
+        lower: ValuationAmount,
+        central: ValuationAmount,
+        upper: ValuationAmount,
+    ) -> Result<Self, AutomaticValuationError> {
+        if [lower, upper].into_iter().any(|amount| {
+            amount.money().currency() != central.money().currency()
+                || amount.basis() != central.basis()
+                || amount.scale() != central.scale()
+        }) || lower.money().amount() > central.money().amount()
+            || central.money().amount() > upper.money().amount()
+        {
+            return Err(AutomaticValuationError::InvalidContract);
+        }
+        Ok(Self {
+            lower,
+            central,
+            upper,
+        })
+    }
     /// Returns the evidence-bound lower value.
     pub const fn lower(self) -> ValuationAmount {
         self.lower
@@ -612,15 +845,21 @@ pub struct AutomaticValuationMethodReceipt {
     id: AutomaticValuationIdentity,
     input_set_id: AutomaticValuationInputSetIdentity,
     method: AutomaticValuationMethod,
+    periods_per_year: Option<NonZeroU32>,
     account_id: AccountId,
     instrument_id: InstrumentId,
     company_security: CompanySecurityIdentitySelectionReceipt,
     peer_identities: Box<[CompanySecurityIdentitySelectionReceipt]>,
     rights_decision: ResearchUseDecisionDigest,
     rights_graph: ResearchUseGraphDigest,
+    rights_expires_at: Timestamp,
+    admitted_input_manifests: Box<[DatasetManifestRef]>,
     current_market_input: InputId,
+    method_base_input: Option<InputId>,
     inputs: Box<[PointInTimeValuationInput]>,
     assumptions: Box<[AutomaticValuationAssumption]>,
+    macro_assumptions: Option<FinancialModelMacroAssumptions>,
+    residual_terminal: Option<ResidualIncomeTerminalReceipt>,
     intermediates: Box<[AutomaticValuationIntermediate]>,
     range: AutomaticValuationRange,
     arithmetic_policy: ValuationArithmeticPolicy,
@@ -633,7 +872,164 @@ pub struct AutomaticValuationMethodReceipt {
     expires_at: Timestamp,
 }
 
+/// Complete untrusted persisted calculation, accepted only after deterministic recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AutomaticValuationRecoveryInput {
+    /// Expected complete calculation commitment.
+    pub expected_id: AutomaticValuationIdentity,
+    /// Expected exact input-set commitment.
+    pub expected_input_set_id: AutomaticValuationInputSetIdentity,
+    /// Closed calculation method.
+    pub method: AutomaticValuationMethod,
+    /// Explicit financial-period frequency for discounting methods.
+    pub periods_per_year: Option<NonZeroU32>,
+    /// Exact reporting account.
+    pub account_id: AccountId,
+    /// Exact valued instrument.
+    pub instrument_id: InstrumentId,
+    /// Full subject identity receipt, decoded by its source authority.
+    pub company_security: CompanySecurityIdentitySelectionReceipt,
+    /// Full ordered peer identity receipts.
+    pub peer_identities: Box<[CompanySecurityIdentitySelectionReceipt]>,
+    /// Original research-use authorization decision.
+    pub rights_decision: ResearchUseDecisionDigest,
+    /// Original transitive source graph.
+    pub rights_graph: ResearchUseGraphDigest,
+    /// Original exclusive authorization expiry.
+    pub rights_expires_at: Timestamp,
+    /// Exact input manifests admitted against the authentic authorization graph.
+    pub admitted_input_manifests: Box<[DatasetManifestRef]>,
+    /// Original selected market input.
+    pub current_market_input: InputId,
+    /// Explicit subject metric or current book value when required.
+    pub method_base_input: Option<InputId>,
+    /// Complete source-authority-decoded input receipts.
+    pub inputs: Box<[PointInTimeValuationInput]>,
+    /// Complete economic and uncertainty assumptions.
+    pub assumptions: Box<[AutomaticValuationAssumption]>,
+    /// Exact source reference and premium consumed by annual discounting methods.
+    pub macro_assumptions: Option<FinancialModelMacroAssumptions>,
+    /// Exact conditional terminal interpretation, required only for residual income.
+    pub residual_terminal: Option<ResidualIncomeTerminalReceipt>,
+    /// Complete method intermediates, still untrusted until recomputed.
+    pub intermediates: Box<[AutomaticValuationIntermediate]>,
+    /// Claimed output amounts, still untrusted until recomputed.
+    pub range: AutomaticValuationRange,
+    /// Exact admitted arithmetic policy.
+    pub arithmetic_policy: ValuationArithmeticPolicy,
+    /// Exact upstream method selector when required.
+    pub method_selection_receipt: Option<EvidenceDigest>,
+    /// Exact forecast-distribution horizon when required.
+    pub forecast_horizon_nanos: Option<NonZeroU64>,
+    /// Exact forecast-distribution terminal instant when required.
+    pub forecast_terminal_at: Option<Timestamp>,
+    /// Original analytical source cutoff.
+    pub measurement_at: Timestamp,
+    /// Original calculation completion.
+    pub calculated_at: Timestamp,
+    /// Original calculation actor.
+    pub calculated_by: ActorId,
+    /// Exclusive result expiry.
+    pub expires_at: Timestamp,
+}
+
 impl AutomaticValuationMethodReceipt {
+    /// Recomputes one persisted receipt without issuing or spending research-use authority.
+    pub(crate) fn try_recover(
+        input: AutomaticValuationRecoveryInput,
+    ) -> Result<Self, AutomaticValuationError> {
+        let value = Self {
+            id: input.expected_id,
+            input_set_id: input.expected_input_set_id,
+            method: input.method,
+            periods_per_year: input.periods_per_year,
+            account_id: input.account_id,
+            instrument_id: input.instrument_id,
+            company_security: input.company_security,
+            peer_identities: input.peer_identities,
+            rights_decision: input.rights_decision,
+            rights_graph: input.rights_graph,
+            rights_expires_at: input.rights_expires_at,
+            admitted_input_manifests: input.admitted_input_manifests,
+            current_market_input: input.current_market_input,
+            method_base_input: input.method_base_input,
+            inputs: input.inputs,
+            assumptions: input.assumptions,
+            macro_assumptions: input.macro_assumptions,
+            residual_terminal: input.residual_terminal,
+            intermediates: input.intermediates,
+            range: input.range,
+            arithmetic_policy: input.arithmetic_policy,
+            method_selection_receipt: input.method_selection_receipt,
+            forecast_horizon_nanos: input.forecast_horizon_nanos,
+            forecast_terminal_at: input.forecast_terminal_at,
+            measurement_at: input.measurement_at,
+            calculated_at: input.calculated_at,
+            calculated_by: input.calculated_by,
+            expires_at: input.expires_at,
+        };
+        verify_recovered_receipt(&value)?;
+        if input_set_identity(&value.inputs)? != value.input_set_id
+            || receipt_identity(&value)? != value.id
+        {
+            return Err(AutomaticValuationError::Conflict(
+                AutomaticValuationConflict::Evidence,
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Exact conditional finite-horizon interpretation and terminal sensitivity.
+    pub const fn residual_terminal(&self) -> Option<&ResidualIncomeTerminalReceipt> {
+        self.residual_terminal.as_ref()
+    }
+
+    /// Charges the complete retained receipt and every dynamic source/identity payload.
+    pub(crate) fn retained_bytes(&self) -> Result<usize, crate::FairValueError> {
+        use std::mem::{size_of, size_of_val};
+        let mut total = crate::checked_add(size_of::<Self>(), self.calculated_by.retained_bytes())?;
+        total = crate::checked_add(
+            total,
+            company_receipt_dynamic_bytes(&self.company_security)?,
+        )?;
+        total = crate::checked_add(total, size_of_val(&*self.peer_identities))?;
+        for peer in &self.peer_identities {
+            total = crate::checked_add(total, company_receipt_dynamic_bytes(peer)?)?;
+        }
+        total = crate::checked_add(total, size_of_val(&*self.admitted_input_manifests))?;
+        for manifest in &self.admitted_input_manifests {
+            total = crate::checked_add(total, crate::evidence::manifest_retained_bytes(manifest)?)?;
+        }
+        total = crate::checked_add(total, size_of_val(&*self.inputs))?;
+        for input in &self.inputs {
+            total = crate::checked_add(
+                total,
+                input
+                    .input()
+                    .retained_bytes()
+                    .checked_sub(size_of::<ValuationInput>())
+                    .ok_or(crate::FairValueError::Arithmetic)?,
+            )?;
+        }
+        total = crate::checked_add(total, size_of_val(&*self.assumptions))?;
+        for assumption in &self.assumptions {
+            total = crate::checked_add(total, assumption.identifier().len())?;
+        }
+        if let Some(binding) = &self.macro_assumptions {
+            total = crate::checked_add(total, binding.premium().identifier().len())?;
+            total = crate::checked_add(total, binding.assumption().identifier().len())?;
+            total = crate::checked_add(
+                total,
+                binding.premium_source_reference().map_or(0, <[u8]>::len),
+            )?;
+            total = crate::checked_add(total, size_of_val(binding.premium_parent_manifests()))?;
+            for manifest in binding.premium_parent_manifests() {
+                total =
+                    crate::checked_add(total, crate::evidence::manifest_retained_bytes(manifest)?)?;
+            }
+        }
+        crate::checked_add(total, size_of_val(&*self.intermediates))
+    }
     /// Returns the complete calculation identity.
     pub const fn id(&self) -> AutomaticValuationIdentity {
         self.id
@@ -645,6 +1041,10 @@ impl AutomaticValuationMethodReceipt {
     /// Returns the exact calculation method.
     pub const fn method(&self) -> AutomaticValuationMethod {
         self.method
+    }
+    /// Returns the model's explicit financial-period frequency, absent for non-discounting methods.
+    pub const fn periods_per_year(&self) -> Option<NonZeroU32> {
+        self.periods_per_year
     }
     /// Returns the exact reporting account.
     pub const fn account_id(&self) -> AccountId {
@@ -670,6 +1070,18 @@ impl AutomaticValuationMethodReceipt {
     pub const fn rights_graph(&self) -> ResearchUseGraphDigest {
         self.rights_graph
     }
+    /// Returns the original exclusive research authorization lifetime.
+    pub const fn rights_expires_at(&self) -> Timestamp {
+        self.rights_expires_at
+    }
+    /// Returns the exact canonical set of input manifests admitted by the source graph.
+    pub fn admitted_input_manifests(&self) -> &[DatasetManifestRef] {
+        &self.admitted_input_manifests
+    }
+    /// Returns the explicit subject metric or opening book input when the method needs one.
+    pub const fn method_base_input(&self) -> Option<InputId> {
+        self.method_base_input
+    }
     /// Returns the exact current-market input identity.
     pub const fn current_market_input(&self) -> InputId {
         self.current_market_input
@@ -681,6 +1093,10 @@ impl AutomaticValuationMethodReceipt {
     /// Returns all explicit economic and uncertainty assumptions.
     pub fn assumptions(&self) -> &[AutomaticValuationAssumption] {
         &self.assumptions
+    }
+    /// Returns the exact retained reference, premium and rate used by a discounting method.
+    pub const fn macro_assumptions(&self) -> Option<&FinancialModelMacroAssumptions> {
+        self.macro_assumptions.as_ref()
     }
     /// Returns every material intermediate calculation in method order.
     pub fn intermediates(&self) -> &[AutomaticValuationIntermediate] {
@@ -734,6 +1150,23 @@ pub struct AutomaticValuationCalculation {
 }
 
 impl AutomaticValuationCalculation {
+    /// Seals the actual completion clock after the bounded calculation has returned.
+    ///
+    /// Source cutoffs stay unchanged. The producer must call this before publication so the
+    /// result never claims to have existed at the earlier request or source-selection time.
+    pub fn completed_at(
+        mut self,
+        completed_at: Timestamp,
+    ) -> Result<Self, AutomaticValuationError> {
+        if completed_at < self.receipt.calculated_at || completed_at >= self.receipt.expires_at {
+            return Err(AutomaticValuationError::InvalidContract);
+        }
+        self.receipt.calculated_at = completed_at;
+        verify_recovered_receipt(&self.receipt)?;
+        self.receipt.id = receipt_identity(&self.receipt)?;
+        Ok(self)
+    }
+
     /// Returns the exact calculated central amount.
     pub const fn amount(&self) -> ValuationAmount {
         self.receipt.range.central
@@ -753,8 +1186,8 @@ pub fn calculate_discounted_cash_flow(
     mut request: DiscountedCashFlowValuationRequest,
 ) -> Result<AutomaticValuationCalculation, AutomaticValuationError> {
     validate_common(&request.common)?;
-    validate_assumption(
-        &request.discount_rate,
+    validate_derived_assumption(
+        request.macro_assumptions.assumption(),
         AutomaticValuationAssumptionKind::DiscountRate,
         &request.common,
     )?;
@@ -770,12 +1203,27 @@ pub fn calculate_discounted_cash_flow(
         ));
     }
     validate_method_input(
-        &request.terminal_value,
+        &request.terminal_cash_flow,
         &request.common,
         request.common.instrument_id,
     )?;
+    let terminal_offset = request
+        .terminal_period
+        .get()
+        .checked_add(1)
+        .ok_or(AutomaticValuationError::Arithmetic)?;
+    let source_anchor = native_financial_input(
+        &request.terminal_cash_flow,
+        FinancialAmountRole::CommonEquityCashFlow,
+        terminal_offset,
+    )?;
+    if source_anchor.identity != request.common.company_security.receipt_digest()
+        || request.periods_per_year != NonZeroU32::MIN
+    {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
     let discount_base = Decimal::ONE
-        .checked_add(request.discount_rate.value())
+        .checked_add(request.macro_assumptions.assumption().value())
         .ok_or(AutomaticValuationError::Arithmetic)?;
     if discount_base <= Decimal::ZERO {
         return Err(AutomaticValuationError::InvalidContract);
@@ -799,8 +1247,10 @@ pub fn calculate_discounted_cash_flow(
     let mut raw_value = Decimal::ZERO;
     let mut inputs = reserved_vec(method_capacity)?;
     let mut intermediates = reserved_vec(method_capacity)?;
-    for value in request.cash_flows {
-        if value.period > request.terminal_period {
+    for (index, value) in request.cash_flows.into_iter().enumerate() {
+        if usize::try_from(value.period.get()).ok() != index.checked_add(1)
+            || value.period > request.terminal_period
+        {
             return Err(AutomaticValuationError::InvalidContract);
         }
         validate_method_input(
@@ -808,6 +1258,16 @@ pub fn calculate_discounted_cash_flow(
             &request.common,
             request.common.instrument_id,
         )?;
+        if native_financial_input(
+            &value.cash_flow,
+            FinancialAmountRole::CommonEquityCashFlow,
+            value.period.get(),
+        )? != source_anchor
+        {
+            return Err(AutomaticValuationError::Conflict(
+                AutomaticValuationConflict::Evidence,
+            ));
+        }
         let amount = input_decimal(&value.cash_flow);
         let (divisor, present_value) = discount(amount, discount_base, value.period)?;
         raw_value = raw_value
@@ -823,13 +1283,35 @@ pub fn calculate_discounted_cash_flow(
             Decimal::ZERO,
             divisor,
             present_value,
-            request.discount_rate.evidence(),
+            request.macro_assumptions.assumption().evidence(),
         ));
         inputs.push(value.cash_flow);
     }
-    let terminal_amount = input_decimal(&request.terminal_value);
-    let (terminal_divisor, terminal_present_value) =
-        discount(terminal_amount, discount_base, request.terminal_period)?;
+    if intermediates.last().map(|step| step.sequence) != Some(request.terminal_period.get()) {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    let growth = DcfTerminalGrowthPolicy::from_inputs(
+        inputs
+            .last()
+            .ok_or(AutomaticValuationError::InvalidContract)?,
+        &request.terminal_cash_flow,
+        request.terminal_period,
+        &request.macro_assumptions,
+        request.common.calculated_at,
+        request.common.expires_at,
+    )?;
+    validate_derived_assumption(
+        growth.assumption(),
+        AutomaticValuationAssumptionKind::TerminalGrowth,
+        &request.common,
+    )?;
+    let terminal_amount = input_decimal(&request.terminal_cash_flow);
+    let (terminal_divisor, terminal_present_value) = terminal_fcfe_discount(
+        terminal_amount,
+        request.macro_assumptions.assumption().value(),
+        growth.assumption().value(),
+        request.terminal_period,
+    )?;
     raw_value = raw_value
         .checked_add(terminal_present_value)
         .ok_or(AutomaticValuationError::Arithmetic)?;
@@ -837,20 +1319,26 @@ pub fn calculate_discounted_cash_flow(
         AutomaticValuationIntermediateKind::DiscountedTerminalValue,
         request.terminal_period.get(),
         request.common.instrument_id,
-        request.terminal_value.input().id(),
-        None,
+        request.terminal_cash_flow.input().id(),
+        Some(growth.final_explicit_input()),
         terminal_amount,
-        Decimal::ZERO,
+        growth.assumption().value(),
         terminal_divisor,
         terminal_present_value,
-        request.discount_rate.evidence(),
+        request.macro_assumptions.assumption().evidence(),
     ));
-    inputs.push(request.terminal_value);
+    inputs.push(request.terminal_cash_flow);
 
-    let assumptions = single_vec(request.discount_rate)?;
+    let mut assumptions = reserved_vec(2)?;
+    assumptions.push(request.macro_assumptions.assumption().clone());
+    assumptions.push(growth.assumption().clone());
     finish(FinishInput {
         common: request.common,
         method: AutomaticValuationMethod::DiscountedCashFlow,
+        macro_assumptions: Some(request.macro_assumptions),
+        residual_terminal: None,
+        periods_per_year: Some(request.periods_per_year),
+        method_base_input: None,
         raw_value,
         uncertainty: request.uncertainty,
         assumptions,
@@ -902,8 +1390,16 @@ pub fn calculate_comparable_companies(
     let intermediate_capacity = comparable_count
         .checked_add(1)
         .ok_or(AutomaticValuationError::Arithmetic)?;
-    let mut weighted_multiple = Decimal::ZERO;
-    let mut weight_sum = 0_u32;
+    let mut arithmetic_inputs = reserved_vec(comparable_count)?;
+    for comparable in &request.comparables {
+        arithmetic_inputs.push((
+            input_decimal(&comparable.value),
+            input_decimal(&comparable.metric),
+            comparable.weight_ppm,
+        ));
+    }
+    let subject_metric = input_decimal(&request.subject_metric);
+    let arithmetic = ComparableValueArithmetic::calculate(subject_metric, &arithmetic_inputs)?;
     let mut inputs = reserved_vec(input_capacity)?;
     let mut assumptions = reserved_vec(comparable_count)?;
     let mut intermediates = reserved_vec(intermediate_capacity)?;
@@ -921,44 +1417,26 @@ pub fn calculate_comparable_companies(
             comparable.instrument_id,
         )?;
         validate_method_input(&comparable.value, &request.common, comparable.instrument_id)?;
-        validate_assumption(
+        validate_derived_assumption(
             &comparable.weight_assumption,
             AutomaticValuationAssumptionKind::ComparableWeight,
             &request.common,
         )?;
-        if comparable.instrument_id == request.common.instrument_id
-            || comparable.weight_ppm == 0
-            || comparable.weight_ppm > PROBABILITY_PARTS_PER_MILLION
-        {
+        if comparable.instrument_id == request.common.instrument_id {
             return Err(AutomaticValuationError::Conflict(
                 AutomaticValuationConflict::PeerSet,
             ));
         }
-        let weight = probability_decimal(comparable.weight_ppm)?;
+        let peer_arithmetic = arithmetic.peers()[index];
+        let weight = peer_arithmetic.weight();
         if comparable.weight_assumption.value() != weight {
             return Err(AutomaticValuationError::Conflict(
                 AutomaticValuationConflict::Evidence,
             ));
         }
-        let metric = input_decimal(&comparable.metric);
-        if metric == Decimal::ZERO {
-            return Err(AutomaticValuationError::Unavailable(
-                AutomaticValuationUnavailable::MethodInput,
-            ));
-        }
         let peer_value = input_decimal(&comparable.value);
-        let multiple = peer_value
-            .checked_div(metric)
-            .ok_or(AutomaticValuationError::Arithmetic)?;
-        let contribution = multiple
-            .checked_mul(weight)
-            .ok_or(AutomaticValuationError::Arithmetic)?;
-        weighted_multiple = weighted_multiple
-            .checked_add(contribution)
-            .ok_or(AutomaticValuationError::Arithmetic)?;
-        weight_sum = weight_sum
-            .checked_add(comparable.weight_ppm)
-            .ok_or(AutomaticValuationError::Arithmetic)?;
+        let multiple = peer_arithmetic.multiple();
+        let contribution = peer_arithmetic.contribution();
         intermediates.push(intermediate(
             AutomaticValuationIntermediateKind::WeightedComparableMultiple,
             u32::try_from(
@@ -981,15 +1459,8 @@ pub fn calculate_comparable_companies(
         assumptions.push(comparable.weight_assumption);
         peer_identities.push(comparable.company_security);
     }
-    if weight_sum != PROBABILITY_PARTS_PER_MILLION {
-        return Err(AutomaticValuationError::Conflict(
-            AutomaticValuationConflict::ProbabilityMass,
-        ));
-    }
-    let subject_metric = input_decimal(&request.subject_metric);
-    let raw_value = subject_metric
-        .checked_mul(weighted_multiple)
-        .ok_or(AutomaticValuationError::Arithmetic)?;
+    let weighted_multiple = arithmetic.weighted_multiple();
+    let raw_value = arithmetic.raw_value();
     intermediates.push(intermediate(
         AutomaticValuationIntermediateKind::ComparableSubjectValue,
         u32::try_from(
@@ -1008,11 +1479,16 @@ pub fn calculate_comparable_companies(
         raw_value,
         request.common.company_security.receipt_digest(),
     ));
+    let method_base_input = Some(request.subject_metric.input().id());
     inputs.push(request.subject_metric);
 
     finish(FinishInput {
         common: request.common,
         method: AutomaticValuationMethod::ComparableCompanies,
+        macro_assumptions: None,
+        residual_terminal: None,
+        periods_per_year: None,
+        method_base_input,
         raw_value,
         uncertainty: request.uncertainty,
         assumptions,
@@ -1035,8 +1511,18 @@ pub fn calculate_residual_income(
         &request.common,
         request.common.instrument_id,
     )?;
-    validate_assumption(
-        &request.cost_of_equity,
+    let source_anchor = native_financial_input(
+        &request.current_book_value,
+        FinancialAmountRole::CommonBookEquity,
+        0,
+    )?;
+    if source_anchor.identity != request.common.company_security.receipt_digest()
+        || request.periods_per_year != NonZeroU32::MIN
+    {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    validate_derived_assumption(
+        request.macro_assumptions.assumption(),
         AutomaticValuationAssumptionKind::CostOfEquity,
         &request.common,
     )?;
@@ -1049,7 +1535,7 @@ pub fn calculate_residual_income(
         ));
     }
     let discount_base = Decimal::ONE
-        .checked_add(request.cost_of_equity.value())
+        .checked_add(request.macro_assumptions.assumption().value())
         .ok_or(AutomaticValuationError::Arithmetic)?;
     if discount_base <= Decimal::ZERO {
         return Err(AutomaticValuationError::InvalidContract);
@@ -1065,6 +1551,17 @@ pub fn calculate_residual_income(
         ));
     }
 
+    let final_period = request
+        .periods
+        .last()
+        .ok_or(AutomaticValuationError::InvalidContract)?;
+    let residual_terminal = ResidualIncomeTerminalReceipt::from_inputs(
+        &request.current_book_value,
+        &final_period.net_income,
+        &final_period.opening_book_value,
+        final_period.period,
+        request.macro_assumptions.assumption(),
+    )?;
     let period_count = request.periods.len();
     let input_capacity = period_count
         .checked_mul(2)
@@ -1073,7 +1570,15 @@ pub fn calculate_residual_income(
     let mut raw_value = input_decimal(&request.current_book_value);
     let mut inputs = reserved_vec(input_capacity)?;
     let mut intermediates = reserved_vec(period_count)?;
-    for period in request.periods {
+    for (index, period) in request.periods.into_iter().enumerate() {
+        if usize::try_from(period.period.get()).ok() != index.checked_add(1) {
+            return Err(AutomaticValuationError::InvalidContract);
+        }
+        if usize::try_from(period.period.get()).map_err(|_| AutomaticValuationError::Arithmetic)?
+            > request.common.arithmetic_policy.maximum_periods()
+        {
+            return Err(AutomaticValuationError::InvalidContract);
+        }
         validate_method_input(
             &period.net_income,
             &request.common,
@@ -1084,9 +1589,33 @@ pub fn calculate_residual_income(
             &request.common,
             request.common.instrument_id,
         )?;
+        let income_anchor = native_financial_input(
+            &period.net_income,
+            FinancialAmountRole::CommonNetIncome,
+            period.period.get(),
+        )?;
+        let opening_anchor = native_financial_input(
+            &period.opening_book_value,
+            FinancialAmountRole::CommonBookEquity,
+            period
+                .period
+                .get()
+                .checked_sub(1)
+                .ok_or(AutomaticValuationError::Arithmetic)?,
+        )?;
+        if income_anchor != source_anchor
+            || opening_anchor != source_anchor
+            || (period.period.get() == 1
+                && period.opening_book_value.input().id()
+                    != request.current_book_value.input().id())
+        {
+            return Err(AutomaticValuationError::Conflict(
+                AutomaticValuationConflict::Evidence,
+            ));
+        }
         let net_income = input_decimal(&period.net_income);
         let equity_charge = input_decimal(&period.opening_book_value)
-            .checked_mul(request.cost_of_equity.value())
+            .checked_mul(request.macro_assumptions.assumption().value())
             .ok_or(AutomaticValuationError::Arithmetic)?;
         let residual_income = net_income
             .checked_sub(equity_charge)
@@ -1105,17 +1634,22 @@ pub fn calculate_residual_income(
             equity_charge,
             divisor,
             present_value,
-            request.cost_of_equity.evidence(),
+            request.macro_assumptions.assumption().evidence(),
         ));
         inputs.push(period.net_income);
         inputs.push(period.opening_book_value);
     }
+    let method_base_input = Some(request.current_book_value.input().id());
     inputs.push(request.current_book_value);
 
-    let assumptions = single_vec(request.cost_of_equity)?;
+    let assumptions = single_vec(request.macro_assumptions.assumption().clone())?;
     finish(FinishInput {
         common: request.common,
         method: AutomaticValuationMethod::ResidualIncome,
+        macro_assumptions: Some(request.macro_assumptions),
+        residual_terminal: Some(residual_terminal),
+        periods_per_year: Some(request.periods_per_year),
+        method_base_input,
         raw_value,
         uncertainty: request.uncertainty,
         assumptions,
@@ -1126,6 +1660,107 @@ pub fn calculate_residual_income(
         forecast_horizon_nanos: None,
         forecast_terminal_at: None,
     })
+}
+
+/// One probability-weighted outcome, without source or valuation admission authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForecastOutcomeArithmetic {
+    probability: Decimal,
+    contribution: Decimal,
+}
+
+impl ForecastOutcomeArithmetic {
+    /// Exact normalized probability of this outcome.
+    pub const fn probability(self) -> Decimal {
+        self.probability
+    }
+    /// Terminal amount multiplied by its probability.
+    pub const fn contribution(self) -> Decimal {
+        self.contribution
+    }
+}
+
+/// Shared expectation arithmetic for live and study forecast valuations.
+///
+/// This numeric result authenticates no input, source, historical basis, or approval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForecastValueArithmetic {
+    outcomes: Box<[ForecastOutcomeArithmetic]>,
+    raw_value: Decimal,
+    lower: Decimal,
+    upper: Decimal,
+}
+
+impl ForecastValueArithmetic {
+    /// Evaluates positive terminal amounts and exact parts-per-million masses in input order.
+    pub fn calculate(points: &[(Decimal, u32)]) -> Result<Self, AutomaticValuationError> {
+        if points.is_empty() || points.len() > MAX_FORECAST_POINTS {
+            return Err(AutomaticValuationError::Unavailable(
+                AutomaticValuationUnavailable::MethodInput,
+            ));
+        }
+        let mut outcomes = reserved_vec(points.len())?;
+        let mut raw_value = Decimal::ZERO;
+        let mut mass = 0_u32;
+        let mut lower: Option<Decimal> = None;
+        let mut upper: Option<Decimal> = None;
+        for &(amount, probability_ppm) in points {
+            if amount <= Decimal::ZERO {
+                return Err(AutomaticValuationError::Unavailable(
+                    AutomaticValuationUnavailable::MethodInput,
+                ));
+            }
+            if probability_ppm == 0 || probability_ppm > PROBABILITY_PARTS_PER_MILLION {
+                return Err(AutomaticValuationError::Conflict(
+                    AutomaticValuationConflict::ProbabilityMass,
+                ));
+            }
+            let probability = probability_decimal(probability_ppm)?;
+            let contribution = amount
+                .checked_mul(probability)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            raw_value = raw_value
+                .checked_add(contribution)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            mass = mass
+                .checked_add(probability_ppm)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            lower = Some(lower.map_or(amount, |prior| prior.min(amount)));
+            upper = Some(upper.map_or(amount, |prior| prior.max(amount)));
+            outcomes.push(ForecastOutcomeArithmetic {
+                probability,
+                contribution,
+            });
+        }
+        if mass != PROBABILITY_PARTS_PER_MILLION {
+            return Err(AutomaticValuationError::Conflict(
+                AutomaticValuationConflict::ProbabilityMass,
+            ));
+        }
+        Ok(Self {
+            outcomes: outcomes.into_boxed_slice(),
+            raw_value,
+            lower: lower.ok_or(AutomaticValuationError::InvalidContract)?,
+            upper: upper.ok_or(AutomaticValuationError::InvalidContract)?,
+        })
+    }
+
+    /// Probability and contribution of each input in its original order.
+    pub fn outcomes(&self) -> &[ForecastOutcomeArithmetic] {
+        &self.outcomes
+    }
+    /// Exact probability-weighted terminal expectation, before final rounding.
+    pub const fn raw_value(&self) -> Decimal {
+        self.raw_value
+    }
+    /// Smallest support amount, before outward rounding.
+    pub const fn lower(&self) -> Decimal {
+        self.lower
+    }
+    /// Largest support amount, before outward rounding.
+    pub const fn upper(&self) -> Decimal {
+        self.upper
+    }
 }
 
 /// Calculates an expectation from explicit terminal values and exact probability mass.
@@ -1167,8 +1802,14 @@ pub fn calculate_forecast_distribution(
     }
 
     let point_count = request.points.len();
-    let mut raw_value = Decimal::ZERO;
-    let mut total_probability = 0_u32;
+    let mut arithmetic_inputs = reserved_vec(point_count)?;
+    arithmetic_inputs.extend(
+        request
+            .points
+            .iter()
+            .map(|point| (input_decimal(&point.terminal_value), point.probability_ppm)),
+    );
+    let arithmetic = ForecastValueArithmetic::calculate(&arithmetic_inputs)?;
     let mut inputs = reserved_vec(point_count)?;
     let mut assumptions = reserved_vec(point_count)?;
     let mut intermediates = reserved_vec(point_count)?;
@@ -1185,35 +1826,48 @@ pub fn calculate_forecast_distribution(
             &request.common,
             request.common.instrument_id,
         )?;
-        validate_assumption(
-            &point.probability_assumption,
-            AutomaticValuationAssumptionKind::ForecastProbability,
-            &request.common,
-        )?;
-        if point.probability_ppm == 0
-            || point.probability_ppm > PROBABILITY_PARTS_PER_MILLION
-            || point.probability_assumption.identifier() != &*point.point_id
+        let EvidenceOrigin::ForecastDistribution { evidence } =
+            point.terminal_value.input().evidence().origin()
+        else {
+            return Err(AutomaticValuationError::Unavailable(
+                AutomaticValuationUnavailable::MethodInput,
+            ));
+        };
+        let source = evidence.source();
+        let native = source
+            .distribution()
+            .points()
+            .get(
+                evidence
+                    .ordinal()
+                    .ok_or(AutomaticValuationError::InvalidContract)?,
+            )
+            .ok_or(AutomaticValuationError::InvalidContract)?;
+        if source.reference().identity() != request.forecast_selection_receipt
+            || source.distribution().points().len() != point_count
+            || native.probability_ppm().get() != point.probability_ppm
+            || point.probability_assumption.kind()
+                != AutomaticValuationAssumptionKind::ForecastProbability
+            || point.probability_assumption.evidence() != source.reference().identity()
+            || point.probability_assumption.available_at() != source.distribution().published_at()
+            || point.probability_assumption.available_at() > request.common.calculated_at
+            || point.probability_assumption.expires_at() < request.common.expires_at
         {
+            return Err(AutomaticValuationError::InvalidContract);
+        }
+        if point.probability_assumption.identifier() != &*point.point_id {
             return Err(AutomaticValuationError::Conflict(
                 AutomaticValuationConflict::ProbabilityMass,
             ));
         }
-        let probability = probability_decimal(point.probability_ppm)?;
+        let outcome = arithmetic.outcomes()[index];
+        let probability = outcome.probability();
         if point.probability_assumption.value() != probability {
             return Err(AutomaticValuationError::Conflict(
                 AutomaticValuationConflict::Evidence,
             ));
         }
         let terminal_value = input_decimal(&point.terminal_value);
-        let contribution = terminal_value
-            .checked_mul(probability)
-            .ok_or(AutomaticValuationError::Arithmetic)?;
-        raw_value = raw_value
-            .checked_add(contribution)
-            .ok_or(AutomaticValuationError::Arithmetic)?;
-        total_probability = total_probability
-            .checked_add(point.probability_ppm)
-            .ok_or(AutomaticValuationError::Arithmetic)?;
         intermediates.push(intermediate(
             AutomaticValuationIntermediateKind::ProbabilityWeightedForecast,
             u32::try_from(
@@ -1228,22 +1882,20 @@ pub fn calculate_forecast_distribution(
             terminal_value,
             Decimal::ZERO,
             probability,
-            contribution,
+            outcome.contribution(),
             point.probability_assumption.evidence(),
         ));
         inputs.push(point.terminal_value);
         assumptions.push(point.probability_assumption);
     }
-    if total_probability != PROBABILITY_PARTS_PER_MILLION {
-        return Err(AutomaticValuationError::Conflict(
-            AutomaticValuationConflict::ProbabilityMass,
-        ));
-    }
-
     finish(FinishInput {
         common: request.common,
         method: AutomaticValuationMethod::ForecastDistribution,
-        raw_value,
+        macro_assumptions: None,
+        residual_terminal: None,
+        periods_per_year: None,
+        method_base_input: None,
+        raw_value: arithmetic.raw_value(),
         uncertainty: request.uncertainty,
         assumptions,
         inputs,
@@ -1256,9 +1908,13 @@ pub fn calculate_forecast_distribution(
 }
 
 struct FinishInput {
+    macro_assumptions: Option<FinancialModelMacroAssumptions>,
+    residual_terminal: Option<ResidualIncomeTerminalReceipt>,
     common: AutomaticValuationInput,
     method: AutomaticValuationMethod,
+    periods_per_year: Option<NonZeroU32>,
     raw_value: Decimal,
+    method_base_input: Option<InputId>,
     uncertainty: AutomaticValuationUncertainty,
     assumptions: Vec<AutomaticValuationAssumption>,
     inputs: Vec<PointInTimeValuationInput>,
@@ -1272,16 +1928,6 @@ struct FinishInput {
 fn finish(
     mut request: FinishInput,
 ) -> Result<AutomaticValuationCalculation, AutomaticValuationError> {
-    validate_assumption(
-        request.uncertainty.lower(),
-        AutomaticValuationAssumptionKind::UncertaintyLower,
-        &request.common,
-    )?;
-    validate_assumption(
-        request.uncertainty.upper(),
-        AutomaticValuationAssumptionKind::UncertaintyUpper,
-        &request.common,
-    )?;
     if request
         .assumptions
         .len()
@@ -1294,6 +1940,18 @@ fn finish(
             .is_none_or(|value| value > MAX_METHOD_INPUTS)
     {
         return Err(AutomaticValuationError::InvalidContract);
+    }
+    if request.method != AutomaticValuationMethod::ForecastDistribution {
+        validate_derived_assumption(
+            request.uncertainty.lower(),
+            AutomaticValuationAssumptionKind::UncertaintyLower,
+            &request.common,
+        )?;
+        validate_derived_assumption(
+            request.uncertainty.upper(),
+            AutomaticValuationAssumptionKind::UncertaintyUpper,
+            &request.common,
+        )?;
     }
     request
         .assumptions
@@ -1359,91 +2017,873 @@ fn finish(
 
     let rights_decision = request.common.rights.decision_digest();
     let rights_graph = request.common.rights.graph_digest();
-    let _consumed_single_use_permit = request.common.rights.permit;
+    let rights_expires_at = request.common.rights.expires_at();
+    if request
+        .inputs
+        .iter()
+        .any(|selected| !request.common.rights.admits(selected.input()))
+    {
+        return Err(AutomaticValuationError::Unavailable(
+            AutomaticValuationUnavailable::Rights,
+        ));
+    }
+    if request.macro_assumptions.as_ref().is_some_and(|binding| {
+        binding.premium_source_reference().is_none()
+            || binding.premium_parent_manifests().iter().any(|manifest| {
+                !request
+                    .common
+                    .rights
+                    .authorization
+                    .graph()
+                    .nodes()
+                    .iter()
+                    .any(|node| node.manifest() == manifest)
+            })
+    }) {
+        return Err(AutomaticValuationError::Unavailable(
+            AutomaticValuationUnavailable::Rights,
+        ));
+    }
+    let admitted_input_manifests =
+        exact_input_manifests(&request.inputs, request.macro_assumptions.as_ref())?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+    let _consumed_single_use_permit = request.common.rights.authorization.into_permit();
+
+    let mut receipt = AutomaticValuationMethodReceipt {
+        id: AutomaticValuationIdentity([0; 32]),
+        input_set_id,
+        method: request.method,
+        periods_per_year: request.periods_per_year,
+        account_id: request.common.account_id,
+        instrument_id: request.common.instrument_id,
+        company_security: request.common.company_security,
+        peer_identities: request.peer_identities.into_boxed_slice(),
+        rights_decision,
+        rights_graph,
+        rights_expires_at,
+        admitted_input_manifests,
+        current_market_input,
+        method_base_input: request.method_base_input,
+        inputs: request.inputs.into_boxed_slice(),
+        assumptions: request.assumptions.into_boxed_slice(),
+        macro_assumptions: request.macro_assumptions,
+        residual_terminal: request.residual_terminal,
+        intermediates: request.intermediates.into_boxed_slice(),
+        range,
+        arithmetic_policy: request.common.arithmetic_policy,
+        method_selection_receipt: request.method_selection_receipt,
+        forecast_horizon_nanos: request.forecast_horizon_nanos,
+        forecast_terminal_at: request.forecast_terminal_at,
+        measurement_at: request.common.measurement_at,
+        calculated_at: request.common.calculated_at,
+        calculated_by: request.common.calculated_by,
+        expires_at: request.common.expires_at,
+    };
+    verify_recovered_receipt(&receipt)?;
+    receipt.id = receipt_identity(&receipt)?;
+    Ok(AutomaticValuationCalculation { receipt })
+}
+
+fn receipt_identity(
+    receipt: &AutomaticValuationMethodReceipt,
+) -> Result<AutomaticValuationIdentity, AutomaticValuationError> {
     let mut hash = CanonicalHasher::new(b"market-squawk/automatic-valuation-calculation/v1");
-    hash.u8(method_tag(request.method));
-    hash.bytes(request.common.account_id.as_uuid().as_bytes());
-    hash.bytes(request.common.instrument_id.as_uuid().as_bytes());
-    hash.fixed(request.common.company_security.receipt_digest().bytes());
-    hash.fixed(rights_decision.bytes());
-    hash.fixed(rights_graph.bytes());
-    hash.fixed(current_market_input.bytes());
-    hash.fixed(input_set_id.bytes());
-    central.hash_into(&mut hash);
-    range.lower.hash_into(&mut hash);
-    range.upper.hash_into(&mut hash);
-    hash.u8(rounding_tag(request.common.arithmetic_policy.rounding()));
+    hash.u8(method_tag(receipt.method));
+    match receipt.periods_per_year {
+        Some(value) => {
+            hash.u8(1);
+            hash.u32(value.get());
+        }
+        None => hash.u8(0),
+    }
+    hash.bytes(receipt.account_id.as_uuid().as_bytes());
+    hash.bytes(receipt.instrument_id.as_uuid().as_bytes());
+    hash.fixed(receipt.company_security.receipt_digest().bytes());
+    hash.fixed(receipt.rights_decision.bytes());
+    hash.fixed(receipt.rights_graph.bytes());
+    hash.i64(receipt.rights_expires_at.unix_nanos());
     hash.u64(
-        u64::try_from(request.common.arithmetic_policy.maximum_periods())
+        u64::try_from(receipt.admitted_input_manifests.len())
+            .map_err(|_| AutomaticValuationError::Arithmetic)?,
+    );
+    for manifest in &receipt.admitted_input_manifests {
+        crate::evidence::hash_manifest(&mut hash, manifest);
+    }
+    hash.fixed(receipt.current_market_input.bytes());
+    match receipt.method_base_input {
+        Some(id) => {
+            hash.u8(1);
+            hash.fixed(id.bytes());
+        }
+        None => hash.u8(0),
+    }
+    match &receipt.residual_terminal {
+        Some(condition) => {
+            hash.u8(1);
+            hash.fixed(condition.identity().bytes());
+        }
+        None => hash.u8(0),
+    }
+    hash.fixed(receipt.input_set_id.bytes());
+    receipt.range.central.hash_into(&mut hash);
+    receipt.range.lower.hash_into(&mut hash);
+    receipt.range.upper.hash_into(&mut hash);
+    hash.u8(rounding_tag(receipt.arithmetic_policy.rounding()));
+    hash.u64(
+        u64::try_from(receipt.arithmetic_policy.maximum_periods())
             .map_err(|_| AutomaticValuationError::Arithmetic)?,
     );
     hash.u64(
-        u64::try_from(request.peer_identities.len())
+        u64::try_from(receipt.peer_identities.len())
             .map_err(|_| AutomaticValuationError::Arithmetic)?,
     );
-    for receipt in &request.peer_identities {
+    for receipt in &receipt.peer_identities {
         hash.fixed(receipt.receipt_digest().bytes());
     }
     hash.u64(
-        u64::try_from(request.assumptions.len())
+        u64::try_from(receipt.assumptions.len())
             .map_err(|_| AutomaticValuationError::Arithmetic)?,
     );
-    for assumption in &request.assumptions {
+    for assumption in &receipt.assumptions {
         hash_assumption(&mut hash, assumption);
     }
+    if let Some(binding) = &receipt.macro_assumptions {
+        hash.bytes(b"annual-government-reference-and-premium/v1");
+        let reference = binding.reference();
+        hash.u8(match reference.maturity() {
+            crate::MacroRateMaturity::TenYear => 1,
+            crate::MacroRateMaturity::ThirtyYear => 2,
+        });
+        hash.bytes(&reference.annual_yield_percent().mantissa().to_be_bytes());
+        hash.u32(reference.annual_yield_percent().scale());
+        hash.fixed(reference.context_identity().bytes());
+        hash.fixed(reference.evidence_identity().bytes());
+        hash.i64(reference.knowledge_cutoff().unix_nanos());
+        hash.bytes(&reference.effective_date_cutoff().year().to_be_bytes());
+        hash.u8(reference.effective_date_cutoff().month());
+        hash.u8(reference.effective_date_cutoff().day());
+        hash.i64(reference.available_at().unix_nanos());
+        hash.i64(reference.expires_at().unix_nanos());
+        hash_assumption(&mut hash, binding.premium());
+        hash_assumption(&mut hash, binding.assumption());
+        match binding.premium_source_reference() {
+            Some(bytes) => {
+                hash.u8(1);
+                hash.bytes(bytes);
+            }
+            None => hash.u8(0),
+        }
+        hash.u64(
+            u64::try_from(binding.premium_parent_manifests().len())
+                .map_err(|_| AutomaticValuationError::Arithmetic)?,
+        );
+        for manifest in binding.premium_parent_manifests() {
+            crate::evidence::hash_manifest(&mut hash, manifest);
+        }
+    }
     hash.u64(
-        u64::try_from(request.intermediates.len())
+        u64::try_from(receipt.intermediates.len())
             .map_err(|_| AutomaticValuationError::Arithmetic)?,
     );
-    for value in &request.intermediates {
+    for value in &receipt.intermediates {
         hash_intermediate(&mut hash, value);
     }
-    hash_optional_digest(&mut hash, request.method_selection_receipt);
-    match request.forecast_horizon_nanos {
+    hash_optional_digest(&mut hash, receipt.method_selection_receipt);
+    match receipt.forecast_horizon_nanos {
         Some(value) => {
             hash.u8(1);
             hash.u64(value.get());
         }
         None => hash.u8(0),
     }
-    match request.forecast_terminal_at {
+    match receipt.forecast_terminal_at {
         Some(value) => {
             hash.u8(1);
             hash.i64(value.unix_nanos());
         }
         None => hash.u8(0),
     }
-    hash.i64(request.common.measurement_at.unix_nanos());
-    hash.i64(request.common.calculated_at.unix_nanos());
-    hash.bytes(request.common.calculated_by.as_str().as_bytes());
-    hash.i64(request.common.expires_at.unix_nanos());
+    hash.i64(receipt.measurement_at.unix_nanos());
+    hash.i64(receipt.calculated_at.unix_nanos());
+    hash.bytes(receipt.calculated_by.as_str().as_bytes());
+    hash.i64(receipt.expires_at.unix_nanos());
 
-    Ok(AutomaticValuationCalculation {
-        receipt: AutomaticValuationMethodReceipt {
-            id: AutomaticValuationIdentity(hash.finish()),
-            input_set_id,
-            method: request.method,
-            account_id: request.common.account_id,
-            instrument_id: request.common.instrument_id,
-            company_security: request.common.company_security,
-            peer_identities: request.peer_identities.into_boxed_slice(),
-            rights_decision,
-            rights_graph,
-            current_market_input,
-            inputs: request.inputs.into_boxed_slice(),
-            assumptions: request.assumptions.into_boxed_slice(),
-            intermediates: request.intermediates.into_boxed_slice(),
-            range,
-            arithmetic_policy: request.common.arithmetic_policy,
-            method_selection_receipt: request.method_selection_receipt,
-            forecast_horizon_nanos: request.forecast_horizon_nanos,
-            forecast_terminal_at: request.forecast_terminal_at,
-            measurement_at: request.common.measurement_at,
-            calculated_at: request.common.calculated_at,
-            calculated_by: request.common.calculated_by,
-            expires_at: request.common.expires_at,
-        },
-    })
+    Ok(AutomaticValuationIdentity(hash.finish()))
+}
+
+fn company_receipt_dynamic_bytes(
+    receipt: &CompanySecurityIdentitySelectionReceipt,
+) -> Result<usize, crate::FairValueError> {
+    use std::mem::size_of_val;
+    let mut total = crate::checked_add(
+        size_of_val(receipt.ordered_candidates()),
+        size_of_val(receipt.ordered_exclusions()),
+    )?;
+    for entry in receipt
+        .ordered_candidates()
+        .iter()
+        .chain(receipt.ordered_exclusions().iter().map(|(entry, _)| entry))
+    {
+        for length in [
+            entry.company_source_id().as_str().len(),
+            entry.provider_company_id().as_str().len(),
+            entry.rights_policy_id().as_str().len(),
+            entry.rights_terms_reference().as_str().len(),
+        ] {
+            total = crate::checked_add(total, length)?;
+        }
+    }
+    Ok(total)
+}
+
+fn recovered_input(
+    receipt: &AutomaticValuationMethodReceipt,
+    id: InputId,
+) -> Result<&PointInTimeValuationInput, AutomaticValuationError> {
+    receipt
+        .inputs
+        .binary_search_by_key(&id, |value| value.input().id())
+        .ok()
+        .and_then(|index| receipt.inputs.get(index))
+        .ok_or(AutomaticValuationError::InvalidContract)
+}
+
+fn recovered_assumption(
+    receipt: &AutomaticValuationMethodReceipt,
+    kind: AutomaticValuationAssumptionKind,
+) -> Result<&AutomaticValuationAssumption, AutomaticValuationError> {
+    let mut matches = receipt
+        .assumptions
+        .iter()
+        .filter(|value| value.kind() == kind);
+    let value = matches
+        .next()
+        .ok_or(AutomaticValuationError::InvalidContract)?;
+    if matches.next().is_some() {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    Ok(value)
+}
+
+fn verify_recovered_receipt(
+    receipt: &AutomaticValuationMethodReceipt,
+) -> Result<(), AutomaticValuationError> {
+    let invalid = AutomaticValuationError::InvalidContract;
+    if receipt.inputs.is_empty()
+        || receipt.inputs.len() > MAX_METHOD_INPUTS
+        || receipt.admitted_input_manifests.is_empty()
+        || receipt.admitted_input_manifests.len() > MAX_INPUT_MANIFESTS
+        || receipt.assumptions.len() < 3
+        || receipt.assumptions.len() > MAX_ASSUMPTIONS
+        || receipt.intermediates.is_empty()
+        || receipt.intermediates.len() > MAX_FORECAST_POINTS
+        || receipt.peer_identities.len() > MAX_COMPARABLES
+        || receipt.calculated_at < receipt.measurement_at
+        || receipt.expires_at <= receipt.calculated_at
+        || receipt.rights_expires_at < receipt.expires_at
+        || receipt.rights_decision.bytes() == [0; 32]
+        || receipt.rights_graph.bytes() == [0; 32]
+        || receipt
+            .inputs
+            .windows(2)
+            .any(|pair| pair[0].input().id() >= pair[1].input().id())
+        || receipt.assumptions.windows(2).any(|pair| {
+            (pair[0].kind(), pair[0].identifier()) >= (pair[1].kind(), pair[1].identifier())
+        })
+    {
+        return Err(invalid);
+    }
+    residual::verify_residual_terminal(receipt)?;
+    if !exact_input_manifests(&receipt.inputs, receipt.macro_assumptions.as_ref())?
+        .into_iter()
+        .eq(receipt.admitted_input_manifests.iter())
+    {
+        return Err(AutomaticValuationError::Conflict(
+            AutomaticValuationConflict::Evidence,
+        ));
+    }
+    validate_company_security(
+        &receipt.company_security,
+        receipt.instrument_id,
+        receipt.measurement_at,
+        receipt.expires_at,
+    )?;
+    let market = recovered_input(receipt, receipt.current_market_input)?;
+    if market.knowledge_at() < receipt.measurement_at
+        || market.knowledge_at() > receipt.calculated_at
+        || market.input().subject_instrument_id() != receipt.instrument_id
+        || market.input().reference_instrument_id() != receipt.instrument_id
+        || market.input().relationship() != InputInstrumentRelation::Identical
+        || market.input().amount().basis() != ValuationAmountBasis::PerInstrumentUnit
+        || !is_published_market_input(market)
+        || market
+            .input()
+            .evidence()
+            .source_timestamp()
+            .is_none_or(|time| time > market.knowledge_at())
+        || market
+            .input()
+            .market_access_assessment()
+            .is_some_and(|value| value.account_id() != receipt.account_id)
+    {
+        return Err(invalid);
+    }
+    for selected in &receipt.inputs {
+        let input = selected.input();
+        let expected_cutoff = if is_published_market_input(selected) {
+            market.knowledge_at()
+        } else {
+            receipt.measurement_at
+        };
+        if selected.knowledge_at() != expected_cutoff
+            || selected.expires_at() < receipt.expires_at
+            || selected.rights_graph() != receipt.rights_graph
+            || !derived_input_completed_by(input, receipt.calculated_at)
+            || !input
+                .evidence()
+                .producer_verification_is_current_at(selected.knowledge_at())
+            || input.amount().money().currency() != receipt.range.central.money().currency()
+            || input.relationship() != InputInstrumentRelation::Identical
+            || input.subject_instrument_id() != input.reference_instrument_id()
+            || (input.id() != receipt.current_market_input
+                && input.amount().basis() != receipt.range.central.basis())
+            || (input.id() != receipt.current_market_input
+                && Some(input.id()) != receipt.method_base_input
+                && !receipt.intermediates.iter().any(|step| {
+                    step.primary_input == input.id() || step.secondary_input == Some(input.id())
+                }))
+        {
+            return Err(invalid);
+        }
+    }
+    let lower = recovered_assumption(receipt, AutomaticValuationAssumptionKind::UncertaintyLower)?;
+    let upper = recovered_assumption(receipt, AutomaticValuationAssumptionKind::UncertaintyUpper)?;
+    if lower.value() != receipt.range.lower.money().amount()
+        || upper.value() != receipt.range.upper.money().amount()
+    {
+        return Err(invalid);
+    }
+    for assumption in &receipt.assumptions {
+        let ceiling = receipt.calculated_at;
+        if assumption.available_at() > ceiling || assumption.expires_at() < receipt.expires_at {
+            return Err(invalid);
+        }
+    }
+    if receipt.method != AutomaticValuationMethod::ComparableCompanies
+        && !receipt.peer_identities.is_empty()
+    {
+        return Err(invalid);
+    }
+    if receipt.method != AutomaticValuationMethod::ForecastDistribution
+        && (receipt.method_selection_receipt.is_some()
+            || receipt.forecast_horizon_nanos.is_some()
+            || receipt.forecast_terminal_at.is_some())
+    {
+        return Err(invalid);
+    }
+    match (receipt.method, receipt.macro_assumptions.as_ref()) {
+        (
+            AutomaticValuationMethod::DiscountedCashFlow | AutomaticValuationMethod::ResidualIncome,
+            Some(binding),
+        ) => {
+            let kind = if receipt.method == AutomaticValuationMethod::DiscountedCashFlow {
+                AutomaticValuationAssumptionKind::DiscountRate
+            } else {
+                AutomaticValuationAssumptionKind::CostOfEquity
+            };
+            let recovered = binding.revalidated()?;
+            if recovered != *binding
+                || binding.premium_source_reference().is_none()
+                || receipt.periods_per_year != Some(NonZeroU32::MIN)
+                || receipt.range.central.money().currency().as_str() != "USD"
+                || binding.reference().knowledge_cutoff() > receipt.measurement_at
+                || recovered_assumption(receipt, kind)? != binding.assumption()
+            {
+                return Err(invalid);
+            }
+        }
+        (
+            AutomaticValuationMethod::ComparableCompanies
+            | AutomaticValuationMethod::ForecastDistribution,
+            None,
+        ) => {}
+        _ => return Err(invalid),
+    }
+    let raw_value = match receipt.method {
+        AutomaticValuationMethod::DiscountedCashFlow | AutomaticValuationMethod::ResidualIncome => {
+            verify_recovered_discounting(receipt)?
+        }
+        AutomaticValuationMethod::ComparableCompanies => verify_recovered_comparables(receipt)?,
+        AutomaticValuationMethod::ForecastDistribution => verify_recovered_distribution(receipt)?,
+    };
+    let rounded = round(
+        raw_value,
+        receipt.range.central.scale(),
+        receipt.arithmetic_policy.rounding(),
+    );
+    if rounded != receipt.range.central.money().amount() {
+        return Err(AutomaticValuationError::Conflict(
+            AutomaticValuationConflict::Evidence,
+        ));
+    }
+    Ok(())
+}
+
+fn verify_recovered_discounting(
+    receipt: &AutomaticValuationMethodReceipt,
+) -> Result<Decimal, AutomaticValuationError> {
+    let invalid = AutomaticValuationError::InvalidContract;
+    let dcf = receipt.method == AutomaticValuationMethod::DiscountedCashFlow;
+    let role = if dcf {
+        AutomaticValuationAssumptionKind::DiscountRate
+    } else {
+        AutomaticValuationAssumptionKind::CostOfEquity
+    };
+    if receipt.periods_per_year != Some(NonZeroU32::MIN)
+        || receipt.assumptions.len() != if dcf { 4 } else { 3 }
+    {
+        return Err(invalid);
+    }
+    let terminal_policy = receipt.terminal_growth_policy()?;
+    let rate = recovered_assumption(receipt, role)?;
+    let base = Decimal::ONE
+        .checked_add(rate.value())
+        .ok_or(AutomaticValuationError::Arithmetic)?;
+    if base <= Decimal::ZERO {
+        return Err(invalid);
+    }
+    let residual_anchor = if dcf {
+        let terminal = receipt.intermediates.last().ok_or(invalid)?;
+        let source = recovered_input(receipt, terminal.primary_input)?;
+        let anchor = native_financial_input(
+            source,
+            FinancialAmountRole::CommonEquityCashFlow,
+            terminal.sequence.checked_add(1).ok_or(invalid)?,
+        )?;
+        if anchor.identity != receipt.company_security.receipt_digest() {
+            return Err(invalid);
+        }
+        Some(anchor)
+    } else {
+        let current = recovered_input(receipt, receipt.method_base_input.ok_or(invalid)?)?;
+        let anchor = native_financial_input(current, FinancialAmountRole::CommonBookEquity, 0)?;
+        if anchor.identity != receipt.company_security.receipt_digest()
+            || receipt.periods_per_year != Some(NonZeroU32::MIN)
+        {
+            return Err(invalid);
+        }
+        Some(anchor)
+    };
+    let mut total = if dcf {
+        if receipt.method_base_input.is_some()
+            || receipt.intermediates.len() < 2
+            || receipt.intermediates.len() - 1
+                > MAX_DCF_PERIODS.min(receipt.arithmetic_policy.maximum_periods())
+        {
+            return Err(invalid);
+        }
+        Decimal::ZERO
+    } else {
+        if receipt.intermediates.len()
+            > MAX_RESIDUAL_PERIODS.min(receipt.arithmetic_policy.maximum_periods())
+        {
+            return Err(invalid);
+        }
+        let value = recovered_input(receipt, receipt.method_base_input.ok_or(invalid)?)?;
+        if value.input().subject_instrument_id() != receipt.instrument_id {
+            return Err(invalid);
+        }
+        input_decimal(value)
+    };
+    let terminal_sequence = if dcf {
+        receipt.intermediates.last().ok_or(invalid)?.sequence
+    } else {
+        0
+    };
+    let mut previous = 0;
+    for (index, step) in receipt.intermediates.iter().enumerate() {
+        let terminal = dcf && index + 1 == receipt.intermediates.len();
+        let kind = if terminal {
+            AutomaticValuationIntermediateKind::DiscountedTerminalValue
+        } else if dcf {
+            AutomaticValuationIntermediateKind::DiscountedCashFlow
+        } else {
+            AutomaticValuationIntermediateKind::DiscountedResidualIncome
+        };
+        if step.kind != kind
+            || step.instrument_id != receipt.instrument_id
+            || step.sequence == 0
+            || usize::try_from(step.sequence).map_err(|_| invalid)?
+                > receipt.arithmetic_policy.maximum_periods()
+            || (!terminal && step.sequence <= previous)
+            || (!terminal && usize::try_from(step.sequence).ok() != index.checked_add(1))
+            || (dcf && step.sequence > terminal_sequence)
+        {
+            return Err(invalid);
+        }
+        if !terminal {
+            previous = step.sequence;
+        }
+        let primary = recovered_input(receipt, step.primary_input)?;
+        if primary.input().subject_instrument_id() != receipt.instrument_id
+            || primary.input().amount().basis() != receipt.range.central.basis()
+        {
+            return Err(invalid);
+        }
+        let amount = input_decimal(primary);
+        let adjustment = if dcf {
+            if (!terminal && step.secondary_input.is_some())
+                || (terminal
+                    && step.secondary_input
+                        != terminal_policy
+                            .as_ref()
+                            .map(DcfTerminalGrowthPolicy::final_explicit_input))
+            {
+                return Err(invalid);
+            }
+            let offset = step
+                .sequence
+                .checked_add(u32::from(terminal))
+                .ok_or(invalid)?;
+            if Some(native_financial_input(
+                primary,
+                FinancialAmountRole::CommonEquityCashFlow,
+                offset,
+            )?) != residual_anchor
+            {
+                return Err(invalid);
+            }
+            if terminal {
+                terminal_policy
+                    .as_ref()
+                    .ok_or(invalid)?
+                    .assumption()
+                    .value()
+            } else {
+                Decimal::ZERO
+            }
+        } else {
+            let opening = recovered_input(receipt, step.secondary_input.ok_or(invalid)?)?;
+            if opening.input().subject_instrument_id() != receipt.instrument_id
+                || opening.input().amount().basis() != receipt.range.central.basis()
+            {
+                return Err(invalid);
+            }
+            let income_anchor = native_financial_input(
+                primary,
+                FinancialAmountRole::CommonNetIncome,
+                step.sequence,
+            )?;
+            let opening_anchor = native_financial_input(
+                opening,
+                FinancialAmountRole::CommonBookEquity,
+                step.sequence.checked_sub(1).ok_or(invalid)?,
+            )?;
+            if Some(income_anchor) != residual_anchor
+                || Some(opening_anchor) != residual_anchor
+                || (step.sequence == 1 && Some(opening.input().id()) != receipt.method_base_input)
+            {
+                return Err(invalid);
+            }
+            input_decimal(opening)
+                .checked_mul(rate.value())
+                .ok_or(AutomaticValuationError::Arithmetic)?
+        };
+        let period = NonZeroU32::new(step.sequence).ok_or(invalid)?;
+        let (factor, result) = if terminal {
+            if previous != step.sequence {
+                return Err(invalid);
+            }
+            terminal_fcfe_discount(amount, rate.value(), adjustment, period)?
+        } else {
+            let discounted = amount
+                .checked_sub(adjustment)
+                .ok_or(AutomaticValuationError::Arithmetic)?;
+            discount(discounted, base, period)?
+        };
+        let expected = intermediate(
+            kind,
+            step.sequence,
+            receipt.instrument_id,
+            step.primary_input,
+            step.secondary_input,
+            amount,
+            adjustment,
+            factor,
+            result,
+            rate.evidence(),
+        );
+        if &expected != step {
+            return Err(invalid);
+        }
+        total = total
+            .checked_add(result)
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+    }
+    Ok(total)
+}
+
+fn verify_recovered_comparables(
+    receipt: &AutomaticValuationMethodReceipt,
+) -> Result<Decimal, AutomaticValuationError> {
+    let invalid = AutomaticValuationError::InvalidContract;
+    let count = receipt.peer_identities.len();
+    if receipt.periods_per_year.is_some()
+        || count == 0
+        || receipt.intermediates.len() != count + 1
+        || receipt.assumptions.len() != count + 2
+        || receipt.assumptions[..count]
+            .iter()
+            .any(|value| value.kind() != AutomaticValuationAssumptionKind::ComparableWeight)
+    {
+        return Err(invalid);
+    }
+    let subject = recovered_input(receipt, receipt.method_base_input.ok_or(invalid)?)?;
+    if subject.input().subject_instrument_id() != receipt.instrument_id
+        || subject.input().amount().basis() != receipt.range.central.basis()
+    {
+        return Err(invalid);
+    }
+    let mut multiple_sum = Decimal::ZERO;
+    let mut weight_sum = 0_u32;
+    let mut previous = None;
+    for (index, identity) in receipt.peer_identities.iter().enumerate() {
+        let step = &receipt.intermediates[index];
+        validate_company_security(
+            identity,
+            step.instrument_id,
+            receipt.measurement_at,
+            receipt.expires_at,
+        )?;
+        if step.instrument_id == receipt.instrument_id
+            || previous.is_some_and(|id| id >= step.instrument_id)
+            || step.kind != AutomaticValuationIntermediateKind::WeightedComparableMultiple
+            || step.sequence != u32::try_from(index + 1).map_err(|_| invalid)?
+        {
+            return Err(invalid);
+        }
+        previous = Some(step.instrument_id);
+        let numerator = recovered_input(receipt, step.primary_input)?;
+        let denominator = recovered_input(receipt, step.secondary_input.ok_or(invalid)?)?;
+        if [numerator, denominator].into_iter().any(|value| {
+            value.input().subject_instrument_id() != step.instrument_id
+                || value.input().amount().basis() != receipt.range.central.basis()
+        }) || input_decimal(denominator).is_zero()
+        {
+            return Err(invalid);
+        }
+        let weight = exact_probability_ppm(step.factor)?;
+        if !receipt.assumptions[..count]
+            .iter()
+            .any(|value| value.evidence() == step.evidence && value.value() == step.factor)
+        {
+            return Err(invalid);
+        }
+        let amount = input_decimal(numerator);
+        let multiple = amount
+            .checked_div(input_decimal(denominator))
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+        let contribution = multiple
+            .checked_mul(step.factor)
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+        let expected = intermediate(
+            step.kind,
+            step.sequence,
+            step.instrument_id,
+            step.primary_input,
+            step.secondary_input,
+            amount,
+            multiple,
+            step.factor,
+            contribution,
+            step.evidence,
+        );
+        if &expected != step {
+            return Err(invalid);
+        }
+        weight_sum = weight_sum
+            .checked_add(weight)
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+        multiple_sum = multiple_sum
+            .checked_add(contribution)
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+    }
+    if weight_sum != PROBABILITY_PARTS_PER_MILLION {
+        return Err(invalid);
+    }
+    let amount = input_decimal(subject);
+    let raw = amount
+        .checked_mul(multiple_sum)
+        .ok_or(AutomaticValuationError::Arithmetic)?;
+    let expected = intermediate(
+        AutomaticValuationIntermediateKind::ComparableSubjectValue,
+        u32::try_from(count + 1).map_err(|_| invalid)?,
+        receipt.instrument_id,
+        subject.input().id(),
+        None,
+        amount,
+        multiple_sum,
+        Decimal::ONE,
+        raw,
+        receipt.company_security.receipt_digest(),
+    );
+    if receipt.intermediates.last() != Some(&expected) {
+        return Err(invalid);
+    }
+    Ok(raw)
+}
+
+fn verify_recovered_distribution(
+    receipt: &AutomaticValuationMethodReceipt,
+) -> Result<Decimal, AutomaticValuationError> {
+    let invalid = AutomaticValuationError::InvalidContract;
+    let count = receipt.intermediates.len();
+    let horizon = receipt.forecast_horizon_nanos.ok_or(invalid)?;
+    let terminal = receipt
+        .measurement_at
+        .checked_add_nanos(i64::try_from(horizon.get()).map_err(|_| invalid)?)
+        .map_err(|_| AutomaticValuationError::Arithmetic)?;
+    if receipt.periods_per_year.is_some()
+        || receipt.method_base_input.is_some()
+        || receipt.forecast_terminal_at != Some(terminal)
+        || !receipt.method_selection_receipt.is_some_and(valid_sha256)
+        || count > MAX_FORECAST_POINTS.min(receipt.arithmetic_policy.maximum_periods())
+        || receipt.assumptions.len() != count + 2
+    {
+        return Err(invalid);
+    }
+    let mut total = Decimal::ZERO;
+    let mut probability_sum = 0_u32;
+    let mut ordinals = Vec::with_capacity(count);
+    let first = recovered_input(
+        receipt,
+        receipt.intermediates.first().ok_or(invalid)?.primary_input,
+    )?;
+    let EvidenceOrigin::ForecastDistribution {
+        evidence: first_evidence,
+    } = first.input().evidence().origin()
+    else {
+        return Err(invalid);
+    };
+    let source = first_evidence.source();
+    if source.distribution().points().len() != count
+        || Some(source.reference().identity()) != receipt.method_selection_receipt
+        || source.distribution().target_at() != Some(terminal)
+    {
+        return Err(invalid);
+    }
+    for (index, step) in receipt.intermediates.iter().enumerate() {
+        let assumption = &receipt.assumptions[index];
+        let value = recovered_input(receipt, step.primary_input)?;
+        if assumption.kind() != AutomaticValuationAssumptionKind::ForecastProbability
+            || step.kind != AutomaticValuationIntermediateKind::ProbabilityWeightedForecast
+            || step.sequence != u32::try_from(index + 1).map_err(|_| invalid)?
+            || step.instrument_id != receipt.instrument_id
+            || step.secondary_input.is_some()
+            || value.input().subject_instrument_id() != receipt.instrument_id
+            || value.input().amount().basis() != receipt.range.central.basis()
+            || value.input().evidence().effective_at() != Some(terminal)
+        {
+            return Err(invalid);
+        }
+        let probability = exact_probability_ppm(assumption.value())?;
+        let EvidenceOrigin::ForecastDistribution { evidence } = value.input().evidence().origin()
+        else {
+            return Err(invalid);
+        };
+        let native = source
+            .distribution()
+            .points()
+            .get(
+                evidence
+                    .ordinal()
+                    .ok_or(AutomaticValuationError::InvalidContract)?,
+            )
+            .ok_or(invalid)?;
+        if evidence.source().reference() != source.reference()
+            || native.probability_ppm().get() != probability
+            || assumption.evidence() != source.reference().identity()
+            || assumption.available_at() != source.distribution().published_at()
+        {
+            return Err(invalid);
+        }
+        ordinals.push(evidence.ordinal().ok_or(invalid)?);
+        let amount = input_decimal(value);
+        let result = amount
+            .checked_mul(assumption.value())
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+        let expected = intermediate(
+            step.kind,
+            step.sequence,
+            step.instrument_id,
+            step.primary_input,
+            None,
+            amount,
+            Decimal::ZERO,
+            assumption.value(),
+            result,
+            assumption.evidence(),
+        );
+        if &expected != step {
+            return Err(invalid);
+        }
+        probability_sum = probability_sum
+            .checked_add(probability)
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+        total = total
+            .checked_add(result)
+            .ok_or(AutomaticValuationError::Arithmetic)?;
+    }
+    if probability_sum != PROBABILITY_PARTS_PER_MILLION {
+        return Err(invalid);
+    }
+    ordinals.sort_unstable();
+    if ordinals.iter().copied().ne(0..count) {
+        return Err(invalid);
+    }
+    let lower = recovered_assumption(receipt, AutomaticValuationAssumptionKind::UncertaintyLower)?;
+    let upper = recovered_assumption(receipt, AutomaticValuationAssumptionKind::UncertaintyUpper)?;
+    let scale = u32::from(receipt.range.central.scale());
+    for (assumption, ordinal, rounding) in [
+        (lower, 0, RoundingStrategy::ToNegativeInfinity),
+        (upper, count - 1, RoundingStrategy::ToPositiveInfinity),
+    ] {
+        let expected = source
+            .amount(ordinal)
+            .map_err(|_| invalid)?
+            .money()
+            .amount()
+            .round_dp_with_strategy(scale, rounding);
+        if assumption.value() != expected
+            || assumption.evidence() != source.reference().identity()
+            || assumption.available_at() != source.distribution().published_at()
+        {
+            return Err(invalid);
+        }
+    }
+    Ok(total)
+}
+
+fn exact_probability_ppm(value: Decimal) -> Result<u32, AutomaticValuationError> {
+    let scaled = value
+        .checked_mul(Decimal::from(PROBABILITY_PARTS_PER_MILLION))
+        .ok_or(AutomaticValuationError::Arithmetic)?
+        .normalize();
+    if scaled.scale() != 0 {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    let result =
+        u32::try_from(scaled.mantissa()).map_err(|_| AutomaticValuationError::InvalidContract)?;
+    if result == 0
+        || result > PROBABILITY_PARTS_PER_MILLION
+        || probability_decimal(result)? != value
+    {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    Ok(result)
 }
 
 fn validate_common(common: &AutomaticValuationInput) -> Result<(), AutomaticValuationError> {
@@ -1466,7 +2906,13 @@ fn validate_common(common: &AutomaticValuationInput) -> Result<(), AutomaticValu
     }
     let market = &common.current_market;
     let input = market.input();
-    if market.knowledge_at() != common.measurement_at
+    if !common.rights.admits(input) {
+        return Err(AutomaticValuationError::Unavailable(
+            AutomaticValuationUnavailable::Rights,
+        ));
+    }
+    if market.knowledge_at() < common.measurement_at
+        || market.knowledge_at() > common.calculated_at
         || market.expires_at() < common.expires_at
         || market.rights_graph() != common.rights.graph_digest()
         || input.subject_instrument_id() != common.instrument_id
@@ -1474,14 +2920,14 @@ fn validate_common(common: &AutomaticValuationInput) -> Result<(), AutomaticValu
         || input.relationship() != InputInstrumentRelation::Identical
         || input.amount().money().currency() != common.currency
         || input.amount().basis() != ValuationAmountBasis::PerInstrumentUnit
-        || !matches!(input.evidence().origin(), EvidenceOrigin::Market { .. })
+        || !is_published_market_input(market)
         || !input
             .evidence()
-            .producer_verification_is_current_at(common.measurement_at)
+            .producer_verification_is_current_at(market.knowledge_at())
         || input
             .evidence()
             .source_timestamp()
-            .is_none_or(|value| value > common.measurement_at)
+            .is_none_or(|value| value > market.knowledge_at())
     {
         return Err(AutomaticValuationError::Unavailable(
             AutomaticValuationUnavailable::CurrentMarket,
@@ -1496,6 +2942,95 @@ fn validate_common(common: &AutomaticValuationInput) -> Result<(), AutomaticValu
         ));
     }
     Ok(())
+}
+
+fn is_published_market_input(selected: &PointInTimeValuationInput) -> bool {
+    let evidence = selected.input().evidence();
+    matches!(
+        evidence.origin(),
+        EvidenceOrigin::Market {
+            publication: Some(_),
+            ..
+        } | EvidenceOrigin::PublishedMarket { .. }
+    ) && evidence.automatic_selection_binding()
+        == Some((selected.selection_receipt(), selected.knowledge_at()))
+}
+
+fn automatic_input_manifests(input: &ValuationInput) -> &[DatasetManifestRef] {
+    match input.evidence().origin() {
+        EvidenceOrigin::Market {
+            publication: Some(publication),
+            ..
+        } => std::slice::from_ref(publication.manifest()),
+        EvidenceOrigin::PublishedMarket { evidence } => std::slice::from_ref(evidence.manifest()),
+        EvidenceOrigin::Research { manifest, .. }
+        | EvidenceOrigin::Analytics { manifest, .. }
+        | EvidenceOrigin::Fundamental { manifest, .. } => std::slice::from_ref(manifest),
+        EvidenceOrigin::ForecastDistribution { evidence } => {
+            evidence.source().reference().parent_manifests()
+        }
+        EvidenceOrigin::Market {
+            publication: None, ..
+        }
+        | EvidenceOrigin::Portfolio { .. }
+        | EvidenceOrigin::AutomaticValuation { .. } => &[],
+    }
+}
+
+fn exact_input_manifests<'a>(
+    inputs: &'a [PointInTimeValuationInput],
+    macro_assumptions: Option<&'a FinancialModelMacroAssumptions>,
+) -> Result<Vec<&'a DatasetManifestRef>, AutomaticValuationError> {
+    if inputs.is_empty() || inputs.len() > MAX_METHOD_INPUTS {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    let mut manifests = Vec::new();
+    manifests
+        .try_reserve_exact(inputs.len())
+        .map_err(|_| AutomaticValuationError::Arithmetic)?;
+    for input in inputs {
+        let source_manifests = automatic_input_manifests(input.input());
+        if source_manifests.is_empty() {
+            return Err(AutomaticValuationError::Unavailable(
+                AutomaticValuationUnavailable::Rights,
+            ));
+        }
+        for manifest in source_manifests {
+            if manifests.contains(&manifest) {
+                continue;
+            }
+            if manifests.len() >= MAX_INPUT_MANIFESTS {
+                return Err(AutomaticValuationError::InvalidContract);
+            }
+            manifests
+                .try_reserve(1)
+                .map_err(|_| AutomaticValuationError::Arithmetic)?;
+            manifests.push(manifest);
+        }
+    }
+    if let Some(binding) = macro_assumptions {
+        for manifest in binding.premium_parent_manifests() {
+            if !manifests.contains(&manifest) {
+                if manifests.len() == MAX_INPUT_MANIFESTS {
+                    return Err(AutomaticValuationError::InvalidContract);
+                }
+                manifests
+                    .try_reserve_exact(1)
+                    .map_err(|_| AutomaticValuationError::Arithmetic)?;
+                manifests.push(manifest);
+            }
+        }
+    }
+    manifests.sort_by(|left, right| {
+        left.dataset_id()
+            .as_str()
+            .cmp(right.dataset_id().as_str())
+            .then_with(|| left.manifest_version().cmp(&right.manifest_version()))
+            .then_with(|| left.schema().cmp(right.schema()))
+            .then_with(|| left.content_hash().cmp(&right.content_hash()))
+    });
+    manifests.dedup();
+    Ok(manifests)
 }
 
 fn validate_company_security(
@@ -1582,20 +3117,31 @@ fn validate_method_input(
     common: &AutomaticValuationInput,
     instrument_id: InstrumentId,
 ) -> Result<(), AutomaticValuationError> {
-    if value.knowledge_at() != common.measurement_at || value.expires_at() < common.expires_at {
+    let expected_cutoff = if is_published_market_input(value) {
+        common.current_market.knowledge_at()
+    } else {
+        common.measurement_at
+    };
+    if value.knowledge_at() != expected_cutoff || value.expires_at() < common.expires_at {
         return Err(AutomaticValuationError::Unavailable(
             AutomaticValuationUnavailable::MethodInput,
         ));
     }
-    if value.rights_graph() != common.rights.graph_digest() {
+    if value.rights_graph() != common.rights.graph_digest() || !common.rights.admits(value.input())
+    {
         return Err(AutomaticValuationError::Unavailable(
             AutomaticValuationUnavailable::Rights,
         ));
     }
     let input = value.input();
+    if !derived_input_completed_by(input, common.calculated_at) {
+        return Err(AutomaticValuationError::Unavailable(
+            AutomaticValuationUnavailable::MethodInput,
+        ));
+    }
     if !input
         .evidence()
-        .producer_verification_is_current_at(common.measurement_at)
+        .producer_verification_is_current_at(value.knowledge_at())
     {
         return Err(AutomaticValuationError::Unavailable(
             AutomaticValuationUnavailable::MethodInput,
@@ -1622,22 +3168,181 @@ fn validate_method_input(
     Ok(())
 }
 
-fn validate_assumption(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFinancialAnchor {
+    annual_period: FundamentalPeriod,
+    identity: EvidenceDigest,
+    source_selection: EvidenceDigest,
+}
+
+fn native_financial_input(
+    value: &PointInTimeValuationInput,
+    required_role: FinancialAmountRole,
+    offset: u32,
+) -> Result<NativeFinancialAnchor, AutomaticValuationError> {
+    let invalid = AutomaticValuationError::Unavailable(AutomaticValuationUnavailable::MethodInput);
+    let EvidenceOrigin::ForecastDistribution { evidence } = value.input().evidence().origin()
+    else {
+        return Err(invalid);
+    };
+    let source = evidence.source();
+    let epoch = source.financial_epoch().ok_or(invalid)?;
+    let binding = epoch.financial_period().ok_or(invalid)?;
+    let Some(market_squawk_data::FeatureLabelMeasurement::FinancialAmount {
+        currency,
+        role,
+        basis,
+        share_convention,
+    }) = epoch.financial_measurement()
+    else {
+        return Err(invalid);
+    };
+    let selection = if offset == 0 {
+        ForecastValuationValueSelection::FinancialOrigin
+    } else {
+        ForecastValuationValueSelection::ConditionalMean
+    };
+    if evidence.selection() != selection
+        || role != required_role
+        || basis != FinancialAmountBasis::TotalCommonEquity
+        || share_convention.is_some()
+        || currency != value.input().amount().money().currency()
+        || value.input().amount().basis() != ValuationAmountBasis::TotalCommonEquity
+        || binding.cadence() != FundamentalCadence::Annual
+        || epoch.source_selection_as_of() != value.knowledge_at()
+        || source.reference().knowledge_at() != value.knowledge_at()
+        || source.distribution().financial_target() != Some(binding)
+        || (offset > 0
+            && binding
+                .target_ordinal()
+                .checked_sub(binding.observed_ordinal())
+                != Some(offset))
+        || (offset == 0 && required_role != FinancialAmountRole::CommonBookEquity)
+        || matches!(binding.observed_period(), FundamentalPeriod::Instant { .. })
+            != (required_role == FinancialAmountRole::CommonBookEquity)
+    {
+        return Err(invalid);
+    }
+    let observed_end = binding.observed_period().end();
+    let mut annual_period = None;
+    for row in binding.duration_chain() {
+        let period = row.fact_context().period();
+        if period.end() != observed_end {
+            continue;
+        }
+        if !matches!(period, FundamentalPeriod::Duration { .. })
+            || annual_period.is_some_and(|existing| existing != period)
+        {
+            return Err(invalid);
+        }
+        annual_period = Some(period);
+    }
+    Ok(NativeFinancialAnchor {
+        annual_period: annual_period.ok_or(invalid)?,
+        identity: binding.identity_receipt_digest(),
+        source_selection: binding.source_selection_digest(),
+    })
+}
+
+fn derived_input_completed_by(input: &ValuationInput, calculated_at: Timestamp) -> bool {
+    match input.evidence().origin() {
+        EvidenceOrigin::ForecastDistribution { evidence } => {
+            evidence.source().reference().selected_at() <= calculated_at
+                && evidence.source().distribution().published_at() <= calculated_at
+        }
+        _ => true,
+    }
+}
+
+fn validate_derived_assumption(
     value: &AutomaticValuationAssumption,
     kind: AutomaticValuationAssumptionKind,
     common: &AutomaticValuationInput,
 ) -> Result<(), AutomaticValuationError> {
-    if value.kind() != kind {
-        return Err(AutomaticValuationError::Conflict(
-            AutomaticValuationConflict::Evidence,
-        ));
-    }
-    if value.available_at() > common.measurement_at || value.expires_at() < common.expires_at {
+    if value.kind() != kind
+        || value.available_at() > common.calculated_at
+        || value.expires_at() < common.expires_at
+    {
         return Err(AutomaticValuationError::Unavailable(
             AutomaticValuationUnavailable::Assumption,
         ));
     }
     Ok(())
+}
+
+/// Checked annual-period arithmetic only; these numbers do not mint valuation or source evidence.
+pub struct AnnualEquityArithmetic;
+impl AnnualEquityArithmetic {
+    /// Recomputes a conditional FCFE-ratio/cap scenario without granting source authority.
+    pub fn conditional_terminal_growth(
+        final_fcfe: Decimal,
+        next_fcfe: Decimal,
+        nominal_risk_free_cap: Decimal,
+        annual_cost_of_equity: Decimal,
+    ) -> Result<(Decimal, Decimal), AutomaticValuationError> {
+        terminal::conditional_terminal_growth(
+            final_fcfe,
+            next_fcfe,
+            nominal_risk_free_cap,
+            annual_cost_of_equity,
+        )
+    }
+    /// Discounts one genuine annual amount at the supplied explicit annual rate.
+    pub fn discounted_amount(
+        amount: Decimal,
+        annual_rate: Decimal,
+        period: NonZeroU32,
+    ) -> Result<Decimal, AutomaticValuationError> {
+        let base = Decimal::ONE
+            .checked_add(annual_rate)
+            .filter(|value| *value > Decimal::ZERO)
+            .ok_or(AutomaticValuationError::InvalidContract)?;
+        discount(amount, base, period).map(|(_, value)| value)
+    }
+    /// Values genuine next-period common FCFE with a separately supplied continuation assumption.
+    pub fn discounted_terminal_fcfe(
+        next_period_fcfe: Decimal,
+        annual_cost_of_equity: Decimal,
+        annual_growth: Decimal,
+        terminal_period: NonZeroU32,
+    ) -> Result<Decimal, AutomaticValuationError> {
+        terminal_fcfe_discount(
+            next_period_fcfe,
+            annual_cost_of_equity,
+            annual_growth,
+            terminal_period,
+        )
+        .map(|(_, value)| value)
+    }
+}
+
+fn terminal_fcfe_discount(
+    next_period_fcfe: Decimal,
+    annual_cost_of_equity: Decimal,
+    annual_growth: Decimal,
+    terminal_period: NonZeroU32,
+) -> Result<(Decimal, Decimal), AutomaticValuationError> {
+    if next_period_fcfe <= Decimal::ZERO
+        || annual_growth <= -Decimal::ONE
+        || annual_growth >= annual_cost_of_equity
+    {
+        return Err(AutomaticValuationError::InvalidContract);
+    }
+    let continuation = annual_cost_of_equity
+        .checked_sub(annual_growth)
+        .ok_or(AutomaticValuationError::Arithmetic)?;
+    let base = Decimal::ONE
+        .checked_add(annual_cost_of_equity)
+        .filter(|value| *value > Decimal::ZERO)
+        .ok_or(AutomaticValuationError::InvalidContract)?;
+    let (discount_factor, _) = discount(Decimal::ONE, base, terminal_period)?;
+    let divisor = continuation
+        .checked_mul(discount_factor)
+        .ok_or(AutomaticValuationError::Arithmetic)?;
+    let value = next_period_fcfe
+        .checked_div(divisor)
+        .ok_or(AutomaticValuationError::Arithmetic)?;
+    Ok((divisor.normalize(), value.normalize()))
 }
 
 fn discount(
@@ -1815,6 +3520,7 @@ const fn assumption_tag(value: AutomaticValuationAssumptionKind) -> u8 {
         AutomaticValuationAssumptionKind::ForecastProbability => 4,
         AutomaticValuationAssumptionKind::UncertaintyLower => 5,
         AutomaticValuationAssumptionKind::UncertaintyUpper => 6,
+        AutomaticValuationAssumptionKind::TerminalGrowth => 7,
     }
 }
 

@@ -2,7 +2,15 @@
 
 use std::{borrow::Cow, fmt, sync::Arc, time::Duration};
 
+pub(super) mod annual_yields;
+mod board;
+mod census;
+mod saved_series;
+mod series_history;
+pub(crate) use saved_series::MACRO_GET_LATEST_SERIES_OBSERVATION;
+pub(crate) use series_history::MACRO_GET_SERIES_HISTORY;
 mod energy;
+mod provider_periods;
 
 pub(crate) const RESIDENTIAL_ELECTRICITY_PRICE_DATASET: &str =
     "market_squawk.us_residential_electricity_price";
@@ -45,7 +53,7 @@ const FRED_UNEMPLOYMENT_SERIES_ID: &str = "UNRATE";
 const FRED_UNEMPLOYMENT_UNIT_ID: &str = "fred-unit:v1:Percent";
 const TREASURY_PERCENT_UNIT_ID: &str = "percent";
 const H15_INDICATOR_COUNT: usize = 11;
-const MACRO_CONTEXT_INDICATOR_COUNT: usize = 13;
+pub(crate) const MACRO_CONTEXT_INDICATOR_COUNT: usize = 15;
 const MACRO_MODEL_INDICATOR_COUNT: usize = 12;
 const MAXIMUM_MACRO_CONTEXT_INPUTS: usize = 4_096;
 const MAXIMUM_TIMESTAMP_BYTES: usize = 64;
@@ -146,6 +154,23 @@ pub(crate) struct MacroContextReadCapability {
 }
 
 impl MacroContextReadCapability {
+    /// Reads the exact yield references and regime used by independently composed financial models.
+    pub(crate) async fn read_investment_context(
+        &self,
+        knowledge_cutoff: Timestamp,
+        effective_date_cutoff: CalendarDate,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<super::macro_features::MacroInvestmentContext, ServiceError> {
+        super::macro_features::read_macro_investment_context(
+            self,
+            knowledge_cutoff,
+            effective_date_cutoff,
+            deadline,
+            cancellation,
+        )
+        .await
+    }
     /// Binds the currently composed canonical Board/FRED read authorities.
     #[must_use]
     pub(crate) fn new(reader: AnalyticalReadCapability, fred: FredLatestKnownOperation) -> Self {
@@ -225,8 +250,11 @@ impl MacroContextReadCapability {
                 .await
         });
         let energy = self.read_energy(cutoffs, deadline, cancellation.child_token());
-        let (board, fred, (treasury_fiscal, treasury_daily), energy) =
-            tokio::try_join!(board, fred, treasury, energy)?;
+        let census = Box::pin(self.read_census(cutoffs, deadline, cancellation.child_token()));
+        let periods =
+            Box::pin(self.read_provider_periods(cutoffs, deadline, cancellation.child_token()));
+        let (board, fred, (treasury_fiscal, treasury_daily), energy, census, (labor, income)) =
+            tokio::try_join!(board, fred, treasury, energy, census, periods)?;
         product_snapshot(
             cutoffs,
             board,
@@ -234,72 +262,10 @@ impl MacroContextReadCapability {
             treasury_fiscal,
             treasury_daily,
             energy,
+            census,
+            labor,
+            income,
         )
-    }
-
-    async fn read_board(
-        &self,
-        cutoffs: MacroContextCutoffs,
-        deadline: std::time::Instant,
-        cancellation: CancellationToken,
-    ) -> Result<Option<AnalyticalMacroLatestKnownOutput>, ServiceError> {
-        let profile = BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()
-            .map_err(|_| ServiceError::Unavailable)?;
-        let contract = profile.contract();
-        if contract.release() != BoardRelease::H15SelectedInterestRates
-            || contract.family() != BoardDatasetFamily::H15TreasuryConstantMaturities
-            || contract.frequency() != BoardFrequency::BusinessDaily
-            || h15_treasury_constant_maturities_dashboard_series().len() != H15_INDICATOR_COUNT
-        {
-            return Err(ServiceError::Unavailable);
-        }
-
-        let dataset = DatasetId::try_from(profile.analytical_dataset().as_str())
-            .map_err(|_| ServiceError::Unavailable)?;
-        let Some(generation) = self
-            .reader
-            .latest(&dataset, deadline, &cancellation)
-            .map_err(map_read_error)?
-        else {
-            return Ok(None);
-        };
-        let source_id =
-            SourceId::try_from(BOARD_DDP_SOURCE_ID).map_err(|_| ServiceError::Unavailable)?;
-        if generation.source_id() != &source_id || generation.manifest().dataset_id() != &dataset {
-            return Err(ServiceError::InvalidResult);
-        }
-
-        let mut series = Vec::new();
-        series
-            .try_reserve_exact(H15_INDICATOR_COUNT)
-            .map_err(|_| ServiceError::ResourceExhausted)?;
-        for descriptor in h15_treasury_constant_maturities_dashboard_series() {
-            series.push(
-                descriptor
-                    .canonical_macro_series_identifier()
-                    .map_err(|_| ServiceError::Unavailable)?,
-            );
-        }
-        let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(series)
-            .map_err(map_read_error)?;
-        let request = AnalyticalMacroLatestKnownRequest::try_new(
-            generation.manifest().clone(),
-            source_id,
-            cutoffs.knowledge_cutoff,
-            cutoffs.effective_date_cutoff,
-            allowlist,
-        )
-        .map_err(map_read_error)?;
-        let query_limits = macro_context_query_limits(&request, deadline)?;
-        let output = self
-            .reader
-            .read_macro_latest_known_snapshot(request, query_limits, deadline, cancellation)
-            .await
-            .map_err(map_read_error)?;
-        if output.output().manifest() != generation.manifest() {
-            return Err(ServiceError::InvalidResult);
-        }
-        Ok(Some(output))
     }
 
     async fn read_fred(
@@ -403,7 +369,7 @@ impl MacroContextOperation {
         }
     }
 
-    /// Adds the existing rich-store owner for restart-safe energy publication reads.
+    /// Adds the existing rich-store owner for restart-safe native Macro publication reads.
     pub(crate) fn with_energy_store(mut self, research: Arc<crate::ResearchService>) -> Self {
         self.read.energy_store = Some(research);
         self
@@ -647,6 +613,7 @@ pub(crate) enum MacroContextCategory {
     InterestRates,
     LaborMarket,
     EnergyPrices,
+    Income,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -654,6 +621,8 @@ pub(crate) enum MacroContextCategory {
 pub(crate) enum MacroContextFrequency {
     BusinessDaily,
     Monthly,
+    Quarterly,
+    Annual,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -723,6 +692,8 @@ pub(crate) enum MacroContextInputRole {
     GovernmentBorrowingCost,
     LaborMarket,
     ResidentialElectricityPrice,
+    CaliforniaBeginningQuarterEmployment,
+    CaliforniaAnnualPersonalIncome,
 }
 
 /// One typed canonical input retained by the neutral selection snapshot.
@@ -774,6 +745,38 @@ impl MacroContextSelectedObservation {
     pub(crate) const fn observation(&self) -> Option<&MacroObservation> {
         self.observation.as_ref()
     }
+
+    /// Binds only this selected economic observation and its exact publication/read authority.
+    ///
+    /// An unrelated indicator cannot stand in for the evidence of a rate used by a valuation.
+    pub(crate) fn evidence_digest(&self) -> Result<Option<EvidenceDigest>, ServiceError> {
+        match (
+            self.observation.as_ref(),
+            self.authority,
+            self.source_receipt.as_ref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(observation), Some(authority), Some(receipt)) => {
+                if observation.context().provenance().source_id() != &receipt.source_id {
+                    return Err(ServiceError::InvalidResult);
+                }
+                let mut digest = Sha256::new();
+                hash_text(&mut digest, "market-squawk/macro-selected-observation/v1");
+                hash_text(&mut digest, self.indicator_id);
+                digest.update([authority.digest_tag()]);
+                hash_source_receipt(&mut digest, receipt);
+                let encoded =
+                    serde_json::to_vec(observation).map_err(|_| ServiceError::InvalidResult)?;
+                hash_bytes(&mut digest, &encoded);
+                require_sha256(EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    digest.finalize().into(),
+                ))
+                .map(Some)
+            }
+            _ => Err(ServiceError::InvalidResult),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -782,6 +785,9 @@ enum MacroContextSelectionAuthority {
     Board,
     Fred,
     OfficialEnergyStatistics,
+    OfficialEmploymentStatistics,
+    OfficialLaborStatistics,
+    OfficialIncomeStatistics,
 }
 
 /// Reusable typed neutral Macro selection plus opaque exact evidence.
@@ -790,6 +796,8 @@ pub(crate) struct MacroContextSnapshot {
     inputs: Box<[MacroContextInputObservation]>,
     selected: Box<[MacroContextSelectedObservation]>,
     energy_selected: MacroContextSelectedObservation,
+    census_selected: MacroContextSelectedObservation,
+    income_selected: MacroContextSelectedObservation,
     evidence: MacroContextEvidenceReceipt,
 }
 
@@ -810,9 +818,12 @@ impl MacroContextSnapshot {
     }
 
     fn into_tool_result(self, limits: ServiceLimits) -> Result<TypedToolResult, ServiceError> {
-        // Product consumption includes energy. Model evidence remains scoped to its fixed vector.
+        // Product consumption includes the separately qualified economic indicators.
+        // Model evidence remains scoped to its fixed vector.
         let mut product_selected = self.selected.to_vec();
         product_selected.push(self.energy_selected.clone());
+        product_selected.push(self.census_selected.clone());
+        product_selected.push(self.income_selected.clone());
         let product_evidence = MacroContextEvidenceReceipt::try_new(
             MacroContextCutoffs {
                 knowledge_cutoff: self.evidence.knowledge_cutoff,
@@ -823,6 +834,34 @@ impl MacroContextSnapshot {
             &product_selected,
         )?;
         require_sha256(product_evidence.consumed_digest())?;
+        let investment_context =
+            match super::macro_features::MacroInvestmentContext::try_from_snapshot(&self) {
+                Ok(value) => {
+                    use super::macro_features::MacroRateRegime;
+                    let regime = value.regime();
+                    let rates = value.valuation_rates();
+                    json!({
+                        "availability": "available",
+                        "curve": match regime.regime() {
+                            MacroRateRegime::UpwardSloping => "upward_sloping",
+                            MacroRateRegime::Flat => "flat",
+                            MacroRateRegime::Inverted => "inverted",
+                            MacroRateRegime::Mixed => "mixed",
+                        },
+                        "effective": rates.effective(),
+                        "threeMonthToTenYearSpreadPercentagePoints": regime.three_month_to_ten_year_spread().to_string(),
+                        "twoYearToTenYearSpreadPercentagePoints": regime.two_year_to_ten_year_spread().to_string(),
+                        "governmentYieldReferences": [
+                            {"maturityYears": 10, "annualPercent": rates.ten_year_government_yield().to_string(),
+                            "availableAt": timestamp_text(rates.ten_year_reference().available_at())?},
+                            {"maturityYears": 30, "annualPercent": rates.thirty_year_government_yield().to_string(),
+                            "availableAt": timestamp_text(rates.thirty_year_reference().available_at())?},
+                        ],
+                    })
+                }
+                Err(ServiceError::Unavailable) => json!({"availability": "unavailable"}),
+                Err(error) => return Err(error),
+            };
         let availability = self.dto.availability;
         let selected_indicators = self
             .dto
@@ -847,7 +886,12 @@ impl MacroContextSnapshot {
         });
         let metadata = ToolResultMetadata::try_complete(source_coverage, data_quality)
             .map_err(|_| ServiceError::InvalidResult)?;
-        let content = serde_json::to_value(self.dto).map_err(|_| ServiceError::InvalidResult)?;
+        let mut content =
+            serde_json::to_value(self.dto).map_err(|_| ServiceError::InvalidResult)?;
+        content
+            .as_object_mut()
+            .ok_or(ServiceError::InvalidResult)?
+            .insert("investmentContext".into(), investment_context);
         TypedToolResult::try_new(content, MACRO_CONTEXT_INDICATOR_COUNT, metadata, limits)
             .map_err(Into::into)
     }
@@ -866,11 +910,14 @@ impl fmt::Debug for MacroContextSnapshot {
 
 fn product_snapshot(
     cutoffs: MacroContextCutoffs,
-    board: Option<AnalyticalMacroLatestKnownOutput>,
+    board: [Option<board::BoardRead>; 2],
     fred: Option<AnalyticalMacroLatestKnownOutput>,
     treasury_fiscal: Box<[TreasuryCurrentAnalyticalRead]>,
     treasury_daily: Box<[TreasuryCurrentAnalyticalRead]>,
     energy: Option<energy::EnergyRead>,
+    census: Option<census::CensusRead>,
+    labor: Option<provider_periods::PeriodRead>,
+    income: Option<provider_periods::PeriodRead>,
 ) -> Result<MacroContextSnapshot, ServiceError> {
     let definitions = H15_INDICATORS
         .iter()
@@ -899,12 +946,17 @@ fn product_snapshot(
     );
 
     let input_count = board
-        .as_ref()
-        .map_or(0, |output| output.observations().len())
-        .checked_add(
-            fred.as_ref()
-                .map_or(0, |output| output.observations().len()),
-        )
+        .iter()
+        .flatten()
+        .try_fold(0_usize, |count, read| {
+            count.checked_add(read.output().observations().len())
+        })
+        .and_then(|count| {
+            count.checked_add(
+                fred.as_ref()
+                    .map_or(0, |output| output.observations().len()),
+            )
+        })
         .and_then(|count| {
             treasury_fiscal.iter().try_fold(count, |count, read| {
                 count.checked_add(read.output().observations().len())
@@ -922,6 +974,12 @@ fn product_snapshot(
                     .map_or(0, |read| read.receipt.observations().len()),
             )
         })
+        .and_then(|count| {
+            count.checked_add(census.as_ref().map_or(0, |read| read.observations().len()))
+        })
+        .and_then(|count| {
+            count.checked_add(usize::from(labor.is_some()) + usize::from(income.is_some()))
+        })
         .filter(|count| *count <= MAXIMUM_MACRO_CONTEXT_INPUTS)
         .ok_or(ServiceError::ResourceExhausted)?;
     let mut inputs = Vec::new();
@@ -931,26 +989,28 @@ fn product_snapshot(
     let mut receipts = Vec::new();
     receipts
         .try_reserve_exact(
-            3_usize
-                .checked_add(treasury_fiscal.len())
+            board
+                .iter()
+                .flatten()
+                .count()
+                .checked_add(5)
+                .and_then(|count| count.checked_add(treasury_fiscal.len()))
                 .and_then(|count| count.checked_add(treasury_daily.len()))
                 .ok_or(ServiceError::ResourceExhausted)?,
         )
         .map_err(|_| ServiceError::ResourceExhausted)?;
 
-    if let Some(board) = board {
-        let receipt = Arc::new(MacroContextSourceReceipt::try_from_output(
-            MacroContextInternalSource::InterestRates,
-            &board,
-        )?);
+    for read in board.into_iter().flatten() {
+        let receipt = Arc::new(read.source_receipt()?);
+        let board = read.output();
         retain_inputs(
-            &board,
+            board,
             cutoffs,
             |_| Ok(MacroContextInputRole::GovernmentYieldCurve),
             &mut inputs,
         )?;
         project_board(
-            &board,
+            board,
             cutoffs,
             &mut observations[..H15_INDICATOR_COUNT],
             &mut selected[..H15_INDICATOR_COUNT],
@@ -1009,8 +1069,30 @@ fn product_snapshot(
         receipts.push(receipt);
     }
 
+    provider_periods::project_labor(
+        labor,
+        cutoffs,
+        &mut observations[H15_INDICATOR_COUNT],
+        &mut selected[H15_INDICATOR_COUNT],
+        &mut inputs,
+        &mut receipts,
+    )?;
     let energy_selected = energy::project_energy(
         energy,
+        cutoffs,
+        &mut observations,
+        &mut inputs,
+        &mut receipts,
+    )?;
+    let census_selected = census::project_census(
+        census,
+        cutoffs,
+        &mut observations,
+        &mut inputs,
+        &mut receipts,
+    )?;
+    let income_selected = provider_periods::project_income(
+        income,
         cutoffs,
         &mut observations,
         &mut inputs,
@@ -1087,6 +1169,8 @@ fn product_snapshot(
         inputs: inputs.into_boxed_slice(),
         selected: selected.into_boxed_slice(),
         energy_selected,
+        census_selected,
+        income_selected,
         evidence,
     })
 }
@@ -1480,8 +1564,6 @@ fn validate_canonical_input(
         || provenance.instrument_id().is_some()
         || provenance.venue_id().is_some()
         || provenance.quality() != DataQuality::OfficialDelayed
-        || provenance.received_at() > cutoffs.knowledge_cutoff
-        || provenance.ingested_at() > cutoffs.knowledge_cutoff
     {
         return Err(ServiceError::InvalidResult);
     }
@@ -1686,6 +1768,27 @@ impl MacroContextEvidenceReceipt {
         &self.consumed_parent_manifests
     }
 
+    /// Fixture-only read of the native binding actually consumed by selected Board rates.
+    /// A consulted but unselected full-history generation is never returned as evidence.
+    #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+    pub(crate) fn selected_board_native_binding(
+        &self,
+    ) -> Result<Option<EvidenceDigest>, ServiceError> {
+        let mut selected = self.consulted_sources.iter().filter(|source| {
+            source.source == MacroContextInternalSource::InterestRates
+                && source.source_id.as_str() == BOARD_DDP_SOURCE_ID
+                && source.native_binding_digest.is_some()
+                && self.consumed_parent_manifests.contains(&source.manifest)
+        });
+        let binding = selected
+            .next()
+            .and_then(|source| source.native_binding_digest);
+        if selected.next().is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(binding)
+    }
+
     /// Returns a nonzero SHA-256 identity over exact consumed selections and cutoffs.
     pub(crate) const fn consumed_digest(&self) -> EvidenceDigest {
         self.consumed_digest
@@ -1747,6 +1850,8 @@ enum MacroContextInternalSource {
     LaborMarket,
     FiscalConditions,
     EnergyPrices,
+    RegionalEmployment,
+    RegionalIncome,
 }
 
 impl MacroContextInternalSource {
@@ -1756,6 +1861,8 @@ impl MacroContextInternalSource {
             Self::LaborMarket => 2,
             Self::FiscalConditions => 3,
             Self::EnergyPrices => 4,
+            Self::RegionalEmployment => 5,
+            Self::RegionalIncome => 6,
         }
     }
 }
@@ -1767,6 +1874,9 @@ impl MacroContextSelectionAuthority {
             Self::Board => 2,
             Self::Fred => 3,
             Self::OfficialEnergyStatistics => 4,
+            Self::OfficialEmploymentStatistics => 5,
+            Self::OfficialLaborStatistics => 6,
+            Self::OfficialIncomeStatistics => 7,
         }
     }
 }

@@ -25,7 +25,7 @@ use market_squawk_valuation::{
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -34,8 +34,24 @@ use super::{
     domain_support::{DomainLifecycle, admitted_result_limits, ensure_request_live},
 };
 
+mod automatic;
+mod backup_read;
+mod automatic_read;
+pub(crate) use automatic_read::FairValueAutomaticReadCapability;
+use backup_read::BackupAutomaticValuationRead;
+pub(crate) use backup_read::FairValueBackupAttestationLease;
+mod forecast_source;
 mod resolver;
 mod serialization;
+
+pub(crate) use automatic::{
+    AutomaticForecastValuationRequest, AutomaticInvestmentValuationEvaluation,
+    AutomaticInvestmentValuationRequest, AutomaticInvestmentValuationSources,
+    AutomaticValuationModelCases, AutomaticValuationPublication,
+    HistoricalForecastValuationAssumption, HistoricalForecastValuationReceipt,
+    HistoricalStudyValuationReadCapability, HistoricalValuationMethodEvaluation,
+    ObservedComparableValuationRequest, automatic_valuation_model_cases,
+};
 
 pub use resolver::{
     AnalyticsFairValueInputPublisher, FairValueInputAuthorityError,
@@ -51,6 +67,8 @@ use serialization::{
     predicate_name, predicate_result_value, product_basis_value, quality_name, reason_name,
     relation_name, significance_name, timestamp_value,
 };
+
+pub(crate) use forecast_source::ForecastValuationSourceFactory;
 
 const LIST_MEASUREMENTS: &str = "FairValue.ListMeasurements";
 const GET_WORKSPACE: &str = "FairValue.GetWorkspace";
@@ -393,6 +411,7 @@ pub trait FairValueInputResolver: Send + Sync + 'static {
 /// Application-owned fair-value surface over one durable catalog writer and receipt resolver.
 pub struct FairValueDomainService {
     state: Arc<Mutex<FairValueService>>,
+    backup_automatic_read: Arc<std::sync::Mutex<std::sync::Weak<BackupAutomaticValuationRead>>>,
     workflow_tokens: Arc<Mutex<FairValueWorkflowTokens>>,
     resolver: Arc<dyn FairValueInputResolver>,
     selection_authority: Arc<dyn FairValueProducerSelectionAuthority>,
@@ -724,43 +743,20 @@ impl FairValueBackupAttestation {
     }
 
     /// Reopens a fresh restored catalog and recomputes its complete logical identity.
-    pub(crate) fn validate_restored_catalog(
+    pub(crate) async fn validate_restored_catalog(
         self,
         catalog: FairValueCatalogCapability,
         limits: FairValueLimits,
+        resolver: &dyn market_squawk_valuation::ForecastValuationResolver,
+        recovery_at: Timestamp,
     ) -> Result<FairValueService, FairValueBackupError> {
-        let restored = FairValueService::open(catalog, limits)?;
+        let restored =
+            FairValueService::open_with_forecast_resolver(catalog, limits, resolver, recovery_at)
+                .await?;
         if Self::try_from_service(&restored)? != self {
             return Err(FairValueBackupError::CatalogMismatch);
         }
         Ok(restored)
-    }
-}
-
-/// Non-cloneable mutation fence retained across Fair Value backup materialization.
-pub(crate) struct FairValueBackupAttestationLease {
-    state: OwnedMutexGuard<FairValueService>,
-    attestation: FairValueBackupAttestation,
-}
-
-impl FairValueBackupAttestationLease {
-    /// Returns the exact owner-issued attestation captured before the common cutoff.
-    pub(crate) const fn attestation(&self) -> FairValueBackupAttestation {
-        self.attestation
-    }
-
-    /// Proves that the retained owner and catalog still match the emitted attestation.
-    pub(crate) fn revalidate(&self) -> Result<(), FairValueBackupError> {
-        if FairValueBackupAttestation::try_from_service(&self.state)? != self.attestation {
-            return Err(FairValueBackupError::CatalogMismatch);
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for FairValueBackupAttestationLease {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("FairValueBackupAttestationLease([RETAINED FAIR-VALUE WRITER])")
     }
 }
 
@@ -921,6 +917,7 @@ impl FairValueDomainService {
         })?;
         Ok(Self {
             state: Arc::new(Mutex::new(service)),
+            backup_automatic_read: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
             workflow_tokens: Arc::new(Mutex::new(FairValueWorkflowTokens::default())),
             resolver,
             selection_authority,
@@ -950,27 +947,6 @@ impl FairValueDomainService {
             maximum_scan: self.maximum_query_results,
             lifecycle: Arc::clone(&self.lifecycle),
         }
-    }
-
-    /// Retains the sole Fair Value writer and captures its exact analytical-catalog attestation.
-    pub(crate) async fn retain_backup_attestation(
-        self: &Arc<Self>,
-        cancellation: &CancellationToken,
-    ) -> Result<FairValueBackupAttestationLease, FairValueBackupError> {
-        let state = Arc::clone(&self.state);
-        let guard = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(FairValueBackupError::Cancelled),
-            guard = state.lock_owned() => guard,
-        };
-        if cancellation.is_cancelled() {
-            return Err(FairValueBackupError::Cancelled);
-        }
-        let attestation = FairValueBackupAttestation::try_from_service(&guard)?;
-        Ok(FairValueBackupAttestationLease {
-            state: guard,
-            attestation,
-        })
     }
 
     /// Resolves product workflow tokens to the immutable evidence used by governance.
@@ -2027,14 +2003,26 @@ fn product_input_value(
         }
         EvidenceOrigin::Research { .. }
         | EvidenceOrigin::Analytics { .. }
-        | EvidenceOrigin::Portfolio { .. } => None,
+        | EvidenceOrigin::Portfolio { .. }
+        | EvidenceOrigin::Fundamental { .. }
+        | EvidenceOrigin::AutomaticValuation { .. }
+        | EvidenceOrigin::ForecastDistribution { .. }
+        | EvidenceOrigin::PublishedMarket { .. } => None,
     };
     let evidence = input.evidence();
     let (evidence_kind, evidence_label) = match evidence.origin() {
         EvidenceOrigin::Market { .. } => ("market_observation", "Current market observation"),
         EvidenceOrigin::Research { .. } => ("published_research", "Published research"),
         EvidenceOrigin::Analytics { .. } => ("analysis", "Analytical estimate"),
+        EvidenceOrigin::ForecastDistribution { .. } => ("analysis", "Forecast estimate"),
         EvidenceOrigin::Portfolio { .. } => ("portfolio", "Portfolio position"),
+        EvidenceOrigin::Fundamental { .. } => ("fundamental", "Published company fundamental"),
+        EvidenceOrigin::PublishedMarket { .. } => {
+            ("published_market", "Published market observation")
+        }
+        EvidenceOrigin::AutomaticValuation { .. } => {
+            ("automatic_valuation", "Calculated valuation")
+        }
     };
     let market_access = input.market_access_assessment().map(|assessment| {
         json!({
@@ -2239,6 +2227,7 @@ impl ParsedMeasurement {
             "per_instrument_unit" => ValuationAmountBasis::PerInstrumentUnit,
             "reporting_entity_total" => ValuationAmountBasis::ReportingEntityTotal,
             "position_total" => ValuationAmountBasis::PositionTotal,
+            "total_common_equity" => ValuationAmountBasis::TotalCommonEquity,
             _ => return Err(ServiceError::InvalidRequest),
         };
         let amount = ValuationAmount::try_new(Money::new(decimal, currency), scale, basis)
@@ -2797,10 +2786,13 @@ fn map_resolution_error(error: FairValueInputResolutionError) -> ServiceError {
 
 fn map_fair_value_error(error: FairValueError) -> ServiceError {
     match error {
+        FairValueError::Cancelled => ServiceError::Cancelled,
+        FairValueError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         FairValueError::MeasurementNotFound
         | FairValueError::DecisionNotFound
         | FairValueError::ApprovalNotFound => ServiceError::NotFound,
-        FairValueError::LimitExceeded { .. }
+        FairValueError::ResourceExhausted
+        | FairValueError::LimitExceeded { .. }
         | FairValueError::RetainedBytesExceeded { .. }
         | FairValueError::QueryLimitExceeded { .. } => ServiceError::ResourceExhausted,
         FairValueError::Persistence => ServiceError::Unavailable,

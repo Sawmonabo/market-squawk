@@ -444,7 +444,8 @@ fn map_fair_value_error(error: FairValueError) -> GovernanceDomainAdapterError {
         FairValueError::MeasurementNotFound
         | FairValueError::DecisionNotFound
         | FairValueError::ApprovalNotFound => GovernanceDomainAdapterError::NotFound,
-        FairValueError::LimitExceeded { .. }
+        FairValueError::ResourceExhausted
+        | FairValueError::LimitExceeded { .. }
         | FairValueError::RetainedBytesExceeded { .. }
         | FairValueError::QueryLimitExceeded { .. } => {
             GovernanceDomainAdapterError::CapacityExceeded

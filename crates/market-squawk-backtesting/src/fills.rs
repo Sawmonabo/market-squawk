@@ -1,15 +1,18 @@
 //! Versioned research-only execution assumptions and deterministic fill simulation.
 
+mod forward;
+
 use std::num::NonZeroU32;
 
 use market_squawk_data::Sha256Digest;
 use market_squawk_domain::{
-    BasisPoints, FinancialError, InstrumentId, Money, OrderId, OrderSide, OrderType, PriceTicks,
-    QuantityLots, RoundingPolicy, TimeInForce, Timestamp,
+    BasisPoints, FinancialError, InstrumentId, LotSize, Money, OrderId, OrderSide, OrderType,
+    PriceTicks, QuantityLots, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{OrderIntent, OrderIntentDigest};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore as _, SeedableRng as _};
+use rust_decimal::{Decimal, prelude::ToPrimitive as _};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -279,6 +282,53 @@ impl ResearchFillSimulator {
         spread: BasisPoints,
         available_capacity: QuantityLots,
     ) -> Result<Option<ResearchFill>, ResearchFillError> {
+        self.simulate_reference(
+            intent,
+            requested,
+            executed_at,
+            Decimal::from(mid_price.get()),
+            Decimal::ONE,
+            spread,
+            available_capacity,
+        )
+    }
+
+    /// Uses the native monetary close; only the final adverse execution price is quantized.
+    pub(crate) fn simulate_money(
+        &mut self,
+        intent: &OrderIntent,
+        requested: QuantityLots,
+        executed_at: Timestamp,
+        reference: Money,
+        spread: BasisPoints,
+        available_capacity: QuantityLots,
+    ) -> Result<Option<ResearchFill>, ResearchFillError> {
+        if reference.currency() != intent.execution_terms().quote_currency()
+            || reference.amount() <= Decimal::ZERO
+        {
+            return Err(ResearchFillError::Arithmetic);
+        }
+        self.simulate_reference(
+            intent,
+            requested,
+            executed_at,
+            reference.amount(),
+            intent.execution_terms().price_tick().as_decimal(),
+            spread,
+            available_capacity,
+        )
+    }
+
+    fn simulate_reference(
+        &mut self,
+        intent: &OrderIntent,
+        requested: QuantityLots,
+        executed_at: Timestamp,
+        reference_amount: Decimal,
+        tick_size: Decimal,
+        spread: BasisPoints,
+        available_capacity: QuantityLots,
+    ) -> Result<Option<ResearchFill>, ResearchFillError> {
         if available_capacity.get() == 0 {
             return Ok(None);
         }
@@ -309,24 +359,13 @@ impl ResearchFillSimulator {
             .checked_add(self.assumptions.slippage_basis_points.get())
             .and_then(|value| value.checked_add(i32::try_from(jitter).ok()?))
             .ok_or(ResearchFillError::Arithmetic)?;
-        let price = adverse_price(mid_price, intent.side(), adverse)?;
-        if !order_permits(intent, mid_price, price) {
+        let price = adverse_price(reference_amount, tick_size, intent.side(), adverse)?;
+        if price.get() <= 0 || !order_permits(intent, reference_amount, tick_size, price) {
             return Ok(None);
         }
         let terms = intent.execution_terms();
-        let notional = price
-            .checked_mul_quantity(
-                quantity,
-                terms.price_tick(),
-                terms.lot_size(),
-                terms.quote_currency(),
-            )?
-            .checked_mul_decimal(terms.contract_multiplier())?;
-        let fee = notional.checked_basis_points(
-            self.assumptions.fee_basis_points,
-            self.assumptions.fee_decimal_scale,
-            RoundingPolicy::NearestEven,
-        )?;
+        let notional = self.assumptions.modeled_notional(terms, price, quantity)?;
+        let fee = self.assumptions.modeled_fee(notional)?;
         Ok(Some(ResearchFill {
             order_id: intent.order_id(),
             intent_digest: intent.digest(),
@@ -346,7 +385,28 @@ impl ResearchFillSimulator {
         &self,
         depth: QuantityLots,
     ) -> Result<QuantityLots, ResearchFillError> {
-        participation_capacity(depth, self.assumptions.maximum_participation_basis_points)
+        self.assumptions.modeled_participation_capacity(depth)
+    }
+
+    /// Declared daily research participation in realized traded volume. This calculation grants
+    /// no observed quote-depth or instantaneous execution-liquidity claim.
+    pub(crate) fn daily_bar_capacity(
+        &self,
+        traded_volume: Decimal,
+        lot_size: LotSize,
+    ) -> Result<QuantityLots, ResearchFillError> {
+        if traded_volume < Decimal::ZERO {
+            return Err(ResearchFillError::Arithmetic);
+        }
+        let capacity = traded_volume
+            .checked_mul(Decimal::from(
+                self.assumptions.maximum_participation_basis_points.get(),
+            ))
+            .and_then(|value| value.checked_div(Decimal::from(10_000_u32)))
+            .and_then(|value| value.checked_div(lot_size.as_decimal()))
+            .and_then(|value| value.floor().to_i64())
+            .ok_or(ResearchFillError::Arithmetic)?;
+        QuantityLots::new(capacity).map_err(|_| ResearchFillError::Arithmetic)
     }
 }
 
@@ -363,40 +423,51 @@ fn participation_capacity(
 }
 
 fn adverse_price(
-    mid: PriceTicks,
+    reference_amount: Decimal,
+    tick_size: Decimal,
     side: OrderSide,
     adverse_basis_points: i32,
 ) -> Result<PriceTicks, ResearchFillError> {
     let factor = match side {
-        OrderSide::Buy => 10_000_i128 + i128::from(adverse_basis_points),
-        OrderSide::Sell => 10_000_i128 - i128::from(adverse_basis_points),
-    };
-    if factor <= 0 {
-        return Err(ResearchFillError::InvalidPolicy);
+        OrderSide::Buy => 10_000_i32.checked_add(adverse_basis_points),
+        OrderSide::Sell => 10_000_i32.checked_sub(adverse_basis_points),
     }
-    let numerator = i128::from(mid.get())
-        .checked_mul(factor)
+    .filter(|value| *value > 0)
+    .ok_or(ResearchFillError::InvalidPolicy)?;
+    let denominator = tick_size
+        .checked_mul(Decimal::from(10_000))
+        .ok_or(ResearchFillError::Arithmetic)?;
+    let adjusted = reference_amount
+        .checked_mul(Decimal::from(factor))
+        .and_then(|value| value.checked_div(denominator))
         .ok_or(ResearchFillError::Arithmetic)?;
     let ticks = match side {
-        OrderSide::Buy => {
-            numerator.div_euclid(10_000) + i128::from(numerator.rem_euclid(10_000) > 0)
-        }
-        OrderSide::Sell => numerator.div_euclid(10_000),
+        OrderSide::Buy => adjusted.ceil(),
+        OrderSide::Sell => adjusted.floor(),
     };
     Ok(PriceTicks::new(
-        i64::try_from(ticks).map_err(|_| ResearchFillError::Arithmetic)?,
+        ticks.to_i64().ok_or(ResearchFillError::Arithmetic)?,
     ))
 }
 
-fn order_permits(intent: &OrderIntent, reference: PriceTicks, execution: PriceTicks) -> bool {
+fn order_permits(
+    intent: &OrderIntent,
+    reference: Decimal,
+    tick_size: Decimal,
+    execution: PriceTicks,
+) -> bool {
     let limit_ok = match (intent.side(), intent.limit_price()) {
         (OrderSide::Buy, Some(limit)) => execution <= limit,
         (OrderSide::Sell, Some(limit)) => execution >= limit,
         (_, None) => true,
     };
     let stop_ok = match (intent.side(), intent.stop_price()) {
-        (OrderSide::Buy, Some(stop)) => reference >= stop,
-        (OrderSide::Sell, Some(stop)) => reference <= stop,
+        (OrderSide::Buy, Some(stop)) => Decimal::from(stop.get())
+            .checked_mul(tick_size)
+            .is_some_and(|stop| reference >= stop),
+        (OrderSide::Sell, Some(stop)) => Decimal::from(stop.get())
+            .checked_mul(tick_size)
+            .is_some_and(|stop| reference <= stop),
         (_, None) => true,
     };
     match intent.order_type() {

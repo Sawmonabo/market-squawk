@@ -252,7 +252,8 @@ async fn process_command(
             return;
         }
     };
-    if parts.authority.validate_current().is_err()
+    if (parts.authority.is_virtual_paper() && !adapter.accepts_virtual_paper())
+        || parts.authority.validate_current().is_err()
         || deadline_expired(final_now, parts.valid_until, parts.monotonic_deadline)
         || operation_cancellation.is_cancelled()
         || tokio::time::Instant::now() >= operation_deadline

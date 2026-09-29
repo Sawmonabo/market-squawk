@@ -1,7 +1,7 @@
 # Dataset build and query operations
 
 This runbook covers immutable dataset inspection, phase-one point-in-time feature/label generation,
-receipt-admitted feature-product inspection, bounded dataset reads, and the CLI-only read-only SQL
+explicit study clocks, receipt-admitted feature-product inspection, bounded dataset reads, and the CLI-only read-only SQL
 surface.
 
 | Field | Value |
@@ -9,7 +9,7 @@ surface.
 | Document type | Operations runbook |
 | Audience | Local research operators, feature producers, data stewards, and incident responders |
 | Status | Current, with analytical-query overflow limitations called out below |
-| Last substantive review | 2026-08-12 |
+| Last substantive review | 2026-08-12; request-clock contract refreshed 2026-09-08 |
 | Review basis | Current phase-one generation and receipt-admitted feature-product contracts; not release approval evidence |
 
 ## Contents
@@ -57,7 +57,7 @@ data and report `executionEligible: false`.
 `dataset build` and `feature build` publish the same kind of immutable phase-one derived
 generation. They return a reproducible phase-one descriptor digest, but they do not issue a product
 receipt, admit a closed feature-dataset product, or create a training-ready Python export. Product
-admission is a separate code-owned operation over an exact closed Analysis or Training contract.
+admission is a separate code-owned operation over an exact closed Analysis, Training, or StudyInputs contract.
 
 ## Safety and authority boundaries
 
@@ -71,8 +71,9 @@ admission is a separate code-owned operation over an exact closed Analysis or Tr
 - A parent is authorized by its complete immutable manifest tuple, not by dataset name alone.
   Preserve `dataset`, `version`, `schema`, `schemaVersion`, `schemaFingerprintSha256`, and
   `contentSha256` exactly.
-- The builder checks what was knowable by each example cutoff. Do not replace evidenced
-  availability with an earlier timestamp or omit a revision conflict to make a build pass.
+- The builder selects sources at each explicit `sourceSelectionAsOfUnixNanos`. A retrospective
+  study uses its actual frozen snapshot for this clock and keeps the simulated decision separate.
+  Do not replace evidenced availability with an earlier timestamp or omit a revision conflict.
 - `intendedUse: "train"` requests and verifies source rights for that use. It does not create the
   separately required Training product receipt.
 - `query sql` registers exactly one pinned generation as the relation `dataset`. It cannot query
@@ -100,8 +101,9 @@ Before building, confirm that:
 - every source in the transitive parent graph authorizes the requested `intendedUse`;
 - parent, universe, component, and example evidence was produced together rather than assembled
   from unrelated runs;
-- feature cutoffs precede their label cutoffs, and the train, validation, and test ends are strictly
-  increasing;
+- train, validation, and test ends are strictly increasing; generic/as-known training label
+  knowledge advances beyond feature knowledge, while retrospective labels may share the frozen
+  snapshot cutoff and StudyInputs has no label-knowledge clock;
 - every component is materialized already, with at least one exact observation-family selector;
   and
 - the request file is retained with the publication receipt for reproducibility.
@@ -194,10 +196,10 @@ succeeded. Each receipt-admitted feature-dataset entry includes its exact manife
 universe, split, source, and `pythonExportSha256` identities.
 
 The installed reader is bounded to the closed Analysis contract
-`market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.analysis/v1`.
+`market-squawk.feature-dataset.completed-bar-close-price-return-macro-context-fixed-horizon-forward-return.analysis/v1`.
 `feature list` is not Training-contract authority. Model training remains unavailable until a
 code-owned producer issues the separate
-`market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.training/v1` receipt for
+`market-squawk.feature-dataset.completed-bar-close-price-return-macro-context-fixed-horizon-forward-return.training/v1` receipt for
 the exact generation and export.
 
 When a page reports more entries, continue with the last returned dataset identity:
@@ -232,7 +234,8 @@ The build JSON is camelCase, except for tagged enum values such as `latest_known
 
 The empty collections above document structure only and are not a valid request. The builder
 requires nonempty parents, universe memberships, component specifications, and examples, including
-at least one feature and one label specification.
+at least one feature specification. Qualified Training additionally requires real mature label
+components; qualified StudyInputs contains features only.
 
 ### 1. Copy every immutable parent pin
 
@@ -317,15 +320,26 @@ Closed values are:
 - `scope`: `instrument`, `account`, or `global`; and
 - `corporateActions`: `not_applicable` or `requires_adjustment`.
 
-An example has a non-nil instrument UUID, a feature cutoff, a strictly later label cutoff, and one
-component for every declared contract:
+An example has a non-nil instrument UUID, separate source-selection and decision clocks, explicit
+financial origin/target coordinates, and one component for every declared contract. This generic
+example uses a later label-knowledge clock; `labelSelectionAsOfUnixNanos` must be present even when
+its value is null for StudyInputs:
 
 ```json
 {
   "exampleId": "example-2024-01-03-instrument-1",
   "instrumentId": "11111111-1111-4111-8111-111111111111",
-  "cutoffAtUnixNanos": 1704240000000000000,
-  "labelCutoffAtUnixNanos": 1704326400000000000,
+  "sourceSelectionAsOfUnixNanos": 1704240000000000000,
+  "labelSelectionAsOfUnixNanos": 1704326400000000000,
+  "decisionAtUnixNanos": 1704240000000000000,
+  "effectiveCutoff": {
+    "precision": "exact_timestamp",
+    "unixNanos": 1704240000000000000
+  },
+  "labelEffectiveCutoff": {
+    "precision": "exact_timestamp",
+    "unixNanos": 1704326400000000000
+  },
   "components": [
     {
       "spec": {
@@ -355,6 +369,11 @@ component for every declared contract:
           }
         }
       ],
+      "selectionEffectiveCutoff": {
+        "precision": "exact_timestamp",
+        "unixNanos": 1704240000000000000
+      },
+      "labelSelectionEffectiveCutoff": null,
       "adjustment": {
         "kind": "not_applicable"
       }
@@ -363,9 +382,9 @@ component for every declared contract:
 }
 ```
 
-That fragment illustrates exact field names; it is not a complete request because a valid build
-also needs a label component. A component has 1–64 distinct selectors. Selector families are
-closed to `filing`, `fundamental`, `macro`, `portfolio_position`, `transaction`,
+That example is a generic feature example; the complete request also needs its matching component
+specification, parents, universe, explicit unqualified policy, rights, and limits. A component has 1–64 distinct selectors. Selector families are
+closed to `filing`, `fundamental`, `macro`, `market_bar`, `portfolio_position`, `transaction`,
 `corporate_action`, `universe_membership`, and `alternative_data`, with the fields defined by the
 request decoder linked below.
 
@@ -413,12 +432,46 @@ behalf.
     "version": 1
   },
   "missingValues": "reject",
-  "implementationRevision": "feature-producer-commit-or-release-id"
+  "implementationRevision": "feature-producer-commit-or-release-id",
+  "study": null
 }
 ```
 
-Use this object as `policy`. Split ends are inclusive and strictly increasing. Examples after
-`testEndUnixNanos` are not admitted.
+Use this object as `policy` for a genuinely generic, unqualified request. `study` is required:
+explicit null means unqualified; omitting it is invalid. Split ends are inclusive and strictly
+increasing. Examples after `testEndUnixNanos` in their declared chronological basis are not admitted.
+
+A qualified request supplies the complete `study` object instead, for example:
+
+```json
+{
+  "basis": "retrospective_frozen_snapshot",
+  "purpose": "study_inputs",
+  "snapshotAsOfUnixNanos": 1767225600000000000,
+  "decisionLagNanos": 0,
+  "targetHorizonNanos": 31536000000000000
+}
+```
+
+Those values illustrate the closed policy shape. A real request must use its actual frozen source
+cutoff and matching source-backed examples. `basis` is `historical_as_known` or
+`retrospective_frozen_snapshot`; `purpose` is `training` or `study_inputs`. All fields are required,
+including explicit `decisionLagNanos: null` for historical-as-known data. Retrospective lag is a
+nonnegative declared assumption smaller than the positive target horizon; zero does not claim an
+execution fill at the close. Required study limitations come from the data policy, not caller choice.
+
+| Basis/purpose | Source and label clocks | Financial coordinates and partition rule |
+| --- | --- | --- |
+| Unqualified (`study: null`) | Source selection equals decision; label selection is strictly later | Both effective coordinates are explicit; label knowledge must fit its chronological partition |
+| Historical-as-known Training | Genuine source availability passes unchanged PIT at source selection; label knowledge advances | Label knowledge is purged beyond each partition end |
+| Retrospective Training | Feature and label selection both equal the actual snapshot | Decision equals completed origin plus declared lag; exact target must be mature and is purged beyond its economic partition end |
+| StudyInputs | Explicit null label selection, no label component or terminal selector | Every predeclared origin remains even when its exact target is missing or immature; partition by the declared basis |
+
+For qualified completed-close price recipes, `effectiveCutoff` is the authentic completed bar
+close and `labelEffectiveCutoff` is that origin plus the exact declared horizon. Preserve the
+provider timestamp in each source selector. Do not use acquisition time as the financial origin,
+move the target to decision plus horizon, or substitute a nearby trading session. The phase-one
+CLI still grants no closed product receipt, forecast admission, or live recommendation authority.
 
 `revisionMode` means:
 

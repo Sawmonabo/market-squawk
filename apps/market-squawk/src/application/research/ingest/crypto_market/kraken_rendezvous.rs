@@ -91,14 +91,20 @@ impl SourceObjectKey {
 
     fn direct(
         handoff: &CoinbaseMarketHandoff,
-    ) -> Result<(Self, Self, usize), CryptoMarketPublicationError> {
-        let CoinbaseMarketRawLineage::DirectInitial(lineage) = handoff.raw_lineage() else {
-            return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+    ) -> Result<(Option<Self>, Self, usize), CryptoMarketPublicationError> {
+        let (snapshot, frames, initial) = match handoff.raw_lineage() {
+            CoinbaseMarketRawLineage::DirectInitial(lineage) => {
+                (lineage.snapshot().receipt(), lineage.replay(), true)
+            }
+            CoinbaseMarketRawLineage::DirectSuccessor(lineage) => {
+                (lineage.snapshot(), lineage.frames(), false)
+            }
+            CoinbaseMarketRawLineage::AdvancedTrade(_) => {
+                return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+            }
         };
         let decoder = handoff.typed_batch().evidence();
-        let snapshot = lineage.snapshot().receipt();
-        let terminal = lineage
-            .replay()
+        let terminal = frames
             .last()
             .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
         if terminal.decoder_evidence().frame_id() != decoder.frame_id()
@@ -112,19 +118,19 @@ impl SourceObjectKey {
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
         Ok((
-            Self {
+            initial.then(|| Self {
                 source_id: snapshot.source_id().clone(),
                 generation: snapshot.connection_generation(),
                 coordinate: SourceObjectCoordinate::HttpResponse(snapshot.coordinate_digest()),
                 raw_payload_digest: snapshot.body_digest(),
-            },
+            }),
             Self {
                 source_id: decoder.binding().source_id().clone(),
                 generation: decoder.binding().connection_generation(),
                 coordinate: SourceObjectCoordinate::TransportFrame(decoder.frame_id().get()),
                 raw_payload_digest: decoder.payload_digest(),
             },
-            lineage.replay().len(),
+            frames.len(),
         ))
     }
 
@@ -371,22 +377,49 @@ impl CryptoPendingFrameIngress {
         let (snapshot_key, terminal_key, replay_count) = SourceObjectKey::direct(&handoff)?;
         let retained_bytes = direct_retained_bytes(&handoff)
             .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
-        let snapshot = self.wait_for_rows(snapshot_key, 1, retained_bytes).await;
+        let initial = snapshot_key.is_some();
+        let snapshot = match snapshot_key {
+            Some(key) => self.wait_for_rows(key, 1, retained_bytes).await,
+            None => None,
+        };
         let terminal = self.wait_for_rows(terminal_key, 1, retained_bytes).await;
-        let qualification = match (snapshot, terminal) {
-            (Some(mut snapshot), Some(mut terminal)) => {
-                let initial_snapshot = snapshot
-                    .pop()
-                    .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?
-                    .into_observation()
-                    .into_parts()
-                    .event;
+        let (qualification, native_selections, precommit_authority) = match (snapshot, terminal) {
+            (snapshot, Some(mut terminal)) if !initial || snapshot.is_some() => {
                 let replay = terminal
                     .pop()
                     .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?
-                    .into_observation()
-                    .into_parts()
-                    .event;
+                    .into_observation();
+                let mut committed = Vec::new();
+                committed
+                    .try_reserve_exact(if initial { 2 } else { 1 })
+                    .map_err(|_| CryptoMarketPublicationError::RendezvousUnavailable)?;
+                if let Some(mut snapshot) = snapshot {
+                    committed.push(
+                        snapshot
+                            .pop()
+                            .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?
+                            .into_observation(),
+                    );
+                }
+                committed.push(replay);
+                let (selections, authority) = super::committed_publication_authority(
+                    &committed,
+                    observed_at,
+                    precommit_authority,
+                )?;
+                let mut events = committed.into_iter().map(|row| row.into_parts().event);
+                let initial_snapshot = if initial {
+                    Some(
+                        events
+                            .next()
+                            .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?,
+                    )
+                } else {
+                    None
+                };
+                let replay = events
+                    .next()
+                    .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
                 let terminal_ordinal = replay_count
                     .checked_sub(1)
                     .and_then(|ordinal| u16::try_from(ordinal).ok())
@@ -401,19 +434,33 @@ impl CryptoPendingFrameIngress {
                         CoinbaseMarketOmissionReason::UnsupportedCanonicalFamily,
                     ));
                 }
-                CoinbaseMarketQualificationOutcome::Qualified(
-                    CoinbaseQualifiedMarketPublication::ExchangeDirect {
+                let rows = vec![CoinbaseQualifiedDirectReplayRow::new(
+                    terminal_ordinal,
+                    replay,
+                )];
+                let qualified = match initial_snapshot {
+                    Some(initial_snapshot) => CoinbaseQualifiedMarketPublication::ExchangeDirect {
                         initial_snapshot,
-                        replay_rows: vec![CoinbaseQualifiedDirectReplayRow::new(
-                            terminal_ordinal,
-                            replay,
-                        )],
+                        replay_rows: rows,
                         replay_omissions,
                     },
+                    None => CoinbaseQualifiedMarketPublication::ExchangeDirectSuccessor {
+                        rows,
+                        omissions: replay_omissions,
+                    },
+                };
+                (
+                    CoinbaseMarketQualificationOutcome::Qualified(qualified),
+                    Some(selections),
+                    authority,
                 )
             }
-            _ => CoinbaseMarketQualificationOutcome::Unavailable(
-                CoinbaseMarketNonPublicationReason::ApplicationBackpressure,
+            _ => (
+                CoinbaseMarketQualificationOutcome::Unavailable(
+                    CoinbaseMarketNonPublicationReason::ApplicationBackpressure,
+                ),
+                None,
+                precommit_authority,
             ),
         };
         let deadline = Instant::now()
@@ -424,6 +471,7 @@ impl CryptoPendingFrameIngress {
                 handoff,
                 context,
                 qualification,
+                native_selections,
                 analytical_dataset,
                 idempotency_key,
                 observed_at,
@@ -619,21 +667,28 @@ impl CryptoCommittedRowIngress {
 }
 
 fn direct_retained_bytes(handoff: &CoinbaseMarketHandoff) -> Option<usize> {
-    let CoinbaseMarketRawLineage::DirectInitial(lineage) = handoff.raw_lineage() else {
-        return None;
+    let (snapshot, frames, body_bytes) = match handoff.raw_lineage() {
+        CoinbaseMarketRawLineage::DirectInitial(lineage) => (
+            lineage.snapshot().receipt(),
+            lineage.replay(),
+            usize::try_from(lineage.snapshot().receipt().body_length()).ok()?,
+        ),
+        CoinbaseMarketRawLineage::DirectSuccessor(lineage) => {
+            (lineage.snapshot(), lineage.frames(), 0)
+        }
+        CoinbaseMarketRawLineage::AdvancedTrade(_) => return None,
     };
-    let snapshot = lineage.snapshot().receipt();
     std::mem::size_of::<CoinbaseMarketHandoff>()
         .checked_add(handoff.typed_batch().retained_bytes().ok()?)?
-        .checked_add(usize::try_from(snapshot.body_length()).ok()?)?
+        .checked_add(body_bytes)?
         .checked_add(snapshot.final_url().len())?
         .checked_add(snapshot.segments().len().checked_mul(std::mem::size_of::<
             market_squawk_sources::HttpResponseSegmentReceipt,
         >())?)?
-        .checked_add(lineage.replay().len().checked_mul(std::mem::size_of::<
+        .checked_add(frames.len().checked_mul(std::mem::size_of::<
             market_squawk_adapter_coinbase::CoinbaseDirectReplayFrame,
         >())?)?
-        .checked_add(lineage.replay().iter().try_fold(0_usize, |total, frame| {
+        .checked_add(frames.iter().try_fold(0_usize, |total, frame| {
             total.checked_add(frame.raw_payload().as_bytes().len())
         })?)
 }

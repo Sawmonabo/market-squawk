@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::mem::size_of;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,9 +22,9 @@ use market_squawk_sources::{
     ExtractionRecord, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
     ExtractionSource, ExtractionSourceError, MAX_EXTRACTION_RECORD_BYTES,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ObservedProviderOrder, ProviderCaptureMaterial,
-    ProviderCaptureScope, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
     ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
-    SealedProviderCaptureBinding, SourceError, SourceMetadataProvider, SourceObject,
+    ProviderWholeCaptureToken, SourceError, SourceMetadataProvider, SourceObject,
     SourceObjectCaptureIdentity,
 };
 use serde::Serialize;
@@ -82,7 +83,7 @@ struct DiscoveredSecMaterial {
 /// Non-serializable authority proving one filing root belongs to the requested captured
 /// submissions/accession and exactly matches this source's retained representation and raw bytes.
 pub(crate) struct AdmittedFilingXbrlRoot {
-    sealed_root: SealedProviderCaptureBinding,
+    sealed_root: ProviderWholeCaptureToken,
     filing: SecFilingXbrlCoordinates,
     filing_document: RetrievedSecBytes,
     filing_representation: SecRepresentation,
@@ -202,6 +203,53 @@ impl SecPendingFilingXbrlAdmission {
     }
 }
 
+// Immutable parser inputs retained after the exact capture graph and taxonomy were verified.
+struct SecPreparedFilingXbrlExtraction {
+    dataset: SecResearchDataset,
+    submissions: RetrievedSubmissions,
+    filing_document: RetrievedSecBytes,
+    document_context: XbrlDocumentContext,
+    identities: Arc<ProviderIdentityRegistry>,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    parser_limits: SecParserLimits,
+}
+
+impl SecPreparedFilingXbrlExtraction {
+    fn checked_retained_bytes(&self) -> Result<usize, SecClientError> {
+        let submissions = self.submissions.checked_retained_bytes()?;
+        let document = self.filing_document.checked_retained_bytes()?;
+        let company = self.submissions.document().company_metadata();
+        let company_slots = company
+            .former_names()
+            .len()
+            .checked_mul(size_of::<FormerCompanyName>())
+            .and_then(|n| {
+                n.checked_add(
+                    company
+                        .ticker_exchange_pairs()
+                        .len()
+                        .checked_mul(size_of::<ProviderReportedSecurityAssociation>())?,
+                )
+            })
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(size_of::<CompanyIdentityObservation>()))
+            .ok_or(SecClientError::ResponseTooLarge)?;
+        size_of::<Self>()
+            .checked_add(self.dataset.checked_dynamic_retained_bytes().ok_or(SecClientError::ResponseTooLarge)?)
+            .and_then(|n| n.checked_add(submissions))
+            // Reserve the full source allocation again for projected company strings/evidence,
+            // plus destination vector capacity and header before projection construction.
+            .and_then(|n| n.checked_add(submissions))
+            .and_then(|n| n.checked_add(company_slots))
+            .and_then(|n| n.checked_add(document))
+            .and_then(|n| n.checked_add(self.document_context.checked_dynamic_retained_bytes(self.dataset.xbrl_taxonomy()?)?))
+            .and_then(|n| n.checked_add(self.source_id.retained_bytes()))
+            .and_then(|n| n.checked_add(self.metadata_revision.as_source_identifier().retained_bytes()))
+            .ok_or(SecClientError::ResponseTooLarge)
+    }
+}
+
 /// Closed filing-XBRL capture graph ready for bounded canonical extraction.
 ///
 /// Construction proves the accession belongs to the exact captured current submissions object,
@@ -209,7 +257,7 @@ impl SecPendingFilingXbrlAdmission {
 /// taxonomy artifact is an exact captured official artifact. Consumption produces the canonical
 /// batch and the same one-use raw graph material; callers cannot replace either half.
 pub struct SecFilingXbrlCaptureHandoff {
-    pending: SecPendingFilingXbrlAdmission,
+    pending: SecPreparedFilingXbrlExtraction,
     capture_material: ProviderCaptureMaterial,
 }
 
@@ -218,7 +266,14 @@ impl std::fmt::Debug for SecFilingXbrlCaptureHandoff {
         formatter
             .debug_struct("SecFilingXbrlCaptureHandoff")
             .field("dataset", self.pending.dataset.dataset())
-            .field("accession", self.pending.filing.accession())
+            .field(
+                "accession",
+                &self
+                    .pending
+                    .dataset
+                    .filing_xbrl_coordinates()
+                    .map(SecFilingXbrlCoordinates::accession),
+            )
             .field("capture", self.capture_material.receipt())
             .finish_non_exhaustive()
     }
@@ -477,9 +532,9 @@ impl SecEdgarSource {
 
     /// Extracts SEC analytical records with company identity from the same exact source bytes.
     ///
-    /// The ordinary [`ExtractionSource`] implementation delegates here and discards only the
-    /// adapter-specific sidecar. Callers that own company-identity publication use this method so
-    /// no second raw-store read or parser pass is required.
+    /// The capture-first application bridge consumes this result together with exact raw material.
+    /// The generic [`ExtractionSource`] entry point cannot publish SEC company evidence; the
+    /// application retains company identity and mandatory native lineage from this same parse.
     pub fn extract_with_company_identity(
         &self,
         authority: ExtractionAuthority,
@@ -529,8 +584,8 @@ impl SecEdgarSource {
     clippy::too_many_arguments,
     reason = "captured filing, source authority, parser bounds, and exact taxonomy bodies remain explicit"
 )]
-pub(crate) fn admit_filing_xbrl_root_from_sealed_binding(
-    sealed_root: SealedProviderCaptureBinding,
+pub(crate) fn admit_filing_xbrl_root_from_sealed_capture(
+    sealed_root: ProviderWholeCaptureToken,
     raw_store: Arc<RawEvidenceStore>,
     representation_registry: Arc<SecRepresentationRegistry>,
     source_id: SourceId,
@@ -541,9 +596,9 @@ pub(crate) fn admit_filing_xbrl_root_from_sealed_binding(
     filing_document: &RetrievedSecBytes,
     cancellation: &CancellationToken,
 ) -> Result<AdmittedFilingXbrlRoot, SecClientError> {
-    sealed_root
-        .validate()
-        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    if Some(sealed_root.persisted_receipt().capture()) != filing_document.capture_receipt() {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
     let filing = SecFilingXbrlCoordinates::from_captured_current_submissions(
         submissions,
         accession,
@@ -564,24 +619,15 @@ pub(crate) fn admit_filing_xbrl_root_from_sealed_binding(
     let receipt = filing_document
         .capture_receipt()
         .ok_or(SecClientError::InvalidCaptureMaterial)?;
-    let batch = sealed_root.batch();
-    let object = batch.request().object();
-    let record = batch
-        .records()
-        .first()
-        .filter(|_| batch.records().len() == 1)
-        .ok_or(SecClientError::InvalidCompositeRepresentation)?;
-    if sealed_root.scope() != ProviderCaptureScope::Whole
-        || sealed_root.native_lineage().schema().implementation()
-            != ProviderNativeLineageImplementation::SecEdgarV1
-        || sealed_root.capture_evidence() != receipt
-        || object.source_id() != &source_id
-        || object.metadata_revision() != &metadata_revision
-        || object.dataset().as_str() != locator.url()
-        || object.object_id().as_str() != locator.url()
-        || object.evidence().content_digest() != filing_document.evidence()
-        || record.payload().as_ref() != filing_document.bytes().as_ref()
-        || record.evidence().content_digest() != filing_document.evidence()
+    if receipt.source_id() != &source_id
+        || receipt.metadata_revision() != &metadata_revision
+        || receipt.dataset().as_str() != locator.url()
+        || receipt.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+        || receipt.pages().len() != 1
+        || receipt.pages()[0].body_digest() != filing_document.evidence()
+        || receipt.pages()[0].body_bytes()
+            != u64::try_from(filing_document.bytes().len())
+                .map_err(|_| SecClientError::ResponseTooLarge)?
     {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
@@ -623,9 +669,9 @@ pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
         filing_document,
         filing_representation,
     } = admitted_root;
-    sealed_root
-        .validate()
-        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    if Some(sealed_root.persisted_receipt().capture()) != filing_document.capture_receipt() {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
     let taxonomy = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
         Arc::clone(&raw_store),
         &source_id,
@@ -650,8 +696,38 @@ pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
         parser_limits,
     };
     let (pending, capture_material) = pending.into_sealing_parts(cancellation)?;
+    // Finish immutable custody validation before minting the opaque extraction capability. This
+    // context cannot be substituted by a caller. Mutable source/lifecycle authority is still
+    // checked on every extraction and at shared publication.
+    let document_context = XbrlDocumentContext::from_validated_taxonomy(
+        pending.filing.accession().clone(),
+        SourceIdentifier::try_from(pending.filing.cik())?,
+        &pending.taxonomy,
+        retrieved_payload_evidence(&pending.filing_document)?,
+        pending.filing_document.received_at(),
+        cancellation,
+    )?;
+    let SecPendingFilingXbrlAdmission {
+        dataset,
+        submissions,
+        filing_document,
+        identities,
+        source_id,
+        metadata_revision,
+        parser_limits,
+        ..
+    } = pending;
     Ok(SecFilingXbrlCaptureHandoff {
-        pending,
+        pending: SecPreparedFilingXbrlExtraction {
+            dataset,
+            submissions,
+            filing_document,
+            document_context,
+            identities,
+            source_id,
+            metadata_revision,
+            parser_limits,
+        },
         capture_material,
     })
 }
@@ -683,7 +759,7 @@ impl ExtractionSource for SecEdgarSource {
     reason = "the closed graph, exact extraction bounds, deadline, and authorities remain explicit"
 )]
 fn extract_filing_xbrl_handoff(
-    pending: SecPendingFilingXbrlAdmission,
+    pending: SecPreparedFilingXbrlExtraction,
     capture_material: ProviderCaptureMaterial,
     authority: ExtractionAuthority,
     max_records: NonZeroU32,
@@ -695,7 +771,21 @@ fn extract_filing_xbrl_handoff(
     if cancellation.is_cancelled() {
         return Err(SecClientError::Cancelled);
     }
-    pending.revalidate(cancellation)?;
+    let maximum = usize::try_from(max_bytes.get().min(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES))
+        .map_err(|_| SecClientError::ResponseTooLarge)?;
+    let fixed_retained = pending
+        .checked_retained_bytes()?
+        .checked_add(capture_material.checked_plain_retained_bytes()?)
+        .ok_or(SecClientError::ResponseTooLarge)?;
+    // Canonical serialization may retain both the growing buffer and its ownership transition.
+    let record_scratch = MAX_EXTRACTION_RECORD_BYTES
+        .checked_mul(2)
+        .ok_or(SecClientError::ResponseTooLarge)?;
+    let parser_admission = maximum
+        .checked_sub(fixed_retained)
+        .and_then(|n| n.checked_sub(record_scratch))
+        .filter(|n| *n > 0)
+        .ok_or(SecClientError::ResponseTooLarge)?;
     if authority.metadata().source_id() != &pending.source_id
         || authority.metadata().revision() != &pending.metadata_revision
     {
@@ -728,7 +818,11 @@ fn extract_filing_xbrl_handoff(
         .map(|page| page.received_at())
         .max()
         .ok_or(SecClientError::InvalidCaptureMaterial)?;
-    let (published_at, availability) = filing_discovery_availability(&pending.filing, received_at)?;
+    let filing = pending
+        .dataset
+        .filing_xbrl_coordinates()
+        .ok_or(SecClientError::InvalidCompositeRepresentation)?;
+    let (published_at, availability) = filing_discovery_availability(filing, received_at)?;
     let discovery = DiscoveryRequest::try_new(
         pending.dataset.dataset().clone(),
         None,
@@ -741,7 +835,7 @@ fn extract_filing_xbrl_handoff(
         pending.metadata_revision.clone(),
         &discovery,
         pending.dataset.source_object_id().clone(),
-        filing_media_type(pending.filing.document())?,
+        filing_media_type(filing.document())?,
         ExactPayloadEvidence::from_content_digest(capture.content_digest()),
         SourceObjectCaptureIdentity::try_from_capture(capture)?,
         EffectiveInterval::new(received_at, None)
@@ -754,19 +848,34 @@ fn extract_filing_xbrl_handoff(
     let request = ExtractionRequest::try_new(object, max_records, max_bytes, deadline)
         .map_err(map_extraction_contract_error)?;
 
-    let filing_payload = retrieved_payload_evidence(&pending.filing_document)?;
-    let document_context = XbrlDocumentContext::from_validated_taxonomy(
-        pending.filing.accession().clone(),
-        SourceIdentifier::try_from(pending.filing.cik())?,
-        &pending.taxonomy,
-        filing_payload,
-        pending.filing_document.received_at(),
-        cancellation,
-    )?;
+    let request_retained = usize::try_from(
+        request
+            .dynamic_retained_bytes()
+            .map_err(map_extraction_contract_error)?,
+    )
+    .map_err(|_| SecClientError::ResponseTooLarge)?
+    .checked_add(size_of::<ExtractionRequest>())
+    .ok_or(SecClientError::ResponseTooLarge)?;
+    // Original/local/accumulator requests and two in-flight record metadata/clone allowances.
+    let request_owners = request_retained
+        .checked_mul(5)
+        .ok_or(SecClientError::ResponseTooLarge)?;
+    let parser_admission = parser_admission
+        .checked_sub(request_owners)
+        .filter(|n| *n > 0)
+        .ok_or(SecClientError::ResponseTooLarge)?;
+    let parser_limits = pending
+        .parser_limits
+        .intersect(request_parser_limits(
+            &request,
+            pending.filing_document.bytes().len(),
+            0,
+        )?)?
+        .with_retained_bytes(parser_admission)?;
     let document = XbrlDocumentParser::parse_with_cancellation(
         pending.filing_document.bytes(),
-        pending.parser_limits,
-        document_context,
+        parser_limits,
+        pending.document_context,
         cancellation,
     )?;
     let ingested_at = crate::client::system_timestamp()?;
@@ -785,8 +894,24 @@ fn extract_filing_xbrl_handoff(
         pending.filing_document.evidence(),
         pending.filing_document.received_at(),
         ingested_at,
+        parser_admission,
         cancellation,
     )?;
+    let normalization_retained = normalized.working_set_retained_bytes();
+    let canonical_admission = parser_admission
+        .checked_sub(normalization_retained)
+        .filter(|n| *n > 0)
+        .ok_or(SecClientError::ResponseTooLarge)?;
+    let request = ExtractionRequest::try_new(
+        request.object().clone(),
+        max_records,
+        NonZeroU64::new(
+            u64::try_from(canonical_admission).map_err(|_| SecClientError::ResponseTooLarge)?,
+        )
+        .ok_or(SecClientError::ResponseTooLarge)?,
+        deadline,
+    )
+    .map_err(map_extraction_contract_error)?;
     let mut records =
         ExtractionBatchAccumulator::try_new(&request).map_err(map_extraction_contract_error)?;
     while let Some(observation) = normalized.try_next_observation(cancellation)? {
@@ -804,14 +929,35 @@ fn extract_filing_xbrl_handoff(
     if batch.records().is_empty() {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
+    let batch_retained =
+        usize::try_from(batch.total_bytes().map_err(map_extraction_contract_error)?)
+            .map_err(|_| SecClientError::ResponseTooLarge)?;
+    let row_map_retained = batch
+        .records()
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|n| n.checked_mul(2))
+        .ok_or(SecClientError::ResponseTooLarge)?;
+    let native_admission = canonical_admission
+        .checked_sub(batch_retained)
+        .and_then(|n| n.checked_sub(row_map_retained))
+        .filter(|n| *n > 0)
+        .ok_or(SecClientError::ResponseTooLarge)?;
     let native_lineage = normalized
         .into_native_lineage()?
-        .try_into_provider_native_lineage(&batch)
+        .try_into_provider_native_lineage(&batch, native_admission)
         .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
     let mut row_capture_page_ordinals = Vec::new();
     row_capture_page_ordinals
         .try_reserve_exact(batch.records().len())
         .map_err(|_| SecClientError::AllocationFailed)?;
+    if row_capture_page_ordinals
+        .capacity()
+        .checked_mul(size_of::<u16>())
+        .is_none_or(|bytes| bytes > row_map_retained)
+    {
+        return Err(SecClientError::ResponseTooLarge);
+    }
     row_capture_page_ordinals.resize(batch.records().len(), 1);
     authority.validate_current()?;
     Ok((
@@ -1253,6 +1399,9 @@ fn company_identity_from_submissions(
     former_names
         .try_reserve_exact(metadata.former_names().len())
         .map_err(|_| SecClientError::AllocationFailed)?;
+    if former_names.capacity() > metadata.former_names().len().saturating_mul(2) {
+        return Err(SecClientError::AllocationFailed);
+    }
     for former_name in metadata.former_names() {
         if cancellation.is_cancelled() {
             return Err(SecClientError::Cancelled);
@@ -1267,6 +1416,9 @@ fn company_identity_from_submissions(
     associations
         .try_reserve_exact(metadata.ticker_exchange_pairs().len())
         .map_err(|_| SecClientError::AllocationFailed)?;
+    if associations.capacity() > metadata.ticker_exchange_pairs().len().saturating_mul(2) {
+        return Err(SecClientError::AllocationFailed);
+    }
     for association in metadata.ticker_exchange_pairs() {
         if cancellation.is_cancelled() {
             return Err(SecClientError::Cancelled);
@@ -1601,9 +1753,19 @@ impl Write for CanonicalRecordWriter<'_> {
         if new_len > MAX_EXTRACTION_RECORD_BYTES {
             return Err(std::io::Error::other("SEC canonical record is too large"));
         }
-        self.payload
-            .try_reserve(buffer.len())
-            .map_err(|_| std::io::Error::other("SEC canonical record allocation failed"))?;
+        if new_len > self.payload.capacity() {
+            let capacity = new_len
+                .max(self.payload.capacity().saturating_mul(2).max(8))
+                .min(MAX_EXTRACTION_RECORD_BYTES);
+            self.payload
+                .try_reserve_exact(capacity - self.payload.len())
+                .map_err(|_| std::io::Error::other("SEC canonical record allocation failed"))?;
+        }
+        if self.payload.capacity() > MAX_EXTRACTION_RECORD_BYTES {
+            return Err(std::io::Error::other(
+                "SEC canonical record allocation exceeds admission",
+            ));
+        }
         self.payload.extend_from_slice(buffer);
         Ok(buffer.len())
     }

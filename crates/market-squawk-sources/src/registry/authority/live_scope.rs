@@ -27,6 +27,7 @@ pub struct ValidatedLiveScope {
     budget: CurrentBudgetAuthority,
     clock: Arc<SealedRegistryClock>,
     universe_evidence: Option<ExactPayloadEvidence>,
+    provider_identity: CurrentProviderIdentity,
 }
 
 impl ValidatedLiveScope {
@@ -60,6 +61,8 @@ impl ValidatedLiveScope {
     /// Fails after health/subscription change, session/revision rollover, or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         let trusted = self.clock.observe()?;
+        self.provider_identity.validate_at(trusted.wall())?;
+        self.provider_identity.validate_at(at)?;
         if trusted.monotonic() < self.trusted_valid_from_monotonic {
             return Err(RegistryError::TrustedClockRegression);
         }
@@ -157,7 +160,12 @@ impl ValidatedLiveScope {
         self,
         observation: crate::ProviderNormalizedObservation,
         evidence: CurrentObservationEvidence,
+        row_ordinal: usize,
+        row_count: usize,
     ) -> Result<CurrentProviderObservation, RegistryError> {
+        if row_count == 0 || row_count > crate::MAX_DECODED_EVENTS || row_ordinal >= row_count {
+            return Err(RegistryError::DecoderProfileMismatch);
+        }
         let crate::SourceProtocolProfile::Live(protocol) = self.protocol else {
             return Err(RegistryError::DecoderProfileMismatch);
         };
@@ -189,6 +197,9 @@ impl ValidatedLiveScope {
         };
         Ok(CurrentProviderObservation {
             key,
+            provider_identity: self.provider_identity,
+            row_ordinal,
+            row_count,
             evidence,
             observation,
             policy: CurrentLivePolicy {

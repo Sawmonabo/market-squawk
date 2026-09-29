@@ -81,6 +81,9 @@ pub struct CoinbaseDirectAccountActivation {
     onboarding: Arc<ProviderOnboardingService>,
     app_config: AppConfig,
     _provider_rate: ProviderRateAuthority,
+    catalog_reader: market_squawk_data::MarketDataInstrumentReadCapability,
+    catalog_synchronizer: market_squawk_data::MarketDataInstrumentSynchronizationCapability,
+    research_service: Arc<crate::ResearchService>,
     account_subject: SourceIdentifier,
     admission: CoinbaseDirectRuntimeAdmission,
     product_count: usize,
@@ -148,6 +151,18 @@ impl CoinbaseDirectAccountActivation {
         &self._provider_rate
     }
 
+    pub(crate) fn catalog_reader(&self) -> market_squawk_data::MarketDataInstrumentReadCapability {
+        self.catalog_reader.clone()
+    }
+
+    pub(crate) fn catalog_synchronizer(&self) -> market_squawk_data::MarketDataInstrumentSynchronizationCapability {
+        self.catalog_synchronizer.clone()
+    }
+
+    pub(crate) fn research_service(&self) -> Arc<crate::ResearchService> {
+        Arc::clone(&self.research_service)
+    }
+
     pub(crate) fn take_products(
         &mut self,
     ) -> [Option<CoinbaseDirectProductActivation>; COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS] {
@@ -203,6 +218,9 @@ pub(super) fn activate_coinbase_direct(
     onboarding: Arc<ProviderOnboardingService>,
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
+    catalog_reader: market_squawk_data::MarketDataInstrumentReadCapability,
+    catalog_synchronizer: market_squawk_data::MarketDataInstrumentSynchronizationCapability,
+    research_service: Arc<crate::ResearchService>,
     lease: ProviderActivationLease,
     spec: CoinbaseDirectAdapterActivation,
     publication_packages: Vec<CoinbaseMarketPublicationPackage>,
@@ -250,6 +268,9 @@ pub(super) fn activate_coinbase_direct(
         onboarding,
         app_config,
         _provider_rate: provider_rate,
+        catalog_reader,
+        catalog_synchronizer,
+        research_service,
         account_subject,
         admission,
         product_count,

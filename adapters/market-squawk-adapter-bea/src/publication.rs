@@ -10,6 +10,7 @@ use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionRecord, ExtractionRevisionPlan,
     ProviderCaptureScope, ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
     ProviderNativeLineageImplementation, SealedProviderCaptureBinding,
+    SealedProviderCaptureSetReceipt,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -101,12 +102,12 @@ impl BeaPublicationRejoinCoordinates {
         self.doctor_sealed_graph_digest
     }
 
-    /// Returns the physical request graph containing these canonical rows.
+    /// Returns the aggregate commitment joining metadata admission and observation seal.
     pub const fn acquisition_sealed_graph_digest(&self) -> EvidenceDigest {
         self.acquisition_sealed_graph_digest
     }
 
-    /// Returns the shared seal receipt for the complete acquisition graph.
+    /// Returns the shared seal receipt for the standalone observation response.
     pub const fn acquisition_capture_receipt_digest(&self) -> EvidenceDigest {
         self.acquisition_capture_receipt_digest
     }
@@ -116,7 +117,7 @@ impl BeaPublicationRejoinCoordinates {
         self.acquisition_physical_receipt_digest
     }
 
-    /// Returns the graph component containing the exact `GetData` response.
+    /// Returns the page ordinal containing the exact standalone `GetData` response.
     pub const fn data_component_ordinal(&self) -> u16 {
         self.data_component_ordinal
     }
@@ -169,6 +170,7 @@ pub struct BeaPublicationCandidate {
     observations: Vec<BeaCanonicalObservation>,
     revision_plan: ExtractionRevisionPlan,
     sealed_capture_binding: SealedProviderCaptureBinding,
+    metadata_capture: SealedProviderCaptureSetReceipt,
     source_batch_digest: EvidenceDigest,
 }
 
@@ -271,21 +273,20 @@ impl BeaPublicationCandidate {
         if capture_token.persisted_receipt() != sealed_acquisition.sealed_capture() {
             return Err(BeaPublicationError::InvalidAuthority);
         }
-        let data_component = capture_token
-            .persisted_receipt()
-            .capture()
-            .request_graph_components()
-            .get(usize::from(coordinates.data_component_ordinal))
-            .ok_or(BeaPublicationError::InvalidEvidence)?;
-        if data_component.page_count().get() != 1 {
+        let data_capture = capture_token.persisted_receipt().capture();
+        if coordinates.data_component_ordinal != 0
+            || !data_capture.request_graph_components().is_empty()
+            || data_capture.pages().len() != 1
+        {
             return Err(BeaPublicationError::InvalidEvidence);
         }
+        let data_page_ordinal = data_capture.pages()[0].ordinal();
         let mut row_capture_page_ordinals = Vec::new();
         row_capture_page_ordinals
             .try_reserve_exact(canonical_batch.records().len())
             .map_err(|_| BeaPublicationError::InvalidEvidence)?;
         row_capture_page_ordinals.extend(std::iter::repeat_n(
-            data_component.first_page_ordinal(),
+            data_page_ordinal,
             canonical_batch.records().len(),
         ));
         let sealed_capture_binding = SealedProviderCaptureBinding::try_whole(
@@ -297,11 +298,13 @@ impl BeaPublicationCandidate {
         .map_err(|_| BeaPublicationError::InvalidEvidence)?;
         coordinates.candidate_digest =
             candidate_digest(&coordinates, &revision_plan, source_batch_digest)?;
+        let metadata_capture = sealed_acquisition.metadata_capture().clone();
         let candidate = Self {
             coordinates,
             observations,
             revision_plan,
             sealed_capture_binding,
+            metadata_capture,
             source_batch_digest,
         };
         candidate.validate()?;
@@ -315,7 +318,10 @@ impl BeaPublicationCandidate {
             .sealed_capture_binding
             .persisted_segment_receipt(0)
             .ok_or(BeaPublicationError::InvalidEvidence)?;
-        if self.observations.is_empty()
+        if self.metadata_capture.capture().source_id() != &coordinates.source_id
+            || self.metadata_capture.capture().metadata_revision() != &coordinates.metadata_revision
+            || self.metadata_capture.capture().dataset() != &coordinates.dataset_id
+            || self.observations.is_empty()
             || self.revision_plan.len() != self.observations.len()
             || !self.revision_plan.is_locally_observed()
             || !self.revision_plan.native_lineage_required()
@@ -376,12 +382,14 @@ impl BeaPublicationCandidate {
             observations: _,
             revision_plan,
             sealed_capture_binding,
+            metadata_capture,
             source_batch_digest: _,
         } = self;
         BeaSharedPublicationParts {
             coordinates,
             revision_plan,
             sealed_capture_binding,
+            metadata_capture,
         }
     }
 }
@@ -392,6 +400,7 @@ pub struct BeaSharedPublicationParts {
     coordinates: BeaPublicationRejoinCoordinates,
     revision_plan: ExtractionRevisionPlan,
     sealed_capture_binding: SealedProviderCaptureBinding,
+    metadata_capture: SealedProviderCaptureSetReceipt,
 }
 
 impl BeaSharedPublicationParts {
@@ -427,13 +436,152 @@ impl BeaSharedPublicationParts {
         BeaPublicationRejoinCoordinates,
         ExtractionRevisionPlan,
         SealedProviderCaptureBinding,
+        SealedProviderCaptureSetReceipt,
     ) {
         (
             self.coordinates,
             self.revision_plan,
             self.sealed_capture_binding,
+            self.metadata_capture,
         )
     }
+}
+
+/// Native identity decoded only from an independently verified durable BEA lineage row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeaNativePublishedSeriesCoordinate {
+    series: SourceIdentifier,
+    unit: SourceIdentifier,
+    cl_unit: String,
+    unit_multiplier: i16,
+}
+impl BeaNativePublishedSeriesCoordinate {
+    /// Returns the original canonical series identity, including regional dimensions.
+    pub const fn canonical_series(&self) -> &SourceIdentifier {
+        &self.series
+    }
+    /// Returns the canonical base unit after the original exact scale conversion.
+    pub const fn canonical_unit(&self) -> &SourceIdentifier {
+        &self.unit
+    }
+    /// Returns a display unit consistent with the already-scaled canonical value.
+    pub fn canonical_unit_label(&self) -> Option<&'static str> {
+        match (self.cl_unit.as_str(), self.unit_multiplier) {
+            ("Dollars", _) | ("Millions of dollars", 6) => Some("Dollars"),
+            ("Millions of dollars", 0) => Some("Millions of dollars"),
+            _ => None,
+        }
+    }
+}
+
+/// Decodes the selected Regional SAINC1 California annual personal-income coordinate.
+///
+/// This function supplies no publication or custody authority. Callers must first verify the
+/// original native batch, physical capture, and selected canonical row through the shared store.
+pub fn decode_bea_california_personal_income_coordinate(
+    payload: &[u8],
+) -> Result<Option<BeaNativePublishedSeriesCoordinate>, BeaPublicationError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Row {
+        dataset: String,
+        table: Option<String>,
+        line: Option<String>,
+        dimensions: std::collections::BTreeMap<String, String>,
+        period: String,
+        frequency: String,
+        value: Option<String>,
+        raw_value: Option<String>,
+        missing: Option<String>,
+        missing_marker: Option<String>,
+        cl_unit: String,
+        unit_multiplier: i16,
+        note_references: Vec<String>,
+        notes: Vec<Note>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Note {
+        reference: String,
+        text: String,
+    }
+    if payload.is_empty() || payload.len() > 64 * 1024 {
+        return Err(BeaPublicationError::InvalidEvidence);
+    }
+    let row: Row =
+        serde_json::from_slice(payload).map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    // All fields are decoded strictly even when this row belongs to another Regional measure.
+    let _original = (
+        &row.value,
+        &row.raw_value,
+        &row.missing,
+        &row.missing_marker,
+        row.unit_multiplier,
+        &row.note_references,
+    );
+    for note in &row.notes {
+        let _ = (&note.reference, &note.text);
+    }
+    if row.dataset != "Regional"
+        || row.table.as_deref() != Some("SAINC1")
+        || row.line.as_deref() != Some("1")
+        || row.frequency != "annual"
+    {
+        return Ok(None);
+    }
+    let mut geography = row
+        .dimensions
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("GeoFIPS"));
+    let Some((_, geography_value)) = geography.next() else {
+        return Err(BeaPublicationError::InvalidEvidence);
+    };
+    if geography.next().is_some() {
+        return Err(BeaPublicationError::InvalidEvidence);
+    }
+    if geography_value != "06000" {
+        return Ok(None);
+    }
+    // The original provider row code must still identify the selected SAINC1 line.
+    // `line` is the request LineCode, while `Code` is retained separately in dimensions.
+    let mut codes = row
+        .dimensions
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("Code"));
+    if !matches!(codes.next(), Some((_, value)) if value.as_str() == "SAINC1-1")
+        || codes.next().is_some()
+    {
+        return Err(BeaPublicationError::InvalidEvidence);
+    }
+    if row.period.len() != 4
+        || !row.period.bytes().all(|c| c.is_ascii_digit())
+        || row.period.parse::<u16>().ok().filter(|y| *y > 0).is_none()
+        || row.cl_unit.is_empty()
+        || row.cl_unit.len() > 128
+    {
+        return Err(BeaPublicationError::InvalidEvidence);
+    }
+    let series_digest = crate::canonical::canonical_series_digest_from_parts(
+        &row.dataset,
+        row.table.as_deref(),
+        row.line.as_deref(),
+        crate::BeaFrequency::Annual,
+        &row.dimensions,
+    )
+    .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    let series = crate::canonical::identifier_from_digest("bea-series", series_digest)
+        .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    let unit = crate::canonical::identifier_from_digest(
+        "bea-unit",
+        crate::canonical::unit_digest_from_cl_unit(&row.cl_unit),
+    )
+    .map_err(|_| BeaPublicationError::InvalidEvidence)?;
+    Ok(Some(BeaNativePublishedSeriesCoordinate {
+        series,
+        unit,
+        cl_unit: row.cl_unit,
+        unit_multiplier: row.unit_multiplier,
+    }))
 }
 
 #[derive(Serialize)]
@@ -464,6 +612,9 @@ struct BeaNativeLineageBatchV1<'a> {
     dataset: &'a str,
     parameters: Vec<BeaNativeParameterV1<'a>>,
     metadata_generation: [u8; 32],
+    metadata_capture_observation_digest: [u8; 32],
+    metadata_sealed_receipt_digest: [u8; 32],
+    metadata_physical_receipt_digest: [u8; 32],
     dimensions: Vec<BeaNativeDimensionV1<'a>>,
     result_attributes: &'a std::collections::BTreeMap<String, String>,
     notes: Vec<BeaNativeNoteV1<'a>>,
@@ -566,6 +717,20 @@ fn native_lineage(
             dataset: page.dataset().as_str(),
             parameters,
             metadata_generation: page.metadata_generation().digest(),
+            metadata_capture_observation_digest: sealed_acquisition
+                .metadata_capture()
+                .capture()
+                .observation_digest()
+                .bytes(),
+            metadata_sealed_receipt_digest: sealed_acquisition
+                .metadata_capture()
+                .receipt_digest()
+                .bytes(),
+            metadata_physical_receipt_digest: sealed_acquisition
+                .metadata_capture()
+                .segment()
+                .physical_receipt_digest()
+                .bytes(),
             dimensions,
             result_attributes: page.result_attributes(),
             notes: response_notes,

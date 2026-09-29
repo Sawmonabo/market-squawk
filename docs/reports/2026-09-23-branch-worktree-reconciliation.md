@@ -1,5 +1,50 @@
 # Branch and worktree reconciliation audit — 2026-09-23
 
+## September 29 subsequent worktree retirement
+
+After the dependency checkpoint below, two obsolete archival branch labels,
+`codex/fred-shared-integration` (`a882d169`) and `codex/sec-product-handoff`
+(`7efda6a2`), were retired after comparison with current V1 behavior. Their exact
+histories are retained in an independently verified bundle with SHA-256
+`000df9908ad7aa9508928675bc59c3af7e75de0e56f78b36d916a0ff391012f6`.
+Required source behavior remains subject to current-product verification;
+obsolete setup-website and superseded shared implementations were not replayed.
+
+The Alpaca native-identity and Kraken native-identity worktrees were then
+removed without force. Before restoring their archived tracked paths and
+removing archived untracked files, the lead compared live heads, status,
+index, source bytes and backup bytes. Kraken's seven ignored proof files were
+preserved independently as well. Neither retirement deletes the corresponding
+local or remote branch; replacement integration is still pending.
+
+Census and Schwab were subsequently retired after root independently verified
+all three Census and twenty-three Schwab changed files against their independent
+archives, exact status/index/patches, advertised bundle heads and no active
+handles. Schwab's two ignored proof files were independently preserved and
+verified. Normal worktree removal followed restoration of only those enumerated
+archived tracked paths. Both branch references remain.
+
+One required Census donor behavior was retained in the active implementation:
+valid unrelated global catalog entries without a year are skipped without
+inventing a vintage. The complete catalog evidence remains retained; malformed
+distributions and mismatched time-series coordinates are rejected. All seven
+Census library tests passed, including this focused regression.
+
+The last linked worktree, common-seal, was subsequently removed normally.
+Root independently compared all 255 working/deletion states with the original
+September 7 archive, reconstructed all fourteen staged versions using the
+archived index patch and donor HEAD, and verified exact Git state, complete
+history bundle and absence of active handles. The old synchronous Coinbase
+publication actor is superseded by the current asynchronous successor and
+committed-predecessor validation. Only explicitly archived paths were restored
+or unlinked; no forced removal or blanket cleaning occurred.
+
+Inventory after these actions: **18 local branches, 14 origin heads, one local
+worktree: V1**. Three local and two remote Codex branches remain. All linked
+worktrees are gone; branch references remain a separate disposition barrier.
+No main/release merge, public publication, old-session deletion or recovery-backup
+deletion occurred.
+
 ## September 29 dependency and branch closure checkpoint
 
 Dependency updates are consolidated on the V1 feature branch in `a7987440`:
@@ -250,3 +295,181 @@ unresolved transitive source-run availability proof for derived data. Neither
 was removed; old code will be selected only where it fits the current V1
 contracts. These retained states are product/integration work, not accepted
 provider completion.
+
+The September 24 review of `crypto-canonical-data` confirmed that its 22 tracked
+and two untracked files still match the independent September 7 backup. Its
+branch head is already an ancestor of the target, and its old market-event and
+raw-recovery stack is superseded. The lane still contains a missing transitive
+source-run availability proof for derived generations and bounds for legacy
+order-book vectors. Its Parquet retention accounting exposed a current memory
+gap, now being reconciled in the active implementation. The worktree remains
+linked until those current-design behaviors and their consumers are verified;
+the old schema and unfinished event API will not be merged wholesale.
+
+## September 24 current-market attestation disposition
+
+The `feature/current-market-native-attestation` worktree at `75285e03` contains
+four branch-only commits and 44 modified files that adapt provider, application,
+platform, test and fuzz callers to the older `ProviderNativeInstrumentAttestation`
+type. Its embedded Coinbase/Kraken identity records are obsolete under the
+current catalog-selected native identity design. The current target carries
+the intended native identity through provider publication using catalog-owned
+selection and v2 lineage; the old branch adds no distinct restart or recovery
+behavior. Installed live restart of the current path remains an open product
+acceptance gate, not evidence supplied by this branch.
+
+The independent September 7 backup records the exact branch head and all 44
+modified files. On September 24 the lead rechecked the head, the 44 live file
+hashes and status entries (zero staged or untracked), all five relevant backup
+checksums, and the verifying Git bundle containing this branch. No runtime
+process or agent still used the worktree. Its old behavior is explicitly
+dispositioned as superseded; its source and commits remain recoverable from
+`/Users/sawmonabo/dev/market-squawk-handoff-backups/2026-09-07/`. The local
+branch remains until the current replacement is accepted and its branch
+retirement is recorded.
+
+After the exact backup comparison, the lead reconciled only those 44 obsolete
+working files, verified a clean source status, removed the idle worktree
+without force and pruned its metadata. The live inventory is now **27 local
+branches, 19 origin heads and 9 linked worktrees**. The target checkout, other
+worktrees and independent backup were not removed.
+
+## September 24 opportunity candidate disposition
+
+The `feature/opportunity-product-v1` head `4299d786` has two unique commits and
+19 tracked edits plus one untracked macro-assumptions file. Its older proposal,
+valuation and presentation implementation is superseded by the current V1
+product design; wholesale merge would regress the current forecast, historical
+study and portfolio contracts. The two still-useful Desktop behaviors were
+carried into the target: saved-analysis dates now use the product timestamp
+formatter, and the current analysis decoder checks portfolio/evidence,
+action, price-projection and position-scale consistency. The Desktop typecheck
+passed after those changes. This is focused integration evidence, not installed
+or exact-head product approval.
+
+An independent copy of both commits, a complete Git bundle, exact tracked and
+untracked source bytes, staged/unstaged patches and status is in
+`/Users/sawmonabo/dev/market-squawk-handoff-backups/2026-09-23-opportunity-wip-reconciliation/`.
+Its manifest SHA-256 is
+`eb4e4ca42d951c37e2a9d24a4be1ebceaed015f08d30cc745c74c4fdb4d89f55`.
+The lead verified all 30 listed artifact checksums, the complete-history bundle,
+all 20 live source file hashes and byte copies, and the full-index working diff
+and status against the archive before retirement. The branch remains until the
+accepted target contains these consumer fixes and its separate ref disposition
+is recorded.
+
+After exact comparison, the lead reconciled only the 19 archived tracked files
+and the archived untracked file, confirmed the source status was clean, removed
+the idle worktree without force, and pruned metadata. All 30 backup checksums
+passed again afterward. The linked-worktree count is now **8**, including the
+target; the branch remains at `4299d786` with its complete-history backup.
+
+## September 24 remaining worktrees and dependency queue
+
+A fresh read-only audit found all seven remaining side worktrees dirty:
+`alpaca-native-identity`, `census-durable-macro`, `common-seal-root-integration`,
+`crypto-canonical-data`, `kraken-native-identity`, `schwab-product-vertical`, and
+`source-current-integration`. Alpaca, Census, Kraken, Schwab and common-seal
+have branch-only commits; crypto and source-current have target-ancestor heads
+but still retain unique uncommitted state. None qualifies for removal.
+Alpaca has nine modified and three untracked paths; Census has three modified;
+Kraken has six modified; Schwab has 23 modified; common-seal has 255 changed
+paths including 14 staged and 38 untracked; crypto has 22 modified and two
+untracked; source-current has 57 modified including ten staged. Refresh these
+counts before acting. No `codex/` side ref was deleted merely for its age.
+
+Schwab's September 7 backup covered six dirty paths, while its live worktree
+now has 23. A new independent backup at
+`/Users/sawmonabo/dev/market-squawk-handoff-backups/2026-09-24-schwab-wip-reconciliation/`
+preserves all 23 current modified files, full index and patch state, and a
+complete-history bundle at `c3b257af`. Its manifest SHA-256 is
+`ff8c9894df6dba5e0b2c2de6cd60a8a0765583d8808322480b51092d4393870c`.
+The lead independently verified every archived file hash against the live
+source, all archive artifact hashes and the bundle. Schwab remains linked
+because its provider behavior is not yet accepted in the target.
+
+The five open Dependabot PRs (#46, #48, #52, #53, #54) still target `main`.
+Their requested `futures-util`, `async-trait`, `rust_decimal`, `clap`, and
+`uuid` versions are now in the local V1 lockfile; the decimal pin was also
+updated in the workspace manifest. A focused `market-squawk --lib` compile
+and nine existing financial exactness checks passed after the combined update.
+Dependency policy then exposed an affected `rustls` 0.23.42 and yanked
+`chacha20` 0.10.1; the local lock now selects 0.23.45 and 0.10.2 respectively.
+`cargo deny check` passes on the revised graph. The later security-update
+compile passed; the encrypted-store restart proof remains a separate gate. This is
+uncommitted, non-final integration evidence. Keep the PRs and remote bot branches until the V1 checkpoint is
+accepted and pushed and their `main` disposition is explicit. No merge into
+`main` or `release` was made.
+
+The September 24 combined V1 application compile also passed after integrating
+the Coinbase Direct two-product coordinator, Census reobservation comparator,
+H.15 selected full-history replay and neutral macro consumer, and the
+source-bound current-share decision core. The existing critical Census
+reobservation test, H.15 selected-partition replay test, and Coinbase Direct
+two-product coordinator/restart test each passed. These
+are focused source checks, not installed live journeys or accepted release
+evidence. Current-share generation, typed saved replay, Desktop chart overlays,
+and provider restart remain open; an unfinished candidate cannot serve as a
+branch-retirement proof. The seven remaining side worktrees and all five
+Dependabot PRs remain in place.
+
+## September 24 crypto canonical worktree disposition
+
+The old `codex/crypto-canonical-data` worktree head `3facc2b2` is an ancestor
+of the V1 target. Its 22 tracked edits and two untracked files implement an
+older raw/event schema and catalog path. Current V1 source has the necessary
+transitive source-run closure, availability-gated point-in-time selectors,
+bounded Parquet retention accounting and 4,096-entry order-book bounds. The
+older fixture and schema paths are obsolete under the current native lineage
+design; no old patch is being merged wholesale. Current-root presence and
+focused source tests do not establish installed restart acceptance.
+
+The independent September 7 archive records this exact head, all 24 real
+source files, status and full-index patches, plus a complete-history Git
+bundle. The lead independently compared each archived real file byte-for-byte
+with the live worktree; all 24 matched, as did the status, index and working
+patches. The bundle verified and contains `codex/crypto-canonical-data` at
+`3facc2b2`. Twelve AppleDouble `._` tar metadata entries are not source files
+and were excluded from the byte comparison. No persistent process or active
+agent owns this worktree. This is an explicit preserved handoff and obsolete
+source disposition under the worktree lifecycle rule; the branch and backup
+remain for the later accepted-integration branch decision.
+
+After a final exact-status comparison, the lead restored only the 22 archived
+tracked paths and removed only the two archived untracked paths in that old
+worktree. It then verified a clean status, removed the idle worktree without
+force and pruned worktree metadata. The independent archive checksum remains
+`72b1d33be08c2f01616d93ae25ce958ec02184b1160b25a322a2ff8be710d2a6`;
+the local `codex/crypto-canonical-data` branch still points to `3facc2b2`.
+The live inventory is now **27 local branches, 19 origin heads and 7 linked
+worktrees**. No other source or ref was removed.
+
+## September 24 source-current and Schwab follow-up
+
+The earlier 14-file source-current gap assessment above is superseded for code
+presence. The current V1 target selects catalog identity before public-source
+profile installation and carries that selection through Coinbase and Kraken
+decoders and publication checks. The old worktree's static registry and empty
+identity tables are obsolete. Both the September 7 and September 23 independent
+archives match all 57 live files, status, index listing and full-index patches;
+the September 7 complete-history bundle verifies. No process held an open
+handle at the audit. The worktree remains linked pending a focused installed
+selected-identity, publication, typed-read and restart check for the current
+path. The branch remains separately pending an accepted target checkpoint.
+
+The Schwab daily-history mapper had asserted raw adjustment and period-start
+timestamps without an accessible official price-history contract. The target
+now retains sealed raw response evidence but denies canonical daily bars until
+those semantics can be verified. Its focused existing adapter check passed.
+This does not complete Schwab quote, reference, options or Streamer journeys,
+nor does it permit retirement of the backed-up 23-file Schwab worktree.
+
+The Census worktree still has three unstaged files and 22 branch-only commits.
+Its September 7 archive predates those edits, so a new independent exact-file,
+index, patch and complete-history bundle backup was created at
+`/Users/sawmonabo/dev/market-squawk-handoff-backups/2026-09-23-census-wip-reconciliation/`.
+All 11 archive checksums passed; the source remains linked pending branch-only
+behavior disposition and installed restart proof. The Kraken worktree's six
+unstaged files and five branch-only commits match its verified September 23
+independent backup. Current V1 has newer catalog-selected behavior, but its
+publication/shutdown/restart proof is not yet accepted; Kraken remains linked.

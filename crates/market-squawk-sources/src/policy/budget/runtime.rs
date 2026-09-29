@@ -394,6 +394,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                transport_generation: AtomicU64::new(1),
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: None,
@@ -427,6 +428,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                transport_generation: AtomicU64::new(1),
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: None,
@@ -448,6 +450,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                transport_generation: AtomicU64::new(1),
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: Some(binding),
@@ -470,6 +473,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
+                transport_generation: AtomicU64::new(1),
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 durability: Some(durability),
@@ -494,6 +498,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(checkpoint.availability_generation),
+                transport_generation: AtomicU64::new(1),
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
                 durability: Some(binding),
@@ -519,6 +524,7 @@ impl SharedProviderBudget {
                 state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(checkpoint.availability_generation),
+                transport_generation: AtomicU64::new(1),
                 provider_rate_state_version: AtomicU64::new(0),
                 terminal: AtomicBool::new(checkpoint.terminal || checkpoint.poisoned),
                 durability: Some(durability),
@@ -658,6 +664,24 @@ impl SharedProviderBudget {
             ));
         }
         Ok(())
+    }
+
+    fn revoke_transport_authority(
+        &self,
+        admission: &RuntimeOperationAdmission,
+    ) -> Result<(), BudgetUnavailableReason> {
+        self.allocation
+            .transport_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                self.terminal_fault(
+                    BudgetUnavailableReason::AvailabilityGenerationExhausted,
+                    admission,
+                )
+            })
     }
 
     pub(in crate::policy) fn revoke_persist_and_fail<T>(
@@ -941,6 +965,9 @@ impl SharedProviderBudget {
                     }
                 }
                 Ok((_observation, ProviderRateReservationDecision::Unavailable(reason))) => {
+                    if let Err(terminal) = self.revoke_transport_authority(&operation) {
+                        return BudgetDecision::Unavailable(terminal);
+                    }
                     return BudgetDecision::Unavailable(reason);
                 }
                 Ok((_observation, ProviderRateReservationDecision::Ready(_))) => {
@@ -954,6 +981,9 @@ impl SharedProviderBudget {
         let Ok(mut state) = self.allocation.state.lock() else {
             return self.terminal_unavailable(BudgetUnavailableReason::StatePoisoned, &operation);
         };
+        if let Err(reason) = self.revoke_transport_authority(&operation) {
+            return BudgetDecision::Unavailable(reason);
+        }
         let Ok(observation) = self.allocation.clock.observation() else {
             return self
                 .terminal_unavailable(BudgetUnavailableReason::ClockUnavailable, &operation);
@@ -1060,6 +1090,9 @@ impl SharedProviderBudget {
                     }
                 }
                 Ok((_observation, ProviderRateReservationDecision::Unavailable(reason))) => {
+                    if let Err(terminal) = self.revoke_transport_authority(&operation) {
+                        return BudgetDecision::Unavailable(terminal);
+                    }
                     return BudgetDecision::Unavailable(reason);
                 }
                 Ok((_observation, ProviderRateReservationDecision::Ready(_))) => {
@@ -1073,6 +1106,9 @@ impl SharedProviderBudget {
         let Ok(mut state) = self.allocation.state.lock() else {
             return self.terminal_unavailable(BudgetUnavailableReason::StatePoisoned, &operation);
         };
+        if let Err(reason) = self.revoke_transport_authority(&operation) {
+            return BudgetDecision::Unavailable(reason);
+        }
         let Ok(observation) = self.allocation.clock.observation() else {
             return self
                 .terminal_unavailable(BudgetUnavailableReason::ClockUnavailable, &operation);
@@ -1147,6 +1183,9 @@ impl SharedProviderBudget {
         let Ok(mut state) = self.allocation.state.lock() else {
             return self.terminal_unavailable(BudgetUnavailableReason::StatePoisoned, &operation);
         };
+        if let Err(reason) = self.revoke_transport_authority(&operation) {
+            return BudgetDecision::Unavailable(reason);
+        }
         let Ok(observation) = self.allocation.clock.observation() else {
             return self
                 .terminal_unavailable(BudgetUnavailableReason::ClockUnavailable, &operation);
@@ -1227,6 +1266,9 @@ impl BudgetReservation {
                 budget.terminal_fault(BudgetUnavailableReason::StatePoisoned, operation),
             );
         };
+        // Capture under the same state lock used by refusal/disable controls. A control
+        // change during the network handshake must invalidate the eventual transport lease.
+        let transport_generation = self.allocation.transport_generation.load(Ordering::Acquire);
         let Ok(pre_dispatch_observation) = self.allocation.clock.observation() else {
             return BudgetDispatchDecision::Unavailable(
                 budget.terminal_fault(BudgetUnavailableReason::ClockUnavailable, operation),
@@ -1360,6 +1402,7 @@ impl BudgetReservation {
             runtime_admission,
             provider_rate: provider_rate_permit,
             active: Arc::new(AtomicBool::new(true)),
+            transport_generation,
             released: false,
         })
     }

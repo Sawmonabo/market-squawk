@@ -14,7 +14,7 @@ pub enum ProviderObservationPayload {
         /// Provider-authored taker order type when the selected feed supplies it.
         taker_order_type: Option<TradeTakerOrderType>,
     },
-    /// Quote with at least one side; each side is price/quantity atomic.
+    /// Quote with at least one side; accumulated sides retain separate original field evidence.
     Quote {
         /// Optional bid side.
         bid: Option<ProviderBookLevel>,
@@ -90,6 +90,13 @@ impl ProviderObservationPayload {
         bids: Vec<ProviderBookLevel>,
         asks: Vec<ProviderBookLevel>,
     ) -> Result<Self, DecodeError> {
+        if bids
+            .iter()
+            .chain(asks.iter())
+            .any(|level| level.accumulated.is_some())
+        {
+            return Err(DecodeError::InvalidProviderEvidence);
+        }
         if bids.len().saturating_add(asks.len()) > MAX_DECODED_BOOK_ITEMS {
             return Err(DecodeError::TooManyNumericFields {
                 max: MAX_DECODED_BOOK_ITEMS,
@@ -113,6 +120,12 @@ impl ProviderObservationPayload {
         depth: MarketDepth,
         changes: Vec<ProviderBookChange>,
     ) -> Result<Self, DecodeError> {
+        if changes
+            .iter()
+            .any(|change| change.level.accumulated.is_some())
+        {
+            return Err(DecodeError::InvalidProviderEvidence);
+        }
         if changes.is_empty() {
             return Err(DecodeError::InvalidProviderEvidence);
         }
@@ -172,14 +185,12 @@ impl ProviderObservationPayload {
                     .map_or(0, SourceIdentifier::retained_bytes),
                 aggressor.rule.provider_rule().retained_bytes(),
             ])?,
-            Self::Quote { bid, ask } => {
-                checked_sum(bid.iter().chain(ask.iter()).flat_map(|level| {
-                    [
-                        level.price.0.retained_bytes(),
-                        level.quantity.0.retained_bytes(),
-                    ]
-                }))?
-            }
+            Self::Quote { bid, ask } => bid
+                .iter()
+                .chain(ask.iter())
+                .try_fold(0usize, |total, level| {
+                    checked_sum([total, level.deep_retained_bytes()?])
+                })?,
             Self::BookSnapshot(value) => checked_sum([
                 value
                     .bids

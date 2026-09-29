@@ -182,6 +182,7 @@ pub struct OrderIntent {
     reason_codes: Box<[OrderReasonCode]>,
     maximum_slippage: BasisPoints,
     required_quality: DataQuality,
+    virtual_paper: bool,
     digest: OrderIntentDigest,
 }
 
@@ -194,7 +195,7 @@ impl OrderIntent {
     /// invalid chronology, unbounded rationale, negative or excessive slippage, and any requested
     /// execution quality other than [`DataQuality::DirectVerified`].
     pub fn try_new(input: OrderIntentInput) -> Result<Self, OrderIntentError> {
-        Self::try_new_inner(input, None)
+        Self::try_new_inner(input, None, false)
     }
 
     /// Validates one target-bound intent while retaining the ordinary risk/dispatch path.
@@ -205,12 +206,27 @@ impl OrderIntent {
         target_reference
             .validate()
             .map_err(|_| OrderIntentError::InvalidTargetReference)?;
-        Self::try_new_inner(input, Some(target_reference))
+        Self::try_new_inner(input, Some(target_reference), false)
+    }
+
+    pub(crate) fn try_new_virtual_paper(
+        input: OrderIntentInput,
+        target_reference: OrderTargetReference,
+    ) -> Result<Self, OrderIntentError> {
+        target_reference
+            .validate()
+            .map_err(|_| OrderIntentError::InvalidTargetReference)?;
+        Self::try_new_inner(input, Some(target_reference), true)
+    }
+    /// Immutable purpose included in the canonical order digest.
+    pub const fn is_virtual_paper(&self) -> bool {
+        self.virtual_paper
     }
 
     fn try_new_inner(
         input: OrderIntentInput,
         target_reference: Option<OrderTargetReference>,
+        virtual_paper: bool,
     ) -> Result<Self, OrderIntentError> {
         validate_order_prices(input.order_type, input.limit_price, input.stop_price)?;
         validate_time_in_force(input.order_type, input.time_in_force)?;
@@ -236,11 +252,23 @@ impl OrderIntent {
                 max: MAX_INTENT_SLIPPAGE_BASIS_POINTS,
             });
         }
-        if input.required_quality != DataQuality::DirectVerified {
+        if input.required_quality
+            != if virtual_paper {
+                DataQuality::DirectUnverified
+            } else {
+                DataQuality::DirectVerified
+            }
+        {
             return Err(OrderIntentError::IneligibleRequiredQuality);
         }
 
-        let digest = digest_intent(&input, &input.reason_codes, target_reference.as_ref());
+        let mut digest = digest_intent(&input, &input.reason_codes, target_reference.as_ref());
+        if virtual_paper {
+            let mut scoped = Sha256::new();
+            scoped.update(b"market-squawk/virtual-paper-intent/v1\0");
+            scoped.update(digest.as_bytes());
+            digest = OrderIntentDigest(scoped.finalize().into());
+        }
         let reason_codes = input.reason_codes.into_boxed_slice();
         Ok(Self {
             order_id: input.order_id,
@@ -261,6 +289,7 @@ impl OrderIntent {
             reason_codes,
             maximum_slippage: input.maximum_slippage,
             required_quality: input.required_quality,
+            virtual_paper,
             digest,
         })
     }

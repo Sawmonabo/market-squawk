@@ -1197,15 +1197,17 @@ pub enum BudgetPoolError {
     Persistence,
 }
 
-/// Non-serializable proof that one exact provider request permit remains active.
+/// Non-serializable proof that one exact provider request or upgraded transport remains active.
 ///
-/// The lease is tied to the permit allocation, its post-admission availability generation, and
-/// the permit's lifetime. It cannot be reconstructed from provider health DTOs and becomes invalid
-/// immediately when the permit is released or the shared budget is revoked or terminal.
+/// Request leases bind post-admission request availability. After an explicit successful
+/// handshake transition, transport leases bind the same allocation's control generation instead
+/// of free request capacity. Both expire with their permit owner, budget control revocation, or
+/// terminal/session failure; neither can be reconstructed from provider health DTOs.
 #[derive(Clone)]
 pub struct BudgetPermitLease {
     allocation: Arc<BudgetAllocation>,
     availability_generation: u64,
+    established_transport: bool,
     active: Arc<AtomicBool>,
 }
 
@@ -1228,11 +1230,13 @@ impl BudgetPermitLease {
                 .durability
                 .as_ref()
                 .is_none_or(|binding| binding.session.is_available())
-            && self
-                .allocation
-                .availability_generation
-                .load(Ordering::Acquire)
-                == self.availability_generation
+            && if self.established_transport {
+                self.allocation.transport_generation.load(Ordering::Acquire)
+                    == self.availability_generation
+            } else {
+                self.allocation.availability_generation.load(Ordering::Acquire)
+                    == self.availability_generation
+            }
             && self.active.load(Ordering::Acquire)
             && !self.allocation.state.is_poisoned()
             && !self.allocation.terminal.load(Ordering::Acquire)
@@ -1290,12 +1294,14 @@ impl std::fmt::Debug for BudgetReservation {
     }
 }
 
-/// RAII reservation for one in-flight provider request.
+/// RAII owner for one provider request, optionally retained by its upgraded transport.
+/// Request concurrency is released at handshake completion; owner drop still revokes its lease.
 pub struct BudgetPermit {
     pub(in crate::policy) allocation: Arc<BudgetAllocation>,
     pub(in crate::policy) runtime_admission: RuntimeOperationAdmission,
     pub(in crate::policy) provider_rate: Option<ProviderRatePermit>,
     pub(in crate::policy) active: Arc<AtomicBool>,
+    pub(in crate::policy) transport_generation: u64,
     pub(in crate::policy) released: bool,
 }
 
@@ -1309,16 +1315,55 @@ impl std::fmt::Debug for BudgetPermit {
 }
 
 impl BudgetPermit {
-    /// Borrows the exact active request as an opaque process-local authority lease.
+    /// Borrows this exact request or established transport as a process-local authority lease.
     pub fn active_lease(&self) -> BudgetPermitLease {
         BudgetPermitLease {
             allocation: Arc::clone(&self.allocation),
-            availability_generation: self
-                .allocation
-                .availability_generation
-                .load(Ordering::Acquire),
+            availability_generation: if self.released {
+                self.transport_generation
+            } else {
+                self.allocation.availability_generation.load(Ordering::Acquire)
+            },
+            established_transport: self.released,
             active: Arc::clone(&self.active),
         }
+    }
+
+    /// Completes a successful HTTP upgrade without reserving request capacity for socket life.
+    ///
+    /// The adapter must call this only after the original transport reports a successful upgrade.
+    /// The same permit remains owned until that socket exits. Existing request leases are
+    /// permanently invalidated; newly borrowed leases retain allocation, control-generation,
+    /// durability, and owner-lifetime checks while independent requests use the freed slot.
+    ///
+    /// # Errors
+    ///
+    /// Rejects repeated completion, weighted-response policies, revoked control authority, and
+    /// any failed local or durable release. Request-window charges are never refunded.
+    pub fn complete_transport_handshake(&mut self) -> Result<(), BudgetUnavailableReason> {
+        if self.released || !self.active.load(Ordering::Acquire) {
+            return Err(BudgetUnavailableReason::AvailabilityChanged);
+        }
+        if self.allocation.policy.has_weighted_windows() {
+            return Err(BudgetUnavailableReason::PersistenceUnavailable);
+        }
+        // This existing release path persists both local and product-wide concurrency exactly
+        // once and terminalizes the allocation on any failure. Never revive its old lease.
+        self.release_inner();
+        if self.allocation.terminal.load(Ordering::Acquire) {
+            return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
+        }
+        if self.allocation.transport_generation.load(Ordering::Acquire)
+            != self.transport_generation
+        {
+            return Err(BudgetUnavailableReason::AvailabilityChanged);
+        }
+        self.active = Arc::new(AtomicBool::new(true));
+        if !self.active_lease().is_current() {
+            self.active.store(false, Ordering::Release);
+            return Err(BudgetUnavailableReason::AvailabilityChanged);
+        }
+        Ok(())
     }
 
     /// Atomically terminalizes this exact dispatched provider response and releases concurrency.
@@ -1441,10 +1486,12 @@ impl BudgetPermit {
     }
 
     fn release_inner(&mut self) {
+        // Handshake completion has already released concurrency, but Drop must still revoke
+        // the established transport lease retained by the same owner.
+        self.active.store(false, Ordering::Release);
         if self.released {
             return;
         }
-        self.active.store(false, Ordering::Release);
         let budget = SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
         };

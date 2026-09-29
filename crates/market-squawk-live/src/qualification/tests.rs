@@ -1,3 +1,6 @@
+#[path = "../../../market-squawk-sources/tests/common/mod.rs"]
+mod source_fixture;
+
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::str::FromStr;
@@ -222,8 +225,14 @@ fn metadata(policy: FixturePolicy) -> TestResult<SourceMetadata> {
 }
 
 fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<CurrentFixture> {
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(metadata(policy)?, Timestamp::from_unix_nanos(1))?;
+    let (mut registry, registered) = source_fixture::register_fixture_source(
+        metadata(policy)?,
+        &[(
+            market_squawk_domain::InstrumentId::from_str(INSTRUMENT)?,
+            "BTC-USD",
+        )],
+        Timestamp::from_unix_nanos(1),
+    )?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(id("session-1")?),
@@ -308,6 +317,11 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
             id("trade-1")?,
             VenueId::try_from("coinbase")?,
             market_squawk_domain::InstrumentId::from_str(INSTRUMENT)?,
+            market_squawk_sources::ProviderNativeInstrumentIdentity::new(
+                market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+                market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+                market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+            ),
             ProviderTimestampEvidence::Provided {
                 value: frame_at,
                 rule: rule("coinbase-timestamp")?,

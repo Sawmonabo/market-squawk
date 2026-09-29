@@ -987,25 +987,31 @@ impl SourceController {
     }
 
     fn begin_shutdown(&self) {
-        self.portal_activation.begin_shutdown();
+        // Close request admission first. In-flight and persisted account cleanup still needs the
+        // original portal/onboarding authority until its real runtime receipt is acknowledged.
         self.lifecycle.begin_shutdown();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
         self.begin_shutdown();
-        let activation = self
-            .portal_activation
+        self.lifecycle.finish_shutdown(deadline).await?;
+        self.source_lifecycle
             .finish_shutdown(deadline)
             .await
-            .map_err(map_portal_activation_shutdown_error);
-        let lifecycle = self.lifecycle.finish_shutdown(deadline).await;
-        activation.and(lifecycle)
+            .map_err(map_source_lifecycle_error)?;
+        self.portal_activation.begin_shutdown();
+        self.portal_activation
+            .finish_shutdown(deadline)
+            .await
+            .map_err(map_portal_activation_shutdown_error)
     }
 }
 
 fn map_portal_activation_shutdown_error(error: ProviderPortalActivationError) -> ServiceError {
     match error {
         ProviderPortalActivationError::Cancelled => ServiceError::Cancelled,
+        ProviderPortalActivationError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        ProviderPortalActivationError::Internal => ServiceError::Internal,
         ProviderPortalActivationError::InvalidRequest
         | ProviderPortalActivationError::Unavailable
         | ProviderPortalActivationError::StateUnavailable => ServiceError::Unavailable,

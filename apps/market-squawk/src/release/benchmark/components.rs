@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
 use market_squawk_adapter_kraken::{
-    KrakenDecodeOutcome, KrakenDecoder, KrakenDecoderState, KrakenDepth,
+    KrakenChannel, KrakenDecodeOutcome, KrakenDecoder, KrakenDecoderState, KrakenDepth,
+    KrakenNativeMarketCoordinates,
 };
 use market_squawk_analytics::{
     RollingFeatureState, RollingWindowConfig, TopOfBookView, TradeFeatureView, top_of_book_features,
@@ -114,7 +115,11 @@ pub(super) fn measure_all(
 fn measure_kraken(iterations: u64) -> Result<ComponentLatencyDistribution> {
     let instrument =
         market_squawk_domain::InstrumentId::from_str("018f0000-0000-7000-8000-000000000091")?;
-    let mut decoder = KrakenDecoder::try_new("BTC/USD", instrument, KrakenDepth::Ten)?;
+    let coordinates = KrakenNativeMarketCoordinates::diagnostic_decoder_fixture(
+        instrument,
+        KrakenChannel::Book(KrakenDepth::Ten),
+    )?;
+    let mut decoder = KrakenDecoder::try_new(coordinates, KrakenDepth::Ten)?;
     measure(iterations, || {
         let outcome = decoder.decode_payload(KRAKEN_FIXTURE)?;
         let KrakenDecodeOutcome::Market(observations) = outcome else {

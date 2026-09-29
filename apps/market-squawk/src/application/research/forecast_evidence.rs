@@ -57,16 +57,19 @@ const SERVING_LOOKBACK_NANOS: i64 = 10 * 366 * 24 * 60 * 60 * 1_000_000_000;
 pub(crate) struct AnalyticalForecastEvidenceReader {
     analytical: AnalyticalReadCapability,
     macro_context: Option<MacroContextReadCapability>,
+    calendar: Option<crate::application::market_calendar::CompletedMarketSessionReadCapability>,
 }
 
 impl AnalyticalForecastEvidenceReader {
     pub(crate) const fn new(
         analytical: AnalyticalReadCapability,
         macro_context: Option<MacroContextReadCapability>,
+        calendar: Option<crate::application::market_calendar::CompletedMarketSessionReadCapability>,
     ) -> Self {
         Self {
             analytical,
             macro_context,
+            calendar,
         }
     }
 
@@ -77,10 +80,11 @@ impl AnalyticalForecastEvidenceReader {
         cancellation: CancellationToken,
     ) -> Result<Option<ForecastDatasetEvidence>, ForecastEvidenceReadError> {
         let identity = metadata.dataset();
+        let (training_contract, _) = dataset_contracts(metadata)?;
         let evidence = match self
             .analytical
             .forecast_dataset_evidence(
-                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
+                training_contract,
                 identity.manifest(),
                 identity.selection_as_of(),
                 evidence_limits()?,
@@ -98,8 +102,7 @@ impl AnalyticalForecastEvidenceReader {
         let dataset = evidence.dataset();
         let generation = dataset.generation();
         let fence = evidence.fence();
-        if dataset.product_contract()
-            != FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1
+        if dataset.product_contract() != training_contract
             || generation.manifest() != identity.manifest()
             || generation.build_spec_digest() != Some(identity.build_spec_digest())
             || dataset.universe_digest() != identity.universe_digest()
@@ -110,6 +113,9 @@ impl AnalyticalForecastEvidenceReader {
             || fence.selection_sha256() != identity.selection_digest()
             || fence.as_of() != identity.selection_as_of()
             || fence.selected_rows() != identity.selected_component_rows()
+            || dataset.split_policy() != identity.split_policy()
+            || dataset.study_policy() != identity.study_policy()
+            || dataset.source_snapshot_digest() != identity.source_snapshot_digest()
         {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
         }
@@ -118,6 +124,7 @@ impl AnalyticalForecastEvidenceReader {
 
     async fn exact_analysis(
         &self,
+        metadata: &ModelMetadata,
         manifest: &DatasetManifestRef,
         as_of: Timestamp,
         deadline: Instant,
@@ -126,7 +133,7 @@ impl AnalyticalForecastEvidenceReader {
         match self
             .analytical
             .forecast_dataset_evidence(
-                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
+                dataset_contracts(metadata)?.1,
                 manifest,
                 as_of,
                 evidence_limits()?,
@@ -148,45 +155,41 @@ impl AnalyticalForecastEvidenceReader {
     ) -> Result<Vec<AnalyticalFeatureDataset>, ForecastEvidenceReadError> {
         let limit = AnalyticalReadLimit::try_new(DATASET_PAGE)
             .map_err(|_| ForecastEvidenceReadError::Capacity)?;
-        let mut after: Option<DatasetId> = None;
         let mut datasets = Vec::new();
-        loop {
-            check_control(deadline, cancellation)?;
-            let page = self
-                .analytical
-                .feature_datasets(
-                    FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
-                    after.as_ref(),
-                    limit,
-                    deadline,
-                    cancellation,
-                )
-                .map_err(map_read_error)?;
-            if page.datasets().is_empty() {
-                if page.has_more() {
-                    return Err(ForecastEvidenceReadError::InvalidEvidence);
+        for contract in analysis_contracts() {
+            let mut after: Option<DatasetId> = None;
+            loop {
+                check_control(deadline, cancellation)?;
+                let page = self
+                    .analytical
+                    .feature_datasets(contract, after.as_ref(), limit, deadline, cancellation)
+                    .map_err(map_read_error)?;
+                if page.datasets().is_empty() {
+                    if page.has_more() {
+                        return Err(ForecastEvidenceReadError::InvalidEvidence);
+                    }
+                    break;
                 }
-                break;
-            }
-            let retained_dataset_count = datasets
-                .len()
-                .checked_add(page.datasets().len())
-                .ok_or(ForecastEvidenceReadError::Capacity)?;
-            if retained_dataset_count > MAX_DATASETS {
-                return Err(ForecastEvidenceReadError::Capacity);
-            }
-            datasets
-                .try_reserve_exact(page.datasets().len())
-                .map_err(|_| ForecastEvidenceReadError::Capacity)?;
-            for dataset in page.datasets() {
-                datasets.push(dataset.clone());
-            }
-            after = page
-                .datasets()
-                .last()
-                .map(|dataset| dataset.generation().manifest().dataset_id().clone());
-            if !page.has_more() {
-                break;
+                let retained_dataset_count = datasets
+                    .len()
+                    .checked_add(page.datasets().len())
+                    .ok_or(ForecastEvidenceReadError::Capacity)?;
+                if retained_dataset_count > MAX_DATASETS {
+                    return Err(ForecastEvidenceReadError::Capacity);
+                }
+                datasets
+                    .try_reserve_exact(page.datasets().len())
+                    .map_err(|_| ForecastEvidenceReadError::Capacity)?;
+                for dataset in page.datasets() {
+                    datasets.push(dataset.clone());
+                }
+                after = page
+                    .datasets()
+                    .last()
+                    .map(|dataset| dataset.generation().manifest().dataset_id().clone());
+                if !page.has_more() {
+                    break;
+                }
             }
         }
         Ok(datasets)
@@ -205,6 +208,22 @@ impl fmt::Debug for AnalyticalForecastEvidenceReader {
 
 #[async_trait]
 impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
+    async fn financial_input(
+        &self,
+        manifest: &DatasetManifestRef,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_data::FeatureDatasetInputEpochOutput, ForecastEvidenceReadError> {
+        crate::application::model::forecast::reopen_financial_input(
+            &self.analytical,
+            manifest,
+            deadline,
+            cancellation,
+        )
+        .await
+        .map_err(map_serving_error)
+    }
+
     async fn catalog(
         &self,
         request: ForecastEvidenceCatalogRequest,
@@ -213,6 +232,20 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
     ) -> Result<ForecastEvidenceCatalogSnapshot, ForecastEvidenceReadError> {
         check_control(deadline, &cancellation)?;
         let analysis_catalog = self.analysis_catalog(deadline, &cancellation)?;
+        let current_output = if let Some(input) = request.current_feature_input() {
+            Some(
+                crate::application::model::forecast::reopen_current_price_input(
+                    &self.analytical,
+                    input.manifest(),
+                    deadline,
+                    cancellation.child_token(),
+                )
+                .await
+                .map_err(map_serving_error)?,
+            )
+        } else {
+            None
+        };
         let mut datasets = Vec::new();
         let maximum_pairs = request
             .models()
@@ -238,22 +271,49 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
                 return Err(ForecastEvidenceReadError::InvalidEvidence);
             }
             let metadata = model.metadata();
+            if matches!(
+                metadata.output_binding().target(),
+                ForecastTargetMeaning::FixedHorizonEvent { .. }
+            ) && current_output.is_none()
+            {
+                continue;
+            }
+            if let (Some(output), Some(input)) = (&current_output, request.current_feature_input())
+            {
+                let index = crate::application::model::forecast::current_price_coordinate_index(
+                    output,
+                    input.example_id(),
+                )
+                .map_err(map_serving_error)?;
+                let coordinate = output
+                    .coordinate(index)
+                    .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+                let epoch = coordinate.epoch();
+                let compatible = matches!(metadata.output_binding().target(), ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos, origin_basis } | ForecastTargetMeaning::FixedHorizonEvent { horizon_nanos, origin_basis, .. }
+                    if Some(origin_basis) == epoch.fixed_horizon_origin_basis()
+                    && epoch.target_at().zip(epoch.target_origin()).is_some_and(|(target, origin)| target.unix_nanos().checked_sub(origin.unix_nanos()) == i64::try_from(horizon_nanos.get()).ok()));
+                if !compatible {
+                    continue;
+                }
+            }
+            let Some(horizon) = admitted_forecast_horizon(metadata) else {
+                continue;
+            };
             let Some(training) = self
                 .exact_training(metadata, deadline, cancellation.child_token())
                 .await?
             else {
                 continue;
             };
-            let Some(horizon) = admitted_return_horizon(metadata) else {
-                continue;
-            };
+
             for candidate in analysis_catalog
                 .iter()
-                .filter(|candidate| pairable_summary(&training, candidate))
+                .filter(|candidate| pairable_summary(metadata, &training, candidate))
             {
                 check_control(deadline, &cancellation)?;
                 let Some(analysis) = self
                     .exact_analysis(
+                        metadata,
                         candidate.generation().manifest(),
                         metadata.dataset().selection_as_of(),
                         deadline,
@@ -264,7 +324,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
                     continue;
                 };
                 let pairing = pair(metadata, &training, &analysis)?;
-                let instruments = instrument_inventory(
+                let historical_instruments = instrument_inventory(
                     metadata,
                     analysis.rows(),
                     analysis.fence().as_of(),
@@ -272,6 +332,98 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
                     deadline,
                     &cancellation,
                 )?;
+                // OOS labels qualify the trained estimator; only genuine current sources supply catalog origins.
+                let mut instruments = Vec::new();
+                if let (Some(output), Some(input)) =
+                    (&current_output, request.current_feature_input())
+                {
+                    let index =
+                        crate::application::model::forecast::current_price_coordinate_index(
+                            output,
+                            input.example_id(),
+                        )
+                        .map_err(map_serving_error)?;
+                    let coordinate = output
+                        .coordinate(index)
+                        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+                    if historical_instruments
+                        .iter()
+                        .any(|value| value.instrument_id() == coordinate.epoch().instrument_id())
+                    {
+                        let prepared = current_price_materialization(
+                            metadata,
+                            output,
+                            index,
+                            request.knowledge_cutoff(),
+                            input.session_cohort(),
+                        )?;
+                        let calendar = self.calendar.clone().map(crate::application::market_calendar::ForecastSessionReadCapability::Current);
+                        let origin =
+                            crate::application::model::forecast::current_price_session_origin(
+                                calendar.as_ref(),
+                                input.session_cohort(),
+                                coordinate,
+                                deadline,
+                                cancellation.child_token(),
+                            )
+                            .await
+                            .map_err(map_serving_error)?;
+                        let mut availability = ForecastInstrumentAvailability::try_new(
+                            coordinate.epoch().instrument_id(),
+                            prepared.observed_cutoff,
+                            prepared.observed_cutoff,
+                            prepared.available_at,
+                            NonZeroUsize::MIN,
+                            prepared.decimal_scale,
+                        )?;
+                        if let Some(origin) = origin {
+                            availability = availability.with_session_origin(origin)?;
+                        }
+                        instruments.push(availability);
+                    }
+                } else {
+                    for historical in historical_instruments {
+                        match serving_materialization(
+                            &self.analytical,
+                            &analysis,
+                            historical.instrument_id(),
+                            request.knowledge_cutoff(),
+                            None,
+                            deadline,
+                            cancellation.child_token(),
+                        )
+                        .await
+                        {
+                            Ok(current) => {
+                                if current
+                                    .observed_cutoff
+                                    .checked_add_nanos(
+                                        i64::try_from(horizon.get()).map_err(|_| {
+                                            ForecastEvidenceReadError::InvalidEvidence
+                                        })?,
+                                    )
+                                    .is_ok_and(|target| target > request.knowledge_cutoff())
+                                {
+                                    instruments.push(ForecastInstrumentAvailability::try_new(
+                                        historical.instrument_id(),
+                                        current
+                                            .observed_history
+                                            .first()
+                                            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
+                                            .observed_at(),
+                                        current.observed_cutoff,
+                                        current.available_at,
+                                        NonZeroUsize::new(current.observed_history.len())
+                                            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
+                                        current.decimal_scale,
+                                    )?);
+                                }
+                            }
+                            Err(ForecastEvidenceReadError::Unavailable) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
                 if instruments.is_empty() {
                     continue;
                 }
@@ -280,8 +432,12 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
                     horizon,
                     NonZeroU64::new(MAX_VALIDITY_NANOS)
                         .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
-                    NonZeroUsize::new(MINIMUM_HISTORY)
-                        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
+                    NonZeroUsize::new(if current_output.is_some() {
+                        1
+                    } else {
+                        MINIMUM_HISTORY
+                    })
+                    .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
                 )?;
                 let mut policies = Vec::new();
                 policies
@@ -324,7 +480,19 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
                 })
         });
         let mut authority = Sha256::new();
-        authority.update(b"market-squawk/forecast-analysis-pairing-catalog/v1\0");
+        authority.update(b"market-squawk/current-forecast-analysis-pairing-catalog/v2\0");
+        authority.update(request.knowledge_cutoff().unix_nanos().to_be_bytes());
+        if let Some(output) = &current_output {
+            authority.update(output.query_output().result_digest().bytes());
+        }
+        if let Some(input) = request.current_feature_input() {
+            hash_bytes(&mut authority, input.example_id().as_bytes())?;
+            hash_bytes(
+                &mut authority,
+                &serde_json::to_vec(&input.session_cohort())
+                    .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?,
+            )?;
+        }
         authority.update(request.runtime_generation_sha256().bytes());
         for dataset in &datasets {
             authority.update(dataset.pairing().pairing_sha256().bytes());
@@ -359,6 +527,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
             .ok_or(ForecastEvidenceReadError::Unavailable)?;
         let analysis = self
             .exact_analysis(
+                request.model().metadata(),
                 request.pairing().analysis_fence().manifest(),
                 request.model().metadata().dataset().selection_as_of(),
                 deadline,
@@ -374,6 +543,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
             &analysis,
             &self.analytical,
             self.macro_context.as_ref(),
+            self.calendar.as_ref(),
             None,
             deadline,
             cancellation,
@@ -398,6 +568,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
             .ok_or(ForecastEvidenceReadError::Unavailable)?;
         let analysis = self
             .exact_analysis(
+                request.model().metadata(),
                 request.pairing().analysis_fence().manifest(),
                 request.model().metadata().dataset().selection_as_of(),
                 deadline,
@@ -413,6 +584,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
             &analysis,
             &self.analytical,
             self.macro_context.as_ref(),
+            self.calendar.as_ref(),
             Some(expected.serving_input()),
             deadline,
             cancellation,
@@ -430,20 +602,90 @@ fn evidence_limits() -> Result<ForecastDatasetReadLimits, ForecastEvidenceReadEr
         .map_err(|_| ForecastEvidenceReadError::Capacity)
 }
 
-fn admitted_return_horizon(metadata: &ModelMetadata) -> Option<NonZeroU64> {
+fn analysis_contracts() -> [FeatureDatasetProductContract; 4] {
+    use FeatureDatasetProductContract::*;
+    [
+        PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
+        PriceReturnMacroContextFixedHorizonPriceHigherAnalysisV1,
+        PriceReturnMacroContextFixedHorizonBenchmarkOutperformanceAnalysisV1,
+        PriceReturnMacroContextFixedHorizonProfitAfterCostsAnalysisV1,
+    ]
+}
+
+fn dataset_contracts(
+    metadata: &ModelMetadata,
+) -> Result<(FeatureDatasetProductContract, FeatureDatasetProductContract), ForecastEvidenceReadError>
+{
+    use FeatureDatasetProductContract::*;
+    use market_squawk_data::ProbabilityEventTarget::*;
+    match metadata.output_binding().target() {
+        ForecastTargetMeaning::FixedHorizonTerminal { .. }
+            if metadata.output_binding().measurement() == ForecastMeasurement::Return =>
+        {
+            Ok((
+                PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
+                PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
+            ))
+        }
+        ForecastTargetMeaning::FixedHorizonEvent { event, .. }
+            if metadata.output_binding().measurement() == ForecastMeasurement::Probability
+                && event.validate().is_ok()
+                && metadata.label().name() == event.label_component_name() =>
+        {
+            Ok(match event {
+                PriceHigher => (
+                    PriceReturnMacroContextFixedHorizonPriceHigherTrainingV1,
+                    PriceReturnMacroContextFixedHorizonPriceHigherAnalysisV1,
+                ),
+                BenchmarkOutperformance { .. } => (
+                    PriceReturnMacroContextFixedHorizonBenchmarkOutperformanceTrainingV1,
+                    PriceReturnMacroContextFixedHorizonBenchmarkOutperformanceAnalysisV1,
+                ),
+                ProfitAfterCosts { .. } => (
+                    PriceReturnMacroContextFixedHorizonProfitAfterCostsTrainingV1,
+                    PriceReturnMacroContextFixedHorizonProfitAfterCostsAnalysisV1,
+                ),
+            })
+        }
+        _ => Err(ForecastEvidenceReadError::Unavailable),
+    }
+}
+
+fn admitted_forecast_horizon(metadata: &ModelMetadata) -> Option<NonZeroU64> {
     match (
         metadata.output_binding().measurement(),
         metadata.output_binding().target(),
     ) {
         (
             ForecastMeasurement::Return,
-            ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos },
+            ForecastTargetMeaning::FixedHorizonTerminal {
+                horizon_nanos,
+                origin_basis:
+                    market_squawk_data::FixedHorizonOriginBasis::CompletedBarClose
+                    | market_squawk_data::FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar,
+            },
         ) => Some(horizon_nanos),
+        (
+            ForecastMeasurement::Probability,
+            ForecastTargetMeaning::FixedHorizonEvent {
+                horizon_nanos,
+                origin_basis:
+                    market_squawk_data::FixedHorizonOriginBasis::CompletedBarClose
+                    | market_squawk_data::FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar,
+                event,
+            },
+        ) if event.validate().is_ok()
+            && metadata.label().name() == event.label_component_name()
+            && metadata.probability_calibration().is_some() =>
+        {
+            Some(horizon_nanos)
+        }
         _ => None,
     }
 }
 
 fn pairable_summary(
+    metadata: &ModelMetadata,
     training: &ForecastDatasetEvidence,
     analysis: &AnalyticalFeatureDataset,
 ) -> bool {
@@ -451,7 +693,10 @@ fn pairable_summary(
     let training_generation = training_dataset.generation();
     let analysis_generation = analysis.generation();
     analysis.product_contract()
-        == FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1
+        == match dataset_contracts(metadata) {
+            Ok((_, contract)) => contract,
+            Err(_) => return false,
+        }
         && analysis_generation.build_spec_digest().is_some()
         && analysis_generation.build_spec_digest() != training_generation.build_spec_digest()
         && analysis_generation.manifest() != training_generation.manifest()
@@ -469,7 +714,7 @@ fn pair(
     training: &ForecastDatasetEvidence,
     analysis: &ForecastDatasetEvidence,
 ) -> Result<ForecastDatasetPairingReceipt, ForecastEvidenceReadError> {
-    if !pairable_summary(training, analysis.dataset())
+    if !pairable_summary(metadata, training, analysis.dataset())
         || training.fence().catalog_identity() != analysis.fence().catalog_identity()
         || training.fence().as_of() != analysis.fence().as_of()
         || training.fence().as_of() != metadata.dataset().selection_as_of()
@@ -490,10 +735,13 @@ fn pair(
         analysis.fence().selection_sha256(),
         analysis.fence().as_of(),
         analysis.fence().selected_rows(),
+        analysis.dataset().split_policy(),
+        analysis.dataset().study_policy().copied(),
+        analysis.dataset().source_snapshot_digest(),
     )
     .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
     let fixed_horizon_nanos =
-        admitted_return_horizon(metadata).ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+        admitted_forecast_horizon(metadata).ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
     let training_compatibility = shared_compatibility_digest(training, fixed_horizon_nanos)?;
     let analysis_compatibility = shared_compatibility_digest(analysis, fixed_horizon_nanos)?;
     if training_compatibility != analysis_compatibility {
@@ -602,7 +850,14 @@ fn shared_row_digest(row: &ForecastFeatureRow) -> Result<Sha256Digest, ForecastE
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/forecast-training-analysis-compatible-row/v1\0");
     digest.update(row.instrument_id().as_uuid().as_bytes());
-    digest.update(row.cutoff_at().unix_nanos().to_be_bytes());
+    digest.update(row.source_selection_as_of().unix_nanos().to_be_bytes());
+    digest.update(
+        row.decision_at()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
+            .unix_nanos()
+            .to_be_bytes(),
+    );
+    hash_optional_timestamp(&mut digest, row.label_selection_as_of());
     hash_optional_timestamp(&mut digest, row.observed_effective_at());
     hash_optional_timestamp(&mut digest, row.label_effective_at());
     digest.update([row.target_coordinate_kind(), split_tag(row.split())]);
@@ -735,6 +990,7 @@ fn instrument_inventory(
             instrument,
             origin,
             target,
+            origin_label.source_selection_as_of(),
             origin_label.split(),
         )?;
         inventory.push(ForecastInstrumentAvailability::try_new(
@@ -749,23 +1005,28 @@ fn instrument_inventory(
     Ok(inventory)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "source and calendar owners retain independent exact evidence"
+)]
 async fn materialize(
     request: ForecastEvidenceMaterializationRequest,
     evidence: &ForecastDatasetEvidence,
     analytical: &AnalyticalReadCapability,
     macro_context: Option<&MacroContextReadCapability>,
+    calendar: Option<&crate::application::market_calendar::CompletedMarketSessionReadCapability>,
     expected_serving: Option<&ForecastServingInputFence>,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<PreparedForecastEvidence, ForecastEvidenceReadError> {
     let metadata = request.model().metadata();
     let horizon =
-        admitted_return_horizon(metadata).ok_or(ForecastEvidenceReadError::Unavailable)?;
+        admitted_forecast_horizon(metadata).ok_or(ForecastEvidenceReadError::Unavailable)?;
     if request.selection().dataset_manifest() != request.pairing().training().manifest()
         || request.selection().analysis_manifest() != request.pairing().analysis_fence().manifest()
         || request.pairing().training() != metadata.dataset()
         || request.selection().horizon().points() != NonZeroU16::MIN
-        || request.selection().horizon().step_nanos() != horizon
+        || request.selection().horizon().step_nanos() != Some(horizon)
         || request.pairing().fixed_horizon_nanos() != horizon
         || !has_price_return_macro_context_feature_order_v1(metadata)
     {
@@ -785,9 +1046,69 @@ async fn materialize(
         instrument,
         historical_origin,
         historical_target,
+        historical_oos.source_selection_as_of(),
         historical_oos.split(),
     )?;
     let knowledge_cutoff = request.knowledge_cutoff();
+    if let Some(input) = request.selection().current_feature_input() {
+        let output = crate::application::model::forecast::reopen_current_price_input(
+            analytical,
+            input.manifest(),
+            deadline,
+            cancellation.child_token(),
+        )
+        .await
+        .map_err(map_serving_error)?;
+        let index = crate::application::model::forecast::current_price_coordinate_index(
+            &output,
+            input.example_id(),
+        )
+        .map_err(map_serving_error)?;
+        let coordinate = output
+            .coordinate(index)
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+        if coordinate.epoch().instrument_id() != instrument {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let calendar = calendar.cloned().map(crate::application::market_calendar::ForecastSessionReadCapability::Current);
+        crate::application::model::forecast::current_price_session_origin(
+            calendar.as_ref(),
+            input.session_cohort(),
+            coordinate,
+            deadline,
+            cancellation.child_token(),
+        )
+        .await
+        .map_err(map_serving_error)?;
+        let serving = current_price_materialization(
+            metadata,
+            &output,
+            index,
+            knowledge_cutoff,
+            input.session_cohort(),
+        )?;
+        if expected_serving.is_some_and(|expected| expected != &serving.fence) {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let inputs =
+            crate::application::model::forecast::current_price_feature_values(metadata, coordinate)
+                .map_err(map_serving_error)?;
+        return PreparedForecastEvidence::try_new(
+            request,
+            serving.fence,
+            serving.observed_cutoff,
+            serving.available_at,
+            serving.decimal_scale,
+            serving.observed_history,
+            vec![inputs.into_boxed_slice()],
+        );
+    }
+    if matches!(
+        metadata.output_binding().target(),
+        ForecastTargetMeaning::FixedHorizonEvent { .. }
+    ) {
+        return Err(ForecastEvidenceReadError::Unavailable);
+    }
     let effective_date_cutoff = request.macro_effective_date_cutoff();
     let serving = serving_materialization(
         analytical,
@@ -971,6 +1292,12 @@ fn enrich_serving_materialization(
     }
 
     let composite_feature_sha256 = Sha256Digest::new(digest.finalize().into());
+    let mut serving_parents = serving.fence.parent_manifests().to_vec();
+    for parent in macro_features.parent_manifests() {
+        if !serving_parents.contains(parent) {
+            serving_parents.push(parent.clone());
+        }
+    }
     let composite_fence = ForecastServingInputFence::try_new(
         serving.fence.manifest().clone(),
         serving.fence.source_id().clone(),
@@ -978,10 +1305,15 @@ fn enrich_serving_materialization(
         serving.fence.selection_sha256(),
         serving.fence.result_sha256(),
         serving.fence.knowledge_cutoff(),
-        serving.fence.prior_observed_at(),
+        serving
+            .fence
+            .prior_observed_at()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
         serving.fence.observed_through(),
         composite_feature_sha256,
-    )?;
+    )?
+    .with_origin_bar(serving.fence.origin_bar().cloned())?
+    .with_parent_manifests(serving_parents)?;
     serving.available_at = serving.available_at.max(macro_features.knowledge_cutoff());
     serving.fence = composite_fence;
     Ok((serving, input.into_boxed_slice()))
@@ -1019,6 +1351,52 @@ const fn map_macro_feature_error(error: ServiceError) -> ForecastEvidenceReadErr
     }
 }
 
+fn current_price_materialization(
+    metadata: &ModelMetadata,
+    output: &market_squawk_data::FeatureDatasetInputEpochOutput,
+    index: usize,
+    knowledge_cutoff: Timestamp,
+    cohort: Option<&crate::application::market_calendar::ForecastSessionCohortReference>,
+) -> Result<ServingMaterialization, ForecastEvidenceReadError> {
+    let coordinate = output
+        .coordinate(index)
+        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+    let epoch = coordinate.epoch();
+    if epoch.source_selection_as_of() != knowledge_cutoff {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+    let inputs =
+        crate::application::model::forecast::current_price_feature_values(metadata, coordinate)
+            .map_err(map_serving_error)?;
+    let current_return = *inputs
+        .first()
+        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+    let fence = ForecastServingInputFence::from_current_price_output(output, index, cohort)?;
+    let observed_cutoff = epoch
+        .target_origin()
+        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+    let observed = crate::application::model::forecast::current_price_observed_point(
+        coordinate,
+        current_return,
+    )
+    .map_err(map_serving_error)?;
+    Ok(ServingMaterialization {
+        fence,
+        observed_cutoff,
+        available_at: knowledge_cutoff,
+        decimal_scale: FLOAT_RETURN_SCALE,
+        observed_history: if matches!(
+            metadata.output_binding().target(),
+            ForecastTargetMeaning::FixedHorizonEvent { .. }
+        ) {
+            Vec::new()
+        } else {
+            vec![observed]
+        },
+        current_return,
+    })
+}
+
 struct ServingMaterialization {
     fence: ForecastServingInputFence,
     observed_cutoff: Timestamp,
@@ -1041,24 +1419,6 @@ async fn serving_materialization(
     if expected.is_some_and(|expected| expected.knowledge_cutoff() != knowledge_cutoff) {
         return Err(ForecastEvidenceReadError::InvalidEvidence);
     }
-    let start = knowledge_cutoff
-        .checked_sub_nanos(SERVING_LOOKBACK_NANOS)
-        .map_err(|_| ForecastEvidenceReadError::Unavailable)?;
-    let range = MarketBarEffectiveRange::try_new(start, knowledge_cutoff)
-        .map_err(|_| ForecastEvidenceReadError::Unavailable)?;
-    let read_limit = AnalyticalMarketBarReadLimit::try_new(MAX_SERVING_BARS)
-        .map_err(|_| ForecastEvidenceReadError::Capacity)?;
-    let query_limits = QueryLimits::try_new_with_inline_bytes(
-        u64::from(MAX_SERVING_BARS),
-        SERVING_QUERY_BYTES,
-        SERVING_QUERY_BYTES,
-        SERVING_QUERY_BYTES * 2,
-        4,
-        512,
-        512,
-        SERVING_QUERY_DURATION,
-    )
-    .map_err(|_| ForecastEvidenceReadError::Capacity)?;
 
     let parents = evidence.dataset().generation().parents();
     let mut manifests = Vec::new();
@@ -1094,22 +1454,19 @@ async fn serving_materialization(
     let mut selected = None;
     for manifest in manifests {
         check_control(deadline, &cancellation)?;
-        let request = match AnalyticalMarketBarReadRequest::try_new(
+        let Some(output) = read_serving_market_bars(
+            analytical,
             manifest,
             instrument,
             knowledge_cutoff,
-            Some(range),
-            read_limit,
-        ) {
-            Ok(request) => request,
-            Err(market_squawk_data::AnalyticalReadError::InvalidObservationSchema) => continue,
-            Err(error) => return Err(map_read_error(error)),
+            deadline,
+            cancellation.child_token(),
+        )
+        .await?
+        else {
+            continue;
         };
-        let output = analytical
-            .read_market_bars(request, query_limits, deadline, cancellation.child_token())
-            .await
-            .map_err(map_read_error)?;
-        let Some(candidate) = derive_serving_materialization(output, knowledge_cutoff)? else {
+        let Some(candidate) = derive_serving_materialization(&output, knowledge_cutoff)? else {
             continue;
         };
         if selected.is_some() {
@@ -1118,14 +1475,109 @@ async fn serving_materialization(
         selected = Some(candidate);
     }
     let selected = selected.ok_or(ForecastEvidenceReadError::Unavailable)?;
-    if expected.is_some_and(|expected| expected != &selected.fence) {
+    // The retained fence includes the macro vector. Revalidate the exact bar selection here;
+    // `revalidate` compares the complete evidence after the same macro vector is reconstructed.
+    if expected.is_some_and(|expected| {
+        expected.manifest() != selected.fence.manifest()
+            || expected.source_id() != selected.fence.source_id()
+            || expected.object_graph_sha256() != selected.fence.object_graph_sha256()
+            || expected.selection_sha256() != selected.fence.selection_sha256()
+            || expected.result_sha256() != selected.fence.result_sha256()
+            || expected.knowledge_cutoff() != selected.fence.knowledge_cutoff()
+            || expected.prior_observed_at() != selected.fence.prior_observed_at()
+            || expected.observed_through() != selected.fence.observed_through()
+            || expected.origin_bar() != selected.fence.origin_bar()
+    }) {
         return Err(ForecastEvidenceReadError::InvalidEvidence);
     }
     Ok(selected)
 }
 
+async fn read_serving_market_bars(
+    analytical: &AnalyticalReadCapability,
+    manifest: DatasetManifestRef,
+    instrument: InstrumentId,
+    knowledge_cutoff: Timestamp,
+    deadline: Instant,
+    cancellation: CancellationToken,
+) -> Result<Option<market_squawk_data::AnalyticalMarketBarOutput>, ForecastEvidenceReadError> {
+    check_control(deadline, &cancellation)?;
+    let start = knowledge_cutoff
+        .checked_sub_nanos(SERVING_LOOKBACK_NANOS)
+        .map_err(|_| ForecastEvidenceReadError::Unavailable)?;
+    let range = MarketBarEffectiveRange::try_new(start, knowledge_cutoff)
+        .map_err(|_| ForecastEvidenceReadError::Unavailable)?;
+    let read_limit = AnalyticalMarketBarReadLimit::try_new(MAX_SERVING_BARS)
+        .map_err(|_| ForecastEvidenceReadError::Capacity)?;
+    let query_limits = QueryLimits::try_new_with_inline_bytes(
+        u64::from(MAX_SERVING_BARS),
+        SERVING_QUERY_BYTES,
+        SERVING_QUERY_BYTES,
+        SERVING_QUERY_BYTES * 2,
+        4,
+        512,
+        512,
+        SERVING_QUERY_DURATION,
+    )
+    .map_err(|_| ForecastEvidenceReadError::Capacity)?;
+
+    let request = match AnalyticalMarketBarReadRequest::try_new(
+        manifest,
+        instrument,
+        knowledge_cutoff,
+        Some(range),
+        read_limit,
+    ) {
+        Ok(request) => request,
+        Err(market_squawk_data::AnalyticalReadError::InvalidObservationSchema) => return Ok(None),
+        Err(error) => return Err(map_read_error(error)),
+    };
+    analytical
+        .read_market_bars(request, query_limits, deadline, cancellation)
+        .await
+        .map(Some)
+        .map_err(map_read_error)
+}
+
+/// Reopens the exact original serving query authenticated by the controlled forecast artifact.
+pub(crate) async fn reopen_forecast_serving_output(
+    analytical: &AnalyticalReadCapability,
+    binding: &market_squawk_modeling::AuthenticatedForecastServingBinding,
+    instrument: InstrumentId,
+    deadline: Instant,
+    cancellation: CancellationToken,
+) -> Result<market_squawk_data::AnalyticalMarketBarOutput, ForecastEvidenceReadError> {
+    let output = read_serving_market_bars(
+        analytical,
+        binding.manifest().clone(),
+        instrument,
+        binding.knowledge_cutoff(),
+        deadline,
+        cancellation.child_token(),
+    )
+    .await?
+    .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+    let selected = derive_serving_materialization(&output, binding.knowledge_cutoff())?
+        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+    let fence = selected.fence;
+    if fence.manifest() != binding.manifest()
+        || fence.source_id() != binding.source_id()
+        || fence.object_graph_sha256() != binding.object_graph_sha256()
+        || fence.selection_sha256() != binding.selection_sha256()
+        || fence.result_sha256() != binding.result_sha256()
+        || fence.knowledge_cutoff() != binding.knowledge_cutoff()
+        || fence.prior_observed_at() != binding.prior_observed_at()
+        || Some(fence.observed_through()) != binding.observed_through()
+        || fence.origin_bar() != binding.origin_bar()
+    {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+    check_control(deadline, &cancellation)?;
+    Ok(output)
+}
+
 fn derive_serving_materialization(
-    output: market_squawk_data::AnalyticalMarketBarOutput,
+    output: &market_squawk_data::AnalyticalMarketBarOutput,
     knowledge_cutoff: Timestamp,
 ) -> Result<Option<ServingMaterialization>, ForecastEvidenceReadError> {
     let bars = output.bars();
@@ -1138,8 +1590,7 @@ fn derive_serving_materialization(
     if first.adjustment() != MarketBarAdjustment::Split
         || bars.windows(2).any(|pair| {
             !same_serving_series(&pair[0], &pair[1])
-                || pair[0].time_semantics().provider_timestamp()
-                    >= pair[1].time_semantics().provider_timestamp()
+                || pair[0].completed_at() >= pair[1].completed_at()
         })
     {
         return Ok(None);
@@ -1156,8 +1607,10 @@ fn derive_serving_materialization(
     for pair in bars.windows(2) {
         let prior = &pair[0];
         let current = &pair[1];
-        let observed_at = current.time_semantics().provider_timestamp();
-        if current.completed_at() > knowledge_cutoff {
+        let observed_at = current
+            .completed_at()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+        if observed_at > knowledge_cutoff {
             continue;
         }
         let available_at =
@@ -1188,7 +1641,9 @@ fn derive_serving_materialization(
     }
     let (prior, current, current_value, feature_sha256) =
         latest_feature.ok_or(ForecastEvidenceReadError::Unavailable)?;
-    let observed_cutoff = current.time_semantics().provider_timestamp();
+    let observed_cutoff = current
+        .completed_at()
+        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
     let available_at = maximum_available_at.ok_or(ForecastEvidenceReadError::Unavailable)?;
     let current_return = current_value
         .to_f64()
@@ -1211,10 +1666,13 @@ fn derive_serving_materialization(
         selection,
         result,
         knowledge_cutoff,
-        prior.time_semantics().provider_timestamp(),
+        prior
+            .completed_at()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?,
         observed_cutoff,
         feature_sha256,
-    )?;
+    )?
+    .with_origin_bar(Some(current.clone()))?;
     Ok(Some(ServingMaterialization {
         fence,
         observed_cutoff,
@@ -1279,6 +1737,21 @@ fn serving_feature_digest(
 ) -> Result<Sha256Digest, ForecastEvidenceReadError> {
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/forecast-serving-price-return/v1\0");
+    digest.update(b"CompletedBarClose\0");
+    digest.update(
+        prior
+            .completed_at()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
+            .unix_nanos()
+            .to_be_bytes(),
+    );
+    digest.update(
+        current
+            .completed_at()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
+            .unix_nanos()
+            .to_be_bytes(),
+    );
     digest.update(object_graph.bytes());
     digest.update(selection.bytes());
     digest.update(result.bytes());
@@ -1286,6 +1759,7 @@ fn serving_feature_digest(
         prior
             .time_semantics()
             .provider_timestamp()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
             .unix_nanos()
             .to_be_bytes(),
     );
@@ -1293,6 +1767,7 @@ fn serving_feature_digest(
         current
             .time_semantics()
             .provider_timestamp()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?
             .unix_nanos()
             .to_be_bytes(),
     );
@@ -1323,9 +1798,11 @@ fn exact_terminal_coordinates(
         row.target_coordinate_kind(),
         row.observed_effective_at(),
         row.label_effective_at(),
+        row.decision_at(),
     ) {
-        (1, Some(observed), Some(label))
-            if row.cutoff_at() == observed
+        (3 | 5, Some(observed), Some(label), Some(decision))
+            if observed <= decision
+                && decision < label
                 && label.unix_nanos().checked_sub(observed.unix_nanos())
                     == i64::try_from(horizon.get()).ok() =>
         {
@@ -1341,13 +1818,18 @@ fn latest_oos_origin<'row>(
     instrument: InstrumentId,
     horizon: NonZeroU64,
 ) -> Result<Option<&'row ForecastFeatureRow>, ForecastEvidenceReadError> {
+    let training_end = metadata
+        .training_period()
+        .end()
+        .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
     let mut selected: Option<&ForecastFeatureRow> = None;
-    for row in rows
-        .iter()
-        .filter(|row| row.instrument_id() == instrument && model_label(row, metadata))
-    {
+    for row in rows.iter().filter(|row| {
+        row.instrument_id() == instrument
+            && model_label(row, metadata)
+            && !matches!(row.value(), ForecastFeatureValue::Missing)
+    }) {
         let (origin, _) = exact_terminal_coordinates(row, horizon)?;
-        if row.split() == DatasetSplit::Train || origin < metadata.training_period().end() {
+        if row.split() == DatasetSplit::Train || origin < training_end {
             continue;
         }
         match selected {
@@ -1377,10 +1859,11 @@ fn historical_labels<'row>(
     labels
         .try_reserve_exact(rows.len())
         .map_err(|_| ForecastEvidenceReadError::Capacity)?;
-    for row in rows
-        .iter()
-        .filter(|row| row.instrument_id() == instrument && model_label(row, metadata))
-    {
+    for row in rows.iter().filter(|row| {
+        row.instrument_id() == instrument
+            && model_label(row, metadata)
+            && !matches!(row.value(), ForecastFeatureValue::Missing)
+    }) {
         let (_, target) = exact_terminal_coordinates(row, horizon)?;
         if target <= through {
             observed_value(row)?;
@@ -1426,6 +1909,7 @@ fn coefficient_row(
     instrument: InstrumentId,
     origin: Timestamp,
     target: Timestamp,
+    cutoff: Timestamp,
     split: DatasetSplit,
 ) -> Result<Vec<f64>, ForecastEvidenceReadError> {
     metadata
@@ -1434,10 +1918,10 @@ fn coefficient_row(
         .map(|binding| {
             let mut candidates = rows.iter().filter(|row| {
                 row.instrument_id() == instrument
-                    && row.cutoff_at() == origin
+                    && row.source_selection_as_of() == cutoff
                     && row.observed_effective_at() == Some(origin)
                     && row.label_effective_at() == Some(target)
-                    && row.target_coordinate_kind() == 1
+                    && matches!(row.target_coordinate_kind(), 3 | 5)
                     && row.split() == split
                     && row.component_kind() == 1
                     && row.component_name() == binding.key().name()
@@ -1523,5 +2007,17 @@ fn map_read_error(error: market_squawk_data::AnalyticalReadError) -> ForecastEvi
             ForecastEvidenceReadError::Unavailable
         }
         _ => ForecastEvidenceReadError::Unavailable,
+    }
+}
+
+fn map_serving_error(error: ServiceError) -> ForecastEvidenceReadError {
+    match error {
+        ServiceError::Cancelled => ForecastEvidenceReadError::Cancelled,
+        ServiceError::DeadlineExceeded => ForecastEvidenceReadError::DeadlineExceeded,
+        ServiceError::ResourceExhausted => ForecastEvidenceReadError::Capacity,
+        ServiceError::Unavailable | ServiceError::NotFound => {
+            ForecastEvidenceReadError::Unavailable
+        }
+        _ => ForecastEvidenceReadError::InvalidEvidence,
     }
 }

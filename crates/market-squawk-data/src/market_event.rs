@@ -7,7 +7,9 @@ use arrow::array::{
     UInt16Array, UInt32Array,
 };
 use arrow::record_batch::RecordBatch;
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, LiveProvenance, MarketEvent};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, LiveEvidenceScope, LiveProvenance, MarketEvent,
+};
 use market_squawk_sources::{
     ProviderMarketEventBatch, SealedProviderEventMicrobatchBinding,
     SealedProviderPublicationBinding, SealedProviderResponseMarketEventBinding,
@@ -206,6 +208,12 @@ impl ProviderMarketEventArrowBatch {
             digest.update(columns.physical_frame_ordinals.value(row).to_be_bytes());
             digest.update(columns.raw_payload_digests.value(row));
             digest.update(columns.native_digests.value(row));
+            if columns.identity_selections.is_null(row) {
+                digest.update([0]);
+            } else {
+                digest.update([1]);
+                digest.update(sha256_evidence(columns.identity_selections.value(row)).bytes());
+            }
             digest.update(columns.event_digests.value(row));
         }
         Ok(EvidenceDigest::new(
@@ -219,6 +227,7 @@ struct EventProjection<'a> {
     event: &'a MarketEvent,
     event_digest: EvidenceDigest,
     native_payload: &'a [u8],
+    identity_selection: Option<&'a [u8]>,
     native_digest: EvidenceDigest,
     component_kind: &'static str,
     logical_ordinal: u16,
@@ -253,6 +262,7 @@ fn response_rows(
                     .canonical_event_digest(ordinal)
                     .ok_or(ArrowConversionError::InvalidMarketEventRow)?,
                 native_payload,
+                identity_selection: native.identity_selection(ordinal),
                 native_digest: native
                     .row_digest(ordinal)
                     .ok_or(ArrowConversionError::InvalidMarketEventRow)?,
@@ -292,6 +302,7 @@ fn event_rows(
                     .canonical_event_digest(ordinal)
                     .ok_or(ArrowConversionError::InvalidMarketEventRow)?,
                 native_payload,
+                identity_selection: native.identity_selection(ordinal),
                 native_digest: native
                     .row_digest(ordinal)
                     .ok_or(ArrowConversionError::InvalidMarketEventRow)?,
@@ -324,6 +335,10 @@ fn build_event_batch(
     let mut instruments = Vec::with_capacity(count);
     let mut venues = Vec::with_capacity(count);
     let mut identifiers = Vec::with_capacity(count);
+    let mut scopes = Vec::with_capacity(count);
+    let mut cohorts = Vec::with_capacity(count);
+    let mut products = Vec::with_capacity(count);
+    let mut channels = Vec::with_capacity(count);
     let mut source_times = Vec::with_capacity(count);
     let mut received = Vec::with_capacity(count);
     let mut available = Vec::with_capacity(count);
@@ -336,12 +351,14 @@ fn build_event_batch(
     let mut sequences = Vec::with_capacity(count);
     let mut raw_digests = Vec::with_capacity(count);
     let mut native_digests = Vec::with_capacity(count);
+    let mut identity_selections = Vec::with_capacity(count);
     let mut event_digests = Vec::with_capacity(count);
     let mut json = Vec::with_capacity(count);
     let mut events = Vec::with_capacity(count);
     for (ordinal, row) in rows.into_iter().enumerate() {
         let provenance = market_event_provenance(row.event);
         let payload = serde_json::to_vec(row.event)?;
+        validate_identity_selection(row.identity_selection, provenance)?;
         if sha256_evidence(&payload) != row.event_digest
             || sha256_evidence(row.native_payload) != row.native_digest
             || provenance.binding().payload_digest() != row.raw_payload_digest
@@ -352,13 +369,28 @@ fn build_event_batch(
             .push(u32::try_from(ordinal).map_err(|_| ArrowConversionError::InvalidMarketEventRow)?);
         source_ids.push(provenance.source_id().as_str());
         kinds.push(market_event_kind(row.event));
+        validate_event_scope(row.event)?;
         instruments.push(
             provenance
                 .instrument_id()
-                .ok_or(ArrowConversionError::InvalidMarketEventRow)?
-                .as_uuid()
-                .as_bytes()
-                .to_vec(),
+                .map(|id| id.as_uuid().as_bytes().to_vec()),
+        );
+        let (scope_kind, cohort_key) = scope_columns(provenance.binding().scope());
+        scopes.push(scope_kind);
+        cohorts.push(cohort_key);
+        products.push(
+            provenance
+                .binding()
+                .provider_product()
+                .as_source_identifier()
+                .as_str(),
+        );
+        channels.push(
+            provenance
+                .binding()
+                .provider_channel()
+                .as_source_identifier()
+                .as_str(),
         );
         venues.push(
             provenance
@@ -382,6 +414,7 @@ fn build_event_batch(
         );
         raw_digests.push(row.raw_payload_digest.bytes().to_vec());
         native_digests.push(row.native_digest.bytes().to_vec());
+        identity_selections.push(row.identity_selection);
         event_digests.push(row.event_digest.bytes().to_vec());
         json.push(payload);
         events.push(row.event.clone());
@@ -391,11 +424,16 @@ fn build_event_batch(
         Arc::new(UInt32Array::from(ordinals)),
         Arc::new(StringArray::from(source_ids)),
         Arc::new(StringArray::from(kinds)),
-        Arc::new(FixedSizeBinaryArray::try_from_iter(
-            instruments.iter().map(Vec::as_slice),
+        Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            instruments.iter().map(|value| value.as_deref()),
+            16,
         )?),
         Arc::new(StringArray::from(venues)),
         Arc::new(StringArray::from(identifiers)),
+        Arc::new(StringArray::from(scopes)),
+        Arc::new(StringArray::from(cohorts)),
+        Arc::new(StringArray::from(products)),
+        Arc::new(StringArray::from(channels)),
         Arc::new(TimestampNanosecondArray::from(source_times).with_timezone_utc()),
         Arc::new(TimestampNanosecondArray::from(received).with_timezone_utc()),
         Arc::new(TimestampNanosecondArray::from(available).with_timezone_utc()),
@@ -420,6 +458,7 @@ fn build_event_batch(
         Arc::new(FixedSizeBinaryArray::try_from_iter(
             native_digests.iter().map(Vec::as_slice),
         )?),
+        Arc::new(BinaryArray::from_iter(identity_selections)),
         Arc::new(FixedSizeBinaryArray::try_from_iter(
             event_digests.iter().map(Vec::as_slice),
         )?),
@@ -498,17 +537,30 @@ fn validate_restarted_row(
     expected: ExpectedRow<'_>,
 ) -> Result<(), ArrowConversionError> {
     let provenance = market_event_provenance(event);
+    validate_event_scope(event)?;
+    let instrument_uuid = provenance.instrument_id().map(|id| id.as_uuid());
     if columns.schema_versions.value(ordinal) != MARKET_EVENT_SCHEMA_VERSION
         || columns.canonical_ordinals.value(ordinal)
             != u32::try_from(ordinal).map_err(|_| ArrowConversionError::InvalidMarketEventRow)?
         || columns.source_ids.value(ordinal) != provenance.source_id().as_str()
         || columns.event_kinds.value(ordinal) != market_event_kind(event)
-        || columns.instrument_ids.value(ordinal)
+        || (!columns.instrument_ids.is_null(ordinal)).then(|| columns.instrument_ids.value(ordinal))
+            != instrument_uuid.as_ref().map(|id| id.as_bytes().as_slice())
+        || columns.scope_kinds.value(ordinal) != scope_columns(provenance.binding().scope()).0
+        || (!columns.cohort_keys.is_null(ordinal)).then(|| columns.cohort_keys.value(ordinal))
+            != scope_columns(provenance.binding().scope()).1
+        || columns.provider_products.value(ordinal)
             != provenance
-                .instrument_id()
-                .ok_or(ArrowConversionError::InvalidMarketEventRow)?
-                .as_uuid()
-                .as_bytes()
+                .binding()
+                .provider_product()
+                .as_source_identifier()
+                .as_str()
+        || columns.provider_channels.value(ordinal)
+            != provenance
+                .binding()
+                .provider_channel()
+                .as_source_identifier()
+                .as_str()
         || columns.venue_ids.value(ordinal)
             != provenance
                 .venue_id()
@@ -534,6 +586,7 @@ fn validate_restarted_row(
         raw,
         native_digest,
         event_digest,
+        identity_selection,
     ) = match expected {
         ExpectedRow::Response(row) => (
             RESPONSE_KIND,
@@ -545,6 +598,7 @@ fn validate_restarted_row(
             row.payload_digest(),
             row.native_semantic_digest(),
             row.canonical_event_digest(),
+            row.identity_selection(),
         ),
         ExpectedRow::Event(row) => (
             EVENT_KIND,
@@ -556,8 +610,15 @@ fn validate_restarted_row(
             row.payload_digest(),
             row.native_semantic_digest(),
             row.canonical_event_digest(),
+            row.identity_selection(),
         ),
     };
+    let actual_selection = (!columns.identity_selections.is_null(ordinal))
+        .then(|| columns.identity_selections.value(ordinal));
+    if actual_selection != identity_selection {
+        return Err(ArrowConversionError::InvalidMarketEventRow);
+    }
+    validate_identity_selection(actual_selection, provenance)?;
     let actual_event_id =
         (!columns.event_ids.is_null(ordinal)).then(|| columns.event_ids.value(ordinal));
     let actual_connection_id =
@@ -660,6 +721,10 @@ struct EventColumns<'a> {
     instrument_ids: &'a FixedSizeBinaryArray,
     venue_ids: &'a StringArray,
     source_identifiers: &'a StringArray,
+    scope_kinds: &'a StringArray,
+    cohort_keys: &'a StringArray,
+    provider_products: &'a StringArray,
+    provider_channels: &'a StringArray,
     source_timestamps: &'a TimestampNanosecondArray,
     received_at: &'a TimestampNanosecondArray,
     available_at: &'a TimestampNanosecondArray,
@@ -672,6 +737,7 @@ struct EventColumns<'a> {
     source_sequence: &'a BinaryArray,
     raw_payload_digests: &'a FixedSizeBinaryArray,
     native_digests: &'a FixedSizeBinaryArray,
+    identity_selections: &'a BinaryArray,
     event_digests: &'a FixedSizeBinaryArray,
     event_json: &'a BinaryArray,
 }
@@ -694,6 +760,10 @@ impl<'a> EventColumns<'a> {
             instrument_ids: column!("instrument_id", FixedSizeBinaryArray),
             venue_ids: column!("venue_id", StringArray),
             source_identifiers: column!("source_identifier", StringArray),
+            scope_kinds: column!("scope_kind", StringArray),
+            cohort_keys: column!("cohort_key", StringArray),
+            provider_products: column!("provider_product", StringArray),
+            provider_channels: column!("provider_channel", StringArray),
             source_timestamps: column!("source_timestamp", TimestampNanosecondArray),
             received_at: column!("received_at", TimestampNanosecondArray),
             available_at: column!("available_at", TimestampNanosecondArray),
@@ -706,6 +776,7 @@ impl<'a> EventColumns<'a> {
             source_sequence: column!("source_sequence_be", BinaryArray),
             raw_payload_digests: column!("raw_payload_sha256", FixedSizeBinaryArray),
             native_digests: column!("native_semantic_sha256", FixedSizeBinaryArray),
+            identity_selections: column!("identity_selection", BinaryArray),
             event_digests: column!("event_sha256", FixedSizeBinaryArray),
             event_json: column!("event_json", BinaryArray),
         })
@@ -716,6 +787,11 @@ const fn market_event_provenance(event: &MarketEvent) -> &LiveProvenance {
     match event {
         MarketEvent::Trade(value) => value.provenance(),
         MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::MarketDataQuote(value) => value.provenance(),
+        MarketEvent::MarketDataTrade(value) => value.provenance(),
+        MarketEvent::MarketDataBook(value) => value.provenance(),
+        MarketEvent::MarketDataChart(value) => value.provenance(),
+        MarketEvent::MarketDataScreener(value) => value.provenance(),
         MarketEvent::BookSnapshot(value) => value.provenance(),
         MarketEvent::BookDelta(value) => value.provenance(),
         MarketEvent::Auction(value) => value.provenance(),
@@ -729,6 +805,11 @@ const fn market_event_kind(event: &MarketEvent) -> &'static str {
     match event {
         MarketEvent::Trade(_) => "trade",
         MarketEvent::Quote(_) => "quote",
+        MarketEvent::MarketDataQuote(_) => "market_data_quote",
+        MarketEvent::MarketDataTrade(_) => "market_data_trade",
+        MarketEvent::MarketDataBook(_) => "market_data_book",
+        MarketEvent::MarketDataChart(_) => "market_data_chart",
+        MarketEvent::MarketDataScreener(_) => "market_data_screener",
         MarketEvent::BookSnapshot(_) => "book_snapshot",
         MarketEvent::BookDelta(_) => "book_delta",
         MarketEvent::Auction(_) => "auction",
@@ -758,4 +839,50 @@ fn decode_optional_u64(
 
 fn sha256_evidence(bytes: &[u8]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
+}
+
+fn scope_columns(scope: &LiveEvidenceScope) -> (&'static str, Option<&str>) {
+    match scope {
+        LiveEvidenceScope::Instrument(_) => ("instrument", None),
+        LiveEvidenceScope::SourceCohort(key) => ("source_cohort", Some(key.as_str())),
+    }
+}
+
+fn validate_event_scope(event: &MarketEvent) -> Result<(), ArrowConversionError> {
+    let binding = market_event_provenance(event).binding();
+    match (event, binding.scope()) {
+        (MarketEvent::MarketDataScreener(value), LiveEvidenceScope::SourceCohort(key))
+            if key == &value.input().cohort_key && key == binding.source_identifier() =>
+        {
+            Ok(())
+        }
+        (MarketEvent::MarketDataScreener(_), _) | (_, LiveEvidenceScope::SourceCohort(_)) => {
+            Err(ArrowConversionError::InvalidMarketEventRow)
+        }
+        (_, LiveEvidenceScope::Instrument(_)) => Ok(()),
+    }
+}
+
+/// The catalog separately replays the projection; this check binds it to the actual canonical row.
+fn validate_identity_selection(
+    payload: Option<&[u8]>,
+    provenance: &LiveProvenance,
+) -> Result<(), ArrowConversionError> {
+    if let Some(payload) = payload {
+        if payload.is_empty()
+            || payload.len() > market_squawk_sources::MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES
+        {
+            return Err(ArrowConversionError::InvalidMarketEventRow);
+        }
+        let selection: market_squawk_sources::ProviderIdentitySelectionEvidence =
+            serde_json::from_slice(payload)?;
+        if provenance.instrument_id() != Some(selection.native.instrument)
+            || provenance.venue_id() != Some(&selection.native.venue)
+            || selection.native.knowledge_at > provenance.received_at()
+            || selection.native.effective_at > provenance.received_at()
+        {
+            return Err(ArrowConversionError::InvalidMarketEventRow);
+        }
+    }
+    Ok(())
 }

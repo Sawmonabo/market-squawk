@@ -1,6 +1,6 @@
 //! Provider-neutral immutable history projection for ordinary Market consumers.
 
-use market_squawk_domain::{DataQuality, InstrumentId};
+use market_squawk_domain::{BarTimeSemantics, DataQuality, InstrumentId};
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
@@ -11,10 +11,10 @@ use serde_json::{Value, json};
 use super::{ensure_live, serialization::timestamp_value, system_timestamp};
 use crate::application::research::{
     LatestMarketHistoryReadRequest, MarketHistoryAdjustmentPolicy, MarketHistoryBar,
-    MarketHistoryMissingReason, MarketHistoryPartialReason, MarketHistoryQuality,
-    MarketHistoryReadCapability, MarketHistoryReadLimit, MarketHistoryReadOutcome,
-    MarketHistorySeries, MarketHistorySessionPolicy, MarketHistoryTimeframe,
-    MarketHistoryUnavailableReason,
+    MarketHistoryInterval, MarketHistoryMissingReason, MarketHistoryPartialReason,
+    MarketHistoryQuality, MarketHistoryReadCapability, MarketHistoryReadLimit,
+    MarketHistoryReadOutcome, MarketHistorySeries, MarketHistorySessionPolicy,
+    MarketHistoryTimeframe, MarketHistoryUnavailableReason,
 };
 
 const PRODUCT_PERIOD: &str = "daily";
@@ -90,8 +90,7 @@ fn product_series_result(
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     for bar in series.bars() {
         bars.push(json!({
-            "startsAt": timestamp_value(bar.period_start()),
-            "endsAt": timestamp_value(bar.period_end_exclusive()),
+            "time": bar_time_value(bar),
                 "open": bar.open().amount().normalize().to_string(),
                 "high": bar.high().amount().normalize().to_string(),
                 "low": bar.low().amount().normalize().to_string(),
@@ -247,14 +246,9 @@ fn series_result(
         "adjustment": PRODUCT_ADJUSTMENT,
         "currency": series.currency().as_str(),
         "coverage": {
-            "selectedStart": timestamp_value(coverage.requested().start()),
-            "selectedEndExclusive": timestamp_value(coverage.requested().end_exclusive()),
-            "materializedStart": timestamp_value(coverage.materialized().start()),
-            "materializedEndExclusive": timestamp_value(
-                coverage.materialized().end_exclusive()
-            ),
-            "returnedStart": timestamp_value(coverage.returned().start()),
-            "returnedEndExclusive": timestamp_value(coverage.returned().end_exclusive()),
+            "requested": interval_value(coverage.requested()),
+            "materialized": interval_value(coverage.materialized()),
+            "returned": interval_value(coverage.returned()),
             "materializedBars": coverage.materialized_bars(),
             "returnedBars": coverage.returned_bars(),
         },
@@ -334,11 +328,25 @@ fn validate_series(series: &MarketHistorySeries) -> Result<(), ServiceError> {
         || quality.retrospective_training_eligible()
         || quality.observation_quality() == DataQuality::Quarantined
         || series.bars().windows(2).any(|pair| {
-            pair[0].period_start() >= pair[1].period_start()
-                || pair[0].period_end_exclusive() > pair[1].period_start()
+            match (pair[0].time_semantics(), pair[1].time_semantics()) {
+                (
+                    BarTimeSemantics::TimestampedPeriod(first),
+                    BarTimeSemantics::TimestampedPeriod(second),
+                ) => {
+                    first.period_start() >= second.period_start()
+                        || first.period_end_exclusive() > second.period_start()
+                }
+                (
+                    BarTimeSemantics::NominalDailyDate(first),
+                    BarTimeSemantics::NominalDailyDate(second),
+                ) => first.date() >= second.date(),
+                _ => true,
+            }
         })
         || series.bars().iter().any(|bar| {
-            bar.period_start() >= bar.period_end_exclusive()
+            bar.time_semantics()
+                .timestamped_period()
+                .is_some_and(|period| period.period_start() >= period.period_end_exclusive())
                 || bar.open().currency() != series.currency()
                 || bar.high().currency() != series.currency()
                 || bar.low().currency() != series.currency()
@@ -352,9 +360,27 @@ fn validate_series(series: &MarketHistorySeries) -> Result<(), ServiceError> {
     }
     let first = series.bars().first().ok_or(ServiceError::InvalidResult)?;
     let last = series.bars().last().ok_or(ServiceError::InvalidResult)?;
-    if coverage.returned().start() != first.period_start()
-        || coverage.returned().end_exclusive() != last.period_end_exclusive()
-    {
+    let returned_matches = match coverage.returned() {
+        MarketHistoryInterval::Timestamped {
+            start,
+            end_exclusive,
+        } => {
+            first.period_start() == Some(start)
+                && last.period_end_exclusive() == Some(end_exclusive)
+                && first.nominal_date().is_none()
+                && last.nominal_date().is_none()
+        }
+        MarketHistoryInterval::NominalDates {
+            start,
+            end_inclusive,
+        } => {
+            first.nominal_date() == Some(start)
+                && last.nominal_date() == Some(end_inclusive)
+                && first.period_start().is_none()
+                && last.period_end_exclusive().is_none()
+        }
+    };
+    if !returned_matches {
         return Err(ServiceError::InvalidResult);
     }
     Ok(())
@@ -362,8 +388,7 @@ fn validate_series(series: &MarketHistorySeries) -> Result<(), ServiceError> {
 
 fn bar_value(bar: &MarketHistoryBar) -> Value {
     json!({
-        "periodStart": timestamp_value(bar.period_start()),
-        "periodEndExclusive": timestamp_value(bar.period_end_exclusive()),
+        "time": bar_time_value(bar),
         "open": decimal_text(bar.open().amount()),
         "high": decimal_text(bar.high().amount()),
         "low": decimal_text(bar.low().amount()),
@@ -372,6 +397,37 @@ fn bar_value(bar: &MarketHistoryBar) -> Value {
         "tradeCount": bar.trade_count(),
         "vwap": bar.vwap().map(|value| decimal_text(value.amount())),
     })
+}
+
+fn bar_time_value(bar: &MarketHistoryBar) -> Value {
+    match bar.time_semantics() {
+        BarTimeSemantics::TimestampedPeriod(period) => json!({
+            "precision": "timestamped_period", "startsAt": timestamp_value(period.period_start()),
+            "endsAt": timestamp_value(period.period_end_exclusive()),
+        }),
+        BarTimeSemantics::NominalDailyDate(date) => json!({
+            "precision": "nominal_date", "date": date.date().to_string(),
+        }),
+    }
+}
+
+fn interval_value(interval: MarketHistoryInterval) -> Value {
+    match interval {
+        MarketHistoryInterval::Timestamped {
+            start,
+            end_exclusive,
+        } => json!({
+            "precision": "timestamped_period", "startsAt": timestamp_value(start),
+            "endsAt": timestamp_value(end_exclusive),
+        }),
+        MarketHistoryInterval::NominalDates {
+            start,
+            end_inclusive,
+        } => json!({
+            "precision": "nominal_dates", "startDate": start.to_string(),
+            "endDateInclusive": end_inclusive.to_string(),
+        }),
+    }
 }
 
 fn decimal_text(value: Decimal) -> String {

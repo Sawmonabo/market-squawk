@@ -167,6 +167,11 @@ pub(super) fn payload_identity<'a>(
                 .serializable(value.revision_evidence())
                 .map_err(map_error)?;
         }
+        ResearchObservation::MarketCalendar(value) => {
+            encoder.u8(12).map_err(map_error)?;
+            encoder.serializable(value.scope()).map_err(map_error)?;
+            encoder.serializable(value.payload()).map_err(map_error)?;
+        }
         ResearchObservation::PortfolioPosition(value) => {
             encoder.u8(4).map_err(map_error)?;
             encoder
@@ -193,6 +198,10 @@ pub(super) fn payload_identity<'a>(
             encoder
                 .str(value.source_record_id().as_str())
                 .map_err(map_error)?;
+        }
+        ResearchObservation::CorporateActionSource(value) => {
+            encoder.u8(15).map_err(map_error)?;
+            encoder.serializable(value.payload()).map_err(map_error)?;
         }
         ResearchObservation::CorporateAction(value) => {
             encoder.u8(6).map_err(map_error)?;
@@ -380,6 +389,17 @@ fn encode_candidate_family(
             encoder.u8(fund_nav_valuation_basis_tag(value.valuation_basis()))?;
             encoder.str(value.currency().as_str())?;
         }
+        ResearchObservation::MarketCalendar(value) => {
+            encoder.u8(12)?;
+            encoder.str(provenance.source_id().as_str())?;
+            encoder.option_str(provenance.venue_id().map(|venue| venue.as_str()))?;
+            encoder.serializable(value.scope())?;
+            encoder.u8(u8::from(matches!(
+                value.payload(),
+                market_squawk_domain::MarketCalendarPayload::Coverage { .. }
+            )))?;
+            encode_coordinate(encoder, context.time().effective())?;
+        }
         ResearchObservation::PortfolioPosition(value) => {
             encoder.u8(4)?;
             encoder.str(provenance.source_id().as_str())?;
@@ -401,6 +421,11 @@ fn encode_candidate_family(
             }
             encoder.str(value.account_id().as_str())?;
             encoder.str(value.source_record_id().as_str())?;
+        }
+        ResearchObservation::CorporateActionSource(_) => {
+            encoder.u8(15)?;
+            encoder.str(provenance.source_id().as_str())?;
+            encoder.str(provenance.source_identifier().as_str())?;
         }
         ResearchObservation::CorporateAction(_) => {
             encoder.u8(6)?;
@@ -581,18 +606,45 @@ fn encode_market_bar_series_semantics(
     encoder: &mut CanonicalEncoder<'_>,
     semantics: &market_squawk_domain::BarTimeSemantics,
 ) -> Result<(), CanonicalEncodingError> {
-    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
-    encode_market_bar_session_family(encoder, semantics.session())
+    match semantics {
+        market_squawk_domain::BarTimeSemantics::TimestampedPeriod(period) => {
+            encoder.u8(1)?;
+            encoder.u8(bar_timestamp_basis_tag(period.timestamp_basis()))?;
+            encode_market_bar_session_family(encoder, period.session())
+        }
+        market_squawk_domain::BarTimeSemantics::NominalDailyDate(date) => {
+            encoder.u8(2)?;
+            encoder.str(date.ruleset().as_str())
+        }
+    }
 }
 
 fn encode_market_bar_time(
     encoder: &mut CanonicalEncoder<'_>,
     semantics: &market_squawk_domain::BarTimeSemantics,
 ) -> Result<(), CanonicalEncodingError> {
-    encoder.i64(semantics.period_start().unix_nanos())?;
-    encoder.i64(semantics.period_end_exclusive().unix_nanos())?;
-    encoder.u8(bar_timestamp_basis_tag(semantics.timestamp_basis()))?;
-    encode_market_bar_session(encoder, semantics.session())
+    match semantics {
+        market_squawk_domain::BarTimeSemantics::TimestampedPeriod(period) => {
+            encoder.u8(1)?;
+            encoder.i64(period.period_start().unix_nanos())?;
+            encoder.i64(period.period_end_exclusive().unix_nanos())?;
+            encoder.u8(bar_timestamp_basis_tag(period.timestamp_basis()))?;
+            let session = period.session();
+            encoder.u8(market_bar_session_kind_tag(session.kind()))?;
+            encoder.str(session.ruleset().as_str())?;
+            let evidence = session.evidence();
+            encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
+            encoder.bytes(&evidence.bytes())
+        }
+        market_squawk_domain::BarTimeSemantics::NominalDailyDate(date) => {
+            encoder.u8(2)?;
+            encode_calendar_date(encoder, date.date())?;
+            encoder.str(date.ruleset().as_str())?;
+            let evidence = date.evidence().content_digest();
+            encoder.u8(digest_algorithm_tag(evidence.algorithm()))?;
+            encoder.bytes(&evidence.bytes())
+        }
+    }
 }
 
 fn encode_market_bar_session_family(

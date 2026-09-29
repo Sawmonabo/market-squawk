@@ -179,6 +179,16 @@ impl XbrlDocumentParser {
         if bytes.len() > limits.decoded_bytes() {
             return Err(SecXbrlError::ByteLimitExceeded);
         }
+        check_xbrl_cancelled(cancellation)?;
+        let scratch = parser_scratch_reservation(bytes, limits, cancellation)?;
+        let output_admission = limits
+            .retained_output_bytes()
+            .checked_sub(scratch)
+            .filter(|remaining| *remaining > 0)
+            .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?;
+        let limits = limits
+            .with_retained_bytes(output_admission)
+            .map_err(|_| SecXbrlError::RetainedOutputLimitExceeded)?;
         let mut reader = NsReader::from_reader(bytes);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = true;

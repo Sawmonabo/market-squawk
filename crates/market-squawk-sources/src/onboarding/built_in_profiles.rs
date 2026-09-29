@@ -171,10 +171,6 @@ const RIGHTS_LOCAL_PERSONAL_RESEARCH: &[DataUseRight] = &[
     DataUseRight::new(DataUseOperation::Export, OperationAdmission::Blocked),
     DataUseRight::new(DataUseOperation::Redistribute, OperationAdmission::Blocked),
 ];
-const EXCHANGE_DUTIES: &[&str] = &[
-    "preserve exact provider and venue provenance",
-    "do not admit persistence, modeling, export, or redistribution without a later rights decision",
-];
 const PRIVATE_CRYPTO_RESEARCH_DUTIES: &[&str] = &[
     "preserve exact provider, venue, product, channel, generation, and raw-payload provenance",
     "restrict persisted source data and every transformed or model-derived artifact to owner-local personal research use",
@@ -217,6 +213,13 @@ const LOCAL_RECOVERY: &[&str] = &[
 ];
 
 const COINBASE_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
     ProfileEvidence::new(
         "DOC-001",
         "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/rest-api",
@@ -732,39 +735,46 @@ const BLS_V1_EVIDENCE: &[ProfileEvidence] = &[
 ];
 const BLS_V2_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
         "DOC-026",
         "https://www.bls.gov/developers/api_faqs.htm",
-        "2026-07-25",
+        "2026-09-23",
         None,
-        true,
+        false,
     ),
     ProfileEvidence::new(
         "DOC-027",
         "https://data.bls.gov/registrationEngine/",
-        "2026-07-25",
+        "2026-09-23",
         None,
         false,
     ),
     ProfileEvidence::new(
         "DOC-028",
         "https://www.bls.gov/developers/api_signature_v2.htm",
-        "2026-07-25",
+        "2026-09-23",
         None,
-        true,
+        false,
     ),
     ProfileEvidence::new(
         "DOC-029",
         "https://www.bls.gov/developers/termsOfService.htm",
-        "2026-07-25",
+        "2026-09-23",
         None,
-        true,
+        false,
     ),
     ProfileEvidence::new(
         "BLS-CONTENT-ORIGIN",
         "https://www.bls.gov/opub/copyright-information.htm",
-        "2026-07-25",
+        "2026-09-23",
         None,
-        true,
+        false,
     ),
 ];
 const TREASURY_XML_EVIDENCE: &[ProfileEvidence] = &[
@@ -911,6 +921,9 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
     }
     if spec.id == EIA_PROFILE {
         return build_current_eia(spec);
+    }
+    if spec.id == CENSUS_PROFILE {
+        return build_current_census(spec);
     }
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
     let prior_credential_kind = initial_credential_kind(spec.id, credentialed);
@@ -1232,6 +1245,26 @@ fn build_current_eia(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, Pro
     finish_profile(spec, Vec::new(), capability)
 }
 
+fn build_current_census(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
+    let revision = ProviderCapabilityRevision::new(1)?;
+    let capability = build_capability(
+        &spec,
+        revision,
+        CredentialKind::ApiKey,
+        RatePolicyDescriptor::try_new_enforced(
+            SourceIdentifier::try_from(spec.rate_policy)?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            true,
+            revision,
+            SourceIdentifier::try_from("census.data-api.onboarding-probe")?,
+            PROVIDER_RELEASE_REPORT_DIGEST,
+            built_in_budget(&spec, true)?,
+            true,
+        )?,
+    )?;
+    finish_profile(spec, Vec::new(), capability)
+}
+
 fn build_current_fred(
     spec: BuiltInSpec,
 ) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
@@ -1420,7 +1453,7 @@ fn capability_evidence(
             COINBASE_DIRECT_COMPOSITION_DIGEST,
         ));
     }
-    if is_selected_architecture_profile(spec.id)
+    if (is_selected_architecture_profile(spec.id) || spec.id == "bls.v2-registered")
         && (revision.get() >= 3 || matches!(spec.id, FRED_PROFILE | EIA_PROFILE))
     {
         evidence.push(EvidenceBinding::new(
@@ -1463,7 +1496,8 @@ fn has_provider_release_revision(profile_id: &str) -> bool {
 fn is_selected_architecture_profile(profile_id: &str) -> bool {
     matches!(
         profile_id,
-        COINBASE_DIRECT_PROFILE
+        "coinbase.public-market-data"
+            | COINBASE_DIRECT_PROFILE
             | ALPACA_BASIC_PROFILE
             | NASDAQ_REFERENCE_PROFILE
             | SCHWAB_MARKET_DATA_PROFILE
@@ -1509,7 +1543,7 @@ fn built_in_budget(
             .budget_policy()
             .map_err(|_| ProviderProfileError::InvalidProfile),
         "bls.v1-unregistered" => bls_budget(None, 25, backoff),
-        "bls.v2-registered" => bls_budget(Some("bls.registered-onboarding"), 500, backoff),
+        "bls.v2-registered" => bls_budget(Some("bls.registered-onboarding"), 400, backoff),
         FRED_PROFILE => fred_budget(backoff, "fred.onboarding-api-key"),
         "treasury.daily-rates-xml" | "treasury.fiscal-data" => {
             simple_budget("us-treasury", None, 100, MINUTE_NANOS, 2, backoff)
@@ -1711,8 +1745,13 @@ fn bls_budget(
     };
     let windows = [
         ProviderBudgetWindow::try_new(
-            NonZeroU32::new(50).ok_or(ProviderProfileError::InvalidProfile)?,
-            nonzero_u64(10 * SECOND_NANOS)?,
+            NonZeroU32::new(if account.is_some() { 1 } else { 50 })
+                .ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(if account.is_some() {
+                SECOND_NANOS
+            } else {
+                10 * SECOND_NANOS
+            })?,
             BudgetWindowSemantics::Sliding,
         )?,
         ProviderBudgetWindow::try_new(
@@ -1724,7 +1763,8 @@ fn bls_budget(
     Ok(ProviderBudgetPolicy::try_new_conjunctive(
         scope,
         &windows,
-        NonZeroU16::new(2).ok_or(ProviderProfileError::InvalidProfile)?,
+        NonZeroU16::new(if account.is_some() { 1 } else { 2 })
+            .ok_or(ProviderProfileError::InvalidProfile)?,
         backoff,
     )?)
 }
@@ -1790,7 +1830,7 @@ fn coinbase() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
         account: Requirement::NotRequired,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RightsLimited,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
@@ -1801,9 +1841,9 @@ fn coinbase() -> Result<BuiltInSpec, ProviderProfileError> {
             "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD",
             None,
         )?,
-        rights: RIGHTS_LIMITED,
-        duties: EXCHANGE_DUTIES,
-        persistence_evidence_source_id: None,
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: PRIVATE_CRYPTO_RESEARCH_DUTIES,
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
         rotation: "not applicable: this surface has no credential",
         revocation: "not applicable: this surface has no credential",
         recovery: COMMON_RECOVERY,
@@ -2131,9 +2171,13 @@ fn bea() -> Result<BuiltInSpec, ProviderProfileError> {
         permissions: &["data.read"],
         coverage: "Credentialed metadata-driven BEA national, regional, industry, personal-income, and international accounts through GetDatasetList, parameter discovery, and exact GetData dataset coordinates; protected UserID authentication, bounded HTTPS, metadata and data parsing, correction evidence, exact dataset contracts, and raw-capture lineage are available under shared 60-request, 60-MB, and 10-error per-minute application budgets",
         quality: DataQuality::OfficialDelayed,
-        probe: VerificationProbe::local(
-            "BEA protected credential handling, metadata discovery, exact dataset request authority, bounded HTTPS, parsing, correction evidence, and raw-capture lineage are available for activation",
-        ),
+        probe: VerificationProbe::network_secret_query(
+            ProbeTransport::HttpGet,
+            "https://apps.bea.gov/api/data",
+            &[("Method", "GetDatasetList"), ("ResultFormat", "JSON")],
+            "UserID",
+            36,
+        )?,
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "import the 36-character UserID as one protected API-key value and redact it from every URL, log, trace, error, receipt, and diagnostic",
@@ -2163,15 +2207,24 @@ fn census() -> Result<BuiltInSpec, ProviderProfileError> {
         // Census collects contact details during key issuance. The Data API request contract uses
         // only the issued key, so provider onboarding does not require those details again.
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::RightsLimited,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("census.data.read"),
         permissions: &["data.read"],
-        coverage: "Credentialed cold-research target for exact Census dataset-vintage-variable-geography coordinates spanning demographic, household, business, trade, and geographic statistical evidence; current provider request, daily, variable, row, and pagination maxima remain unverified, with selected application safety limits of one request per second and 400 requests per day; provider-native query grammar, discovery/response contracts, bounded HTTPS, and raw-capture source core are present, while an application redacted doctor, activation, durable canonical publication, PIT typed read, product composition, and restart/release proof remain absent",
+        coverage: "Credentialed metadata-admitted Census datasets retain exact vintage, variable, predicate, geography, and temporal coordinates; protected credential verification precedes source registration, and every canonical publication seals the original adapter doctor, discovery graph, data, and normalized provider-period observations under shared application limits of one request per second and 400 per day",
         quality: DataQuality::OfficialDelayed,
-        probe: VerificationProbe::local(
-            "Census query, discovery, response, bounded HTTPS, dataset-contract, and raw-capture core is installed, but the application redacted doctor, activation, durable canonical publisher, PIT read, and product proof are not; activation remains refresh_required",
-        ),
+        probe: VerificationProbe::network_secret_query(
+            ProbeTransport::HttpGet,
+            "https://api.census.gov/data/2024/acs/acs1",
+            &[
+                ("get", "NAME,B01001_001E"),
+                ("for", "us:1"),
+                ("descriptive", "false"),
+                ("outputFormat", "json"),
+            ],
+            "key",
+            512,
+        )?,
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "import the API key as one protected value and redact the complete secret-bearing query from every URL, log, trace, error, receipt, and diagnostic",
@@ -2184,9 +2237,9 @@ fn census() -> Result<BuiltInSpec, ProviderProfileError> {
         revocation: "remove the exact local credential generation and disable the provider; use provider support for any remote key action",
         recovery: REFRESH_RECOVERY,
         evidence: CENSUS_EVIDENCE,
-        rate_policy: "census.data-api.pending-rate-policy.v1",
+        rate_policy: "census.data-api.application-rate-policy.v1",
         refresh_trigger: "CENSUS-DATA-API",
-        handoff_instruction: "Import the configured Census API key. The provider-native query, discovery, response, transport, and capture core is present; the profile remains unavailable until an application redacted doctor, activation, durable canonical macro/reference publication, PIT read, product composition, and restart/release proof are implemented.",
+        handoff_instruction: "Import the protected API key and verify its exact generation, then choose native dataset, variables, predicates, geography, and time coordinates. Metadata admission and original sealed publication are required before durable observations become available. Restart reads reopen the original canonical evidence without provider credentials.",
     })
 }
 
@@ -2506,23 +2559,28 @@ fn bls_v2() -> Result<BuiltInSpec, ProviderProfileError> {
         // only the issued registration key. Do not expand the exact credential-bundle schema with
         // registration-form metadata that the runtime does not consume.
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("bls.timeseries.read"),
         permissions: &["timeseries.read"],
-        coverage: "BLS v2 series within registered-tier limits and annual key renewal",
+        coverage: "Registered BLS v2 exact series for owner-local personal research, with annual key renewal, at most 50 series and 10 years per request, and 400 attempts per day at one request per second",
         quality: DataQuality::OfficialDelayed,
         probe: VerificationProbe::network(
             ProbeTransport::HttpPostJson,
             "https://api.bls.gov/publicAPI/v2/timeseries/data/",
             Some(r#"{"seriesid":["LNS14000000"],"startyear":"2025","endyear":"2025"}"#),
         )?,
-        rights: RIGHTS_BLS,
-        duties: BLS_DUTIES,
-        persistence_evidence_source_id: Some("DOC-029"),
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: &[
+            "retain BLS provenance and access date, the required disclaimer, and truthful source representation",
+            "exclude third-party copyrighted media and BLS trademarks from data admission",
+            "restrict source data and derived artifacts to owner-local personal research; prohibit export, redistribution, third-party serving, and sale",
+            "enforce the conservative 10-year, 400-attempt daily and one-request-per-second application bounds with annual registered-key renewal",
+        ],
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
         rotation: "renew at least annually and import the emailed replacement as a higher generation",
         revocation: "delete the exact local generation; no reviewed remote key-revocation API exists",
-        recovery: REFRESH_RECOVERY,
+        recovery: COMMON_RECOVERY,
         evidence: BLS_V2_EVIDENCE,
         rate_policy: "bls.v2-registered.rate-policy.v1",
         refresh_trigger: "BLS-V2",

@@ -648,7 +648,10 @@ fn map_error(error: TreasuryApplicationError) -> ServiceError {
 
 fn map_treasury_read_error(error: AnalyticalReadError) -> ServiceError {
     match error {
-        error @ (AnalyticalReadError::ForecastDatasetUnavailable
+        error @ (AnalyticalReadError::NativeSessionControl(_)
+        | AnalyticalReadError::ForecastDatasetUnavailable
+        | AnalyticalReadError::InputEpochResultRequiresInline
+        | AnalyticalReadError::InvalidInputEpoch
         | AnalyticalReadError::Manifest(_)
         | AnalyticalReadError::Query(_)
         | AnalyticalReadError::Parquet(_)
@@ -662,6 +665,7 @@ fn map_treasury_read_error(error: AnalyticalReadError) -> ServiceError {
         | AnalyticalReadError::InvalidFundNavLimit
         | AnalyticalReadError::InvalidFundNavDateRange
         | AnalyticalReadError::InvalidMacroSeriesAllowlist
+        | AnalyticalReadError::InvalidMacroHistoryRequest
         | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
         | AnalyticalReadError::MacroSnapshotResultRequiresInline
         | AnalyticalReadError::MacroSnapshotCandidateSetSaturated

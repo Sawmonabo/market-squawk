@@ -1,0 +1,370 @@
+//! Controlled original-calendar replay for both guided selection and exact recipe reopening.
+
+use crate::{ResearchService, ResearchServiceError};
+use chrono::Datelike as _;
+use market_squawk_adapter_alpaca::{
+    AlpacaAuthenticatedCalendarRequest, AlpacaRetainedCalendarSessions, AlpacaTradingApiEnvironment,
+};
+use market_squawk_data::CompleteMarketBarHistoryOutput;
+use market_squawk_domain::{CalendarDate, DigestAlgorithm, EvidenceDigest, Timestamp};
+use market_squawk_sources::SealedProviderCaptureSetReceipt;
+use std::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+/// Borrowed immutable coordinates from one of the two privately constructed calendar reads.
+struct NativeSessionCalendar<'a> {
+    reference: &'a crate::application::market_calendar::CompletedMarketSessionReference,
+    calendar_id: &'a market_squawk_domain::SourceIdentifier,
+    calendar_revision: &'a market_squawk_domain::RevisionBoundPayloadEvidence,
+    available_at: Timestamp,
+    venue_id: &'a market_squawk_domain::VenueId,
+    action_calendar: &'a std::sync::Arc<market_squawk_data::RetainedCorporateActionCalendar>,
+}
+
+impl ResearchService {
+    /// Associates source-native dates only with the exact already-reopened calendar retained by
+    /// the original price publication. This supplies named-session simulated clocks, never a
+    /// provider observation timestamp or a historical ticker-continuity assertion.
+    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        calendar: &crate::application::market_calendar::CompletedMarketSessionRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        self.rejoin_market_history_native_sessions_with_calendar_with_job_context(
+            output,
+            calendar,
+            deadline,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar_for_job(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        calendar: &crate::application::market_calendar::CompletedMarketSessionRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        job: &market_squawk_jobs::JobRunContext,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        self.rejoin_market_history_native_sessions_with_calendar_with_job_context(
+            output,
+            calendar,
+            deadline,
+            cancellation,
+            Some(job),
+        )
+        .await
+    }
+
+    pub(crate) async fn rejoin_market_history_native_sessions_with_calendar_with_job_context(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        calendar: &crate::application::market_calendar::CompletedMarketSessionRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        job: Option<&market_squawk_jobs::JobRunContext>,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        let calendar = NativeSessionCalendar {
+            reference: calendar.reference(),
+            calendar_id: calendar.calendar_id(),
+            calendar_revision: calendar.calendar_revision(),
+            available_at: calendar.available_at(),
+            venue_id: calendar.venue_id(),
+            action_calendar: calendar.source_action_calendar(),
+        };
+        self.rejoin_market_history_native_sessions_with_original_calendar(
+            output,
+            calendar,
+            deadline,
+            cancellation,
+            job,
+        )
+        .await
+    }
+
+    /// Original historical replay only; this accepts no live authority or publication guard.
+    pub(crate) async fn rejoin_market_history_native_sessions_with_retained_calendar_with_job_context(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        calendar: &crate::application::market_calendar::RetainedMarketSessionRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        job: Option<&market_squawk_jobs::JobRunContext>,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        let calendar = NativeSessionCalendar {
+            reference: calendar.reference(),
+            calendar_id: calendar.calendar_id(),
+            calendar_revision: calendar.calendar_revision(),
+            available_at: calendar.available_at(),
+            venue_id: calendar.venue_id(),
+            action_calendar: calendar.source_action_calendar(),
+        };
+        self.rejoin_market_history_native_sessions_with_original_calendar(
+            output,
+            calendar,
+            deadline,
+            cancellation,
+            job,
+        )
+        .await
+    }
+
+    async fn rejoin_market_history_native_sessions_with_original_calendar(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        calendar: NativeSessionCalendar<'_>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        job: Option<&market_squawk_jobs::JobRunContext>,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        let invalid = || ResearchServiceError::IngestAuthorityMismatch;
+        let receipt = output.selection().receipt();
+        if receipt.requested_range().is_some() {
+            return self
+                .rejoin_market_history_native_sessions_with_job_context(
+                    output,
+                    deadline,
+                    cancellation,
+                    job,
+                )
+                .await;
+        }
+        let graph = receipt.date_windows().ok_or_else(invalid)?;
+        let original = graph.calendar();
+        if calendar.reference.origin_content_digest() != original.origin_content_digest
+            || calendar.reference.capture_binding_digest() != original.capture_binding_digest
+            || calendar.calendar_id != &original.calendar_id
+            || calendar.calendar_revision != &original.calendar_revision
+            || calendar.available_at != original.calendar_available_at
+            || !original.relationship.matches(
+                calendar.venue_id,
+                receipt.venue_id(),
+                graph.requested_dates(),
+            )
+            || calendar.action_calendar.knowledge_cutoff()
+                != output.read_receipt().knowledge_cutoff()
+        {
+            return Err(invalid());
+        }
+        if let Some(attached) = output.native_sessions() {
+            if attached.source_replay_digest() != calendar.action_calendar.evidence_digest() {
+                return Err(invalid());
+            }
+            return Ok(output);
+        }
+        let manifest = self
+            .analytical_reader()
+            .provider_capture_origin(
+                original.capture_binding_digest,
+                market_squawk_data::Sha256Digest::new(original.origin_content_digest.bytes()),
+                output.read_receipt().knowledge_cutoff(),
+                deadline,
+                cancellation,
+            )
+            .map_err(map_native_history_error)?
+            .ok_or_else(invalid)?;
+        let original_calendar = std::sync::Arc::clone(calendar.action_calendar);
+        self.read_provider_capture_generation_with_job_context(
+            job,
+            manifest,
+            deadline,
+            cancellation,
+            move |owned, _, control, _, _| {
+                if owned.pinned().manifest() != original_calendar.manifest()
+                    || owned.published_at() > output.read_receipt().knowledge_cutoff()
+                {
+                    return Err(ResearchServiceError::IngestAuthorityMismatch);
+                }
+                output
+                    .try_with_nominal_native_sessions(&original_calendar, control)
+                    .map_err(map_native_history_error)
+            },
+        )
+        .await
+    }
+
+    /// Rejoins native sessions from the exact creating generation through the existing bounded
+    /// raw worker. Unsupported source associations remain explicitly unattached; consumers that
+    /// require native execution sessions must reject that state.
+    pub(crate) async fn rejoin_market_history_native_sessions(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        self.rejoin_market_history_native_sessions_with_job_context(
+            output,
+            deadline,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn rejoin_market_history_native_sessions_for_job(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        job: &market_squawk_jobs::JobRunContext,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        self.rejoin_market_history_native_sessions_with_job_context(
+            output,
+            deadline,
+            cancellation,
+            Some(job),
+        )
+        .await
+    }
+
+    pub(crate) async fn rejoin_market_history_native_sessions_with_job_context(
+        &self,
+        output: CompleteMarketBarHistoryOutput,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        job: Option<&market_squawk_jobs::JobRunContext>,
+    ) -> Result<CompleteMarketBarHistoryOutput, ResearchServiceError> {
+        if output.native_sessions().is_some() {
+            return Ok(output);
+        }
+        if output.selection().receipt().source_id().as_str() != "alpaca-basic-iex-market-data" {
+            return Ok(output);
+        }
+        let manifest = output.selection().receipt().origin_manifest().clone();
+        self.read_provider_capture_generation_with_job_context(
+            job,
+            manifest,
+            deadline,
+            cancellation,
+            move |owned, store, control, _, _| {
+                let invalid = || ResearchServiceError::IngestAuthorityMismatch;
+                let receipt = output.selection().receipt();
+                if owned.pinned().manifest() != receipt.origin_manifest()
+                    || owned.source_id() != receipt.source_id()
+                    || owned.published_at() != receipt.published_at()
+                {
+                    return Err(invalid());
+                }
+                let object = owned
+                    .objects()
+                    .iter()
+                    .find(|object| {
+                        object.generation_object_ordinal()
+                            == usize::from(receipt.origin_object_ordinal())
+                    })
+                    .ok_or_else(invalid)?;
+                if object.object().artifact_id() != receipt.origin_artifact_id()
+                    || object.inputs().len() != 1
+                {
+                    return Err(invalid());
+                }
+                let binding = object.inputs()[0].binding();
+                let (component_ordinal, digest, page_count) =
+                    receipt.session_calendar_component().ok_or_else(invalid)?;
+                let component = binding
+                    .capture()
+                    .request_graph_components()
+                    .get(usize::from(component_ordinal))
+                    .ok_or_else(invalid)?;
+                if binding.binding_digest().bytes() != receipt.binding_digest().bytes()
+                    || binding.sealed_capture_receipt_digest().bytes()
+                        != receipt.capture_receipt_digest().bytes()
+                    || binding.capture().content_digest().bytes()
+                        != receipt.capture_graph_digests().0.bytes()
+                    || binding.capture().observation_digest().bytes()
+                        != receipt.capture_graph_digests().1.bytes()
+                    || component.content_digest().bytes() != digest.bytes()
+                    || component.page_count().get() != page_count
+                    || binding.layout() != "whole_single_segment"
+                    || binding.physical_claims().len() != 1
+                {
+                    return Err(invalid());
+                }
+                let (start, end) = receipt.requested_range().ok_or_else(invalid)?;
+                let (start_date, end_date) = (utc_date(start)?, utc_date(end)?);
+                let mut request = None;
+                for environment in [
+                    AlpacaTradingApiEnvironment::Live,
+                    AlpacaTradingApiEnvironment::Paper,
+                ] {
+                    let candidate = AlpacaAuthenticatedCalendarRequest::try_new(
+                        environment,
+                        start_date,
+                        end_date,
+                    )
+                    .map_err(|_| invalid())?;
+                    if candidate
+                        .capture_request_identity()
+                        .map_err(|_| invalid())?
+                        == component.request_set_identity()
+                    {
+                        if request.replace(candidate).is_some() {
+                            return Err(invalid());
+                        }
+                    }
+                }
+                let request = request.ok_or_else(invalid)?;
+                let segment = store.open_verified_claim_with_control(
+                    binding.physical_claims()[0].claim(),
+                    control,
+                )?;
+                let sealed = SealedProviderCaptureSetReceipt::try_bind(
+                    binding.capture().clone(),
+                    segment.receipt().clone(),
+                )
+                .map_err(|_| invalid())?;
+                if sealed.receipt_digest()
+                    != EvidenceDigest::new(
+                        DigestAlgorithm::Sha256,
+                        receipt.capture_receipt_digest().bytes(),
+                    )
+                {
+                    return Err(invalid());
+                }
+                let replay = AlpacaRetainedCalendarSessions::try_replay(
+                    &request, &sealed, &segment, control,
+                )
+                .map_err(map_calendar_replay_error)?;
+                output
+                    .try_with_native_sessions(replay, control)
+                    .map_err(map_native_history_error)
+            },
+        )
+        .await
+    }
+}
+
+fn utc_date(timestamp: Timestamp) -> Result<CalendarDate, ResearchServiceError> {
+    let instant = chrono::DateTime::from_timestamp_nanos(timestamp.unix_nanos());
+    CalendarDate::new(
+        u16::try_from(instant.year()).map_err(|_| ResearchServiceError::IngestAuthorityMismatch)?,
+        u8::try_from(instant.month()).map_err(|_| ResearchServiceError::IngestAuthorityMismatch)?,
+        u8::try_from(instant.day()).map_err(|_| ResearchServiceError::IngestAuthorityMismatch)?,
+    )
+    .map_err(|_| ResearchServiceError::IngestAuthorityMismatch)
+}
+
+fn map_calendar_replay_error(
+    error: market_squawk_adapter_alpaca::AlpacaCalendarDecodeError,
+) -> ResearchServiceError {
+    match error {
+        market_squawk_adapter_alpaca::AlpacaCalendarDecodeError::Control(control) => {
+            market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(control).into()
+        }
+        _ => ResearchServiceError::IngestAuthorityMismatch,
+    }
+}
+fn map_native_history_error(
+    error: market_squawk_data::AnalyticalReadError,
+) -> ResearchServiceError {
+    match error {
+        market_squawk_data::AnalyticalReadError::NativeSessionControl(control) => {
+            market_squawk_platform::SealedResearchJournalStoreError::ObjectControl(control).into()
+        }
+        _ => ResearchServiceError::IngestAuthorityMismatch,
+    }
+}

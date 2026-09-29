@@ -31,7 +31,7 @@ use super::{
     MarketEventDurableReadWriter, MarketEventPointInTimeSelector,
     ProductionResearchIngestCoordinator, ResearchIngestCompositionError, ResearchRightsAuthority,
 };
-use crate::provider_onboarding::SchwabOAuthMarketAuthority;
+use crate::provider_onboarding::SchwabOAuthReceiptCurrentness;
 
 /// Exact non-secret generation identity for one callable research-provider adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +73,13 @@ impl SchwabRestQuotePublicationPackage {
     ) {
         (self.generation, self.durable_writer)
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct SchwabStreamerPublicationPackage {
+    pub(crate) authority: Arc<super::schwab_market::SchwabStreamerGenerationAuthority>,
+    pub(crate) durable_writer: MarketEventDurableReadWriter,
+    pub(crate) durable_read: MarketEventDurableRead,
 }
 
 impl ResearchProviderRuntimeGeneration {
@@ -266,6 +273,21 @@ impl ResearchProviderRuntimeGeneration {
             return Ok(false);
         }
         if self.session_id != expected.session_id {
+            return Ok(true);
+        }
+        // A bounded Instruments or quote generation is renewed by a freshly verified doctor when
+        // the application credential itself has not changed. Its dedicated publisher rechecks
+        // the exact doctor, OAuth epoch and active account before acquisition and precommit.
+        // The predecessor must already be drained at registration, and the common checks above
+        // require an actual later authority interval in the same exact source slot.
+        if (self.profile.as_str()
+            == super::schwab_instrument_reference::SCHWAB_INSTRUMENT_REFERENCE_PROFILE
+            || self.profile.as_str() == market_squawk_sources::SCHWAB_MARKET_DATA_SURFACE_ID)
+            && self.credential_generation == expected.credential_generation
+            && self.secret_reference == expected.secret_reference
+            && self.capability_revision == expected.capability_revision
+            && self.capability_digest == expected.capability_digest
+        {
             return Ok(true);
         }
         Ok(self.capability_revision == expected.capability_revision
@@ -674,6 +696,13 @@ impl ResearchProviderAdmission {
         })
     }
 
+    pub(super) fn revoke_if_idle(&self) -> bool {
+        self.begin_revocation();
+        let Ok(_publication) = self.state.publication_barrier.try_write() else { return false; };
+        self.state.phase.store(ADMISSION_DRAINED, Ordering::Release);
+        true
+    }
+
     pub(super) async fn revoke_and_drain(&self) {
         self.begin_revocation();
         let publication = Arc::clone(&self.state.publication_barrier)
@@ -696,14 +725,14 @@ impl ResearchProviderAdmission {
 struct SchwabCompositeMarketRuntimeAdmission {
     generation_digest: EvidenceDigest,
     admission: ResearchProviderAdmission,
-    oauth: SchwabOAuthMarketAuthority,
+    oauth: SchwabOAuthReceiptCurrentness,
     oauth_receipt: SchwabOAuthAuthorityReceipt,
 }
 
 #[cfg(test)]
 pub(super) fn test_schwab_composite_market_runtime_admission(
     generation: &ResearchProviderRuntimeGeneration,
-    oauth: SchwabOAuthMarketAuthority,
+    oauth: SchwabOAuthReceiptCurrentness,
     oauth_receipt: SchwabOAuthAuthorityReceipt,
 ) -> Result<
     Arc<dyn super::schwab_market::SchwabMarketRuntimeAdmission>,
@@ -792,7 +821,7 @@ impl std::fmt::Debug for SchwabCompositeMarketRuntimeAdmission {
         formatter
             .debug_struct("SchwabCompositeMarketRuntimeAdmission")
             .field("generation_digest", &self.generation_digest)
-            .field("oauth", &"[PROTECTED TOKEN AUTHORITY]")
+            .field("oauth", &"[SECRET-FREE RECEIPT VALIDATION]")
             .field("oauth_generation", &self.oauth_receipt.generation().get())
             .finish_non_exhaustive()
     }
@@ -1069,9 +1098,10 @@ impl CommittedResearchProviderReplacement {
         {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
-        let candidate_capability = self
-            .candidate_capability
-            .take()
+        // Preserve the original capability if timestamp or metadata publication fails, while
+        // still rejecting a missing candidate before changing the registered metadata.
+        self.candidate_capability
+            .as_ref()
             .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
         let replacement_registration = if current.metadata == self.candidate.metadata {
             None
@@ -1089,6 +1119,11 @@ impl CommittedResearchProviderReplacement {
                     )?,
             )
         };
+        // No await or candidate mutation separates the presence check from this exact move.
+        let candidate_capability = self
+            .candidate_capability
+            .take()
+            .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
         let super::RegisteredSourceCapability { erased, typed } = candidate_capability;
         current.source = erased;
         current.typed_capability = typed;
@@ -1533,7 +1568,7 @@ impl ResearchProviderRuntimeMutationAuthority {
         &self,
         generation: &ResearchProviderRuntimeGeneration,
         doctor: SchwabMarketDataDoctorReceiptV1,
-        oauth: SchwabOAuthMarketAuthority,
+        oauth: SchwabOAuthReceiptCurrentness,
         oauth_receipt: SchwabOAuthAuthorityReceipt,
         analytical_dataset: DatasetId,
         operation_timeout: Duration,
@@ -1546,52 +1581,9 @@ impl ResearchProviderRuntimeMutationAuthority {
         {
             return Err(SchwabMarketPublicationError::AuthorityInvalid);
         }
-        let generation_digest = generation.generation_digest()?;
-        oauth
-            .validate_current_receipt(oauth_receipt)
-            .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
         let package = {
-            let authority = self
-                .coordinator
-                .authority
-                .lock()
-                .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
-            if self.coordinator.lifecycle.shutdown_token().is_cancelled()
-                || authority.registry.is_none()
-            {
-                return Err(ResearchIngestCompositionError::ShuttingDown.into());
-            }
-            let current = authority
-                .publication_sources
-                .get(generation.profile())
-                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
-            if current.generation != *generation
-                || current.metadata != *generation.metadata()
-                || current.rights != generation.rights
-                || current.registration.source_id() != generation.metadata().source_id()
-                || current.registration.revision() != generation.metadata().revision()
-                || current.admission.generation_digest != Some(generation_digest)
-            {
-                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration.into());
-            }
-            current.admission.ensure_live()?;
-            oauth
-                .validate_current_receipt(oauth_receipt)
-                .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
-            let admission = Arc::new(SchwabCompositeMarketRuntimeAdmission {
-                generation_digest,
-                admission: current.admission.clone(),
-                oauth,
-                oauth_receipt,
-            });
-            admission.ensure_exact_current()?;
-            let closure = Arc::new(SchwabMarketPublicationClosure::try_new(
-                Arc::clone(&self.coordinator.research),
-                generation.clone(),
-                current.rights.clone(),
-                doctor,
-                admission,
-            )?);
+            let closure =
+                self.bind_schwab_publication_closure(generation, doctor, oauth, oauth_receipt)?;
             let generation_authority =
                 closure.bind_rest_quote_sink(operation_timeout, analytical_dataset.clone())?;
             let point_in_time = MarketEventPointInTimeSelector::new(
@@ -1607,6 +1599,123 @@ impl ResearchProviderRuntimeMutationAuthority {
             }
         };
         Ok(package)
+    }
+
+    /// Binds the exact registered MarketCalendar family, original OAuth receipt and doctor.
+    /// The returned owner seals native outcomes and publishes through ordinary immutable research manifests.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "generation, doctor, and original OAuth remain explicit"
+    )]
+    pub(crate) fn bind_schwab_market_hours_publication_package(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        doctor: SchwabMarketDataDoctorReceiptV1,
+        oauth: SchwabOAuthReceiptCurrentness,
+        oauth_receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<
+        super::schwab_market::SchwabMarketHoursGenerationAuthority,
+        SchwabMarketPublicationError,
+    > {
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || generation.profile().as_str() != super::schwab_market::SCHWAB_MARKET_HOURS_PROFILE
+            || generation.metadata().source_id().as_str()
+                != super::schwab_market::SCHWAB_MARKET_HOURS_SOURCE
+            || generation.metadata().coverage().domain()
+                != market_squawk_sources::CoverageDomain::MarketCalendar
+            || oauth.session_id() != generation.session_id()
+        {
+            return Err(SchwabMarketPublicationError::AuthorityInvalid);
+        }
+        let closure =
+            self.bind_schwab_publication_closure(generation, doctor, oauth, oauth_receipt)?;
+        super::schwab_market::SchwabMarketHoursGenerationAuthority::try_new(closure)
+    }
+
+    fn bind_schwab_publication_closure(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        doctor: SchwabMarketDataDoctorReceiptV1,
+        oauth: SchwabOAuthReceiptCurrentness,
+        oauth_receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<Arc<SchwabMarketPublicationClosure>, SchwabMarketPublicationError> {
+        if oauth.session_id() != generation.session_id() {
+            return Err(SchwabMarketPublicationError::AuthorityInvalid);
+        }
+        let generation_digest = generation.generation_digest()?;
+        let authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || authority.registry.is_none()
+        {
+            return Err(ResearchIngestCompositionError::ShuttingDown.into());
+        }
+        let current = authority
+            .publication_sources
+            .get(generation.profile())
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation != *generation
+            || current.metadata != *generation.metadata()
+            || current.rights != generation.rights
+            || current.registration.source_id() != generation.metadata().source_id()
+            || current.registration.revision() != generation.metadata().revision()
+            || current.admission.generation_digest != Some(generation_digest)
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration.into());
+        }
+        current.admission.ensure_live()?;
+        oauth
+            .validate_current_receipt(oauth_receipt)
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
+        let admission = Arc::new(SchwabCompositeMarketRuntimeAdmission {
+            generation_digest,
+            admission: current.admission.clone(),
+            oauth,
+            oauth_receipt,
+        });
+        admission.ensure_exact_current()?;
+        let closure = Arc::new(SchwabMarketPublicationClosure::try_new(
+            Arc::clone(&self.coordinator.research),
+            generation.clone(),
+            current.rights.clone(),
+            doctor,
+            admission,
+        )?);
+        Ok(closure)
+    }
+
+    pub(crate) fn bind_schwab_streamer_publication_package(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        doctor: SchwabMarketDataDoctorReceiptV1,
+        oauth: SchwabOAuthReceiptCurrentness,
+        oauth_receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<SchwabStreamerPublicationPackage, SchwabMarketPublicationError> {
+        if generation.profile().as_str() != super::schwab_market::SCHWAB_STREAMER_PROFILE
+            || generation.metadata().source_id().as_str()
+                != super::schwab_market::SCHWAB_STREAMER_SOURCE
+        {
+            return Err(SchwabMarketPublicationError::AuthorityInvalid);
+        }
+        let closure =
+            self.bind_schwab_publication_closure(generation, doctor, oauth, oauth_receipt)?;
+        let authority =
+            Arc::new(super::schwab_market::SchwabStreamerGenerationAuthority::try_new(closure)?);
+        let selector = MarketEventPointInTimeSelector::new(
+            Arc::clone(&self.coordinator.research),
+            DatasetId::try_from(SCHWAB_MARKET_EVENT_ANALYTICAL_DATASET)
+                .map_err(|_| SchwabMarketPublicationError::AuthorityInvalid)?,
+            generation.metadata().source_id().clone(),
+        );
+        let (durable_writer, durable_read) = MarketEventDurableRead::channel(selector);
+        Ok(SchwabStreamerPublicationPackage {
+            authority,
+            durable_writer,
+            durable_read,
+        })
     }
 
     /// Registers one provider adapter bound to an exact onboarding/runtime generation.
@@ -1725,6 +1834,51 @@ impl ResearchProviderRuntimeMutationAuthority {
         self.coordinator.register_source_inner(
             generation.profile().clone(),
             source,
+            rights,
+            Some(generation),
+        )
+    }
+
+    /// Retains the same Board allocation for dashboard and source-owned complete-file operations.
+    pub(crate) fn register_board_provider_source(
+        &self,
+        generation: ResearchProviderRuntimeGeneration,
+        source: Arc<market_squawk_adapter_federal_reserve::BoardSource>,
+        rights: ResearchRightsAuthority,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        if source.metadata() != generation.metadata()
+            || rights != generation.rights
+            || &rights.source_id != source.metadata().source_id()
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        self.coordinator.register_source_capability_inner(
+            generation.profile().clone(),
+            source.metadata().clone(),
+            super::RegisteredSourceCapability::board(source),
+            rights,
+            Some(generation),
+        )
+    }
+
+    /// Registers the same BEA allocation for neutral discovery and sealed-token ingestion.
+    pub(crate) fn register_bea_provider_source(
+        &self,
+        generation: ResearchProviderRuntimeGeneration,
+        source: super::BeaRegisteredSource,
+        rights: ResearchRightsAuthority,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        if source.metadata() != generation.metadata()
+            || source.generation() != &generation
+            || rights != generation.rights
+            || &rights.source_id != source.metadata().source_id()
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        self.coordinator.register_source_capability_inner(
+            generation.profile().clone(),
+            source.metadata().clone(),
+            super::RegisteredSourceCapability::bea(source),
             rights,
             Some(generation),
         )
@@ -2036,6 +2190,25 @@ impl ResearchProviderRuntimeMutationAuthority {
             expected,
             candidate,
             super::RegisteredSourceCapability::treasury(source),
+            rights,
+        )
+    }
+
+    /// Preserves the exact BEA successor's typed allocation in the existing replacement owner.
+    pub(crate) fn prepare_bea_provider_replacement(
+        &self,
+        expected: ResearchProviderRuntimeGeneration,
+        candidate: ResearchProviderRuntimeGeneration,
+        source: super::BeaRegisteredSource,
+        rights: ResearchRightsAuthority,
+    ) -> Result<ResearchProviderRuntimeReplacement, ResearchIngestCompositionError> {
+        if source.generation() != &candidate {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeReplacement);
+        }
+        self.prepare_provider_replacement_capability(
+            expected,
+            candidate,
+            super::RegisteredSourceCapability::bea(source),
             rights,
         )
     }
@@ -2386,15 +2559,13 @@ mod tests {
     };
     use market_squawk_domain::{
         AssetClass, AssignmentVerification, AuthorizationBasis, ChecksumCapability, CoverageDelay,
-        Currency, DataQuality, DeliveryEvidence, Denomination, DigestAlgorithm, EffectiveInterval,
+        Currency, DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval,
         EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier, ExternalIdentifierRecord,
         ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
-        InstrumentDefinition, InstrumentDefinitionInput, InstrumentDefinitionRevision,
-        InstrumentId, IntegrityRule, LotSize, MetadataRevision, ProviderChannel,
-        ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
-        ProviderInstrumentId, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
-        SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier,
-        TickSize, Ticker, Timestamp, TradingStatus, VenueId,
+        InstrumentId, IntegrityRule, MetadataRevision, ProviderChannel, ProviderIdentityEvidence,
+        ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId, ProviderProduct,
+        RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion, SequenceCapability,
+        SnapshotApplicability, SourceId, SourceIdentifier, Ticker, Timestamp, VenueId,
     };
     use market_squawk_platform::{
         EncryptedFileSecretStore, LocalPaths, SecretCancellation, SecretGeneration,
@@ -2413,7 +2584,6 @@ mod tests {
         SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
         SourceMetadataInput, SourceProtocolProfile,
     };
-    use rust_decimal::Decimal;
 
     use crate::ResearchService;
     use crate::application::market_runtime::{
@@ -2421,11 +2591,12 @@ mod tests {
         SchwabRestQuoteSourceEvidence,
     };
     use crate::live_source::{
-        SchwabRestQuoteCurrentBridge, SchwabRestQuoteCurrentPublication,
-        SchwabRestQuoteCurrentRequest,
+        SchwabQualifiedCurrent, SchwabRestQuoteCurrentBridge,
+        SchwabRestQuoteCurrentPublication, SchwabRestQuoteCurrentRequest,
+        SchwabRestQuoteCurrentUnavailable,
     };
     use crate::provider_activation::{
-        MarketInstrumentBinding, MarketInstrumentReferenceBinding, MarketSubscriptionPriority,
+        MarketInstrumentReferenceBinding, MarketSubscriptionPriority,
         SchwabMarketDataAccountActivation, SchwabMarketDataActivationError,
     };
     use crate::provider_onboarding::SchwabOAuthMarketAuthority;
@@ -2456,7 +2627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schwab_quote_attempt_retains_exact_epoch_through_precommit_and_fails_closed()
+    async fn schwab_quote_attempt_rejects_revoked_epoch_before_current_qualification()
     -> TestResult {
         let directory = tempfile::tempdir()?;
         let session_id = Uuid::new_v4();
@@ -2474,44 +2645,29 @@ mod tests {
             oauth_receipt,
         )?;
         let generation = market_squawk_domain::ConnectionGeneration::new(1)?;
+        let bridge_calls = Arc::new(AtomicUsize::new(0));
         let sink = SchwabRestQuoteSealFirstSink::new(
             Arc::clone(&durable),
-            Arc::new(PublishedCurrentBridge(generation)),
+            Arc::new(CountingUnavailableCurrentBridge(Arc::clone(&bridge_calls))),
         );
-        let accepted = SchwabRestQuoteProducer::publish_test_completed_response(
-            &sink,
-            executed_quote(token, oauth_receipt.access_issued_at_unix_seconds()).await?,
-            evidence.clone(),
-            vec![binding.clone()],
-            epoch,
-            generation,
-        )
-        .await?;
-        assert_eq!(accepted.published(), 1);
-        assert_eq!(wire.exchange_count(), 1);
-
-        let (token, revoked_epoch) =
-            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
         let completed =
             executed_quote(token, oauth_receipt.access_issued_at_unix_seconds()).await?;
         oauth.revoke_test_authority();
-        assert!(
-            revoked_epoch
-                .validate_current(revoked_epoch.receipt())
-                .is_err()
-        );
+        assert!(epoch.validate_current(epoch.receipt()).is_err());
         assert!(
             SchwabRestQuoteProducer::publish_test_completed_response(
                 &sink,
                 completed,
                 evidence,
                 vec![binding],
-                revoked_epoch,
+                epoch,
                 generation,
             )
             .await
             .is_err()
         );
+        assert_eq!(bridge_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(wire.exchange_count(), 1);
         assert!(matches!(
             durable.latest_source_health()?,
             Some(super::super::schwab_market::SchwabRestQuoteSourceHealthOutcome::PostSealPublicationUnavailable {
@@ -2539,17 +2695,26 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct PublishedCurrentBridge(market_squawk_domain::ConnectionGeneration);
+    struct CountingUnavailableCurrentBridge(Arc<AtomicUsize>);
 
-    impl SchwabRestQuoteCurrentBridge for PublishedCurrentBridge {
-        fn publish_current(
+    impl SchwabRestQuoteCurrentBridge for CountingUnavailableCurrentBridge {
+        fn qualify_current(
             &self,
             _request: SchwabRestQuoteCurrentRequest<'_>,
+        ) -> Result<SchwabQualifiedCurrent, SchwabRestQuoteCurrentUnavailable> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)
+        }
+
+        fn publish_qualified(
+            &self,
+            _qualified: SchwabQualifiedCurrent,
+            _deadline: Instant,
         ) -> SchwabRestQuoteCurrentPublication {
-            SchwabRestQuoteCurrentPublication::Published {
-                observations: 1,
-                source_generation: self.0,
-            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            SchwabRestQuoteCurrentPublication::Unavailable(
+                SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth,
+            )
         }
     }
 
@@ -2775,7 +2940,6 @@ mod tests {
             product.clone(),
             channel.clone(),
         )?;
-        let binding = quote_binding(source_id.clone(), instrument_id, effective)?;
         let capability_digest = digest(31);
         let parent_rights = digest(32);
         let rights = ResearchRightsAuthority::try_new_scoped(
@@ -2811,6 +2975,12 @@ mod tests {
             8,
             ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
         )?);
+        let binding = quote_binding(
+            &research,
+            metadata.source_id().clone(),
+            instrument_id,
+            effective,
+        )?;
         let durable = super::super::schwab_market::SchwabRestQuoteGenerationAuthority::bind_test_rest_quote_sink(
             research,
             generation,
@@ -2923,13 +3093,14 @@ mod tests {
     }
 
     fn quote_binding(
+        research: &ResearchService,
         source_id: SourceId,
         instrument_id: InstrumentId,
         effective: EffectiveInterval,
     ) -> Result<SchwabRestQuoteInstrumentBinding, Box<dyn std::error::Error>> {
         let provider_identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
             instrument_id,
-            source_id: source_id.clone(),
+            source_id: SourceId::try_from("schwab-trader-api-instruments")?,
             provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
             evidence: ProviderIdentityEvidence::from_content_digest(digest(10)),
             source_timestamp: Some(Timestamp::from_unix_nanos(0)),
@@ -2954,26 +3125,49 @@ mod tests {
                 SourceIdentifier::try_from("https://example.test/reference")?,
             ),
         });
-        let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
-            instrument_id,
-            definition_revision: InstrumentDefinitionRevision::try_from(1_u64)?,
-            asset_class: AssetClass::Index,
-            primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
-            quote_currency: Currency::try_from("USD")?,
-            tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
-            lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
-            contract_multiplier: Decimal::ONE,
-            venue_mappings: Vec::new(),
-            provider_identities: vec![provider_identity.clone()],
-            identifiers: vec![identifier.clone()],
-            trading_status: TradingStatus::Active,
-        })?;
+        let definition = market_squawk_domain::MarketDataInstrumentDefinition::try_new(
+            market_squawk_domain::MarketDataInstrumentDefinitionInput {
+                instrument_id,
+                reference_evidence: RevisionBoundPayloadEvidence::new(
+                    MetadataRevision::new(SourceIdentifier::try_from("test-schwab-reference")?),
+                    ExactPayloadEvidence::from_content_digest(digest(12)),
+                ),
+                effective_interval: effective,
+                asset_class: AssetClass::Index,
+                display_name: None,
+                quote_currency: Currency::try_from("USD")?,
+                quote_currency_evidence: ExactPayloadEvidence::from_content_digest(digest(13)),
+                venue_mappings: Vec::new(),
+                provider_identities: vec![provider_identity.clone()],
+                identifiers: vec![identifier.clone()],
+            },
+        )?;
+        research
+            .market_data_instrument_synchronization()
+            .synchronize(
+                market_squawk_data::MarketDataInstrumentSynchronization::try_new(
+                    vec![definition],
+                    1,
+                )?,
+                std::time::Instant::now() + Duration::from_secs(5),
+                &CancellationToken::new(),
+            )?;
+        let record = research
+            .market_data_instruments()
+            .latest(
+                instrument_id,
+                std::time::Instant::now() + Duration::from_secs(5),
+                &CancellationToken::new(),
+            )?
+            .ok_or("missing canonical test reference")?;
+        let at = record.published_at();
         SchwabRestQuoteInstrumentBinding::try_new(
-            MarketInstrumentBinding::try_new(
-                MarketSubscriptionPriority::CurrentlyViewed,
-                definition,
+            crate::provider_activation::SchwabQuoteReferenceBinding::try_new(
+                record,
                 provider_identity,
                 MarketInstrumentReferenceBinding::AssignedExternalIdentifier(identifier),
+                MarketSubscriptionPriority::CurrentlyViewed,
+                at,
             )?,
             &source_id,
         )

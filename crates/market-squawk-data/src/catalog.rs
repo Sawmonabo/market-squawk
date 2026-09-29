@@ -81,17 +81,26 @@ pub use self::listing_reference::{
     MAX_LISTING_REFERENCE_SEARCH_ROWS,
 };
 pub use self::market_data_instruments::{
-    MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS, MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS,
-    MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS, MarketDataInstrumentCatalogError,
+    AcceptedNativeReferenceCapture, AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission, CurrentListedPopulation,
+    CurrentListedPopulationAdmission, CurrentListedPopulationMember,
+    CurrentListedPopulationPartition, CurrentListedPopulationScope,
+    CurrentListedPopulationSourceScope, CurrentPopulationError, CurrentPopulationExclusion,
+    CurrentPopulationExclusionReason, DatasetPopulationPartition, DatasetPopulationSourceUse,
+    MAX_CURRENT_LISTED_POPULATION_MEMBERS, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
+    MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS, MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS,
+    MarketDataInstrumentCatalogError, MarketDataInstrumentCurrentExpectation,
+    MarketDataInstrumentEnumerationCursor, MarketDataInstrumentEnumerationPage,
     MarketDataInstrumentMatchKind, MarketDataInstrumentPopulationDisposition,
     MarketDataInstrumentPopulationExclusion, MarketDataInstrumentPopulationExclusionReason,
     MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationSelection,
     MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
     MarketDataInstrumentSearchMatch, MarketDataInstrumentSearchPage,
-    MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
-    MarketDataInstrumentSynchronizationReceipt, MarketDataProviderIdentityExactReceipt,
-    MarketDataProviderIdentityQuery, MarketDataProviderIdentityResolution,
-    MarketDataProviderIdentityResolutionOutcome, MarketDataProviderIdentitySelection,
+    MarketDataInstrumentSourceReferenceInput, MarketDataInstrumentSynchronization,
+    MarketDataInstrumentSynchronizationCapability, MarketDataInstrumentSynchronizationReceipt,
+    MarketDataProviderIdentityExactReceipt, MarketDataProviderIdentityQuery,
+    MarketDataProviderIdentityResolution, MarketDataProviderIdentityResolutionOutcome,
+    MarketDataProviderIdentitySelection, NativeReferenceSourceCoordinate,
+    OfficialIssuerInstrumentReference, RetainedNativeReferenceCapture,
 };
 pub use self::market_recovery::ProviderMarketEventDurableRoute;
 pub use self::official_options_reference::{
@@ -155,11 +164,13 @@ pub(crate) use provider_capture::{
     MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
     PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET, PreparedProviderCaptureBinding,
     ProviderArtifactInputCoordinate, ProviderMacroPlanCompletionCapture,
-    load_provider_capture_for_run, retain_prepared_provider_capture_binding,
+    ProviderMetadataCaptureEvidence, load_provider_capture_for_run,
+    retain_prepared_provider_capture_binding,
 };
 pub use provider_capture::{
     PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
     PersistedProviderCapturePhysicalClaim, PersistedProviderNativeLineageSchema,
+    ProviderCaptureOriginalReceipt,
 };
 pub use provider_event::{
     PersistedProviderEventBindingEvidence, PersistedProviderEventBindingRow,
@@ -170,10 +181,14 @@ pub use provider_event::{
 pub(crate) use provider_event::{
     PreparedProviderPublicationBinding, retain_prepared_provider_publication_binding,
 };
-pub(crate) use provider_logical::retain_sealed_provider_logical_publication_binding;
+pub(crate) use provider_logical::{
+    MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES,
+    retain_sealed_provider_logical_publication_binding,
+};
 pub use provider_logical::{
     PersistedProviderLogicalGenerationBinding, PersistedProviderLogicalObjectClaim,
     PersistedProviderLogicalPartitionClaim, PersistedProviderLogicalPublicationBinding,
+    ProviderLogicalOriginalReceipt, ProviderLogicalPublicationOrigin,
 };
 pub(crate) use provider_macro_plan::{
     CompletedProviderMacroPlanSession, MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES,
@@ -186,8 +201,8 @@ pub(crate) use provider_macro_plan::{
     reconstruct_provider_macro_plan_projection,
 };
 pub use provider_option::{
-    PersistedProviderOptionMarketBindingEvidence, PersistedProviderOptionMarketBindingRow,
-    PersistedProviderOptionMarketNativeLineage,
+    PersistedOptionContractReferenceDependency, PersistedProviderOptionMarketBindingEvidence,
+    PersistedProviderOptionMarketBindingRow, PersistedProviderOptionMarketNativeLineage,
 };
 pub(crate) use provider_option::{
     PreparedProviderOptionMarketBinding, retain_prepared_provider_option_market_binding,

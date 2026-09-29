@@ -201,13 +201,33 @@ impl CensusDatasetCatalog {
         let mut identities = BTreeSet::new();
         for entry in entries {
             let entry = entry.as_object().ok_or(CensusAdapterError::SchemaDrift)?;
-            let vintage = required_vintage(entry, "c_vintage")?;
+            let path = required_string_array(entry, "c_dataset", limits)?;
+            // The public catalog omits c_vintage for time-series entries. Admit that
+            // shape only when both independent provider coordinates identify the route.
+            let vintage = if !entry.contains_key("c_vintage") {
+                let time_series = optional_bool(entry, "c_isTimeseries")?;
+                let time_series_path = path.first().is_some_and(|segment| segment == "timeseries");
+                if time_series == Some(true) && time_series_path {
+                    CensusDatasetVintage::TimeSeries
+                } else if expected_vintage.is_none()
+                    && !time_series_path
+                    && time_series != Some(true)
+                {
+                    // Unrelated global catalog entries have no year coordinate. Validate all
+                    // supplied metadata, retain the original document, and mint no dataset.
+                    validate_timeless_catalog_entry(entry, limits)?;
+                    continue;
+                } else {
+                    return Err(CensusAdapterError::SchemaDrift);
+                }
+            } else {
+                required_vintage(entry, "c_vintage")?
+            };
             if expected_vintage
                 .is_some_and(|expected| vintage != CensusDatasetVintage::Year(expected))
             {
                 return Err(CensusAdapterError::MetadataMismatch);
             }
-            let path = required_string_array(entry, "c_dataset", limits)?;
             let dataset = match vintage {
                 CensusDatasetVintage::Year(year) => CensusDataset::try_new(year, path.join("/"))?,
                 CensusDatasetVintage::TimeSeries => {
@@ -243,7 +263,7 @@ impl CensusDatasetCatalog {
         }
         datasets.sort_by(|left, right| left.dataset.cmp(&right.dataset));
         Ok(Self {
-            evidence: CensusMetadataEvidence::new(bytes, datasets.len()),
+            evidence: CensusMetadataEvidence::new(bytes, entries.len()),
             datasets,
         })
     }
@@ -260,8 +280,9 @@ impl CensusDatasetCatalog {
 }
 
 /// The provider's variable predicate grammar.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "provider_value")]
+#[serde(deny_unknown_fields)]
 pub enum CensusPredicateType {
     /// String equality/prefix-wildcard predicate and text response value.
     String,
@@ -605,8 +626,10 @@ pub struct CensusGeographyMetadata {
     name: String,
     geo_level_display: SourceIdentifier,
     reference_date: Option<CalendarDate>,
+    reference_year: Option<u16>,
     requires: Vec<String>,
     wildcard: Vec<String>,
+    wildcard_allowed: Option<bool>,
     optional_with_wildcard_for: Vec<String>,
 }
 
@@ -624,6 +647,11 @@ impl CensusGeographyMetadata {
     /// Returns the dataset geography reference date when supplied.
     pub const fn reference_date(&self) -> Option<CalendarDate> {
         self.reference_date
+    }
+
+    /// Returns the provider reference year when no month or day was reported.
+    pub const fn reference_year(&self) -> Option<u16> {
+        self.reference_year
     }
 
     /// Returns required containing geography names.
@@ -783,12 +811,24 @@ impl CensusGeographyCatalog {
         for entry in entries {
             let entry = entry.as_object().ok_or(CensusAdapterError::SchemaDrift)?;
             let name = required_text(entry, "name", limits)?;
-            let geo_level_display = identifier(&required_text(entry, "geoLevelDisplay", limits)?)?;
+            let display = optional_text(entry, "geoLevelDisplay", limits)?;
+            let level_id = optional_text(entry, "geoLevelId", limits)?;
+            if display.as_ref().zip(level_id.as_ref()).is_some_and(|(a, b)| a != b) {
+                return Err(CensusAdapterError::MetadataMismatch);
+            }
+            let geo_level_display = identifier(
+                &display.or(level_id).ok_or(CensusAdapterError::SchemaDrift)?,
+            )?;
             if !identities.insert((name.clone(), geo_level_display.clone())) {
                 return Err(CensusAdapterError::DuplicateIdentity);
             }
             let requires = optional_string_array(entry, "requires", limits)?;
-            let wildcard = optional_string_array(entry, "wildcard", limits)?;
+            // Boolean wildcard controls this level; the array form names allowed
+            // wildcard parents. A boolean never grants parent wildcard permission.
+            let (wildcard, wildcard_allowed) = match entry.get("wildcard") {
+                Some(Value::Bool(allowed)) => (Vec::new(), Some(*allowed)),
+                _ => (optional_string_array(entry, "wildcard", limits)?, None),
+            };
             let optional_with_wildcard_for =
                 optional_string_array_or_scalar(entry, "optionalWithWCFor", limits)?;
             let required_set = requires.iter().map(String::as_str).collect::<BTreeSet<_>>();
@@ -799,14 +839,26 @@ impl CensusGeographyCatalog {
             {
                 return Err(CensusAdapterError::SchemaDrift);
             }
+            let reference = optional_text(entry, "referenceDate", limits)?;
+            let (reference_date, reference_year) = match reference.as_deref() {
+                Some(value) if value.len() == 4 && value.bytes().all(|b| b.is_ascii_digit()) => {
+                    let year = value.parse::<u16>().map_err(|_| CensusAdapterError::SchemaDrift)?;
+                    if !(1000..=9999).contains(&year) {
+                        return Err(CensusAdapterError::SchemaDrift);
+                    }
+                    (None, Some(year))
+                }
+                Some(value) => (Some(parse_date(value)?), None),
+                None => (None, None),
+            };
             geographies.push(CensusGeographyMetadata {
                 name,
                 geo_level_display,
-                reference_date: optional_text(entry, "referenceDate", limits)?
-                    .map(|value| parse_date(&value))
-                    .transpose()?,
+                reference_date,
+                reference_year,
                 requires,
                 wildcard,
+                wildcard_allowed,
                 optional_with_wildcard_for,
             });
         }
@@ -870,6 +922,9 @@ impl CensusGeographyCatalog {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
                 let for_is_wildcard = clause_is_wildcard(for_clause.codes())?;
+                if for_is_wildcard && entry.wildcard_allowed == Some(false) {
+                    return Err(CensusAdapterError::MetadataMismatch);
+                }
                 let grammar_digest =
                     geography_grammar_digest(&self.dataset, &self.evidence, entry, geography)?;
                 CensusGeographyAdmission::Standard {
@@ -962,6 +1017,26 @@ fn required_u16(object: &Map<String, Value>, key: &str) -> Result<u16, CensusAda
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         .ok_or(CensusAdapterError::SchemaDrift)?;
     u16::try_from(value).map_err(|_| CensusAdapterError::SchemaDrift)
+}
+
+fn validate_timeless_catalog_entry(
+    object: &Map<String, Value>,
+    limits: CensusParseLimits,
+) -> Result<(), CensusAdapterError> {
+    for field in [
+        "title",
+        "description",
+        "c_variablesLink",
+        "c_groupsLink",
+        "c_geographyLink",
+    ] {
+        optional_text(object, field, limits)?;
+    }
+    distribution_api_url(object, limits)?;
+    for field in ["c_isAvailable", "c_isAggregate", "c_isTimeseries"] {
+        optional_bool(object, field)?;
+    }
+    Ok(())
 }
 
 fn required_vintage(
@@ -1224,20 +1299,22 @@ fn distribution_api_url(
     if distributions.len() > limits.max_columns() {
         return Err(CensusAdapterError::ResourceLimitExceeded);
     }
+    let mut admitted_api_url = None;
     for distribution in distributions {
         let distribution = distribution
             .as_object()
             .ok_or(CensusAdapterError::SchemaDrift)?;
-        if distribution
-            .get("format")
-            .and_then(Value::as_str)
-            .is_some_and(|format| format.eq_ignore_ascii_case("api"))
-            && let Some(access_url) = distribution.get("accessURL")
+        let format = optional_text(distribution, "format", limits)?;
+        let access_url = optional_text(distribution, "accessURL", limits)?;
+        if admitted_api_url.is_none()
+            && format
+                .as_deref()
+                .is_some_and(|format| format.eq_ignore_ascii_case("api"))
         {
-            return bounded_str(access_url, limits).map(|value| Some(value.to_owned()));
+            admitted_api_url = access_url;
         }
     }
-    Ok(None)
+    Ok(admitted_api_url)
 }
 
 fn parse_date(value: &str) -> Result<CalendarDate, CensusAdapterError> {

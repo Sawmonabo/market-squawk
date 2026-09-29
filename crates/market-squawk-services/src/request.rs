@@ -146,6 +146,30 @@ pub struct JsonStructureLimits {
 }
 
 impl JsonStructureLimits {
+    /// Maximum admitted nesting depth.
+    #[must_use]
+    pub const fn maximum_depth(self) -> usize {
+        self.maximum_depth
+    }
+
+    /// Maximum UTF-8 bytes in one string.
+    #[must_use]
+    pub const fn maximum_string_bytes(self) -> usize {
+        self.maximum_string_bytes
+    }
+
+    /// Maximum items in one array.
+    #[must_use]
+    pub const fn maximum_array_items(self) -> usize {
+        self.maximum_array_items
+    }
+
+    /// Maximum entries in one object.
+    #[must_use]
+    pub const fn maximum_map_entries(self) -> usize {
+        self.maximum_map_entries
+    }
+
     /// Creates positive structural ceilings.
     ///
     /// # Errors

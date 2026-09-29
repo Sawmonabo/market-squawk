@@ -26,7 +26,7 @@ use crate::{
 
 pub use batch::{ExtractionBatch, ExtractionBatchAccumulator, ExtractionContentIdentity};
 pub use capture::{
-    CompleteMarketBarHistoryV1, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMP_BYTES,
+    CompleteMarketBarHistoryV1, CompleteMarketBarDateWindowsV1, CompleteMarketBarDateWindowsInputV1, CompleteMarketBarDateWindowV1, CompleteMarketBarDateSessionV1, RetainedMarketHistoryNormalizationV1, RetainedMarketHistoryNativeCoverageV1, RetainedMarketHistoryCashUnitV1, MarketHistoryCashUnitStatus, ProviderNativeExchangeCode, ReviewedMarketCalendarRelationship, RetainedMarketHistoryCalendarV1, MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMP_BYTES,
     MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS, MAX_PROVIDER_CAPTURE_BYTES,
     MAX_PROVIDER_CAPTURE_PAGE_BYTES, MAX_PROVIDER_CAPTURE_PAGES,
     MAX_PROVIDER_EVENT_MICROBATCH_BYTES, MAX_PROVIDER_EVENT_MICROBATCH_FRAMES,
@@ -52,6 +52,7 @@ pub use capture::{
     SealedProviderCompositeResponseEventBinding, SealedProviderEventMicrobatchBinding,
     SealedProviderEventMicrobatchReceipt, SealedProviderPublicationBinding,
     SealedProviderResponseMarketEventBinding, SourceObjectCaptureIdentity,
+    validate_provider_market_event_binding_metadata,
     verify_provider_market_event_native_lineage_batch_evidence,
 };
 pub use contracts::{
@@ -81,6 +82,8 @@ pub use native_lineage::{
     verify_provider_native_lineage_batch_evidence,
 };
 pub use option_market::{
+    ProviderOptionContractReferenceRow, ProviderOptionContractReferenceDependency,
+    MAX_OPTION_REFERENCE_DEPENDENCIES, MAX_OPTION_REFERENCE_DEPENDENCY_BYTES,
     MAX_OPTION_REQUEST_CONTRACTS, MAX_PROVIDER_OPTION_MARKET_BATCH_BYTES,
     MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS, MAX_PROVIDER_OPTION_MARKET_ROW_BYTES,
     OptionExpirationRange, OptionMarketBatchDisposition, OptionMarketBatchKind,

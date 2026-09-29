@@ -2164,6 +2164,82 @@ fn require_release_start_preview(preview: &Value, fixture: ReleasePaperStartFixt
     Ok(())
 }
 
+async fn create_release_paper_account(
+    application: &Application,
+    fixture: ReleasePaperStartFixture,
+    origin: RequestOrigin,
+) -> Result<()> {
+    let preparation = invoke_with_origin(
+        application,
+        "Bot.GetAccountPreparation",
+        Map::new(),
+        LIVE_START_TIMEOUT,
+        origin,
+    )
+    .await?;
+    if preparation.get("availability").and_then(Value::as_str) != Some("ready") {
+        bail!("virtual account preparation is unavailable for the release fixture");
+    }
+    let cash_choice = exact_release_choice_token(&preparation, "virtualCashChoices", |choice| {
+        choice.pointer("/amount/amount").and_then(Value::as_str)
+            == Some(fixture.virtual_cash_amount)
+    })?;
+    let cash = preparation.get("virtualCashChoices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.iter().find(|choice| {
+            choice.get("choiceToken").and_then(Value::as_str) == Some(cash_choice.as_str())
+        }))
+        .ok_or_else(|| anyhow!("release virtual-cash choice is absent"))?;
+    let currency = required_text(cash.pointer("/amount/currency"), "virtual-cash currency")?;
+    let currency_choice = exact_release_choice_token(&preparation, "currencyChoices", |choice| {
+        choice.get("currency").and_then(Value::as_str) == Some(currency.as_str())
+    })?;
+    let cost_choice = exact_release_choice_token(&preparation, "costChoices", |choice| {
+        choice.get("estimatedTradingCost").and_then(Value::as_str)
+            == Some(fixture.estimated_trading_cost)
+    })?;
+    let preview = invoke_with_origin(
+        application,
+        "Bot.PrepareAccount",
+        json_object(json!({
+            "cashChoice": cash_choice,
+            "costChoice": cost_choice,
+            "currencyChoice": currency_choice,
+        }))?,
+        LIVE_START_TIMEOUT,
+        origin,
+    )
+    .await?;
+    if preview.pointer("/virtualCash/amount").and_then(Value::as_str)
+        != Some(fixture.virtual_cash_amount)
+        || preview.pointer("/virtualCash/currency").and_then(Value::as_str)
+            != Some(currency.as_str())
+        || preview.get("estimatedTradingCost").and_then(Value::as_str)
+            != Some(fixture.estimated_trading_cost)
+        || preview.get("accountLabel") != preparation.get("accountLabel")
+        || preview.get("safeguards") != preparation.get("safeguards")
+    {
+        bail!("virtual account preview does not match the explicit release fixture");
+    }
+    let confirmation_token = required_text(
+        preview.get("confirmationToken"), "virtual account confirmationToken",
+    )?;
+    let created = invoke_with_origin(
+        application,
+        "Bot.CreateAccount",
+        json_object(json!({"confirmationToken": confirmation_token, "confirm": true}))?,
+        LIVE_START_TIMEOUT,
+        origin,
+    )
+    .await?;
+    if created.get("accountCreated").and_then(Value::as_bool) != Some(true)
+        || created.get("sessionAvailability").and_then(Value::as_str) != Some("stopped")
+    {
+        bail!("virtual account creation did not leave the release session stopped");
+    }
+    Ok(())
+}
+
 async fn exercise_live_surface(
     application: &Application,
     surface_id: &'static str,
@@ -2177,7 +2253,7 @@ async fn exercise_live_surface(
         _ => bail!("selected provider surface is not a live runtime"),
     };
     let origin = RequestOrigin::try_new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())?;
-    let preparation = invoke_with_origin(
+    let mut preparation = invoke_with_origin(
         application,
         "Bot.GetStartPreparation",
         Map::new(),
@@ -2185,6 +2261,23 @@ async fn exercise_live_surface(
         origin,
     )
     .await?;
+    if preparation.get("availability").and_then(Value::as_str) == Some("account_required") {
+        create_release_paper_account(application, paper_start, origin).await?;
+        preparation = invoke_with_origin(
+            application,
+            "Bot.GetStartPreparation",
+            Map::new(),
+            LIVE_START_TIMEOUT,
+            origin,
+        )
+        .await?;
+    }
+    if preparation.get("availability").and_then(Value::as_str) != Some("ready") {
+        bail!("paper session preparation is unavailable for the release fixture");
+    }
+    let market_choice = exact_release_choice_token(&preparation, "marketChoices", |choice| {
+        choice.get("label").and_then(Value::as_str) == Some("Digital assets")
+    })?;
     let cash_choice = exact_release_choice_token(&preparation, "virtualCashChoices", |choice| {
         choice.pointer("/amount/amount").and_then(Value::as_str)
             == Some(paper_start.virtual_cash_amount)
@@ -2200,6 +2293,7 @@ async fn exercise_live_surface(
         application,
         "Bot.PrepareStart",
         json_object(json!({
+            "marketChoice": market_choice,
             "cashChoice": cash_choice,
             "costChoice": cost_choice,
             "modeChoice": mode_choice,
@@ -2209,6 +2303,9 @@ async fn exercise_live_surface(
     )
     .await?;
     require_release_start_preview(&preview, paper_start)?;
+    if preview.get("marketLabel").and_then(Value::as_str) != Some("Digital assets") {
+        bail!("paper start preview does not match the release market");
+    }
     let confirmation_token = required_text(
         preview.get("confirmationToken"),
         "paper start confirmationToken",
@@ -2217,7 +2314,7 @@ async fn exercise_live_surface(
         let start = invoke_with_origin(
             application,
             "Bot.Start",
-            json_object(json!({"confirmationToken": confirmation_token}))?,
+            json_object(json!({"confirmationToken": confirmation_token, "confirm": true}))?,
             LIVE_START_TIMEOUT,
             origin,
         )
@@ -2278,7 +2375,7 @@ async fn exercise_live_surface(
         let reconciliation = invoke(
             application,
             "Execution.Reconcile",
-            Map::new(),
+            json_object(json!({"confirm": true}))?,
             APPLICATION_REQUEST_TIMEOUT,
         )
         .await?;
@@ -2300,7 +2397,7 @@ async fn exercise_live_surface(
     let stop = invoke(
         application,
         "Bot.Stop",
-        json_object(json!({"reason": "provider release evidence completed"}))?,
+        json_object(json!({"reason": "provider release evidence completed", "confirm": true}))?,
         shutdown_timeout,
     )
     .await;

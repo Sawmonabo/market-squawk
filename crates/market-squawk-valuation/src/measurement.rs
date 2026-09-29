@@ -188,6 +188,8 @@ pub enum ValuationAmountBasis {
     ReportingEntityTotal,
     /// Aggregate amount attributable to one retained portfolio position.
     PositionTotal,
+    /// Aggregate amount attributable to all common equity claims of the reporting entity.
+    TotalCommonEquity,
 }
 
 /// Exact currency amount, declared accounting decimal scale, and economic basis.
@@ -571,6 +573,7 @@ pub(crate) const fn amount_basis_tag(value: ValuationAmountBasis) -> u8 {
         ValuationAmountBasis::PerInstrumentUnit => 1,
         ValuationAmountBasis::ReportingEntityTotal => 2,
         ValuationAmountBasis::PositionTotal => 3,
+        ValuationAmountBasis::TotalCommonEquity => 4,
     }
 }
 

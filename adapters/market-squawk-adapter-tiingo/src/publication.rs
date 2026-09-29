@@ -6,6 +6,9 @@
 //! publication. Provider-native sidecars retain metadata, request, disposition, gap, and action
 //! semantics without copying canonical identities, local clocks, or capture digests.
 
+mod history;
+pub use history::*;
+
 use bytes::Bytes;
 use market_squawk_domain::{
     DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, FundNavCorrectionState,
@@ -34,7 +37,7 @@ use crate::canonical::{
 };
 use crate::{
     TiingoAdapterError, TiingoCaptureMaterialError, TiingoCapturedPage, TiingoCoverage,
-    TiingoEndpointFamily, TiingoEodBarCandidate, TiingoEodBarTimeAuthority,
+    TiingoEndpointFamily, TiingoEodBarCandidate,
     TiingoEodContractEvidence, TiingoEodInstrumentAuthority, TiingoEodMapError,
     TiingoEodMappingInput, TiingoEodProviderActionEvidence, TiingoEodReceipt, TiingoEodSurface,
     TiingoEodSurfaceGap, TiingoEodSurfaceGapReason, TiingoFundContext,
@@ -327,7 +330,6 @@ impl TiingoSealedLatestPublication {
         self,
         instrument: &TiingoEodInstrumentAuthority,
         contract: &TiingoEodContractEvidence,
-        bar_time_authority: &dyn TiingoEodBarTimeAuthority,
         extraction_request: ExtractionRequest,
         ingested_at: Timestamp,
     ) -> Result<TiingoLatestEodPublicationOutcome, TiingoLatestPublicationError> {
@@ -347,7 +349,6 @@ impl TiingoSealedLatestPublication {
             sealed_metadata_capture: sealed_capture,
             instrument,
             contract,
-            bar_time_authority,
             ingested_at,
         })?;
         if page.bars().is_empty() {
@@ -630,7 +631,7 @@ fn eod_observation(
         instrument_id: Some(bar.instrument_id()),
         venue_id: Some(bar.venue_id().clone()),
         source_identifier,
-        source_timestamp: Some(bar.time_semantics().provider_timestamp()),
+        source_timestamp: None,
         received_at: bar.received_at(),
         ingested_at: bar.ingested_at(),
         quality: DataQuality::Aggregated,
@@ -642,8 +643,8 @@ fn eod_observation(
     })?;
     let context = ResearchContext::new(
         provenance,
-        ResearchTime::new(
-            bar.time_semantics().provider_timestamp(),
+        ResearchTime::try_new_with_coordinates(
+            bar.time_semantics().effective_coordinate(),
             None,
             RevisionNumber::new(1)?,
             None,
@@ -912,6 +913,8 @@ fn action_native(action: &TiingoEodProviderActionEvidence) -> TiingoEodActionNat
 
 const fn endpoint_name(endpoint: TiingoEndpointFamily) -> &'static str {
     match endpoint {
+        TiingoEndpointFamily::CorporateActionDistributions => "corporate_action_distributions",
+        TiingoEndpointFamily::CorporateActionSplits => "corporate_action_splits",
         TiingoEndpointFamily::Metadata => "metadata",
         TiingoEndpointFamily::LatestDailyPrices => "latest_daily_prices",
         TiingoEndpointFamily::HistoricalDailyPrices => "historical_daily_prices",
@@ -920,6 +923,8 @@ const fn endpoint_name(endpoint: TiingoEndpointFamily) -> &'static str {
 
 const fn scope_name(scope: &TiingoRequestScope) -> &'static str {
     match scope {
+        TiingoRequestScope::Distributions { .. } => "distributions",
+        TiingoRequestScope::Splits { .. } => "splits",
         TiingoRequestScope::Metadata => "metadata",
         TiingoRequestScope::Latest => "latest",
         TiingoRequestScope::History { .. } => "history",

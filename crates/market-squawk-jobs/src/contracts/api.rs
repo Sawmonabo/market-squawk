@@ -129,6 +129,21 @@ impl JobRecoveryPage {
 /// Atomic durable storage required by the job authority.
 #[async_trait]
 pub trait JobRepository: Send + Sync {
+    /// Reserves the original request before any one-use input authority is consumed.
+    async fn begin_start(
+        &self,
+        binding: &super::JobStartBinding,
+    ) -> Result<super::JobStartAdmission, JobRepositoryError>;
+    /// Reads only the exact authenticated original request and argument commitment.
+    async fn reconcile_start(
+        &self,
+        binding: &super::JobStartBinding,
+    ) -> Result<super::JobStartReconciliation, JobRepositoryError>;
+    /// Fences absent or unfinished admission; admitted jobs retain their exact identity.
+    async fn cancel_start(
+        &self,
+        binding: &super::JobStartBinding,
+    ) -> Result<super::JobStartReconciliation, JobRepositoryError>;
     /// Creates the initial queued snapshot exactly once.
     async fn create(&self, spec: &AdmittedJobSpec) -> Result<JobSnapshot, JobRepositoryError>;
     /// Appends one event only when identity, generation, and expected sequence all match.
@@ -626,5 +641,5 @@ pub trait JobRunner: Send + Sync {
     /// Executes using only generation-scoped capabilities.
     async fn run(&self, context: JobRunContext) -> Result<JobCompletion, JobRunError>;
     /// Determines how an interrupted snapshot may proceed.
-    fn recover(&self, snapshot: &JobSnapshot) -> JobRecoveryDisposition;
+    async fn recover(&self, snapshot: &JobSnapshot) -> JobRecoveryDisposition;
 }

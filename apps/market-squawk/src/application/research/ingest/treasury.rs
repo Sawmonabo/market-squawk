@@ -103,7 +103,9 @@ pub(super) async fn drain_generation_replay(
             super::RegisteredTypedSourceCapability::TreasuryAllHistory(source) => {
                 Some(Arc::clone(source))
             }
-            super::RegisteredTypedSourceCapability::None => None,
+            super::RegisteredTypedSourceCapability::None
+            | super::RegisteredTypedSourceCapability::BoardFullHistory(_)
+            | super::RegisteredTypedSourceCapability::BeaRegional(_) => None,
         }
     };
     if let Some(source) = source {

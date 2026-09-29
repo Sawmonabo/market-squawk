@@ -27,6 +27,7 @@ pub use instruments::{
     CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,
     CoinbaseSourceConfig, KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation,
     KrakenConfigurationError, KrakenInstrumentMapping, KrakenSourceConfig,
+    RECOMMENDED_PUBLIC_BTC_USD_INSTRUMENT_ID,
 };
 
 const ENV_PREFIX: &str = "MARKET_SQUAWK_";

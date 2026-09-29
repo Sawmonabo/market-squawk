@@ -164,7 +164,7 @@ impl JobRunner for BackupJobRunner {
         self.inner.run(context).await
     }
 
-    fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, _snapshot: &market_squawk_jobs::JobSnapshot) -> JobRecoveryDisposition {
         // Backup destinations, retention previews, and workspace approvals are process-owned.
         // Their terminal repositories remain queryable, but an interrupted mutation is never
         // guessed or replayed without fresh application admission.

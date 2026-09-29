@@ -400,18 +400,34 @@ fn effective_coordinate(
 fn canonical_series_digest(
     observation: &BeaObservation,
 ) -> Result<EvidenceDigest, BeaCanonicalError> {
+    canonical_series_digest_from_parts(
+        observation.identity().dataset().as_str(),
+        observation.identity().table(),
+        observation.identity().line(),
+        observation.period().frequency(),
+        observation.identity().dimensions(),
+    )
+}
+
+pub(crate) fn canonical_series_digest_from_parts(
+    dataset: &str,
+    table: Option<&str>,
+    line: Option<&str>,
+    frequency: BeaFrequency,
+    original_dimensions: &BTreeMap<String, String>,
+) -> Result<EvidenceDigest, BeaCanonicalError> {
     let mut dimensions = BTreeMap::new();
-    for (name, value) in observation.identity().dimensions() {
+    for (name, value) in original_dimensions {
         if !matches_semantic(name, &["TimePeriod", "CL_UNIT", "UNIT_MULT"]) {
             dimensions.insert(name, value);
         }
     }
     let mut hasher = Sha256::new();
     hasher.update(b"market-squawk/bea-canonical-series/v1");
-    hash_text(&mut hasher, observation.identity().dataset().as_str())?;
-    hash_optional_text(&mut hasher, observation.identity().table())?;
-    hash_optional_text(&mut hasher, observation.identity().line())?;
-    hasher.update([match observation.period().frequency() {
+    hash_text(&mut hasher, dataset)?;
+    hash_optional_text(&mut hasher, table)?;
+    hash_optional_text(&mut hasher, line)?;
+    hasher.update([match frequency {
         BeaFrequency::Annual => 1,
         BeaFrequency::Quarterly => 2,
         BeaFrequency::Monthly => 3,
@@ -432,16 +448,20 @@ fn canonical_series_digest(
 }
 
 fn unit_digest(observation: &BeaObservation) -> EvidenceDigest {
+    unit_digest_from_cl_unit(observation.unit().cl_unit())
+}
+
+pub(crate) fn unit_digest_from_cl_unit(cl_unit: &str) -> EvidenceDigest {
     let mut hasher = Sha256::new();
     // The canonical value is already scaled to the base `CL_UNIT`. `UNIT_MULT` remains in the
     // native row/capture lineage and must not be encoded into the post-scaling unit identity.
     hasher.update(b"market-squawk/bea-canonical-unit/v2");
     hasher.update(
-        u64::try_from(observation.unit().cl_unit().len())
+        u64::try_from(cl_unit.len())
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
-    hasher.update(observation.unit().cl_unit().as_bytes());
+    hasher.update(cl_unit.as_bytes());
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
@@ -474,7 +494,7 @@ fn scale_value_exact(value: Decimal, exponent: i16) -> Result<Decimal, BeaCanoni
     Ok(scaled.normalize())
 }
 
-fn identifier_from_digest(
+pub(crate) fn identifier_from_digest(
     prefix: &str,
     digest: EvidenceDigest,
 ) -> Result<SourceIdentifier, BeaCanonicalError> {

@@ -90,6 +90,7 @@ pub struct CoinbaseMarketPublicationContext {
     dataset: SourceIdentifier,
     stream_identity: SourceIdentifier,
     physical: CoinbaseMarketPhysicalCaptureIdentity,
+    direct_predecessor_publication: Option<EvidenceDigest>,
 }
 
 impl CoinbaseMarketPublicationContext {
@@ -103,7 +104,25 @@ impl CoinbaseMarketPublicationContext {
             dataset,
             stream_identity,
             physical,
+            direct_predecessor_publication: None,
         }
+    }
+
+    /// Records the actual preceding durable publication selected by the owning application.
+    /// This digest is evidence, not an authority token; the application must obtain it from its
+    /// committed receipt and validate exact capture continuity before calling the seal boundary.
+    pub fn bind_direct_predecessor(
+        &mut self,
+        digest: EvidenceDigest,
+    ) -> Result<(), CoinbaseMarketPublicationError> {
+        if self.direct_predecessor_publication.is_some()
+            || digest.algorithm() != market_squawk_domain::DigestAlgorithm::Sha256
+            || digest.bytes() == [0; 32]
+        {
+            return Err(CoinbaseMarketPublicationError::RawEvidenceMismatch);
+        }
+        self.direct_predecessor_publication = Some(digest);
+        Ok(())
     }
 
     /// Returns the application-selected durable dataset.
@@ -296,6 +315,7 @@ impl CoinbaseDirectSnapshotSealMaterial {
 #[derive(Debug)]
 pub enum CoinbaseMarketSealMaterial {
     AdvancedTrade(CoinbaseEventMicrobatchSealMaterial),
+    ExchangeDirectSuccessor(CoinbaseEventMicrobatchSealMaterial),
     ExchangeDirect {
         snapshot: CoinbaseDirectSnapshotSealMaterial,
         replay: CoinbaseEventMicrobatchSealMaterial,
@@ -306,6 +326,7 @@ pub enum CoinbaseMarketSealMaterial {
 #[derive(Debug)]
 pub enum CoinbaseMarketSealedTokens {
     AdvancedTrade(ProviderEventMicrobatchToken),
+    ExchangeDirectSuccessor(ProviderEventMicrobatchToken),
     ExchangeDirect {
         snapshot: ProviderWholeCaptureToken,
         replay: ProviderEventMicrobatchToken,
@@ -376,6 +397,10 @@ impl CoinbaseMarketOmission {
 /// Already-qualified canonical events for one exact Coinbase surface.
 #[derive(Debug)]
 pub enum CoinbaseQualifiedMarketPublication {
+    ExchangeDirectSuccessor {
+        rows: Vec<CoinbaseQualifiedDirectReplayRow>,
+        omissions: Vec<CoinbaseMarketOmission>,
+    },
     AdvancedTrade {
         rows: Vec<CoinbaseQualifiedPublicRow>,
         omissions: Vec<CoinbaseMarketOmission>,
@@ -445,6 +470,13 @@ pub struct CoinbaseMarketSealRejoin {
 
 #[derive(Debug)]
 enum CoinbasePublicationRawEvidence {
+    ExchangeDirectSuccessor {
+        replay: Box<[CoinbaseDirectReplayPublicationEvidence]>,
+        snapshot_coordinate: EvidenceDigest,
+        predecessor_frame: u64,
+        predecessor_payload: EvidenceDigest,
+        predecessor_publication: EvidenceDigest,
+    },
     AdvancedTrade {
         source_sequence: Option<u64>,
         exchange_at: Option<Timestamp>,
@@ -621,7 +653,12 @@ impl CoinbaseMarketSealRejoin {
                     .as_source_identifier()
                     .retained_bytes(),
             )?
-            .checked_add(self.evidence.venue().retained_bytes())
+            .checked_add(self.evidence.venue().retained_bytes())?
+            .checked_add(
+                self.evidence
+                    .selected_public_identity()
+                    .map_or(Some(0), |selected| selected.dynamic_retained_bytes())?,
+            )
     }
 
     /// Consumes the sealed frame and exact post-commit live rows into the common immutable
@@ -792,6 +829,11 @@ impl CoinbaseMarketHandoff {
         CoinbaseMarketPublicationError,
     > {
         let (evidence, raw, typed_batch) = self.into_parts();
+        typed_batch
+            .evidence()
+            .currentness_lease()
+            .validate_current()
+            .map_err(|_| CoinbaseMarketPublicationError::RawEvidenceMismatch)?;
         let binding = typed_batch.evidence().binding();
         let expected_channel = expected_provider_channel(evidence.feed())?;
         let source_id = binding.source_id().clone();
@@ -800,6 +842,7 @@ impl CoinbaseMarketHandoff {
             dataset,
             stream_identity,
             physical,
+            direct_predecessor_publication,
         } = context;
         let CoinbaseMarketPhysicalCaptureIdentity {
             connection_id,
@@ -808,7 +851,7 @@ impl CoinbaseMarketHandoff {
 
         match raw {
             CoinbaseMarketRawLineage::AdvancedTrade(payload) => {
-                if event_ids.len() != 1 {
+                if event_ids.len() != 1 || direct_predecessor_publication.is_some() {
                     return Err(CoinbaseMarketPublicationError::InvalidPhysicalIdentity);
                 }
                 let decoder = typed_batch.evidence();
@@ -847,9 +890,73 @@ impl CoinbaseMarketHandoff {
                     CoinbaseMarketSealMaterial::AdvancedTrade(material),
                 ))
             }
+            CoinbaseMarketRawLineage::DirectSuccessor(lineage) => {
+                let predecessor_publication = direct_predecessor_publication
+                    .ok_or(CoinbaseMarketPublicationError::RawEvidenceMismatch)?;
+                let (snapshot, predecessor, frames) = lineage.into_parts();
+                if event_ids.len() != frames.len() || frames.is_empty() {
+                    return Err(CoinbaseMarketPublicationError::InvalidPhysicalIdentity);
+                }
+                let mut raw_frames = Vec::new();
+                let mut replay = Vec::new();
+                raw_frames
+                    .try_reserve_exact(frames.len())
+                    .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
+                replay
+                    .try_reserve_exact(frames.len())
+                    .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
+                for (ordinal, frame) in frames.into_iter().enumerate() {
+                    let (event, payload, native_trade) = frame.into_parts();
+                    let decoder = event.evidence();
+                    replay.push(CoinbaseDirectReplayPublicationEvidence {
+                        sequence: event.sequence().get(),
+                        provider_timestamp: event.timestamp(),
+                        received_at: decoder.received_at(),
+                        payload_digest: decoder.payload_digest(),
+                        native_semantics: encode_direct_event(&event, native_trade.as_ref())?,
+                    });
+                    raw_frames.push(CoinbaseMarketRawSealFrame {
+                        event_id: event_ids[ordinal],
+                        connection_id,
+                        source_sequence: Some(event.sequence().get()),
+                        exchange_at: Some(event.timestamp()),
+                        received_at: decoder.received_at(),
+                        payload: Bytes::copy_from_slice(payload.as_bytes()),
+                    });
+                }
+                let material = CoinbaseEventMicrobatchSealMaterial {
+                    source_id,
+                    metadata_revision,
+                    dataset: dataset.clone(),
+                    stream_identity: stream_identity.clone(),
+                    frames: raw_frames.into_boxed_slice(),
+                };
+                Ok((
+                    CoinbaseMarketSealRejoin {
+                        evidence,
+                        typed_batch,
+                        expected_channel,
+                        dataset,
+                        stream_identity,
+                        physical_connection_id: connection_id,
+                        physical_event_ids: event_ids.into_boxed_slice(),
+                        raw: CoinbasePublicationRawEvidence::ExchangeDirectSuccessor {
+                            replay: replay.into_boxed_slice(),
+                            snapshot_coordinate: snapshot.coordinate_digest(),
+                            predecessor_frame: predecessor.frame_id().get(),
+                            predecessor_payload: predecessor.payload_digest(),
+                            predecessor_publication,
+                        },
+                        public_state: CoinbasePublicPublicationState::NotApplicable,
+                    },
+                    CoinbaseMarketSealMaterial::ExchangeDirectSuccessor(material),
+                ))
+            }
             CoinbaseMarketRawLineage::DirectInitial(lineage) => {
                 let (snapshot, replay) = lineage.into_sealing_split();
-                if event_ids.len() != replay.len().saturating_add(1) {
+                if event_ids.len() != replay.len().saturating_add(1)
+                    || direct_predecessor_publication.is_some()
+                {
                     return Err(CoinbaseMarketPublicationError::InvalidPhysicalIdentity);
                 }
                 let snapshot_receipt = snapshot.receipt();
@@ -916,7 +1023,8 @@ impl CoinbaseMarketHandoff {
                         CoinbaseMarketContinuity::SnapshotContiguous { snapshot, .. } => {
                             snapshot.get()
                         }
-                        CoinbaseMarketContinuity::ProviderCursorUnverified { .. } => {
+                        CoinbaseMarketContinuity::ProviderCursorUnverified { .. }
+                        | CoinbaseMarketContinuity::CapturedContiguous { .. } => {
                             return Err(CoinbaseMarketPublicationError::ProfileMismatch);
                         }
                     },
@@ -1077,6 +1185,30 @@ impl CoinbaseMarketSealRejoin {
                     &expected,
                 )
             }
+            (
+                CoinbasePublicationRawEvidence::ExchangeDirectSuccessor { replay, .. },
+                CoinbaseMarketSealedTokens::ExchangeDirectSuccessor(token),
+            ) => {
+                let expected = replay
+                    .iter()
+                    .map(|frame| ExpectedFrame {
+                        sequence: Some(frame.sequence),
+                        exchange_at: Some(frame.provider_timestamp),
+                        received_at: frame.received_at,
+                        payload_digest: frame.payload_digest,
+                    })
+                    .collect::<Vec<_>>();
+                validate_event_token(
+                    token,
+                    self.source_id(),
+                    self.metadata_revision(),
+                    &self.dataset,
+                    &self.stream_identity,
+                    self.physical_connection_id,
+                    &self.physical_event_ids,
+                    &expected,
+                )
+            }
             _ => Err(CoinbaseMarketPublicationError::ProfileMismatch),
         }
     }
@@ -1186,6 +1318,34 @@ impl CoinbaseMarketSealRejoin {
                     event_binding,
                 )?;
                 Ok(CoinbaseSealedMarketPublication::Published(composite.into()))
+            }
+            (
+                CoinbasePublicationRawEvidence::ExchangeDirectSuccessor { replay, .. },
+                CoinbaseMarketSealedTokens::ExchangeDirectSuccessor(token),
+                CoinbaseQualifiedMarketPublication::ExchangeDirectSuccessor { rows, omissions },
+            ) => {
+                let (events, native, ordinals) =
+                    self.direct_replay_rows(replay, rows, omissions)?;
+                let sidecar = self.encode_batch_sidecar(
+                    ProviderPublicationBindingKind::EventMicrobatch,
+                    Some(self.typed_batch.evidence().frame_id()),
+                )?;
+                let batch = ProviderMarketEventBatch::try_new(
+                    self.source_id().clone(),
+                    self.metadata_revision().clone(),
+                    self.dataset,
+                    events,
+                )?;
+                let native = ProviderMarketEventNativeLineageBatch::try_new(
+                    ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1,
+                    &batch,
+                    native,
+                    Some(sidecar),
+                )?;
+                let binding =
+                    SealedProviderEventMicrobatchBinding::try_new(token, batch, native, ordinals)?;
+                binding.validate()?;
+                Ok(CoinbaseSealedMarketPublication::Published(binding.into()))
             }
             _ => Err(CoinbaseMarketPublicationError::ProfileMismatch),
         }
@@ -1310,6 +1470,16 @@ impl CoinbaseMarketSealRejoin {
             subscription_digest: EvidenceDigest,
             subscription_acknowledgement: Option<EvidenceDigest>,
             continuity_snapshot: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            continuity_predecessor: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            captured_snapshot_coordinate: Option<EvidenceDigest>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            predecessor_frame: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            predecessor_payload: Option<EvidenceDigest>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            predecessor_publication: Option<EvidenceDigest>,
             continuity_terminal: u64,
             source_generation: u64,
             generation_frame_ordinal: Option<u64>,
@@ -1318,9 +1488,30 @@ impl CoinbaseMarketSealRejoin {
         }
         let (continuity_snapshot, continuity_terminal) = match self.evidence.continuity() {
             CoinbaseMarketContinuity::ProviderCursorUnverified { terminal } => (None, terminal),
-            CoinbaseMarketContinuity::SnapshotContiguous { snapshot, terminal } => {
-                (Some(snapshot.get()), terminal.get())
-            }
+            CoinbaseMarketContinuity::SnapshotContiguous { snapshot, terminal }
+            | CoinbaseMarketContinuity::CapturedContiguous {
+                snapshot, terminal, ..
+            } => (Some(snapshot.get()), terminal.get()),
+        };
+        let (
+            captured_snapshot_coordinate,
+            predecessor_frame,
+            predecessor_payload,
+            predecessor_publication,
+        ) = match &self.raw {
+            CoinbasePublicationRawEvidence::ExchangeDirectSuccessor {
+                snapshot_coordinate,
+                predecessor_frame,
+                predecessor_payload,
+                predecessor_publication,
+                ..
+            } => (
+                Some(*snapshot_coordinate),
+                Some(*predecessor_frame),
+                Some(*predecessor_payload),
+                Some(*predecessor_publication),
+            ),
+            _ => (None, None, None, None),
         };
         let sidecar = Sidecar {
             schema: "market-squawk/coinbase-market-publication-sidecar/v1",
@@ -1339,6 +1530,16 @@ impl CoinbaseMarketSealRejoin {
                 .subscription_acknowledgement()
                 .map(|value| value.content_digest()),
             continuity_snapshot,
+            continuity_predecessor: match self.evidence.continuity() {
+                CoinbaseMarketContinuity::CapturedContiguous { predecessor, .. } => {
+                    Some(predecessor.get())
+                }
+                _ => None,
+            },
+            captured_snapshot_coordinate,
+            predecessor_frame,
+            predecessor_payload,
+            predecessor_publication,
             continuity_terminal,
             source_generation: self
                 .typed_batch
@@ -1549,6 +1750,25 @@ fn validate_committed_public_row(
         .ok_or(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch)?;
     let event = committed.event();
     let provenance = event_provenance(event);
+    let selected = handoff
+        .evidence
+        .selected_public_identity()
+        .ok_or(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch)?;
+    let current = committed.native_identity_selection();
+    if selected.native.namespace != current.native.namespace
+        || selected.native.provider_instrument_id != current.native.provider_instrument_id
+        || selected.native.venue != current.native.venue
+        || selected.native.venue_symbol != current.native.venue_symbol
+        || selected.native.instrument != current.native.instrument
+        || selected.definition_digest != current.definition_digest
+        || selected.definition_sequence != current.definition_sequence
+        || selected.reference_revision != current.reference_revision
+        || selected.reference_payload_digest != current.reference_payload_digest
+        || selected.provider_revision != current.provider_revision
+        || selected.provider_payload_digest != current.provider_payload_digest
+    {
+        return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
+    }
     validate_public_event(event, observation, handoff)?;
     if committed.qualification().recorded_quality() != DataQuality::DirectUnverified
         || committed.qualification().binding() != provenance.binding()
@@ -1606,7 +1826,8 @@ fn validate_direct_snapshot_event(
     )?;
     let expected = match handoff.evidence.continuity() {
         CoinbaseMarketContinuity::SnapshotContiguous { snapshot, .. } => Some(snapshot.get()),
-        CoinbaseMarketContinuity::ProviderCursorUnverified { .. } => None,
+        CoinbaseMarketContinuity::ProviderCursorUnverified { .. }
+        | CoinbaseMarketContinuity::CapturedContiguous { .. } => None,
     };
     if canonical_sequence(event) != expected {
         return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
@@ -1625,6 +1846,8 @@ fn validate_direct_replay_event(
         LiveEventClass::BookSnapshot | LiveEventClass::BookDelta => Some(frame.sequence),
         LiveEventClass::Trade
         | LiveEventClass::Quote
+        | LiveEventClass::Chart
+        | LiveEventClass::Screener
         | LiveEventClass::Auction
         | LiveEventClass::TradingHalt
         | LiveEventClass::InstrumentStatus
@@ -1643,7 +1866,7 @@ fn validate_direct_replay_event(
         || provenance.binding().provider_product() != handoff.evidence.product()
         || provenance.binding().provider_channel() != &handoff.expected_channel
         || provenance.binding().venue_id() != handoff.evidence.venue()
-        || provenance.binding().instrument_id() != handoff.evidence.configured_instrument()
+        || provenance.binding().instrument_id() != Some(handoff.evidence.configured_instrument())
         || provenance.binding().connection_generation()
             != handoff
                 .typed_batch
@@ -1689,7 +1912,7 @@ fn validate_common_event(
         || provenance.binding().provider_product() != handoff.evidence.product()
         || provenance.binding().provider_channel() != &handoff.expected_channel
         || provenance.binding().venue_id() != handoff.evidence.venue()
-        || provenance.binding().instrument_id() != handoff.evidence.configured_instrument()
+        || provenance.binding().instrument_id() != Some(handoff.evidence.configured_instrument())
         || provenance.binding().source_identifier() != source_identifier
         || provenance.binding().payload_digest() != payload_digest
         || provenance.binding().event_class() != event_class
@@ -1912,6 +2135,11 @@ fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
     match event {
         MarketEvent::Trade(value) => value.provenance(),
         MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::MarketDataQuote(value) => value.provenance(),
+        MarketEvent::MarketDataTrade(value) => value.provenance(),
+        MarketEvent::MarketDataBook(value) => value.provenance(),
+        MarketEvent::MarketDataChart(value) => value.provenance(),
+        MarketEvent::MarketDataScreener(value) => value.provenance(),
         MarketEvent::BookSnapshot(value) => value.provenance(),
         MarketEvent::BookDelta(value) => value.provenance(),
         MarketEvent::Auction(value) => value.provenance(),
@@ -1923,10 +2151,14 @@ fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
 
 fn event_class_of(event: &MarketEvent) -> LiveEventClass {
     match event {
-        MarketEvent::Trade(_) => LiveEventClass::Trade,
-        MarketEvent::Quote(_) => LiveEventClass::Quote,
-        MarketEvent::BookSnapshot(_) => LiveEventClass::BookSnapshot,
+        MarketEvent::Trade(_) | MarketEvent::MarketDataTrade(_) => LiveEventClass::Trade,
+        MarketEvent::Quote(_) | MarketEvent::MarketDataQuote(_) => LiveEventClass::Quote,
+        MarketEvent::MarketDataBook(_) | MarketEvent::BookSnapshot(_) => {
+            LiveEventClass::BookSnapshot
+        }
         MarketEvent::BookDelta(_) => LiveEventClass::BookDelta,
+        MarketEvent::MarketDataChart(_) => LiveEventClass::Chart,
+        MarketEvent::MarketDataScreener(_) => LiveEventClass::Screener,
         MarketEvent::Auction(_) => LiveEventClass::Auction,
         MarketEvent::TradingHalt(_) => LiveEventClass::TradingHalt,
         MarketEvent::InstrumentStatus(_) => LiveEventClass::InstrumentStatus,
@@ -1952,6 +2184,8 @@ const fn event_class_name(value: LiveEventClass) -> &'static str {
         LiveEventClass::TradingHalt => "trading_halt",
         LiveEventClass::InstrumentStatus => "instrument_status",
         LiveEventClass::CorporateAction => "corporate_action",
+        LiveEventClass::Chart => "chart",
+        LiveEventClass::Screener => "screener",
     }
 }
 

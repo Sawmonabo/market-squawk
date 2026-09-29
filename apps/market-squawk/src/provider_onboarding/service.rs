@@ -103,6 +103,8 @@ const KRAKEN_ACCOUNT_BINDING_DOMAIN: &[u8] = b"market-squawk/kraken-account-bind
 static SECRET_OPERATION_REAPER: LazyLock<SecretOperationReaper> =
     LazyLock::new(SecretOperationReaper::start);
 
+mod bea_doctor;
+mod census_doctor;
 mod eia_doctor;
 mod lifecycle_runtime;
 mod rate_runtime;
@@ -288,6 +290,7 @@ pub(crate) struct ProviderOnboardingOwnedMutationAuthority {
 #[derive(Debug, Default)]
 pub(crate) struct ProviderRuntimeStartupAdmissions {
     sessions: BTreeMap<SourceIdentifier, BTreeSet<Uuid>>,
+    unavailable_surfaces: BTreeSet<SourceIdentifier>,
 }
 
 impl ProviderRuntimeStartupAdmissions {
@@ -300,7 +303,22 @@ impl ProviderRuntimeStartupAdmissions {
                 return Err(ProviderOnboardingError::InvalidSessionState);
             }
         }
-        Ok(Self { sessions })
+        Ok(Self {
+            sessions,
+            unavailable_surfaces: BTreeSet::new(),
+        })
+    }
+
+    pub(crate) fn with_unavailable_surfaces(
+        mut self,
+        surfaces: impl IntoIterator<Item = SourceIdentifier>,
+    ) -> Self {
+        self.unavailable_surfaces.extend(surfaces);
+        self
+    }
+
+    fn unavailable(&self, surface_id: &SourceIdentifier) -> bool {
+        self.unavailable_surfaces.contains(surface_id)
     }
 
     fn admits(&self, surface_id: &SourceIdentifier, session_id: Uuid) -> bool {
@@ -330,6 +348,18 @@ impl ProviderOnboardingService {
                 .try_lock()
                 .map_err(|_error| ProviderOnboardingError::ActivationUnavailable)?,
         })
+    }
+
+    /// Waits for the existing activation mutex without treating another mutation as revocation.
+    /// The caller must bound this future by its original deadline and cancellation.
+    pub(crate) async fn acquire_owned_runtime_mutation_authority(
+        self: &Arc<Self>,
+    ) -> ProviderOnboardingOwnedMutationAuthority {
+        let guard = Arc::clone(&self.activation).lock_owned().await;
+        ProviderOnboardingOwnedMutationAuthority {
+            service: Arc::clone(self),
+            _guard: guard,
+        }
     }
 
     pub(crate) fn try_acquire_owned_runtime_mutation_authority(
@@ -1444,14 +1474,12 @@ impl ProviderOnboardingService {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
-        let eia_session = self
-            .catalog
-            .resume_provider_onboarding(session_id)?
-            .lifecycle()
-            .surface_id()
-            .as_str()
-            == "eia.api-v2";
-        let mut activation = Some(if eia_session {
+        let source_doctor_session = matches!(
+            self.catalog.resume_provider_onboarding(session_id)?
+                .lifecycle().surface_id().as_str(),
+            "eia.api-v2" | "census.data-api"
+        );
+        let mut activation = Some(if source_doctor_session {
             self.activation
                 .try_lock()
                 .map_err(|_| ProviderOnboardingError::ActivationUnavailable)?
@@ -1555,10 +1583,10 @@ impl ProviderOnboardingService {
                         },
                     )
                     .await?;
-                    // The EIA doctor performs provider I/O outside the onboarding mutex.
-                    // Its result is admitted only after reacquiring and checking this exact sequence.
-                    let eia_doctor = profile.id() == "eia.api-v2";
-                    if eia_doctor {
+                    // Source doctors perform provider I/O outside the onboarding mutex.
+                    // Their result is admitted only after reacquiring and checking this exact sequence.
+                    let source_doctor = matches!(profile.id(), "eia.api-v2" | "census.data-api");
+                    if source_doctor {
                         drop(activation.take());
                     }
                     let probe_evidence = if profile.id() == "alpaca.basic-market-data" {
@@ -1567,7 +1595,7 @@ impl ProviderOnboardingService {
                         self.run_credential_probe(profile, &secret, cancellation.clone())
                             .await?
                     };
-                    if eia_doctor {
+                    if source_doctor {
                         activation = Some(
                             self.activation
                                 .try_lock()
@@ -2250,9 +2278,19 @@ impl ProviderOnboardingService {
         secret: &SecretValue,
         cancellation: CancellationToken,
     ) -> Result<CredentialProbeEvidence, ProviderOnboardingError> {
+        if profile.id() == "bea.api-data" {
+            return self
+                .run_bea_credential_doctor(profile, secret, cancellation)
+                .await;
+        }
         if profile.id() == "eia.api-v2" {
             return self
                 .run_eia_credential_doctor(profile, secret, cancellation)
+                .await;
+        }
+        if profile.id() == "census.data-api" {
+            return self
+                .run_census_credential_doctor(profile, secret, cancellation)
                 .await;
         }
         let expected_transport = match profile.id() {
@@ -2498,6 +2536,25 @@ impl ProviderOnboardingService {
         fred_v1_credential: bool,
         cancellation: CancellationToken,
     ) -> Result<Vec<u8>, ProviderOnboardingError> {
+        self.collect_probe_response_bounded(
+            request, policy, rate_permit, credential_probe, fred_v1_credential,
+            cancellation, MAX_PROBE_BODY_BYTES,
+        ).await
+    }
+
+    async fn collect_probe_response_bounded(
+        &self,
+        request: reqwest::RequestBuilder,
+        policy: &market_squawk_sources::EndpointPolicy,
+        rate_permit: &mut ProbeRatePermit,
+        credential_probe: bool,
+        fred_v1_credential: bool,
+        cancellation: CancellationToken,
+        maximum_body_bytes: usize,
+    ) -> Result<Vec<u8>, ProviderOnboardingError> {
+        if maximum_body_bytes == 0 || maximum_body_bytes > MAX_PROBE_BODY_BYTES {
+            return Err(ProviderOnboardingError::InvalidProfile);
+        }
         let request_deadline = tokio::time::Instant::from_std(rate_permit.deadline);
         rate_permit.commit_dispatch(&cancellation).await?;
         let response = tokio::select! {
@@ -2537,11 +2594,11 @@ impl ProviderOnboardingService {
         }
         if let Some(length) = response.content_length() {
             policy.validate_response_size(length)?;
-            if length > MAX_PROBE_BODY_BYTES as u64 {
+            if length > maximum_body_bytes as u64 {
                 return Err(ProviderOnboardingError::ProbeUnavailable);
             }
         }
-        let mut body = Vec::new();
+        let mut body = zeroize::Zeroizing::new(Vec::new());
         let mut stream = response.bytes_stream();
         loop {
             let next = tokio::select! {
@@ -2562,12 +2619,12 @@ impl ProviderOnboardingService {
                 .len()
                 .checked_add(chunk.len())
                 .ok_or(ProviderOnboardingError::ProbeUnavailable)?;
-            if next_len > MAX_PROBE_BODY_BYTES {
+            if next_len > maximum_body_bytes {
                 return Err(ProviderOnboardingError::ProbeUnavailable);
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(body)
+        Ok(std::mem::take(&mut *body))
     }
 
     /// Reads the exact active or application-staged secret without blocking the async executor.
@@ -3906,8 +3963,16 @@ fn credential_assurance(
         "fred-alfred.api-v1-v2" => {
             SourceIdentifier::try_from("fred-unrate-series-read-key-verified").map_err(Into::into)
         }
+        "bea.api-data" => SourceIdentifier::try_from(
+            "bea-regional-dataset-key-verified-metadata-publication-pending",
+        )
+        .map_err(Into::into),
         "eia.api-v2" => SourceIdentifier::try_from(
             "eia-metadata-and-bounded-price-read-verified-publication-pending",
+        )
+        .map_err(Into::into),
+        "census.data-api" => SourceIdentifier::try_from(
+            "census-bounded-population-key-verified-metadata-publication-pending",
         )
         .map_err(Into::into),
         _ => Err(ProviderOnboardingError::InvalidProfile),

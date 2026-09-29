@@ -15,12 +15,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
+use market_squawk_adapter_bea::{bea_api_endpoint_rule, bea_provider_rate_declaration};
 use market_squawk_adapter_bls::{
     BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata, bls_application_provider_budget,
 };
+use market_squawk_adapter_census::{CensusParseLimits, CensusSourceConfig, census_api_endpoint_rules};
 use market_squawk_adapter_eia::{EiaParseLimits, EiaTransportLimits, eia_api_endpoint_rules};
 use market_squawk_adapter_federal_reserve::{
-    BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
+    BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
     BoardDatasetProfile,
 };
 use market_squawk_adapter_files::{ExtractionLimits, ExtractionLimitsInput};
@@ -74,9 +77,11 @@ use crate::provider_activation::eia_configuration::{
     electricity_price_profile, electricity_price_query,
 };
 use crate::provider_activation::{
-    BoardAdapterActivation, CommittedProviderAdapterReplacement,
-    ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
-    TiingoAdapterActivation, YahooAdapterActivation,
+    BEA_SOURCE_ID, BEA_SURFACE, BeaAdapterActivation, BoardAdapterActivation,
+    CensusAdapterActivation, CensusRequestConfiguration,
+    CommittedProviderAdapterReplacement, ControlledLocalFileAdapterActivation,
+    PreparedProviderAdapterReplacement, TiingoAdapterActivation, YahooAdapterActivation,
+    selected_regional_source_config,
 };
 use crate::provider_onboarding::SecCikInput;
 use crate::provider_onboarding::{
@@ -119,6 +124,7 @@ const KRAKEN_PUBLIC_SURFACE: &str = "kraken.spot-public-market-data";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = FRED_ALFRED_API_SURFACE_ID;
+const CENSUS_SURFACE: &str = "census.data-api";
 const FEDERAL_RESERVE_BOARD_SURFACE: &str = "federal-reserve-board.data-download-program";
 const YAHOO_SURFACE: &str = "yahoo-finance.experimental-enrichment";
 const TIINGO_SURFACE: &str = "tiingo.starter-eod-nav";
@@ -1365,6 +1371,9 @@ async fn publish_research_activation(
         .checked_add(Duration::from_secs(60))
         .ok_or(CliProviderActivationError::ProviderConfiguration)?;
     let surface_id = lease.surface_id().as_str();
+    if state.stored_lifecycle_unavailable(surface_id) {
+        return Err(CliProviderActivationError::StateUnavailable);
+    }
     let evidence_digests = evidence.digests();
     let candidate = activation_authority
         .runtime_generation_for_request(lease, &request)
@@ -1388,7 +1397,7 @@ async fn publish_research_activation(
                         != Some(candidate_runtime_digest)
                     && current_state_digest == Some(recipe.state_digest) =>
             {
-                publish_eia_activated_data(
+                publish_activated_macro_data(
                     activation_authority,
                     lease,
                     cancellation,
@@ -1502,7 +1511,7 @@ async fn publish_research_activation(
         state
             .reconcile_evidence_objects()
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        return publish_eia_activated_data(
+        return publish_activated_macro_data(
             activation_authority,
             lease,
             cancellation,
@@ -1563,6 +1572,37 @@ async fn publish_research_activation(
         .await
     {
         Ok(outcome) => outcome,
+        Err(error) if bea_activation_remains_resumable(surface_id, &error) => {
+            let desired = match state.promote_staged_recipe(surface_id, published) {
+                Ok(desired) => desired,
+                Err(_error) => {
+                    quarantine_failed_candidate(
+                        state,
+                        onboarding,
+                        surface_id,
+                        lease.session_id(),
+                        published,
+                        DurableActivationQuarantineReason::StateInvalid,
+                    )?;
+                    return Err(CliProviderActivationError::StateUnavailable);
+                }
+            };
+            if desired != candidate_state_digest {
+                quarantine_failed_candidate(
+                    state,
+                    onboarding,
+                    surface_id,
+                    lease.session_id(),
+                    desired,
+                    DurableActivationQuarantineReason::StateInvalid,
+                )?;
+                return Err(CliProviderActivationError::StateUnavailable);
+            }
+            state
+                .reconcile_evidence_objects()
+                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+            return Err(CliProviderActivationError::Activation(error));
+        }
         Err(error) => {
             quarantine_failed_candidate(
                 state,
@@ -1637,7 +1677,7 @@ async fn publish_research_activation(
     state
         .reconcile_evidence_objects()
         .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-    publish_eia_activated_data(
+    publish_activated_macro_data(
         activation_authority,
         lease,
         cancellation,
@@ -1646,29 +1686,48 @@ async fn publish_research_activation(
     .await
 }
 
-pub(super) async fn publish_eia_activated_data(
+pub(super) async fn publish_activated_macro_data(
     activation: &ProviderAdapterActivation,
     lease: &ProviderActivationLease,
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<(), CliProviderActivationError> {
-    if lease.surface_id().as_str() != "eia.api-v2" {
-        return Ok(());
+    if lease.surface_id().as_str() == SEC_EDGAR_PROFILE_ID {
+        return Box::pin(activation.publish_sec_fundamentals(deadline, cancellation))
+            .await
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration);
     }
+    let operation = match lease.surface_id().as_str() {
+        "eia.api-v2" => "source.energy-data.publication",
+        BLS_PUBLIC_SURFACE | BLS_REGISTERED_SURFACE => "source.labor-data.publication",
+        CENSUS_SURFACE => "source.regional-statistics.publication",
+        _ => return Ok(()),
+    };
     let structure = JsonStructureLimits::try_new(16, 4096, 64, 64)
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     let limits = ServiceLimits::try_new(4096, 8, 4096, 8, structure)
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     let context = RequestContext::new(
-        RequestId::String(Arc::from("source.energy-data.publication")),
+        RequestId::String(Arc::from(operation)),
         cancellation,
         deadline,
         limits,
     );
-    activation
-        .publish_eia_macro(&context)
-        .await
-        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    if matches!(
+        lease.surface_id().as_str(),
+        BLS_PUBLIC_SURFACE | BLS_REGISTERED_SURFACE
+    ) {
+        Box::pin(activation.publish_bls_macro(&context))
+            .await
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    } else if lease.surface_id().as_str() == CENSUS_SURFACE {
+        Box::pin(activation.publish_census_macro(&context))
+            .await
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    } else {
+        Box::pin(activation.publish_eia_macro(&context)).await
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    }
     Ok(())
 }
 
@@ -2509,6 +2568,13 @@ pub(super) fn restore_research_providers(
         );
     }
     for surface_id in RESTORABLE_RESEARCH_SURFACES {
+        if state.stored_lifecycle_unavailable(surface_id) {
+            tracing::warn!(
+                surface_id,
+                "research source lifecycle state is unavailable; retained recipe and credentials remain untouched"
+            );
+            continue;
+        }
         let recipe = match state.load_recipe_for_startup_recovery(surface_id) {
             Ok(DurableActivationRecipeState::Missing) => continue,
             Ok(DurableActivationRecipeState::Quarantined(quarantine)) => {
@@ -2640,7 +2706,7 @@ pub(super) async fn resume_exact_research_provider(
     if activated_generation != &expected {
         return Err(CliProviderActivationError::ProviderConfiguration);
     }
-    publish_eia_activated_data(
+    publish_activated_macro_data(
         activation_authority,
         &prepared.lease,
         cancellation,
@@ -3054,6 +3120,13 @@ fn recovery_requires_explicit_resume(error: &ProviderAdapterActivationError) -> 
     )
 }
 
+fn bea_activation_remains_resumable(
+    surface_id: &str,
+    error: &ProviderAdapterActivationError,
+) -> bool {
+    surface_id == BEA_SURFACE && recovery_requires_explicit_resume(error)
+}
+
 fn quarantine_failed_replacement_recovery(
     onboarding: &crate::ProviderOnboardingService,
     state: &DurableProviderActivationState,
@@ -3189,6 +3262,15 @@ fn build_research_activation(
     )
     .map_err(|_| CliProviderActivationError::InvalidRights)?;
     let activation = match request.provider {
+        ProviderRequest::BeaRegional { provider_dataset } => {
+            let config = selected_regional_source_config(&provider_dataset)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let metadata = bea_metadata(lease, activation_evidence, metadata_effective, &config)?;
+            ProviderAdapterActivationRequest::Bea(BeaAdapterActivation::new(
+                metadata,
+                provider_dataset,
+            ))
+        }
         ProviderRequest::Sec { identities } => {
             let metadata = metadata_with_source_id(
                 lease,
@@ -3212,6 +3294,16 @@ fn build_research_activation(
                     .budget_policy()
                     .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
             )?;
+            let mut selected_companies = identities
+                .iter()
+                .map(|mapping| {
+                    SourceIdentifier::try_from(mapping.cik.as_str())
+                        .map(|cik| (cik, mapping.instrument_id))
+                        .map_err(|_| CliProviderActivationError::ProviderConfiguration)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            selected_companies.sort_unstable();
+            selected_companies.dedup();
             let identities = sec_identity_registry(
                 &metadata,
                 identities,
@@ -3226,6 +3318,7 @@ fn build_research_activation(
                 representations,
                 identities,
                 SecParserLimits::production_defaults(),
+                selected_companies,
             ))
         }
         ProviderRequest::Bls {
@@ -3309,6 +3402,38 @@ fn build_research_activation(
                 FredAdapterActivation::try_new(metadata, provider_dataset)
                     .map_err(CliProviderActivationError::Activation)?,
             )
+        }
+        ProviderRequest::Census { configuration } => {
+            require_surface(lease, ProviderSurface::Exact(CENSUS_SURFACE))?;
+            let contract = configuration.into_contract()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let parse_limits = CensusParseLimits::default();
+            let config = CensusSourceConfig::try_new([contract.clone()], parse_limits)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let network = EndpointPolicy::try_from_api_rules(
+                census_api_endpoint_rules(&config)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                request_bounds(u64::try_from(parse_limits.max_bytes())
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?)?,
+            ).map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+            let policy = lease.provider_budget_policy().cloned()
+                .ok_or(CliProviderActivationError::InvalidMetadata)?;
+            let declaration = ProviderRateDeclaration::try_for_authorization_subject(
+                policy, &authorization_subject(lease)?,
+            ).map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+            let metadata = metadata(
+                lease, activation_evidence, "census", "us-census",
+                SourceClass::OfficialAgency, CoverageDomain::Macroeconomic,
+                AuthorizationMode::UserAuthorized, HistoricalCapability::Historical,
+                metadata_effective, network, declaration.policy().clone(),
+            )?;
+            ProviderAdapterActivationRequest::Census(CensusAdapterActivation::try_new(
+                metadata, contract, parse_limits,
+                NonZeroU32::new(u32::try_from(parse_limits.max_rows())
+                    .map_err(|_| CliProviderActivationError::ProviderConfiguration)?)
+                    .ok_or(CliProviderActivationError::ProviderConfiguration)?,
+                nonzero_u64(64 * 1024 * 1024)?,
+            ).map_err(|_| CliProviderActivationError::ProviderConfiguration)?)
         }
         ProviderRequest::EiaElectricityPrice {
             start_period,
@@ -3462,6 +3587,9 @@ struct ActivationRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum ProviderRequest {
+    BeaRegional {
+        provider_dataset: SourceIdentifier,
+    },
     Sec {
         identities: Vec<SecIdentityMappingRequest>,
     },
@@ -3476,6 +3604,9 @@ enum ProviderRequest {
     TreasuryDailyRates,
     FredAlfred {
         configuration: Box<FredProviderRequest>,
+    },
+    Census {
+        configuration: CensusRequestConfiguration,
     },
     EiaElectricityPrice {
         start_period: String,
@@ -3512,11 +3643,13 @@ struct SecIdentityMappingRequest {
 impl ProviderRequest {
     const fn surface(&self) -> ProviderSurface {
         match self {
+            Self::BeaRegional { .. } => ProviderSurface::Exact(BEA_SURFACE),
             Self::Sec { .. } => ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID),
             Self::Bls { .. } => ProviderSurface::Either(BLS_PUBLIC_SURFACE, BLS_REGISTERED_SURFACE),
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
             Self::TreasuryDailyRates => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
+            Self::Census { .. } => ProviderSurface::Exact(CENSUS_SURFACE),
             Self::EiaElectricityPrice { .. } => ProviderSurface::Exact("eia.api-v2"),
             Self::FederalReserveBoardH15 => ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE),
             Self::YahooEnrichment => ProviderSurface::Exact(YAHOO_SURFACE),
@@ -3532,6 +3665,14 @@ fn portal_provider_request(
 ) -> Result<(ProviderRequest, LoadedActivationEvidence), CliProviderActivationError> {
     match request {
         ProviderPortalActivationRequest::Source => Err(CliProviderActivationError::SurfaceMismatch),
+        ProviderPortalActivationRequest::Census { configuration } => {
+            require_surface(lease, ProviderSurface::Exact(CENSUS_SURFACE))?;
+            configuration.into_contract()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            Ok((ProviderRequest::Census { configuration }, LoadedActivationEvidence {
+                objects: BTreeMap::new(),
+            }))
+        }
         ProviderPortalActivationRequest::EiaElectricityPrice {
             start_period,
             end_period,
@@ -3651,6 +3792,17 @@ fn portal_provider_request(
                     end_year,
                 },
                 LoadedActivationEvidence { objects },
+            ))
+        }
+        ProviderPortalActivationRequest::BeaRegional { provider_dataset } => {
+            require_surface(lease, ProviderSurface::Exact(BEA_SURFACE))?;
+            selected_regional_source_config(&provider_dataset)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            Ok((
+                ProviderRequest::BeaRegional { provider_dataset },
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
             ))
         }
         ProviderPortalActivationRequest::FredAlfred { provider_dataset } => {
@@ -3991,12 +4143,17 @@ fn evidence_references(
                 return Err(CliProviderActivationError::ProviderConfiguration);
             }
         }
-        ProviderRequest::TreasuryFiscal { .. }
+        ProviderRequest::BeaRegional { .. }
+        | ProviderRequest::TreasuryFiscal { .. }
         | ProviderRequest::TreasuryDailyRates
         | ProviderRequest::FederalReserveBoardH15
         | ProviderRequest::YahooEnrichment
         | ProviderRequest::TiingoStarterEodNav
         | ProviderRequest::ControlledLocalFiles { .. } => {}
+        ProviderRequest::Census { configuration } => {
+            configuration.into_contract()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+        }
         ProviderRequest::EiaElectricityPrice {
             start_period,
             end_period,
@@ -4524,7 +4681,15 @@ fn tiingo_network_policy() -> Result<EndpointPolicy, CliProviderActivationError>
         64,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(2 * 1024 * 1024)?)
+    let actions = ApiEndpointRule::try_new(
+        "https://api.tiingo.com/tiingo/corporate-actions",
+        PathScope::Descendants,
+        query_rules(&[("exDate", 10), ("startExDate", 10), ("endExDate", 10)])?,
+        3,
+        96,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    EndpointPolicy::try_from_api_rules(vec![rule, actions], request_bounds(2 * 1024 * 1024)?)
         .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
@@ -4532,10 +4697,12 @@ fn authorization_subject(
     lease: &ProviderActivationLease,
 ) -> Result<SourceIdentifier, CliProviderActivationError> {
     let provider = match lease.surface_id().as_str() {
+        BEA_SURFACE => "bea",
         BLS_REGISTERED_SURFACE => "us-bls",
         FRED_SURFACE => "fred",
         TIINGO_SURFACE => TIINGO_SOURCE_ID,
         "eia.api-v2" => "us-eia",
+        CENSUS_SURFACE => "us-census",
         _ => return Err(CliProviderActivationError::InvalidMetadata),
     };
     let provider = SourceIdentifier::try_from(provider)
@@ -4775,6 +4942,42 @@ fn treasury_metadata(
     )
 }
 
+fn bea_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+    config: &market_squawk_adapter_bea::BeaSourceConfig,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let rule =
+        bea_api_endpoint_rule(config).map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    // Dispatch reserves this declared maximum before sending. Match the actual parser bound
+    // so a single response cannot claim more than the existing shared weighted byte window.
+    let maximum_response_bytes = u64::try_from(config.parse_limits().max_bytes())
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let network =
+        EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(maximum_response_bytes)?)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let budget = bea_provider_rate_declaration()
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?
+        .policy()
+        .clone();
+    metadata_with_source_id(
+        lease,
+        evidence,
+        activation_revision_evidence(evidence)?,
+        SourceId::try_from(BEA_SOURCE_ID)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        "bea",
+        SourceClass::OfficialAgency,
+        CoverageDomain::Macroeconomic,
+        AuthorizationMode::UserAuthorized,
+        HistoricalCapability::Historical,
+        effective,
+        network,
+        budget,
+    )
+}
+
 fn federal_reserve_board_metadata(
     lease: &ProviderActivationLease,
     evidence: EvidenceDigest,
@@ -4794,7 +4997,7 @@ fn federal_reserve_board_metadata(
             )
             .map_err(|_| CliProviderActivationError::InvalidMetadata)
         };
-    let rule = ApiEndpointRule::try_new(
+    let rolling_rule = ApiEndpointRule::try_new(
         without_query(contract.url())?,
         PathScope::Exact,
         vec![
@@ -4810,9 +5013,33 @@ fn federal_reserve_board_metadata(
         256,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    // Match the closed one-megabyte parser ceiling owned by the rolling dashboard profile.
-    let network = EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(1024 * 1024)?)
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let full_rule = ApiEndpointRule::try_new(
+        without_query(BOARD_H15_TREASURY_CONSTANT_MATURITIES_PRODUCTION_URL)?,
+        PathScope::Exact,
+        vec![
+            exact_query("filetype", "csv")?,
+            exact_query("label", "include")?,
+            QueryParameterRule::try_new_exact_empty_public(
+                SourceIdentifier::try_from("lastObs")
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            exact_query("layout", "seriescolumn")?,
+            exact_query("rel", "H15")?,
+            exact_query("series", "bf17364827e38702b42a58cf8eaa3f78")?,
+            exact_query("type", "package")?,
+        ],
+        7,
+        256,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    // The same source authority admits only these two code-owned routes. fetch_raw still
+    // clamps each response to its profile: one MiB rolling, sixteen MiB full history.
+    let network = EndpointPolicy::try_from_api_rules(
+        vec![rolling_rule, full_rule],
+        request_bounds(16 * 1024 * 1024)?,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     let source_id = SourceId::try_from(BOARD_DDP_SOURCE_ID)
         .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     metadata_with_source_id(
@@ -4912,7 +5139,23 @@ fn treasury_publication_deadline() -> Result<Instant, CliProviderActivationError
 
 fn map_portal_activation_error(error: CliProviderActivationError) -> ProviderPortalActivationError {
     match error {
-        CliProviderActivationError::Cancelled => ProviderPortalActivationError::Cancelled,
+        CliProviderActivationError::Activation(ProviderAdapterActivationError::Bea(error)) => {
+            error.into_portal_error()
+        }
+        CliProviderActivationError::Cancelled
+        | CliProviderActivationError::Activation(ProviderAdapterActivationError::Cancelled)
+        | CliProviderActivationError::Onboarding(ProviderOnboardingError::OperationCancelled)
+        | CliProviderActivationError::Activation(ProviderAdapterActivationError::Onboarding(
+            ProviderOnboardingError::OperationCancelled,
+        )) => ProviderPortalActivationError::Cancelled,
+        CliProviderActivationError::Onboarding(ProviderOnboardingError::ProbeDeadlineExceeded)
+        | CliProviderActivationError::Activation(ProviderAdapterActivationError::Onboarding(
+            ProviderOnboardingError::ProbeDeadlineExceeded,
+        )) => ProviderPortalActivationError::DeadlineExceeded,
+        CliProviderActivationError::Onboarding(ProviderOnboardingError::Clock)
+        | CliProviderActivationError::Activation(ProviderAdapterActivationError::Onboarding(
+            ProviderOnboardingError::Clock,
+        )) => ProviderPortalActivationError::Internal,
         CliProviderActivationError::StateUnavailable
         | CliProviderActivationError::InputUnavailable
         | CliProviderActivationError::TreasuryPublication(_)
@@ -5979,9 +6222,7 @@ mod tests {
         let status = crate::local_product::execute_cli_command(
             &recovered,
             crate::cli::Command::Source {
-                command: crate::cli::SourceCommand::Status {
-                    provider: None,
-                },
+                command: crate::cli::SourceCommand::Status { provider: None },
             },
         )
         .await?;

@@ -1,5 +1,8 @@
 //! Conservative local CLI policy for the sealed Coinbase paper-bot service.
 
+mod equity;
+pub(crate) use equity::local_equity_paper_bot;
+
 use std::{
     collections::BTreeSet,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
@@ -102,7 +105,7 @@ const RETAINED_SNAPSHOT_READERS_PER_SHARD: u32 = 4;
 const MAXIMUM_SOURCES_PER_ROUTE: usize = 2;
 const MAXIMUM_STREAMS_PER_ROUTE: usize = 8;
 const LOCAL_LIVE_RUNTIME_MEMORY_CEILING_BYTES: u64 = 512 * 1024 * 1024;
-const LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES: usize = 64 * 1024 * 1024;
 const LOCAL_PAPER_MATCHING_WORK_QUANTUM: usize = 256;
 
 /// Builds the controlled local CLI service using explicit virtual cash and fee assumptions.
@@ -242,8 +245,37 @@ impl CoinbaseDirectLiveMarketComposition {
 }
 
 impl ProductionLiveMarketComposition {
+    pub(crate) fn with_completion_notification(
+        mut self,
+        notify: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.source = self.source.with_completion_notification(notify);
+        self
+    }
+
+    /// Binds official public crypto reference selections before live source startup.
+    pub(crate) async fn with_public_crypto_reference(
+        mut self,
+        reader: market_squawk_data::MarketDataInstrumentReadCapability,
+        synchronizer: market_squawk_data::MarketDataInstrumentSynchronizationCapability,
+        capture_store: std::sync::Arc<market_squawk_platform::SealedResearchJournalStore>,
+        execution: &market_squawk_data::InstrumentDefinitionReadCapability,
+        deadline: std::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Self, ProductionLiveSourceRuntimeError> {
+        self.source = self.source
+            .with_public_crypto_reference(reader, synchronizer, capture_store, execution, deadline, cancellation)
+            .await?;
+        Ok(self)
+    }
+
     /// Returns the quote/book source retained by the bounded fair-value export.
-    pub(crate) fn qualified_market_export_source_id(&self) -> &market_squawk_domain::SourceId {
+    pub(crate) fn qualified_market_export_source_id(
+        &self,
+    ) -> std::result::Result<
+        &market_squawk_domain::SourceId,
+        ProductionLiveSourceCompositionError,
+    > {
         self.source.qualified_market_export_source_id()
     }
 
@@ -453,13 +485,24 @@ fn local_risk_limits(
     cash: Money,
     fee_basis_points: u32,
 ) -> Result<RiskLimits> {
+    local_risk_limits_for_instruments(
+        routes
+            .iter()
+            .map(|route| route.route().instrument())
+            .collect(),
+        cash,
+        fee_basis_points,
+    )
+}
+fn local_risk_limits_for_instruments(
+    instruments: BTreeSet<market_squawk_domain::InstrumentId>,
+    cash: Money,
+    fee_basis_points: u32,
+) -> Result<RiskLimits> {
     let currency = cash.currency();
     Ok(RiskLimits::try_new(RiskLimitsInput {
         currency,
-        eligible_instruments: routes
-            .iter()
-            .map(|route| route.route().instrument())
-            .collect::<BTreeSet<_>>(),
+        eligible_instruments: instruments,
         maximum_position_lots: 1_000_000,
         maximum_order_notional: cash,
         maximum_gross_exposure: cash,
@@ -755,8 +798,8 @@ where
         positions: Vec::new(),
         position_cost_basis: Vec::new(),
     };
-    let portfolio =
-        paper_sandbox_portfolio_capability(account_id, cash, routes.len(), current_timestamp()?)?;
+    let (portfolio_publication, portfolio) =
+        paper_sandbox_portfolio_publication(account_id, cash, routes.len(), current_timestamp()?)?;
     let risk_limits = local_risk_limits(&routes, cash, fee_basis_points)?;
     let paper = paper_config(
         currency,
@@ -766,11 +809,15 @@ where
         session_authority,
     )?;
     let paths = LocalPaths::prepare(config.data_dir())?;
-    let paper_checkpoint_repository = PaperCheckpointRepository::try_new(
+    let repository = PaperCheckpointRepository::open_stopped(
         paths.artifacts()?.clone(),
-        paper.clone(),
         nonzero_usize(LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)?,
-    )?;
+    )?.ok_or_else(|| anyhow!("create and confirm the virtual account before starting a session"))?;
+    if repository.original_account_cash(account_id)? != cash {
+        bail!("selected paper cash differs from the original virtual account");
+    }
+    let paper_checkpoint_repository = repository.bind_execution_policy(paper)?;
+    let paper = paper_checkpoint_repository.original_config().clone();
     let dispatcher = local_dispatcher_config()?;
     let market_sink_retained_bytes = paper.market_ingress_retained_bytes()?;
     let mut strategies = Vec::new();
@@ -831,6 +878,7 @@ where
         },
         accounts: vec![account],
         portfolio,
+        portfolio_publication: Some(portfolio_publication),
         risk_limits,
         risk_service: RiskServiceConfig {
             policy: risk_policy,
@@ -902,6 +950,7 @@ where
         .ok_or_else(|| anyhow!("release benchmark instrument has no venue mapping"))?
         .venue_id()
         .clone();
+    initialize_paper_fixture_account(&config, Money::new(Decimal::new(1_000_000, 0), definition.quote_currency()), 0)?;
     build_local_paper_bot(
         config,
         PaperBotBuildSource::ReleaseBenchmark,
@@ -920,23 +969,43 @@ where
     )
 }
 
-fn paper_sandbox_portfolio_capability(
+/// Existing test/release fixtures explicitly fund through the same original ledger owner.
+/// This helper is absent from ordinary installed-product builds.
+#[cfg(any(test, feature = "release-evidence"))]
+fn initialize_paper_fixture_account(config: &AppConfig, cash: Money, fee_basis_points: u32) -> Result<()> {
+    let paths = LocalPaths::prepare(config.data_dir())?;
+    let maximum = nonzero_usize(LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)?;
+    let account = AccountId::from_str(LOCAL_PAPER_ACCOUNT_ID)?;
+    if let Some(repository) = PaperCheckpointRepository::open_stopped(paths.artifacts()?.clone(), maximum)? {
+        if repository.original_account_cash(account)? != cash { bail!("fixture cash differs from original account"); }
+        return Ok(());
+    }
+    let policy = local_paper_account_configuration(cash.currency(), fee_basis_points)?;
+    let mut repository = PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), policy, maximum)?;
+    repository.initialize_cash_account(account, cash, current_timestamp()?)?;
+    Ok(())
+}
+
+fn paper_sandbox_portfolio_publication(
     account_id: AccountId,
     cash: Money,
     maximum_instruments: usize,
     admitted_at: Timestamp,
-) -> Result<PortfolioReadCapability> {
+) -> Result<(
+    super::portfolio::PaperPortfolioPublication,
+    PortfolioReadCapability,
+)> {
     let maximum_instruments = maximum_instruments.max(1);
     let limits = PortfolioLimits::try_new(PortfolioLimitInput {
         max_accounts: 1,
         max_instruments: maximum_instruments,
-        max_lots: maximum_instruments,
-        max_transactions: 1,
+        max_lots: 65_536,
+        max_transactions: 65_536,
         max_factors: 1,
         max_scenarios: 1,
         max_history: 2,
-        max_results: maximum_instruments,
-        max_retained_bytes: 4 * 1024 * 1024,
+        max_results: maximum_instruments.max(4096),
+        max_retained_bytes: 32 * 1024 * 1024,
     })?;
     let source = SourceIdentifier::try_from("paper-sandbox-user-authorized-initial-cash")?;
     let point_in_time_content = Sha256Digest::new(paper_sandbox_portfolio_digest(
@@ -995,7 +1064,7 @@ fn paper_sandbox_portfolio_capability(
             None,
         )?,
     )?;
-    let retained_bytes = nonzero_usize(4 * 1024 * 1024)?;
+    let retained_bytes = nonzero_usize(32 * 1024 * 1024)?;
     let service = PortfolioService::try_new(
         vec![revision],
         Vec::new(),
@@ -1006,15 +1075,34 @@ fn paper_sandbox_portfolio_capability(
             max_retained_bytes: retained_bytes,
         })?,
     )?;
-    Ok(portfolio_execution_state(
+    let (publisher, reader) = portfolio_execution_state(
         service,
         PortfolioReadLimits::new(
             nonzero_usize(maximum_instruments)?,
             retained_bytes,
             nonzero_usize(4_096)?,
         ),
-    )?
-    .1)
+    )?;
+    Ok((
+        super::portfolio::PaperPortfolioPublication::new(
+            publisher,
+            ledger,
+            account_id,
+            limits,
+            nonzero_usize(maximum_instruments)?,
+            retained_bytes,
+        ),
+        reader,
+    ))
+}
+
+fn paper_sandbox_portfolio_capability(
+    account_id: AccountId,
+    cash: Money,
+    maximum_instruments: usize,
+    admitted_at: Timestamp,
+) -> Result<PortfolioReadCapability> {
+    Ok(paper_sandbox_portfolio_publication(account_id, cash, maximum_instruments, admitted_at)?.1)
 }
 
 fn paper_sandbox_portfolio_digest(
@@ -1035,7 +1123,7 @@ fn paper_sandbox_portfolio_digest(
     digest.finalize().into()
 }
 
-fn current_timestamp() -> Result<Timestamp> {
+pub(super) fn current_timestamp() -> Result<Timestamp> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok(Timestamp::from_unix_nanos(i64::try_from(
         elapsed.as_nanos(),
@@ -1067,6 +1155,8 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
     let source = configured_source(&config, provider)?;
     let paths = LocalPaths::prepare(config.data_dir())?;
     let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
+    let currency = source.routes.first().ok_or_else(|| anyhow!("Kraken fixture has no route"))?.definition().quote_currency();
+    initialize_paper_fixture_account(&config, Money::new(initial_cash, currency), fee_basis_points)?;
     let mut strategy = Some(strategy);
     build_local_paper_bot(
         config,
@@ -1205,6 +1295,42 @@ fn paper_config(
             Timestamp::from_unix_nanos(i64::MAX),
         )?],
     )?;
+    paper_config_with_calendar(currency, fee_basis_points, maximum_mark_age_nanos, calendar)
+}
+
+fn paper_config_with_calendar(
+    currency: Currency,
+    fee_basis_points: u32,
+    maximum_mark_age_nanos: u64,
+    calendar: PaperVenueSessionCalendar,
+) -> Result<PaperExecutionConfig> {
+    paper_config_with_policy(
+        currency,
+        fee_basis_points,
+        maximum_mark_age_nanos,
+        market_squawk_adapter_paper::PaperExecutionSessionPolicy::Venue(calendar),
+    )
+}
+
+/// Funding policy has no calendar and cannot start a paper worker.
+pub(crate) fn local_paper_account_configuration(
+    currency: Currency,
+    fee_basis_points: u32,
+) -> Result<PaperExecutionConfig> {
+    paper_config_with_policy(
+        currency,
+        fee_basis_points,
+        5_000_000_000,
+        market_squawk_adapter_paper::PaperExecutionSessionPolicy::AccountOnly,
+    )
+}
+
+fn paper_config_with_policy(
+    currency: Currency,
+    fee_basis_points: u32,
+    maximum_mark_age_nanos: u64,
+    session_policy: market_squawk_adapter_paper::PaperExecutionSessionPolicy,
+) -> Result<PaperExecutionConfig> {
     let fees = FeeSchedule::try_new(
         fee_basis_points,
         fee_basis_points,
@@ -1230,7 +1356,7 @@ fn paper_config(
         maximum_latency_nanos: 25_000_000,
         cancel_latency_nanos: 5_000_000,
         maximum_mark_age_nanos,
-        day_session_calendar: calendar,
+        session_policy,
         maximum_participation_basis_points: 1_000,
         impact_basis_points_per_level: 10,
         reporting_currency: currency,

@@ -8,9 +8,11 @@ use uuid::Uuid;
 
 mod api;
 mod lifecycle;
+mod start;
 
 pub use api::*;
 pub use lifecycle::*;
+pub use start::*;
 
 const MAXIMUM_RECOVERY_PAGE_ITEMS: usize = 1_024;
 const MAXIMUM_EVENT_PAGE_ITEMS: usize = 4_096;

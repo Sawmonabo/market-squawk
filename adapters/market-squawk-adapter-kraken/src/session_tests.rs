@@ -7,18 +7,23 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{
-    AuthorizationBasis, ConnectionGeneration, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentId, MetadataRevision, RevisionBoundPayloadEvidence, SourceId,
-    SourceIdentifier, Timestamp,
+    AuthorizationBasis, ConnectionGeneration, Currency, Denomination, DigestAlgorithm,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinition,
+    InstrumentDefinitionInput, InstrumentDefinitionRevision, InstrumentId, LotSize,
+    MetadataRevision, ProviderIdentityEvidence, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId,
+    SourceIdentifier, TickSize, Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
+use market_squawk_sources::BudgetReservationDecision;
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
-    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetReservationDecision, BudgetScope, CurrentSourceSession, DecodeOutcome, FreshnessPolicy,
-    LiveMarketSource, LiveSourceGeneration, ProviderBudgetPolicy, ProviderChecksumEvidence,
-    RawMarketFrame, RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
-    SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
+    CurrentSourceSession, DecodeOutcome, FreshnessPolicy, LiveMarketSource, LiveSourceGeneration,
+    ProviderBudgetPolicy, ProviderChecksumEvidence, RawMarketFrame, RawMarketSink, RegistryError,
+    SessionId, SinkError, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
 };
+use rust_decimal::Decimal;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
@@ -36,7 +41,7 @@ use crate::{
     KrakenL3DecoderState, KrakenL3Depth, KrakenL3EstablishedSessionSender, KrakenL3MetadataInput,
     KrakenL3ProductMapping, KrakenL3SubscriptionDispatch, KrakenMarketContinuity,
     KrakenMarketDecodeHandoff, KrakenMarketEventHandoff, KrakenMetadataInput,
-    KrakenSubscriptionRequestEvidence,
+    KrakenReferenceSelectionEvidence, KrakenSubscriptionRequestEvidence,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -84,6 +89,7 @@ impl RawMarketSink for RecordingSink<'_> {
     }
 }
 
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
 const SUBSCRIPTION_REFUSAL: &str = r#"{"method":"subscribe","success":false,"error":"rate limit exceeded","time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25.010Z","req_id":1}"#;
 const PUBLIC_BOOK_ACK: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD"},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25.010Z","req_id":1}"#;
 const PUBLIC_RESET: &str = r#"{"channel":"status","type":"update","data":[{"system":"maintenance","api_version":"v2","connection_id":42,"version":"2.0.0"}]}"#;
@@ -193,7 +199,11 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
                 if value.as_str() == "3310070434"
         )
     }));
-    assert!(publication.is_some());
+    let publication = publication.ok_or("public book lost its publication lineage")?;
+    assert_eq!(
+        publication.native_coordinates(),
+        public_config.native_coordinates()
+    );
     assert!(terminal.is_none());
     assert_eq!(public_decode_control.health().market_messages(), 1);
 
@@ -316,6 +326,28 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         request_evidence.authorization_generation(),
         credential_authority.authorization_generation()
     );
+    let level3_identity = level3_snapshot_handoff.instrument_binding();
+    assert_eq!(level3_identity.native_symbol().as_str(), "BTC/USD");
+    assert_eq!(
+        level3_identity.provider_identity_key().source_id().as_str(),
+        "kraken"
+    );
+    assert_eq!(
+        level3_identity
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "BTC/USD"
+    );
+    assert_eq!(
+        level3_identity.venue_mapping().venue_id().as_str(),
+        "kraken"
+    );
+    assert_eq!(
+        level3_identity.venue_mapping().venue_symbol().as_str(),
+        "BTC/USD"
+    );
+    assert_eq!(level3_identity.externally_resolved_instrument(), instrument);
     assert!(matches!(
         level3_snapshot_handoff.continuity(),
         KrakenMarketContinuity::AuthenticatedLevel3 {
@@ -433,19 +465,17 @@ fn decode_level3_frame(
         .frames_mut()?
         .try_frame(TransportFrameKind::Text, payload)?;
     let validated = authority.validate_live_frame(&frame)?;
-    if let Some(dispatch) = dispatch.as_deref_mut() {
-        if let Some(sent) = dispatch.bind_to_frame(&validated)? {
-            decoder.register_sent_subscription(sent)?;
-        }
+    if let Some(dispatch) = dispatch.as_deref_mut()
+        && let Some(sent) = dispatch.bind_to_frame(&validated)?
+    {
+        decoder.register_sent_subscription(sent)?;
     }
     let handoff = decoder.decode_captured(&validated)?;
-    if let Some(dispatch) = dispatch {
-        if let KrakenMarketEventHandoff::ControlOrDiscontinuity(control) = &handoff {
-            if let KrakenControlOrDiscontinuityKind::AuthenticatedControl(control) = control.kind()
-            {
-                dispatch.apply_control(control)?;
-            }
-        }
+    if let Some(dispatch) = dispatch
+        && let KrakenMarketEventHandoff::ControlOrDiscontinuity(control) = &handoff
+        && let KrakenControlOrDiscontinuityKind::AuthenticatedControl(control) = control.kind()
+    {
+        dispatch.apply_control(control)?;
     }
     Ok(handoff)
 }
@@ -530,6 +560,7 @@ fn exact_evidence(byte: u8) -> ExactPayloadEvidence {
     ))
 }
 
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
 #[tokio::test]
 async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -618,6 +649,7 @@ async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> T
     Ok(())
 }
 
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
 async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStream<TcpStream>> {
     let (stream, _) = listener.accept().await?;
     let mut socket = tokio_tungstenite::accept_async(stream).await?;
@@ -794,12 +826,62 @@ fn test_source(
     .try_build()?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
+    let definition = public_definition(instrument)?;
+    let provider_identity_key = definition.provider_identities()[0].key();
+    let reference_selection = KrakenReferenceSelectionEvidence::try_new(
+        MetadataRevision::new(SourceIdentifier::try_from("kraken-test-reference-v1")?),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [21; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [22; 32]),
+        1,
+        Timestamp::from_unix_nanos(0),
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [23; 32]),
+    )?;
     let config = KrakenConfig::try_new(
         metadata,
-        "BTC/USD",
-        instrument,
+        &definition,
+        &provider_identity_key,
+        &reference_selection,
+        Timestamp::from_unix_nanos(1),
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
     Ok((config, registry, registered))
+}
+
+fn public_definition(instrument: InstrumentId) -> TestResult<InstrumentDefinition> {
+    let usd = Currency::try_from("USD")?;
+    let provider_identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: instrument,
+        source_id: SourceId::try_from("kraken-spot-v2")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("XBTUSD")?,
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [4; 32],
+        )),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+            "kraken-instrument-identity-v1",
+        )?),
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        supersedes: None,
+    });
+    Ok(InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: instrument,
+        definition_revision: InstrumentDefinitionRevision::try_from(1)?,
+        asset_class: market_squawk_domain::AssetClass::Crypto,
+        primary_denomination: Denomination::Currency(usd),
+        quote_currency: usd,
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::new(1, 8))?,
+        contract_multiplier: Decimal::ONE,
+        venue_mappings: vec![VenueMapping::new(
+            VenueId::try_from("kraken")?,
+            VenueSymbol::try_from("BTC/USD")?,
+        )],
+        provider_identities: vec![provider_identity],
+        identifiers: Vec::new(),
+        trading_status: TradingStatus::Active,
+    })?)
 }

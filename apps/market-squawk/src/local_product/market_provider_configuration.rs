@@ -15,7 +15,7 @@ use std::{
 use async_trait::async_trait;
 use market_squawk_adapter_alpaca::AlpacaTransportLimits;
 use market_squawk_adapter_kraken::{KrakenL3ClientTier, KrakenL3Depth};
-use market_squawk_data::MarketDataInstrumentReadCapability;
+use market_squawk_data::{MarketDataInstrumentReadCapability, OfficialIssuerInstrumentReference};
 use market_squawk_domain::{
     EffectiveInterval, ExactPayloadEvidence, ProviderInstrumentId, SourceId, Timestamp,
 };
@@ -39,6 +39,7 @@ use crate::provider_activation::{
 use crate::{ProviderAdapterActivation, ProviderOnboardingService, ResearchService};
 
 const ALPACA_IEX_SOURCE: &str = "alpaca-basic-iex-market-data";
+const ALPACA_OPTION_CHAIN_SOURCE: &str = "alpaca-basic-indicative-option-chain-v1";
 const KRAKEN_LEVEL3_SOURCE: &str = "kraken-authenticated-level3-market-data";
 
 const SECOND_NANOS: u64 = 1_000_000_000;
@@ -52,6 +53,7 @@ pub(super) struct ProductionMarketProviderConfigurationResolver {
     nasdaq: Arc<NasdaqReferenceUniverseService>,
     reference_identity: MarketReferenceIdentityAuthority,
     market_data_instruments: MarketDataInstrumentReadCapability,
+    research: Arc<ResearchService>,
 }
 
 impl ProductionMarketProviderConfigurationResolver {
@@ -60,7 +62,7 @@ impl ProductionMarketProviderConfigurationResolver {
         onboarding: Arc<ProviderOnboardingService>,
         provider_activation: Arc<ProviderAdapterActivation>,
         nasdaq: Arc<NasdaqReferenceUniverseService>,
-        research: &ResearchService,
+        research: &Arc<ResearchService>,
     ) -> Arc<Self> {
         let market_data_instruments = research.market_data_instruments();
         let reference_identity = MarketReferenceIdentityAuthority::new(
@@ -74,6 +76,7 @@ impl ProductionMarketProviderConfigurationResolver {
             nasdaq,
             reference_identity,
             market_data_instruments,
+            research: Arc::clone(research),
         })
     }
 
@@ -90,6 +93,49 @@ impl ProductionMarketProviderConfigurationResolver {
             .map_err(|error| map_reference_error(error, deadline, cancellation))?;
         if listings.is_empty() {
             return Err(ServiceError::Unavailable);
+        }
+        // The official directory proves listing membership, not complete canonical identity.
+        // Admit the retained original issuer facts through the sole catalog owner before reads.
+        let reader = self
+            .nasdaq
+            .listing_reference_reader()
+            .ok_or(ServiceError::Unavailable)?;
+        for issuer in OfficialIssuerInstrumentReference::predeclared_benchmarks()
+            .map_err(|_| ServiceError::InvalidResult)?
+        {
+            ensure_before(deadline, cancellation)?;
+            if !listings.iter().any(|listing| {
+                listing.key().symbol().as_str() == issuer.symbol().as_str()
+                    && listing.key().mic() == issuer.venue()
+            }) {
+                continue;
+            }
+            let listing = reader
+                .exact_current(issuer.symbol().as_str(), issuer.venue(), deadline, cancellation)
+                .map_err(|error| map_reference_error(error, deadline, cancellation))?
+                .ok_or(ServiceError::Unavailable)?;
+            let now = system_timestamp()?;
+            let current = self
+                .market_data_instruments
+                .resolve_exact_as_of(issuer.cusip().as_str(), now, now, deadline, cancellation)
+                .map_err(|error| map_reference_error(error, deadline, cancellation))?;
+            if current.has_more() || current.matches().len() > 1 {
+                return Err(ServiceError::Unavailable);
+            }
+            let expected = current
+                .matches()
+                .first()
+                .map(|matched| matched.record().clone());
+            self.research
+                .publish_market_data_issuer_reference(
+                    issuer.clone(),
+                    listing,
+                    expected,
+                    deadline,
+                    cancellation.child_token(),
+                )
+                .await
+                .map_err(|error| map_reference_error(error, deadline, cancellation))?;
         }
         let mut bindings = Vec::new();
         bindings
@@ -163,6 +209,11 @@ impl ProductionMarketProviderConfigurationResolver {
             ProviderMarketConfigurationRequest::AlpacaBasic(AlpacaBasicMarketConfigurationInput {
                 configured_at,
                 iex_evidence: source_evidence(&lease, ALPACA_IEX_SOURCE)?,
+                calendar_evidence: calendar_source_evidence(&lease)?,
+                // This admits bounded explicit REST demands under the current account/rights
+                // lease. The IEX doctor does not prove option entitlement; actual reference and
+                // complete chain responses must succeed before any option data is published.
+                option_chain_evidence: Some(source_evidence(&lease, ALPACA_OPTION_CHAIN_SOURCE)?),
                 options_evidence: None,
                 iex_instruments: instruments,
                 option_instruments: None,
@@ -291,6 +342,35 @@ fn source_evidence(
         ExactPayloadEvidence::from_content_digest(lease.capability_digest()),
         effective,
         live_freshness()?,
+    ))
+}
+
+// Application schedule revalidation policy, not a provider publication frequency or a poller.
+// Reads compare this age with the original analysis cutoff; historical dates do not expire by age.
+fn calendar_source_evidence(
+    lease: &crate::ProviderActivationLease,
+) -> Result<MarketSourceEvidence, ServiceError> {
+    use sha2::{Digest as _, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/alpaca-calendar-source-contract/v1\0");
+    digest.update(b"https://docs.alpaca.markets/us/reference/calendar-2\0IEX\0XNYS\0XNAS\0UTC\0complete-session-enumeration\0");
+    digest.update(lease.capability_digest().bytes());
+    let day = 24 * 60 * 60 * SECOND_NANOS;
+    let freshness =
+        FreshnessPolicy::try_new(30 * SECOND_NANOS, 30 * SECOND_NANOS, day, day, SECOND_NANOS)
+            .map_err(|_| ServiceError::Internal)?;
+    Ok(MarketSourceEvidence::new(
+        SourceId::try_from("alpaca-market-calendar").map_err(|_| ServiceError::Internal)?,
+        ExactPayloadEvidence::from_content_digest(market_squawk_domain::EvidenceDigest::new(
+            market_squawk_domain::DigestAlgorithm::Sha256,
+            digest.finalize().into(),
+        )),
+        EffectiveInterval::new(
+            lease.authority_effective_at(),
+            lease.verification_expires_at(),
+        )
+        .map_err(|_| ServiceError::InvalidRequest)?,
+        freshness,
     ))
 }
 

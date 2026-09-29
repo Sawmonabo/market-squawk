@@ -26,11 +26,11 @@ impl CurrentHealthReporter {
         self.report_with_budget(snapshot, budget)
     }
 
-    /// Binds health to the exact currently active provider request that carries this live stream.
+    /// Binds health to the exact active request or established transport carrying this stream.
     ///
     /// # Errors
     ///
-    /// Rejects an inactive or transplanted request permit in addition to the ordinary health
+    /// Rejects an inactive, revoked, or transplanted permit in addition to the ordinary health
     /// identity, policy, session, and temporal validation failures.
     pub fn report_with_active_request(
         &mut self,
@@ -245,6 +245,47 @@ impl ExtractionAuthority {
             return Err(crate::ExtractionAuthorityError::NotEffective);
         }
         Ok(())
+    }
+
+    /// Reserves one original response-completion observation before extraction dispatch.
+    ///
+    /// Invoke the returned one-use completion immediately after the complete bounded body has
+    /// arrived, before decoding, sealing, or catalog synchronization. Retain its timestamp with
+    /// those exact bytes in the existing provider capture material; do not recapture the body
+    /// through a later live session. The completion uses this registration's sealed clock and
+    /// does not accept a caller-authored receipt time.
+    ///
+    /// Like raw-frame custody completion, an already reserved observation survives registration
+    /// revocation so received evidence can still be retained. It grants no network, catalog,
+    /// publication, or live-session authority. The request owner must separately hold its exact
+    /// extraction request permit and revalidate currentness before admitting decoded evidence.
+    ///
+    /// # Errors
+    ///
+    /// Reservation rejects stale or ineffective registration authority. Completion rejects an
+    /// unavailable or discontinuous registry clock, including wall or monotonic regression.
+    pub fn try_reserve_response_observation(
+        &self,
+    ) -> Result<
+        impl FnOnce() -> Result<Timestamp, crate::ExtractionAuthorityError>
+        + Send
+        + 'static
+        + use<>,
+        crate::ExtractionAuthorityError,
+    > {
+        self.validate_current()?;
+        let clock = Arc::clone(&self.clock);
+        Ok(move || {
+            clock
+                .observe_receipt()
+                .map(|observation| observation.received_at())
+                .map_err(|error| match error {
+                    RegistryError::TrustedClockUnavailable => {
+                        crate::ExtractionAuthorityError::TrustedTimeUnavailable
+                    }
+                    _ => crate::ExtractionAuthorityError::TrustedTimeDiscontinuous,
+                })
+        })
     }
 
     /// Atomically authorizes an exact target and reserves registry-coordinated concurrency.
@@ -744,6 +785,48 @@ impl RawFrameFactory {
         )
     }
 
+    /// Reserves one raw-custody completion before dispatching a bounded request.
+    ///
+    /// The non-clone completion owns one exact generation binding and ordinal. Invoke it at
+    /// response completion to sample the original trusted receipt clock, then retain the frame
+    /// before checking request or live currentness. Revocation does not erase already received
+    /// raw evidence. This issues no validated frame or currentness lease; ordinary live-frame
+    /// validation is still mandatory before decoding/publication.
+    ///
+    /// # Errors
+    ///
+    /// Reservation rejects stale sessions and ordinal exhaustion. Completion rejects broken
+    /// trusted-time continuity and oversized payloads, independently of session revocation.
+    pub fn try_reserve_capture_frame(
+        &mut self,
+    ) -> Result<
+        impl FnOnce(
+            crate::TransportFrameKind,
+            bytes::Bytes,
+        ) -> Result<crate::RawMarketFrame, crate::SourceError>
+        + Send
+        + 'static
+        + use<>,
+        crate::SourceError,
+    > {
+        let frame_id = self.lease.next_frame_id()?;
+        let binding = self.binding.clone();
+        let lease = Arc::clone(&self.lease);
+        let clock = Arc::clone(&self.clock);
+        Ok(move |transport, payload| {
+            let receipt = clock.observe_receipt().map_err(|error| match error {
+                RegistryError::TrustedClockUnavailable => {
+                    crate::SourceError::TrustedTimeUnavailable
+                }
+                _ => crate::SourceError::TrustedTimeDiscontinuity,
+            })?;
+            lease
+                .validate_receipt(&receipt)
+                .map_err(|_| crate::SourceError::TrustedTimeDiscontinuity)?;
+            crate::RawMarketFrame::try_from_parts(binding, frame_id, receipt, transport, payload)
+        })
+    }
+
     /// Constructs one bounded exact transport frame under this generation's identity.
     ///
     /// # Errors
@@ -978,6 +1061,7 @@ pub struct ValidatedCurrentSourceAuthority<'a> {
     validated: ValidatedSourceSession<'a>,
     health: &'a CurrentHealthAuthority,
     attestation: Option<&'a InstrumentUniverseAttestation>,
+    provider_identities: &'a [CurrentProviderIdentity],
     validated_at: TrustedRegistryTime,
     clock: &'a Arc<SealedRegistryClock>,
 }
@@ -1096,6 +1180,56 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         Ok(lease)
     }
 
+    /// Returns the already registered catalog selection for one covered instrument.
+    ///
+    /// Chart and screener observations can use this identity without turning their observational
+    /// coverage into executable quote or book authority. The caller must retain the matching
+    /// source lease through publication and validate both together at the commit boundary.
+    pub fn selected_provider_identity(
+        &self,
+        venue: &VenueId,
+        instrument: InstrumentId,
+    ) -> Result<CurrentProviderIdentity, RegistryError> {
+        let lease = self.try_current_lease()?;
+        let coverage = self.validated.metadata.coverage();
+        let crate::CoverageHealth::Sufficient {
+            provider_product,
+            provider_channel,
+            ..
+        } = &self.health.coverage
+        else {
+            return Err(RegistryError::LiveScopeNotCovered);
+        };
+        if coverage
+            .live_for(provider_product, provider_channel)
+            .is_none()
+        {
+            return Err(RegistryError::LiveScopeNotCovered);
+        }
+        let instrument_proven = match coverage.instruments().membership(instrument) {
+            crate::InstrumentCoverageMembership::Enumerated => true,
+            crate::InstrumentCoverageMembership::EvidenceBackedUniverse => self
+                .attestation
+                .is_some_and(|attestation| attestation.contains(instrument)),
+            crate::InstrumentCoverageMembership::PartialUnproven
+            | crate::InstrumentCoverageMembership::Outside => false,
+        };
+        if !coverage.topology().contains_venue(venue) || !instrument_proven {
+            return Err(RegistryError::LiveScopeNotCovered);
+        }
+        let index = self
+            .provider_identities
+            .binary_search_by(|identity| {
+                let native = &identity.evidence().native;
+                (&native.venue, native.instrument).cmp(&(venue, instrument))
+            })
+            .map_err(|_| RegistryError::LiveScopeNotCovered)?;
+        let identity = self.provider_identities[index].clone();
+        let at = self.clock.observe()?.wall();
+        lease.validate_provider_identity_at(&identity, at)?;
+        Ok(identity)
+    }
+
     /// Narrows current health authority to an exact venue/instrument/event/depth tuple.
     ///
     /// # Errors
@@ -1109,6 +1243,13 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         event_class: LiveEventClass,
         depth: Option<MarketDepth>,
     ) -> Result<ValidatedLiveScope, RegistryError> {
+        // A ranked cohort or incomplete chart update can never mint current instrument authority.
+        if matches!(
+            event_class,
+            LiveEventClass::Chart | LiveEventClass::Screener
+        ) {
+            return Err(RegistryError::LiveScopeNotCovered);
+        }
         let scope_validated_at = self.clock.observe()?;
         self.validated.session.validate_current_lease()?;
         if scope_validated_at.monotonic() < self.validated_at.monotonic() {
@@ -1135,7 +1276,26 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         if !coverage.topology().contains_venue(venue) || !instrument_proven {
             return Err(RegistryError::LiveScopeNotCovered);
         }
-        let live = coverage.live().ok_or(RegistryError::LiveScopeNotCovered)?;
+        let crate::CoverageHealth::Sufficient {
+            provider_product,
+            provider_channel,
+            ..
+        } = &self.health.coverage
+        else {
+            return Err(RegistryError::LiveScopeNotCovered);
+        };
+        let live = coverage
+            .live_for(provider_product, provider_channel)
+            .ok_or(RegistryError::LiveScopeNotCovered)?;
+        let identity_index = self
+            .provider_identities
+            .binary_search_by(|identity| {
+                let native = &identity.evidence().native;
+                (&native.venue, native.instrument).cmp(&(venue, instrument))
+            })
+            .map_err(|_| RegistryError::LiveScopeNotCovered)?;
+        let provider_identity = self.provider_identities[identity_index].clone();
+        provider_identity.validate_at(scope_validated_at.wall())?;
         let rule = live
             .rule_for(event_class, depth)
             .ok_or(RegistryError::LiveScopeNotCovered)?;
@@ -1145,6 +1305,9 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .map_or(self.health.valid_until, |until| {
                 until.min(self.health.valid_until)
             });
+        let valid_until = provider_identity
+            .inclusive_deadline()
+            .map_or(valid_until, |until| until.min(valid_until));
         let scope_deadline = scope_validated_at
             .checked_deadline(valid_until)?
             .map(|deadline| deadline.min(self.health.valid_until_monotonic));
@@ -1206,6 +1369,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             budget: self.health.budget.clone(),
             clock: Arc::clone(self.clock),
             universe_evidence: self.attestation.map(|value| value.evidence.clone()),
+            provider_identity,
         })
     }
 
@@ -1266,7 +1430,14 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         if evidence.normalization_rule() != protocol.decoder_rule() {
             return Err(RegistryError::DecoderProfileMismatch);
         }
-        let mut observation_authorities = Vec::with_capacity(provider_observations.len());
+        let row_count = provider_observations.len();
+        if row_count == 0 || row_count > crate::MAX_DECODED_EVENTS {
+            return Err(RegistryError::DecoderProfileMismatch);
+        }
+        let mut observation_authorities = Vec::new();
+        observation_authorities
+            .try_reserve_exact(row_count)
+            .map_err(|_| RegistryError::RetainedSizeOverflow)?;
         let quality_ceiling = self.validated.metadata.quality_ceiling();
         for observation in &provider_observations {
             validate_observation_profile(protocol, quality_ceiling, observation)?;
@@ -1276,6 +1447,20 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                 observation.event_class(),
                 observation.depth(),
             )?;
+            scope
+                .provider_identity
+                .validate_at(evidence.received_at())?;
+            let selected_native = &scope.provider_identity.evidence().native;
+            let decoded_native = observation.native_identity();
+            if decoded_native.namespace() != &selected_native.namespace
+                || decoded_native.provider_instrument_id()
+                    != &selected_native.provider_instrument_id
+                || decoded_native.venue_symbol() != &selected_native.venue_symbol
+                || observation.venue() != &selected_native.venue
+                || observation.instrument() != selected_native.instrument
+            {
+                return Err(RegistryError::LiveScopeNotCovered);
+            }
             if !scope.matches_snapshot_evidence(observation.snapshot()) {
                 return Err(RegistryError::DecoderProfileMismatch);
             }
@@ -1284,8 +1469,14 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         let observations = provider_observations
             .into_iter()
             .zip(observation_authorities)
-            .map(|(observation, scope)| {
-                scope.into_current_observation(observation, evidence.clone())
+            .enumerate()
+            .map(|(row_ordinal, (observation, scope))| {
+                scope.into_current_observation(
+                    observation,
+                    evidence.clone(),
+                    row_ordinal,
+                    row_count,
+                )
             })
             .collect::<Result<Vec<_>, RegistryError>>()?;
         let mut positions: HashMap<CurrentBatchKey, usize> =
@@ -1312,8 +1503,11 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                                 .observation
                                 .dynamic_retained_bytes()
                                 .map_err(|_| RegistryError::RetainedSizeOverflow)?;
+                            let identity = observation.provider_identity.retained_bytes()?;
+                            let policy = observation.policy.deep_allocation_charge()?;
                             total
-                                .checked_add(observation.policy.deep_allocation_charge()?)
+                                .checked_add(identity)
+                                .and_then(|bytes| bytes.checked_add(policy))
                                 .and_then(|bytes| {
                                     bytes.checked_add(observation.key.dynamic_retained_bytes())
                                 })

@@ -349,7 +349,7 @@ impl JobRunner for SecFundJobRunner {
         Ok(JobCompletion::Published(result, published))
     }
 
-    fn recover(&self, snapshot: &JobSnapshot) -> JobRecoveryDisposition {
+    async fn recover(&self, snapshot: &JobSnapshot) -> JobRecoveryDisposition {
         if validate_snapshot(
             snapshot,
             &self.kind,
@@ -674,7 +674,11 @@ fn map_live_execution_error(error: SecLiveFundApplicationError) -> SecFundJobExe
         | SecLiveFundApplicationError::Precommit(_)
         | SecLiveFundApplicationError::Client(_)
         | SecLiveFundApplicationError::Preparation(_)
-        | SecLiveFundApplicationError::Publication(_) => {
+        | SecLiveFundApplicationError::Publication(_)
+        // This runner admits only quarterly fund requests. Company-filing failures cannot
+        // establish its terminal fund publication or be retried as a valid fund result.
+        | SecLiveFundApplicationError::Fundamentals(_)
+        | SecLiveFundApplicationError::CompanyRead(_) => {
             SecFundJobExecutionError::InvalidPublication
         }
     }

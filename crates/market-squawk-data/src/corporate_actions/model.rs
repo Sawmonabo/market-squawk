@@ -16,7 +16,7 @@ pub const MAX_CORPORATE_ACTIONS: usize = 1_000_000;
 /// Fixed process ceiling for Rust-visible bytes retained by one plan.
 pub const MAX_CORPORATE_ACTION_RETAINED_BYTES: usize = 512 * 1024 * 1024;
 /// Schema version for durable, self-validating corporate-action plan recovery material.
-pub(super) const CORPORATE_ACTION_PLAN_CODEC_VERSION: u16 = 1;
+pub(super) const CORPORATE_ACTION_PLAN_CODEC_VERSION: u16 = 2;
 
 /// Closed economic treatment applied by one versioned adjustment policy.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -89,6 +89,7 @@ pub struct CorporateActionRecord {
     pub(super) observation: CorporateActionObservation,
     pub(super) source_manifest: DatasetManifestRef,
     pub(super) evidence_digest: EvidenceDigest,
+    pub(super) application: Option<super::CorporateActionApplication>,
 }
 
 impl CorporateActionRecord {
@@ -102,7 +103,40 @@ impl CorporateActionRecord {
             observation,
             source_manifest,
             evidence_digest,
+            application: None,
         }
+    }
+
+    /// Attaches separately retained daily application values, preserving the source observation.
+    pub fn with_application(
+        mut self,
+        application: super::CorporateActionApplication,
+    ) -> Result<Self, CorporateActionError> {
+        if self.application.is_some() {
+            return Err(CorporateActionError::InvalidApplication);
+        }
+        application.validate_for(&self)?;
+        self.application = Some(application);
+        Ok(self)
+    }
+
+    /// Returns separately retained source/calendar application values, when supplied.
+    pub const fn application(&self) -> Option<&super::CorporateActionApplication> {
+        self.application.as_ref()
+    }
+
+    /// Returns the source's exact effective instant or the separately authenticated daily boundary.
+    pub fn application_at(&self) -> Option<Timestamp> {
+        self.observation
+            .context()
+            .time()
+            .effective()
+            .exact_timestamp()
+            .or_else(|| {
+                self.application
+                    .as_ref()
+                    .map(super::CorporateActionApplication::application_at)
+            })
     }
 
     /// Returns the source observation without applying or mutating it.
@@ -272,6 +306,7 @@ impl CorporateActionLimits {
 /// Deterministically ordered point-in-time adjustment plan and complete audit partition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CorporateActionPlan {
+    pub(super) source_coverage: Option<std::sync::Arc<super::CorporateActionSourceCoverage>>,
     pub(super) policy: CorporateActionPolicy,
     pub(super) knowledge_cutoff: Timestamp,
     pub(super) valuation_cutoff: Timestamp,
@@ -449,6 +484,7 @@ struct RecoveryRecord {
     schema_fingerprint: [u8; 32],
     content_hash: [u8; 32],
     evidence_digest: EvidenceDigest,
+    application: Option<super::CorporateActionApplication>,
 }
 
 impl RecoveryRecord {
@@ -462,6 +498,7 @@ impl RecoveryRecord {
             schema_fingerprint: record.source_manifest.schema().fingerprint(),
             content_hash: record.source_manifest.content_hash().bytes(),
             evidence_digest: record.evidence_digest,
+            application: record.application.clone(),
         }
     }
 
@@ -484,11 +521,11 @@ impl RecoveryRecord {
             Sha256Digest::new(self.content_hash),
         )
         .map_err(|_| CorporateActionError::RecoveryCodec)?;
-        Ok(CorporateActionRecord::new(
-            self.observation,
-            manifest,
-            self.evidence_digest,
-        ))
+        let record = CorporateActionRecord::new(self.observation, manifest, self.evidence_digest);
+        match self.application {
+            Some(application) => record.with_application(application),
+            None => Ok(record),
+        }
     }
 }
 
@@ -503,6 +540,12 @@ fn parse_recovery_timestamp(value: &str) -> Result<Timestamp, CorporateActionErr
 /// Corporate-action planning, canonicalization, allocation, or retained-size failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CorporateActionError {
+    /// The bounded authentic source projection was cancelled or expired.
+    #[error("corporate-action source read was interrupted")]
+    SourceReadInterrupted,
+    /// Date application values do not bind the unchanged record or exact calendar session.
+    #[error("corporate-action application evidence is invalid")]
+    InvalidApplication,
     /// Durable plan-recovery material is malformed, unsupported, or fails identity validation.
     #[error("corporate-action recovery material is invalid")]
     RecoveryCodec,

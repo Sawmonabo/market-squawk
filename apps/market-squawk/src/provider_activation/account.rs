@@ -2,12 +2,14 @@
 
 use std::sync::{Arc, Weak};
 
+use market_squawk_data::CatalogAuthority;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_platform::{AppConfig, LocalAuthorityStateStore, LocalPaths};
 use market_squawk_sources::{
     AuthorizationMode, DataUseOperation, ProviderRateAuthority, SourceMetadata,
 };
 
+use crate::provider_onboarding::ProviderOnboardingOwnedMutationAuthority;
 use crate::{ProviderActivationLease, ProviderOnboardingService};
 
 /// Closed user-authorized market-data account surfaces supported by V1 activation.
@@ -189,15 +191,58 @@ pub(super) struct ProviderAccountRuntimeAuthority {
 
 /// Weak-only currentness view of one provider-account runtime owner.
 ///
-/// This handle cannot prolong the account authority lifetime or expose its lease, binding,
-/// provider-rate authority, onboarding service, or local account capability. Once the sole strong
-/// runtime owner is dropped, every check fails closed.
+/// Ordinary checks borrow the runtime owner only for validation. A bounded publication may
+/// explicitly acquire an owned mutation guard that retains the exact account owner until the
+/// publication completes. After every strong owner is dropped, every check fails closed.
 #[derive(Clone)]
 pub(crate) struct ProviderAccountRuntimeCurrentness {
     authority: Weak<ProviderAccountRuntimeAuthority>,
 }
 
 impl ProviderAccountRuntimeCurrentness {
+    /// Acquires the existing activation mutex for one bounded durable publication.
+    ///
+    /// Call after provider acquisition, before taking the catalog lock, and retain the returned
+    /// authority through commit. Subsequent checks must use that authority's methods; calling
+    /// this currentness handle again would try to acquire its already retained mutation guard.
+    pub(crate) fn try_acquire_publication_authority(
+        &self,
+    ) -> Result<ProviderAccountPublicationAuthority, crate::ProviderOnboardingError> {
+        let authority = self
+            .authority
+            .upgrade()
+            .ok_or(crate::ProviderOnboardingError::ActivationUnavailable)?;
+        let onboarding = authority
+            .onboarding
+            .try_acquire_owned_runtime_mutation_authority()?;
+        onboarding.require_active(&authority.lease)?;
+        Ok(ProviderAccountPublicationAuthority {
+            authority,
+            onboarding,
+        })
+    }
+
+    /// Waits for publication ownership, then validates the exact active lease under that guard.
+    /// Call only after provider acquisition; the caller bounds the wait by its deadline and
+    /// cancellation and retains the returned authority through the existing commit boundary.
+    pub(crate) async fn acquire_publication_authority(
+        &self,
+    ) -> Result<ProviderAccountPublicationAuthority, crate::ProviderOnboardingError> {
+        let authority = self
+            .authority
+            .upgrade()
+            .ok_or(crate::ProviderOnboardingError::ActivationUnavailable)?;
+        let onboarding = authority
+            .onboarding
+            .acquire_owned_runtime_mutation_authority()
+            .await;
+        onboarding.require_active(&authority.lease)?;
+        Ok(ProviderAccountPublicationAuthority {
+            authority,
+            onboarding,
+        })
+    }
+
     /// Returns whether the exact retained account lease is still active.
     pub(crate) async fn is_active(&self) -> bool {
         let Some(authority) = self.authority.upgrade() else {
@@ -221,6 +266,29 @@ impl ProviderAccountRuntimeCurrentness {
         self.authority
             .upgrade()
             .is_some_and(|authority| authority.require_current_now().is_ok())
+    }
+}
+
+/// Exact account owner and its existing onboarding mutation guard held through publication.
+#[derive(Debug)]
+pub(crate) struct ProviderAccountPublicationAuthority {
+    authority: Arc<ProviderAccountRuntimeAuthority>,
+    onboarding: ProviderOnboardingOwnedMutationAuthority,
+}
+
+impl ProviderAccountPublicationAuthority {
+    /// Revalidates durable currentness before the publication catalog lock is acquired.
+    pub(crate) fn require_current(&self) -> Result<(), crate::ProviderOnboardingError> {
+        self.onboarding.require_active(&self.authority.lease)
+    }
+
+    /// Revalidates the exact account lease against the already locked publication catalog.
+    pub(crate) fn require_catalog_current(
+        &self,
+        catalog: &CatalogAuthority,
+    ) -> Result<(), crate::ProviderOnboardingError> {
+        self.onboarding
+            .require_active_in_catalog(catalog, &self.authority.lease)
     }
 }
 

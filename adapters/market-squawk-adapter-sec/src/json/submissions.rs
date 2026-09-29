@@ -222,6 +222,27 @@ struct SubmissionsDocumentInner {
 }
 
 impl SubmissionsDocument {
+    pub(crate) fn checked_retained_bytes(&self) -> Result<usize, SecParserError> {
+        let mut limits = SecParserLimits::production_defaults();
+        limits.max_retained_output_bytes = usize::MAX;
+        let budget = RetainedJsonBudget::new(limits);
+        admit_document_allocations(&budget, self)?;
+        // Each Arc's pointee header and reference counts are owned independently of its fields.
+        let headers = std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<SubmissionsDocumentInner>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<SecSubmissionCompanyMetadata>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Vec<SecSubmissionsCompanion>>()))
+            .and_then(|n| {
+                n.checked_add(
+                    (self.inner.filings.len().checked_add(3)?)
+                        .checked_mul(2 * std::mem::size_of::<usize>())?,
+                )
+            })
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        budget.admit_bytes(headers)?;
+        budget.admitted_bytes()
+    }
+
     /// Parses a bounded `submissions/CIK##########.json` document.
     pub fn parse(bytes: &[u8], limits: SecParserLimits) -> Result<Self, SecParserError> {
         Self::parse_with_cancellation(bytes, limits, &CancellationToken::new())

@@ -48,8 +48,9 @@ pub use pacing::{
 };
 pub use parser::{BeaParseLimits, parse_data_page, parse_metadata_page};
 pub use publication::{
-    BeaPublicationCandidate, BeaPublicationError, BeaPublicationRejoinCoordinates,
-    BeaSharedPublicationParts,
+    BeaNativePublishedSeriesCoordinate, BeaPublicationCandidate, BeaPublicationError,
+    BeaPublicationRejoinCoordinates, BeaSharedPublicationParts,
+    decode_bea_california_personal_income_coordinate,
 };
 pub use query::{
     BEA_API_ENDPOINT, BEA_MAX_APPLICATION_PAGES, BEA_MAX_APPLICATION_ROWS_PER_PAGE, BeaMethod,
@@ -68,10 +69,11 @@ pub use sealed::{
 };
 pub use source::{
     BEA_NATIVE_EXTRACTION_SCHEMA, BeaCapturedDataPage, BeaCapturedDiscovery,
-    BeaCapturedMetadataPage, BeaDataEvidencePage, BeaDatasetAcquisition, BeaDatasetContract,
-    BeaDatasetEvidence, BeaMetadataBundle, BeaMetadataEvidenceBundle, BeaMetadataEvidencePage,
-    BeaResponseTelemetry, BeaSource, BeaSourceConfig, BeaSourceError, BeaSourceTelemetry,
-    MAX_BEA_CONFIGURED_DATASETS, bea_api_endpoint_rule, bea_provider_rate_declaration,
+    BeaCapturedMetadataPage, BeaDataEvidencePage, BeaDatasetContract, BeaDatasetEvidence,
+    BeaDoctorRefreshDisposition, BeaMetadataBundle, BeaMetadataEvidenceBundle,
+    BeaMetadataEvidencePage, BeaResponseTelemetry, BeaSource, BeaSourceConfig, BeaSourceError,
+    BeaSourceTelemetry, MAX_BEA_CONFIGURED_DATASETS, bea_api_endpoint_rule,
+    bea_provider_rate_declaration,
 };
 
 #[cfg(test)]

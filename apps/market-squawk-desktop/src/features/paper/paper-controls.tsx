@@ -1,4 +1,5 @@
 import * as React from "react"
+import { Link } from "react-router-dom"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { CircleAlert, OctagonX, Square } from "lucide-react"
 
@@ -18,10 +19,16 @@ import { formatMoney } from "@/lib/formatters"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
+  parsePaperAccountPreparation,
+  parsePaperAccountPreview,
+  parsePaperAccountCreated,
+  type PaperAccountPreview,
+  type PaperAccountPreparation,
   parsePaperStartPreparation,
   parsePaperStartPreview,
   parsePaperStartResult,
   type PaperControlIntent,
+  type PaperStartPreparation,
   type PaperStartPreview,
   type PaperStatus,
 } from "./contracts"
@@ -92,6 +99,139 @@ export function PaperControlPanel({
   )
 }
 
+export function CreatePaperAccountControls({ transport, scope, enabled, onCreated }: {
+  transport: ProductTransport
+  scope: ProductScope
+  enabled: boolean
+  onCreated: (message: string) => Promise<unknown>
+}) {
+  const [cashChoice, setCashChoice] = React.useState("")
+  const [costChoice, setCostChoice] = React.useState("")
+  const [currencyChoice, setCurrencyChoice] = React.useState("")
+  const [preview, setPreview] = React.useState<PaperAccountPreview | null>(null)
+  const [notice, setNotice] = React.useState<string | null>(null)
+  const options = useQuery({
+    queryKey: productKeys.operation(scope, "bot", "Bot.GetAccountPreparation", {}),
+    enabled,
+    queryFn: async () => parsePaperAccountPreparation(await transport.paperControl({ action: "accountPreparation" })),
+  })
+  const preparation = options.data
+  const ready: Extract<PaperAccountPreparation, { availability: "ready" }> | undefined =
+    preparation && preparation.availability === "ready" ? preparation : undefined
+  const cash = ready?.virtualCashChoices.find((choice) => choice.choiceToken === cashChoice)
+  const cost = ready?.costChoices.find((choice) => choice.choiceToken === costChoice)
+  const currency = ready?.currencyChoices.find((choice) => choice.choiceToken === currencyChoice)
+  const prepare = useMutation({
+    mutationFn: async () => {
+      if (!ready || !cash || !cost || !currency) throw new Error("Choose cash, cost, and currency.")
+      const result = parsePaperAccountPreview(await transport.paperControl({
+        action: "prepareAccount", cashChoice, costChoice, currencyChoice,
+      }))
+      if (result.accountLabel !== ready.accountLabel
+        || result.virtualCash.amount !== cash.amount.amount
+        || result.virtualCash.currency !== cash.amount.currency
+        || result.virtualCash.currency !== currency.currency
+        || result.estimatedTradingCost !== cost.estimatedTradingCost
+        || Date.parse(result.expiresAt) <= Date.now()) {
+        throw new Error("The account review does not match the selected choices.")
+      }
+      return result
+    },
+    onSuccess: setPreview,
+  })
+  const create = useMutation({
+    mutationFn: async (exact: PaperAccountPreview) => {
+      if (Date.parse(exact.expiresAt) <= Date.now()) throw new Error("Review the account again before confirming.")
+      return parsePaperAccountCreated(await transport.paperControl({
+        action: "createAccount", confirmationToken: exact.confirmationToken,
+      }, true))
+    },
+    onSuccess: async (message) => {
+      setPreview(null)
+      setNotice(message)
+      setCashChoice("")
+      setCostChoice("")
+      setCurrencyChoice("")
+      await onCreated(message)
+      await options.refetch()
+    },
+    onError: async () => {
+      setPreview(null)
+      await options.refetch()
+    },
+  })
+  React.useEffect(() => {
+    setPreview(null)
+  }, [options.data])
+  React.useEffect(() => {
+    if (!preview) return
+    const timer = window.setTimeout(() => setPreview(null), Math.max(0, Date.parse(preview.expiresAt) - Date.now()))
+    return () => window.clearTimeout(timer)
+  }, [preview])
+  const busy = prepare.isPending || create.isPending || options.isFetching
+  const change = (setter: (value: string) => void) => (value: string) => {
+    setter(value)
+    setPreview(null)
+    setNotice(null)
+    prepare.reset()
+    create.reset()
+  }
+  if (!enabled) return null
+  return <ControlFrame title="Create a practice account">
+    <p className="text-sm leading-6 text-muted-foreground">
+      Set up virtual cash for your practice portfolio and investment analysis. You can create the account while markets are unavailable. Trading still needs current market information and active safety checks.
+    </p>
+    {options.isPending ? <p className="mt-3 text-sm" role="status">Loading account choices…</p>
+      : options.isError ? <p className="mt-3 text-sm text-rose-200" role="alert">Account choices are unavailable. Try refreshing.</p>
+      : options.data?.availability === "already_created" ? <div className="mt-3 space-y-3">
+        <p className="text-sm">{options.data.message}</p>
+        <Button asChild variant="outline"><Link to="/portfolio">Choose recommendation preferences</Link></Button>
+      </div>
+      : options.data?.availability === "unavailable" ? <p className="mt-3 text-sm">{options.data.message}</p>
+      : ready ? <>
+        <div className="mt-4 grid gap-4 lg:grid-cols-3">
+          <PreparedSelect id="account-cash-choice" label="Virtual cash" value={cashChoice} disabled={busy}
+            onChange={change(setCashChoice)} choices={ready.virtualCashChoices.map((choice) => ({ token: choice.choiceToken, label: `${choice.label} · ${formatMoney(choice.amount)}` }))} />
+          <PreparedSelect id="account-cost-choice" label="Estimated trading cost" value={costChoice} disabled={busy}
+            onChange={change(setCostChoice)} choices={ready.costChoices.map((choice) => ({ token: choice.choiceToken, label: `${choice.label} · ${choice.estimatedTradingCost}` }))} />
+          <PreparedSelect id="account-currency-choice" label="Currency" value={currencyChoice} disabled={busy}
+            onChange={change(setCurrencyChoice)} choices={ready.currencyChoices.map((choice) => ({ token: choice.choiceToken, label: `${choice.label} · ${choice.currency}` }))} />
+        </div>
+        {[cash?.explanation, cost?.explanation].filter(Boolean).map((text) => <p key={text} className="mt-2 text-xs text-muted-foreground">{text}</p>)}
+        <Button className="mt-4" disabled={busy || !cash || !cost || !currency} onClick={() => prepare.mutate()}>
+          {prepare.isPending ? "Preparing…" : "Review practice account"}
+        </Button>
+      </> : null}
+    {notice ? <p className="mt-3 text-sm" role="status">{notice}</p> : null}
+    {prepare.isError || create.isError ? <p className="mt-3 text-sm text-rose-200" role="alert">
+      The account could not be confirmed. Refresh its current state, then review the choices again.
+    </p> : null}
+    <Button className="mt-3" variant="ghost" disabled={busy} onClick={() => { setPreview(null); void options.refetch() }}>Refresh account</Button>
+    <Dialog open={preview !== null && ready !== undefined && !options.isError} onOpenChange={(open) => { if (!open && !create.isPending) setPreview(null) }}>
+      <DialogContent showCloseButton={!create.isPending}>
+        <DialogHeader>
+          <DialogTitle>Create this practice account?</DialogTitle>
+          <DialogDescription>Confirm the virtual cash, currency, and estimated trading cost returned for your review.</DialogDescription>
+        </DialogHeader>
+        {preview ? <div className="grid gap-3 sm:grid-cols-2">
+          <Fact label="Account" value={preview.accountLabel} />
+          <Fact label="Virtual cash" value={formatMoney(preview.virtualCash)} />
+          <Fact label="Currency" value={preview.virtualCash.currency} />
+          <Fact label="Estimated trading cost" value={preview.estimatedTradingCost} />
+          <Fact label="Review expires" value={new Date(preview.expiresAt).toLocaleString()} />
+          <div className="sm:col-span-2">{preview.safeguards.map((text) => <p key={text} className="mt-1 text-xs text-muted-foreground">{text}</p>)}</div>
+        </div> : null}
+        <DialogFooter>
+          <Button variant="ghost" disabled={create.isPending} onClick={() => setPreview(null)}>Keep current state</Button>
+          <Button disabled={!preview || busy} onClick={() => { if (preview) create.mutate(preview) }}>
+            {create.isPending ? "Creating…" : "Create practice account"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  </ControlFrame>
+}
+
 function StartPaperControls({
   transport,
   scope,
@@ -103,8 +243,7 @@ function StartPaperControls({
   enabled: boolean
   onStarted: (message: string) => Promise<unknown>
 }) {
-  const [cashChoice, setCashChoice] = React.useState("")
-  const [costChoice, setCostChoice] = React.useState("")
+  const [marketChoice, setMarketChoice] = React.useState("")
   const [modeChoice, setModeChoice] = React.useState("")
   const [preview, setPreview] = React.useState<PaperStartPreview | null>(null)
   const [startError, setStartError] = React.useState(false)
@@ -114,16 +253,35 @@ function StartPaperControls({
     queryFn: async () =>
       parsePaperStartPreparation(await transport.paperControl({ action: "startPreparation" })),
   })
+  const preparation = options.data
+  const readyOptions: Extract<PaperStartPreparation, { availability: "ready" }> | undefined =
+    preparation && preparation.availability === "ready" ? preparation : undefined
+  const originalCash = readyOptions?.virtualCashChoices[0]
+  const originalCost = readyOptions?.costChoices[0]
+  const cashChoice = originalCash?.choiceToken ?? ""
+  const costChoice = originalCost?.choiceToken ?? ""
+  React.useEffect(() => {
+    if (options.data && options.data.availability !== "ready") {
+      setPreview(null)
+      setMarketChoice("")
+      setModeChoice("")
+    }
+  }, [options.data?.availability])
   const prepare = useMutation({
-    mutationFn: async () =>
-      parsePaperStartPreview(
-        await transport.paperControl({
-          action: "prepareStart",
-          cashChoice,
-          costChoice,
-          modeChoice,
-        }),
-      ),
+    mutationFn: async () => {
+      const market = readyOptions?.marketChoices.find((choice) => choice.choiceToken === marketChoice)
+      if (!market || !market.modeChoices.includes(modeChoice)) throw new Error("Choose an available market and mode.")
+      const prepared = parsePaperStartPreview(
+        await transport.paperControl({ action: "prepareStart", marketChoice, cashChoice, costChoice, modeChoice }),
+      )
+      if (prepared.marketLabel !== market.label || prepared.monitoringLabel !== market.monitoringLabel
+        || prepared.virtualCash.amount !== originalCash?.amount.amount
+        || prepared.virtualCash.currency !== originalCash?.amount.currency
+        || prepared.estimatedTradingCost !== originalCost?.estimatedTradingCost) {
+        throw new Error("The prepared market does not match the selection.")
+      }
+      return prepared
+    },
     onSuccess: (value) => {
       setStartError(false)
       setPreview(value)
@@ -144,7 +302,18 @@ function StartPaperControls({
       setStartError(true)
     },
   })
-  const choicesReady = cashChoice !== "" && costChoice !== "" && modeChoice !== ""
+  const selectedMarket = readyOptions?.marketChoices.find((choice) => choice.choiceToken === marketChoice)
+  const allowedModes = readyOptions?.modeChoices.filter((choice) => selectedMarket?.modeChoices.includes(choice.choiceToken)) ?? []
+  const choicesReady = selectedMarket !== undefined
+    && readyOptions?.virtualCashChoices.some((choice) => choice.choiceToken === cashChoice)
+    && readyOptions?.costChoices.some((choice) => choice.choiceToken === costChoice)
+    && allowedModes.some((choice) => choice.choiceToken === modeChoice)
+  const changeChoice = (setChoice: (value: string) => void) => (value: string) => {
+    setChoice(value)
+    setPreview(null)
+    setStartError(false)
+    prepare.reset()
+  }
 
   return (
     <ControlFrame title="Start paper practice">
@@ -156,39 +325,44 @@ function StartPaperControls({
         <p className="text-sm text-muted-foreground">
           Paper-session choices are unavailable. Try again shortly.
         </p>
+      ) : (options.data.availability === "account_required" || options.data.availability === "account_unavailable") ? (
+        <p className="text-sm text-muted-foreground">{options.data.message}</p>
+      ) : options.data.availability === "market_unavailable" ? (
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">{options.data.message}</p>
+          <div className="flex flex-wrap gap-2">
+            <Button asChild variant="outline">
+              <Link to="/system/settings/onboarding">Open Settings</Link>
+            </Button>
+            <Button variant="ghost" disabled={options.isFetching} onClick={() => void options.refetch()}>
+              {options.isFetching ? "Checking…" : "Try again"}
+            </Button>
+          </div>
+        </div>
       ) : (
         <>
           <p className="mb-4 text-sm leading-6 text-muted-foreground">
-            Choose the virtual cash, estimated trading cost, and practice mode. Nothing is selected
-            automatically, and starting a session does not place a virtual or brokerage order.
+            Choose the market and practice mode. This session uses your account's original virtual cash and
+            agreed trading costs. Starting a session does not add funds or place an order.
           </p>
-          <div className="grid gap-4 lg:grid-cols-3">
+          <div className="grid gap-4 lg:grid-cols-2">
             <PreparedSelect
-              id="paper-cash-choice"
-              label="Virtual cash"
-              value={cashChoice}
-              onChange={setCashChoice}
-              choices={options.data.virtualCashChoices.map((choice) => ({
-                token: choice.choiceToken,
-                label: `${choice.label} · ${formatMoney(choice.amount)}`,
-              }))}
+              id="paper-market-choice"
+              label="Market"
+              value={marketChoice}
+              disabled={prepare.isPending || start.isPending}
+              onChange={changeChoice((value) => { setMarketChoice(value); setModeChoice("") })}
+              choices={options.data.marketChoices.map((choice) => ({ token: choice.choiceToken, label: choice.label }))}
             />
-            <PreparedSelect
-              id="paper-cost-choice"
-              label="Estimated trading cost"
-              value={costChoice}
-              onChange={setCostChoice}
-              choices={options.data.costChoices.map((choice) => ({
-                token: choice.choiceToken,
-                label: `${choice.label} · ${choice.estimatedTradingCost}`,
-              }))}
-            />
+            {originalCash ? <Fact label="Original virtual cash" value={formatMoney(originalCash.amount)} /> : null}
+            {originalCost ? <Fact label="Agreed trading cost" value={originalCost.estimatedTradingCost} /> : null}
             <PreparedSelect
               id="paper-mode-choice"
               label="Practice mode"
               value={modeChoice}
-              onChange={setModeChoice}
-              choices={options.data.modeChoices.map((choice) => ({
+              disabled={prepare.isPending || start.isPending || !selectedMarket}
+              onChange={changeChoice(setModeChoice)}
+              choices={allowedModes.map((choice) => ({
                 token: choice.choiceToken,
                 label: choice.label,
               }))}
@@ -214,16 +388,18 @@ function StartPaperControls({
           ) : null}
         </>
       )}
-      <Dialog open={preview !== null} onOpenChange={(open) => !open && !start.isPending && setPreview(null)}>
+      <Dialog open={preview !== null && readyOptions !== undefined && !options.isError} onOpenChange={(open) => !open && !start.isPending && setPreview(null)}>
         <DialogContent showCloseButton={!start.isPending}>
           <DialogHeader>
             <DialogTitle>Start this paper session?</DialogTitle>
             <DialogDescription>
-              Confirm the prepared virtual cash, trading-cost estimate, mode, and safeguards.
+              Confirm the prepared market, virtual cash, trading-cost estimate, mode, and safeguards.
             </DialogDescription>
           </DialogHeader>
           {preview ? (
             <dl className="grid gap-3 sm:grid-cols-2">
+              <Fact label="Market" value={preview.marketLabel} />
+              <Fact label="Order monitoring" value={preview.monitoringLabel} />
               <Fact label="Virtual cash" value={formatMoney(preview.virtualCash)} />
               <Fact label="Estimated trading cost" value={preview.estimatedTradingCost} />
               <Fact label="Practice mode" value={preview.modeLabel} />
@@ -259,17 +435,20 @@ function PreparedSelect({
   value,
   onChange,
   choices,
+  disabled = false,
 }: {
   id: string
   label: string
   value: string
   onChange: (value: string) => void
+  disabled?: boolean
   choices: { token: string; label: string }[]
 }) {
   return (
     <Field label={label} htmlFor={id}>
       <select
         id={id}
+        disabled={disabled}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"

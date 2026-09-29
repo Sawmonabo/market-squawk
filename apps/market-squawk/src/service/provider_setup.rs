@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::application::source::{
     SourceLifecycleAction, SourceLifecycleAuthority, SourceLifecycleCommand,
-    SourceLifecycleCommandInput, SourceLifecycleDisposition,
+    SourceLifecycleCommandInput, SourceLifecycleDisposition, SourceLifecycleError, SourceLifecycleState,
 };
 use crate::provider_onboarding::{
     OnboardingNextAction, ProviderOnboardingError, ProviderOnboardingRequest,
@@ -162,10 +162,14 @@ impl InstalledProviderSetup {
                 .map(|profile| {
                     let surface = SourceIdentifier::try_from(profile.id())
                         .map_err(|_| ServiceError::Unavailable)?;
-                    let saved_session = self
-                        .activation
-                        .retained_setup_session(&surface)
-                        .map_err(|_| ServiceError::Unavailable)?;
+                    let saved_session =
+                        self.activation
+                            .retained_setup_session(&surface)
+                            .map_err(|error| {
+                                SetupFailure::from(error)
+                                    .service_error
+                                    .unwrap_or(ServiceError::Unavailable)
+                            })?;
                     if let Some(session_id) = saved_session {
                         if !sessions
                             .iter()
@@ -224,7 +228,8 @@ impl InstalledProviderSetup {
                 if request.schema != STAGED_SCHEMA
                     || !matches!(
                         request.request,
-                        ProviderOnboardingRequest::UnlockFallback { .. }
+                        ProviderOnboardingRequest::Start { .. }
+                            | ProviderOnboardingRequest::UnlockFallback { .. }
                             | ProviderOnboardingRequest::Activate { .. }
                             | ProviderOnboardingRequest::VerifySaved { .. }
                             | ProviderOnboardingRequest::RestoreSaved { .. }
@@ -261,6 +266,9 @@ impl InstalledProviderSetup {
             match outcome {
                 Ok(value) => json!({"outcome": "completed", "value": value}),
                 Err(error) => {
+                    if let Some(service_error) = error.service_error {
+                        return Err(service_error);
+                    }
                     json!({"outcome": "rejected", "code": error.code, "message": error.message})
                 }
             }
@@ -431,16 +439,33 @@ impl InstalledProviderSetup {
             .lifecycle
             .status(&provider, cancellation, deadline)
             .await
-            .map_err(|_| SetupFailure::unavailable())?;
+            .map_err(SetupFailure::from)?;
         let lease = if restore_saved {
             None
         } else {
             Some(self.onboarding.activation_lease(session_id)?)
         };
+        // A first public live configuration has no predecessor to resynchronize. Restrict
+        // Start to the untouched lifecycle revision and its exact newly admitted binding;
+        // retained, blocked, and research configurations keep their existing recovery path.
+        let first_public_live_configuration = activation_kind(provider.as_str()) == Some("source")
+            && status.fields().state_revision.get() == 1
+            && status.fields().state == SourceLifecycleState::Stopped
+            && status.fields().current_generation.is_none()
+            && status.fields().runtime_generation_digest.is_none()
+            && status.fields().blocker.is_none()
+            && lease.as_ref().is_some_and(|lease| {
+                status.fields().configuration_session_id.is_none_or(|id| id == lease.session_id())
+                    && status.fields().public_configuration_digest.is_none_or(|digest| {
+                        digest == lease.public_configuration_digest()
+                    })
+            });
         let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
             provider,
             action: if restore_saved {
                 SourceLifecycleAction::Retry
+            } else if first_public_live_configuration {
+                SourceLifecycleAction::Start
             } else {
                 SourceLifecycleAction::Reconfigure
             },
@@ -467,7 +492,7 @@ impl InstalledProviderSetup {
             .lifecycle
             .execute(command)
             .await
-            .map_err(|_| SetupFailure::unavailable())?;
+            .map_err(SetupFailure::from)?;
         if !matches!(
             receipt.fields().disposition,
             SourceLifecycleDisposition::Applied | SourceLifecycleDisposition::Replay
@@ -554,24 +579,41 @@ fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {
 struct SetupFailure {
     code: &'static str,
     message: &'static str,
+    service_error: Option<ServiceError>,
 }
 impl SetupFailure {
+    fn control(service_error: ServiceError) -> Self {
+        Self {
+            code: "operation_failed",
+            message: "The setup operation did not complete.",
+            service_error: Some(service_error),
+        }
+    }
     const fn invalid() -> Self {
         Self {
             code: "invalid_request",
+            service_error: None,
             message: "Check the selected provider and the setup fields, then try again.",
         }
     }
     const fn unavailable() -> Self {
         Self {
             code: "provider_unavailable",
+            service_error: None,
             message: "This connection could not be completed. Refresh its saved state and use the recovery action shown.",
         }
     }
-    const fn cancelled() -> Self {
-        Self {
-            code: "cancelled",
-            message: "Setup was interrupted. Refresh to resume its saved progress.",
+    fn cancelled() -> Self {
+        Self::control(ServiceError::Cancelled)
+    }
+}
+impl From<SourceLifecycleError> for SetupFailure {
+    fn from(error: SourceLifecycleError) -> Self {
+        match error {
+            SourceLifecycleError::Cancelled => Self::control(ServiceError::Cancelled),
+            SourceLifecycleError::DeadlineExceeded => Self::control(ServiceError::DeadlineExceeded),
+            SourceLifecycleError::Internal => Self::control(ServiceError::Internal),
+            _ => Self::unavailable(),
         }
     }
 }
@@ -580,25 +622,32 @@ impl From<ProviderOnboardingError> for SetupFailure {
         match error {
             ProviderOnboardingError::CredentialRejected => Self {
                 code: "credential_rejected",
+                service_error: None,
                 message: "The provider rejected the saved credential. Replace it with a current credential and verify again.",
             },
             ProviderOnboardingError::ProbeRateLimited => Self {
                 code: "rate_limited",
+                service_error: None,
                 message: "The provider asked Market Squawk to wait. Saved setup is retained; try verification later.",
             },
             ProviderOnboardingError::AdministrativeContactRequired => Self {
                 code: "contact_required",
+                service_error: None,
                 message: "This provider needs your organization or name and a contact email.",
             },
             ProviderOnboardingError::SecretCleanupUnavailable
             | ProviderOnboardingError::RemoteReconciliationRequired => Self {
                 code: "cleanup_required",
+                service_error: None,
                 message: "This connection needs cleanup before another attempt. Use Reconcile saved setup.",
             },
             ProviderOnboardingError::InvalidRequest
             | ProviderOnboardingError::InvalidSecretShape => Self::invalid(),
-            ProviderOnboardingError::OperationCancelled
-            | ProviderOnboardingError::ProbeDeadlineExceeded => Self::cancelled(),
+            ProviderOnboardingError::OperationCancelled => Self::control(ServiceError::Cancelled),
+            ProviderOnboardingError::ProbeDeadlineExceeded => {
+                Self::control(ServiceError::DeadlineExceeded)
+            }
+            ProviderOnboardingError::Clock => Self::control(ServiceError::Internal),
             _ => Self::unavailable(),
         }
     }
@@ -607,7 +656,11 @@ impl From<ProviderPortalActivationError> for SetupFailure {
     fn from(error: ProviderPortalActivationError) -> Self {
         match error {
             ProviderPortalActivationError::InvalidRequest => Self::invalid(),
-            ProviderPortalActivationError::Cancelled => Self::cancelled(),
+            ProviderPortalActivationError::Cancelled => Self::control(ServiceError::Cancelled),
+            ProviderPortalActivationError::DeadlineExceeded => {
+                Self::control(ServiceError::DeadlineExceeded)
+            }
+            ProviderPortalActivationError::Internal => Self::control(ServiceError::Internal),
             ProviderPortalActivationError::Unavailable
             | ProviderPortalActivationError::StateUnavailable => Self::unavailable(),
         }

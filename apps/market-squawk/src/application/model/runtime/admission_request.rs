@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use market_squawk_data::{CatalogEndpointIdentity, Sha256Digest};
+use market_squawk_data::{CatalogEndpointIdentity, FeatureDatasetProductContract, Sha256Digest};
 use market_squawk_domain::Timestamp;
 use market_squawk_modeling::{
     BundleMetadataRef, ModelOutputSemantics, OnnxFallbackPolicy, OnnxModelPolicy,
@@ -114,6 +114,8 @@ fn request_from_wire(
         Timestamp::from_unix_nanos(wire.dataset.as_of_unix_nanos),
         Sha256Digest::new(dataset_selection_sha256),
         catalog_identity,
+        FeatureDatasetProductContract::from_identity(&wire.dataset.product_contract)
+            .ok_or(ProductionModelRuntimeError::InvalidAdmission)?,
     )?;
     ModelAdmissionRequest::try_new(
         wire.candidate_directory,
@@ -154,6 +156,7 @@ struct AuthorityReferenceWire {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DatasetAuthorityWire {
     export_sha256: String,
+    product_contract: String,
     as_of_unix_nanos: i64,
     selection_sha256: String,
     catalog_identity_sha256: String,

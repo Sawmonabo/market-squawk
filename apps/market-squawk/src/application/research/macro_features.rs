@@ -1,5 +1,7 @@
 //! Exact provider-neutral Macro feature-vector construction.
 
+use std::num::NonZeroU64;
+
 use market_squawk_data::{
     ComponentAdjustmentEvidence, ComponentKind, ComponentScope, ComponentSelector, ComponentValue,
     CorporateActionSensitivity, DatasetManifestRef, FeatureLabelComponentInput,
@@ -20,6 +22,8 @@ const TWO_YEAR_YIELD_INDICATOR: &str = "us-government-yield-2y";
 const TEN_YEAR_YIELD_INDICATOR: &str = "us-government-yield-10y";
 const THIRTY_YEAR_YIELD_INDICATOR: &str = "us-government-yield-30y";
 const RATE_UNIT: &str = "percent_per_year";
+const NANOS_PER_DAY: i64 = 24 * 60 * 60 * 1_000_000_000;
+const MAXIMUM_RATE_AGE_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
 /// Reads and maps one exact provider-neutral Macro feature vector at caller-supplied cutoffs.
 ///
@@ -49,10 +53,6 @@ pub(crate) async fn read_macro_feature_vector(
 /// intentionally has a narrower economic contract: it can retain exact curve/regime and
 /// valuation-assumption evidence while a model or recommendation honestly abstains because a
 /// separate required input is missing.
-#[allow(
-    dead_code,
-    reason = "the shared valuation and decision composition seam consumes this leaf"
-)]
 pub(crate) async fn read_macro_investment_context(
     read: &MacroContextReadCapability,
     knowledge_cutoff: Timestamp,
@@ -126,6 +126,116 @@ impl MacroRateRegimeEvidence {
     }
 }
 
+/// One exact government par-yield observation available to a financial-model assumption.
+///
+/// The value is an annual percentage, not a zero-coupon discount rate or cost of equity. Its
+/// lifetime is selected explicitly by the consuming analytical policy and is never refreshed by
+/// rereading the same observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MacroGovernmentYieldEvidence {
+    annual_yield_percent: Decimal,
+    effective: ResearchTemporalCoordinate,
+    available_at: Timestamp,
+    superseded: Option<ResearchTemporalCoordinate>,
+    knowledge_cutoff: Timestamp,
+    evidence_digest: EvidenceDigest,
+}
+
+impl MacroGovernmentYieldEvidence {
+    fn try_from_snapshot(
+        snapshot: &MacroContextSnapshot,
+        indicator_id: &str,
+    ) -> Result<Self, ServiceError> {
+        let mut matches = snapshot
+            .selected()
+            .iter()
+            .filter(|selected| selected.indicator_id() == indicator_id);
+        let selected = matches.next().ok_or(ServiceError::InvalidResult)?;
+        if matches.next().is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let observation = selected.observation().ok_or(ServiceError::Unavailable)?;
+        let annual_yield_percent = observed_value(observation)?;
+        let context = observation.context();
+        let knowledge_cutoff = snapshot.evidence().knowledge_cutoff();
+        let available_at = context
+            .provenance()
+            .availability()
+            .conservative_available_at()
+            .filter(|available_at| *available_at <= knowledge_cutoff)
+            .ok_or(ServiceError::InvalidResult)?;
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/macro-government-yield-reference/v1\0");
+        digest.update(
+            selected
+                .evidence_digest()?
+                .ok_or(ServiceError::InvalidResult)?
+                .bytes(),
+        );
+        digest.update(knowledge_cutoff.unix_nanos().to_be_bytes());
+        hash_bytes(&mut digest, RATE_UNIT.as_bytes())?;
+        let evidence_digest = require_sha256(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            digest.finalize().into(),
+        ))?;
+        Ok(Self {
+            annual_yield_percent,
+            effective: context.time().effective().clone(),
+            available_at,
+            superseded: context.time().superseded().cloned(),
+            knowledge_cutoff,
+            evidence_digest,
+        })
+    }
+
+    pub(crate) const fn annual_yield_percent(&self) -> Decimal {
+        self.annual_yield_percent
+    }
+
+    pub(crate) const fn effective(&self) -> &ResearchTemporalCoordinate {
+        &self.effective
+    }
+
+    pub(crate) const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+
+    pub(crate) const fn evidence_digest(&self) -> EvidenceDigest {
+        self.evidence_digest
+    }
+
+    /// Applies the consumer's explicit freshness bound to both observation age and availability.
+    ///
+    /// For date-only observations the beginning of that date is the conservative policy boundary,
+    /// not an invented source observation instant. Known supersession can only shorten validity.
+    pub(crate) fn expires_at(
+        &self,
+        maximum_age_nanos: NonZeroU64,
+    ) -> Result<Timestamp, ServiceError> {
+        if maximum_age_nanos.get() > MAXIMUM_RATE_AGE_NANOS {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let maximum_age_nanos =
+            i64::try_from(maximum_age_nanos.get()).map_err(|_| ServiceError::InvalidRequest)?;
+        let effective_bound = conservative_coordinate_bound(&self.effective)?;
+        let mut expires_at = effective_bound
+            .checked_add_nanos(maximum_age_nanos)
+            .map_err(|_| ServiceError::InvalidResult)?
+            .min(
+                self.available_at
+                    .checked_add_nanos(maximum_age_nanos)
+                    .map_err(|_| ServiceError::InvalidResult)?,
+            );
+        if let Some(superseded) = self.superseded.as_ref() {
+            expires_at = expires_at.min(conservative_coordinate_bound(superseded)?);
+        }
+        if expires_at <= self.knowledge_cutoff || expires_at <= self.available_at {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(expires_at)
+    }
+}
+
 /// Exact government-yield references available to a method-specific valuation producer.
 ///
 /// Constant-maturity par yields are retained as assumption context. This type deliberately does
@@ -133,8 +243,8 @@ impl MacroRateRegimeEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MacroValuationRateEvidence {
     effective: ResearchTemporalCoordinate,
-    ten_year_government_yield: Decimal,
-    thirty_year_government_yield: Decimal,
+    ten_year_reference: MacroGovernmentYieldEvidence,
+    thirty_year_reference: MacroGovernmentYieldEvidence,
     unit: SourceIdentifier,
     evidence_digest: EvidenceDigest,
 }
@@ -145,11 +255,19 @@ impl MacroValuationRateEvidence {
     }
 
     pub(crate) const fn ten_year_government_yield(&self) -> Decimal {
-        self.ten_year_government_yield
+        self.ten_year_reference.annual_yield_percent()
     }
 
     pub(crate) const fn thirty_year_government_yield(&self) -> Decimal {
-        self.thirty_year_government_yield
+        self.thirty_year_reference.annual_yield_percent()
+    }
+
+    pub(crate) const fn ten_year_reference(&self) -> &MacroGovernmentYieldEvidence {
+        &self.ten_year_reference
+    }
+
+    pub(crate) const fn thirty_year_reference(&self) -> &MacroGovernmentYieldEvidence {
+        &self.thirty_year_reference
     }
 
     pub(crate) const fn unit(&self) -> &SourceIdentifier {
@@ -173,11 +291,11 @@ pub(crate) struct MacroInvestmentContext {
 }
 
 impl MacroInvestmentContext {
-    fn try_from_snapshot(snapshot: &MacroContextSnapshot) -> Result<Self, ServiceError> {
+    pub(super) fn try_from_snapshot(snapshot: &MacroContextSnapshot) -> Result<Self, ServiceError> {
         let source_evidence = snapshot.evidence();
         require_sha256(source_evidence.consumed_digest())?;
         if source_evidence.consumed_parent_manifests().is_empty() {
-            return Err(ServiceError::InvalidResult);
+            return Err(ServiceError::Unavailable);
         }
 
         let three_month = observed_indicator(snapshot, THREE_MONTH_YIELD_INDICATOR)?;
@@ -196,6 +314,10 @@ impl MacroInvestmentContext {
         let two_year_value = observed_value(two_year)?;
         let ten_year_value = observed_value(ten_year)?;
         let thirty_year_value = observed_value(thirty_year)?;
+        let ten_year_reference =
+            MacroGovernmentYieldEvidence::try_from_snapshot(snapshot, TEN_YEAR_YIELD_INDICATOR)?;
+        let thirty_year_reference =
+            MacroGovernmentYieldEvidence::try_from_snapshot(snapshot, THIRTY_YEAR_YIELD_INDICATOR)?;
         let three_month_to_ten_year_spread = ten_year_value
             .checked_sub(three_month_value)
             .ok_or(ServiceError::InvalidResult)?
@@ -238,8 +360,8 @@ impl MacroInvestmentContext {
         };
         let valuation_rates = MacroValuationRateEvidence {
             effective,
-            ten_year_government_yield: ten_year_value,
-            thirty_year_government_yield: thirty_year_value,
+            ten_year_reference,
+            thirty_year_reference,
             unit,
             evidence_digest: valuation_digest,
         };
@@ -360,11 +482,17 @@ impl MacroFeatureVector {
             let context = observation.context();
             let provenance = context.provenance();
             let effective = context.time().effective().clone();
-            if effective.source_period_value().is_some()
+            // The neutral selector has already verified original monthly labor semantics and
+            // native custody. Preserve the period as the feature coordinate; invent no day.
+            let unsupported_period = effective.source_period_value().is_some_and(|period| {
+                descriptor.indicator_id() != "us-unemployment-rate"
+                    || period.scheme().as_str() != "bls-monthly"
+                    || !(1..=12).contains(&period.ordinal().get())
+                    || period.code().as_str() != format!("M{:02}", period.ordinal())
+            });
+            if unsupported_period
                 || provenance.instrument_id().is_some()
                 || provenance.venue_id().is_some()
-                || provenance.received_at() > evidence.knowledge_cutoff()
-                || provenance.ingested_at() > evidence.knowledge_cutoff()
                 || provenance
                     .availability()
                     .conservative_available_at()
@@ -492,6 +620,21 @@ fn observed_indicator<'snapshot>(
         return Err(ServiceError::InvalidResult);
     }
     selected.observation().ok_or(ServiceError::Unavailable)
+}
+
+fn conservative_coordinate_bound(
+    coordinate: &ResearchTemporalCoordinate,
+) -> Result<Timestamp, ServiceError> {
+    if let Some(timestamp) = coordinate.exact_timestamp() {
+        Ok(timestamp)
+    } else if let Some(date) = coordinate.calendar_date_value() {
+        i64::from(date.days_since_unix_epoch())
+            .checked_mul(NANOS_PER_DAY)
+            .map(Timestamp::from_unix_nanos)
+            .ok_or(ServiceError::InvalidResult)
+    } else {
+        Err(ServiceError::InvalidResult)
+    }
 }
 
 fn observed_value(

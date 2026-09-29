@@ -1,9 +1,27 @@
 //! Alpaca adapter over exact pre-authorized provider period rows.
 
+mod completed;
+mod durable;
+mod publication;
+pub(crate) use completed::{AlpacaCalendarSessionDateReceipt, AlpacaCompletedSessionEvidence};
+pub(crate) use durable::{
+    PublishedAlpacaCalendar, publish_alpaca_market_calendar,
+    publish_alpaca_market_calendar_with_job_context, read_alpaca_completed_calendar,
+    read_alpaca_completed_calendar_with_job_context,
+    read_alpaca_retained_calendar_with_job_context,
+};
+pub(crate) use publication::try_bind_alpaca_calendar_publication;
+
 use std::{fmt, fmt::Write as _, sync::Arc};
 
-use chrono::{DateTime, Datelike as _, LocalResult, NaiveDate, TimeZone as _, Utc};
 use chrono_tz::{America::New_York, IANA_TZDB_VERSION};
+
+use market_squawk_adapter_alpaca::calendar_decode::{
+    ALPACA_IEX_DAILY_AGGREGATION_RULE as ALPACA_DAILY_AGGREGATION_RULE, AlpacaCalendarDayWire,
+    AlpacaCalendarDecodeError, AlpacaMarketWire, ExactInterval, OptionalWire, ParsedCalendarDay,
+    new_york_civil_day, parse_calendar_date, parse_calendar_day, validate_market_identity,
+    validate_market_identity_for,
+};
 
 use market_squawk_adapter_alpaca::{
     AlpacaError, AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest,
@@ -27,14 +45,10 @@ use super::{
 
 const ALPACA_PROVIDER_ID: &str = "alpaca-market-data";
 const ALPACA_IEX_VENUE: &str = "iex";
-const ALPACA_IEX_MARKET: &str = "IEX";
-const ALPACA_MARKET_TIME_ZONE: &str = "America/New_York";
 const ALPACA_DAILY_TIMEFRAME: &str = "1Day";
 const ALPACA_CALENDAR_ID: &str = "alpaca-v3-calendar-iex-utc";
 const ALPACA_DAILY_RULESET_ID: &str = "alpaca-v3-iex-utc-daily-rules-v1";
-const ALPACA_DAILY_AGGREGATION_RULE: &[u8] = b"market-squawk/alpaca-v3-iex-utc-daily/v1\0provider-timestamp=period-start\0period=America/New_York-civil-day\0session=provider-defined\0";
 pub(crate) const MAXIMUM_ALPACA_CALENDAR_RESPONSE_BYTES: usize = 64 * 1024;
-const MAXIMUM_ALPACA_MARKET_NAME_BYTES: usize = 256;
 const MAXIMUM_ALPACA_CALENDAR_SEGMENTS: usize = 4;
 
 /// Exact Alpaca trading API origin selected by the active account environment.
@@ -305,70 +319,6 @@ struct AlpacaCalendarEnvelope {
     calendar: CalendarRows,
 }
 
-#[derive(Deserialize)]
-struct AlpacaMarketWire {
-    acronym: String,
-    name: String,
-    timezone: String,
-    #[serde(default)]
-    bic: OptionalWire<String>,
-    #[serde(default)]
-    mic: OptionalWire<String>,
-}
-
-#[derive(Deserialize)]
-struct AlpacaCalendarDayWire {
-    date: String,
-    core_start: String,
-    core_end: String,
-    #[serde(default)]
-    pre_start: OptionalWire<String>,
-    #[serde(default)]
-    pre_end: OptionalWire<String>,
-    #[serde(default)]
-    post_start: OptionalWire<String>,
-    #[serde(default)]
-    post_end: OptionalWire<String>,
-    #[serde(default)]
-    lunch_start: OptionalWire<String>,
-    #[serde(default)]
-    lunch_end: OptionalWire<String>,
-    #[serde(default)]
-    settlement_date: OptionalWire<String>,
-}
-
-enum OptionalWire<T> {
-    Missing,
-    Present(T),
-}
-
-impl<T> Default for OptionalWire<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
-}
-
-impl<'de, T> Deserialize<'de> for OptionalWire<T>
-where
-    T: Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        T::deserialize(deserializer).map(Self::Present)
-    }
-}
-
-impl OptionalWire<String> {
-    fn as_deref(&self) -> Option<&str> {
-        match self {
-            Self::Missing => None,
-            Self::Present(value) => Some(value),
-        }
-    }
-}
-
 enum CalendarRows {
     Empty,
     One(AlpacaCalendarDayWire),
@@ -406,222 +356,6 @@ impl<'de> Visitor<'de> for CalendarRowsVisitor {
         while sequence.next_element::<IgnoredAny>()?.is_some() {}
         Ok(CalendarRows::Multiple)
     }
-}
-
-#[derive(Clone, Copy)]
-struct ExactInterval {
-    start: Timestamp,
-    end: Timestamp,
-}
-
-impl ExactInterval {
-    fn try_new(start: Timestamp, end: Timestamp) -> Result<Self, AlpacaIexUtcCalendarError> {
-        if start >= end {
-            return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-        }
-        Ok(Self { start, end })
-    }
-
-    const fn new_unchecked(start: Timestamp, end: Timestamp) -> Self {
-        Self { start, end }
-    }
-}
-
-struct ParsedCalendarDay {
-    core: ExactInterval,
-    pre: Option<ExactInterval>,
-    post: Option<ExactInterval>,
-    lunch: Option<ExactInterval>,
-    settlement_date: Option<CalendarDate>,
-}
-
-fn validate_market_identity(market: &AlpacaMarketWire) -> Result<(), AlpacaIexUtcCalendarError> {
-    if market.acronym != ALPACA_IEX_MARKET
-        || market.timezone != ALPACA_MARKET_TIME_ZONE
-        || market.name.is_empty()
-        || market.name.len() > MAXIMUM_ALPACA_MARKET_NAME_BYTES
-        || market.name.trim() != market.name
-        || market.name.chars().any(char::is_control)
-    {
-        return Err(AlpacaIexUtcCalendarUnavailable::UnknownMarketIdentity.into());
-    }
-    if market
-        .mic
-        .as_deref()
-        .is_some_and(|value| !is_upper_alphanumeric(value, 4))
-        || market
-            .bic
-            .as_deref()
-            .is_some_and(|value| !is_upper_alphanumeric(value, 11))
-    {
-        return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-    }
-    Ok(())
-}
-
-fn is_upper_alphanumeric(value: &str, exact_length: usize) -> bool {
-    value.len() == exact_length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-}
-
-fn parse_calendar_day(
-    day: AlpacaCalendarDayWire,
-    response_date: CalendarDate,
-    period_start: Timestamp,
-    period_end_exclusive: Timestamp,
-) -> Result<ParsedCalendarDay, AlpacaIexUtcCalendarError> {
-    let AlpacaCalendarDayWire {
-        date: _,
-        core_start,
-        core_end,
-        pre_start,
-        pre_end,
-        post_start,
-        post_end,
-        lunch_start,
-        lunch_end,
-        settlement_date,
-    } = day;
-    let core = ExactInterval::try_new(
-        parse_utc_timestamp(&core_start)?,
-        parse_utc_timestamp(&core_end)?,
-    )?;
-    let pre = parse_optional_interval(pre_start, pre_end)?;
-    let post = parse_optional_interval(post_start, post_end)?;
-    let lunch = parse_optional_interval(lunch_start, lunch_end)?;
-    let settlement_date = match settlement_date {
-        OptionalWire::Missing => None,
-        OptionalWire::Present(value) => Some(parse_calendar_date(&value)?),
-    };
-    if settlement_date.is_some_and(|settlement_date| settlement_date < response_date) {
-        return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-    }
-    for interval in [Some(core), pre, post, lunch].into_iter().flatten() {
-        if interval.start < period_start || interval.end > period_end_exclusive {
-            return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-        }
-    }
-    if pre.is_some_and(|interval| interval.end > core.start)
-        || post.is_some_and(|interval| interval.start < core.end)
-        || lunch.is_some_and(|interval| interval.start <= core.start || interval.end >= core.end)
-    {
-        return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-    }
-    Ok(ParsedCalendarDay {
-        core,
-        pre,
-        post,
-        lunch,
-        settlement_date,
-    })
-}
-
-fn parse_optional_interval(
-    start: OptionalWire<String>,
-    end: OptionalWire<String>,
-) -> Result<Option<ExactInterval>, AlpacaIexUtcCalendarError> {
-    match (start, end) {
-        (OptionalWire::Missing, OptionalWire::Missing) => Ok(None),
-        (OptionalWire::Present(start), OptionalWire::Present(end)) => {
-            ExactInterval::try_new(parse_utc_timestamp(&start)?, parse_utc_timestamp(&end)?)
-                .map(Some)
-        }
-        (OptionalWire::Missing, OptionalWire::Present(_))
-        | (OptionalWire::Present(_), OptionalWire::Missing) => {
-            Err(AlpacaIexUtcCalendarError::InvalidResponse)
-        }
-    }
-}
-
-fn parse_calendar_date(value: &str) -> Result<CalendarDate, AlpacaIexUtcCalendarError> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 10
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
-    {
-        return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-    }
-    let year = value[0..4]
-        .parse::<u16>()
-        .map_err(|_| AlpacaIexUtcCalendarError::InvalidResponse)?;
-    let month = value[5..7]
-        .parse::<u8>()
-        .map_err(|_| AlpacaIexUtcCalendarError::InvalidResponse)?;
-    let day = value[8..10]
-        .parse::<u8>()
-        .map_err(|_| AlpacaIexUtcCalendarError::InvalidResponse)?;
-    CalendarDate::new(year, month, day).map_err(|_| AlpacaIexUtcCalendarError::InvalidResponse)
-}
-
-fn parse_utc_timestamp(value: &str) -> Result<Timestamp, AlpacaIexUtcCalendarError> {
-    if value.len() > 64
-        || value.as_bytes().get(10) != Some(&b'T')
-        || !(value.ends_with('Z') || value.ends_with("+00:00"))
-    {
-        return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-    }
-    let parsed = DateTime::parse_from_rfc3339(value)
-        .map_err(|_| AlpacaIexUtcCalendarError::InvalidResponse)?;
-    if parsed.offset().local_minus_utc() != 0 {
-        return Err(AlpacaIexUtcCalendarError::InvalidResponse);
-    }
-    parsed
-        .timestamp_nanos_opt()
-        .map(Timestamp::from_unix_nanos)
-        .ok_or(AlpacaIexUtcCalendarError::InvalidResponse)
-}
-
-fn new_york_civil_day(
-    date: CalendarDate,
-) -> Result<(CalendarDate, Timestamp, Timestamp), AlpacaIexUtcCalendarError> {
-    let naive = NaiveDate::from_ymd_opt(
-        i32::from(date.year()),
-        u32::from(date.month()),
-        u32::from(date.day()),
-    )
-    .ok_or(AlpacaIexUtcCalendarError::InvalidResponse)?;
-    let next = naive
-        .succ_opt()
-        .ok_or(AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable)?;
-    let next_year = u16::try_from(next.year())
-        .map_err(|_| AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable)?;
-    let next_date = CalendarDate::new(
-        next_year,
-        u8::try_from(next.month())
-            .map_err(|_| AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable)?,
-        u8::try_from(next.day())
-            .map_err(|_| AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable)?,
-    )
-    .map_err(|_| AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable)?;
-    let start = resolve_new_york_midnight(naive)?;
-    let end = resolve_new_york_midnight(next)?;
-    if start >= end {
-        return Err(AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable.into());
-    }
-    Ok((next_date, start, end))
-}
-
-fn resolve_new_york_midnight(date: NaiveDate) -> Result<Timestamp, AlpacaIexUtcCalendarError> {
-    let local = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or(AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable)?;
-    let resolved = match New_York.from_local_datetime(&local) {
-        LocalResult::Single(resolved) => resolved,
-        LocalResult::Ambiguous(_, _) | LocalResult::None => {
-            return Err(AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable.into());
-        }
-    };
-    resolved
-        .with_timezone(&Utc)
-        .timestamp_nanos_opt()
-        .map(Timestamp::from_unix_nanos)
-        .ok_or_else(|| AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable.into())
 }
 
 fn calendar_session(
@@ -803,6 +537,23 @@ pub(crate) enum AlpacaIexUtcCalendarError {
     /// The parsed schedule failed source-neutral authority admission.
     #[error(transparent)]
     Calendar(#[from] MarketCalendarError),
+}
+
+impl From<AlpacaCalendarDecodeError> for AlpacaIexUtcCalendarError {
+    fn from(error: AlpacaCalendarDecodeError) -> Self {
+        match error {
+            AlpacaCalendarDecodeError::UnknownMarketIdentity => {
+                AlpacaIexUtcCalendarUnavailable::UnknownMarketIdentity.into()
+            }
+            AlpacaCalendarDecodeError::TimeZoneRulesUnavailable => {
+                AlpacaIexUtcCalendarUnavailable::TimeZoneRulesUnavailable.into()
+            }
+            AlpacaCalendarDecodeError::ResourceBoundExceeded => Self::ResourceBoundExceeded,
+            AlpacaCalendarDecodeError::InvalidResponse | AlpacaCalendarDecodeError::Control(_) => {
+                Self::InvalidResponse
+            }
+        }
+    }
 }
 
 impl From<AlpacaIexUtcCalendarUnavailable> for AlpacaIexUtcCalendarError {

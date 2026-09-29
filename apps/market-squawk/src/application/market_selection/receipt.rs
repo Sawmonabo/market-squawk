@@ -322,6 +322,7 @@ pub(crate) struct MarketSelectionReceipt {
     rejected: Vec<RejectedCandidate>,
     selected_at: Timestamp,
     selection_digest: EvidenceDigest,
+    source_evidence_digest: EvidenceDigest,
 }
 
 impl MarketSelectionReceipt {
@@ -334,6 +335,7 @@ impl MarketSelectionReceipt {
         rejected: Vec<RejectedCandidate>,
         selected_at: Timestamp,
         selection_digest: EvidenceDigest,
+        source_evidence_digest: EvidenceDigest,
     ) -> Self {
         Self {
             policy_revision,
@@ -344,6 +346,7 @@ impl MarketSelectionReceipt {
             rejected,
             selected_at,
             selection_digest,
+            source_evidence_digest,
         }
     }
 
@@ -383,6 +386,12 @@ impl MarketSelectionReceipt {
     /// SHA-256 commitment to the complete ordered request, evidence, decision, and policy receipt.
     pub(crate) const fn selection_digest(&self) -> EvidenceDigest {
         self.selection_digest
+    }
+
+    /// Stable source/policy selection identity. This excludes renewed authorization decision
+    /// clocks and identities and cannot prove rights; consumers must hold current authorization.
+    pub(crate) const fn source_evidence_digest(&self) -> EvidenceDigest {
+        self.source_evidence_digest
     }
 
     pub(crate) fn selected(&self) -> Option<SelectedMarketSource<'_>> {

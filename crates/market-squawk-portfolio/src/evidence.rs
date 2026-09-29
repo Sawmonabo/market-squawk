@@ -112,6 +112,7 @@ impl CorporateActionBinding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionEvidence {
     pub(crate) as_of: Timestamp,
+    pub(crate) knowledge_cutoff: Timestamp,
     pub(crate) dataset: DatasetManifestRef,
     pub(crate) point_in_time_content: Sha256Digest,
     pub(crate) point_in_time_audit: Sha256Digest,
@@ -135,13 +136,38 @@ impl RevisionEvidence {
         dataset: DatasetManifestRef,
         point_in_time_content: Sha256Digest,
         point_in_time_audit: Sha256Digest,
+        sources: Vec<SourceIdentifier>,
+        features: Vec<FeatureBinding>,
+        corporate_action: Option<CorporateActionBinding>,
+    ) -> Result<Self, PortfolioError> {
+        Self::try_new_with_knowledge_cutoff(
+            as_of,
+            as_of,
+            dataset,
+            point_in_time_content,
+            point_in_time_audit,
+            sources,
+            features,
+            corporate_action,
+        )
+    }
+
+    /// Separates retrospective actual knowledge from the simulated economic valuation clock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_knowledge_cutoff(
+        as_of: Timestamp,
+        knowledge_cutoff: Timestamp,
+        dataset: DatasetManifestRef,
+        point_in_time_content: Sha256Digest,
+        point_in_time_audit: Sha256Digest,
         mut sources: Vec<SourceIdentifier>,
         mut features: Vec<FeatureBinding>,
         corporate_action: Option<CorporateActionBinding>,
     ) -> Result<Self, PortfolioError> {
-        if sources.is_empty()
+        if as_of > knowledge_cutoff
+            || sources.is_empty()
             || corporate_action.is_some_and(|binding| {
-                binding.knowledge_cutoff > as_of || binding.valuation_cutoff > as_of
+                binding.knowledge_cutoff > knowledge_cutoff || binding.valuation_cutoff > as_of
             })
         {
             return Err(PortfolioError::EvidenceMismatch);
@@ -156,6 +182,7 @@ impl RevisionEvidence {
         }
         Ok(Self {
             as_of,
+            knowledge_cutoff,
             dataset,
             point_in_time_content,
             point_in_time_audit,
@@ -165,7 +192,12 @@ impl RevisionEvidence {
         })
     }
 
-    /// Returns the valuation and knowledge time of the revision.
+    /// Returns the actual latest knowledge allowed by this revision's source evidence.
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    /// Returns the economic valuation time of the revision.
     pub const fn as_of(&self) -> Timestamp {
         self.as_of
     }
@@ -340,6 +372,50 @@ impl ValuationSet {
         fx_rates: Vec<FxRateEvidence>,
         limits: PortfolioLimits,
     ) -> Result<Self, PortfolioError> {
+        Self::try_new_with_timing(
+            base_currency,
+            as_of,
+            dataset,
+            point_in_time_content,
+            prices,
+            fx_rates,
+            limits,
+            true,
+        )
+    }
+
+    /// Values source-admitted executable marks at a cutoff while retaining each observed time.
+    /// The execution source checks freshness; this constructor never rewrites source timestamps.
+    pub fn try_new_with_observation_times(
+        base_currency: Currency,
+        as_of: Timestamp,
+        dataset: DatasetManifestRef,
+        point_in_time_content: Sha256Digest,
+        prices: Vec<PriceEvidence>,
+        fx_rates: Vec<FxRateEvidence>,
+        limits: PortfolioLimits,
+    ) -> Result<Self, PortfolioError> {
+        Self::try_new_with_timing(
+            base_currency,
+            as_of,
+            dataset,
+            point_in_time_content,
+            prices,
+            fx_rates,
+            limits,
+            false,
+        )
+    }
+    fn try_new_with_timing(
+        base_currency: Currency,
+        as_of: Timestamp,
+        dataset: DatasetManifestRef,
+        point_in_time_content: Sha256Digest,
+        prices: Vec<PriceEvidence>,
+        fx_rates: Vec<FxRateEvidence>,
+        limits: PortfolioLimits,
+        simultaneous: bool,
+    ) -> Result<Self, PortfolioError> {
         if prices.len() > limits.max_instruments {
             return Err(PortfolioError::LimitExceeded {
                 resource: "prices",
@@ -356,7 +432,10 @@ impl ValuationSet {
         }
         let mut price_map = BTreeMap::new();
         for price in prices {
-            if price.as_of != as_of || price_map.insert(price.instrument_id, price).is_some() {
+            if price.as_of > as_of
+                || (simultaneous && price.as_of != as_of)
+                || price_map.insert(price.instrument_id, price).is_some()
+            {
                 return Err(PortfolioError::EvidenceMismatch);
             }
         }
@@ -537,14 +616,16 @@ pub struct PortfolioRevision {
     pub(crate) base_currency: Currency,
     pub(crate) cash: Money,
     pub(crate) cash_balances: Vec<CashBalance>,
+    pub(crate) cash_entitlements: Vec<crate::CashEntitlement>,
+    pub(crate) receivable_value: Money,
     pub(crate) positions: Vec<Position>,
     pub(crate) market_value: Money,
     pub(crate) gross_exposure: Money,
     pub(crate) marked_equity: Money,
     pub(crate) peak_marked_equity: Money,
     pub(crate) cost_basis: BasisMeasurement,
-    pub(crate) realized_gain: Money,
-    pub(crate) realized_loss: Money,
+    pub(crate) realized_gain: BasisMeasurement,
+    pub(crate) realized_loss: BasisMeasurement,
     pub(crate) unrealized_gain: BasisMeasurement,
     pub(crate) drawdown: Money,
     pub(crate) income: Money,
@@ -596,6 +677,16 @@ impl PortfolioRevision {
         &self.cash_balances
     }
 
+    /// Returns every source-plan cash entitlement, including settled audit entries.
+    pub fn cash_entitlements(&self) -> &[crate::CashEntitlement] {
+        &self.cash_entitlements
+    }
+
+    /// Returns signed unpaid entitlements in the reporting currency. This value is not spendable.
+    pub const fn receivable_value(&self) -> Money {
+        self.receivable_value
+    }
+
     /// Returns positions in canonical instrument order.
     pub fn positions(&self) -> &[Position] {
         &self.positions
@@ -619,7 +710,7 @@ impl PortfolioRevision {
         self.gross_exposure
     }
 
-    /// Returns reporting-currency cash plus signed position market value.
+    /// Returns cash plus signed unpaid entitlements and position market value.
     pub const fn marked_equity(&self) -> Money {
         self.marked_equity
     }
@@ -635,12 +726,12 @@ impl PortfolioRevision {
     }
 
     /// Returns realized trading and capital-action gain.
-    pub const fn realized_gain(&self) -> Money {
+    pub const fn realized_gain(&self) -> BasisMeasurement {
         self.realized_gain
     }
 
     /// Returns cumulative loss magnitude from negative realized outcomes.
-    pub const fn realized_loss(&self) -> Money {
+    pub const fn realized_loss(&self) -> BasisMeasurement {
         self.realized_loss
     }
 

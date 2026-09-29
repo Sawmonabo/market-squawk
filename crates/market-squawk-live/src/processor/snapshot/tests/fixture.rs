@@ -1,3 +1,6 @@
+#[path = "../../../../../market-squawk-sources/tests/common/mod.rs"]
+mod source_fixture;
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
@@ -74,6 +77,7 @@ pub(super) struct PopulatedState {
     pub(super) evaluated_at: Timestamp,
     pub(super) source_valid_until: Timestamp,
     _generation_owners: Vec<GenerationLeaseOwner>,
+    _source_registries: Vec<AuthoritativeSourceRegistry>,
 }
 
 pub(super) fn populated_state() -> TestResult<PopulatedState> {
@@ -82,6 +86,7 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
     let mut streams = HashMap::new();
     let mut statuses = StatusBook::try_new(3)?;
     let mut generation_owners = Vec::new();
+    let mut source_registries = Vec::new();
     let mut expected_timeline = None;
     for (allocation, source, product, channel, status) in [
         (
@@ -106,7 +111,7 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
             TradingStatus::Inactive,
         ),
     ] {
-        let (current, timeline) = current_snapshot(source, product, channel)?;
+        let (current, timeline, registry) = current_snapshot(source, product, channel)?;
         if source == "source-a" {
             expected_timeline = Some(timeline);
         }
@@ -134,6 +139,7 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
         assert_eq!(binding.status, status);
         streams.insert(current.stream_key().clone(), state);
         generation_owners.push(owner);
+        source_registries.push(registry);
     }
     let expected_timeline = expected_timeline.ok_or("source-a timeline was not constructed")?;
     Ok(PopulatedState {
@@ -145,6 +151,7 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
         evaluated_at: expected_timeline.evaluated_at,
         source_valid_until: expected_timeline.source_valid_until,
         _generation_owners: generation_owners,
+        _source_registries: source_registries,
     })
 }
 
@@ -155,11 +162,12 @@ fn current_snapshot(
 ) -> TestResult<(
     market_squawk_sources::CurrentProviderObservation,
     SnapshotTimeline,
+    AuthoritativeSourceRegistry,
 )> {
     let instrument = InstrumentId::from_str(INSTRUMENT)?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(
+    let (mut registry, registered) = source_fixture::register_fixture_source(
         metadata(source, product, channel, instrument)?,
+        &[(instrument, "BTC-USD")],
         Timestamp::from_unix_nanos(1),
     )?;
     let session = registry.begin_session(
@@ -219,6 +227,11 @@ fn current_snapshot(
         id(&format!("snapshot-{source}"))?,
         VenueId::try_from("coinbase")?,
         instrument,
+        market_squawk_sources::ProviderNativeInstrumentIdentity::new(
+            market_squawk_domain::SourceId::try_from("coinbase-advanced-trade")?,
+            market_squawk_domain::ProviderInstrumentId::try_from("BTC-USD")?,
+            market_squawk_domain::VenueSymbol::try_from("BTC-USD")?,
+        ),
         ProviderTimestampEvidence::Provided {
             value: timeline.source_timestamp,
             rule: rule("snapshot-timestamp")?,
@@ -257,6 +270,7 @@ fn current_snapshot(
             .next()
             .ok_or("snapshot fixture lost current observation")?,
         timeline,
+        registry,
     ))
 }
 

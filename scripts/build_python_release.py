@@ -37,12 +37,6 @@ MAX_RUNTIME_DISTRIBUTIONS = 32
 MAX_DISTRIBUTION_FILES = 16_384
 MAX_DISTRIBUTION_EXTERNAL_PATHS = 256
 MAX_DISTRIBUTION_ROOTS = 64
-MAX_DISTRIBUTION_FILE_BYTES = 256 * 1024 * 1024
-MAX_APPLICATION_EXECUTABLE_BYTES = 768 * 1024 * 1024
-MAX_ONNX_WORKER_EXECUTABLE_BYTES = 256 * 1024 * 1024
-MAX_VALIDATOR_EXECUTABLE_BYTES = 256 * 1024 * 1024
-MAX_TRAINING_LAUNCHER_BYTES = 32 * 1024 * 1024
-MAX_DISTRIBUTION_BYTES = 1024 * 1024 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024
 RUST_TOOLCHAIN = "1.97.1"
 MACOS_DEPLOYMENT_TARGET = "12.0"
@@ -1284,25 +1278,20 @@ def _extract_tar_archive(
     mode = "r:gz" if archive_format == "tar.gz" else "r:xz"
     with tarfile.open(archive, mode=mode) as source:
         members = source.getmembers()
-        total = 0
         if not members or len(members) > 32_768:
             raise ReleaseBuildError("release component archive entry count is invalid")
         for member in members:
             _validate_archive_path(member.name)
             if not (member.isdir() or member.isreg() or member.issym() or member.islnk()):
                 raise ReleaseBuildError("release component archive contains a special entry")
-            if member.size < 0 or member.size > MAX_DISTRIBUTION_FILE_BYTES:
-                raise ReleaseBuildError("release component archive entry is oversized")
-            total += member.size
-            if total > MAX_DISTRIBUTION_BYTES:
-                raise ReleaseBuildError("release component archive is oversized")
+            if member.size < 0:
+                raise ReleaseBuildError("release component archive entry size is invalid")
         source.extractall(destination, members=members, filter="data")
 
 
 def _extract_zip_archive(archive: Path, destination: Path) -> None:
     with zipfile.ZipFile(archive, mode="r") as source:
         members = source.infolist()
-        total = 0
         if not members or len(members) > 32_768:
             raise ReleaseBuildError("release component archive entry count is invalid")
         for member in members:
@@ -1312,13 +1301,9 @@ def _extract_zip_archive(archive: Path, destination: Path) -> None:
             if (
                 member.flag_bits & 0x1
                 or member.file_size < 0
-                or member.file_size > MAX_DISTRIBUTION_FILE_BYTES
                 or file_type not in (0, stat.S_IFREG, stat.S_IFDIR)
             ):
                 raise ReleaseBuildError("release component archive contains an invalid entry")
-            total += member.file_size
-            if total > MAX_DISTRIBUTION_BYTES:
-                raise ReleaseBuildError("release component archive is oversized")
             output = destination.joinpath(*PurePosixPath(member.filename).parts)
             if member.is_dir():
                 output.mkdir(parents=True, exist_ok=True)
@@ -1342,7 +1327,6 @@ def _validate_archive_path(value: str) -> None:
 
 def _admit_extracted_tree(root: Path) -> None:
     files = 0
-    total = 0
     for path in root.rglob("*"):
         metadata = path.lstat()
         if path.is_symlink():
@@ -1355,9 +1339,8 @@ def _admit_extracted_tree(root: Path) -> None:
         if not stat.S_ISREG(metadata.st_mode):
             raise ReleaseBuildError("release component archive contains a special file")
         files += 1
-        total += metadata.st_size
-        if files > 32_768 or total > MAX_DISTRIBUTION_BYTES:
-            raise ReleaseBuildError("release component extraction exceeds its fixed bounds")
+        if files > 32_768:
+            raise ReleaseBuildError("release component extraction file count exceeds its bound")
 
 
 def admit_development_runtime_root(
@@ -2239,7 +2222,6 @@ def _download_locked_wheel(artifact: dict[str, object], destination: Path) -> No
     if (
         not isinstance(expected_size, int)
         or expected_size <= 0
-        or expected_size > MAX_DISTRIBUTION_FILE_BYTES
         or not isinstance(expected_digest, str)
     ):
         raise ReleaseBuildError("selected wheel identity is invalid")
@@ -2304,6 +2286,8 @@ def _inspect_wheel_license_files(
     result = []
     for name in candidates:
         try:
+            if archive.getinfo(name).file_size > MAX_RECORD_BYTES:
+                raise ReleaseBuildError("wheel license material exceeds its byte bound")
             payload = archive.read(name)
         except KeyError as error:
             raise ReleaseBuildError("declared wheel license file is absent") from error
@@ -2321,6 +2305,8 @@ def _inspect_wheel_license_files(
 
 def _validate_wheel_record(archive: zipfile.ZipFile, record_name: str) -> None:
     try:
+        if archive.getinfo(record_name).file_size > MAX_RECORD_BYTES:
+            raise ReleaseBuildError("wheel RECORD exceeds its byte bound")
         rows = list(csv.reader(io.TextIOWrapper(archive.open(record_name), encoding="utf-8")))
     except (UnicodeError, csv.Error) as error:
         raise ReleaseBuildError("wheel RECORD is unreadable") from error
@@ -2336,9 +2322,14 @@ def _validate_wheel_record(archive: zipfile.ZipFile, record_name: str) -> None:
         digest_value, size_value = records[name]
         if not digest_value.startswith("sha256=") or not size_value.isdigit():
             raise ReleaseBuildError("wheel RECORD entry lacks SHA-256 or size")
-        payload = archive.read(name)
-        encoded = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
-        if digest_value != f"sha256={encoded}" or int(size_value) != len(payload):
+        digest = hashlib.sha256()
+        observed = 0
+        with archive.open(name) as stream:
+            while chunk := stream.read(1024 * 1024):
+                observed += len(chunk)
+                digest.update(chunk)
+        encoded = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode()
+        if digest_value != f"sha256={encoded}" or int(size_value) != observed:
             raise ReleaseBuildError("wheel RECORD entry identity differs")
 
 
@@ -3058,6 +3049,8 @@ def _build_release(
         bootstrap_environment,
         native_code_signing,
     )
+    dataset_fixture = _build_dataset_fixture_executable(root, toolchain, bootstrap_environment)
+    dataset_fixture_sha256 = _file_digest(dataset_fixture)[1]
     validator_size, validator_sha256 = _file_digest(built_executables.validator)
     build_python = _create_venv(
         build_runtime,
@@ -3292,6 +3285,9 @@ def _build_release(
             root,
             runtime_environment,
         )
+        fixture_environment = dict(runtime_environment)
+        fixture_environment["MARKET_SQUAWK_DATASET_FIXTURE_EXECUTABLE"] = str(dataset_fixture)
+        fixture_environment["MARKET_SQUAWK_DATASET_FIXTURE_SHA256"] = dataset_fixture_sha256
         _run(
             [
                 release_python,
@@ -3303,7 +3299,7 @@ def _build_release(
                 "-q",
             ],
             root,
-            runtime_environment,
+            fixture_environment,
         )
         matrix_evidence.append(
             {
@@ -3319,6 +3315,7 @@ def _build_release(
                     runtime_environment,
                 ),
                 "focused_tests": list(FOCUSED_TESTS),
+                "dataset_fixture_executable_sha256": dataset_fixture_sha256,
                 "training_environment_sha256": environment_sha256,
                 "runtime_distributions": [
                     {
@@ -3394,6 +3391,54 @@ def _build_release(
         )
     _remove_owned_child(layout.build_venv, layout.root, "build-venv")
     _remove_owned_child(layout.build_home, layout.root, "build-home")
+
+
+
+def _build_dataset_fixture_executable(
+    root: Path,
+    toolchain: dict[str, object],
+    environment: dict[str, str],
+) -> Path:
+    """Build the existing data producer test for verification; never install it in the release."""
+    command = [
+        str(_bound_tool(toolchain, "cargo")), "test", "-p", "market-squawk-data",
+        "--test", "publication_recovery", "--no-run", "--release", "--locked",
+        "--message-format=json",
+    ]
+    # Compiler artifact messages can exceed the small tool-version output bound. Retain them
+    # in a temporary file instead of buffering the dependency graph on the Python heap.
+    with tempfile.TemporaryFile(mode="w+b") as messages:
+        completed = subprocess.run(
+            command, cwd=root, env=environment, stdin=subprocess.DEVNULL,
+            stdout=messages, check=False,
+        )
+        if completed.returncode != 0:
+            raise ReleaseBuildError("existing data fixture producer did not build")
+        if messages.tell() > 16 * 1024 * 1024:
+            raise ReleaseBuildError("data fixture compiler evidence exceeded its bound")
+        messages.seek(0)
+        candidates: set[Path] = set()
+        while line := messages.readline(1024 * 1024 + 1):
+            if len(line) > 1024 * 1024:
+                raise ReleaseBuildError("data fixture compiler message exceeded its bound")
+            value = json.loads(line)
+            if (
+                value.get("reason") == "compiler-artifact"
+                and value.get("target", {}).get("name") == "publication_recovery"
+                and value.get("target", {}).get("kind") == ["test"]
+                and value.get("executable") is not None
+            ):
+                candidates.add(Path(value["executable"]))
+    if len(candidates) != 1:
+        raise ReleaseBuildError("existing data fixture executable was not uniquely produced")
+    executable = candidates.pop()
+    expected_parent = _cargo_release_dir(root, platform_profile(str(toolchain.get("target")))) / "deps"
+    if (
+        executable.is_symlink() or not executable.is_file()
+        or executable.resolve(strict=True).parent != expected_parent.resolve(strict=True)
+    ):
+        raise ReleaseBuildError("data fixture executable escaped the existing Cargo output")
+    return executable.resolve(strict=True)
 
 
 def _build_native_release_executables(
@@ -3474,16 +3519,10 @@ def _development_runtime_receipt(
     }
     programs = {}
     for name, path in program_paths.items():
-        maximum_bytes = (
-            MAX_ONNX_WORKER_EXECUTABLE_BYTES
-            if name == "onnx_worker"
-            else MAX_APPLICATION_EXECUTABLE_BYTES
-        )
         if (
             path.is_symlink()
             or not path.is_file()
             or path.stat().st_size == 0
-            or path.stat().st_size > maximum_bytes
         ):
             raise ReleaseBuildError("development runtime program is unavailable")
         size_bytes, sha256 = _file_digest(path)
@@ -3498,11 +3537,9 @@ def _development_runtime_receipt(
         installed_application.is_symlink()
         or not installed_application.is_file()
         or installed_application.stat().st_size == 0
-        or installed_application.stat().st_size > MAX_APPLICATION_EXECUTABLE_BYTES
         or installed_worker.is_symlink()
         or not installed_worker.is_file()
         or installed_worker.stat().st_size == 0
-        or installed_worker.stat().st_size > MAX_ONNX_WORKER_EXECUTABLE_BYTES
     ):
         raise ReleaseBuildError("development runtime installed program is unavailable")
     if (
@@ -3679,7 +3716,6 @@ def install_native_training_driver(
         source.is_symlink()
         or not source.is_file()
         or source.stat().st_size == 0
-        or source.stat().st_size > MAX_TRAINING_LAUNCHER_BYTES
         or destination.is_symlink()
         or not destination.is_file()
         or len(record_candidates) != 1
@@ -4164,24 +4200,18 @@ def _copy_runtime_release(
     if expected_source.resolve(strict=True) != runtime.executable:
         raise ReleaseBuildError("managed Python runtime layout is not canonical")
     observed_files = 0
-    observed_bytes = 0
     for source in source_root.rglob("*"):
-        metadata = source.lstat()
         if source.is_symlink():
             resolved = source.resolve(strict=True)
             if not resolved.is_file() or not resolved.is_relative_to(source_root):
                 raise ReleaseBuildError("managed Python runtime contains an unsafe link")
-            size = resolved.stat().st_size
-        elif source.is_file():
-            size = metadata.st_size
         elif source.is_dir():
             continue
-        else:
+        elif not source.is_file():
             raise ReleaseBuildError("managed Python runtime contains a special file")
         observed_files += 1
-        observed_bytes += size
-        if observed_files > 32_768 or observed_bytes > 2 * 1024 * 1024 * 1024:
-            raise ReleaseBuildError("managed Python runtime exceeds its copy bounds")
+        if observed_files > 32_768:
+            raise ReleaseBuildError("managed Python runtime file count exceeds its bound")
     shutil.copytree(
         source_root,
         release_root,
@@ -4535,29 +4565,20 @@ def build_release_manifest(
         for name, path in native_files.items()
     ):
         raise ReleaseBuildError("native release executable identity is invalid")
-    native_limits = {
-        "application": MAX_APPLICATION_EXECUTABLE_BYTES,
-        "onnx_worker": MAX_ONNX_WORKER_EXECUTABLE_BYTES,
-        "training_driver": MAX_TRAINING_LAUNCHER_BYTES,
-        "validator": MAX_VALIDATOR_EXECUTABLE_BYTES,
-    }
     try:
         native_sizes = {name: path.stat().st_size for name, path in native_files.items()}
     except OSError as error:
         raise ReleaseBuildError("native release executable identity is invalid") from error
-    if any(
-        size <= 0 or size > native_limits[name]
-        for name, size in native_sizes.items()
-    ):
-        raise ReleaseBuildError("native release executable exceeds its byte bound")
+    if any(size <= 0 for size in native_sizes.values()):
+        raise ReleaseBuildError("native release executable is empty")
     native_identities = {
         name: _file_digest(path) for name, path in native_files.items()
     }
     if any(
-        size != native_sizes[name] or size > native_limits[name]
+        size != native_sizes[name]
         for name, (size, _digest) in native_identities.items()
     ):
-        raise ReleaseBuildError("native release executable exceeds its byte bound")
+        raise ReleaseBuildError("native release executable changed during inspection")
     payload = {
         "application": {
             "sha256": native_identities["application"][1],
@@ -4617,9 +4638,8 @@ def harden_project_wheel(project_wheel: Path) -> None:
     if (
         project_wheel.is_symlink()
         or not project_wheel.is_file()
-        or project_wheel.stat().st_size > MAX_DISTRIBUTION_BYTES
     ):
-        raise ReleaseBuildError("project wheel is not a bounded regular file")
+        raise ReleaseBuildError("project wheel is not a regular file")
     mutable_bootstrap = "market_squawk/__init__.py"
     nested_native_prefix = "market_squawk/market_squawk."
     temporary = project_wheel.with_name(f".{project_wheel.name}.native-bootstrap")
@@ -4665,7 +4685,6 @@ def harden_project_wheel(project_wheel: Path) -> None:
                 raise ReleaseBuildError("project wheel native initializer is duplicated")
 
             with zipfile.ZipFile(temporary, "x", allowZip64=True) as destination:
-                total_size = 0
                 for member in members:
                     name = member.filename
                     path = _safe_record_path(name)
@@ -4679,7 +4698,6 @@ def harden_project_wheel(project_wheel: Path) -> None:
                         or member.flag_bits & 0x1
                         or stat.S_IFMT(mode) not in (0, stat.S_IFREG)
                         or member.file_size < 0
-                        or member.file_size > MAX_DISTRIBUTION_FILE_BYTES
                     ):
                         raise ReleaseBuildError("project wheel contains an invalid file")
                     if member == records[0] or name == mutable_bootstrap:
@@ -4700,11 +4718,6 @@ def harden_project_wheel(project_wheel: Path) -> None:
                             if not chunk:
                                 break
                             copied += len(chunk)
-                            total_size += len(chunk)
-                            if total_size > MAX_DISTRIBUTION_BYTES:
-                                raise ReleaseBuildError(
-                                    "project wheel expanded size exceeds its bound"
-                                )
                             digest.update(chunk)
                             writer.write(chunk)
                     if copied != member.file_size or output_name in entries:
@@ -4795,7 +4808,6 @@ def inspect_installed_distribution(
     owned_file_identities: set[tuple[int, int]] = set()
     saw_record = False
     saw_training_driver = False
-    total_size = 0
     try:
         with record.open("r", encoding="utf-8", newline="") as stream:
             for row in csv.reader(stream):
@@ -4894,14 +4906,9 @@ def inspect_installed_distribution(
                             "installed distribution RECORD identity mismatch"
                         )
                     hashed_entries.add(name)
-                if size < 0 or size > MAX_DISTRIBUTION_FILE_BYTES:
+                if size < 0 or name in entries:
                     raise ReleaseBuildError(
-                        "installed distribution file exceeds its byte bound"
-                    )
-                total_size += size
-                if total_size > MAX_DISTRIBUTION_BYTES or name in entries:
-                    raise ReleaseBuildError(
-                        "installed distribution RECORD is duplicated or oversized"
+                        "installed distribution RECORD size or ownership is invalid"
                     )
                 entries[name] = (observed_sha256, size)
     except (OSError, UnicodeError, csv.Error) as error:
@@ -5196,10 +5203,9 @@ def _inspect_installed_distribution_file(
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_size < 0
-            or before.st_size > MAX_DISTRIBUTION_FILE_BYTES
         ):
             raise ReleaseBuildError(
-                "installed distribution file exceeds its byte bound"
+                "installed distribution file is invalid"
             )
         digest = hashlib.sha256()
         header = bytearray()
@@ -5463,8 +5469,25 @@ def _sha256(value: object) -> None:
 
 
 def _file_digest(path: Path) -> tuple[int, str]:
-    content = path.read_bytes()
-    return len(content), hashlib.sha256(content).hexdigest()
+    digest = hashlib.sha256()
+    observed = 0
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ReleaseBuildError("release file is not regular")
+        while chunk := stream.read(1024 * 1024):
+            observed += len(chunk)
+            if observed > before.st_size:
+                raise ReleaseBuildError("release file changed during hashing")
+            digest.update(chunk)
+        after = os.fstat(stream.fileno())
+    if (
+        observed != before.st_size
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise ReleaseBuildError("release file changed during hashing")
+    return observed, digest.hexdigest()
 
 
 def _site_packages_path(

@@ -119,7 +119,8 @@ impl Default for CensusParseLimits {
 }
 
 /// Local receipt, decode, ingestion, and conservative availability clocks.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusClocks {
     received_at: Timestamp,
     decoded_at: Timestamp,
@@ -191,8 +192,9 @@ impl CensusClocks {
 }
 
 /// A provider-reported observation period without invented timestamp precision.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "precision")]
+#[serde(deny_unknown_fields)]
 pub enum CensusReportedTime {
     /// Four-digit year.
     Year { year: u16 },
@@ -260,11 +262,12 @@ impl CensusReportedTime {
 }
 
 /// One provider-native exact value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+#[serde(deny_unknown_fields)]
 pub enum CensusTypedValue {
     /// Exact integer.
-    Integer(i128),
+    Integer(#[serde(with = "retained_census_integer")] i128),
     /// Exact base-10 decimal.
     Decimal(Decimal),
     /// Provider text.
@@ -273,8 +276,31 @@ pub enum CensusTypedValue {
     Boolean(bool),
 }
 
+// Tagged Serde enums buffer their content without an i128 representation. Decimal text
+// preserves the complete provider integer domain in the one native evidence schema.
+mod retained_census_integer {
+    pub(super) fn serialize<S: serde::Serializer>(
+        value: &i128,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<i128, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        let value: i128 = text.parse().map_err(serde::de::Error::custom)?;
+        if value.to_string() != text {
+            return Err(serde::de::Error::custom("noncanonical Census integer"));
+        }
+        Ok(value)
+    }
+}
+
 /// One metadata-declared annotation or flag cell.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusAnnotation {
     variable: SourceIdentifier,
     raw: String,
@@ -293,8 +319,11 @@ impl CensusAnnotation {
 }
 
 /// Exact missing-value evidence.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum CensusMissingReason {
     /// Provider JSON null.
     JsonNull,
@@ -307,8 +336,9 @@ pub enum CensusMissingReason {
 }
 
 /// One primary value with closed missing, annotation, and invalid states.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
+#[serde(deny_unknown_fields)]
 pub enum CensusValueState {
     /// A typed value with every requested metadata annotation column present and empty.
     Observed { value: CensusTypedValue },
@@ -340,8 +370,9 @@ pub enum CensusValueState {
     },
 }
 
-/// One retained non-geographic request predicate.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// One exact non-geographic row coordinate from a response or fixed predicate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusPredicateValue {
     variable: SourceIdentifier,
     predicate_type: CensusPredicateType,
@@ -349,6 +380,14 @@ pub struct CensusPredicateValue {
 }
 
 impl CensusPredicateValue {
+    pub(crate) fn from_validated_predicate(predicate: &crate::CensusPredicate) -> Self {
+        Self {
+            variable: predicate.variable().clone(),
+            predicate_type: predicate.predicate_type().clone(),
+            values: predicate.values().to_vec(),
+        }
+    }
+
     /// Returns the predicate variable.
     pub const fn variable(&self) -> &SourceIdentifier {
         &self.variable
@@ -359,20 +398,41 @@ impl CensusPredicateValue {
         &self.predicate_type
     }
 
-    /// Returns repeated query values.
+    /// Returns the single exact row coordinate.
     pub fn values(&self) -> &[String] {
         &self.values
+    }
+
+    pub(crate) fn is_exact(&self) -> bool {
+        self.values.len() == 1
+            && crate::CensusPredicate::try_new(
+                self.variable.as_str(),
+                self.predicate_type.clone(),
+                &self.values,
+            )
+            .is_ok_and(|predicate| predicate.exact_value().is_some())
     }
 }
 
 /// One exact standard geography component.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusGeographyComponent {
     level: String,
     code: String,
 }
 
 impl CensusGeographyComponent {
+    pub(crate) fn retained_state(code: &str) -> Result<Self, CensusAdapterError> {
+        if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(CensusAdapterError::InvalidQuery);
+        }
+        Ok(Self {
+            level: "state".to_owned(),
+            code: code.to_owned(),
+        })
+    }
+
     /// Returns the provider geography level.
     pub fn level(&self) -> &str {
         &self.level
@@ -385,8 +445,11 @@ impl CensusGeographyComponent {
 }
 
 /// Semantic scope of one safely identified provider geography.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum CensusGeographyScope {
     /// One exact aggregate coordinate.
     Aggregate,
@@ -397,8 +460,9 @@ pub enum CensusGeographyScope {
 }
 
 /// Exact provider geography attached to one response row.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(deny_unknown_fields)]
 pub enum CensusGeographyValue {
     /// Standard `for`/`in` hierarchy.
     Standard {
@@ -422,7 +486,115 @@ pub enum CensusGeographyValue {
     },
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RetainedGeographyScope {
+    Aggregate,
+    Detail,
+    Unknown,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedGeographyComponent {
+    level: String,
+    code: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+enum RetainedGeography {
+    Standard {
+        scope: RetainedGeographyScope,
+        components: Vec<RetainedGeographyComponent>,
+        fully_qualified_geoid: Option<String>,
+        name: Option<String>,
+    },
+    Uniform {
+        scope: RetainedGeographyScope,
+        fully_qualified_geoid: String,
+        name: Option<String>,
+    },
+}
+
 impl CensusGeographyValue {
+    /// Recovers a sealed native row's exact bounded geography shape.
+    pub(crate) fn from_retained_json(
+        value: &serde_json::Value,
+    ) -> Result<Self, CensusAdapterError> {
+        let wire: RetainedGeography =
+            serde_json::from_value(value.clone()).map_err(|_| CensusAdapterError::SchemaDrift)?;
+        let scope = |scope| match scope {
+            RetainedGeographyScope::Aggregate => Ok(CensusGeographyScope::Aggregate),
+            RetainedGeographyScope::Detail => Ok(CensusGeographyScope::Detail),
+            RetainedGeographyScope::Unknown => Ok(CensusGeographyScope::Unknown),
+        };
+        let bounded = |text: &str| {
+            !text.is_empty()
+                && text.len() <= CensusParseLimits::default().max_string_bytes
+                && !text.chars().any(char::is_control)
+        };
+        let recovered = match wire {
+            RetainedGeography::Standard {
+                scope: requested_scope,
+                components,
+                fully_qualified_geoid,
+                name,
+            } => {
+                if components.is_empty() || components.len() > 17 {
+                    return Err(CensusAdapterError::SchemaDrift);
+                }
+                let mut seen = BTreeSet::new();
+                let mut exact = Vec::new();
+                for component in components {
+                    if !bounded(&component.level)
+                        || component.level.contains([':', ',', '&'])
+                        || !bounded(&component.code)
+                        || component.code == "*"
+                        || !seen.insert(component.level.clone())
+                    {
+                        return Err(CensusAdapterError::SchemaDrift);
+                    }
+                    exact.push(CensusGeographyComponent {
+                        level: component.level,
+                        code: component.code,
+                    });
+                }
+                if fully_qualified_geoid.as_deref().is_some_and(|text| !bounded(text))
+                    || name.as_deref().is_some_and(|text| !bounded(text))
+                {
+                    return Err(CensusAdapterError::SchemaDrift);
+                }
+                Self::Standard {
+                    scope: scope(requested_scope)?,
+                    components: exact,
+                    fully_qualified_geoid,
+                    name,
+                }
+            }
+            RetainedGeography::Uniform {
+                scope: requested_scope,
+                fully_qualified_geoid,
+                name,
+            } => {
+                if !bounded(&fully_qualified_geoid)
+                    || name.as_deref().is_some_and(|text| !bounded(text))
+                {
+                    return Err(CensusAdapterError::SchemaDrift);
+                }
+                Self::Uniform {
+                    scope: scope(requested_scope)?,
+                    fully_qualified_geoid,
+                    name,
+                }
+            }
+        };
+        if serde_json::to_value(&recovered).map_err(|_| CensusAdapterError::SchemaDrift)? != *value {
+            return Err(CensusAdapterError::SchemaDrift);
+        }
+        Ok(recovered)
+    }
+
     /// Returns the request-derived aggregate/detail/unknown state.
     pub const fn scope(&self) -> CensusGeographyScope {
         match self {
@@ -646,6 +818,19 @@ pub enum CensusCompletenessIssue {
     },
     /// An unrequested, non-geographic header column appeared.
     UnexpectedColumn { column: SourceIdentifier },
+    /// A returned predicate coordinate fell outside its admitted request.
+    UnexpectedPredicateValue {
+        row_number: usize,
+        variable: SourceIdentifier,
+        value: Option<String>,
+    },
+    /// An expanding predicate had no response column to identify its row coordinate.
+    MissingPredicateCoordinate { variable: SourceIdentifier },
+    /// No admitted row contained one exact requested predicate value.
+    MissingRequestedPredicateValue {
+        variable: SourceIdentifier,
+        value: String,
+    },
     /// A standard FIPS geography column was absent.
     MissingGeographyLevel { level: String },
     /// A UCGID response did not return `GEO_ID`, so rows could not be assigned safely.
@@ -725,15 +910,17 @@ impl CensusCompleteness {
 }
 
 /// Census Data API response pagination evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(deny_unknown_fields)]
 pub enum CensusPagination {
     /// The reviewed ordinary data-query contract returned one complete JSON matrix and no cursor.
     SingleResponse { request_count: u32 },
 }
 
 /// Exact request/return accounting.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CensusResponseAccounting {
     requests: u32,
     requested_primary_variables: usize,
@@ -754,6 +941,43 @@ pub struct CensusResponseAccounting {
 }
 
 impl CensusResponseAccounting {
+    pub(crate) fn validate_complete(
+        &self,
+        header_count: usize,
+        canonical_count: usize,
+    ) -> Result<(), crate::CensusSourceError> {
+        let values = self
+            .observed_values
+            .checked_add(self.missing_values)
+            .and_then(|value| value.checked_add(self.annotated_values))
+            .and_then(|value| value.checked_add(self.invalid_values));
+        if self.requests != 1
+            || self.requested_primary_variables == 0
+            || self.requested_primary_variables > self.requested_wire_variables
+            || self.returned_columns != header_count
+            || self.requested_wire_variables != self.returned_requested_variables
+            || self.returned_requested_variables > self.returned_columns
+            || self.missing_requested_variables != 0
+            || self.returned_rows != self.usable_rows
+            || self.skipped_rows != 0
+            || self.returned_geographies > self.usable_rows
+            || self
+                .requested_geographies
+                .is_some_and(|count| count != self.returned_geographies)
+            || self
+                .usable_rows
+                .checked_mul(self.requested_primary_variables)
+                != Some(self.observations)
+            || values != Some(self.observations)
+            || self.invalid_values != 0
+            || canonical_count == 0
+            || canonical_count > self.observations
+        {
+            return Err(crate::CensusSourceError::Protocol);
+        }
+        Ok(())
+    }
+
     /// Returns provider requests represented by this page.
     pub const fn requests(&self) -> u32 {
         self.requests
@@ -1379,7 +1603,6 @@ struct CensusPageBuilder<'a> {
     header_index: HashMap<String, usize>,
     expected_wire: Vec<SourceIdentifier>,
     primary: Vec<SourceIdentifier>,
-    predicates: Vec<CensusPredicateValue>,
     issues: BTreeSet<CensusCompletenessIssue>,
     observations: Vec<CensusObservation>,
     returned_geographies: HashMap<[u8; 32], CensusGeographyValue>,
@@ -1456,6 +1679,15 @@ impl<'a> CensusPageBuilder<'a> {
                 });
             }
         }
+        for predicate in query.predicates() {
+            if exact_default_predicate(query, metadata, predicate.variable().as_str()).is_some()
+                && !header_index.contains_key(predicate.variable().as_str())
+            {
+                issues.insert(CensusCompletenessIssue::MissingRequestedVariable {
+                    variable: predicate.variable().clone(),
+                });
+            }
+        }
         for variable in &primary {
             let variable_metadata = metadata
                 .get(variable.as_str())
@@ -1488,23 +1720,30 @@ impl<'a> CensusPageBuilder<'a> {
         }
         for column in &header {
             let name = column.as_str();
-            let allowed_context =
-                geography_set.contains(name) || matches!(name, "GEO_ID" | "NAME" | "time");
+            let allowed_context = geography_set.contains(name)
+                || matches!(name, "GEO_ID" | "NAME" | "time")
+                || exact_default_predicate(query, metadata, name).is_some()
+                || query.predicates().iter().any(|predicate| {
+                    predicate.variable().as_str() == name
+                        && metadata.get(name).is_some_and(|declared| {
+                            declared.predicate_type() == predicate.predicate_type()
+                        })
+                });
             if !expected_set.contains(name) && !allowed_context {
                 issues.insert(CensusCompletenessIssue::UnexpectedColumn {
                     column: column.clone(),
                 });
             }
         }
-        let predicates = query
-            .predicates()
-            .iter()
-            .map(|predicate| CensusPredicateValue {
-                variable: predicate.variable().clone(),
-                predicate_type: predicate.predicate_type().clone(),
-                values: predicate.values().to_vec(),
-            })
-            .collect::<Vec<_>>();
+        for predicate in query.predicates() {
+            if !header_index.contains_key(predicate.variable().as_str())
+                && predicate.exact_value().is_none()
+            {
+                issues.insert(CensusCompletenessIssue::MissingPredicateCoordinate {
+                    variable: predicate.variable().clone(),
+                });
+            }
+        }
         let maximum_observations = limits.max_cells.min(
             limits
                 .max_rows
@@ -1542,7 +1781,6 @@ impl<'a> CensusPageBuilder<'a> {
             header_index,
             expected_wire,
             primary,
-            predicates,
             issues,
             observations,
             returned_geographies,
@@ -1563,6 +1801,51 @@ impl<'a> CensusPageBuilder<'a> {
     fn push_row(&mut self, row: Vec<CensusCell>) -> Result<(), CensusAdapterError> {
         self.returned_rows = checked_increment(self.returned_rows)?;
         let row_number = self.returned_rows;
+        let mut predicates = Vec::new();
+        predicates
+            .try_reserve_exact(self.query.predicates().len())
+            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        let mut predicates_complete = true;
+        for predicate in self.query.predicates() {
+            let name = predicate.variable().as_str();
+            let default = exact_default_predicate(self.query, self.metadata, name);
+            let index = self.header_index.get(name);
+            let value = match index {
+                Some(index) => row[*index].exact_text(),
+                None => predicate.exact_value().map(str::to_owned),
+            };
+            // Preserve the accepted QWI contract: a metadata-declared default must
+            // be echoed as exact text and may not be synthesized from the request.
+            if let Some(expected) = default
+                && let Some(index) = index
+                && !matches!(&row[*index], CensusCell::Text(actual) if actual == expected)
+            {
+                return Err(CensusAdapterError::MetadataMismatch);
+            }
+            if value
+                .as_ref()
+                .is_some_and(|value| predicate.contains_response_value(value))
+            {
+                predicates.push(CensusPredicateValue {
+                    variable: predicate.variable().clone(),
+                    predicate_type: predicate.predicate_type().clone(),
+                    values: value.into_iter().collect(),
+                });
+            } else {
+                predicates_complete = false;
+                if index.is_some() {
+                    self.issues.insert(CensusCompletenessIssue::UnexpectedPredicateValue {
+                        row_number,
+                        variable: predicate.variable().clone(),
+                        value,
+                    });
+                }
+            }
+        }
+        if !predicates_complete {
+            self.skipped_rows = checked_increment(self.skipped_rows)?;
+            return Ok(());
+        }
         let Some(geography) = row_geography(
             self.query,
             &self.header_index,
@@ -1598,9 +1881,13 @@ impl<'a> CensusPageBuilder<'a> {
             }
         }
         let geography_digest = geography.identity_digest();
+        let row_scope_digest = sha256(
+            &serde_json::to_vec(&(geography_digest, &predicates))
+                .map_err(|_| CensusAdapterError::SchemaDrift)?,
+        );
         if let Some(first_row_number) = self
             .row_identities
-            .insert((geography_digest, reported_time.clone()), row_number)
+            .insert((row_scope_digest, reported_time.clone()), row_number)
         {
             self.issues
                 .insert(CensusCompletenessIssue::DuplicateReturnedGeography {
@@ -1664,6 +1951,7 @@ impl<'a> CensusPageBuilder<'a> {
                 variable,
                 &value,
                 &geography,
+                &predicates,
                 reported_time.as_ref(),
                 self.metadata_payload_digest,
             )?;
@@ -1676,8 +1964,13 @@ impl<'a> CensusPageBuilder<'a> {
                         variable: variable.clone(),
                     });
             }
-            let family_digest =
-                family_digest(self.query, variable, &geography, reported_time.as_ref())?;
+            let family_digest = family_digest(
+                self.query,
+                variable,
+                &geography,
+                &predicates,
+                reported_time.as_ref(),
+            )?;
             let candidate_bytes = conservative_observation_components_bytes(
                 self.query.dataset(),
                 variable,
@@ -1686,7 +1979,7 @@ impl<'a> CensusPageBuilder<'a> {
                 variable_metadata.group(),
                 &value,
                 &geography,
-                &self.predicates,
+                &predicates,
                 reported_time.as_ref(),
             )?;
             self.ensure_next_observation_capacity(candidate_bytes)?;
@@ -1707,7 +2000,7 @@ impl<'a> CensusPageBuilder<'a> {
                 group: variable_metadata.group().cloned(),
                 value,
                 geography: geography.clone(),
-                predicates: self.predicates.clone(),
+                predicates: predicates.clone(),
                 reported_time: reported_time.clone(),
                 request_digest: self.query.request_digest(),
                 response_payload_digest: self.response_payload_digest,
@@ -1787,6 +2080,31 @@ impl<'a> CensusPageBuilder<'a> {
 
     fn finish(mut self) -> Result<CensusDataPage, CensusAdapterError> {
         reconcile_geography_scope(self.query, &self.returned_geographies, &mut self.issues)?;
+        for predicate in self.query.predicates() {
+            for expected in predicate.values() {
+                let exact = crate::CensusPredicate::try_new(
+                    predicate.variable().as_str(),
+                    predicate.predicate_type().clone(),
+                    [expected],
+                )?;
+                if exact.exact_value().is_some()
+                    && !self.observations.iter().any(|observation| {
+                        observation.predicates().iter().any(|coordinate| {
+                            coordinate.variable() == exact.variable()
+                                && coordinate
+                                    .values()
+                                    .iter()
+                                    .any(|value| exact.contains_response_value(value))
+                        })
+                    })
+                {
+                    self.issues.insert(CensusCompletenessIssue::MissingRequestedPredicateValue {
+                        variable: predicate.variable().clone(),
+                        value: expected.clone(),
+                    });
+                }
+            }
+        }
         let returned_requested_variables = self
             .expected_wire
             .iter()
@@ -2044,8 +2362,16 @@ fn completeness_issue_string_bytes(issue: &CensusCompletenessIssue) -> usize {
         | CensusCompletenessIssue::MissingGroupVariable { variable }
         | CensusCompletenessIssue::UnexpectedColumn { column: variable }
         | CensusCompletenessIssue::InvalidTypedValue { variable, .. }
+        | CensusCompletenessIssue::MissingPredicateCoordinate { variable }
         | CensusCompletenessIssue::DuplicateEconomicObservation { variable, .. } => {
             variable.as_str().len()
+        }
+        CensusCompletenessIssue::UnexpectedPredicateValue { variable, value, .. } => variable
+            .as_str()
+            .len()
+            .saturating_add(value.as_ref().map_or(0, String::len)),
+        CensusCompletenessIssue::MissingRequestedPredicateValue { variable, value } => {
+            variable.as_str().len().saturating_add(value.len())
         }
         CensusCompletenessIssue::UnrequestedDeclaredAttribute {
             variable,
@@ -2177,6 +2503,29 @@ impl CensusCell {
             Self::Text(value) | Self::Number(value) => Some(value.clone()),
             Self::Boolean(value) => Some(value.to_string()),
         }
+    }
+}
+
+// A metadata-declared default bound to one exact string predicate must be echoed
+// in the response. Other admitted predicate columns are retained per row.
+fn exact_default_predicate<'a>(
+    query: &'a CensusDataQuery,
+    metadata: &CensusVariableCatalog,
+    name: &str,
+) -> Option<&'a str> {
+    let variable = metadata.get(name)?;
+    if variable.required() != crate::CensusRequiredVariable::DefaultDisplayed
+        || variable.predicate_type() != &CensusPredicateType::String
+    {
+        return None;
+    }
+    let predicate = query.predicates().iter().find(|predicate| {
+        predicate.variable().as_str() == name
+            && predicate.predicate_type() == variable.predicate_type()
+    })?;
+    match predicate.values() {
+        [value] if !value.contains('*') => Some(value.as_str()),
+        _ => None,
     }
 }
 
@@ -2535,15 +2884,16 @@ fn reconcile_geography_scope(
     Ok(())
 }
 
-fn row_digest(
+pub(crate) fn row_digest(
     query: &CensusDataQuery,
     variable: &SourceIdentifier,
     value: &CensusValueState,
     geography: &CensusGeographyValue,
+    predicates: &[CensusPredicateValue],
     time: Option<&CensusReportedTime>,
     metadata_digest: [u8; 32],
 ) -> Result<[u8; 32], CensusAdapterError> {
-    let payload = serde_json::to_vec(&(value, geography, time))
+    let payload = serde_json::to_vec(&(value, geography, predicates, time))
         .map_err(|_| CensusAdapterError::SchemaDrift)?;
     let mut hasher = Sha256::new();
     update_digest_component(&mut hasher, b"market-squawk-census-native-row-v2");
@@ -2554,17 +2904,18 @@ fn row_digest(
     Ok(hasher.finalize().into())
 }
 
-fn family_digest(
+pub(crate) fn family_digest(
     query: &CensusDataQuery,
     variable: &SourceIdentifier,
     geography: &CensusGeographyValue,
+    predicates: &[CensusPredicateValue],
     time: Option<&CensusReportedTime>,
 ) -> Result<[u8; 32], CensusAdapterError> {
     let family = serde_json::to_vec(&(
         query.dataset(),
         variable,
         geography.identity_digest(),
-        query.predicates(),
+        predicates,
         query.time(),
         time,
     ))
@@ -2648,6 +2999,16 @@ mod tests {
               "attributes": "",
               "limit": 0,
               "required": false
+            },
+            "sex": {
+              "label": "Sex",
+              "predicateType": "string",
+              "required": "predicate-only"
+            },
+            "age": {
+              "label": "Age",
+              "predicateType": "int",
+              "required": "predicate-only"
             },
             "state": {
               "label": "State",
@@ -2816,6 +3177,73 @@ mod tests {
                 attribute: annotation,
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn predicate_rows_keep_distinct_subgroups_and_detect_missing_coordinates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = metadata()?;
+        let scoped_query = CensusDataQuery::try_new(
+            dataset()?,
+            query(&metadata)?.selection().clone(),
+            vec![
+                crate::CensusPredicate::try_new(
+                    "sex", crate::CensusPredicateType::String, ["1", "2"],
+                )?,
+                crate::CensusPredicate::try_new(
+                    "age", crate::CensusPredicateType::Integer, ["20:40"],
+                )?,
+            ],
+            CensusGeography::standard(
+                CensusGeographyClause::try_new("state", [CensusGeographyCode::try_new("02")?])?,
+                Vec::new(),
+            )?,
+            None,
+        )?;
+        let page = CensusDataPage::parse(
+            &scoped_query,
+            &metadata,
+            &geography_admission()?,
+            br#"[
+              ["B01001_001E", "B01001_001EA", "NAME", "state", "age", "sex"],
+              ["10", null, "Alaska", "02", "30", "1"],
+              ["10", null, "Alaska", "02", "30", "2"]
+            ]"#,
+            CensusParseLimits::default(),
+            clocks()?,
+        )?;
+        assert!(page.completeness().is_complete());
+        assert_eq!(page.observations().len(), 2);
+        assert_eq!(page.observations()[0].predicates()[1].values(), &["1"]);
+        assert_eq!(page.observations()[1].predicates()[1].values(), &["2"]);
+        assert_ne!(page.observations()[0].row_digest(), page.observations()[1].row_digest());
+        assert_ne!(
+            page.observations()[0].revision_candidate().family_digest(),
+            page.observations()[1].revision_candidate().family_digest(),
+        );
+        let omitted = CensusDataPage::parse(
+            &scoped_query,
+            &metadata,
+            &geography_admission()?,
+            br#"[["B01001_001E", "B01001_001EA", "NAME", "state", "age", "sex"],
+                  ["10", null, "Alaska", "02", "30", "1"]]"#,
+            CensusParseLimits::default(),
+            clocks()?,
+        )?;
+        assert!(!omitted.completeness().is_complete());
+        assert_eq!(omitted.observations().len(), 1);
+        let unidentified = CensusDataPage::parse(
+            &scoped_query,
+            &metadata,
+            &geography_admission()?,
+            br#"[["B01001_001E", "B01001_001EA", "NAME", "state"],
+                  ["10", null, "Alaska", "02"]]"#,
+            CensusParseLimits::default(),
+            clocks()?,
+        )?;
+        assert!(!unidentified.completeness().is_complete());
+        assert!(unidentified.observations().is_empty());
         Ok(())
     }
 }

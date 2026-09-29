@@ -44,12 +44,18 @@ const MAX_CONTROL_MESSAGES: usize = 4_096;
 const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 const RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS: i64 = 1_784_779_200_000_000_000;
 const RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS: i64 = 1_816_315_200_000_000_000;
-const RECOMMENDED_INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
+pub const RECOMMENDED_PUBLIC_BTC_USD_INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
+const RECOMMENDED_INSTRUMENT_ID: &str = RECOMMENDED_PUBLIC_BTC_USD_INSTRUMENT_ID;
 const RECOMMENDED_PRIMARY_ASSET_ID: &str = "b9f6d14f-9140-4ca3-a412-9bd59b3b5e67";
 const COINBASE_REVIEW_EVIDENCE_SHA256: &str =
     "18e2c5d1c52a32b3bf734415a579ec99aea8ef2cb8d3c34a38f4fea577ab73bb";
 const KRAKEN_PUBLIC_FEED_REVIEW_EVIDENCE_SHA256: &str =
     "10ad4be02cbc6d2047e67e4703a604c104991d10a9f0ece531e070309715cbe7";
+// Review-time hashes of the official reference documentation, observed 2026-09-23.
+const COINBASE_PUBLIC_PRODUCT_REVIEW_EVIDENCE_SHA256: &str =
+    "6d6be28e5a9484c6bbfa75041b382cdaf2bbe387237d1cc4168aa02b59d58bd7";
+const KRAKEN_INSTRUMENT_REVIEW_EVIDENCE_SHA256: &str =
+    "9b4544298835999a3457f48dbd03e4061fce3d82b98bfc82129b6adbc20ae9be";
 
 const REQUIRED_EVENT_CLASSES: [LiveEventClass; 3] = [
     LiveEventClass::BookSnapshot,
@@ -99,6 +105,7 @@ impl CoinbaseControlLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoinbaseSourceConfig {
     authorization: CoinbaseAuthorizationAttestation,
+    reference_authorization: CoinbaseAuthorizationAttestation,
     instruments: Box<[CoinbaseInstrumentMapping]>,
     freshness: Duration,
     max_frame_bytes: NonZeroUsize,
@@ -116,6 +123,10 @@ impl CoinbaseSourceConfig {
     /// Returns the explicit locally admitted public-interface authorization attestation.
     pub const fn authorization(&self) -> &CoinbaseAuthorizationAttestation {
         &self.authorization
+    }
+    /// Authorization reviewed for the public product-reference REST surface.
+    pub const fn reference_authorization(&self) -> &CoinbaseAuthorizationAttestation {
+        &self.reference_authorization
     }
 
     /// Returns provider products and their explicit internal instrument definitions.
@@ -181,6 +192,16 @@ pub(super) fn recommended_coinbase_public_config()
             "effective_from_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS},
             "effective_until_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS}
           }},
+          "reference_authorization":{{
+            "mode":"public_interface",
+            "provider":"coinbase-exchange",
+            "basis":"market-squawk-reviewed-coinbase-product-reference",
+            "evidence_sha256":"{COINBASE_PUBLIC_PRODUCT_REVIEW_EVIDENCE_SHA256}",
+            "evidence_reference":"https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product",
+            "evidence_version":"reviewed-2026-09-23",
+            "effective_from_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS},
+            "effective_until_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS}
+          }},
           "instruments":[{{
             "product":"BTC-USD",
             "instrument_id":"{RECOMMENDED_INSTRUMENT_ID}",
@@ -213,6 +234,7 @@ pub(super) fn recommended_coinbase_public_config()
 struct CoinbaseSourceConfigWire {
     endpoint: String,
     authorization: CoinbaseAuthorizationAttestationWire,
+    reference_authorization: CoinbaseAuthorizationAttestationWire,
     event_classes: Vec<LiveEventClass>,
     depth: MarketDepth,
     freshness_ms: u64,
@@ -311,6 +333,8 @@ impl TryFrom<CoinbaseSourceConfigWire> for CoinbaseSourceConfig {
     fn try_from(wire: CoinbaseSourceConfigWire) -> Result<Self, Self::Error> {
         validate_source_profile(&wire)?;
         let authorization = CoinbaseAuthorizationAttestation::try_from(wire.authorization)?;
+        let reference_authorization =
+            CoinbaseAuthorizationAttestation::try_from(wire.reference_authorization)?;
         let mut products = BTreeSet::new();
         let mut instrument_ids = BTreeSet::new();
         let mut instruments = Vec::with_capacity(wire.instruments.len());
@@ -337,6 +361,7 @@ impl TryFrom<CoinbaseSourceConfigWire> for CoinbaseSourceConfig {
         };
         Ok(Self {
             authorization,
+            reference_authorization,
             instruments: instruments.into_boxed_slice(),
             freshness,
             max_frame_bytes,
@@ -555,6 +580,7 @@ impl KrakenAuthorizationAttestation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KrakenSourceConfig {
     authorization: KrakenAuthorizationAttestation,
+    reference_authorization: KrakenAuthorizationAttestation,
     instrument: KrakenInstrumentMapping,
     freshness: Duration,
     max_frame_bytes: NonZeroUsize,
@@ -571,6 +597,10 @@ impl KrakenSourceConfig {
     /// Returns explicit locally admitted public-interface authorization evidence.
     pub const fn authorization(&self) -> &KrakenAuthorizationAttestation {
         &self.authorization
+    }
+    /// Authorization reviewed for the public v2 instrument-reference channel.
+    pub const fn reference_authorization(&self) -> &KrakenAuthorizationAttestation {
+        &self.reference_authorization
     }
 
     /// Returns the exact Kraken v2 symbol.
@@ -633,6 +663,16 @@ pub(super) fn recommended_kraken_public_config()
             "evidence_sha256":"{KRAKEN_PUBLIC_FEED_REVIEW_EVIDENCE_SHA256}",
             "evidence_reference":"https://github.com/Sawmonabo/market-squawk/blob/main/docs/research/2026-07-16-kraken-websocket-v2-checksum.md",
             "evidence_version":"reviewed-2026-08-14",
+            "effective_from_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS},
+            "effective_until_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS}
+          }},
+          "reference_authorization":{{
+            "mode":"public_interface",
+            "provider":"kraken",
+            "basis":"market-squawk-reviewed-kraken-instrument-reference",
+            "evidence_sha256":"{KRAKEN_INSTRUMENT_REVIEW_EVIDENCE_SHA256}",
+            "evidence_reference":"https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument",
+            "evidence_version":"reviewed-2026-09-23",
             "effective_from_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS},
             "effective_until_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS}
           }},
@@ -714,6 +754,7 @@ enum KrakenChannelWire {
 struct KrakenSourceConfigWire {
     endpoint: String,
     authorization: KrakenAuthorizationAttestationWire,
+    reference_authorization: KrakenAuthorizationAttestationWire,
     channels: [KrakenChannelWire; 2],
     depth: usize,
     freshness_ms: u64,
@@ -795,6 +836,7 @@ impl TryFrom<KrakenSourceConfigWire> for KrakenSourceConfig {
         };
         Ok(Self {
             authorization: wire.authorization.try_into()?,
+            reference_authorization: wire.reference_authorization.try_into()?,
             instrument: wire.instrument.try_into()?,
             freshness: Duration::from_millis(wire.freshness_ms),
             max_frame_bytes,

@@ -236,9 +236,11 @@ impl ProbeRateAuthority {
         let policy = descriptor
             .enforcement_policy()
             .ok_or(ProviderOnboardingError::InvalidProfile)?;
-        if profile.id() != SCHWAB_MARKET_DATA_SURFACE_ID
+        if self.provider_rate.is_none()
+            || profile.id() != SCHWAB_MARKET_DATA_SURFACE_ID
             || binding.descriptor != descriptor
             || policy.scope().authorization_account().is_none()
+            || policy.weighted_window_count() != 0
             || descriptor.refresh_on_http_429() != Some(true)
             || authorization_subject.as_str().is_empty()
         {
@@ -342,14 +344,23 @@ impl SchwabMarketDoctorRatePermit for SchwabMarketDoctorProbeRatePermit {
                         .await
                         .map_err(map_doctor_rate_error)?;
                 }
-                SchwabMarketDoctorProbeStatus::Http(status) if (200..=299).contains(&status) => {
+                SchwabMarketDoctorProbeStatus::Http(status)
+                    if (200..=299).contains(&status)
+                        || (status == 101
+                            && matches!(self.scope, SchwabMarketDoctorProbeScope::Streamer(_))) =>
+                {
                     self.inner.record_success().map_err(map_doctor_rate_error)?;
                 }
                 SchwabMarketDoctorProbeStatus::Streamer(0) => {
                     self.inner.record_success().map_err(map_doctor_rate_error)?;
                 }
-                SchwabMarketDoctorProbeStatus::Http(_)
-                | SchwabMarketDoctorProbeStatus::Streamer(_) => {}
+                SchwabMarketDoctorProbeStatus::Streamer(_) => {
+                    self.inner
+                        .observe_provider_refusal()
+                        .await
+                        .map_err(map_doctor_rate_error)?;
+                }
+                SchwabMarketDoctorProbeStatus::Http(_) => {}
             }
             self.observation_recorded = true;
             Ok(())
@@ -621,6 +632,21 @@ impl ProbeRatePermit {
             ProbeRatePermitAuthority::Aggregate { .. } => {
                 Err(ProviderOnboardingError::InvalidSessionState)
             }
+        }
+    }
+
+    async fn observe_provider_refusal(&self) -> Result<(), ProviderOnboardingError> {
+        match &self.authority {
+            ProbeRatePermitAuthority::Aggregate {
+                budget,
+                reservation: None,
+                permit: Some(_),
+            } => match budget.apply_refusal(0) {
+                BudgetDecision::WaitUntil(_) => Ok(()),
+                _ => Err(ProviderOnboardingError::ProbeRateLimited),
+            },
+            // Production Schwab doctor requires the shared durable authority.
+            _ => Err(ProviderOnboardingError::InvalidSessionState),
         }
     }
 

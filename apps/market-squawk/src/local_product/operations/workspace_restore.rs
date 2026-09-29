@@ -21,10 +21,10 @@ use market_squawk_data::{
     AnalyticalDataService, AnalyticalRestoreMode, AnalyticalRestoreTarget, ObjectStoreConfig,
 };
 use market_squawk_decisions::DecisionRepositoryLimits;
-use market_squawk_jobs::{JobRepositoryConfig, SqliteJobRepository};
+use market_squawk_jobs::JobRepositoryConfig;
 use market_squawk_platform::LocalPaths;
 use market_squawk_runtime::WorkspaceId;
-use market_squawk_services::ArtifactRepository;
+use market_squawk_services::{ArtifactReadContext, ArtifactRepository};
 use market_squawk_valuation::FairValueLimits;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -36,7 +36,7 @@ use crate::{
             ProductBackupManifest, ProductRestoreFinalizer, StagedProductRestoreTarget,
         },
         decision::DecisionApplication,
-        fair_value::FairValueBackupAttestation,
+        fair_value::{FairValueBackupAttestation, ForecastValuationSourceFactory},
         model::backup::ModelBackupAuthority,
         settings::SettingsSeed,
         workspace::WorkspaceDescriptor,
@@ -48,8 +48,9 @@ use crate::{
 use super::{
     backup::ManagedBackupRepository,
     configuration_backup::restore_configuration_component_absent,
+    jobs_backup::restore_jobs_component_fresh,
     settings::SettingsLifecycleAuthority,
-    source_data_backup::validate_fresh_restore,
+    source_data_backup::restore_source_data_fresh,
     workspace_backup::{
         FreshWorkspaceRestoreAuthority, FreshWorkspaceRestoreSession,
         VerifiedWorkspaceComponentReader, WorkspaceBackupBundleSource,
@@ -126,6 +127,7 @@ pub(crate) struct WorkspaceRestorePolicy {
     settings_lifecycle: SettingsLifecycleAuthority,
     portfolio_limits: PortfolioApplicationLimits,
     model: Arc<ModelBackupAuthority>,
+    model_evaluation_records: NonZeroUsize,
     decision_limits: DecisionRepositoryLimits,
     jobs: JobRepositoryConfig,
     fair_value_limits: FairValueLimits,
@@ -146,6 +148,7 @@ impl WorkspaceRestorePolicy {
         settings_lifecycle: SettingsLifecycleAuthority,
         portfolio_limits: PortfolioApplicationLimits,
         model: Arc<ModelBackupAuthority>,
+        model_evaluation_records: NonZeroUsize,
         decision_limits: DecisionRepositoryLimits,
         jobs: JobRepositoryConfig,
         fair_value_limits: FairValueLimits,
@@ -162,6 +165,7 @@ impl WorkspaceRestorePolicy {
             settings_lifecycle,
             portfolio_limits,
             model,
+            model_evaluation_records,
             decision_limits,
             jobs,
             fair_value_limits,
@@ -440,7 +444,7 @@ impl fmt::Debug for InstalledWorkspaceRestoreFinalizer {
 impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
     async fn finalize(
         mut self: Box<Self>,
-        analytical: &AnalyticalDataService,
+        analytical: Arc<AnalyticalDataService>,
         cancellation: &CancellationToken,
     ) -> Result<(), ProductBackupError> {
         ensure_live(cancellation)?;
@@ -456,7 +460,9 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             self.policy.settings_lifecycle.clone(),
             &configuration,
         )
+        .inspect_err(|_| tracing::warn!(component = "configuration", "workspace component restore failed"))
         .map_err(|_| ProductBackupError::RestoreComponents)?;
+        drop(configuration);
 
         ensure_live(cancellation)?;
         let provider_metadata =
@@ -465,12 +471,49 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             &self.paths,
             &provider_metadata,
         )
+        .inspect_err(|_| tracing::warn!(component = "provider_metadata", "workspace component restore failed"))
         .map_err(|_| ProductBackupError::RestoreComponents)?;
+        drop(provider_metadata);
 
         ensure_live(cancellation)?;
-        let source_data =
-            self.read_component(ProductBackupComponentKind::SourceData, cancellation)?;
-        validate_fresh_restore(self.snapshot, &source_data)?;
+        let controlled = controlled_artifact_repository(
+            self.paths
+                .artifacts()
+                .map_err(|_| ProductBackupError::InvalidRestoreTarget)?
+                .clone(),
+            self.policy.maximum_controlled_artifact_bytes,
+        )
+        .map_err(|_| ProductBackupError::RestoreComponents)?;
+        let artifacts: Arc<dyn ArtifactRepository> = controlled;
+        let research = Arc::new(crate::ResearchService::from_analytical(
+            &self.paths,
+            Arc::clone(&analytical),
+        ).map_err(|_| ProductBackupError::RestoreComponents)?);
+        let source_data = self.components
+            .get_mut(&ProductBackupComponentKind::SourceData)
+            .ok_or(ProductBackupError::IncompleteComponents)?;
+        source_data.verify_and_rewind(cancellation)?;
+        let source_result = restore_source_data_fresh(
+            &mut source_data.file,
+            self.snapshot,
+            &self.paths,
+            Arc::clone(&research),
+            Arc::clone(&artifacts),
+            NonZeroUsize::new(crate::paper_bot::LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)
+                .ok_or(ProductBackupError::InvalidRestoreTarget)?,
+            self.policy.maximum_controlled_artifact_bytes,
+            cancellation,
+        ).await;
+        research.begin_owned_io_shutdown();
+        let shutdown_deadline = std::time::Instant::now()
+            .checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
+            .ok_or(ProductBackupError::RestoreComponents)?;
+        let shutdown = research.finish_owned_io_shutdown(shutdown_deadline).await;
+        // Final ownership is dropped before any failed workspace can be abandoned. The I/O
+        // owner's Drop joins unavoidable native completion if its bounded drain timed out.
+        drop(research);
+        shutdown.map_err(|_| ProductBackupError::RestoreWorker)?;
+        source_result.inspect_err(|_| tracing::warn!(component = "source_data", "workspace component restore failed"))?;
 
         ensure_live(cancellation)?;
         let portfolios =
@@ -490,77 +533,136 @@ impl ProductRestoreFinalizer for InstalledWorkspaceRestoreFinalizer {
             &portfolios,
             &transactions,
         )
+        .inspect_err(|_| tracing::warn!(component = "portfolios", "workspace component restore failed"))
         .map_err(|_| ProductBackupError::RestoreComponents)?;
+        drop((portfolios, transactions));
 
         ensure_live(cancellation)?;
-        let controlled = controlled_artifact_repository(
-            self.paths
-                .artifacts()
-                .map_err(|_| ProductBackupError::InvalidRestoreTarget)?
-                .clone(),
-            self.policy.maximum_controlled_artifact_bytes,
-        )
-        .map_err(|_| ProductBackupError::RestoreComponents)?;
-        let artifacts: Arc<dyn ArtifactRepository> = controlled;
         let models = self
             .components
             .get_mut(&ProductBackupComponentKind::Models)
             .ok_or(ProductBackupError::IncompleteComponents)?;
         models.verify_and_rewind(cancellation)?;
-        let _models = self
+        let mut restored_models = self
             .policy
             .model
             .restore_fresh_workspace(
                 &mut models.file,
                 self.paths.clone(),
-                artifacts,
+                Arc::clone(&artifacts),
+                analytical.analytical_reader(),
+                self.policy.model_evaluation_records,
                 cancellation,
             )
             .await
+            .inspect_err(|_| tracing::warn!(component = "models", "workspace component restore failed"))
             .map_err(|_| ProductBackupError::RestoreComponents)?;
 
         ensure_live(cancellation)?;
-        let decisions =
-            self.read_component(ProductBackupComponentKind::DecisionTargets, cancellation)?;
-        let _decisions = DecisionApplication::restore_backup_fresh(
-            self.paths
-                .control_root()
-                .map_err(|_| ProductBackupError::InvalidRestoreTarget)?
-                .decision_database_location(),
-            self.policy.decision_limits,
-            &decisions,
-            component_digest(
-                &self.components,
-                ProductBackupComponentKind::DecisionTargets,
-            )?,
-        )
-        .map_err(|_| ProductBackupError::RestoreComponents)?;
-
-        ensure_live(cancellation)?;
-        let jobs =
-            self.read_component(ProductBackupComponentKind::JobsAndReceipts, cancellation)?;
-        SqliteJobRepository::restore_fresh(
+        let jobs = self
+            .components
+            .get_mut(&ProductBackupComponentKind::JobsAndReceipts)
+            .ok_or(ProductBackupError::IncompleteComponents)?;
+        jobs.verify_and_rewind(cancellation)?;
+        restore_jobs_component_fresh(
+            &mut jobs.file,
             self.paths
                 .control_root()
                 .map_err(|_| ProductBackupError::InvalidRestoreTarget)?
                 .job_database_location(),
+            &self.paths,
+            crate::application::analysis::GovernedBacktestInputAuthorityLimits::standard(),
+            crate::application::analysis::GovernedBacktestRepositoryLimits::standard(),
             self.policy.jobs,
-            &jobs,
+            artifacts.as_ref(),
+            self.snapshot,
+            self.policy.maximum_buffered_component_bytes,
+            cancellation,
         )
         .await
-        .map_err(|_| ProductBackupError::RestoreComponents)?;
+        .inspect_err(|_| tracing::warn!(component = "jobs", "workspace component restore failed"))?;
 
         ensure_live(cancellation)?;
         let fair_value =
             self.read_component(ProductBackupComponentKind::FairValueEvidence, cancellation)?;
         let attestation = FairValueBackupAttestation::decode(&fair_value)
             .map_err(|_| ProductBackupError::RestoreComponents)?;
-        let _fair_value = attestation
+        drop(fair_value);
+        let decision_research = Arc::new(crate::ResearchService::from_analytical(
+            &self.paths, Arc::clone(&analytical),
+        ).map_err(|_| ProductBackupError::RestoreComponents)?);
+        let retained_calendar = crate::application::market_calendar::RetainedMarketSessionReadCapability::new(Arc::clone(&decision_research));
+        restored_models.bind_retained_forecast_calendar(retained_calendar.clone())
+            .map_err(|_| ProductBackupError::RestoreComponents)?;
+        let restored_model = restored_models.model_domain();
+        let recovery_deadline = std::time::Instant::now()
+            .checked_add(super::super::LOCAL_RECOVERY_TIMEOUT)
+            .ok_or(ProductBackupError::RestoreComponents)?;
+        let recovery_context = ArtifactReadContext::new(cancellation.clone(), recovery_deadline);
+        let resolver = ForecastValuationSourceFactory::borrowed_resolver(
+            restored_model.as_ref(),
+            analytical.as_ref(),
+            recovery_context.clone(),
+        );
+        let fair_value = attestation
             .validate_restored_catalog(
                 analytical.fair_value_catalog(),
                 self.policy.fair_value_limits,
+                &resolver,
+                super::super::local_product_timestamp()
+                    .map_err(|_| ProductBackupError::RestoreComponents)?,
             )
-            .map_err(|_| ProductBackupError::RestoreComponents)?;
+            .await
+            .map_err(|_| {
+                if cancellation.is_cancelled() {
+                    ProductBackupError::Cancelled
+                } else {
+                    ProductBackupError::RestoreComponents
+                }
+            })?;
+        let restore_decisions = async {
+            let request_context = crate::application::decision::current_share::recovery_request_context(&recovery_context)
+                .map_err(|_| ProductBackupError::RestoreComponents)?;
+            let replay = crate::application::decision::current_share::CurrentShareReplayCapability {
+                research: Arc::clone(&decision_research),
+                calendars: crate::application::market_calendar::ForecastSessionReadCapability::Retained(retained_calendar),
+                // Each exact market reference restores its own saved maximum-age policy.
+                market: crate::application::market_selection::MarketInvestmentReadCapability::try_new(
+                    Arc::clone(&decision_research), decision_research.instrument_definitions(),
+                    decision_research.market_data_instruments(), 1,
+                ).map_err(|_| ProductBackupError::RestoreComponents)?,
+                forecasts: restored_model.clone(),
+                valuations: crate::application::fair_value::FairValueAutomaticReadCapability::from_restored_service(fair_value)
+                    .map_err(|_| ProductBackupError::RestoreComponents)?,
+                valuation_sources: ForecastValuationSourceFactory::new(restored_model.clone(), Arc::clone(&decision_research)),
+                source_actions: crate::application::SourceAppliedCorporateActionReadCapability::for_paper_backup(
+                    Arc::clone(&decision_research), Arc::clone(&artifacts),
+                ),
+                maximum_forecast_artifact_bytes: NonZeroUsize::new(crate::application::model::forecast::MAXIMUM_FORECAST_ARTIFACT_BYTES)
+                    .ok_or(ProductBackupError::RestoreComponents)?,
+            };
+            let decisions = self.read_component(ProductBackupComponentKind::DecisionTargets, cancellation)?;
+            DecisionApplication::restore_backup_fresh(
+                self.paths.control_root().map_err(|_| ProductBackupError::InvalidRestoreTarget)?.decision_database_location(),
+                self.policy.decision_limits, &decisions,
+                component_digest(&self.components, ProductBackupComponentKind::DecisionTargets)?,
+                &replay, &request_context,
+            ).await.inspect_err(|_| tracing::warn!(component = "decisions", "workspace component restore failed"))
+                .map_err(|_| ProductBackupError::RestoreComponents)?;
+            Ok::<(), ProductBackupError>(())
+        }.await;
+        decision_research.begin_owned_io_shutdown();
+        let shutdown = decision_research.finish_owned_io_shutdown(recovery_deadline).await;
+        drop(decision_research);
+        shutdown.map_err(|_| ProductBackupError::RestoreWorker)?;
+        restore_decisions?;
+        recovery_context.ensure_live().map_err(|_| {
+            if cancellation.is_cancelled() {
+                ProductBackupError::Cancelled
+            } else {
+                ProductBackupError::RestoreComponents
+            }
+        })?;
         ensure_live(cancellation)?;
         self.components.clear();
         self.staging.remove()?;

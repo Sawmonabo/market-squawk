@@ -69,6 +69,9 @@ pub(crate) enum ProductCapability {
     BacktestPreparedStart,
     BacktestPreview,
     BacktestResult,
+    BotAccountPreparation,
+    BotPrepareAccount,
+    BotCreateAccount,
     BotPrepareStart,
     BotStart,
     BotStartPreparation,
@@ -110,6 +113,8 @@ pub(crate) enum ProductCapability {
     MarketHistory,
     MarketInstrument,
     MarketOverview,
+    MarketSessionContext,
+    MarketSessionRead,
     MarketUniverse,
     ModelActivity,
     ModelEvidence,
@@ -166,6 +171,9 @@ impl ProductCapability {
             "Analysis.StartPreparedBacktest" => Self::BacktestPreparedStart,
             "Analysis.StartPreparedFeatureDatasetBuild" => Self::FeatureDatasetPreparedStart,
             "Analysis.ListProductBacktests" => Self::BacktestActivity,
+            "Bot.GetAccountPreparation" => Self::BotAccountPreparation,
+            "Bot.PrepareAccount" => Self::BotPrepareAccount,
+            "Bot.CreateAccount" => Self::BotCreateAccount,
             "Bot.GetStatus" => Self::BotStatus,
             "Bot.GetStartPreparation" => Self::BotStartPreparation,
             "Bot.PrepareStart" => Self::BotPrepareStart,
@@ -198,6 +206,8 @@ impl ProductCapability {
             "Market.GetHistory" => Self::MarketHistory,
             "Market.GetInstrument" => Self::MarketInstrument,
             "Market.GetOverview" => Self::MarketOverview,
+            "Market.GetSessionContext" => Self::MarketSessionContext,
+            "Market.ReadSessionContext" => Self::MarketSessionRead,
             "Market.SearchUniverse" => Self::MarketUniverse,
             "Model.GetForecast" => Self::ForecastDetail,
             "Model.GetForecastOutcomes" => Self::ForecastOutcomes,
@@ -402,6 +412,14 @@ pub(crate) enum DashboardQueryCommand {
     },
     MarketHistory {
         history_token: String,
+    },
+    MarketSessionContext {
+        product: MarketSessionProduct,
+        date: String,
+        confirmed: bool,
+    },
+    MarketSessionRead {
+        reference: MarketSessionReference,
     },
     SourceStatus {
         source_ids: Option<Vec<String>>,
@@ -619,6 +637,32 @@ pub(crate) enum DashboardQueryCommand {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum MarketSessionProduct {
+    Equity,
+    Option,
+    Bond,
+    Future,
+    Forex,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct MarketSessionRequest {
+    product: MarketSessionProduct,
+    date: String,
+}
+
+/// Inert original application reference; forwarded without minting or replacing its identity.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct MarketSessionReference {
+    request: MarketSessionRequest,
+    origin_content_sha256: String,
+    capture_binding_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum OperationLogSeverity {
     Trace,
     Debug,
@@ -764,6 +808,16 @@ pub(crate) enum DatasetPreparationUse {
     tag = "action"
 )]
 pub(crate) enum AnalysisControlCommand {
+    GetRecommendationSetup,
+    PreviewRecommendationSetup {
+        expected_revision: u64,
+        account_id: Uuid,
+        allocation_profile: RecommendationAllocationInput,
+    },
+    CommitRecommendationSetup {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
     FeatureDatasetOptions,
     PreviewFeatureDataset {
         choice: Uuid,
@@ -781,6 +835,23 @@ pub(crate) enum AnalysisControlCommand {
     },
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct RecommendationAllocationInput {
+    preferred_position_weight_lower_bps: u16,
+    preferred_position_weight_upper_bps: u16,
+    minimum_cash_reserve: RecommendationReserveInput,
+    maximum_downside_loss_bps_of_marked_equity: u16,
+    available_investment_horizon_days: u16,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct RecommendationReserveInput {
+    amount: String,
+    currency: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(
     deny_unknown_fields,
@@ -791,6 +862,7 @@ pub(crate) enum AnalysisControlCommand {
 pub(crate) enum BacktestProductCommand {
     List,
     Get { backtest_token: Uuid },
+    RecommendationStudy { action_token: Uuid },
 }
 
 #[derive(Debug, Deserialize)]
@@ -910,6 +982,8 @@ pub(crate) enum DecisionControlCommand {
         screen_revision: u32,
         dataset_manifest: Map<String, Value>,
         as_of: String,
+        calendar_reference: Map<String, Value>,
+        financial_profile: Map<String, Value>,
     },
     PrepareDossier {
         draft: Map<String, Value>,
@@ -1048,8 +1122,18 @@ impl fmt::Debug for GovernanceControlCommand {
     tag = "action"
 )]
 pub(crate) enum PaperControlCommand {
+    AccountPreparation,
+    PrepareAccount {
+        cash_choice: String,
+        cost_choice: String,
+        currency_choice: String,
+    },
+    CreateAccount {
+        confirmation_token: String,
+    },
     StartPreparation,
     PrepareStart {
+        market_choice: String,
         cash_choice: String,
         cost_choice: String,
         mode_choice: String,
@@ -1057,7 +1141,9 @@ pub(crate) enum PaperControlCommand {
     Start {
         confirmation_token: String,
     },
-    Targets,
+    Targets {
+        analysis_action_token: Option<Uuid>,
+    },
     PrepareManual {
         target_token: String,
         side: String,

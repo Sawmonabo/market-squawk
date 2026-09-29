@@ -772,6 +772,7 @@ fn fixture_dataset_request(
             CorporateActionPolicy::new(CorporateActionAdjustment::Raw, NonZeroU32::MIN),
             market_squawk_data::MissingValuePolicy::Preserve,
             SourceIdentifier::try_from("backtest-fixture-builder-v1")?,
+            None,
         ),
         ResearchUse::LocalAnalysis,
         ResearchUseLimits::try_new(

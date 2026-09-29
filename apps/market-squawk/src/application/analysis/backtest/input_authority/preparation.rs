@@ -1192,7 +1192,7 @@ fn selected_period(
 
 fn canonical_sql(table: &str, starts_at: Timestamp, ends_at: Timestamp) -> String {
     format!(
-        "SELECT * FROM {table} WHERE cutoff_at >= TIMESTAMP '{}' AND cutoff_at < TIMESTAMP '{}' ORDER BY cutoff_at, instrument_id, example_id, component_kind, component_name",
+        "SELECT * FROM {table} WHERE decision_at >= TIMESTAMP '{}' AND decision_at < TIMESTAMP '{}' ORDER BY decision_at, instrument_id, example_id, component_kind, component_name",
         sql_timestamp(starts_at),
         sql_timestamp(ends_at),
     )
@@ -1495,7 +1495,7 @@ mod tests {
         assert!(
             registration
                 .sql
-                .starts_with("SELECT * FROM feature_labels WHERE cutoff_at")
+                .starts_with("SELECT * FROM feature_labels WHERE decision_at")
         );
         assert!(
             authority

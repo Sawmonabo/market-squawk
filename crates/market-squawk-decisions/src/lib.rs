@@ -48,28 +48,38 @@ pub use investment_projection::{
     SizingCapacityEvidence, SizingConstraintCap, SizingConstraintKind, SizingUnavailableReason,
 };
 pub use investment_proposal::{
-    ActionSpecificCostAvailability, CONFIDENCE_PARTS_PER_MILLION, CostAdjustedPitBacktestEvidence,
-    ForecastCalibrationSummary, ForecastPriceRanges, GeneratedInvestmentProposal,
-    GeneratedPriceLadder, InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput,
-    InvestmentAnalysisId, InvestmentProposalAuthority, InvestmentProposalDecision,
-    InvestmentProposalError, InvestmentProposalId, LiquidityEvidence, MAX_PROPOSAL_INVALIDATORS,
+    ActionSpecificCostAvailability, CONFIDENCE_PARTS_PER_MILLION, ChronologicalOutOfSampleEvidence,
+    CostAdjustedBacktestEvidence, CurrentShareDecisionProjection, CurrentShareMarketAdmission,
+    FinancialModelEvidence, FinancialModelMacroAssumptions,
+    FinancialModelValueRange, ForecastCalibrationSummary, ForecastPriceRanges,
+    GeneratedInvestmentProposal, GeneratedPriceLadder, HarmonicHistoryAudit,
+    HarmonicHistoryAuditInput, HarmonicHistoryDisposition, HarmonicHistoryGeometry,
+    HarmonicHistoryPivot, HarmonicPatternEvidenceReceipt, InvestmentAnalysisEvidence,
+    SavedBenchmarkComparisonEvidence, SavedForecastChartEvidence,
+    InvestmentAnalysisEvidenceInput, InvestmentAnalysisId, InvestmentProposalAuthority,
+    InvestmentProposalDecision, InvestmentProposalError, InvestmentProposalId, LiquidityEvidence,
+    MAX_PROPOSAL_INVALIDATORS, MacroRateMaturity, MacroRateReferenceEvidence,
     MarketReferenceAdjustmentBasis, MarketReferenceEvidence, MarketReferencePriceKind,
-    NoActionInvestmentProposal, NoActionReason, PortfolioPositionState, PortfolioRiskEvidence,
+    NoActionInvestmentProposal, NoActionReason, OriginalShareActionOverlay, PortfolioPositionState, PortfolioRiskEvidence,
     PriceForecastEvidence, ProposalEvidenceWindow, ProposalExecutionEligibility,
     ProposalForecastVintageId, ProposalInvalidator, ProposalTimeBenchmarkAvailability,
     ProposalUnavailableReason, RECOMMENDATION_ASSUMPTION_COUNT,
     RECOMMENDATION_CONFIDENCE_COMPONENT_COUNT, RECOMMENDATION_INVALIDATION_COUNT,
-    RECOMMENDATION_LIMITATION_COUNT, RecommendationAction, RecommendationConfidence,
-    RecommendationConfidenceComponent, RecommendationConfidenceComponentKind,
-    RecommendationConfidenceMeaning, RecommendationDerivationDigest, RecommendationEvidenceDigest,
-    RecommendationEvidenceKind, RecommendationPolicy, RecommendationPolicyDigest,
-    UnavailableInvestmentAnalysis, ValuationEvidence,
+    RECOMMENDATION_LIMITATION_COUNT, RecommendationAction, RecommendationAlphaDecision,
+    RecommendationAlphaEvaluation, RecommendationConfidence, RecommendationConfidenceComponent,
+    RecommendationConfidenceComponentKind, RecommendationConfidenceComponentValue,
+    RecommendationConfidenceMeaning, RecommendationConfidenceUnavailableReason,
+    RecommendationDerivationDigest, RecommendationEvidenceDigest, RecommendationEvidenceKind,
+    RecommendationPolicy, RecommendationPolicyDigest, RecommendationPolicyParameters,
+    RecommendationStudyQualification, UnavailableInvestmentAnalysis, ValuationEvidence,
+    ValuationEvidenceProvenance,
 };
 pub use recommendation_outcome::{
     AnalyticalProfileBindingReference, INVESTMENT_ANALYSIS_EXPLANATION_SCHEMA_VERSION,
     INVESTMENT_ANALYSIS_PUBLICATION_SCHEMA_VERSION, InvestmentAnalysisConclusion,
     InvestmentAnalysisExplanation, InvestmentAnalysisExplanationDigest,
-    InvestmentAnalysisPublicationId, InvestmentAnalysisWorkflowReference,
+    InvestmentAnalysisPublicationId, InvestmentAnalysisRequestProvenance,
+    InvestmentAnalysisWorkflowReference, MAX_INVESTMENT_ANALYSIS_REQUEST_BYTES,
     PreparedPublishedInvestmentAnalysis, PublishedInvestmentAnalysis,
     RECOMMENDATION_OUTCOME_STATUS_SCHEMA_VERSION, RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED,
     RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM, RecommendationAfterTaxReturnAvailability,
@@ -102,3 +112,5 @@ pub use target::{
 
 #[cfg(test)]
 mod tests;
+
+pub use investment_proposal::{InvestmentProbabilityEvidence, ProbabilityCalibrationSummary, ProbabilityEventEvidence, ProbabilityEventKind, ProbabilityForecastEvidence, ProbabilityForecastEvidenceRecord, ProbabilityForecastReference, ProbabilityReliabilityEvidence, ProbabilityUnavailableReason};

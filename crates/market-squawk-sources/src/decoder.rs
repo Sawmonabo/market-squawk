@@ -19,6 +19,10 @@ use crate::{FrameId, FrameSessionBinding, SourceMetadataProvider, ValidatedRawMa
 
 #[path = "decoder/outcome.rs"]
 mod outcome;
+mod quote_state;
+pub use quote_state::{
+    ProviderAccumulatedQuoteEvidence, ProviderQuoteFieldOrigin, ProviderQuoteSizeUnit,
+};
 
 pub use outcome::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
@@ -109,7 +113,7 @@ impl DecoderEvidence {
     /// Returns the shared session-identity allocation plus the owned decoder-rule allocation.
     ///
     /// The inline [`Self`] storage is deliberately excluded.
-    pub(crate) fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
+    pub fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
         self.binding
             .shared_allocation_charge()
             .and_then(|bytes| {
@@ -207,12 +211,42 @@ impl ProviderQuantity {
 pub struct ProviderBookLevel {
     price: ProviderPrice,
     quantity: ProviderQuantity,
+    accumulated: Option<Box<ProviderAccumulatedQuoteEvidence>>,
 }
 
 impl ProviderBookLevel {
     /// Constructs an exact provider book level.
     pub const fn new(price: ProviderPrice, quantity: ProviderQuantity) -> Self {
-        Self { price, quantity }
+        Self {
+            price,
+            quantity,
+            accumulated: None,
+        }
+    }
+
+    /// Retains separately clocked original fields from a documented change-only quote stream.
+    pub fn from_accumulated(
+        price: ProviderPrice,
+        quantity: ProviderQuantity,
+        evidence: ProviderAccumulatedQuoteEvidence,
+    ) -> Self {
+        Self {
+            price,
+            quantity,
+            accumulated: Some(Box::new(evidence)),
+        }
+    }
+    pub fn accumulated_evidence(&self) -> Option<&ProviderAccumulatedQuoteEvidence> {
+        self.accumulated.as_deref()
+    }
+    fn deep_retained_bytes(&self) -> Result<usize, DecodeError> {
+        checked_sum([
+            self.price.0.retained_bytes(),
+            self.quantity.0.retained_bytes(),
+            self.accumulated
+                .as_ref()
+                .map_or(Ok(0), |value| value.retained_bytes())?,
+        ])
     }
 
     /// Returns exact provider price.

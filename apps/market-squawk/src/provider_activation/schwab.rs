@@ -9,7 +9,7 @@ use std::{
 
 use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ParseBounds, ProviderIdentifier, RequestAdmission, RestTransportBounds,
-    SchwabTransportTelemetry, TransientAccessToken,
+    SchwabOAuthAuthorityReceipt, SchwabTransportTelemetry, TransientAccessToken,
 };
 use market_squawk_data::{
     DatasetId, ListingReferenceGenerationReceipt, ListingReferenceReadCapability,
@@ -17,7 +17,7 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     AssignmentVerification, DataQuality, EffectiveInterval, IdentifierEntitlement, LiveEventClass,
-    Timestamp, TradingStatus, VenueId,
+    Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ProviderRateAuthority, SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorReceiptV1,
@@ -32,7 +32,9 @@ use crate::application::{
     SchwabRestQuoteSourceEvidence,
 };
 use crate::live_source::SchwabRestQuoteCurrentSessionInput;
-use crate::provider_onboarding::{SchwabOAuthMarketAuthority, SchwabOAuthPublicationEpoch};
+use crate::provider_onboarding::{
+    SchwabOAuthMarketAuthority, SchwabOAuthPublicationEpoch, SchwabOAuthReceiptCurrentness,
+};
 use crate::{ProviderActivationLease, ProviderOnboardingError};
 
 use super::account::{
@@ -40,9 +42,9 @@ use super::account::{
     ProviderAccountRuntimeCurrentness, ProviderMarketAccount,
 };
 use super::{
-    BoundedMarketInstrumentSet, MarketDataInstrumentBinding, MarketInstrumentBinding,
-    MarketInstrumentReferenceBinding, MarketReferenceIdentityApprovalV1,
-    MarketReferenceIdentityAuthority, ProviderAdapterActivation,
+    MarketDataInstrumentBinding, MarketInstrumentReferenceBinding,
+    MarketReferenceIdentityApprovalV1, MarketReferenceIdentityAuthority, ProviderAdapterActivation,
+    SchwabQuoteReferenceBinding,
 };
 
 const SCHWAB_QUOTE_SOURCE_ID: &str = "schwab-trader-api";
@@ -75,20 +77,90 @@ pub struct SchwabMarketDataAccountActivation {
     oauth: SchwabOAuthMarketAuthority,
     doctor: SchwabMarketDataDoctorReceiptV1,
     doctor_generation: Mutex<SchwabDoctorGenerationDisposition>,
+    market_hours_demand: tokio::sync::Mutex<()>,
+    streamer_owner: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// One selected current source on the sole account group; REST and Streamer never both own it.
+#[derive(Debug)]
+pub(crate) enum PreparedSchwabMarketRuntimeStart {
+    Rest(PreparedSchwabRestMarketRuntimeStart),
+    Streamer(super::schwab_streamer::PreparedSchwabStreamerMarketRuntimeStart),
+}
+impl PreparedSchwabMarketRuntimeStart {
+    pub(crate) fn account_owner(&self) -> Arc<SchwabMarketDataAccountActivation> {
+        match self {
+            Self::Rest(value) => value.account_owner(),
+            Self::Streamer(value) => Arc::clone(&value.activation),
+        }
+    }
+    pub(crate) fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        match self {
+            Self::Rest(value) => value.generation(),
+            Self::Streamer(value) => &value.generation,
+        }
+    }
+    pub(crate) fn durable_read(&self) -> &MarketEventDurableRead {
+        match self {
+            Self::Rest(value) => value.durable_read(),
+            Self::Streamer(value) => &value.publication.durable_read,
+        }
+    }
+    pub(crate) fn activation_lease(&self) -> &ProviderActivationLease {
+        match self {
+            Self::Rest(value) => value.activation_lease(),
+            Self::Streamer(value) => value.activation.lease(),
+        }
+    }
+    pub(crate) fn currentness(&self) -> ProviderAccountRuntimeCurrentness {
+        match self {
+            Self::Rest(value) => value.currentness(),
+            Self::Streamer(value) => value.activation.currentness(),
+        }
+    }
+    pub(crate) fn metadata(&self) -> &SourceMetadata {
+        match self {
+            Self::Rest(value) => value.metadata(),
+            Self::Streamer(value) => value.generation.metadata(),
+        }
+    }
+    pub(crate) fn venue_id(&self) -> &VenueId {
+        match self {
+            Self::Rest(value) => value.venue_id(),
+            Self::Streamer(value) => &value.venue,
+        }
+    }
+    pub(crate) fn bindings(
+        &self,
+    ) -> &[(
+        SchwabQuoteReferenceBinding,
+        Option<MarketReferenceIdentityApprovalV1>,
+    )] {
+        match self {
+            Self::Rest(value) => value.bindings(),
+            Self::Streamer(value) => &value.bindings,
+        }
+    }
+    pub(crate) fn display_bindings(&self) -> &[MarketDataInstrumentBinding] {
+        match self {
+            Self::Rest(value) => value.display_bindings(),
+            Self::Streamer(value) => &value.display_bindings,
+        }
+    }
 }
 
 /// One-use upstream package for the exact registered Schwab current-quote generation.
 ///
-/// Construction consumes a successful account activation and retains the sole durable
-/// publication package. It implements neither `Clone` nor serialization, so OAuth, doctor,
-/// publication, and current-session authority cannot be fanned out across competing runtimes.
-pub(crate) struct PreparedSchwabMarketRuntimeStart {
-    activation: SchwabMarketDataAccountActivation,
+/// Construction retains the single account activation and sole durable publication package.
+/// Internal shared ownership permits independent family demands without copying OAuth or
+/// publication authority; the native Streamer claim remains exclusive.
+pub(crate) struct PreparedSchwabRestMarketRuntimeStart {
+    activation: Arc<SchwabMarketDataAccountActivation>,
     provider_rate: ProviderRateAuthority,
     generation: ResearchProviderRuntimeGeneration,
     evidence: SchwabRestQuoteSourceEvidence,
     bindings: Vec<(
-        MarketInstrumentBinding,
+        SchwabQuoteReferenceBinding,
         Option<MarketReferenceIdentityApprovalV1>,
     )>,
     display_bindings: Box<[MarketDataInstrumentBinding]>,
@@ -102,7 +174,11 @@ pub(crate) struct PreparedSchwabMarketRuntimeStart {
     poll_interval: Duration,
 }
 
-impl PreparedSchwabMarketRuntimeStart {
+impl PreparedSchwabRestMarketRuntimeStart {
+    pub(crate) fn account_owner(&self) -> Arc<SchwabMarketDataAccountActivation> {
+        Arc::clone(&self.activation)
+    }
+
     /// Returns the exact registered provider-runtime generation retained by this package.
     pub(crate) const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
         &self.generation
@@ -132,7 +208,7 @@ impl PreparedSchwabMarketRuntimeStart {
     pub(crate) fn bindings(
         &self,
     ) -> &[(
-        MarketInstrumentBinding,
+        SchwabQuoteReferenceBinding,
         Option<MarketReferenceIdentityApprovalV1>,
     )] {
         &self.bindings
@@ -170,10 +246,10 @@ impl PreparedSchwabMarketRuntimeStart {
     }
 }
 
-impl std::fmt::Debug for PreparedSchwabMarketRuntimeStart {
+impl std::fmt::Debug for PreparedSchwabRestMarketRuntimeStart {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("PreparedSchwabMarketRuntimeStart")
+            .debug_struct("PreparedSchwabRestMarketRuntimeStart")
             .field("generation", &self.generation)
             .field("instrument_count", &self.bindings.len())
             .field("oauth", &"[PROTECTED TOKEN AUTHORITY]")
@@ -192,6 +268,20 @@ enum SchwabDoctorGenerationDisposition {
 }
 
 impl SchwabMarketDataAccountActivation {
+    /// One actual account owns all family demands; this is not a copied account proof.
+    pub(crate) fn market_hours_demand(&self) -> &tokio::sync::Mutex<()> {
+        &self.market_hours_demand
+    }
+
+    pub(crate) fn claim_streamer(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, market_squawk_adapter_schwab::SchwabTransportError>
+    {
+        Arc::clone(&self.streamer_owner)
+            .try_lock_owned()
+            .map_err(|_| market_squawk_adapter_schwab::SchwabTransportError::InvalidConfiguration)
+    }
+
     pub fn lease(&self) -> &ProviderActivationLease {
         self.authority.lease()
     }
@@ -200,8 +290,18 @@ impl SchwabMarketDataAccountActivation {
         self.authority.binding()
     }
 
-    pub(crate) fn oauth_authority(&self) -> SchwabOAuthMarketAuthority {
-        self.oauth.clone()
+    pub(crate) fn oauth_receipt_currentness(&self) -> SchwabOAuthReceiptCurrentness {
+        self.oauth.receipt_currentness()
+    }
+
+    pub(crate) async fn current_oauth_receipt(
+        &self,
+    ) -> Result<SchwabOAuthAuthorityReceipt, SchwabMarketDataActivationError> {
+        self.authority.require_current().await?;
+        let receipt = self.oauth.current_receipt().await?;
+        self.require_doctor_generation(receipt.generation().get())?;
+        self.authority.require_current().await?;
+        Ok(receipt)
     }
 
     pub(crate) const fn doctor_receipt(&self) -> &SchwabMarketDataDoctorReceiptV1 {
@@ -213,9 +313,7 @@ impl SchwabMarketDataAccountActivation {
     }
 
     pub async fn require_current(&self) -> Result<(), SchwabMarketDataActivationError> {
-        self.authority.require_current().await?;
-        let current = self.oauth.current_receipt().await?;
-        self.require_doctor_generation(current.generation().get())
+        self.current_oauth_receipt().await.map(|_| ())
     }
 
     /// Acquires one exact token/publication attempt behind the serialized OAuth barrier.
@@ -248,7 +346,7 @@ impl SchwabMarketDataAccountActivation {
         &self,
         metadata: &SourceMetadata,
         bindings: &[(
-            MarketInstrumentBinding,
+            SchwabQuoteReferenceBinding,
             Option<MarketReferenceIdentityApprovalV1>,
         )],
         nasdaq_generation: Option<&ListingReferenceGenerationReceipt>,
@@ -259,7 +357,10 @@ impl SchwabMarketDataAccountActivation {
         if maximum == 0
             || maximum > SCHWAB_QUOTE_MAXIMUM_SYMBOLS
             || !self.account_binding().validates_metadata(metadata)
-            || metadata.source_id().as_str() != SCHWAB_QUOTE_SOURCE_ID
+            || !matches!(
+                metadata.source_id().as_str(),
+                SCHWAB_QUOTE_SOURCE_ID | super::schwab_quote_metadata::STREAMER_SOURCE
+            )
             || metadata.provider().as_str() != SCHWAB_QUOTE_PROVIDER
             || metadata.budget_policy() != self.lease().provider_budget_policy()
             || !metadata.is_effective_at(at)
@@ -334,6 +435,39 @@ impl std::fmt::Debug for SchwabMarketDataAccountActivation {
 }
 
 impl ProviderAdapterActivation {
+    /// Claims the sole native Streamer executor on the retained account owner.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "account and bounded native inputs remain explicit"
+    )]
+    pub(crate) async fn prepare_schwab_streamer(
+        &self,
+        activation: Arc<SchwabMarketDataAccountActivation>,
+        services: BTreeSet<market_squawk_adapter_schwab::MarketDataService>,
+        control: Arc<dyn market_squawk_adapter_schwab::SchwabStreamerConnectionControlSource>,
+        admission: market_squawk_adapter_schwab::StreamerAdmission,
+        bounds: market_squawk_adapter_schwab::StreamerTransportBounds,
+        parse: ParseBounds,
+        token_admission: AccessTokenAdmission,
+        telemetry: SchwabTransportTelemetry,
+    ) -> Result<
+        crate::provider_rate::GovernedSchwabStreamer,
+        market_squawk_adapter_schwab::SchwabTransportError,
+    > {
+        crate::provider_rate::GovernedSchwabStreamer::try_new(
+            activation,
+            &self.provider_rate,
+            services,
+            control,
+            admission,
+            bounds,
+            parse,
+            token_admission,
+            telemetry,
+        )
+        .await
+    }
+
     /// Activates the exact OAuth epoch proven by the retained durable Schwab doctor receipt.
     pub(crate) async fn activate_schwab_market_data_account(
         &self,
@@ -380,6 +514,8 @@ impl ProviderAdapterActivation {
             authority,
             oauth,
             doctor,
+            market_hours_demand: tokio::sync::Mutex::new(()),
+            streamer_owner: Arc::new(tokio::sync::Mutex::new(())),
             doctor_generation: Mutex::new(SchwabDoctorGenerationDisposition::Current(
                 current.generation().get(),
             )),
@@ -397,9 +533,9 @@ impl ProviderAdapterActivation {
     /// response.
     pub(crate) async fn prepare_schwab_market_runtime_start(
         &self,
-        activation: SchwabMarketDataAccountActivation,
+        activation: Arc<SchwabMarketDataAccountActivation>,
         generation: ResearchProviderRuntimeGeneration,
-        instruments: BoundedMarketInstrumentSet,
+        instruments: Vec<SchwabQuoteReferenceBinding>,
         display_bindings: Vec<MarketDataInstrumentBinding>,
         reference_identity: Option<MarketReferenceIdentityAuthority>,
         listing_reference: Option<ListingReferenceReadCapability>,
@@ -461,7 +597,7 @@ impl ProviderAdapterActivation {
         {
             return Err(SchwabMarketRuntimeStartError::SourceEvidence);
         }
-        let nasdaq_generation = selected_nasdaq_generation(instruments.bindings())?;
+        let nasdaq_generation = selected_nasdaq_generation(&instruments)?;
         match (&nasdaq_generation, &reference_identity, &listing_reference) {
             (Some(expected), Some(_identity), Some(reader)) => {
                 let current = reader
@@ -484,13 +620,13 @@ impl ProviderAdapterActivation {
         )?;
         validate_schwab_display_bindings(&bindings, &display_bindings, now)?;
         let bounds = schwab_quote_runtime_bounds()?;
-        let oauth = activation.oauth_authority();
+        let oauth = activation.oauth_receipt_currentness();
         let oauth_receipt = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
                 return Err(SchwabMarketRuntimeStartError::Cancelled);
             }
-            receipt = oauth.current_receipt() => receipt?,
+            receipt = activation.current_oauth_receipt() => receipt?,
         };
         if oauth_receipt.generation().get() != doctor.access_token_generation()
             || oauth_receipt
@@ -522,46 +658,48 @@ impl ProviderAdapterActivation {
             return Err(SchwabMarketRuntimeStartError::Cancelled);
         }
         let poll_interval = schwab_quote_poll_interval(metadata, SCHWAB_QUOTE_REQUEST_TIMEOUT)?;
-        Ok(PreparedSchwabMarketRuntimeStart {
-            activation,
-            provider_rate: self.provider_rate.clone(),
-            generation,
-            evidence,
-            bindings,
-            display_bindings: display_bindings.into_boxed_slice(),
-            reference_identity,
-            listing_reference,
-            nasdaq_generation,
-            bounds,
-            telemetry: SchwabTransportTelemetry::default(),
-            publication,
-            request_timeout: SCHWAB_QUOTE_REQUEST_TIMEOUT,
-            poll_interval,
-        })
+        Ok(PreparedSchwabMarketRuntimeStart::Rest(
+            PreparedSchwabRestMarketRuntimeStart {
+                activation,
+                provider_rate: self.provider_rate.clone(),
+                generation,
+                evidence,
+                bindings,
+                display_bindings: display_bindings.into_boxed_slice(),
+                reference_identity,
+                listing_reference,
+                nasdaq_generation,
+                bounds,
+                telemetry: SchwabTransportTelemetry::default(),
+                publication,
+                request_timeout: SCHWAB_QUOTE_REQUEST_TIMEOUT,
+                poll_interval,
+            },
+        ))
     }
 }
 
-fn exact_schwab_quote_bindings(
-    instruments: BoundedMarketInstrumentSet,
+pub(super) fn exact_schwab_quote_bindings(
+    instruments: Vec<SchwabQuoteReferenceBinding>,
     identity_approvals: Vec<MarketReferenceIdentityApprovalV1>,
     metadata: &SourceMetadata,
     nasdaq_generation: Option<&ListingReferenceGenerationReceipt>,
     at: Timestamp,
 ) -> Result<
     Vec<(
-        MarketInstrumentBinding,
+        SchwabQuoteReferenceBinding,
         Option<MarketReferenceIdentityApprovalV1>,
     )>,
     SchwabMarketRuntimeStartError,
 > {
-    let bindings = instruments.bindings();
+    let bindings = &instruments;
     let mut retained = Vec::new();
     retained
         .try_reserve_exact(bindings.len())
         .map_err(|_error| SchwabMarketRuntimeStartError::InvalidControls)?;
     for binding in bindings {
         let approval = match binding.reference() {
-            Some(MarketInstrumentReferenceBinding::NasdaqListing(_)) => {
+            MarketInstrumentReferenceBinding::NasdaqListing(_) => {
                 let mut matches = identity_approvals
                     .iter()
                     .filter(|approval| approval.instrument_id() == binding.instrument_id());
@@ -574,8 +712,7 @@ fn exact_schwab_quote_bindings(
                 }
                 Some(approval)
             }
-            Some(MarketInstrumentReferenceBinding::AssignedExternalIdentifier(_)) => None,
-            None => return Err(SchwabMarketRuntimeStartError::CanonicalIdentity),
+            MarketInstrumentReferenceBinding::AssignedExternalIdentifier(_) => None,
         };
         retained.push((binding.clone(), approval));
     }
@@ -597,9 +734,9 @@ fn exact_schwab_quote_bindings(
     Ok(retained)
 }
 
-fn validate_schwab_display_bindings(
+pub(super) fn validate_schwab_display_bindings(
     strict: &[(
-        MarketInstrumentBinding,
+        SchwabQuoteReferenceBinding,
         Option<MarketReferenceIdentityApprovalV1>,
     )],
     display: &[MarketDataInstrumentBinding],
@@ -629,13 +766,11 @@ fn validate_schwab_display_bindings(
 }
 
 fn strict_and_display_definition_match(
-    strict: &MarketInstrumentBinding,
+    strict: &SchwabQuoteReferenceBinding,
     display: &MarketDataInstrumentBinding,
     at: Timestamp,
 ) -> bool {
-    let Some(record) = strict.canonical_market_data_definition() else {
-        return false;
-    };
+    let record = strict.canonical_record();
     let definition = record.definition();
     record.published_at() <= at
         && interval_contains(definition.effective_interval(), at)
@@ -652,7 +787,7 @@ fn strict_and_display_definition_match(
 
 fn validate_exact_schwab_quote_bindings(
     bindings: &[(
-        MarketInstrumentBinding,
+        SchwabQuoteReferenceBinding,
         Option<MarketReferenceIdentityApprovalV1>,
     )],
     metadata: &SourceMetadata,
@@ -667,30 +802,20 @@ fn validate_exact_schwab_quote_bindings(
     let mut instrument_ids = BTreeSet::new();
     let mut provider_symbols = BTreeSet::new();
     for (binding, approval) in bindings {
-        let canonical_definition = binding
-            .canonical_market_data_definition()
-            .ok_or(SchwabMarketRuntimeStartError::CanonicalIdentity)?;
-        let identity = binding
-            .provider_identity()
-            .ok_or(SchwabMarketRuntimeStartError::CanonicalIdentity)?;
-        let reference = binding
-            .reference()
-            .ok_or(SchwabMarketRuntimeStartError::CanonicalIdentity)?;
+        let canonical_definition = binding.canonical_record();
+        let identity = binding.provider_identity();
+        let reference = binding.reference();
         if canonical_definition.published_at() > at
             || !interval_contains(canonical_definition.definition().effective_interval(), at)
             || !reference_is_current(binding, reference, approval.as_ref(), nasdaq_generation, at)
-            || identity.source_id() != metadata.source_id()
+            || identity.source_id().as_str()
+                != super::schwab_quote_binding::SCHWAB_INSTRUMENT_REFERENCE_SOURCE
             || identity.instrument_id() != binding.instrument_id()
-            || binding.execution_terms().instrument_id() != binding.instrument_id()
             || binding.definition().provider_identity_at(
                 identity.source_id(),
                 identity.provider_instrument_id(),
                 at,
             ) != Some(identity)
-            || matches!(
-                binding.definition().trading_status(),
-                TradingStatus::Inactive | TradingStatus::Delisted
-            )
             || !metadata
                 .coverage()
                 .asset_classes()
@@ -715,15 +840,13 @@ fn validate_exact_schwab_quote_bindings(
 }
 
 fn reference_is_current(
-    binding: &MarketInstrumentBinding,
+    binding: &SchwabQuoteReferenceBinding,
     reference: &MarketInstrumentReferenceBinding,
     approval: Option<&MarketReferenceIdentityApprovalV1>,
     nasdaq_generation: Option<&ListingReferenceGenerationReceipt>,
     at: Timestamp,
 ) -> bool {
-    let Some(canonical_record) = binding.canonical_market_data_definition() else {
-        return false;
-    };
+    let canonical_record = binding.canonical_record();
     let canonical_definition = canonical_record.definition();
     match reference {
         MarketInstrumentReferenceBinding::NasdaqListing(listing) => {
@@ -761,13 +884,12 @@ fn reference_is_current(
     }
 }
 
-fn selected_nasdaq_generation(
-    bindings: &[MarketInstrumentBinding],
+pub(super) fn selected_nasdaq_generation(
+    bindings: &[SchwabQuoteReferenceBinding],
 ) -> Result<Option<ListingReferenceGenerationReceipt>, SchwabMarketRuntimeStartError> {
     let mut selected = None;
     for binding in bindings {
-        let Some(MarketInstrumentReferenceBinding::NasdaqListing(listing)) = binding.reference()
-        else {
+        let MarketInstrumentReferenceBinding::NasdaqListing(listing) = binding.reference() else {
             continue;
         };
         match &selected {
@@ -840,7 +962,7 @@ fn nonzero(value: usize) -> Result<NonZeroUsize, SchwabMarketRuntimeStartError> 
     NonZeroUsize::new(value).ok_or(SchwabMarketRuntimeStartError::InvalidControls)
 }
 
-fn system_timestamp() -> Result<Timestamp, SchwabMarketRuntimeStartError> {
+pub(super) fn system_timestamp() -> Result<Timestamp, SchwabMarketRuntimeStartError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_error| SchwabMarketRuntimeStartError::Clock)?;
@@ -897,4 +1019,56 @@ pub enum SchwabMarketDataActivationError {
     Onboarding(#[from] ProviderOnboardingError),
     #[error(transparent)]
     OAuth(#[from] crate::provider_onboarding::SchwabOAuthRuntimeError),
+}
+
+/// Original canonical and listing revisions retained through the same catalog transaction.
+#[derive(Debug)]
+pub(crate) struct SchwabQuoteReferencePrecommit {
+    canonical: market_squawk_data::MarketDataInstrumentReadCapability,
+    records: Vec<market_squawk_data::MarketDataInstrumentRecord>,
+    listing: Option<(
+        market_squawk_data::ListingReferenceReadCapability,
+        market_squawk_data::ListingReferenceGenerationReceipt,
+    )>,
+    deadline: std::time::Instant,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+impl SchwabQuoteReferencePrecommit {
+    pub(crate) fn new(
+        canonical: market_squawk_data::MarketDataInstrumentReadCapability,
+        records: Vec<market_squawk_data::MarketDataInstrumentRecord>,
+        listing: Option<(
+            market_squawk_data::ListingReferenceReadCapability,
+            market_squawk_data::ListingReferenceGenerationReceipt,
+        )>,
+        deadline: std::time::Instant,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            canonical,
+            records,
+            listing,
+            deadline,
+            cancellation,
+        }
+    }
+    pub(crate) fn validate_catalog(
+        &self,
+        catalog: &market_squawk_data::CatalogAuthority,
+    ) -> Result<(), market_squawk_data::IngestError> {
+        if self.records.is_empty() || self.records.len() > 50 {
+            return Err(market_squawk_data::IngestError::PublicationAuthorityRevoked);
+        }
+        for record in &self.records {
+            self.canonical
+                .require_current_in_catalog(catalog, record, self.deadline, &self.cancellation)
+                .map_err(|_| market_squawk_data::IngestError::PublicationAuthorityRevoked)?;
+        }
+        if let Some((reader, expected)) = &self.listing {
+            reader
+                .require_current_in_catalog(catalog, expected, self.deadline, &self.cancellation)
+                .map_err(|_| market_squawk_data::IngestError::PublicationAuthorityRevoked)?;
+        }
+        Ok(())
+    }
 }

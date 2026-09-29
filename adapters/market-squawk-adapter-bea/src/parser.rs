@@ -1051,11 +1051,36 @@ fn parse_observations(
             .map_err(|_| BeaError::InvalidField("UNIT_MULT"))?;
         let table =
             first_member_or_parameter(&members, request, &["TableName", "TableID", "TableId"]);
-        let line = first_member_or_parameter(
-            &members,
-            request,
-            &["SeriesCode", "LineNumber", "LineCode", "Code", "Indicator"],
-        );
+        let line = if dataset.as_str().eq_ignore_ascii_case("Regional") {
+            // `Code` is a composite response series code (for example, `SAINC1-1`).
+            // The selected LineCode remains the exact request coordinate; the original Code
+            // stays in `members` and therefore in the native and canonical identity.
+            let selected_line = supplied_parameter(request, "LineCode")
+                .filter(|line| !line.eq_ignore_ascii_case("ALL"));
+            if let Some(selected_line) = selected_line {
+                let selected_table = supplied_parameter(request, "TableName")
+                    .ok_or(BeaError::InvalidField("Regional TableName"))?;
+                let returned_code =
+                    member(&members, "Code").ok_or(BeaError::InvalidField("Regional Code"))?;
+                if !returned_code.eq_ignore_ascii_case(&format!("{selected_table}-{selected_line}"))
+                {
+                    return Err(BeaError::InvalidField("Regional Code"));
+                }
+                Some(selected_line.to_owned())
+            } else {
+                first_member_or_parameter(
+                    &members,
+                    request,
+                    &["SeriesCode", "LineNumber", "LineCode", "Code", "Indicator"],
+                )
+            }
+        } else {
+            first_member_or_parameter(
+                &members,
+                request,
+                &["SeriesCode", "LineNumber", "LineCode", "Code", "Indicator"],
+            )
+        };
         let identity = BeaObservationIdentity::new(dataset.clone(), table, line, members)?;
         let identity_key = (identity.digest(), period.raw().to_owned());
         if !identities.insert(identity_key) {
@@ -1181,6 +1206,15 @@ fn parse_production_time(raw: String) -> Result<BeaProductionTime, BeaError> {
         raw,
         Timestamp::from_unix_nanos(value),
     ))
+}
+
+fn supplied_parameter<'a>(request: &'a BeaRequest, name: &str) -> Option<&'a str> {
+    request
+        .query()
+        .supplied_parameters()
+        .iter()
+        .find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 fn first_member_or_parameter(

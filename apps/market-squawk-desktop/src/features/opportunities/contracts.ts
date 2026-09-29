@@ -51,14 +51,19 @@ const nonnegativeIntegerSchema = canonicalIntegerSchema.refine(
   (value) => BigInt(value) >= 0n,
   "Expected a nonnegative integer.",
 )
-const positiveIntegerSchema = canonicalIntegerSchema.refine(
-  (value) => BigInt(value) > 0n,
-  "Expected a positive integer.",
-)
 const currencySchema = z.string().regex(/^[A-Z]{3}$/)
 const nonnegativeU32Schema = z.number().int().min(0).max(MAXIMUM_U32)
 const positiveU32Schema = z.number().int().min(1).max(MAXIMUM_U32)
 const productTextSchema = z.string().trim().min(1).max(2_048)
+const unavailableSummarySchema = z.object({
+  state: z.literal("unavailable"),
+  summary: productTextSchema,
+}).strict()
+const studyQualificationSchema = z.object({
+  basis: z.enum(["historical_as_known", "retrospective_frozen_snapshot"]),
+  limitations: z.array(productTextSchema).max(4),
+  summary: productTextSchema,
+}).strict()
 const savedScreenIdSchema = z
   .string()
   .min(1)
@@ -188,9 +193,13 @@ const priceSummarySchema = z
 
 const coverageKinds = [
   "current_market",
+  "broader_research",
+  "price_pattern",
   "forecast",
+  "financial_model",
   "valuation",
   "historical_test",
+  "out_of_sample",
   "liquidity",
   "portfolio_risk",
 ] as const
@@ -253,6 +262,7 @@ const historicalTestSchema = z
     trials: positiveU32Schema,
     stabilityPercent: percentageSchema,
     evaluatedThrough: canonicalRfc3339Schema,
+    studyQualification: studyQualificationSchema,
     summary: productTextSchema,
   })
   .strict()
@@ -284,63 +294,139 @@ const uncertaintyKinds = [
   "portfolio_risk_capacity",
 ] as const
 
+const liquidityReliabilityReasons = [
+  "buy_add_capacity_unavailable",
+  "trim_sell_capacity_unavailable",
+  "action_side_not_established",
+] as const
+const policyWeightSchema = z.number().int().min(0).max(1_000_000)
+const uncertaintyComponentSchema = z.discriminatedUnion("state", [
+  z.object({
+    kind: z.enum(uncertaintyKinds),
+    state: z.literal("available"),
+    reliabilityPercent: percentageSchema,
+    configuredWeightPpm: policyWeightSchema,
+    reason: z.null(),
+  }).strict(),
+  z.object({
+    kind: z.literal("liquidity_capacity"),
+    state: z.literal("unavailable"),
+    reliabilityPercent: z.null(),
+    configuredWeightPpm: policyWeightSchema,
+    reason: z.enum(liquidityReliabilityReasons),
+  }).strict(),
+  z.object({
+    kind: z.literal("liquidity_capacity"),
+    state: z.literal("not_applicable"),
+    reliabilityPercent: z.null(),
+    configuredWeightPpm: policyWeightSchema,
+    reason: z.null(),
+  }).strict(),
+])
+const uncertaintyComponentsSchema = z.array(uncertaintyComponentSchema)
+  .length(uncertaintyKinds.length)
+  .superRefine((components, context) => {
+    if (components.some((component, index) => component.kind !== uncertaintyKinds[index])) {
+      context.addIssue({
+        code: "custom",
+        message: "Evidence-reliability components are not in canonical order.",
+      })
+    }
+  })
 const uncertaintySchema = z.union([
-  z
-    .object({
-      state: z.literal("available"),
-      evidenceReliabilityPercent: percentageSchema,
-      components: z
-        .array(
-          z
-            .object({
-              kind: z.enum(uncertaintyKinds),
-              reliabilityPercent: percentageSchema,
-            })
-            .strict(),
-        )
-        .length(uncertaintyKinds.length),
-      summary: productTextSchema,
-    })
-    .strict()
-    .superRefine((value, context) => {
-      if (
-        value.components.some(
-          (component, index) => component.kind !== uncertaintyKinds[index],
-        )
-      ) {
-        context.addIssue({
-          code: "custom",
-          message: "Evidence-reliability components are not in canonical order.",
-        })
-      }
-    }),
-  z
-    .object({
-      state: z.literal("unavailable"),
-      summary: productTextSchema,
-    })
-    .strict(),
+  z.object({
+    state: z.literal("available"),
+    evidenceReliabilityPercent: percentageSchema,
+    reason: z.null(),
+    applicablePolicyWeightPpm: z.number().int().min(1).max(1_000_000),
+    components: uncertaintyComponentsSchema,
+    studyQualification: studyQualificationSchema,
+    summary: productTextSchema,
+  }).strict(),
+  z.object({
+    state: z.literal("unavailable"),
+    evidenceReliabilityPercent: z.null(),
+    reason: z.enum([...liquidityReliabilityReasons, "no_applicable_policy_weight"]),
+    applicablePolicyWeightPpm: policyWeightSchema,
+    components: uncertaintyComponentsSchema,
+    studyQualification: studyQualificationSchema,
+    summary: productTextSchema,
+  }).strict(),
+  unavailableSummarySchema,
 ])
 
 const evidenceSummarySchema = z
   .object({
     coverage: coverageSchema,
     calibration: calibrationSchema,
-    outOfSample: z
-      .object({
-        state: z.literal("not_established"),
+    outOfSample: z.discriminatedUnion("state", [
+      z.object({
+        state: z.literal("available"),
+        completedObservations: positiveU32Schema,
+        totalSignals: positiveU32Schema,
+        folds: positiveU32Schema,
+        completionCoveragePercent: percentageSchema,
+        evaluatedFrom: canonicalRfc3339Schema,
+        evaluatedThrough: canonicalRfc3339Schema,
+        studyQualification: studyQualificationSchema,
         summary: productTextSchema,
-      })
-      .strict(),
+      }).strict(),
+      unavailableSummarySchema,
+    ]),
     historicalTest: historicalTestSchema.nullable(),
     costs: costSummarySchema,
     uncertainty: uncertaintySchema,
   })
   .strict()
 
+const signedMoneySchema = z.object({
+  amount: canonicalDecimalSchema,
+  currency: currencySchema,
+}).strict()
+const signedMoneyRangeSchema = z.object({
+  lower: signedMoneySchema,
+  upper: signedMoneySchema,
+}).strict().superRefine((range, context) => {
+  if (range.lower.currency !== range.upper.currency
+    || compareCanonicalDecimals(range.lower.amount, range.upper.amount) > 0) {
+    context.addIssue({ code: "custom", message: "The signed money range is inconsistent." })
+  }
+})
+const grossPricePnlSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"),
+    range: signedMoneyRangeSchema,
+    summary: productTextSchema,
+  }).strict(),
+  unavailableSummarySchema,
+])
+
+const exactFinancialRatioSchema = z.object({ numerator: signedMoneySchema, denominator: moneySchema })
+  .strict().superRefine((ratio, context) => {
+    if (ratio.numerator.currency !== ratio.denominator.currency) {
+      context.addIssue({ code: "custom", message: "The exact price-return ratio mixes currencies." })
+    }
+  })
+const exactRatioRangeSchema = z.object({ lower: exactFinancialRatioSchema, upper: exactFinancialRatioSchema }).strict()
+const expectedReturnSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"), metric: z.literal("expected_gross_price_return"),
+    basis: z.literal("admitted_conditional_mean_terminal_price"),
+    grossPriceReturnPercent: canonicalDecimalSchema.nullable(), exactRatio: exactFinancialRatioSchema,
+    summary: productTextSchema,
+  }).strict(), unavailableSummarySchema,
+])
+const zoneDistanceSchema = z.object({
+  priceRange: priceRangeSchema, absolutePriceChange: signedMoneyRangeSchema,
+  exactPriceReturnRatio: exactRatioRangeSchema,
+}).strict()
+
 const priceChangeRangeSchema = z
   .object({
     priceRange: priceRangeSchema,
+    absolutePriceChange: signedMoneyRangeSchema,
+    grossPricePnl: grossPricePnlSchema,
+    exactPriceReturnRatio: exactRatioRangeSchema,
     priceChangePercent: z
       .object({
         lower: canonicalDecimalSchema,
@@ -360,9 +446,27 @@ const outcomeProjectionSchema = z
   .object({
     startingPrice: moneySchema,
     endsAt: canonicalRfc3339Schema,
+    positionScale: z.object({
+      quantityLots: nonnegativeIntegerSchema,
+      summary: productTextSchema,
+    }).strict().nullable(),
     downside: priceChangeRangeSchema,
     base: priceChangeRangeSchema,
     upside: priceChangeRangeSchema,
+    entryDistance: zoneDistanceSchema, addDistance: zoneDistanceSchema,
+    trimDistance: zoneDistanceSchema, exitDistance: zoneDistanceSchema,
+    expectedReturn: expectedReturnSchema,
+    expectedGrossPricePnl: z.discriminatedUnion("state", [
+      z.object({
+        state: z.literal("available"),
+        amount: signedMoneySchema,
+        summary: productTextSchema,
+      }).strict(),
+      unavailableSummarySchema,
+    ]),
+    netPnl: unavailableSummarySchema,
+    benchmarkReturn: unavailableSummarySchema,
+    afterTaxPnl: unavailableSummarySchema,
     limitations: z.array(productTextSchema).min(1).max(8),
   })
   .strict()
@@ -388,8 +492,8 @@ const lotRangeSchema = z.union([
   z
     .object({
       kind: z.literal("available"),
-      lower: positiveIntegerSchema,
-      upper: positiveIntegerSchema,
+      lower: nonnegativeIntegerSchema,
+      upper: nonnegativeIntegerSchema,
     })
     .strict()
     .superRefine((value, context) => {
@@ -400,20 +504,49 @@ const lotRangeSchema = z.union([
   z
     .object({
       kind: z.literal("unavailable"),
-      reasons: z.array(productTextSchema).min(1).max(16),
+      reasons: z.array(productTextSchema).min(1).max(8),
     })
     .strict(),
 ])
 
-const sizingSchema = z
-  .object({
-    evaluatedAt: canonicalRfc3339Schema,
-    currentLots: nonnegativeIntegerSchema,
-    hardFeasibleLots: lotRangeSchema,
-    preferredFeasibleLots: lotRangeSchema,
+const nonnegativeMoneySchema = z.object({
+  amount: canonicalDecimalSchema.refine((value) => !value.startsWith("-")), currency: currencySchema,
+}).strict()
+const sizingKinds = ["cash_reserve", "downside_loss", "liquidity", "portfolio_risk", "forward_cost", "preferred_weight"] as const
+const notionalRangeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("available"), lower: nonnegativeMoneySchema, upper: nonnegativeMoneySchema }).strict(),
+  z.object({ kind: z.literal("unavailable"), reasons: z.array(productTextSchema).min(1).max(8) }).strict(),
+]).superRefine((range, context) => {
+  if (range.kind === "available" && (range.lower.currency !== range.upper.currency
+    || comparePositiveDecimals(range.lower.amount, range.upper.amount) > 0)) {
+    context.addIssue({ code: "custom", message: "The target notional range is inconsistent." })
+  }
+})
+const sizingCapSchema = z.discriminatedUnion("state", [
+  z.object({ kind: z.enum(sizingKinds), state: z.literal("available"), lower: nonnegativeIntegerSchema, upper: nonnegativeIntegerSchema }).strict(),
+  z.object({ kind: z.enum(sizingKinds), state: z.literal("unavailable"), summary: productTextSchema }).strict(),
+]).superRefine((cap, context) => {
+  if (cap.state === "available" && BigInt(cap.lower) > BigInt(cap.upper)) {
+    context.addIssue({ code: "custom", message: "The sizing constraint range is reversed." })
+  }
+})
+const sizingSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("evaluated"), evaluatedAt: canonicalRfc3339Schema,
+    currentLots: nonnegativeIntegerSchema, markedEquity: moneySchema,
+    settlementAvailableCash: signedMoneySchema.nullable(), perLotNotional: moneySchema,
+    perLotDownsideLoss: nonnegativeMoneySchema, constraintCaps: z.array(sizingCapSchema).length(6),
+    hardFeasibleLots: lotRangeSchema, preferredFeasibleLots: lotRangeSchema,
+    hardFeasibleTargetNotional: notionalRangeSchema, preferredFeasibleTargetNotional: notionalRangeSchema,
+    hardBindingCaps: z.array(z.enum(sizingKinds)).max(5), preferredBindingCaps: z.array(z.enum(sizingKinds)).max(6),
+    preferredWeightRounding: z.object({ lowerRoundUpExcess: nonnegativeMoneySchema, upperRoundDownRemainder: nonnegativeMoneySchema }).strict(),
     summary: productTextSchema,
-  })
-  .strict()
+  }).strict(),
+  z.object({ state: z.literal("unavailable"),
+    reason: z.enum(["no_generated_proposal", "price_not_on_execution_tick", "exact_portfolio_lots_unavailable"]),
+    summary: productTextSchema,
+  }).strict(),
+])
 
 const realizedOutcomeResultSchema = z.discriminatedUnion("kind", [
   z
@@ -527,6 +660,14 @@ function rangeMoney(range: ProductPriceRange): ProductMoney[] {
   return [range.lower, range.upper]
 }
 
+function sameMoney(left: ProductMoney, right: ProductMoney): boolean {
+  return left.amount === right.amount && left.currency === right.currency
+}
+
+function sameRange(left: ProductPriceRange, right: ProductPriceRange): boolean {
+  return sameMoney(left.lower, right.lower) && sameMoney(left.upper, right.upper)
+}
+
 function strictlyIncreasingMoney(values: ProductMoney[]): boolean {
   const currency = values[0]?.currency
   return (
@@ -563,12 +704,37 @@ function analysisMoney(analysis: {
     )
   }
   if (analysis.outcomeProjection) {
+    const projection = analysis.outcomeProjection
     values.push(
-      analysis.outcomeProjection.startingPrice,
-      ...rangeMoney(analysis.outcomeProjection.downside.priceRange),
-      ...rangeMoney(analysis.outcomeProjection.base.priceRange),
-      ...rangeMoney(analysis.outcomeProjection.upside.priceRange),
+      projection.startingPrice,
+      ...rangeMoney(projection.downside.priceRange),
+      ...rangeMoney(projection.base.priceRange),
+      ...rangeMoney(projection.upside.priceRange),
     )
+    for (const scenario of [projection.downside, projection.base, projection.upside]) {
+      values.push(...rangeMoney(scenario.absolutePriceChange),
+        scenario.exactPriceReturnRatio.lower.numerator,
+        scenario.exactPriceReturnRatio.lower.denominator,
+        scenario.exactPriceReturnRatio.upper.numerator,
+        scenario.exactPriceReturnRatio.upper.denominator)
+      if (scenario.grossPricePnl.state === "available") {
+        values.push(...rangeMoney(scenario.grossPricePnl.range))
+      }
+    }
+    for (const distance of [projection.entryDistance, projection.addDistance,
+      projection.trimDistance, projection.exitDistance]) {
+      values.push(...rangeMoney(distance.priceRange), ...rangeMoney(distance.absolutePriceChange),
+        distance.exactPriceReturnRatio.lower.numerator,
+        distance.exactPriceReturnRatio.lower.denominator,
+        distance.exactPriceReturnRatio.upper.numerator,
+        distance.exactPriceReturnRatio.upper.denominator)
+    }
+    if (projection.expectedReturn.state === "available") {
+      values.push(projection.expectedReturn.exactRatio.numerator, projection.expectedReturn.exactRatio.denominator)
+    }
+    if (projection.expectedGrossPricePnl.state === "available") {
+      values.push(projection.expectedGrossPricePnl.amount)
+    }
   }
   const realized = analysis.realizedOutcome?.result
   if (realized?.kind === "completed") {
@@ -576,6 +742,392 @@ function analysisMoney(analysis: {
   }
   return values
 }
+
+const evidenceFamilySchema = z.object({
+  state: z.enum(["available", "unavailable"]),
+  summary: productTextSchema,
+}).strict()
+const pricePatternEvidenceSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"),
+    outcome: z.enum(["pattern_detected", "no_matching_pattern", "pattern_expired", "pattern_invalidated"]),
+    summary: productTextSchema,
+  }).strict(),
+  z.object({
+    state: z.literal("unavailable"),
+    outcome: z.enum([
+      "insufficient_bars", "insufficient_turning_points", "history_unavailable",
+      "adjustment_unavailable", "trading_activity_unavailable", "price_precision_unavailable",
+      "assessment_unavailable", "not_evaluated",
+    ]),
+    summary: productTextSchema,
+  }).strict(),
+])
+const analyticalEvidenceSchema = z.object({
+  currentMarket: evidenceFamilySchema,
+  broaderResearch: evidenceFamilySchema,
+  pricePattern: pricePatternEvidenceSchema,
+  forecast: evidenceFamilySchema,
+  financialModel: evidenceFamilySchema,
+  valuation: evidenceFamilySchema,
+  historicalTest: evidenceFamilySchema,
+  outOfSample: evidenceFamilySchema,
+  liquidity: evidenceFamilySchema,
+  portfolioRisk: evidenceFamilySchema,
+  combination: z.object({
+    state: z.enum(["multi_evidence", "insufficient"]),
+    summary: productTextSchema,
+  }).strict(),
+}).strict()
+const liquiditySchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"),
+    quotedSpreadPercent: canonicalDecimalSchema.refine((value) => !value.startsWith("-")),
+    buyAddCapacityPercent: percentageSchema.nullable(),
+    trimSellCapacityPercent: percentageSchema.nullable(),
+    summary: productTextSchema,
+  }).strict(),
+  unavailableSummarySchema,
+])
+const portfolioContextSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"),
+    portfolioLabel: z.string().trim().min(1).max(128),
+    positionState: z.enum(["no_position", "current_position"]),
+    riskCapacityPercent: percentageSchema,
+    summary: productTextSchema,
+  }).strict(),
+  unavailableSummarySchema,
+])
+const virtualPaperEligibilitySchema = z.object({
+  state: z.literal("not_eligible"),
+  executionAuthority: z.literal("none"),
+  requiresExplicitPaperApproval: z.literal(true),
+  requiresFreshRiskCheck: z.literal(true),
+  summary: productTextSchema,
+}).strict()
+
+const chartValueSchema = positiveDecimalSchema.refine(
+  (value) => Number.isFinite(Number(value)),
+  "Expected a drawable saved price.",
+)
+const chartRangeSchema = z.object({ lower: chartValueSchema, upper: chartValueSchema }).strict()
+  .superRefine((range, context) => {
+    if (comparePositiveDecimals(range.lower, range.upper) > 0) {
+      context.addIssue({ code: "custom", message: "The saved price range is reversed." })
+    }
+  })
+const chartTimeSchema = canonicalIntegerSchema
+const chartSessionCoordinateSchema = z.object({
+  kind: z.literal("session_date"), date: z.iso.date(), sessionCloseUnixNanos: chartTimeSchema,
+}).strict()
+const chartCoordinateSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("timestamp"), timeUnixNanos: chartTimeSchema }).strict(),
+  chartSessionCoordinateSchema,
+])
+const chartQualitySchema = z.enum(["direct_verified", "direct_unverified", "official_delayed", "aggregated", "indicative", "modeled", "estimated", "stale", "quarantined"])
+const forecastOriginSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"), basis: z.literal("split_adjusted_price"),
+    coordinate: chartCoordinateSchema, value: chartValueSchema,
+    quality: chartQualitySchema, summary: productTextSchema,
+  }).strict(),
+  unavailableSummarySchema,
+])
+const chartHistoryPointSchema = z.union([
+  z.object({
+    coordinate: chartCoordinateSchema,
+    availableAtUnixNanos: chartTimeSchema,
+    value: chartValueSchema,
+    quality: chartQualitySchema,
+  }).strict(),
+  z.object({
+    coordinate: chartCoordinateSchema,
+    availableAtUnixNanos: z.null(), value: z.null(), quality: z.null(),
+  }).strict(),
+])
+const chartHistorySchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"), summary: productTextSchema,
+    basis: z.literal("split_adjusted_price"),
+    points: z.array(chartHistoryPointSchema).min(1).max(4_096),
+  }).strict(),
+  z.object({
+    state: z.literal("unavailable"), summary: productTextSchema,
+    basis: z.literal("split_adjusted_price"), points: z.tuple([]),
+  }).strict(),
+])
+const forecastPointSchema = z.object({
+  timeUnixNanos: chartTimeSchema, central: chartValueSchema,
+  interval50: chartRangeSchema.nullable(), interval80: chartRangeSchema.nullable(),
+  interval95: chartRangeSchema.nullable(),
+}).strict().superRefine((point, context) => {
+  for (const interval of [point.interval50, point.interval80, point.interval95]) {
+    if (interval !== null && (comparePositiveDecimals(interval.lower, point.central) > 0
+      || comparePositiveDecimals(point.central, interval.upper) > 0)) {
+      context.addIssue({ code: "custom", message: "The forecast range does not contain its central price." })
+    }
+  }
+  if (point.interval50 !== null && point.interval80 !== null
+    && (comparePositiveDecimals(point.interval80.lower, point.interval50.lower) > 0
+      || comparePositiveDecimals(point.interval50.upper, point.interval80.upper) > 0)) {
+    context.addIssue({ code: "custom", message: "The calibrated forecast ranges are not nested." })
+  }
+  if (point.interval80 !== null && point.interval95 !== null
+    && (comparePositiveDecimals(point.interval95.lower, point.interval80.lower) > 0
+      || comparePositiveDecimals(point.interval80.upper, point.interval95.upper) > 0)) {
+    context.addIssue({ code: "custom", message: "The calibrated forecast ranges are not nested." })
+  }
+})
+const chartForecastSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"), summary: productTextSchema,
+    basis: z.literal("saved_price_projection"),
+    observedThroughUnixNanos: chartTimeSchema, origin: forecastOriginSchema,
+    points: z.tuple([forecastPointSchema]),
+  }).strict(),
+  z.object({
+    state: z.literal("unavailable"), summary: productTextSchema,
+    basis: z.literal("saved_price_projection"),
+    observedThroughUnixNanos: z.null(), origin: unavailableSummarySchema,
+    points: z.tuple([]),
+  }).strict(),
+])
+const benchmarkMemberSchema = z.object({
+  instrumentId: actionTokenSchema,
+  label: z.string().trim().min(1).max(128),
+}).strict()
+const benchmarkMembersSchema = z.union([
+  z.tuple([
+    benchmarkMemberSchema.extend({ role: z.literal("subject") }),
+    benchmarkMemberSchema.extend({ role: z.literal("selected") }),
+  ]),
+  z.tuple([
+    benchmarkMemberSchema.extend({ role: z.literal("subject") }),
+    benchmarkMemberSchema.extend({ role: z.literal("selected") }),
+    benchmarkMemberSchema.extend({ role: z.literal("accompanying") }),
+  ]),
+])
+const unavailableBenchmarkMembersSchema = z.union([
+  z.tuple([benchmarkMemberSchema.extend({ role: z.literal("subject") })]),
+  benchmarkMembersSchema,
+])
+const benchmarkCoordinateSchema = z.object({
+  date: z.iso.date(), sessionCloseUnixNanos: chartTimeSchema,
+}).strict()
+const benchmarkObservationSchema = z.object({
+  close: positiveDecimalSchema,
+  priceIndex: positiveDecimalSchema.refine((value) => Number.isFinite(Number(value)),
+    "Expected a drawable saved price index."),
+  availableAtUnixNanos: chartTimeSchema,
+  providerCompletedAtUnixNanos: chartTimeSchema.nullable(),
+  quality: chartQualitySchema,
+}).strict()
+const benchmarkBasisSchema = z.literal("split_adjusted_price_index")
+const benchmarkHistorySchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"), summary: productTextSchema,
+    basis: benchmarkBasisSchema, members: benchmarkMembersSchema,
+    baseline: benchmarkCoordinateSchema,
+    points: z.array(z.object({
+      coordinate: benchmarkCoordinateSchema,
+      observations: z.array(benchmarkObservationSchema.nullable()).min(2).max(3),
+    }).strict()).min(1).max(4_096),
+  }).strict(),
+  z.object({
+    state: z.literal("unavailable"), summary: productTextSchema,
+    basis: benchmarkBasisSchema, members: unavailableBenchmarkMembersSchema,
+    reason: z.enum([
+      "selection_unavailable", "missing_subject", "missing_selected_comparison",
+      "no_common_observation", "storage_unavailable", "integrity_unproven",
+    ]),
+  }).strict(),
+]).superRefine((benchmark, context) => {
+  if (benchmark.state !== "available") {
+    if (benchmark.members.length === 1 && benchmark.reason !== "selection_unavailable") {
+      context.addIssue({ code: "custom", message: "Unavailable comparison history lacks its saved selection." })
+    }
+    return
+  }
+  const first = benchmark.points[0]
+  if (!first || first.coordinate.date !== benchmark.baseline.date
+    || first.coordinate.sessionCloseUnixNanos !== benchmark.baseline.sessionCloseUnixNanos
+    || first.observations[0]?.priceIndex !== "100"
+    || first.observations[1]?.priceIndex !== "100") {
+    context.addIssue({ code: "custom", message: "The saved comparison has no common base-100 observation." })
+  }
+  benchmark.points.forEach((point, index) => {
+    if (point.observations.length !== benchmark.members.length
+      || index > 0 && (point.coordinate.date <= benchmark.points[index - 1]!.coordinate.date
+        || BigInt(point.coordinate.sessionCloseUnixNanos) <= BigInt(benchmark.points[index - 1]!.coordinate.sessionCloseUnixNanos))) {
+      context.addIssue({ code: "custom", path: ["points", index], message: "Comparison sessions or members are inconsistent." })
+    }
+  })
+})
+const chartActionKinds = ["entry", "add", "trim", "exit"] as const
+const chartActionRangeSchema = z.object({
+  kind: z.enum(chartActionKinds), label: productTextSchema,
+  lower: chartValueSchema, upper: chartValueSchema,
+  startAtUnixNanos: chartTimeSchema, endAtUnixNanos: chartTimeSchema,
+  summary: productTextSchema,
+}).strict().superRefine((range, context) => {
+  if (comparePositiveDecimals(range.lower, range.upper) > 0
+    || BigInt(range.startAtUnixNanos) >= BigInt(range.endAtUnixNanos)) {
+    context.addIssue({ code: "custom", message: "The saved action reference range or interval is reversed." })
+  }
+})
+const chartActionClocks = {
+  basis: z.literal("split_adjusted_price"), summary: productTextSchema,
+  informationCurrentThroughUnixNanos: chartTimeSchema,
+  admittedAtUnixNanos: chartTimeSchema, expiresAtUnixNanos: chartTimeSchema,
+}
+const chartActionRangesSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("available"), ...chartActionClocks,
+    ranges: z.array(chartActionRangeSchema).length(chartActionKinds.length),
+  }).strict(),
+  z.object({ state: z.literal("unavailable"), ...chartActionClocks,
+    reason: z.enum(["no_supported_action_ranges", "share_conversion_unavailable",
+      "original_history_unavailable", "expired_at_admission", "range_conversion_unavailable"]),
+    ranges: z.tuple([]),
+  }).strict(),
+]).superRefine((levels, context) => {
+  if (levels.state === "available" && (BigInt(levels.informationCurrentThroughUnixNanos) > BigInt(levels.admittedAtUnixNanos)
+    || levels.ranges.some((range, index) => range.kind !== chartActionKinds[index]
+      || range.startAtUnixNanos !== levels.admittedAtUnixNanos || range.endAtUnixNanos !== levels.expiresAtUnixNanos))) {
+    context.addIssue({ code: "custom", message: "Saved action references contradict their original admission interval." })
+  }
+})
+const investmentChartSchema = z.object({
+  informationCurrentThroughUnixNanos: chartTimeSchema,
+  basisExplanation: productTextSchema,
+  history: chartHistorySchema,
+  forecast: chartForecastSchema,
+  benchmark: benchmarkHistorySchema,
+  actionRanges: chartActionRangesSchema,
+  pricePattern: z.object({
+    status: z.enum(["unavailable", "confirmed", "insufficient_bars", "insufficient_pivots", "no_matching_pattern", "expired", "invalidated"]),
+    summary: productTextSchema, basis: z.literal("split_adjusted_price"),
+    kind: z.enum(["ab_cd", "gartley", "bat", "butterfly", "crab", "deep_crab", "cypher", "shark"]).nullable(),
+    direction: z.enum(["bullish", "bearish"]).nullable(),
+    pivots: z.array(z.object({
+      name: z.enum(["X", "A", "B", "C", "D"]), kind: z.enum(["high", "low"]),
+      observedAtUnixNanos: chartTimeSchema, availableAtUnixNanos: chartTimeSchema,
+      confirmedAtUnixNanos: chartTimeSchema, value: chartValueSchema,
+    }).strict()).max(5),
+    ratios: z.array(z.object({
+      name: z.enum(["AB/XA", "BC/AB", "CD/BC", "CD/AB", "AD/XA", "XC/XA", "CD/XC"]),
+      numerator: nonnegativeIntegerSchema, denominator: canonicalIntegerSchema.refine((value) => BigInt(value) > 0n),
+    }).strict()).max(7),
+    reversalZone: chartRangeSchema.nullable(), invalidation: chartValueSchema.nullable(),
+    targets: z.array(chartValueSchema).max(3), expiresAtUnixNanos: chartTimeSchema.nullable(),
+    observationCutoffUnixNanos: chartTimeSchema.nullable(), confirmationCutoffUnixNanos: chartTimeSchema.nullable(),
+    interpretation: z.array(productTextSchema).max(8),
+  }).strict(),
+}).strict().superRefine((chart, context) => {
+  const history = chart.history
+  const cutoff = BigInt(chart.informationCurrentThroughUnixNanos)
+  if (chart.actionRanges.informationCurrentThroughUnixNanos !== chart.informationCurrentThroughUnixNanos
+    || chart.actionRanges.state === "available" && history.state !== "available") {
+    context.addIssue({ code: "custom", path: ["actionRanges"],
+      message: "Saved action references lack their original chart history or information cutoff." })
+  }
+  if (history.state === "available") {
+    if (history.points.at(-1)?.value === null) {
+      context.addIssue({ code: "custom", path: ["history", "points"],
+        message: "Saved history must end at a genuine observed price." })
+    }
+    history.points.forEach((point, index) => {
+      const coordinate = point.coordinate
+      const time = coordinate.kind === "timestamp"
+        ? coordinate.timeUnixNanos : coordinate.sessionCloseUnixNanos
+      const previous = history.points[index - 1]?.coordinate
+      const previousTime = previous?.kind === "timestamp"
+        ? previous.timeUnixNanos : previous?.sessionCloseUnixNanos
+      if (BigInt(time) > cutoff
+        || point.availableAtUnixNanos !== null && BigInt(point.availableAtUnixNanos) > cutoff
+        || previousTime !== undefined && BigInt(time) <= BigInt(previousTime)
+        || coordinate.kind === "session_date" && previous?.kind === "session_date"
+          && coordinate.date <= previous.date) {
+        context.addIssue({ code: "custom", path: ["history", "points", index],
+          message: "Saved price sessions or availability exceed the original information cutoff." })
+      }
+    })
+  }
+  const forecast = chart.forecast
+  if (forecast.state === "available") {
+    if (BigInt(forecast.observedThroughUnixNanos) > cutoff
+      || BigInt(forecast.points[0].timeUnixNanos) <= BigInt(forecast.observedThroughUnixNanos)) {
+      context.addIssue({ code: "custom", path: ["forecast"],
+        message: "The saved forecast endpoint or origin contradicts its evidence cutoff." })
+    }
+    const origin = forecast.origin
+    if (origin.state === "available") {
+      const originTime = origin.coordinate.kind === "timestamp"
+        ? origin.coordinate.timeUnixNanos : origin.coordinate.sessionCloseUnixNanos
+      if (originTime !== forecast.observedThroughUnixNanos) {
+        context.addIssue({ code: "custom", path: ["forecast", "origin"],
+          message: "The original price does not match the saved forecast cutoff." })
+      }
+      if (history.state === "available") {
+        const last = history.points.at(-1)!
+        const lastTime = last.coordinate.kind === "timestamp"
+          ? last.coordinate.timeUnixNanos : last.coordinate.sessionCloseUnixNanos
+        if (lastTime !== originTime || last.value !== origin.value) {
+          context.addIssue({ code: "custom", path: ["forecast", "origin"],
+            message: "The saved forecast origin does not match its final observed price." })
+        }
+      }
+    }
+  }
+  const pattern = chart.pricePattern
+  if (pattern.status === "confirmed" ? pattern.kind === null || pattern.direction === null || pattern.pivots.length !== 5
+    || pattern.reversalZone === null || pattern.invalidation === null || pattern.expiresAtUnixNanos === null
+    || pattern.observationCutoffUnixNanos === null || pattern.confirmationCutoffUnixNanos === null
+    : pattern.pivots.length !== 0 || pattern.reversalZone !== null || pattern.invalidation !== null || pattern.targets.length !== 0) {
+    context.addIssue({ code: "custom", message: "Pattern geometry must belong to confirmed saved evidence." })
+  }
+})
+
+const savedBenchmarkIdentitySchema = z.object({
+  instrumentId: actionTokenSchema, definitionAlgorithm: z.enum(["sha256", "blake3"]), definitionDigest: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict().nullable()
+const savedProbabilitySchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("available"), probabilityPercent: percentageSchema,
+    benchmark: savedBenchmarkIdentitySchema,
+    observedAt: canonicalRfc3339Schema, endsAt: canonicalRfc3339Schema,
+    expiresAt: canonicalRfc3339Schema, assumptions: z.array(productTextSchema).max(5),
+    calibration: z.object({
+      evaluatedFrom: canonicalRfc3339Schema, evaluatedThrough: canonicalRfc3339Schema,
+      completedOutcomes: positiveU32Schema, brierScore: z.number().min(0).max(1),
+      logLoss: z.number().min(0),
+    }).strict(),
+  }).strict(),
+  z.object({ state: z.literal("unavailable"), summary: productTextSchema,
+    benchmark: savedBenchmarkIdentitySchema,
+    assumptions: z.array(productTextSchema).max(5),
+  }).strict(),
+]).superRefine((event, context) => {
+  if (event.state === "available" && (event.observedAt >= event.endsAt
+    || event.observedAt >= event.expiresAt
+    || event.calibration.evaluatedFrom >= event.calibration.evaluatedThrough
+    || event.calibration.evaluatedThrough > event.observedAt)) {
+    context.addIssue({ code: "custom", message: "Saved event probability has inconsistent evidence dates." })
+  }
+})
+const savedProbabilitiesSchema = z.object({
+  priceHigher: savedProbabilitySchema, benchmarkOutperformance: savedProbabilitySchema,
+  profitAfterCosts: savedProbabilitySchema,
+}).strict().superRefine((events, context) => {
+  if (events.priceHigher.benchmark !== null || events.profitAfterCosts.benchmark !== null
+    || (events.benchmarkOutperformance.state === "available" && events.benchmarkOutperformance.benchmark === null)) {
+    context.addIssue({ code: "custom", message: "Saved benchmark identity does not match its event." })
+  }
+  const ready = Object.values(events).filter((event) => event.state === "available")
+  if (ready.some((event) => event.observedAt !== ready[0]?.observedAt || event.endsAt !== ready[0]?.endsAt)) {
+    context.addIssue({ code: "custom", message: "Saved event probabilities do not share their original horizon." })
+  }
+})
 
 export const investmentAnalysisSchema = z
   .object({
@@ -591,13 +1143,20 @@ export const investmentAnalysisSchema = z
     recommendation: recommendationSchema,
     horizon: horizonSchema,
     priceSummary: priceSummarySchema,
+    chart: investmentChartSchema,
+    probabilities: savedProbabilitiesSchema,
     reasons: z.array(productTextSchema).min(1).max(32),
     risks: z.array(productTextSchema).max(32),
     assumptions: z.array(productTextSchema).max(32),
     invalidators: z.array(productTextSchema).max(32),
     evidenceSummary: evidenceSummarySchema,
+    analyticalEvidence: analyticalEvidenceSchema,
+    liquidity: liquiditySchema,
+    portfolioContext: portfolioContextSchema,
+    virtualPaperEligibility: virtualPaperEligibilitySchema,
     outcomeProjection: outcomeProjectionSchema.nullable(),
-    sizing: sizingSchema.nullable(),
+    sizing: sizingSchema,
+    expectedReturn: expectedReturnSchema,
     realizedOutcome: realizedOutcomeSchema.nullable(),
     trackRecordActionToken: actionTokenSchema.nullable(),
   })
@@ -607,7 +1166,7 @@ export const investmentAnalysisSchema = z
       analysis.recommendation.kind !== "action" &&
       (analysis.priceSummary.actionRanges !== null ||
         analysis.outcomeProjection !== null ||
-        analysis.sizing !== null)
+        analysis.sizing.state === "evaluated")
     ) {
       context.addIssue({
         code: "custom",
@@ -655,8 +1214,127 @@ export const investmentAnalysisSchema = z
         message: "The outcome projection uses a different investment horizon.",
       })
     }
+    if (analysis.sizing.state === "evaluated") {
+      const sizing = analysis.sizing
+      const amounts = [sizing.markedEquity, sizing.perLotNotional, sizing.perLotDownsideLoss,
+        sizing.preferredWeightRounding.lowerRoundUpExcess, sizing.preferredWeightRounding.upperRoundDownRemainder,
+        ...(sizing.settlementAvailableCash === null ? [] : [sizing.settlementAvailableCash]),
+        ...[sizing.hardFeasibleTargetNotional, sizing.preferredFeasibleTargetNotional]
+          .flatMap((range) => range.kind === "available" ? [range.lower, range.upper] : [])]
+      if (amounts.some((amount) => amount.currency !== analysis.currency)
+        || sizing.constraintCaps.some((cap, index) => cap.kind !== sizingKinds[index])
+        || new Set(sizing.hardBindingCaps).size !== sizing.hardBindingCaps.length
+        || new Set(sizing.preferredBindingCaps).size !== sizing.preferredBindingCaps.length) {
+        context.addIssue({ code: "custom", message: "Saved sizing uses inconsistent currencies or constraints." })
+      }
+    }
+    if (analysis.expectedReturn.state === "available"
+      && (analysis.expectedReturn.exactRatio.numerator.currency !== analysis.currency
+        || analysis.expectedReturn.exactRatio.denominator.currency !== analysis.currency)) {
+      context.addIssue({ code: "custom", message: "Expected return uses a different reporting currency." })
+    }
+    if (analysis.portfolioContext.state === "available"
+      && analysis.portfolioContext.portfolioLabel !== analysis.portfolioLabel) {
+      context.addIssue({ code: "custom", path: ["portfolioContext", "portfolioLabel"],
+        message: "The portfolio context belongs to a different portfolio." })
+    }
+    const evidenceFamilies = [
+      ["current_market", analysis.analyticalEvidence.currentMarket],
+      ["broader_research", analysis.analyticalEvidence.broaderResearch],
+      ["price_pattern", analysis.analyticalEvidence.pricePattern],
+      ["forecast", analysis.analyticalEvidence.forecast],
+      ["financial_model", analysis.analyticalEvidence.financialModel],
+      ["valuation", analysis.analyticalEvidence.valuation],
+      ["historical_test", analysis.analyticalEvidence.historicalTest],
+      ["out_of_sample", analysis.analyticalEvidence.outOfSample],
+      ["liquidity", analysis.analyticalEvidence.liquidity],
+      ["portfolio_risk", analysis.analyticalEvidence.portfolioRisk],
+    ] as const
+    evidenceFamilies.forEach(([kind, family], index) => {
+      const coverage = analysis.evidenceSummary.coverage.items[index]
+      if (coverage?.kind !== kind || coverage.state !== family.state) {
+        context.addIssue({ code: "custom", path: ["analyticalEvidence"],
+          message: "The analytical evidence families contradict evidence coverage." })
+      }
+    })
+    const expectedCombination = analysis.recommendation.kind === "unavailable"
+      ? "insufficient" : "multi_evidence"
+    if (analysis.analyticalEvidence.combination.state !== expectedCombination) {
+      context.addIssue({ code: "custom", path: ["analyticalEvidence", "combination", "state"],
+        message: "The evidence-combination state contradicts the recommendation." })
+    }
+    const structuredAvailability = [
+      [analysis.priceSummary.current, analysis.analyticalEvidence.currentMarket.state],
+      [analysis.priceSummary.fairValue, analysis.analyticalEvidence.valuation.state],
+      [analysis.priceSummary.scenarios, analysis.analyticalEvidence.forecast.state],
+      [analysis.evidenceSummary.historicalTest, analysis.analyticalEvidence.historicalTest.state],
+    ] as const
+    if (structuredAvailability.some(([structured, state]) =>
+      (structured === null ? "unavailable" : "available") !== state)
+      || analysis.liquidity.state !== analysis.analyticalEvidence.liquidity.state
+      || analysis.portfolioContext.state !== analysis.analyticalEvidence.portfolioRisk.state
+      || analysis.evidenceSummary.outOfSample.state !== analysis.analyticalEvidence.outOfSample.state) {
+      context.addIssue({ code: "custom", path: ["analyticalEvidence"],
+        message: "The evidence-family summary contradicts its structured evidence." })
+    }
+    if (analysis.recommendation.kind === "action"
+      && [analysis.analyticalEvidence.currentMarket,
+        analysis.analyticalEvidence.forecast,
+        analysis.analyticalEvidence.financialModel,
+        analysis.analyticalEvidence.valuation,
+        analysis.analyticalEvidence.historicalTest,
+        analysis.analyticalEvidence.outOfSample,
+        analysis.analyticalEvidence.liquidity,
+        analysis.analyticalEvidence.portfolioRisk,
+      ].some((family) => family.state !== "available")) {
+      context.addIssue({ code: "custom", path: ["analyticalEvidence"],
+        message: "An investment action is missing an independent required evidence family." })
+    }
+    const projection = analysis.outcomeProjection
     const scenarios = analysis.priceSummary.scenarios
     const actionRanges = analysis.priceSummary.actionRanges
+    if (projection === null) {
+      if (analysis.expectedReturn.state !== "unavailable") {
+        context.addIssue({ code: "custom", path: ["expectedReturn"],
+          message: "Expected return is available without a saved outcome projection." })
+      }
+    } else {
+      const grossPricePnlStates = [projection.downside.grossPricePnl.state,
+        projection.base.grossPricePnl.state, projection.upside.grossPricePnl.state]
+      if ((projection.positionScale === null
+        && grossPricePnlStates.some((state) => state === "available"))
+        || (projection.positionScale !== null
+          && grossPricePnlStates.some((state) => state !== "available"))
+        || (projection.expectedGrossPricePnl.state === "available"
+          && projection.positionScale === null)) {
+        context.addIssue({ code: "custom", path: ["outcomeProjection", "positionScale"],
+          message: "Gross profit-or-loss availability contradicts the exact position scale." })
+      }
+      const expected = analysis.expectedReturn
+      const projected = projection.expectedReturn
+      if (expected.state !== projected.state || (expected.state === "available"
+        && projected.state === "available"
+        && (expected.grossPriceReturnPercent !== projected.grossPriceReturnPercent
+          || expected.exactRatio.numerator.amount !== projected.exactRatio.numerator.amount
+          || expected.exactRatio.denominator.amount !== projected.exactRatio.denominator.amount
+          || expected.exactRatio.numerator.currency !== projected.exactRatio.numerator.currency
+          || expected.exactRatio.denominator.currency !== projected.exactRatio.denominator.currency))) {
+        context.addIssue({ code: "custom", path: ["expectedReturn"],
+          message: "Expected return contradicts the saved outcome projection." })
+      }
+      if (scenarios === null || actionRanges === null || analysis.priceSummary.current === null
+        || !sameMoney(projection.startingPrice, analysis.priceSummary.current)
+        || !sameRange(projection.downside.priceRange, scenarios.downside)
+        || !sameRange(projection.base.priceRange, scenarios.base)
+        || !sameRange(projection.upside.priceRange, scenarios.upside)
+        || !sameRange(projection.entryDistance.priceRange, actionRanges.entry)
+        || !sameRange(projection.addDistance.priceRange, actionRanges.add)
+        || !sameRange(projection.trimDistance.priceRange, actionRanges.trim)
+        || !sameRange(projection.exitDistance.priceRange, actionRanges.exit)) {
+        context.addIssue({ code: "custom", path: ["outcomeProjection"],
+          message: "The outcome projection contradicts its saved prices and action ranges." })
+      }
+    }
     if (
       actionRanges !== null &&
       (scenarios === null ||
@@ -976,6 +1654,7 @@ const savedScreenProductEnvelopeSchema = z
   .strict()
 
 export type InvestmentAnalysis = z.infer<typeof investmentAnalysisSchema>
+export type StudyQualification = z.infer<typeof studyQualificationSchema>
 export type InvestmentAnalysisLocator = z.infer<
   typeof investmentAnalysisLocatorSchema
 >
@@ -984,6 +1663,12 @@ export type RecommendationTrackRecord = z.infer<
   typeof recommendationTrackRecordSchema
 >
 export type SavedScreenProduct = z.infer<typeof savedScreenProductSchema>
+
+export function admittedAnalysisActionToken(value: string | null): string | null {
+  if (value === null) return null
+  const parsed = actionTokenSchema.safeParse(value)
+  return parsed.success ? parsed.data : null
+}
 
 export function admittedSavedScreenId(value: string | null): string | null {
   if (value === null) return null

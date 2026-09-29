@@ -6,7 +6,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_domain::{SourceIdentifier, Timestamp, VenueSymbol};
+use market_squawk_data::MarketDataInstrumentReadCapability;
 use market_squawk_live::ShardKey;
 use market_squawk_platform::{
     AppConfig, CaptureChannelLimits, CaptureProcessInfrastructure, CaptureWriterPolicy,
@@ -16,7 +17,7 @@ use market_squawk_platform::{
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationSubjectResolver, ProviderRateAuthority, SessionId,
-    SourceMetadata,
+    SourceMetadata, ProviderNativeIdentityRequest,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +33,11 @@ use crate::{
     provider_activation::{PreparedSchwabMarketRuntimeStart, ProviderAccountRuntimeCurrentness},
 };
 
-use super::{display::DisplaySourceDescriptor, schwab_sink::SchwabRestQuoteCurrentRuntime};
+use super::{
+    display::DisplaySourceDescriptor, group::AccountRuntimeStartFailure,
+    schwab_sink::SchwabRestQuoteCurrentRuntime,
+    schwab_streamer::{SchwabCurrentRuntime, SchwabStreamerCurrentRuntime},
+};
 
 /// Installation-wide key for the sole active Schwab account surface. The owning runtime registry
 /// validates that no second Schwab surface exists before this authority can be opened.
@@ -40,7 +45,7 @@ pub(crate) const SCHWAB_CURRENT_LIVE_AUTHORITY_KEY: &str = "schwab-rest-quotes-c
 const CAPTURE_FLUSH_RECORDS: usize = 256;
 
 pub(super) struct StartedSchwabCurrentRuntime {
-    pub(super) runtime: SchwabRestQuoteCurrentRuntime,
+    pub(super) runtime: SchwabCurrentRuntime,
     pub(super) currentness: ProviderAccountRuntimeCurrentness,
     pub(super) descriptor: Arc<DisplaySourceDescriptor>,
     pub(super) metadata: Arc<[SourceMetadata]>,
@@ -55,6 +60,7 @@ pub(super) struct StartedSchwabCurrentRuntime {
 )]
 pub(super) async fn start_schwab_current_runtime(
     prepared: PreparedSchwabMarketRuntimeStart,
+    catalog_reader: MarketDataInstrumentReadCapability,
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
     capture_process: CaptureProcessInfrastructure,
@@ -64,30 +70,50 @@ pub(super) async fn start_schwab_current_runtime(
     lifecycle: CancellationToken,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<StartedSchwabCurrentRuntime, ServiceError> {
-    ensure_before(deadline, cancellation, &lifecycle)?;
+) -> Result<StartedSchwabCurrentRuntime, AccountRuntimeStartFailure> {
+    ensure_before(deadline, cancellation, &lifecycle)
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     let currentness = prepared.currentness();
     let metadata = Arc::<[SourceMetadata]>::from([prepared.metadata().clone()]);
     let durable_read = prepared.durable_read().clone();
     let session_identifier =
         SourceIdentifier::try_from(prepared.generation().session_id().to_string())
-            .map_err(|_| ServiceError::InvalidResult)?;
+            .map_err(|_| ServiceError::InvalidResult)
+            .map_err(AccountRuntimeStartFailure::before_owner)?;
     let venue = prepared.venue_id().clone();
+    let selected_at = system_timestamp().map_err(AccountRuntimeStartFailure::before_owner)?;
+    let native_requests: Vec<ProviderNativeIdentityRequest> = prepared.bindings().iter().map(|(binding, _)| {
+        let identity = binding.provider_identity();
+        Ok(ProviderNativeIdentityRequest {
+            namespace: identity.source_id().clone(),
+            provider_instrument_id: identity.provider_instrument_id().clone(),
+            instrument: binding.instrument_id(),
+            venue: venue.clone(),
+            venue_symbol: VenueSymbol::try_from(binding.provider_symbol())
+                .map_err(|_| ServiceError::InvalidResult)?,
+            knowledge_at: selected_at,
+            effective_at: selected_at,
+        })
+    }).collect::<Result<_, ServiceError>>()
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
 
     let mut display_bindings = Vec::new();
     display_bindings
         .try_reserve_exact(prepared.display_bindings().len())
-        .map_err(|_| ServiceError::ResourceExhausted)?;
+        .map_err(|_| ServiceError::ResourceExhausted)
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     display_bindings.extend(prepared.display_bindings().iter().cloned());
     let descriptor = DisplaySourceDescriptor::try_new(
         super::configuration::AccountMarketSurface::SchwabMarketData.surface_id(),
         prepared.metadata().clone(),
         display_bindings.into_boxed_slice(),
-    )?;
+    )
+    .map_err(AccountRuntimeStartFailure::before_owner)?;
     let mut routes = Vec::new();
     routes
         .try_reserve_exact(prepared.bindings().len())
-        .map_err(|_| ServiceError::ResourceExhausted)?;
+        .map_err(|_| ServiceError::ResourceExhausted)
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     for (binding, _approval) in prepared.bindings() {
         routes.push(ShardKey::new(venue.clone(), binding.instrument_id()));
     }
@@ -102,6 +128,8 @@ pub(super) async fn start_schwab_current_runtime(
         actor_limits,
         read_admission,
         prepared.metadata(),
+        catalog_reader,
+        &native_requests,
         &session_identifier,
         &routes,
         lifecycle.clone(),
@@ -111,14 +139,38 @@ pub(super) async fn start_schwab_current_runtime(
     .await?;
     let display_monitor =
         supervise_display_routes(monitors, terminal_read_admission, lifecycle.clone());
-    let input = prepared.into_runtime_input(current, lifecycle.clone());
-    let runtime = match SchwabRestQuoteCurrentRuntime::start(input, deadline).await {
+    let started = match prepared {
+        PreparedSchwabMarketRuntimeStart::Rest(prepared) => {
+            SchwabRestQuoteCurrentRuntime::start(
+                prepared.into_runtime_input(current, lifecycle.clone()), deadline,
+            ).await.map(SchwabCurrentRuntime::Rest).map_err(|error| {
+                tracing::warn!(error = %error.cause, "Schwab REST current-market startup failed");
+                AccountRuntimeStartFailure::after_cleanup(
+                    request_state_error(deadline, cancellation),
+                    error.cleanup.map_err(|cleanup| {
+                        tracing::error!(%cleanup, "Schwab REST startup cleanup failed");
+                        ServiceError::Unavailable
+                    }),
+                )
+            })
+        }
+        PreparedSchwabMarketRuntimeStart::Streamer(prepared) => {
+            SchwabStreamerCurrentRuntime::start(prepared, current, lifecycle.clone(), deadline)
+                .await.map(SchwabCurrentRuntime::Streamer)
+        }
+    };
+    let runtime = match started {
         Ok(runtime) => runtime,
         Err(error) => {
             lifecycle.cancel();
-            tracing::warn!(%error, "Schwab current-market runtime start failed");
-            let _ = display_monitor.await;
-            return Err(request_state_error(deadline, cancellation));
+            tracing::warn!(error = %error.cause, "Schwab current-market runtime start failed");
+            let monitor_cleanup = display_monitor.await.map_err(|error| {
+                tracing::error!(%error, "Schwab startup monitor join failed");
+                ServiceError::Unavailable
+            });
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                error.cause, error.cleanup.and(monitor_cleanup),
+            ));
         }
     };
     Ok(StartedSchwabCurrentRuntime {
@@ -144,6 +196,8 @@ async fn prepare_current_session(
     actor_limits: DisplayMarketActorLimits,
     read_admission: DisplayMarketReadAdmission,
     metadata: &SourceMetadata,
+    catalog_reader: MarketDataInstrumentReadCapability,
+    native_requests: &[ProviderNativeIdentityRequest],
     session_identifier: &SourceIdentifier,
     routes: &[ShardKey],
     lifecycle: CancellationToken,
@@ -154,20 +208,25 @@ async fn prepare_current_session(
         SchwabRestQuoteCurrentSessionInput,
         Vec<DisplayMarketSupervisorMonitor>,
     ),
-    ServiceError,
+    AccountRuntimeStartFailure,
 > {
-    ensure_before(deadline, cancellation, &lifecycle)?;
+    ensure_before(deadline, cancellation, &lifecycle)
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     if routes.is_empty() {
-        return Err(ServiceError::InvalidRequest);
+        return Err(AccountRuntimeStartFailure::before_owner(
+            ServiceError::InvalidRequest,
+        ));
     }
     let mut display_ingresses = Vec::new();
     display_ingresses
         .try_reserve_exact(routes.len())
-        .map_err(|_| ServiceError::ResourceExhausted)?;
+        .map_err(|_| ServiceError::ResourceExhausted)
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     let mut monitors = Vec::new();
     monitors
         .try_reserve_exact(routes.len())
-        .map_err(|_| ServiceError::ResourceExhausted)?;
+        .map_err(|_| ServiceError::ResourceExhausted)
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     let queue_capacity = app_config.capture_queue_capacity();
     let capture_sink = RollingMemoryCaptureSink::try_new(
         queue_capacity,
@@ -176,23 +235,27 @@ async fn prepare_current_session(
     .map_err(|error| {
         tracing::error!(%error, "Schwab current capture sink construction failed");
         ServiceError::ResourceExhausted
-    })?;
+    })
+    .map_err(AccountRuntimeStartFailure::before_owner)?;
     let flush_records = NonZeroUsize::new(queue_capacity.get().min(CAPTURE_FLUSH_RECORDS))
-        .ok_or(ServiceError::Internal)?;
+        .ok_or(ServiceError::Internal)
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     let capture_policy =
-        CaptureWriterPolicy::try_new(flush_records, app_config.capture_flush_interval()).map_err(
-            |error| {
+        CaptureWriterPolicy::try_new(flush_records, app_config.capture_flush_interval())
+            .map_err(|error| {
                 tracing::error!(%error, "Schwab current capture policy is invalid");
                 ServiceError::Internal
-            },
-        )?;
-    let registered_at = system_timestamp()?;
-    let started_at = system_timestamp()?;
+            })
+            .map_err(AccountRuntimeStartFailure::before_owner)?;
+    let registered_at = system_timestamp().map_err(AccountRuntimeStartFailure::before_owner)?;
+    let started_at = system_timestamp().map_err(AccountRuntimeStartFailure::before_owner)?;
 
-    let paths = LocalPaths::prepare(app_config.data_dir()).map_err(|error| {
-        tracing::error!(%error, "Schwab current authority path is unavailable");
-        ServiceError::Unavailable
-    })?;
+    let paths = LocalPaths::prepare(app_config.data_dir())
+        .map_err(|error| {
+            tracing::error!(%error, "Schwab current authority path is unavailable");
+            ServiceError::Unavailable
+        })
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     let store = LocalAuthorityStateStore::try_open(
         paths
             .root()
@@ -202,7 +265,8 @@ async fn prepare_current_session(
     .map_err(|error| {
         tracing::error!(%error, "Schwab current authority store is unavailable");
         ServiceError::Unavailable
-    })?;
+    })
+    .map_err(AccountRuntimeStartFailure::before_owner)?;
     let resolver: Arc<dyn AuthorizationSubjectResolver> = Arc::new(provider_rate.clone());
     let mut registry =
         AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
@@ -213,15 +277,32 @@ async fn prepare_current_session(
         .map_err(|error| {
             tracing::error!(%error, "Schwab current source registry is unavailable");
             ServiceError::Unavailable
-        })?;
+        }).map_err(AccountRuntimeStartFailure::before_owner)?;
+    registry = registry.with_provider_identity_authority(Arc::new(catalog_reader))
+        .map_err(|error| { tracing::error!(%error, "Schwab catalog authority unavailable"); ServiceError::Unavailable })
+        .map_err(AccountRuntimeStartFailure::before_owner)?;
     let registered = match registry.register_or_resume_exact(metadata.clone(), registered_at) {
         Ok(registered) => registered,
         Err(error) => {
             tracing::error!(%error, "Schwab current source registration failed");
-            let _ = registry.shutdown();
-            return Err(ServiceError::Unavailable);
+            let cleanup = registry.shutdown().map_err(|error| {
+                tracing::error!(%error, "Schwab original registry cleanup failed");
+                ServiceError::Unavailable
+            });
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
         }
     };
+    if let Err(error) = registry.record_provider_identities(&registered, native_requests, deadline, cancellation) {
+        tracing::error!(%error, "Schwab current native identity selection failed");
+        let cleanup = registry.shutdown().map_err(|error| {
+            tracing::error!(%error, "Schwab source registry cleanup failed");
+            ServiceError::Unavailable
+        });
+        return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, cleanup));
+    }
     let session = match registry.begin_next_session(
         &registered,
         SessionId::new(session_identifier.clone()),
@@ -230,8 +311,14 @@ async fn prepare_current_session(
         Ok(session) => session,
         Err(error) => {
             tracing::error!(%error, "Schwab current source session failed");
-            let _ = registry.shutdown();
-            return Err(ServiceError::Unavailable);
+            let cleanup = registry.shutdown().map_err(|error| {
+                tracing::error!(%error, "Schwab original registry cleanup failed");
+                ServiceError::Unavailable
+            });
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
         }
     };
     drop(registered);
@@ -240,24 +327,33 @@ async fn prepare_current_session(
         Ok(capabilities) => capabilities,
         Err(error) => {
             tracing::error!(%error, "Schwab current capture generation is unavailable");
-            close_unstarted_registry(registry, session);
-            return Err(ServiceError::Unavailable);
+            let cleanup = close_unstarted_registry(registry, session);
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
         }
     };
     let health_reporter = match registry.take_current_health_reporter(&session) {
         Ok(reporter) => reporter,
         Err(error) => {
             tracing::error!(%error, "Schwab current health authority is unavailable");
-            close_unstarted_registry(registry, session);
-            return Err(ServiceError::Unavailable);
+            let cleanup = close_unstarted_registry(registry, session);
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
         }
     };
     let raw_frames = match registry.take_raw_frame_factory(&session) {
         Ok(factory) => factory,
         Err(error) => {
             tracing::error!(%error, "Schwab current raw-frame authority is unavailable");
-            close_unstarted_registry(registry, session);
-            return Err(ServiceError::Unavailable);
+            let cleanup = close_unstarted_registry(registry, session);
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
         }
     };
     let (capture, capture_control, capture_writer) = match raw_capture_channel(
@@ -268,16 +364,22 @@ async fn prepare_current_session(
         Ok(channel) => channel,
         Err(error) => {
             tracing::error!(%error, "Schwab current capture channel construction failed");
-            close_unstarted_registry(registry, session);
-            return Err(ServiceError::ResourceExhausted);
+            let cleanup = close_unstarted_registry(registry, session);
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::ResourceExhausted,
+                cleanup,
+            ));
         }
     };
     let capture_writer = match spawn_capture_writer(capture_writer, capture_sink, capture_policy) {
         Ok(writer) => writer,
         Err(error) => {
             tracing::error!(%error, "Schwab current capture writer start failed");
-            close_unstarted_registry(registry, session);
-            return Err(ServiceError::Unavailable);
+            let cleanup = close_unstarted_registry(registry, session);
+            return Err(AccountRuntimeStartFailure::after_cleanup(
+                ServiceError::Unavailable,
+                cleanup,
+            ));
         }
     };
     let mut current = SchwabRestQuoteCurrentSessionInput::new(
@@ -296,8 +398,7 @@ async fn prepare_current_session(
     );
     if let Err(error) = current.activate_capture_initial() {
         tracing::error!(?error, "Schwab current capture activation failed");
-        let _ = current.shutdown().await;
-        return Err(ServiceError::Unavailable);
+        return Err(current_start_failure(ServiceError::Unavailable, current).await);
     }
     for route in routes {
         let key = match DisplayMarketKey::try_new(
@@ -309,8 +410,7 @@ async fn prepare_current_session(
             Ok(key) => key,
             Err(error) => {
                 tracing::error!(%error, "Schwab current display key is invalid");
-                let _ = current.shutdown().await;
-                return Err(ServiceError::InvalidResult);
+                return Err(current_start_failure(ServiceError::InvalidResult, current).await);
             }
         };
         match current
@@ -326,8 +426,11 @@ async fn prepare_current_session(
             Ok(monitor) => monitors.push(monitor),
             Err(error) => {
                 tracing::error!(?error, "Schwab current display route registration failed");
-                let _ = current.shutdown().await;
-                return Err(request_state_error(deadline, cancellation));
+                return Err(current_start_failure(
+                    request_state_error(deadline, cancellation),
+                    current,
+                )
+                .await);
             }
         }
     }
@@ -337,9 +440,24 @@ async fn prepare_current_session(
 fn close_unstarted_registry(
     mut registry: AuthoritativeSourceRegistry,
     session: market_squawk_sources::CurrentSourceSession,
-) {
-    let _ = registry.end_session(&session, session.started_at());
-    let _ = registry.shutdown();
+) -> Result<(), ServiceError> {
+    let end = registry.end_session(&session, session.started_at());
+    let shutdown = registry.shutdown();
+    end.and(shutdown).map_err(|error| {
+        tracing::error!(%error, "Schwab unstarted registry cleanup failed");
+        ServiceError::Unavailable
+    })
+}
+
+async fn current_start_failure(
+    cause: ServiceError,
+    current: SchwabRestQuoteCurrentSessionInput,
+) -> AccountRuntimeStartFailure {
+    let cleanup = current.shutdown().await.map_err(|error| {
+        tracing::error!(?error, "Schwab partial current-session cleanup failed");
+        ServiceError::Unavailable
+    });
+    AccountRuntimeStartFailure::after_cleanup(cause, cleanup)
 }
 
 fn supervise_display_routes(

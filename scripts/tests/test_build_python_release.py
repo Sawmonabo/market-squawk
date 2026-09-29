@@ -673,55 +673,16 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 release["payload"]["project_wheel"]["sha256"],
                 hashlib.sha256(b"wheel").hexdigest(),
             )
-            self.assertEqual(
-                builder.MAX_APPLICATION_EXECUTABLE_BYTES,
-                768 * 1024 * 1024,
-            )
-            self.assertEqual(
-                builder.MAX_ONNX_WORKER_EXECUTABLE_BYTES,
-                256 * 1024 * 1024,
-            )
-            self.assertEqual(
-                builder.MAX_VALIDATOR_EXECUTABLE_BYTES,
-                256 * 1024 * 1024,
-            )
-
-            for executable, maximum_bytes, original in (
-                (
-                    application,
-                    builder.MAX_APPLICATION_EXECUTABLE_BYTES,
-                    b"application",
-                ),
-                (
-                    onnx_worker,
-                    builder.MAX_ONNX_WORKER_EXECUTABLE_BYTES,
-                    b"onnx-worker",
-                ),
-                (
-                    validator,
-                    builder.MAX_VALIDATOR_EXECUTABLE_BYTES,
-                    b"validator",
-                ),
+            for name, executable in (
+                ("application", application),
+                ("onnx_worker", onnx_worker),
+                ("training_driver", training_driver),
+                ("validator", validator),
             ):
-                with self.subTest(executable=executable.name):
-                    executable.chmod(0o755)
-                    with executable.open("r+b") as oversized:
-                        oversized.truncate(maximum_bytes + 1)
-                    signer.reset_mock()
-                    with self.assertRaises(builder.ReleaseBuildError):
-                        builder.build_release_manifest(
-                            digest,
-                            project_wheel,
-                            "cp310",
-                            "abi3",
-                            "macosx_12_0_arm64",
-                            canonical_release,
-                            builder.platform_profile("aarch64-apple-darwin"),
-                            signer,
-                        )
-                    signer.sign.assert_not_called()
-                    executable.write_bytes(original)
-                    executable.chmod(0o555)
+                self.assertEqual(
+                    release["payload"][name]["size_bytes"],
+                    executable.stat().st_size,
+                )
 
 
 if __name__ == "__main__":

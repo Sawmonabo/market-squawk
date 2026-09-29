@@ -9,7 +9,7 @@ mod live_runtime;
 
 use market_squawk_adapter_coinbase::{
     CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig, CoinbaseExchangeDecoder,
-    CoinbaseExchangeSource, CoinbaseTransportLimits,
+    CoinbaseExchangeSource, CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, InstrumentDefinition,
@@ -44,7 +44,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 use super::super::provider_rate::open_provider_rate_authority;
-use super::instruments::ProductionInstrumentSet;
+use super::instruments::{
+    ProductionCatalogSelection, ProductionInstrumentError, ProductionInstrumentSet,
+};
 use super::kraken::{
     KrakenPublicChannel, KrakenPublicCurrentnessObserver, KrakenPublicSupervisorSet,
     KrakenPublicSupervisorSetError, ProductionKrakenProfileError, ProductionKrakenProfileSet,
@@ -65,6 +67,11 @@ pub(in crate::live_source) use coinbase_publication_supervisor::{
 };
 use kraken_publication_supervisor::KrakenPublicationSupervisor;
 pub(in crate::live_source) use live_runtime::ProductionLiveRuntimeOwner;
+use market_squawk_data::{
+    InstrumentDefinitionReadCapability, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentSynchronizationCapability, MarketDataProviderIdentityQuery,
+};
+use market_squawk_sources::{ProviderIdentitySelectionEvidence, ProviderNativeIdentityRequest};
 
 const SOURCE_ID: &str = "coinbase-exchange-public";
 const PROVISIONAL_METADATA_REVISION: &str = "coinbase-advanced-trade-v1-provisional";
@@ -162,6 +169,8 @@ pub struct ProductionLiveSourceComposition {
     installation: ProductionSourceInstallation,
     routes: Vec<LiveRouteConfig>,
     provider_rate: ProviderRateAuthority,
+    catalog: Option<ProductionCatalogSelection>,
+    completion: Option<Arc<PublicSourceCompletion>>,
 }
 
 /// Sealed source topology admitted by one public-provider composition.
@@ -171,6 +180,7 @@ pub struct ProductionLiveSourceComposition {
 #[derive(Debug)]
 enum ProductionSourceInstallation {
     Single(ProductionSourceProfile),
+    KrakenPending { local_endpoint: Option<String> },
     Kraken {
         book: ProductionSourceProfile,
         trades: ProductionSourceProfile,
@@ -178,14 +188,15 @@ enum ProductionSourceInstallation {
 }
 
 impl ProductionSourceInstallation {
-    fn primary(&self) -> &ProductionSourceProfile {
+    fn primary(&self) -> Option<&ProductionSourceProfile> {
         match self {
-            Self::Single(profile) | Self::Kraken { book: profile, .. } => profile,
+            Self::Single(profile) | Self::Kraken { book: profile, .. } => Some(profile),
+            Self::KrakenPending { .. } => None,
         }
     }
 
     const fn is_kraken(&self) -> bool {
-        matches!(self, Self::Kraken { .. })
+        matches!(self, Self::KrakenPending { .. } | Self::Kraken { .. })
     }
 
     #[cfg(all(test, debug_assertions))]
@@ -193,6 +204,11 @@ impl ProductionSourceInstallation {
         self,
         endpoint: &str,
     ) -> Result<Self, ProductionProviderError> {
+        if matches!(self, Self::KrakenPending { .. }) {
+            return Ok(Self::KrakenPending {
+                local_endpoint: Some(endpoint.to_owned()),
+            });
+        }
         let Self::Kraken { book, trades } = self else {
             return Err(ProductionProviderError::TestConnectorMismatch);
         };
@@ -312,11 +328,8 @@ impl ProductionLiveSourceComposition {
                     .kraken()
                     .ok_or(ProductionLiveSourceCompositionError::MissingKrakenConfiguration)?;
                 validate_kraken_routes(source, &routes)?;
-                let [book, trades] =
-                    ProductionKrakenProfileSet::try_from_config(source)?.into_channels();
-                ProductionSourceInstallation::Kraken {
-                    book: ProductionSourceProfile::kraken(book, source),
-                    trades: ProductionSourceProfile::kraken(trades, source),
+                ProductionSourceInstallation::KrakenPending {
+                    local_endpoint: None,
                 }
             }
         };
@@ -325,12 +338,212 @@ impl ProductionLiveSourceComposition {
             installation,
             routes,
             provider_rate,
+            catalog: None,
+            completion: None,
         })
     }
 
+    /// Binds the selected native routes and checks live actor terms against the installed catalog.
+    /// The source registry reselects every request before any session or capture starts.
+    pub(crate) fn with_completion_notification(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.completion = Some(Arc::new(PublicSourceCompletion {
+            incarnation: uuid::Uuid::new_v4(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+            notify,
+        }));
+        self
+    }
+
+    pub(crate) fn with_catalog_selection(
+        mut self,
+        reader: market_squawk_data::MarketDataInstrumentReadCapability,
+        execution: &InstrumentDefinitionReadCapability,
+        requests: Vec<ProviderNativeIdentityRequest>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, ProductionInstrumentError> {
+        let selected = ProductionCatalogSelection::try_new(reader, requests)?;
+        let at = system_timestamp().map_err(|_| ProductionInstrumentError::CatalogUnavailable)?;
+        selected.validate_live_routes(execution, &self.routes, at, deadline, cancellation)?;
+        self.catalog = Some(selected);
+        Ok(self)
+    }
+
+    /// Acquires genuine public provider reference evidence, publishes its selected catalog
+    /// identity, and binds the exact resulting native requests before source startup.
+    pub(crate) async fn with_public_crypto_reference(
+        self,
+        reader: MarketDataInstrumentReadCapability,
+        synchronizer: MarketDataInstrumentSynchronizationCapability,
+        capture_store: Arc<market_squawk_platform::SealedResearchJournalStore>,
+        execution: &InstrumentDefinitionReadCapability,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, ProductionLiveSourceRuntimeError> {
+        let kraken = self.installation.is_kraken();
+        let paths = LocalPaths::prepare(self.config.data_dir())
+            .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+        let kraken_budget = if kraken {
+            Some(
+                super::kraken::reference_budget(
+                    self.config
+                        .kraken()
+                        .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+                )
+                .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let reference_budget = kraken_budget
+            .as_ref()
+            .or_else(|| {
+                self.installation
+                    .primary()
+                    .and_then(|profile| profile.metadata().budget_policy())
+            })
+            .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+        let selected = super::crypto_reference::synchronize_public_crypto_reference(
+            reader,
+            synchronizer,
+            &paths,
+            self.provider_rate.clone(),
+            reference_budget,
+            capture_store,
+            if kraken { None } else { self.config.coinbase() },
+            if kraken { self.config.kraken() } else { None },
+            deadline,
+            cancellation,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "public crypto reference selection failed");
+            ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable
+        })?;
+        let requests = if kraken {
+            selected.kraken_requests
+        } else {
+            selected.coinbase_requests
+        };
+        let reader = selected.reader;
+        let mut coinbase_evidence = Vec::<ProviderIdentitySelectionEvidence>::new();
+        let mut kraken_profiles = None;
+        for request in &requests {
+            let query = MarketDataProviderIdentityQuery::try_new(
+                request.namespace.clone(),
+                request.provider_instrument_id.clone(),
+                request.knowledge_at,
+                request.effective_at,
+            )
+            .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+            let selection = reader
+                .select_provider_identity_as_of(query, deadline, cancellation)
+                .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?
+                .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+            if kraken {
+                if kraken_profiles.is_some() {
+                    return Err(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable);
+                }
+                let record = reader
+                    .read_selected_provider_definition(&selection, deadline, cancellation)
+                    .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+                kraken_profiles = Some(
+                    ProductionKrakenProfileSet::try_from_selection(
+                        self.config
+                            .kraken()
+                            .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+                        &record,
+                        &selection,
+                    )
+                    .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+                );
+            } else {
+                coinbase_evidence.push(
+                    reader
+                        .selected_provider_identity_evidence(
+                            &selection,
+                            request,
+                            deadline,
+                            cancellation,
+                        )
+                        .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+                );
+            }
+        }
+        #[cfg(all(test, debug_assertions))]
+        let local_kraken_endpoint = match &self.installation {
+            ProductionSourceInstallation::KrakenPending { local_endpoint } => local_endpoint.clone(),
+            _ => None,
+        };
+        let mut composition = self
+            .with_catalog_selection(reader, execution, requests, deadline, cancellation)
+            .map_err(|error| {
+                tracing::warn!(%error, "public crypto route does not match selected catalog terms");
+                ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable
+            })?;
+        composition.installation = if kraken {
+            let [book, trades] = kraken_profiles
+                .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?
+                .into_channels();
+            let source = composition
+                .config
+                .kraken()
+                .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+            ProductionSourceInstallation::Kraken {
+                book: ProductionSourceProfile::kraken(book, source),
+                trades: ProductionSourceProfile::kraken(trades, source),
+            }
+        } else {
+            let source = composition
+                .config
+                .coinbase()
+                .ok_or(ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+            let profile = ProductionCoinbaseProfile::try_from_selected_at(
+                source,
+                &coinbase_evidence,
+                system_timestamp()
+                    .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+            )
+            .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+            ProductionSourceInstallation::Single(
+                ProductionSourceProfile::coinbase(
+                    profile,
+                    source,
+                    PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY,
+                    PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY,
+                )
+                .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?,
+            )
+        };
+        #[cfg(all(test, debug_assertions))]
+        if let Some(endpoint) = local_kraken_endpoint {
+            composition.installation = composition
+                .installation
+                .with_local_kraken_endpoint_for_test(&endpoint)
+                .map_err(|_| ProductionLiveSourceRuntimeError::CryptoReferenceUnavailable)?;
+        }
+        Ok(composition)
+    }
+
     /// Returns the only provider endpoint accepted by the sealed production adapter.
-    pub fn endpoint(&self) -> &str {
-        self.installation.primary().endpoint()
+    pub fn endpoint(&self) -> Result<&str, ProductionLiveSourceCompositionError> {
+        match &self.installation {
+            ProductionSourceInstallation::KrakenPending {
+                local_endpoint: Some(endpoint),
+            } => Ok(endpoint),
+            ProductionSourceInstallation::KrakenPending {
+                local_endpoint: None,
+            } => self
+                .config
+                .kraken()
+                .map(|source| source.endpoint())
+                .ok_or(ProductionLiveSourceCompositionError::MissingKrakenConfiguration),
+            _ => self
+                .installation
+                .primary()
+                .map(ProductionSourceProfile::endpoint)
+                .ok_or(ProductionLiveSourceCompositionError::CatalogSelectionRequired),
+        }
     }
 
     /// Returns every exact source-metadata record installed by this composition.
@@ -344,6 +557,9 @@ impl ProductionLiveSourceComposition {
         let capacity = match &self.installation {
             ProductionSourceInstallation::Single(_) => 1,
             ProductionSourceInstallation::Kraken { .. } => 2,
+            ProductionSourceInstallation::KrakenPending { .. } => {
+                return Err(ProductionLiveSourceCompositionError::CatalogSelectionRequired);
+            }
         };
         let mut metadata = Vec::new();
         metadata
@@ -357,6 +573,9 @@ impl ProductionLiveSourceComposition {
                 metadata.push(book.metadata().clone());
                 metadata.push(trades.metadata().clone());
             }
+            ProductionSourceInstallation::KrakenPending { .. } => {
+                return Err(ProductionLiveSourceCompositionError::CatalogSelectionRequired);
+            }
         }
         Ok(metadata.into())
     }
@@ -366,8 +585,13 @@ impl ProductionLiveSourceComposition {
     /// This deliberately does not describe the complete installed topology. Public provenance
     /// consumers must use [`Self::source_metadata`]. Kraken trade observations remain available
     /// through the native market snapshot rather than the quote/book fair-value export.
-    pub(crate) fn qualified_market_export_source_id(&self) -> &SourceId {
-        self.installation.primary().metadata().source_id()
+    pub(crate) fn qualified_market_export_source_id(
+        &self,
+    ) -> Result<&SourceId, ProductionLiveSourceCompositionError> {
+        self.installation
+            .primary()
+            .map(|profile| profile.metadata().source_id())
+            .ok_or(ProductionLiveSourceCompositionError::CatalogSelectionRequired)
     }
 
     /// Returns the complete validated route set that will be reserved before network access.
@@ -672,6 +896,8 @@ impl ProductionLiveSourceComposition {
             installation,
             routes: configured_routes,
             provider_rate,
+            catalog,
+            completion,
         } = self;
         let routes = configured_routes
             .iter()
@@ -756,53 +982,65 @@ impl ProductionLiveSourceComposition {
                 }
             }
         };
-        let owner = match installation {
-            ProductionSourceInstallation::Single(profile) => {
-                let supervisor = ProductionSourceSupervisor::try_new_with_provider_rate(
-                    &config,
-                    profile,
-                    paths,
-                    capture_process,
-                    ingress,
-                    routes,
-                    route_buffer_limits,
-                    provider_rate,
-                );
-                let supervisor = match (supervisor, publication_ingresses) {
-                    (Ok(supervisor), None) => Ok(supervisor),
-                    (Ok(supervisor), Some(CryptoPublicationIngresses::Coinbase(ingress))) => {
-                        Ok(supervisor.with_publication(ingress))
+        let owner = if let Some(catalog) = catalog.as_ref() {
+            match installation {
+                ProductionSourceInstallation::Single(profile) => {
+                    let supervisor =
+                        ProductionSourceSupervisor::try_new_with_provider_rate_and_catalog(
+                            &config,
+                            profile,
+                            paths,
+                            capture_process,
+                            ingress,
+                            routes,
+                            route_buffer_limits,
+                            provider_rate,
+                            catalog,
+                            Instant::now()
+                                .checked_add(source_shutdown)
+                                .unwrap_or_else(Instant::now),
+                            &cancellation,
+                        );
+                    let supervisor = match (supervisor, publication_ingresses) {
+                        (Ok(supervisor), None) => Ok(supervisor),
+                        (Ok(supervisor), Some(CryptoPublicationIngresses::Coinbase(ingress))) => {
+                            Ok(supervisor.with_publication(ingress))
+                        }
+                        (Ok(_), Some(CryptoPublicationIngresses::Kraken { .. })) => Err(
+                            ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch,
+                        ),
+                        (Err(error), _) => Err(ProductionLiveSourceRuntimeError::Supervisor(error)),
+                    };
+                    match supervisor {
+                        Ok(supervisor) => {
+                            ProductionSupervisorOwner::start_single(
+                                supervisor.with_completion(completion.clone()),
+                                cancellation,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
                     }
-                    (Ok(_), Some(CryptoPublicationIngresses::Kraken { .. })) => {
-                        Err(ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch)
-                    }
-                    (Err(error), _) => Err(ProductionLiveSourceRuntimeError::Supervisor(error)),
-                };
-                match supervisor {
-                    Ok(supervisor) => {
-                        ProductionSupervisorOwner::start_single(supervisor, cancellation).await
-                    }
-                    Err(error) => Err(error),
                 }
-            }
-            ProductionSourceInstallation::Kraken { book, trades } => match publication_ingresses {
-                None | Some(CryptoPublicationIngresses::Coinbase(_)) => {
-                    Err(ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch)
-                }
-                Some(CryptoPublicationIngresses::Kraken {
-                    book: book_publication,
-                    trades: trade_publication,
-                }) => {
-                    match KrakenPublicCurrentnessObserver::try_new(
-                        live.snapshots(),
-                        &routes,
-                        book.metadata().source_id().clone(),
-                        trades.metadata().source_id().clone(),
-                    ) {
-                        Err(error) => Err(map_kraken_supervisor_error(error)),
-                        Ok(currentness) => {
-                            let book_supervisor =
-                                ProductionSourceSupervisor::try_new_with_provider_rate(
+                ProductionSourceInstallation::Kraken { book, trades } => {
+                    match publication_ingresses {
+                        None | Some(CryptoPublicationIngresses::Coinbase(_)) => Err(
+                            ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch,
+                        ),
+                        Some(CryptoPublicationIngresses::Kraken {
+                            book: book_publication,
+                            trades: trade_publication,
+                        }) => {
+                            match KrakenPublicCurrentnessObserver::try_new(
+                                live.snapshots(),
+                                &routes,
+                                book.metadata().source_id().clone(),
+                                trades.metadata().source_id().clone(),
+                            ) {
+                                Err(error) => Err(map_kraken_supervisor_error(error)),
+                                Ok(currentness) => {
+                                    let book_supervisor =
+                                ProductionSourceSupervisor::try_new_with_provider_rate_and_catalog(
                                     &config,
                                     book,
                                     paths.clone(),
@@ -811,14 +1049,17 @@ impl ProductionLiveSourceComposition {
                                     routes.clone(),
                                     route_buffer_limits,
                                     provider_rate.clone(),
+                                    catalog,
+                                    Instant::now().checked_add(source_shutdown).unwrap_or_else(Instant::now),
+                                    &cancellation,
                                 )
                                 .map(|supervisor| supervisor.with_publication(book_publication))
                                 .map_err(ProductionLiveSourceRuntimeError::Supervisor);
-                            match book_supervisor {
-                                Err(error) => Err(error),
-                                Ok(book_supervisor) => {
-                                    let trade_supervisor =
-                                        ProductionSourceSupervisor::try_new_with_provider_rate(
+                                    match book_supervisor {
+                                        Err(error) => Err(error),
+                                        Ok(book_supervisor) => {
+                                            let trade_supervisor =
+                                        ProductionSourceSupervisor::try_new_with_provider_rate_and_catalog(
                                             &config,
                                             trades,
                                             paths,
@@ -827,16 +1068,19 @@ impl ProductionLiveSourceComposition {
                                             routes,
                                             route_buffer_limits,
                                             provider_rate,
+                                            catalog,
+                                            Instant::now().checked_add(source_shutdown).unwrap_or_else(Instant::now),
+                                            &cancellation,
                                         )
                                         .map(
                                             |supervisor| {
                                                 supervisor.with_publication(trade_publication)
                                             },
                                         );
-                                    match trade_supervisor {
+                                            match trade_supervisor {
                                     Ok(trade_supervisor) => KrakenPublicSupervisorSet::start(
-                                        book_supervisor,
-                                        trade_supervisor,
+                                        book_supervisor.with_completion(completion.clone()),
+                                        trade_supervisor.with_completion(completion.clone()),
                                         cancellation,
                                         source_shutdown,
                                         currentness,
@@ -856,12 +1100,23 @@ impl ProductionLiveSourceComposition {
                                         ),
                                     },
                                 }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            },
+                ProductionSourceInstallation::KrakenPending { .. } => Err(
+                    ProductionLiveSourceRuntimeError::Supervisor(
+                        ProductionSupervisorError::MissingCatalogSelection,
+                    ),
+                ),
+            }
+        } else {
+            Err(ProductionLiveSourceRuntimeError::Supervisor(
+                ProductionSupervisorError::MissingCatalogSelection,
+            ))
         };
         let owner = match owner {
             Ok(owner) => owner,
@@ -927,6 +1182,7 @@ impl ProductionLiveSourceComposition {
         }
         Ok(ProductionLiveSourceRuntime {
             supervisor: owner,
+            completion,
             publication,
             live,
             source_shutdown,
@@ -1073,21 +1329,47 @@ const fn kraken_channel_name(channel: KrakenPublicChannel) -> &'static str {
     }
 }
 
+/// One completion signal per exact public runtime; all Kraken children share the incarnation.
+/// The signal grants no recovery authority: the consumer must join and classify the outcome.
+#[derive(Debug)]
+pub(super) struct PublicSourceCompletion {
+    incarnation: uuid::Uuid,
+    completed: std::sync::atomic::AtomicBool,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl PublicSourceCompletion {
+    pub(super) fn finish(&self) {
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_one();
+    }
+}
+
 /// Owned production live runtime with read-only snapshots and bounded coordinated shutdown.
 #[derive(Debug)]
 pub struct ProductionLiveSourceRuntime {
     // Declared first so owner drop cancels every source before the live runtime is dropped.
     supervisor: ProductionSupervisorOwner,
+    completion: Option<Arc<PublicSourceCompletion>>,
     publication: Option<CryptoPublicationSupervisor>,
     live: ProductionLiveRuntimeOwner,
     source_shutdown: Duration,
 }
 
 impl ProductionLiveSourceRuntime {
+    pub(crate) fn completed_incarnation(&self) -> Option<uuid::Uuid> {
+        self.completion
+            .as_ref()
+            .filter(|signal| signal.completed.load(std::sync::atomic::Ordering::Acquire))
+            .map(|signal| signal.incarnation)
+    }
+
     /// Reports whether the source supervisor still owns the live producer generation.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        self.supervisor.is_healthy()
+        self.completed_incarnation().is_none()
+            && self.supervisor.is_healthy()
             && self
                 .publication
                 .as_ref()
@@ -1134,6 +1416,7 @@ impl ProductionLiveSourceRuntime {
     pub async fn shutdown(self) -> Result<(), ProductionLiveSourceRuntimeError> {
         let Self {
             supervisor,
+            completion: _,
             publication,
             live,
             source_shutdown,
@@ -1292,9 +1575,28 @@ impl ProductionCoinbaseProfile {
         config: &CoinbaseSourceConfig,
         at: Timestamp,
     ) -> Result<Self, ProductionCoinbaseProfileError> {
+        Self::try_from_instruments_at(config, ProductionInstrumentSet::try_from(config)?, at)
+    }
+
+    pub(super) fn try_from_selected_at(
+        config: &CoinbaseSourceConfig,
+        selected: &[ProviderIdentitySelectionEvidence],
+        at: Timestamp,
+    ) -> Result<Self, ProductionCoinbaseProfileError> {
+        Self::try_from_instruments_at(
+            config,
+            ProductionInstrumentSet::try_from_selected_public(config, selected)?,
+            at,
+        )
+    }
+
+    fn try_from_instruments_at(
+        config: &CoinbaseSourceConfig,
+        instruments: ProductionInstrumentSet,
+        at: Timestamp,
+    ) -> Result<Self, ProductionCoinbaseProfileError> {
         let attestation = config.authorization();
         validate_authorization(attestation, at)?;
-        let instruments = ProductionInstrumentSet::try_from(config)?;
         let configuration = ProfileInputsEvidence::try_from(config)?;
         let configuration_evidence = exact_evidence(CONFIGURATION_EVIDENCE_DOMAIN, &configuration)?;
         let effective = attestation.effective_interval();
@@ -1353,6 +1655,12 @@ impl ProductionCoinbaseProfile {
                 io_timeout_nanos: duration_nanos(transport_limits.io_timeout())?,
             },
             channels: ["level2", "market_trades", "heartbeats"],
+            selected_public_identities: instruments
+                .adapter_mappings()
+                .iter()
+                .filter_map(CoinbaseProductMapping::selected_public_identity)
+                .map(SelectedProfileIdentityEvidence::from)
+                .collect(),
             pre_acknowledgement_data_message_capacity: PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY,
             pre_acknowledgement_data_byte_capacity: PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY,
         };
@@ -1454,8 +1762,46 @@ struct CompleteProfileEvidence<'a> {
     configuration: ProfileInputsEvidence<'a>,
     transport: TransportEvidence,
     channels: [&'static str; 3],
+    selected_public_identities: Vec<SelectedProfileIdentityEvidence<'a>>,
     pre_acknowledgement_data_message_capacity: usize,
     pre_acknowledgement_data_byte_capacity: usize,
+}
+
+#[derive(Serialize)]
+struct SelectedProfileIdentityEvidence<'a> {
+    namespace: &'a SourceId,
+    provider_instrument_id: &'a market_squawk_domain::ProviderInstrumentId,
+    venue: &'a market_squawk_domain::VenueId,
+    venue_symbol: &'a market_squawk_domain::VenueSymbol,
+    instrument: market_squawk_domain::InstrumentId,
+    definition_digest: EvidenceDigest,
+    definition_sequence: u32,
+    reference_revision: &'a MetadataRevision,
+    reference_payload_digest: EvidenceDigest,
+    provider_revision: &'a MetadataRevision,
+    provider_payload_digest: EvidenceDigest,
+    definition_validity: market_squawk_domain::EffectiveInterval,
+    provider_validity: market_squawk_domain::EffectiveInterval,
+}
+
+impl<'a> From<&'a ProviderIdentitySelectionEvidence> for SelectedProfileIdentityEvidence<'a> {
+    fn from(selected: &'a ProviderIdentitySelectionEvidence) -> Self {
+        Self {
+            namespace: &selected.native.namespace,
+            provider_instrument_id: &selected.native.provider_instrument_id,
+            venue: &selected.native.venue,
+            venue_symbol: &selected.native.venue_symbol,
+            instrument: selected.native.instrument,
+            definition_digest: selected.definition_digest,
+            definition_sequence: selected.definition_sequence,
+            reference_revision: &selected.reference_revision,
+            reference_payload_digest: selected.reference_payload_digest,
+            provider_revision: &selected.provider_revision,
+            provider_payload_digest: selected.provider_payload_digest,
+            definition_validity: selected.definition_validity,
+            provider_validity: selected.provider_validity,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1594,6 +1940,8 @@ pub enum ProductionLiveSourceCompositionError {
     MissingCoinbaseConfiguration,
     #[error("production Kraken configuration is required")]
     MissingKrakenConfiguration,
+    #[error("public market reference selection is required before source metadata is available")]
+    CatalogSelectionRequired,
     #[error("production source route set does not exactly cover configured instruments")]
     RouteSetMismatch,
     #[error("production source route set contains a duplicate route")]
@@ -1636,6 +1984,8 @@ pub enum ProductionLiveSourceRuntimeError {
     DuplicateQualifiedMarketExportRoute { route: ShardKey },
     #[error("public crypto durable publication does not match its exact source topology")]
     CryptoPublicationAuthorityMismatch,
+    #[error("current public crypto reference and economic terms are unavailable")]
+    CryptoReferenceUnavailable,
     #[error("public crypto durable-publication bounds are invalid")]
     CryptoPublicationBounds,
     #[error("public crypto publication worker exited before source startup completed")]

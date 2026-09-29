@@ -4044,7 +4044,6 @@ fn project_metadata_governed_row(
         joins,
         fields,
         projection_disposition,
-        membership: None,
         row_number,
         row_evidence,
     })

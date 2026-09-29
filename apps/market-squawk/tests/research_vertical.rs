@@ -112,6 +112,10 @@ impl EphemeralSourceInspectionAuthority for UnusedAdapterActivation {
 
 #[async_trait]
 impl SourceLifecycleAuthority for UnusedAdapterActivation {
+    async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), SourceLifecycleError> {
+        Ok(())
+    }
+
     fn supports(&self, _provider: &SourceIdentifier) -> bool {
         false
     }
@@ -907,6 +911,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             "treasury.fiscal-data",
             "--dataset",
             "average-interest-rates",
+            "--confirm",
         ])
         .is_ok()
     );
@@ -919,6 +924,8 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             "average-interest-rates:sha256:fixture",
             "--dataset",
             "average-interest-rates",
+            "--discovery-receipt",
+            "00000000-0000-4000-8000-000000000001",
             "--confirm",
         ])
         .is_ok()
@@ -1035,12 +1042,22 @@ async fn one_shot_source_cli_mints_and_consumes_its_receipt_in_one_product_lifet
     )?;
     let product =
         LocalProduct::try_new_with_prepublished_research_sources(config, [registration]).await?;
+    let discover = Cli::try_parse_from([
+        "market-squawk", "source", "discover", profile.as_str(),
+        "--dataset", dataset.as_str(), "--confirm",
+    ])?;
+    let discovered = execute_cli_command(&product, discover.command).await?;
+    let selected = &discovered.value()["data"]["objects"][0];
+    let receipt = selected["discovery_receipt"].as_str().ok_or("missing discovery receipt")?;
+    let object = selected["object_id"].as_str().ok_or("missing discovered object")?;
     let cli = Cli::try_parse_from([
         "market-squawk",
         "ingest",
         "source",
         profile.as_str(),
-        "one-shot-object",
+        object,
+        "--discovery-receipt",
+        receipt,
         "--dataset",
         dataset.as_str(),
         "--confirm",
@@ -1375,11 +1392,12 @@ async fn provider_onboarding_keeps_imported_secrets_write_only() -> Result<(), B
     let service = Arc::new(service);
     let registered = service.register_profile("bls.v2-registered")?;
     let replayed = service.register_profile("bls.v2-registered")?;
-    let started = service.start_deferred(StartOnboardingRequest::try_new(
-        "bls.v2-registered",
-        None,
-        None,
-    )?)?;
+    let started = service
+        .start(
+            StartOnboardingRequest::try_new("bls.v2-registered", None, None)?,
+            CancellationToken::new(),
+        )
+        .await?;
     let session_id = started.session_id();
     let secret = "sentinel-registration-key-never-echo";
     let accepted = service
@@ -1391,11 +1409,20 @@ async fn provider_onboarding_keeps_imported_secrets_write_only() -> Result<(), B
         .await?;
     let accepted_body = serde_json::to_string(&accepted)?;
     let resumed = service.resume(session_id)?;
-    let sec = service.start_deferred(StartOnboardingRequest::try_new(
-        "sec.edgar-public",
-        Some("Market Squawk".to_owned()),
-        Some("operations@example.test".to_owned()),
-    )?)?;
+    // This test verifies retained public configuration, not network availability. The public
+    // start API reserves the session before its cancellable automatic anonymous probe.
+    let sec_cancellation = CancellationToken::new();
+    sec_cancellation.cancel();
+    let sec = service
+        .start(
+            StartOnboardingRequest::try_new(
+                "sec.edgar-public",
+                Some("Market Squawk".to_owned()),
+                Some("operations@example.test".to_owned()),
+            )?,
+            sec_cancellation,
+        )
+        .await?;
     let recovered_sec = service.resume(sec.session_id())?;
     let sessions = service.sessions(CatalogLimit::new(8)?)?;
     let current = service.current_sessions(CatalogLimit::new(8)?)?;

@@ -197,25 +197,29 @@ fn input_record(value: &ValuationInput) -> Result<FairValueCatalogRecord, FairVa
     record(
         FairValueRecordKind::Input,
         value.id().bytes(),
-        &InputPayload {
-            version: PAYLOAD_VERSION,
-            subject_instrument_id: value.subject_instrument_id().to_string(),
-            reference_instrument_id: value.reference_instrument_id().to_string(),
-            relationship: crate::measurement::relation_tag(value.relationship()),
-            amount: amount_payload(value.amount()),
-            significance: crate::measurement::significance_tag(value.significance()),
-            observability: crate::measurement::observability_tag(value.observability()),
-            adjustment: crate::measurement::adjustment_tag(value.adjustment()),
-            market_activity: crate::measurement::activity_tag(value.market_activity()),
-            market_access: crate::measurement::access_tag(value.market_access()),
-            data_quality: crate::measurement::quality_tag(value.data_quality()),
-            evidence_id: value.evidence().hash().bytes(),
-            use_assessment: value.use_assessment().map(use_assessment_payload),
-            market_access_id: value
-                .market_access_assessment()
-                .map(|item| item.id().bytes()),
-        },
+        &input_payload(value),
     )
+}
+
+fn input_payload(value: &ValuationInput) -> InputPayload {
+    InputPayload {
+        version: PAYLOAD_VERSION,
+        subject_instrument_id: value.subject_instrument_id().to_string(),
+        reference_instrument_id: value.reference_instrument_id().to_string(),
+        relationship: crate::measurement::relation_tag(value.relationship()),
+        amount: amount_payload(value.amount()),
+        significance: crate::measurement::significance_tag(value.significance()),
+        observability: crate::measurement::observability_tag(value.observability()),
+        adjustment: crate::measurement::adjustment_tag(value.adjustment()),
+        market_activity: crate::measurement::activity_tag(value.market_activity()),
+        market_access: crate::measurement::access_tag(value.market_access()),
+        data_quality: crate::measurement::quality_tag(value.data_quality()),
+        evidence_id: value.evidence().hash().bytes(),
+        use_assessment: value.use_assessment().map(use_assessment_payload),
+        market_access_id: value
+            .market_access_assessment()
+            .map(|item| item.id().bytes()),
+    }
 }
 
 fn measurement_record(
@@ -248,22 +252,26 @@ fn market_access_record(
     record(
         FairValueRecordKind::MarketAccess,
         value.id().bytes(),
-        &MarketAccessPayload {
-            version: PAYLOAD_VERSION,
-            account_id: value.account_id().to_string(),
-            venue_id: value.venue_id().as_str().to_owned(),
-            instrument_id: value.instrument_id().to_string(),
-            conclusion: crate::measurement::access_tag(value.conclusion()),
-            effective_from_ns: value.effective_from().unix_nanos(),
-            effective_until_ns: value.effective_until().unix_nanos(),
-            rationale: value.rationale().to_owned(),
-            prepared_by: value.prepared_by().as_str().to_owned(),
-            prepared_at_ns: value.prepared_at().unix_nanos(),
-            approved_by: value.approved_by().as_str().to_owned(),
-            approved_at_ns: value.approved_at().unix_nanos(),
-            supersedes_id: value.supersedes().map(MarketAccessAssessmentId::bytes),
-        },
+        &market_access_payload(value),
     )
+}
+
+fn market_access_payload(value: &ApprovedMarketAccess) -> MarketAccessPayload {
+    MarketAccessPayload {
+        version: PAYLOAD_VERSION,
+        account_id: value.account_id().to_string(),
+        venue_id: value.venue_id().as_str().to_owned(),
+        instrument_id: value.instrument_id().to_string(),
+        conclusion: crate::measurement::access_tag(value.conclusion()),
+        effective_from_ns: value.effective_from().unix_nanos(),
+        effective_until_ns: value.effective_until().unix_nanos(),
+        rationale: value.rationale().to_owned(),
+        prepared_by: value.prepared_by().as_str().to_owned(),
+        prepared_at_ns: value.prepared_at().unix_nanos(),
+        approved_by: value.approved_by().as_str().to_owned(),
+        approved_at_ns: value.approved_at().unix_nanos(),
+        supersedes_id: value.supersedes().map(MarketAccessAssessmentId::bytes),
+    }
 }
 
 fn evidence_payload(value: &FairValueEvidence) -> Result<EvidencePayload, FairValueError> {
@@ -293,6 +301,74 @@ fn evidence_payload(value: &FairValueEvidence) -> Result<EvidencePayload, FairVa
 
 fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueError> {
     Ok(match value {
+        EvidenceOrigin::ForecastDistribution { evidence } => {
+            let value = evidence.source().reference();
+            OriginPayload::ForecastDistribution {
+                source: Box::new(ForecastReferencePayload {
+                    identity: value.identity().bytes(),
+                    distribution_identity: value.distribution_identity().bytes(),
+                    vintage_id: value.vintage_id().bytes(),
+                    forecast_artifact_hash: value.forecast_artifact_hash().bytes(),
+                    metadata_hash: value.metadata_hash().bytes(),
+                    instrument_id: value.instrument_id().to_string(),
+                    training_manifest: manifest_payload(value.training_manifest()),
+                    serving_manifest: manifest_payload(value.serving_manifest()),
+                    parent_manifests: value
+                        .parent_manifests()
+                        .iter()
+                        .map(manifest_payload)
+                        .collect(),
+                    serving_source: value.serving_source().as_str().to_owned(),
+                    serving_graph: value.serving_graph().bytes(),
+                    serving_query: value.serving_query().bytes(),
+                    serving_result: value.serving_result().bytes(),
+                    serving_feature: value.serving_feature().bytes(),
+                    origin_bar_digest: match value.source_origin() {
+                        crate::ForecastValuationOriginIdentity::CompletedBar(digest) => {
+                            Some(digest.bytes())
+                        }
+                        crate::ForecastValuationOriginIdentity::FinancialEpoch(_)
+                        | crate::ForecastValuationOriginIdentity::CurrentPriceEpoch(_) => None,
+                    },
+                    financial_epoch_digest: match value.source_origin() {
+                        crate::ForecastValuationOriginIdentity::FinancialEpoch(digest) => {
+                            Some(digest.bytes())
+                        }
+                        crate::ForecastValuationOriginIdentity::CompletedBar(_)
+                        | crate::ForecastValuationOriginIdentity::CurrentPriceEpoch(_) => None,
+                    },
+                    current_price_epoch_digest: match value.source_origin() {
+                        crate::ForecastValuationOriginIdentity::CurrentPriceEpoch(digest) => {
+                            Some(digest.bytes())
+                        }
+                        _ => None,
+                    },
+                    knowledge_at_ns: value.knowledge_at().unix_nanos(),
+                    selected_at_ns: value.selected_at().unix_nanos(),
+                }),
+                ordinal: evidence
+                    .ordinal()
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| FairValueError::Arithmetic)?,
+                financial_origin: evidence.selection()
+                    == crate::ForecastValuationValueSelection::FinancialOrigin,
+            }
+        }
+        EvidenceOrigin::PublishedMarket { evidence } => OriginPayload::PublishedMarket {
+            manifest: manifest_payload(&evidence.manifest),
+            selection_digest: evidence.selection_digest.bytes(),
+            publication_digest: evidence.publication_digest.bytes(),
+            publication_row: evidence.publication_row,
+            canonical_event_digest: evidence.canonical_event_digest.bytes(),
+            canonical_event: evidence.canonical_event.to_string(),
+            canonical_price_authority: evidence.canonical_price_authority.to_string(),
+            definition_content: evidence.definition_content.bytes(),
+            definition_audit: evidence.definition_audit.bytes(),
+            knowledge_at_ns: evidence.knowledge_at.unix_nanos(),
+            manifest_published_at_ns: evidence.manifest_published_at.unix_nanos(),
+            origin_published_at_ns: evidence.origin_published_at.unix_nanos(),
+        },
         EvidenceOrigin::Market {
             venue_id,
             assessment_id,
@@ -302,6 +378,7 @@ fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueErro
             definition_revision,
             activity_policy_hash,
             activity_set_hash,
+            publication,
         } => OriginPayload::Market {
             venue_id: venue_id.as_str().to_owned(),
             assessment_id: assessment_id.as_str().to_owned(),
@@ -312,6 +389,20 @@ fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueErro
             definition_revision: *definition_revision,
             activity_policy_hash: *activity_policy_hash,
             activity_set_hash: *activity_set_hash,
+            publication: publication.as_ref().map(|value| MarketPublicationPayload {
+                qualified_input_id: value.qualified_input_id.bytes(),
+                qualified_amount: amount_payload(value.qualified_amount),
+                manifest: manifest_payload(&value.manifest),
+                selection_digest: value.selection_digest.bytes(),
+                publication_digest: value.publication_digest.bytes(),
+                publication_row: value.publication_row,
+                coordinate_digest: value.coordinate_digest.bytes(),
+                canonical_event_digest: value.canonical_event_digest.bytes(),
+                canonical_event: value.canonical_event.to_string(),
+                knowledge_at_ns: value.knowledge_at.unix_nanos(),
+                manifest_published_at_ns: value.manifest_published_at.unix_nanos(),
+                origin_published_at_ns: value.origin_published_at.unix_nanos(),
+            }),
         },
         EvidenceOrigin::Research {
             manifest,
@@ -366,6 +457,34 @@ fn origin_payload(value: &EvidenceOrigin) -> Result<OriginPayload, FairValueErro
             quantity_scale: position_quantity.scale(),
             point_in_time_digest: *point_in_time_digest,
         },
+        EvidenceOrigin::Fundamental {
+            manifest,
+            origin_digest,
+            request_digest,
+            selection_digest,
+            result_digest,
+            company_security_digest,
+            row,
+            canonical_row_digest,
+            knowledge_at,
+            generation_completed_at,
+            canonical_observation,
+        } => OriginPayload::Fundamental {
+            manifest: manifest_payload(manifest),
+            origin_digest: origin_digest.bytes(),
+            request_digest: request_digest.bytes(),
+            selection_digest: selection_digest.bytes(),
+            result_digest: result_digest.bytes(),
+            company_security_digest: company_security_digest.bytes(),
+            row: *row,
+            canonical_row_digest: canonical_row_digest.bytes(),
+            knowledge_at_ns: knowledge_at.unix_nanos(),
+            generation_completed_at_ns: generation_completed_at.unix_nanos(),
+            canonical_observation: canonical_observation.to_string(),
+        },
+        EvidenceOrigin::AutomaticValuation { receipt } => OriginPayload::AutomaticValuation {
+            receipt: Box::new(automatic_receipt_payload(receipt)?),
+        },
     })
 }
 
@@ -378,6 +497,168 @@ fn record<T: Serialize>(
         kind,
         id,
         serde_json::to_vec(payload).map_err(|_| FairValueError::Persistence)?,
+    )
+    .map_err(|_| FairValueError::Persistence)
+}
+
+fn automatic_receipt_payload(
+    value: &crate::AutomaticValuationMethodReceipt,
+) -> Result<AutomaticReceiptPayload, FairValueError> {
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(value.inputs().len())
+        .map_err(|_| FairValueError::Arithmetic)?;
+    for input in value.inputs() {
+        if matches!(
+            input.input().evidence().origin(),
+            EvidenceOrigin::AutomaticValuation { .. }
+        ) {
+            return Err(FairValueError::InvalidProducerEvidence);
+        }
+        inputs.push(AutomaticInputPayload {
+            input_id: input.input().id().bytes(),
+            input: input_payload(input.input()),
+            evidence: evidence_payload(input.input().evidence())?,
+            market_access: input
+                .input()
+                .market_access_assessment()
+                .map(market_access_payload),
+            selection_receipt: input.selection_receipt().bytes(),
+            rights_graph: input.rights_graph().bytes(),
+            knowledge_at_ns: input.knowledge_at().unix_nanos(),
+            expires_at_ns: input.expires_at().unix_nanos(),
+        });
+    }
+    let assumptions = value
+        .assumptions()
+        .iter()
+        .map(automatic_assumption_payload)
+        .collect();
+    let intermediates = value
+        .intermediates()
+        .iter()
+        .map(|item| AutomaticIntermediatePayload {
+            kind: match item.kind() {
+                crate::AutomaticValuationIntermediateKind::DiscountedCashFlow => 1,
+                crate::AutomaticValuationIntermediateKind::DiscountedTerminalValue => 2,
+                crate::AutomaticValuationIntermediateKind::WeightedComparableMultiple => 3,
+                crate::AutomaticValuationIntermediateKind::ComparableSubjectValue => 4,
+                crate::AutomaticValuationIntermediateKind::DiscountedResidualIncome => 5,
+                crate::AutomaticValuationIntermediateKind::ProbabilityWeightedForecast => 6,
+            },
+            sequence: item.sequence(),
+            instrument_id: item.instrument_id().to_string(),
+            primary_input: item.primary_input().bytes(),
+            secondary_input: item.secondary_input().map(InputId::bytes),
+            amount_mantissa: item.amount().mantissa().to_string(),
+            amount_scale: item.amount().scale(),
+            adjustment_mantissa: item.adjustment().mantissa().to_string(),
+            adjustment_scale: item.adjustment().scale(),
+            factor_mantissa: item.factor().mantissa().to_string(),
+            factor_scale: item.factor().scale(),
+            result_mantissa: item.result().mantissa().to_string(),
+            result_scale: item.result().scale(),
+            evidence: item.evidence().bytes(),
+        })
+        .collect();
+    Ok(AutomaticReceiptPayload {
+        id: value.id().bytes(),
+        input_set_id: value.input_set_id().bytes(),
+        method: match value.method() {
+            crate::AutomaticValuationMethod::DiscountedCashFlow => 1,
+            crate::AutomaticValuationMethod::ComparableCompanies => 2,
+            crate::AutomaticValuationMethod::ResidualIncome => 3,
+            crate::AutomaticValuationMethod::ForecastDistribution => 4,
+        },
+        periods_per_year: value.periods_per_year().map(NonZeroU32::get),
+        account_id: value.account_id().to_string(),
+        instrument_id: value.instrument_id().to_string(),
+        company_security: identity_payload(value.company_security())?,
+        peer_identities: value
+            .peer_identities()
+            .iter()
+            .map(identity_payload)
+            .collect::<Result<Vec<_>, _>>()?,
+        rights_decision: value.rights_decision().bytes(),
+        rights_graph: value.rights_graph().bytes(),
+        rights_expires_at_ns: value.rights_expires_at().unix_nanos(),
+        admitted_input_manifests: value
+            .admitted_input_manifests()
+            .iter()
+            .map(manifest_payload)
+            .collect(),
+        current_market_input: value.current_market_input().bytes(),
+        method_base_input: value.method_base_input().map(InputId::bytes),
+        inputs,
+        assumptions,
+        macro_assumptions: value.macro_assumptions().map(|binding| {
+            let reference = binding.reference();
+            AutomaticMacroAssumptionsPayload {
+                maturity: match reference.maturity() {
+                    crate::MacroRateMaturity::TenYear => 1,
+                    crate::MacroRateMaturity::ThirtyYear => 2,
+                },
+                annual_yield_mantissa: reference.annual_yield_percent().mantissa().to_string(),
+                annual_yield_scale: reference.annual_yield_percent().scale(),
+                context_identity: reference.context_identity().bytes(),
+                evidence_identity: reference.evidence_identity().bytes(),
+                knowledge_cutoff_ns: reference.knowledge_cutoff().unix_nanos(),
+                effective_date_cutoff: reference.effective_date_cutoff(),
+                available_at_ns: reference.available_at().unix_nanos(),
+                expires_at_ns: reference.expires_at().unix_nanos(),
+                premium: automatic_assumption_payload(binding.premium()),
+                premium_source: binding.premium_source_reference().map(<[u8]>::to_vec),
+                premium_parents: binding
+                    .premium_parent_manifests()
+                    .iter()
+                    .map(manifest_payload)
+                    .collect(),
+                rate: automatic_assumption_payload(binding.assumption()),
+            }
+        }),
+        residual_terminal: value.residual_terminal().map(|condition| {
+            ResidualIncomeTerminalPayload {
+            convention: match condition.convention() {
+                crate::ResidualIncomeTerminalConvention::ZeroAbnormalEarningsAfterExplicitHorizon => 1,
+            },
+            terminal_period: condition.terminal_period().get(),
+            current_book_input: condition.current_book_input().bytes(),
+            final_income_input: condition.final_income_input().bytes(),
+            final_opening_book_input: condition.final_opening_book_input().bytes(),
+            annual_rate_identity: condition.annual_rate_identity().bytes(),
+            annual_cost_of_equity_mantissa: condition.annual_cost_of_equity().mantissa().to_string(),
+            annual_cost_of_equity_scale: condition.annual_cost_of_equity().scale(),
+            continuing_value_sensitivity_mantissa: condition.continuing_value_sensitivity().mantissa().to_string(),
+            continuing_value_sensitivity_scale: condition.continuing_value_sensitivity().scale(),
+            identity: condition.identity().bytes(),
+            }
+        }),
+        intermediates,
+        lower: amount_payload(value.range().lower()),
+        central: amount_payload(value.range().central()),
+        upper: amount_payload(value.range().upper()),
+        rounding: value.arithmetic_policy().rounding(),
+        maximum_periods: u32::try_from(value.arithmetic_policy().maximum_periods())
+            .map_err(|_| FairValueError::Arithmetic)?,
+        method_selection_receipt: value.method_selection_receipt().map(EvidenceDigest::bytes),
+        forecast_horizon_nanos: value
+            .forecast_horizon_nanos()
+            .map(std::num::NonZeroU64::get),
+        forecast_terminal_at_ns: value.forecast_terminal_at().map(Timestamp::unix_nanos),
+        measurement_at_ns: value.measurement_at().unix_nanos(),
+        calculated_at_ns: value.calculated_at().unix_nanos(),
+        calculated_by: value.calculated_by().as_str().to_owned(),
+        expires_at_ns: value.expires_at().unix_nanos(),
+    })
+}
+
+fn identity_payload(
+    value: &market_squawk_data::CompanySecurityIdentitySelectionReceipt,
+) -> Result<String, FairValueError> {
+    String::from_utf8(
+        value
+            .canonical_bytes()
+            .map_err(|_| FairValueError::Persistence)?,
     )
     .map_err(|_| FairValueError::Persistence)
 }
@@ -402,4 +683,26 @@ fn operation(
 ) -> Result<FairValueCatalogOperation, FairValueError> {
     FairValueCatalogOperation::try_new(kind, actor.as_str(), business_at, records, links)
         .map_err(|_| FairValueError::Persistence)
+}
+
+fn automatic_assumption_payload(
+    item: &crate::AutomaticValuationAssumption,
+) -> AutomaticAssumptionPayload {
+    AutomaticAssumptionPayload {
+        kind: match item.kind() {
+            crate::AutomaticValuationAssumptionKind::DiscountRate => 1,
+            crate::AutomaticValuationAssumptionKind::ComparableWeight => 2,
+            crate::AutomaticValuationAssumptionKind::CostOfEquity => 3,
+            crate::AutomaticValuationAssumptionKind::ForecastProbability => 4,
+            crate::AutomaticValuationAssumptionKind::UncertaintyLower => 5,
+            crate::AutomaticValuationAssumptionKind::UncertaintyUpper => 6,
+            crate::AutomaticValuationAssumptionKind::TerminalGrowth => 7,
+        },
+        identifier: item.identifier().to_owned(),
+        mantissa: item.value().mantissa().to_string(),
+        scale: item.value().scale(),
+        evidence: item.evidence().bytes(),
+        available_at_ns: item.available_at().unix_nanos(),
+        expires_at_ns: item.expires_at().unix_nanos(),
+    }
 }

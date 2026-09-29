@@ -14,6 +14,12 @@ use serde_json::{Map, Value};
 
 use crate::application::decision::{
     AdmittedScreenJob, DecisionApplication, ScreenJobRequest, ScreenWorkflowError,
+    screen_workflow::ScreenDatasetSelection,
+};
+
+use crate::application::{
+    analytical_profile::{AnalyticalProfileResolution, revalidate},
+    market_calendar::{CompletedMarketSessionReadCapability, CompletedMarketSessionReference},
 };
 
 pub(super) const RUN_SCREEN: &str = "Decision.RunScreen";
@@ -22,14 +28,23 @@ pub(super) const RUN_SCREEN: &str = "Decision.RunScreen";
 pub(super) struct ScreenWorkflowOperations {
     decisions: Arc<DecisionApplication>,
     reader: AnalyticalReadCapability,
+    calendars: CompletedMarketSessionReadCapability,
+    research: Arc<crate::ResearchService>,
 }
 
 impl ScreenWorkflowOperations {
     pub(super) const fn new(
         decisions: Arc<DecisionApplication>,
         reader: AnalyticalReadCapability,
+        calendars: CompletedMarketSessionReadCapability,
+        research: Arc<crate::ResearchService>,
     ) -> Self {
-        Self { decisions, reader }
+        Self {
+            decisions,
+            reader,
+            calendars,
+            research,
+        }
     }
 
     pub(super) async fn prepare(
@@ -41,12 +56,36 @@ impl ScreenWorkflowOperations {
         ensure_live(context)?;
         let input: RunScreenRequest =
             decode(&super::super::business_arguments(request.arguments()))?;
+        let profile = revalidate(&input.financial_profile, None).map_err(ServiceError::from)?;
+        let calendar = self
+            .calendars
+            .read_reference(
+                &input.calendar_reference,
+                selected_at,
+                context.deadline(),
+                context.cancellation().clone(),
+            )
+            .await
+            .map_err(|_| {
+                ensure_live(context)
+                    .err()
+                    .unwrap_or(ServiceError::Unavailable)
+            })?
+            .ok_or_else(|| {
+                ensure_live(context)
+                    .err()
+                    .unwrap_or(ServiceError::Unavailable)
+            })?;
+        ensure_live(context)?;
         let request = ScreenJobRequest::new(
             ScreenId::try_new(input.screen_id).map_err(|_error| ServiceError::InvalidRequest)?,
             RevisionNumber::new(input.screen_revision)
                 .map_err(|_error| ServiceError::InvalidRequest)?,
-            input.dataset_manifest.try_into_domain()?,
+            ScreenDatasetSelection::PublishedDataset(input.dataset_manifest.try_into_domain()?),
             input.as_of,
+            calendar,
+            profile,
+            Arc::clone(&self.research),
         );
         let admitted = self
             .decisions
@@ -58,7 +97,11 @@ impl ScreenWorkflowOperations {
                 context.cancellation().clone(),
             )
             .await
-            .map_err(map_workflow)?;
+            .map_err(|error| {
+                ensure_live(context)
+                    .err()
+                    .unwrap_or_else(|| map_workflow(error))
+            })?;
         ensure_live(context)?;
         Ok(admitted)
     }
@@ -81,6 +124,8 @@ struct RunScreenRequest {
     screen_revision: u32,
     dataset_manifest: ManifestInput,
     as_of: Timestamp,
+    calendar_reference: CompletedMarketSessionReference,
+    financial_profile: AnalyticalProfileResolution,
 }
 
 #[derive(Deserialize)]
