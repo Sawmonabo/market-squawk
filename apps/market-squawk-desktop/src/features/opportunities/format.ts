@@ -5,6 +5,11 @@ const HOURS_PER_DAY = 24n
 const NANOS_PER_DAY =
   NANOS_PER_SECOND * SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY
 
+/** Displays a saved money amount exactly, including its sign and currency. */
+export function formatMoney(value: { amount: string; currency: string }): string {
+  return `${value.amount} ${value.currency}`
+}
+
 /** Formats a retained integer without passing it through JavaScript's Number type. */
 export function formatLosslessInteger(value: string): string {
   try {

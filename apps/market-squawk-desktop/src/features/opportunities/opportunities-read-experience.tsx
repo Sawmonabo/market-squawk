@@ -18,8 +18,6 @@ import type { ProductTransport } from "@/lib/transport"
 import {
   admittedAnalysisActionToken,
   admittedSavedScreenId,
-  parseInvestmentAnalysis,
-  parseInvestmentAnalysisPage,
   parseSavedScreenProduct,
   type InvestmentAnalysisLocator,
 } from "./contracts"
@@ -36,7 +34,7 @@ import { AnalysisLaunch } from "./analysis-launch"
 
 import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
 
-const ANALYSIS_PAGE_LIMIT = 24
+import { useSavedInvestmentAnalyses, useSavedInvestmentAnalysis } from "./use-saved-investment-analysis"
 
 export function OpportunitiesReadExperience({
   transport,
@@ -76,56 +74,8 @@ export function OpportunitiesReadExperience({
       screenReadAvailable,
   })
   const navigation = useCursorNavigation()
-  const analyses = useQuery({
-    queryKey: productKeys.operation(
-      scope,
-      "decision",
-      "Decision.ListInvestmentAnalyses",
-      { limit: ANALYSIS_PAGE_LIMIT, afterActionToken: navigation.after },
-    ),
-    gcTime: 0,
-    queryFn: async ({ signal }) => {
-      const request = {
-        ...(navigation.after ? { afterActionToken: navigation.after } : {}),
-        limit: ANALYSIS_PAGE_LIMIT,
-      }
-      return parseInvestmentAnalysisPage(
-        await transport.query({
-          query: "decisionInvestmentAnalyses",
-          ...(navigation.after ? { afterActionToken: navigation.after } : {}),
-          limit: request.limit,
-        }, { signal }),
-        request,
-      )
-    },
-    enabled: readAvailable,
-  })
-  const history = analyses.data?.analyses ?? []
-  const repeatedIdentity =
-    new Set(history.map((analysis) => analysis.actionToken)).size !== history.length
-  const selected = useQuery({
-    queryKey: productKeys.operation(
-      scope,
-      "decision",
-      "Decision.GetInvestmentAnalysis",
-      { actionToken: selectedActionToken },
-    ),
-    queryFn: async ({ signal }) => {
-      const actionToken = selectedActionToken
-      if (actionToken === null) {
-        throw new Error("Select a saved analysis before opening its brief.")
-      }
-      return parseInvestmentAnalysis(
-        await transport.query({
-          query: "decisionInvestmentAnalysis",
-          actionToken,
-        }, { signal }),
-        actionToken,
-      )
-    },
-    enabled: readAvailable && selectedActionToken !== null,
-    gcTime: 0,
-  })
+  const analyses = useSavedInvestmentAnalyses({ transport, scope, available: readAvailable, after: navigation.after })
+  const selected = useSavedInvestmentAnalysis({ transport, scope, available: readAvailable, actionToken: selectedActionToken })
   const trackRecordAvailable =
     product.status === "ready" &&
     hasProductCapability(product.bootstrap, "decision_recommendation_history")
@@ -203,86 +153,12 @@ export function OpportunitiesReadExperience({
           </AlertDescription>
         </Alert>
       ) : (
-        <section className="mt-6" aria-labelledby="opportunity-history-title">
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-2">
-                <History className="size-4 text-primary" aria-hidden="true" />
-                <h2 id="opportunity-history-title" className="text-lg font-semibold">
-                  Saved analysis history
-                </h2>
-              </div>
-              <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">
-                Generated, no-action, and unavailable outcomes are all kept. Their order is not a
-                quality score or recommendation ranking.
-              </p>
-            </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void analyses.refetch()}
-              disabled={analyses.isFetching}
-            >
-              <RefreshCw
-                className={analyses.isFetching ? "animate-spin" : undefined}
-                aria-hidden="true"
-              />
-              Refresh history
-            </Button>
-          </div>
-
-          {analyses.isPending ? (
-            <HistoryLoading />
-          ) : analyses.isError && history.length === 0 ? (
-            <HistoryError
-              detail="Saved analyses could not be retrieved. Try again."
-              onRetry={() => void analyses.refetch()}
-            />
-          ) : repeatedIdentity ? (
-            <Alert variant="destructive" className="mt-5">
-              <CircleAlert aria-hidden="true" />
-              <AlertTitle>Analysis history could not be reconciled</AlertTitle>
-              <AlertDescription>
-                The saved history contains conflicting duplicate entries. Market Squawk will not
-                hide or reorder them.
-              </AlertDescription>
-            </Alert>
-          ) : history.length === 0 ? (
-            <EmptyHistory />
-          ) : (
-            <>
-              <p className="mt-5 text-xs text-muted-foreground">
-                {history.length.toLocaleString("en-US")} saved analysis
-                {history.length === 1 ? "" : "es"} loaded in creation order.
-              </p>
-              <div className="mt-3 grid gap-3 xl:grid-cols-2">
-                {history.map((analysis) => (
-                  <AnalysisHistoryCard
-                    key={analysis.actionToken}
-                    analysis={analysis}
-                    selected={analysis.actionToken === selectedActionToken}
-                    onSelect={() => setSearchParams((current) => {
-                      const next = new URLSearchParams(current)
-                      next.set("analysis", analysis.actionToken)
-                      return next
-                    })}
-                  />
-                ))}
-              </div>
-
-              {analyses.isError ? (
-                <HistoryError
-                  detail="More saved analyses could not be retrieved. Try again."
-                  onRetry={() => void analyses.refetch()}
-                />
-              ) : null}
-
-              <CursorNavigation navigation={navigation} next={analyses.data?.completeness === "truncated" ? analyses.data.nextAfterActionToken : null} busy={analyses.isFetching}
-                onRestart={() => { if (navigation.after === undefined) void analyses.refetch() }} />
-            </>
-          )}
-        </section>
+        <SavedAnalysisHistory analyses={analyses} navigation={navigation}
+          selectedActionToken={selectedActionToken} onSelect={(actionToken) => setSearchParams((current) => {
+            const next = new URLSearchParams(current)
+            next.set("analysis", actionToken)
+            return next
+          })} />
       )}
 
 
@@ -353,10 +229,12 @@ function AnalysisHistoryCard({
   analysis,
   selected,
   onSelect,
+  openLabel,
 }: {
   analysis: InvestmentAnalysisLocator
   selected: boolean
   onSelect: () => void
+  openLabel: string
 }) {
   const tone = analysisOutcomeTone(analysis.recommendation)
   const toneClass =
@@ -411,7 +289,7 @@ function AnalysisHistoryCard({
         <CardFact label="Expires" value={formatProductTimestamp(analysis.horizon.expiresAt)} />
       </dl>
       <div className="mt-4 flex items-center justify-end gap-1 text-xs font-medium text-primary">
-        Open brief
+        {openLabel}
         <ChevronRight className="size-3" aria-hidden="true" />
       </div>
     </button>
@@ -471,5 +349,87 @@ function HistoryError({ detail, onRetry }: { detail: string; onRetry: () => void
         </Button>
       </AlertDescription>
     </Alert>
+  )
+}
+
+export function SavedAnalysisHistory({ analyses, navigation, selectedActionToken, onSelect, openLabel = "Open brief" }: {
+  analyses: ReturnType<typeof useSavedInvestmentAnalyses>
+  navigation: ReturnType<typeof useCursorNavigation>
+  selectedActionToken: string | null
+  onSelect: (actionToken: string) => void
+  openLabel?: string
+}) {
+  const history = analyses.data?.analyses ?? []
+  return (
+    <section className="mt-6" aria-labelledby="opportunity-history-title">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <History className="size-4 text-primary" aria-hidden="true" />
+            <h2 id="opportunity-history-title" className="text-lg font-semibold">
+              Saved analysis history
+            </h2>
+          </div>
+          <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">
+            Generated, no-action, and unavailable outcomes are all kept. Their order is not a
+            quality score or recommendation ranking.
+          </p>
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => void analyses.refetch()}
+          disabled={analyses.isFetching}
+        >
+          <RefreshCw
+            className={analyses.isFetching ? "animate-spin" : undefined}
+            aria-hidden="true"
+          />
+          Refresh history
+        </Button>
+      </div>
+
+      {analyses.isPending ? (
+        <HistoryLoading />
+      ) : analyses.isError && history.length === 0 ? (
+        <HistoryError
+          detail="Saved analyses could not be retrieved. Try again."
+          onRetry={() => void analyses.refetch()}
+        />
+      ) : history.length === 0 ? (
+        <EmptyHistory />
+      ) : (
+        <>
+          <p className="mt-5 text-xs text-muted-foreground">
+            {history.length.toLocaleString("en-US")} saved analysis
+            {history.length === 1 ? "" : "es"} loaded in creation order.
+          </p>
+          <div className="mt-3 grid gap-3 xl:grid-cols-2">
+            {history.map((analysis) => (
+              <AnalysisHistoryCard
+                key={analysis.actionToken}
+                analysis={analysis}
+                selected={analysis.actionToken === selectedActionToken}
+                onSelect={() => onSelect(analysis.actionToken)}
+                openLabel={openLabel}
+              />
+            ))}
+          </div>
+
+          {analyses.isError ? (
+            <HistoryError
+              detail="More saved analyses could not be retrieved. Try again."
+              onRetry={() => void analyses.refetch()}
+            />
+          ) : null}
+
+        </>
+      )}
+      {analyses.data || navigation.canGoPrevious || analyses.isError ? (
+        <CursorNavigation navigation={navigation} next={analyses.data?.completeness === "truncated" ? analyses.data.nextAfterActionToken : null} busy={analyses.isFetching}
+          onRestart={() => { if (navigation.after === undefined) void analyses.refetch() }} />
+      ) : null}
+    </section>
   )
 }

@@ -8,6 +8,7 @@ import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-
 import { lookupRoute } from "@/features/lookup/lookup-surface"
 import { lookupResultSchema } from "@/features/lookup/schemas"
 import type { MarketProductRow } from "@/features/markets/market-product"
+import { parseInvestmentAnalysis, type InvestmentAnalysis } from "@/features/opportunities/contracts"
 import type { PortfolioPositionChoice } from "@/features/portfolio/portfolio-contracts"
 import { PortfolioPlanning } from "@/features/portfolio/portfolio-planning"
 import {
@@ -784,6 +785,74 @@ describe("Market Squawk desktop boundary", () => {
     expect(renderedText).not.toMatch(/kraken|coinbase|websocket-v2/i)
     expect(renderedText).not.toContain(marketSelectionToken)
     expect(renderedText).not.toMatch(/\bticks?\b|\blots?\b/i)
+  })
+
+  it("opens the exact saved valuation with method amounts and preserves explicit selection", async () => {
+    const user = userEvent.setup()
+    const selectedToken = "11111111-1111-4111-8111-111111111111"
+    const listedToken = "22222222-2222-4222-8222-222222222222"
+    const unavailable = { state: "unavailable" as const, summary: "Insufficient completed outcomes." }
+    const money = (amount: string) => ({ amount, currency: "USD" })
+    const families = ["current_market", "broader_research", "price_pattern", "forecast", "financial_model", "valuation", "historical_test", "out_of_sample", "liquidity", "portfolio_risk"] as const
+    const analysis: InvestmentAnalysis = {
+      actionToken: selectedToken, investment: { symbol: "MSFT", name: "Microsoft" },
+      portfolioLabel: "Research portfolio", currency: "USD",
+      recommendation: { kind: "unavailable", summary: "Research values are available; an investment decision is not." },
+      horizon: { informationCurrentThrough: "2026-09-01T00:00:00.000000000Z", endsAt: "2026-10-01T00:00:00.000000000Z", expiresAt: "2026-09-02T00:00:00.000000000Z" },
+      priceSummary: {
+        current: null, fairValue: null, scenarios: null, actionRanges: null,
+        valuationMethods: {
+          sourceCutoffUnixNanos: "1788220800000000000", marketCutoffUnixNanos: "1788220800000000000", completedAtUnixNanos: "1788220800000000001",
+          methods: [
+            { method: "discounted_cash_flow", status: "calculated", basis: "total_common_equity", lower: money("900000"), central: money("1000000"), upper: money("1100000"), recommendationUse: "not_per_instrument_unit", terminalGrowth: { uncapped: "0.04", riskFreeCap: "0.03", applied: "0.03" }, residualTerminal: null },
+            { method: "comparable_companies", status: "unavailable", summary: "Comparable-company evidence is missing." },
+            { method: "residual_income", status: "calculated", basis: "reporting_entity_total", lower: money("-100"), central: money("0"), upper: money("100"), recommendationUse: "not_per_instrument_unit", terminalGrowth: null, residualTerminal: { condition: "Residual earnings fade to zero.", explicitPeriods: 5, continuingValueSensitivity: "0.2" } },
+            { method: "forecast_distribution", status: "calculated", basis: "per_instrument_unit", lower: money("90"), central: money("100"), upper: money("110"), recommendationUse: "admission_unavailable", terminalGrowth: null, residualTerminal: null },
+          ],
+        },
+      },
+      chart: null, chartAvailable: false,
+      probabilities: { priceHigher: { ...unavailable, benchmark: null, assumptions: [] }, benchmarkOutperformance: { ...unavailable, benchmark: null, assumptions: [] }, profitAfterCosts: { ...unavailable, benchmark: null, assumptions: [] } },
+      reasons: ["Saved method evidence is retained independently of recommendation availability."], risks: [], assumptions: ["Original financial inputs remain fixed."], invalidators: [],
+      evidenceSummary: { coverage: { availableCount: 0, possibleCount: 10, items: families.map((kind) => ({ kind, state: "unavailable" })), summary: "No combined investment estimate is available." }, calibration: unavailable, outOfSample: unavailable, historicalTest: null, costs: unavailable, uncertainty: unavailable },
+      analyticalEvidence: { currentMarket: unavailable, broaderResearch: unavailable, pricePattern: { ...unavailable, outcome: "not_evaluated" }, forecast: unavailable, financialModel: unavailable, valuation: unavailable, historicalTest: unavailable, outOfSample: unavailable, liquidity: unavailable, portfolioRisk: unavailable, combination: { state: "insufficient", summary: "Research is not an investment recommendation." } },
+      liquidity: unavailable, portfolioContext: unavailable,
+      virtualPaperEligibility: { state: "not_eligible", executionAuthority: "none", requiresExplicitPaperApproval: true, requiresFreshRiskCheck: true, summary: "No paper action is authorized." },
+      outcomeProjection: null, sizing: { ...unavailable, reason: "no_generated_proposal" }, expectedReturn: unavailable, realizedOutcome: null, trackRecordActionToken: null,
+    }
+    const result = (data: unknown): ApplicationResult => ({ data, metadata: { completeness: "complete", returnedItems: 1, availableItems: 1 } })
+    // The backend always publishes this field, including null when no methods exist.
+    const noMethods = { ...analysis, actionToken: listedToken, investment: { symbol: "AAPL", name: "Apple" }, priceSummary: { ...analysis.priceSummary, valuationMethods: null } }
+    expect(parseInvestmentAnalysis(result(noMethods), listedToken).priceSummary.valuationMethods).toBeNull()
+    const requested: string[] = []
+    render(
+      <MemoryRouter initialEntries={[`/advanced/valuation-targets?analysis=${selectedToken}`]}>
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["decision_analysis", "decision_analysis_list"] }, undefined, async (request) => {
+          if (request.query === "decisionInvestmentAnalyses") return result({ completeness: "complete", returnedCount: 1, availableCount: 1, nextAfterActionToken: null, analyses: [{ actionToken: listedToken, investment: noMethods.investment, portfolioLabel: analysis.portfolioLabel, currency: analysis.currency, horizon: analysis.horizon, recommendation: analysis.recommendation }] })
+          if (request.query === "decisionInvestmentAnalysis") {
+            requested.push(request.actionToken)
+            return result(request.actionToken === selectedToken ? analysis : noMethods)
+          }
+          throw new Error(`Unexpected valuation query: ${request.query}`)
+        })} />
+      </MemoryRouter>,
+    )
+    expect(await screen.findByText("Comparable-company evidence is missing.")).toBeTruthy()
+    expect(screen.getByText("Residual earnings fade to zero.")).toBeTruthy()
+    const cashFlow = within(screen.getByRole("region", { name: "Discounted cash flow" }))
+    expect(cashFlow.getByText("Total common equity")).toBeTruthy()
+    expect(cashFlow.getByText(/1000000/)).toBeTruthy()
+    expect(cashFlow.queryByText("Per instrument unit")).toBeNull()
+    const residual = within(screen.getByRole("region", { name: "Residual income" }))
+    expect(residual.getByText("Reporting entity total")).toBeTruthy()
+    expect(residual.getByText(/-100/)).toBeTruthy()
+    const ranges = screen.getByRole("heading", { name: "Price ranges" }).closest("section")
+    expect(ranges?.querySelectorAll("dd")).toHaveLength(7)
+    expect([...ranges!.querySelectorAll("dd")].every((value) => value.textContent === "Unavailable")).toBe(true)
+    expect(requested).toEqual([selectedToken])
+    await user.click(screen.getByRole("button", { name: /AAPL/ }))
+    await waitFor(() => expect(requested).toEqual([selectedToken, listedToken]))
+    await waitFor(() => expect(screen.queryByText("Residual earnings fade to zero.")).toBeNull())
   })
 
   it("renders one provider-neutral economic context with paired date cutoffs", async () => {

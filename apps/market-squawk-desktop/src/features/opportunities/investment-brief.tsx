@@ -21,8 +21,9 @@ import type {
   RecommendationTrackRecord,
   StudyQualification,
 } from "./contracts"
-import { formatLosslessInteger } from "./format"
+import { formatLosslessInteger, formatMoney as money } from "./format"
 import { SavedBenchmarkChart } from "./saved-benchmark-chart"
+import { ValuationEvidence } from "../fair-value/valuation-evidence"
 
 type Money = NonNullable<InvestmentAnalysis["priceSummary"]["current"]>
 type PriceRange = NonNullable<
@@ -124,6 +125,9 @@ export function InvestmentBrief({
         <SavedInvestmentChartRead actionToken={analysis.actionToken} currency={analysis.currency} transport={transport} scope={scope} />
       </DemandPanel> : <p className="mt-5 text-xs text-muted-foreground">Saved chart evidence is unavailable for this analysis.</p>}
       <SavedProbabilities analysis={analysis} />
+      <DemandPanel title="Valuation methods" className="mt-5 rounded-lg border border-border bg-background/25 p-4">
+        <ValuationEvidence analysis={analysis} />
+      </DemandPanel>
       <PriceRanges analysis={analysis} />
       <SignalExplanation key={analysis.actionToken} analysis={analysis} />
       <ProductLists analysis={analysis} />
@@ -458,35 +462,32 @@ function SavedProbabilities({ analysis }: { analysis: InvestmentAnalysis }) {
   </Disclosure>
 }
 
-function PriceRanges({ analysis }: { analysis: InvestmentAnalysis }) {
+export function PriceRanges({ analysis }: { analysis: InvestmentAnalysis }) {
   const scenarios = analysis.priceSummary.scenarios
   const actionRanges = analysis.priceSummary.actionRanges
-  if (!scenarios && !actionRanges) return null
   return (
     <Disclosure title="Price ranges">
       <p className="text-xs leading-5 text-muted-foreground">
         These are saved research ranges, not guaranteed prices.
       </p>
-      {scenarios ? (
-        <dl className="mt-4 grid gap-4 sm:grid-cols-3">
-          <Fact label="Downside scenario" value={priceRange(scenarios.downside)} />
-          <Fact label="Base scenario" value={priceRange(scenarios.base)} />
-          <Fact label="Upside scenario" value={priceRange(scenarios.upside)} />
-        </dl>
-      ) : null}
-      {actionRanges ? (
-        <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <Fact label="Entry range" value={priceRange(actionRanges.entry)} />
-          <Fact label="Add range" value={priceRange(actionRanges.add)} />
-          <Fact label="Trim range" value={priceRange(actionRanges.trim)} />
-          <Fact label="Exit range" value={priceRange(actionRanges.exit)} />
-        </dl>
-      ) : null}
+      <dl className="mt-4 grid gap-4 sm:grid-cols-3">
+        <Fact label="Downside scenario" value={priceRange(scenarios?.downside ?? null)} />
+        <Fact label="Base scenario" value={priceRange(scenarios?.base ?? null)} />
+        <Fact label="Upside scenario" value={priceRange(scenarios?.upside ?? null)} />
+      </dl>
+      {scenarios === null ? <p className="mt-3 text-xs text-muted-foreground">{analysis.analyticalEvidence.forecast.summary}</p> : null}
+      <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <Fact label="Entry range" value={priceRange(actionRanges?.entry ?? null)} />
+        <Fact label="Add range" value={priceRange(actionRanges?.add ?? null)} />
+        <Fact label="Trim range" value={priceRange(actionRanges?.trim ?? null)} />
+        <Fact label="Exit range" value={priceRange(actionRanges?.exit ?? null)} />
+      </dl>
+      {actionRanges === null ? <p className="mt-3 text-xs text-muted-foreground">{analysis.recommendation.summary}</p> : null}
     </Disclosure>
   )
 }
 
-function ProductLists({ analysis }: { analysis: InvestmentAnalysis }) {
+export function ProductLists({ analysis }: { analysis: InvestmentAnalysis }) {
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <TextList title="Why" values={analysis.reasons} empty="No additional reason was saved." />
@@ -505,7 +506,7 @@ function ProductLists({ analysis }: { analysis: InvestmentAnalysis }) {
   )
 }
 
-function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
+export function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
   const evidence = analysis.evidenceSummary
   const historical = evidence.historicalTest
   const uncertainty = evidence.uncertainty
@@ -1005,15 +1006,12 @@ function actionLabel(action: "buy" | "add" | "hold" | "trim" | "sell") {
   return action.charAt(0).toUpperCase() + action.slice(1)
 }
 
-function money(value: Money): string {
-  return `${value.amount} ${value.currency}`
-}
-
 function nullableMoney(value: Money | null): string {
   return value ? money(value) : "Unavailable"
 }
 
-function priceRange(value: PriceRange): string {
+function priceRange(value: PriceRange | null): string {
+  if (value === null) return "Unavailable"
   return `${money(value.lower)} – ${money(value.upper)}`
 }
 

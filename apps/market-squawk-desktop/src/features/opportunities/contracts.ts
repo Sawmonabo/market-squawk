@@ -75,6 +75,11 @@ const moneySchema = z
   .object({ amount: positiveDecimalSchema, currency: currencySchema })
   .strict()
 
+const signedMoneySchema = z.object({
+  amount: canonicalDecimalSchema,
+  currency: currencySchema,
+}).strict()
+
 const priceRangeSchema = z
   .object({ lower: moneySchema, upper: moneySchema })
   .strict()
@@ -183,10 +188,47 @@ const actionRangesSchema = z
     }
   })
 
+const valuationTimestampSchema = z.string().min(1).max(20).regex(/^(?:0|-?[1-9]\d*)$/)
+
+function valuationMethodSchema<const Method extends string>(method: Method) {
+  return z.discriminatedUnion("status", [
+    z.object({ method: z.literal(method), status: z.literal("unavailable"), summary: productTextSchema }).strict(),
+    z.object({
+      method: z.literal(method),
+      status: z.literal("calculated"),
+      basis: z.enum(["per_instrument_unit", "total_common_equity", "reporting_entity_total", "position_total"]),
+      lower: signedMoneySchema,
+      central: signedMoneySchema,
+      upper: signedMoneySchema,
+      recommendationUse: z.enum(["selected", "not_per_instrument_unit", "share_unit_basis_unproven", "another_method_selected", "admission_unavailable"]),
+      terminalGrowth: method === "discounted_cash_flow" ? z.object({
+        uncapped: canonicalDecimalSchema, riskFreeCap: canonicalDecimalSchema, applied: canonicalDecimalSchema,
+      }).strict() : z.null(),
+      residualTerminal: method === "residual_income" ? z.object({
+        condition: productTextSchema, explicitPeriods: positiveU32Schema,
+        continuingValueSensitivity: canonicalDecimalSchema,
+      }).strict() : z.null(),
+    }).strict(),
+  ])
+}
+
+const valuationMethodSetSchema = z.object({
+  sourceCutoffUnixNanos: valuationTimestampSchema,
+  marketCutoffUnixNanos: valuationTimestampSchema,
+  completedAtUnixNanos: valuationTimestampSchema,
+  methods: z.tuple([
+    valuationMethodSchema("discounted_cash_flow"),
+    valuationMethodSchema("comparable_companies"),
+    valuationMethodSchema("residual_income"),
+    valuationMethodSchema("forecast_distribution"),
+  ]),
+}).strict()
+
 const priceSummarySchema = z
   .object({
     current: moneySchema.nullable(),
     fairValue: moneySchema.nullable(),
+    valuationMethods: valuationMethodSetSchema.nullable(),
     scenarios: scenarioRangesSchema.nullable(),
     actionRanges: actionRangesSchema.nullable(),
   })
@@ -380,10 +422,6 @@ const evidenceSummarySchema = z
   })
   .strict()
 
-const signedMoneySchema = z.object({
-  amount: canonicalDecimalSchema,
-  currency: currencySchema,
-}).strict()
 const signedMoneyRangeSchema = z.object({
   lower: signedMoneySchema,
   upper: signedMoneySchema,

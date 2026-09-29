@@ -73,11 +73,50 @@ The smoke's old paper `state`/`shutdownComplete` expectations were also updated 
 bootstrap, MCP calls, relay EOF and signing-secret retirement. The shared-service restart check and
 `git diff --check` also pass. This checkpoint removes the obsolete MCP path across three service
 files and updates one existing smoke; no new test, migration, branch or worktree was added. The
-read-only helper is complete. Root's single-job native Desktop build is now running for the fresh
+read-only helper is complete. Root's single-job native Desktop build subsequently completed for the fresh
 V1 root; local secure setup and actual provider/data admission are still pending. No live financial
 or installed workflow completion is claimed.
 
 All earlier active/current tables and local wave handoffs are historical, not live assignments.
+
+### Integrated client slice — saved valuation — 2026-09-29
+
+Acceptance items 2/5/6: render actual saved valuation methods and ranges rather than an unconditional
+unavailable page. Source refresh after `1ca49bf6` confirms the backend producer and Rust output schema
+already publish `priceSummary.valuationMethods`; Desktop's strict parser omits it, rejecting that
+saved result even when the value is null. The Valuation page unconditionally renders unavailable.
+
+| Owner | Exact writable files | Dependency / completion |
+| --- | --- | --- |
+| Lead | Desktop `src/features/opportunities/contracts.ts`, existing `src/test/app.test.tsx`, ledger/Git | Match the existing Rust method-set schema in place, including signed amounts and method-specific assumptions. Reuse exact-decimal primitives. One existing-harness critical journey for saved-result parsing/selection and rendered methods; typecheck. No Rust change or compiler duplication. |
+| Sol High UI (`saved_valuation_finish`, continuing preserved partial edits) | Desktop `src/features/fair-value/fair-value-page.tsx`, optional cohesive `valuation-evidence.tsx`; `src/features/opportunities/opportunities-read-experience.tsx`, `investment-brief.tsx`, `format.ts`, optional `use-saved-investment-analysis.ts` | Shared saved-list/detail reads and range presentation may be extracted within these files for reuse by both views. Use the lead's method-set contract; explicit selected saved result, cursor list, demand detail, cancellation/session scoping; show four methods and their actual amount basis, assumptions, missing reasons and saved ranges. No financial arithmetic, new transports or backend edits. Report exact changes without builds/Git. |
+
+The preserved UI work was completed by `saved_valuation_finish` and inspected by the lead; its
+ownership is released. The coherent checkpoint containing this entry fixes the strict saved-result
+parser and wires Valuation & Targets to exact saved analyses, independently of the current cursor
+page. Both it and Opportunities reuse one cancellable, session-scoped list/detail reader and one
+history presentation. The four method outcomes retain signed amounts, actual value basis, method
+assumptions and original cutoffs. The Everyday brief exposes these details on expansion. Both views
+reuse all seven range slots, with unavailable values and saved explanations instead of omitting
+missing ranges. Exact money formatting is shared; no financial formula or backend authority moved
+to React. No compatibility path, migration, branch or worktree was added.
+
+Critical verification: the existing Desktop app harness now has one saved-valuation journey for the
+previously uncovered producer/parser/display seam. It opens a URL-selected result absent from the
+current history page, checks total-equity versus per-unit presentation and negative amounts,
+preserves seven unavailable range slots, then explicitly switches to the listed result. It also
+admits the backend's required null method-set case. Final selected run passed (1 passed, 7 skipped,
+1.46 seconds); TypeScript and `git diff --check` passed. No broad CI or new test harness ran. These
+are critical fixture checks; real stock calculation and installed saved-result restart remain open.
+The exact pushed identity and validation are recorded in PR #43 with the integration commit.
+
+The lead's one-job native Desktop build completed successfully in 11m55s. The current Desktop and
+shared-service processes are live against `.market-squawk/v1-owner-test`; the current CLI's
+`service status` returns `bootstrap_required` / `encrypted_fallback_locked`. Local secure setup
+requires the owner to enter the password in the native app; no password is requested in chat or
+invented by an agent. A visible usable window and unlocked workspace have not yet been verified.
+Both retained installations remain preserved. The model runtime and live input barriers remain;
+UI fixture success does not establish real-data or installed workflow completion.
 
 ## Resource processing checkpoint — 2026-09-29
 
