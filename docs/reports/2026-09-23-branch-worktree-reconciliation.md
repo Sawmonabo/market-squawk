@@ -1,5 +1,42 @@
 # Branch and worktree reconciliation audit — 2026-09-23
 
+## September 29 dependency and branch closure checkpoint
+
+Dependency updates are consolidated on the V1 feature branch in `a7987440`:
+futures-util 0.3.34, async-trait 0.1.92, rust_decimal 1.43.0, clap 4.6.7
+and uuid 1.26.1. Registry checksums match the five proposed bot updates.
+The isolated dependency candidate passed locked offline Cargo metadata;
+30 existing financial-value tests passed against the integration workspace.
+No full release gate or CI/CD ran. PRs #46, #48, #52, #53 and #54 were closed
+with incorporation comments; live origin inventory confirms all five bot
+branches are absent. Neither main nor release was merged.
+
+The worktree-free `codex/crypto-canonical-data` branch at `3facc2b2` was
+also deleted with ordinary `git branch -d` after fresh ancestor verification
+against the pushed target. Its history remains in the target. It had no
+remote branch or open PR. No donor worktree was removed in this checkpoint.
+
+Three redundant local labels were retired after exact-head and ancestry checks:
+`feature/board-h15-native-publication` and `feature/treasury-sealed-publication`
+both at `0e4ca488`, and `feature/provider-native-lineage-sidecar` at `b0ce2d47`.
+All commits remain reachable through retained `codex/common-seal-root-integration`
+at `988c8547`; none had a separate worktree, live remote branch or open PR.
+This is label consolidation, not acceptance of the common-seal candidate.
+
+Fresh inventory: **21 local branches, 14 origin heads, six local worktrees
+including the target**. Six local and two remote Codex branches remain.
+The five donor worktrees are Alpaca, Census, Kraken, Schwab and common-seal
+integration. Unique commits and dirty layers still require disposition;
+this checkpoint does not claim that all source work is integrated.
+
+The source API and updated callers already coexist as pending changes in
+the target checkout. They must be committed as a coherent dependency set;
+there is no separate caller commit to cherry-pick. Existing useful lane
+commits can be cherry-picked when their prerequisites are present. Replaced
+or rejected changes are preserved and explicitly retired rather than replayed.
+Original session and recovery backups remain protected. PR #43 records the
+pushed dependency checkpoint and focused verification limits.
+
 ## September 28 closure checkpoint
 
 The obsolete `source-current-integration` checkout has been retired. Before
