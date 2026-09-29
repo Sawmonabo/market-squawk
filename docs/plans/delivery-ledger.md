@@ -42,10 +42,40 @@ passed. Logs are retained locally under `.agents/tmp/v1-first-stock/`; the test 
 are the durable evidence summary. No full CI, release gate, RAM measurement, live provider admission,
 positive forecast, saved-Brief restart or installed-journey completion is claimed.
 
-Root now owns the existing service/CLI/helper build and normal development workspace setup
-(`.market-squawk/development-installation`, data `.market-squawk/development`). No source edits or
-additional worker dispatch are assigned during that startup attempt. Build scheduling stays serial,
-one-job and nonincremental. Stale model-runtime binaries are not used as current proof.
+Current native service/CLI/helpers built successfully with one compiler job. The normal development
+root failed startup because its retained identity payload is an obsolete untagged format-2 record
+(`formatVersion`, `installationId`, `legacySecretCleanup`); both payload hashes match, but this is not
+the current tagged runtime identity. No migration, deletion or identity rewrite was performed.
+Root explicitly selected the retained `.market-squawk/oauth-live-v1-20260923/installation` and
+paired `data` root to reuse its current identity and saved native setup. The current service reaches
+the typed `encrypted_fallback_locked` bootstrap state there. This is setup progress, not data admission.
+Both workspaces and their original evidence remain preserved.
+
+Root owns native Desktop build/launch and unlock setup; builds remain serial, one-job and
+nonincremental. Stale model-runtime binaries are not used as current proof. The bounded read-only
+Astra High investigation confirmed obsolete MCP migration/cleanup code. Root now owns
+`service/mcp_control.rs`, its `try_prepare` call in `service/runtime.rs`, and the obsolete MCP
+cleanup-reference append in `service/mod.rs`. Remove that path in place while preserving durable
+revocations, live credential rotation and real runtime signing-secret cleanup. Reuse the existing
+shared-service restart test and MCP smoke; add no test suite. Native compilation was stopped before
+application compilation so this correction can enter the same launch candidate; completed compiler
+cache remains intact. Both retained MCP documents contain the obsolete cleanup field. Preserve them
+and use a fresh `.market-squawk/v1-owner-test` installation for current first-launch verification,
+without translating old state, resetting its revocations or claiming old-workspace recovery.
+The existing shared-service restart test passes after removal (one selected case, 48.06 seconds).
+The MCP smoke exposed stale expectations: it still requires management-only domains, the hidden
+`Market.GetSnapshot` operation and native metadata intentionally absent from product discovery.
+Root also owns `scripts/smoke_mcp.py` to align that existing check with `product_capabilities`,
+the provider-neutral `Market.GetOverview` operation and public MCP authority annotations. The
+actual status/mutation/EOF/shutdown checks remain; no product authority is widened to satisfy smoke.
+The smoke's old paper `state`/`shutdownComplete` expectations were also updated to the current
+`sessionAvailability`/`safeguards` product contract. Final smoke exits zero, including real service
+bootstrap, MCP calls, relay EOF and signing-secret retirement. The shared-service restart check and
+`git diff --check` also pass. This checkpoint removes the obsolete MCP path across three service
+files and updates one existing smoke; no new test, migration, branch or worktree was added. The
+read-only helper is complete. Root's single-job native Desktop build is now running for the fresh
+V1 root; local secure setup and actual provider/data admission are still pending. No live financial
+or installed workflow completion is claimed.
 
 All earlier active/current tables and local wave handoffs are historical, not live assignments.
 

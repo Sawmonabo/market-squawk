@@ -1574,10 +1574,6 @@ fn retire_and_verify_ephemeral_credentials(
             Vec::new()
         }
     };
-    match mcp_control::credential_references(paths) {
-        Ok(mut mcp_references) => references.append(&mut mcp_references),
-        Err(_error) => failed = true,
-    }
     references.sort();
     references.dedup();
 

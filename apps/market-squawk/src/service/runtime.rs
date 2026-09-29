@@ -326,7 +326,6 @@ impl PreparedRuntime {
         let mcp_clients = PreparedMcpClientAuthority::try_prepare(
             paths,
             state.runtime,
-            &secret_store,
             mcp_roots,
         )?;
         let desktop_credential = credentials.credential(

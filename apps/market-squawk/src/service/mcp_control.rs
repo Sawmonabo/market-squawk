@@ -16,8 +16,7 @@ use market_squawk_mcp::{
     AuthenticatedMcpClient, McpHttpAuthError, McpHttpAuthenticator, McpLimitSpec,
 };
 use market_squawk_platform::{
-    LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError, SecretRef,
-    SecretStore, SecretValue,
+    LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError, SecretValue,
 };
 use market_squawk_runtime::{
     AppRequestEnvelope, ClientCredentialRegistration, ClientId, CredentialError,
@@ -36,10 +35,8 @@ pub(super) const ACTIVATE_OPERATION: &str = "Mcp.ActivateCredential";
 pub(super) const ROTATE_OPERATION: &str = "Mcp.RotateCredential";
 pub(super) const REVOKE_OPERATION: &str = "Mcp.RevokeCredential";
 
-const FORMAT_VERSION: u16 = 2;
-const LEGACY_FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 1;
 const AUTHORITY_DIRECTORY: &str = "installed-service/mcp-client-authority";
-const MAXIMUM_LEGACY_SECRET_REFERENCES: usize = 4;
 
 /// Durable preparation boundary resolved before the runtime credential registry is loaded.
 pub(super) struct PreparedMcpClientAuthority {
@@ -84,26 +81,25 @@ impl PreparedMcpClientAuthority {
     pub(super) fn try_prepare(
         paths: &LocalPaths,
         runtime: RuntimeIdentity,
-        _secret_store: &Arc<dyn SecretStore>,
         registrations: [ClientCredentialRegistration; 2],
     ) -> Result<Self, McpControlError> {
         let authority_root = paths.control_root()?.root().join(AUTHORITY_DIRECTORY);
         let store = LocalAuthorityStateStore::try_open(&authority_root)?;
         validate_current_registrations(&registrations)?;
-        let (mut document, migrated_from_legacy) = match store.load()? {
+        let mut document = match store.load()? {
             Some(encoded) => decode_authority_document(&encoded, runtime.installation_id())?,
             None => {
                 let document =
                     AuthorityDocument::new(runtime).validate(runtime.installation_id())?;
                 store_document(&store, &document)?;
-                (document, false)
+                document
             }
         };
         let workspace_changed = document.workspace_id != runtime.workspace_id();
         if workspace_changed {
             document.workspace_id = runtime.workspace_id();
         }
-        if migrated_from_legacy || workspace_changed {
+        if workspace_changed {
             store_document(&store, &document)?;
         }
         drop(store);
@@ -511,12 +507,7 @@ struct AuthorityDocument {
     format_version: u16,
     installation_id: InstallationId,
     workspace_id: WorkspaceId,
-    #[serde(default)]
     revoked_clients: Vec<NamedClient>,
-    /// Retired V1 references are non-authoritative, cleanup-pending debt. They remain durable
-    /// until an explicit foreground owner deletes and verifies the exact secrets.
-    #[serde(default)]
-    legacy_secret_cleanup: Vec<SecretRef>,
 }
 
 impl AuthorityDocument {
@@ -526,7 +517,6 @@ impl AuthorityDocument {
             installation_id: runtime.installation_id(),
             workspace_id: runtime.workspace_id(),
             revoked_clients: Vec::new(),
-            legacy_secret_cleanup: Vec::new(),
         }
     }
 
@@ -535,18 +525,11 @@ impl AuthorityDocument {
         if self.format_version != FORMAT_VERSION
             || self.installation_id != installation_id
             || revoked.len() != self.revoked_clients.len()
-            || self.legacy_secret_cleanup.len() > MAXIMUM_LEGACY_SECRET_REFERENCES
             || !revoked.is_subset(&HashSet::from([
                 NamedClient::ClaudeCode,
                 NamedClient::Codex,
             ]))
         {
-            return Err(McpControlError::InvalidState);
-        }
-        let mut references = self.legacy_secret_cleanup.clone();
-        references.sort();
-        references.dedup();
-        if references.len() != self.legacy_secret_cleanup.len() {
             return Err(McpControlError::InvalidState);
         }
         Ok(self)
@@ -569,35 +552,6 @@ impl AuthorityDocument {
                 });
         }
     }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LegacyClientCredentialRegistration {
-    client_id: ClientId,
-    client: NamedClient,
-    reference: SecretRef,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LegacyPendingRotation {
-    client: NamedClient,
-    prior: LegacyClientCredentialRegistration,
-    candidate: LegacyClientCredentialRegistration,
-    plan: Value,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LegacyAuthorityDocument {
-    format_version: u16,
-    installation_id: InstallationId,
-    workspace_id: WorkspaceId,
-    clients: Vec<LegacyClientCredentialRegistration>,
-    #[serde(default)]
-    revoked_clients: Vec<NamedClient>,
-    pending: Option<LegacyPendingRotation>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -721,95 +675,13 @@ fn store_document(
     Ok(())
 }
 
-/// Returns only retired, non-authoritative V1 references retained for explicit foreground cleanup.
-pub(super) fn credential_references(paths: &LocalPaths) -> Result<Vec<SecretRef>, McpControlError> {
-    let authority_root = paths.control_root()?.root().join(AUTHORITY_DIRECTORY);
-    let store = LocalAuthorityStateStore::try_open(authority_root)?;
-    let Some(encoded) = store.load()? else {
-        return Ok(Vec::new());
-    };
-    decode_authority_references(&encoded)
-}
-
 fn decode_authority_document(
     encoded: &[u8],
     installation_id: InstallationId,
-) -> Result<(AuthorityDocument, bool), McpControlError> {
-    if let Ok(document) = serde_json::from_slice::<AuthorityDocument>(encoded) {
-        return document
-            .validate(installation_id)
-            .map(|document| (document, false));
-    }
-    let legacy = serde_json::from_slice::<LegacyAuthorityDocument>(encoded)
-        .map_err(|_error| McpControlError::InvalidState)?;
-    migrate_legacy_authority(legacy, installation_id).map(|document| (document, true))
-}
-
-fn decode_authority_references(encoded: &[u8]) -> Result<Vec<SecretRef>, McpControlError> {
-    if let Ok(document) = serde_json::from_slice::<AuthorityDocument>(encoded) {
-        if document.format_version != FORMAT_VERSION
-            || document.legacy_secret_cleanup.len() > MAXIMUM_LEGACY_SECRET_REFERENCES
-        {
-            return Err(McpControlError::InvalidState);
-        }
-        return Ok(document.legacy_secret_cleanup);
-    }
-    let legacy = serde_json::from_slice::<LegacyAuthorityDocument>(encoded)
-        .map_err(|_error| McpControlError::InvalidState)?;
-    let installation_id = legacy.installation_id;
-    Ok(migrate_legacy_authority(legacy, installation_id)?.legacy_secret_cleanup)
-}
-
-fn migrate_legacy_authority(
-    legacy: LegacyAuthorityDocument,
-    installation_id: InstallationId,
 ) -> Result<AuthorityDocument, McpControlError> {
-    if legacy.format_version != LEGACY_FORMAT_VERSION || legacy.installation_id != installation_id {
-        return Err(McpControlError::InvalidState);
-    }
-    validate_legacy_registrations(&legacy.clients)?;
-    if let Some(pending) = &legacy.pending {
-        ensure_mcp_client(pending.client)?;
-        if pending.prior.client != pending.client
-            || pending.candidate.client != pending.client
-            || pending.prior.client_id != pending.candidate.client_id
-            || pending.plan.is_null()
-        {
-            return Err(McpControlError::InvalidState);
-        }
-    }
-    let revoked = legacy
-        .revoked_clients
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    if revoked.len() != legacy.revoked_clients.len()
-        || !revoked.is_subset(&HashSet::from([
-            NamedClient::ClaudeCode,
-            NamedClient::Codex,
-        ]))
-    {
-        return Err(McpControlError::InvalidState);
-    }
-    let mut references = legacy
-        .clients
-        .into_iter()
-        .map(|registration| registration.reference)
-        .collect::<Vec<_>>();
-    if let Some(pending) = legacy.pending {
-        references.push(pending.prior.reference);
-        references.push(pending.candidate.reference);
-    }
-    references.sort();
-    references.dedup();
-    AuthorityDocument {
-        format_version: FORMAT_VERSION,
-        installation_id,
-        workspace_id: legacy.workspace_id,
-        revoked_clients: legacy.revoked_clients,
-        legacy_secret_cleanup: references,
-    }
-    .validate(installation_id)
+    serde_json::from_slice::<AuthorityDocument>(encoded)
+        .map_err(|_error| McpControlError::InvalidState)?
+        .validate(installation_id)
 }
 
 fn validate_current_registrations(
@@ -822,26 +694,6 @@ fn validate_current_registrations(
     let ids = registrations
         .iter()
         .map(ClientCredentialRegistration::client_id)
-        .collect::<HashSet<_>>();
-    if clients != HashSet::from([NamedClient::ClaudeCode, NamedClient::Codex]) || ids.len() != 2 {
-        return Err(McpControlError::InvalidState);
-    }
-    Ok(())
-}
-
-fn validate_legacy_registrations(
-    registrations: &[LegacyClientCredentialRegistration],
-) -> Result<(), McpControlError> {
-    if registrations.len() != 2 {
-        return Err(McpControlError::InvalidState);
-    }
-    let clients = registrations
-        .iter()
-        .map(|registration| registration.client)
-        .collect::<HashSet<_>>();
-    let ids = registrations
-        .iter()
-        .map(|registration| registration.client_id)
         .collect::<HashSet<_>>();
     if clients != HashSet::from([NamedClient::ClaudeCode, NamedClient::Codex]) || ids.len() != 2 {
         return Err(McpControlError::InvalidState);

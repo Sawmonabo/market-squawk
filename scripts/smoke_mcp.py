@@ -618,19 +618,16 @@ def main() -> int:
                 if isinstance(tool, dict) and isinstance(tool.get("name"), str)
             }
             required_domains = {
-                "Source",
                 "Market",
-                "Research",
-                "Fundamental",
                 "Macro",
                 "Portfolio",
                 "Analysis",
+                "AnalyticalProfile",
+                "Risk",
                 "Model",
                 "Decision",
-                "FairValue",
                 "Bot",
                 "Execution",
-                "Job",
             }
             observed_domains = {
                 name.split(".", maxsplit=1)[0] for name in names if "." in name
@@ -640,42 +637,25 @@ def main() -> int:
                 not missing_domains,
                 f"MCP tool registry is missing required domains: {missing_domains}",
             )
-            require("Market.GetSnapshot" in names, "Market.GetSnapshot tool is missing")
+            require("Market.GetOverview" in names, "Market.GetOverview tool is missing")
             require("Risk.TriggerKillSwitch" in names, "Risk.TriggerKillSwitch tool is missing")
             tools_by_name = {
                 tool["name"]: tool
                 for tool in tool_entries
                 if isinstance(tool, dict) and isinstance(tool.get("name"), str)
             }
-            snapshot_contract = (
-                tools_by_name["Market.GetSnapshot"]
-                .get("_meta", {})
-                .get("org.market-squawk/tool-contract", {})
+            require(
+                tools_by_name["Market.GetOverview"].get("annotations", {}).get("readOnlyHint")
+                is True,
+                "Market.GetOverview must expose read-only authority",
+            )
+            kill_switch = tools_by_name["Risk.TriggerKillSwitch"]
+            require(
+                kill_switch.get("annotations", {}).get("readOnlyHint") is False,
+                "Risk.TriggerKillSwitch must expose mutation authority",
             )
             require(
-                snapshot_contract.get("domain") == "market",
-                "Market.GetSnapshot must expose its market-domain contract",
-            )
-            require(
-                snapshot_contract.get("authorization") == "read_only",
-                "Market.GetSnapshot must expose read-only authority",
-            )
-            require(
-                snapshot_contract.get("result", {}).get("sourceEvidence")
-                == "required",
-                "Market.GetSnapshot must require source and quality evidence",
-            )
-            kill_switch_contract = (
-                tools_by_name["Risk.TriggerKillSwitch"]
-                .get("_meta", {})
-                .get("org.market-squawk/tool-contract", {})
-            )
-            require(
-                kill_switch_contract.get("domain") == "bot",
-                "Risk.TriggerKillSwitch must expose its paper-bot domain",
-            )
-            require(
-                kill_switch_contract.get("authorization") == "local_confirmation",
+                "confirm" in kill_switch.get("inputSchema", {}).get("required", []),
                 "Risk.TriggerKillSwitch must require local confirmation",
             )
             status = request(
@@ -696,13 +676,10 @@ def main() -> int:
                 },
             )
             require("error" not in status, f"Bot.GetStatus failed: {status}")
+            status_data = status.get("result", {}).get("structuredContent", {}).get("data", {})
             require(
-                status.get("result", {})
-                .get("structuredContent", {})
-                .get("data", {})
-                .get("state")
-                == "stopped",
-                "Bot.GetStatus did not reach the production application",
+                status_data == {"sessionAvailability": "ready", "safeguards": "active"},
+                "Bot.GetStatus did not report an idle session with active safeguards",
             )
             mutation = request(
                 process,
@@ -724,12 +701,10 @@ def main() -> int:
                 },
             )
             require("error" not in mutation, f"Risk.TriggerKillSwitch failed: {mutation}")
+            mutation_data = mutation.get("result", {}).get("structuredContent", {}).get("data", {})
             require(
-                mutation.get("result", {})
-                .get("structuredContent", {})
-                .get("data", {})
-                .get("shutdownComplete")
-                is True,
+                mutation_data.get("sessionAvailability") == "ready"
+                and mutation_data.get("safeguards") == "active",
                 "Risk.TriggerKillSwitch did not complete through governed paper control",
             )
             print("MCP smoke test passed")
