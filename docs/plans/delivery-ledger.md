@@ -279,6 +279,67 @@ ownership is released. No CI, resource measurement, live or installed completion
 Next dependency: selected holdings/exposure/history identity and continuation, alongside pending
 native secure setup and actual stock/model/input admission.
 
+### Selected-account positions checkpoint — 2026-09-29
+
+Acceptance 4/5/6; clean refreshed base `50b79f6b`. GetHoldings already owns exact financial
+values but takes raw account IDs, materializes every result and truncates without continuation;
+Desktop's unused speculative schema leaves the positions table disconnected. Complete this
+existing operation in place, with account-token selection, immutable-snapshot cursor pages,
+canonical historical investment display and cancellable demand loading. No new endpoint or
+financial calculation. Exposure/history remain required subsequent producer-to-consumer slices.
+
+| Owner | Exclusive writable files | Dependency / finish condition |
+| --- | --- | --- |
+| Lead | `portfolio_application.rs`, `portfolio_application/read.rs`, `local_product/mod.rs`, shared input/output contracts, CLI/native/TypeScript transport, existing control-plane and Desktop app checks, ledger/docs/Git | Freeze holdings page contract, register existing catalog read authority, schedule blocking catalog work through existing lifecycle, update all consumers and prove cursor/restart/cancellation before commit/push. |
+| Sol High holdings page | New cohesive `portfolio_application/holdings.rs` only | Implement `call(image, request, context, limits, instruments: Option<&MarketDataInstrumentReadCapability>)`; reuse ReadScope token resolver and financial row helpers. Return only a bounded page plus continuation pinned to the original revision and query scope; never materialize all JSON rows. |
+| Sol High investment display | New `portfolio_application/instrument_display.rs` only | Resolve page IDs through `pin_population_as_of` at retained portfolio knowledge/effective clocks, batching within existing catalog limits and respecting cancellation/deadline. Return actual nullable name/symbol; no ticker inference, current-name substitution or fabricated identity. |
+| Sol High positions Desktop | `features/portfolio/{portfolio-contracts.ts,holding-table.tsx,use-portfolio.ts,portfolio-page.tsx,portfolio-panels.tsx}`, new cohesive `account-holdings.tsx` if needed | Replace only unused holding shape with actual frozen row/page contract. Demand-load selected account, reuse cursor navigation, cancel/release pages on close/account change, exact numbers and truthful reported-price/basis/missing-name display. Preserve risk/performance. No builds/tests/Git. |
+
+Lead shared scope is `application/contracts.rs`, `application/contracts/output.rs`,
+`cli.rs`, `local_product/cli_transport.rs`, `release/demonstrate/local.rs`, Desktop
+`src/lib/transport.ts`, `features/shared/cursor-navigation.tsx` and native
+`contracts.rs`/`service_client.rs`; existing checks are
+`tests/harnesses/control_plane.rs` and Desktop `src/test/app.test.tsx`. The release demonstration
+consumer is updated in place to actual saved-import output and listed account tokens; it is not run
+as a per-task release gate.
+
+DAG: frozen input/output → independent page/display/UI → lead shared integration and critical
+existing checks → commit/push and ownership release. All work stays in the primary worktree;
+lead alone owns compilation. The page response carries its own cursor so Previous also restores
+the first page of the original snapshot; only explicit refresh/restart selects the latest one.
+Provider/live stock admission remains waiting on native secure setup;
+no installed or live evidence is claimed for this slice.
+
+Implemented and critically verified in `69a64fbc`; all three Sol High handoffs were inspected,
+integrated and released. The lead corrected first-page navigation to preserve its original snapshot,
+updated all current callers in place, and retained the shared catalog's original knowledge/effective
+clocks for nullable investment names. No compatibility reader, migration, new endpoint or financial
+calculation was added. The response builds only the requested page and supplies continuation rather
+than silently truncating a whole-account JSON result.
+
+Critical verification (local, one compiler job; no broad CI or release gate):
+
+- Existing `portfolio_import_atomically_publishes_the_queried_revision` passes (1 selected test).
+  It now checks admitted holdings output, exact quantities, scope-bound cursors, first/next pages
+  across a newer import, and identical first/next pages after service reopen. Existing performance
+  and accounting/recovery assertions remain. The additional fixture's fractional quantity initially
+  had an invalid whole-share lot size; the fixture was corrected, not the importer validation.
+- Existing Desktop `loads selected portfolio reports on demand and discards a cancelled account
+  response` passes (1 selected test). It now covers positions expansion, cancelled account reads,
+  exact money/fractional quantity, unknown names/basis, Next/Previous pinning, explicit refresh and
+  close. No new component suite or harness.
+- Desktop TypeScript validation and `cargo check --locked --offline -p market-squawk-desktop --lib`
+  pass. The Rust check/test use `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0`. Existing compiler warnings
+  remain; `git diff --check` passes.
+
+Local logs: `.agents/tmp/v1-first-stock/portfolio-holdings-{check,typecheck,ui,native-check}.log`.
+These prove the changed deterministic contracts and wiring, not live catalog-name resolution or an
+installed portfolio journey. Native secure setup and real stock/model input admission remain the
+live dependency. Exposure, transactions/history/attribution, scenario/planning and paper composition
+remain required; whole-app RAM and final owner-test gates remain deferred until complete workflows.
+Only the lead owns the next integration assignment; no implementation agents remain active for this
+checkpoint, and no additional branch/worktree was created. PR #43 records the pushed identity.
+
 ## Resource processing checkpoint — 2026-09-29
 
 The owner resumed work after the mockup pause and approved
