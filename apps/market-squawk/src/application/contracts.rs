@@ -843,6 +843,11 @@ const PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::requi
     "accountToken",
     ArgumentKind::OpaqueProductToken,
 )];
+const PORTFOLIO_HOLDINGS_ARGUMENTS: &[ArgumentSpec] = &[
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
+    CURSOR_PAGE_ARGUMENTS[0],
+    CURSOR_PAGE_ARGUMENTS[1],
+];
 const RECOMMENDATION_SETUP_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required(
         "expectedRevision",
@@ -2253,9 +2258,13 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LIST_REVISIONS_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
-    read_portfolio(
+    read(
         "Portfolio.GetHoldings",
-        "Return bounded current holdings under an exact revision.",
+        "Return a page of positions from the selected portfolio snapshot.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_HOLDINGS_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read_portfolio(
         "Portfolio.GetTransactions",

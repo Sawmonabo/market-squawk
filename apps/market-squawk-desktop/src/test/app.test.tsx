@@ -970,6 +970,23 @@ describe("Market Squawk desktop boundary", () => {
         reconciliation: { status: "clear", discrepancies: [] },
       },
     }
+    const holdingsPage = (next: boolean, name: string | null = next ? null : "Original investment") => ({
+      pageCursor: next ? "next-position-page" : "first-position-page",
+      nextCursor: next ? null : "next-position-page",
+      snapshotToken: cashReport.snapshotToken, effectiveAtUnixNanos: cashReport.effectiveAtUnixNanos,
+      availableAtUnixNanos: cashReport.availableAtUnixNanos,
+      holdings: [{
+        accountId: cashReport.accountId, snapshotToken: cashReport.snapshotToken,
+        instrumentId: next ? "22222222-2222-4222-8222-222222222222" : "11111111-1111-4111-8111-111111111111",
+        investment: { name, symbol: null }, currency: "USD", quantity: "1.000000000000000001", lotSize: "0.000000000000000001",
+        marketValue: { amount: "9007199254740993.01", currency: "USD" },
+        asOfUnixNanos: cashReport.effectiveAtUnixNanos, costBasis: { state: "not_available" },
+        price: { asOfUnixNanos: cashReport.effectiveAtUnixNanos, state: "reported", confidence: "limited", explanation: "Value recorded in this portfolio observation." },
+      }],
+    })
+    const holdingsReads: { account: string; cursor?: string }[] = []
+    let holdingsSignal: AbortSignal | undefined
+    let resolveHoldings: ((value: ApplicationResult) => void) | undefined
     const performanceReads: string[] = []
     let performanceSignal: AbortSignal | undefined
     let resolvePerformance: ((value: ApplicationResult) => void) | undefined
@@ -978,8 +995,16 @@ describe("Market Squawk desktop boundary", () => {
     let resolveFirst: ((value: ApplicationResult) => void) | undefined
     render(
       <MemoryRouter initialEntries={["/portfolio"]}>
-        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance"] }, undefined, async (request, options) => {
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings"] }, undefined, async (request, options) => {
           if (request.query === "portfolioAccounts") return result({ accounts, nextCursor: null }, 2)
+          if (request.query === "portfolioHoldings") {
+            holdingsReads.push({ account: request.accountToken, cursor: request.cursor })
+            if (request.accountToken === first) {
+              holdingsSignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolveHoldings = resolve })
+            }
+            return result(holdingsPage(request.cursor === "next-position-page"))
+          }
           if (request.query === "portfolioPerformance") {
             performanceReads.push(request.accountToken)
             if (request.accountToken === first) {
@@ -1006,6 +1031,9 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(await screen.findByRole("button", { name: /Portfolio 1/ }, { timeout: 5_000 }))
     expect(reads).toEqual([])
     expect(performanceReads).toEqual([])
+    expect(holdingsReads).toEqual([])
+    await user.click(screen.getByText("Positions"))
+    await waitFor(() => expect(holdingsReads).toEqual([{ account: first, cursor: undefined }]))
     await user.click(screen.getByText("Cash and performance"))
     await waitFor(() => expect(performanceReads).toEqual([first]))
     await user.click(screen.getByText("Risk and guidance"))
@@ -1013,6 +1041,7 @@ describe("Market Squawk desktop boundary", () => {
     await user.click(screen.getByRole("button", { name: /Portfolio 2/ }))
     await waitFor(() => expect(firstSignal?.aborted).toBe(true))
     expect(performanceSignal?.aborted).toBe(true)
+    expect(holdingsSignal?.aborted).toBe(true)
     await user.click(screen.getByText("Cash and performance"))
     expect(await screen.findByText("USD 9,007,199,254,740,993.01")).toBeTruthy()
     expect(screen.getByText("USD 7.50 · Partial")).toBeTruthy()
@@ -1034,6 +1063,24 @@ describe("Market Squawk desktop boundary", () => {
     expect(screen.queryByText("Portfolio 1 original risk guidance")).toBeNull()
     await user.click(screen.getByText("Risk and guidance"))
     await waitFor(() => expect(screen.queryByText("Portfolio 2 original risk guidance")).toBeNull())
+    await user.click(screen.getByText("Positions"))
+    expect(await screen.findByText("Original investment")).toBeTruthy()
+    expect(screen.getByText("1.000000000000000001")).toBeTruthy()
+    expect(screen.getByText("USD 9,007,199,254,740,993.01")).toBeTruthy()
+    expect(screen.getByText("Cost basis not available")).toBeTruthy()
+    resolveHoldings?.(result(holdingsPage(false, "Wrong account investment")))
+    const positions = within(screen.getByLabelText("Positions for Portfolio 2"))
+    await user.click(positions.getByRole("button", { name: "Next" }))
+    expect(await screen.findByText("Investment name unavailable")).toBeTruthy()
+    expect(screen.queryByText("Original investment")).toBeNull()
+    await user.click(positions.getByRole("button", { name: "Previous" }))
+    expect(await screen.findByText("Original investment")).toBeTruthy()
+    expect(holdingsReads.at(-1)).toEqual({ account: second, cursor: "first-position-page" })
+    expect(screen.queryByText("Wrong account investment")).toBeNull()
+    await user.click(positions.getByRole("button", { name: "Refresh positions" }))
+    await waitFor(() => expect(holdingsReads.at(-1)).toEqual({ account: second, cursor: undefined }))
+    await user.click(screen.getByText("Positions"))
+    await waitFor(() => expect(screen.queryByText("Original investment")).toBeNull())
   })
 
   it("keeps portfolio planning explicit and analysis-only", async () => {

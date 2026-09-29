@@ -1411,11 +1411,19 @@ async fn portfolio(
         PortfolioCommand::ImportFlow { command } => {
             return portfolio_import(authority, command).await;
         }
-        PortfolioCommand::Holdings { account } => (
-            "Portfolio.GetHoldings",
-            json_object(json!({"accountId": account}))?,
-            "portfolio holdings read",
-        ),
+        PortfolioCommand::Holdings {
+            account,
+            cursor,
+            limit,
+        } => {
+            let mut arguments = product_page_arguments(cursor, limit, 512)?;
+            arguments.insert("accountToken".to_owned(), json!(account));
+            (
+                "Portfolio.GetHoldings",
+                arguments,
+                "portfolio positions read",
+            )
+        }
         PortfolioCommand::Transactions { account } => (
             "Portfolio.GetTransactions",
             json_object(json!({"accountId": account}))?,

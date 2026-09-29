@@ -371,7 +371,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Portfolio.CommitRecommendationSetup" => recommendation_setup_receipt(),
         "Portfolio.ListAccounts" => cursor_page("accounts", portfolio_account()),
         "Portfolio.ListRevisions" => nullable_rows(portfolio_snapshot()),
-        "Portfolio.GetHoldings" => array(portfolio_holding()),
+        "Portfolio.GetHoldings" => portfolio_holdings_page(),
         "Portfolio.GetTransactions" => array(portfolio_transaction()),
         "Portfolio.GetPerformance" => portfolio_performance(),
         "Portfolio.GetExposure" => portfolio_exposure(),
@@ -6182,8 +6182,26 @@ fn portfolio_account() -> Value {
     ])
 }
 
+fn portfolio_holdings_page() -> Value {
+    closed_complete(vec![
+        ("holdings", array(portfolio_holding())),
+        ("pageCursor", bounded_text(512)),
+        ("nextCursor", nullable(bounded_text(512))),
+        ("snapshotToken", uuid()),
+        ("effectiveAtUnixNanos", text()),
+        ("availableAtUnixNanos", nullable(text())),
+    ])
+}
+
 fn portfolio_holding() -> Value {
     closed_complete(vec![
+        (
+            "investment",
+            closed_complete(vec![
+                ("name", nullable(text())),
+                ("symbol", nullable(text())),
+            ]),
+        ),
         ("accountId", text()),
         ("snapshotToken", uuid()),
         ("instrumentId", text()),

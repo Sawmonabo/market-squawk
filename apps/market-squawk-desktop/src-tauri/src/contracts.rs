@@ -481,7 +481,9 @@ pub(crate) enum DashboardQueryCommand {
         limit: Option<u16>,
     },
     PortfolioHoldings {
-        account_id: String,
+        account_token: String,
+        cursor: Option<String>,
+        limit: Option<u16>,
     },
     PortfolioTransactions {
         account_id: String,

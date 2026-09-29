@@ -224,24 +224,44 @@ async fn run_cli_vertical(product: &LocalProduct, scratch: &Path) -> Result<CliE
     .context("release portfolio import failed")?;
     let portfolio_import = imported
         .value()
-        .pointer("/data/accountId")
+        .pointer("/data/state")
         .and_then(Value::as_str)
-        == Some(ACCOUNT)
-        && imported
+        == Some("saved");
+    let accounts = execute_cli_command(
+        product,
+        Command::Portfolio {
+            command: PortfolioCommand::Accounts {
+                cursor: None,
+                limit: 25,
+            },
+        },
+    )
+    .await
+    .context("release portfolio directory read failed")?;
+    let account_rows = accounts
+        .value()
+        .pointer("/data/accounts")
+        .and_then(Value::as_array)
+        .context("release portfolio directory missing")?;
+    if account_rows.len() != 1
+        || !accounts
             .value()
-            .pointer("/data/rawEvidenceRetained")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && imported
-            .value()
-            .pointer("/data/reconciliationDiscrepancies")
-            .and_then(Value::as_u64)
-            == Some(0);
+            .pointer("/data/nextCursor")
+            .is_some_and(Value::is_null)
+    {
+        bail!("release fixture requires exactly its one explicitly imported portfolio");
+    }
+    let account_token = account_rows[0]
+        .get("accountToken")
+        .and_then(Value::as_str)
+        .context("release portfolio account token missing")?;
     let holdings = execute_cli_command(
         product,
         Command::Portfolio {
             command: PortfolioCommand::Holdings {
-                account: ACCOUNT.to_owned(),
+                account: account_token.to_owned(),
+                cursor: None,
+                limit: 25,
             },
         },
     )
@@ -261,9 +281,13 @@ async fn run_cli_vertical(product: &LocalProduct, scratch: &Path) -> Result<CliE
         &scratch.join("portfolio-request.json"),
         &json!({"accountId": ACCOUNT}),
     )?;
+    let selected_account_request = write_json(
+        &scratch.join("selected-portfolio-request.json"),
+        &json!({"accountToken": account_token}),
+    )?;
     let mut portfolio_analytics = holdings
         .value()
-        .pointer("/data")
+        .pointer("/data/holdings")
         .and_then(Value::as_array)
         .is_some_and(|rows| !rows.is_empty())
         && transactions
@@ -273,13 +297,13 @@ async fn run_cli_vertical(product: &LocalProduct, scratch: &Path) -> Result<CliE
             .is_some_and(|rows| !rows.is_empty());
     for command in [
         PortfolioCommand::Performance {
-            request: account_request.clone(),
+            request: selected_account_request.clone(),
         },
         PortfolioCommand::Exposure {
             request: account_request.clone(),
         },
         PortfolioCommand::Risk {
-            request: account_request.clone(),
+            request: selected_account_request,
         },
     ] {
         let result = execute_cli_command(product, Command::Portfolio { command })

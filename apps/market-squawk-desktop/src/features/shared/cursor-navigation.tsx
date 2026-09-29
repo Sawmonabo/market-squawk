@@ -14,9 +14,9 @@ export function useCursorNavigation() {
     page: position.prior.length + 1,
     canGoPrevious: position.prior.length > 0,
     isRepeated: (cursor: string) => cursor === position.after || position.prior.includes(cursor),
-    next: (cursor: string | null | undefined) => {
+    next: (cursor: string | null | undefined, currentPage?: string) => {
       if (cursor === null || cursor === undefined || cursor === position.after || position.prior.includes(cursor)) return
-      setPosition((current) => ({ after: cursor, prior: [...current.prior, current.after] }))
+      setPosition((current) => ({ after: cursor, prior: [...current.prior, currentPage ?? current.after] }))
     },
     previous: () => setPosition((current) => current.prior.length === 0 ? current : ({
       after: current.prior.at(-1), prior: current.prior.slice(0, -1),
@@ -25,8 +25,9 @@ export function useCursorNavigation() {
   }
 }
 
-export function CursorNavigation({ navigation, next, busy, error = false, onRestart, onNavigate }: {
+export function CursorNavigation({ navigation, current, next, busy, error = false, onRestart, onNavigate }: {
   navigation: ReturnType<typeof useCursorNavigation>
+  current?: string
   next: string | null | undefined
   busy: boolean
   error?: boolean
@@ -39,7 +40,7 @@ export function CursorNavigation({ navigation, next, busy, error = false, onRest
     <div className="flex gap-2">
       <Button size="sm" variant="outline" disabled={busy} onClick={() => { navigation.restart(); onNavigate?.(); onRestart?.() }}>Restart from first page</Button>
       <Button size="sm" variant="outline" disabled={busy || !navigation.canGoPrevious} onClick={() => { navigation.previous(); onNavigate?.() }}>Previous</Button>
-      <Button size="sm" variant="outline" disabled={busy || next === null || next === undefined || invalidNext} onClick={() => { navigation.next(next); onNavigate?.() }}>Next</Button>
+      <Button size="sm" variant="outline" disabled={busy || next === null || next === undefined || invalidNext} onClick={() => { navigation.next(next, current); onNavigate?.() }}>Next</Button>
     </div>
     {error ? <p role="alert" className="w-full text-xs text-destructive">This page could not be opened. Restart from the first page to read a fresh snapshot.</p> : null}
     {invalidNext ? <p role="alert" className="w-full text-xs text-destructive">The next page could not be opened. Restart from the first page to refresh these results.</p> : null}

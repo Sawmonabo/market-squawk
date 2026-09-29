@@ -116,7 +116,8 @@ path-free Parquet artifact reference with `artifactId`, `sha256`, `byteCount`, `
 | `portfolio import preview <path> --account <id> --confirm` | Review a selected file and its required interpretation choices. |
 | `portfolio import approve --review-token <token> --interpretations <path> --confirm` | Approve explicit interpretations from that review; returns an approval token. |
 | `portfolio import commit --approval-token <token> --confirm`; `portfolio import discard --review-token <token> --confirm` | Save the approved import, or discard an unsaved review. |
-| `portfolio holdings --account <id>`; `portfolio transactions --account <id>` | Bounded current holdings or normalized transactions. |
+| `portfolio holdings --account <token> [--cursor <cursor>] [--limit <count>]` | Exact positions from the selected saved snapshot, with reported prices, cost basis and available historical investment names. Get the token from `portfolio accounts`; continuation remains on the original snapshot, while a fresh request reads the current one. Default page size 25. |
+| `portfolio transactions --account <id>` | Bounded normalized transactions. |
 | `portfolio performance <request>`; `portfolio risk <request>` | Confined typed point-in-time request object using `accountToken` returned by `portfolio accounts`. Performance preserves optional instrument/time filters and returns exact cash, reported value, returns and reconciliation from one saved snapshot. |
 | `portfolio exposure <request>` | Confined typed point-in-time request object using `accountId`. |
 | `backtest run <request> --confirm`; `backtest show <run>` | CLI-owned governed-input registration followed by a bounded backtest request, or one result. |

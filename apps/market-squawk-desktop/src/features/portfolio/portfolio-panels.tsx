@@ -79,13 +79,16 @@ export function AllocationPanel({ holdings }: { holdings: PortfolioHolding[] }) 
     <section className="rounded-xl border border-border bg-card/35 p-5">
       <PanelHeading
         eyebrow="What you own"
-        title="Largest positions"
-        detail="Market value by named investment. Negative values represent short exposure."
+        title="Positions on this page"
+        detail="Reported market values for this page only, not the complete portfolio allocation. Negative values represent short exposure."
       />
       <div className="mt-4">
         <PortfolioChart
           data={holdings.map((holding) => ({
-            label: investmentDisplayName(holding.investment),
+            label: investmentDisplayName({
+              name: holding.investment.name ?? "Investment name unavailable",
+              symbol: holding.investment.symbol,
+            }),
             exactAmount: holding.marketValue.amount,
             currency: holding.marketValue.currency,
           }))}

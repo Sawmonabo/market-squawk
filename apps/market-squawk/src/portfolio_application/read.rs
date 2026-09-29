@@ -131,6 +131,18 @@ impl ReadScope {
     }
 }
 
+pub(super) fn check_context(
+    context: &RequestContext,
+) -> Result<(), PortfolioApplicationServiceError> {
+    if context.cancellation().is_cancelled() {
+        Err(PortfolioApplicationServiceError::Cancelled)
+    } else if std::time::Instant::now() >= context.deadline() {
+        Err(PortfolioApplicationServiceError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn call(
     image: &PortfolioReadImage,
     request: &TypedToolRequest,
@@ -152,7 +164,6 @@ pub(super) fn call(
     };
     let revision = select_revision(image, &scope)?;
     match request.name() {
-        "Portfolio.GetHoldings" => holdings(revision, &scope, context),
         "Portfolio.GetTransactions" => transactions(revision, &scope, context),
         "Portfolio.GetPerformance" => analytics::performance(image, revision, &scope, context),
         "Portfolio.GetExposure" => analytics::exposure(revision, &scope, context),
@@ -235,12 +246,7 @@ fn list_accounts(
         .range((start, Unbounded))
         .take(limit.saturating_add(1))
     {
-        if context.cancellation().is_cancelled() {
-            return Err(PortfolioApplicationServiceError::Cancelled);
-        }
-        if std::time::Instant::now() >= context.deadline() {
-            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
-        }
+        check_context(context)?;
         let ordinal = image
             .account_ordinals
             .binary_search_by_key(account_id, |(id, _)| *id)
@@ -471,33 +477,6 @@ pub(super) fn select_revision<'image>(
     Ok(revision)
 }
 
-fn holdings(
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let rows = revision
-        .holdings
-        .iter()
-        .filter(|holding| scope.admits_instrument(holding.instrument_id()))
-        .map(|holding| {
-            Ok(json!({
-                "accountId": holding.account_id().to_string(),
-                "snapshotToken": snapshot_token(revision),
-                "instrumentId": holding.instrument_id().to_string(),
-                "currency": holding.currency().as_str(),
-                "quantity": holding.quantity().to_string(),
-                "lotSize": holding.lot_size().as_decimal().to_string(),
-                "marketValue": money_value(holding.market_value()),
-                "asOfUnixNanos": holding.as_of().unix_nanos().to_string(),
-                "costBasis": basis_value(holding.basis()),
-                "price": source_mark_details(holding.as_of().unix_nanos().to_string()),
-            }))
-        })
-        .collect::<Result<Vec<_>, PortfolioApplicationServiceError>>()?;
-    bounded_rows(rows, revision, scope, context)
-}
-
 fn transactions(
     revision: &PublishedRevision,
     scope: &ReadScope,
@@ -643,7 +622,7 @@ fn data_result(
         .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)
 }
 
-fn narrowed_limits(
+pub(super) fn narrowed_limits(
     context: &RequestContext,
     maximum_items: usize,
     maximum_bytes: usize,
@@ -732,7 +711,7 @@ fn transaction_token(transaction: &PortfolioTransaction) -> String {
     .to_string()
 }
 
-fn basis_value(basis: &BasisResolution) -> Value {
+pub(super) fn basis_value(basis: &BasisResolution) -> Value {
     match basis {
         BasisResolution::Resolved { observation } => json!({
             "state": "available",
@@ -770,7 +749,7 @@ const fn transaction_kind(kind: TransactionKind) -> &'static str {
     }
 }
 
-fn money_value(value: Money) -> Value {
+pub(super) fn money_value(value: Money) -> Value {
     json!({
         "amount": value.amount().to_string(),
         "currency": value.currency().as_str(),

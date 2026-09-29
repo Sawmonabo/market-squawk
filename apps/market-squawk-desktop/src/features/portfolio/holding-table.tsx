@@ -1,58 +1,21 @@
-import * as React from "react"
 import type { ColumnDef } from "@tanstack/react-table"
-import { Search } from "lucide-react"
 
 import { DataTable } from "@/components/tables/data-table"
-import { Input } from "@/components/ui/input"
-import { formatMoney } from "@/lib/formatters"
+import { formatMoney, groupDecimal } from "@/lib/formatters"
+import { formatUnixNanos } from "../opportunities/format"
 
 import type { PortfolioHolding } from "./portfolio-contracts"
-import { formatProductTime, investmentDisplayName } from "./portfolio-format"
 
 export function HoldingTable({ holdings }: { holdings: PortfolioHolding[] }) {
-  const [filter, setFilter] = React.useState("")
-  const normalized = filter.trim().toLocaleLowerCase()
-  const visible = normalized
-    ? holdings.filter((holding) =>
-        [
-          holding.investment.name,
-          holding.investment.symbol ?? "",
-          holding.investment.typeLabel,
-          holding.marketValue.currency,
-          holding.costBasis.state === "available"
-            ? holding.costBasis.methodLabel
-            : holding.costBasis.explanation,
-        ].some((value) => value.toLocaleLowerCase().includes(normalized)),
-      )
-    : holdings
-
   return (
-    <div>
-      <div className="relative mb-3 max-w-sm">
-        <Search
-          className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
-          aria-hidden="true"
-        />
-        <Input
-          value={filter}
-          onChange={(event) => setFilter(event.target.value)}
-          placeholder="Find an investment or currency"
-          aria-label="Filter portfolio positions"
-          className="pl-9"
-        />
-      </div>
-      <DataTable
-        ariaLabel="Portfolio positions"
-        columns={holdingColumns}
-        data={visible}
-        getRowId={(holding) => holding.positionActionToken}
-        emptyMessage={
-          holdings.length === 0
-            ? "This portfolio has no positions."
-            : "No position matches this filter."
-        }
-      />
-    </div>
+    <DataTable
+      ariaLabel="Portfolio positions"
+      columns={holdingColumns}
+      data={holdings}
+      getRowId={(holding) => holding.instrumentId}
+      pageSize={Math.max(holdings.length, 1)}
+      emptyMessage="This portfolio observation has no positions."
+    />
   )
 }
 
@@ -60,14 +23,20 @@ const holdingColumns: ColumnDef<PortfolioHolding, unknown>[] = [
   {
     id: "investment",
     header: "Investment",
-    cell: ({ row }) => (
-      <div className="min-w-44">
-        <p className="font-medium">{investmentDisplayName(row.original.investment)}</p>
-        <p className="mt-1 text-[10px] text-muted-foreground">
-          {row.original.investment.typeLabel}
-        </p>
-      </div>
-    ),
+    cell: ({ row }) => {
+      const { investment, asOfUnixNanos } = row.original
+      return (
+        <div className="min-w-44">
+          <p className="font-medium">
+            {investment.name ?? "Investment name unavailable"}
+            {investment.symbol ? ` (${investment.symbol})` : ""}
+          </p>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Recorded {formatUnixNanos(asOfUnixNanos)}
+          </p>
+        </div>
+      )
+    },
   },
   {
     id: "price",
@@ -87,12 +56,17 @@ const holdingColumns: ColumnDef<PortfolioHolding, unknown>[] = [
     accessorFn: (holding) => holding.quantity,
     header: "Quantity",
     enableSorting: false,
-    meta: { className: "font-mono tabular-nums" },
-    cell: ({ row }) => row.original.quantityLabel,
+    cell: ({ row }) => (
+      <div>
+        <p className="font-mono tabular-nums">{groupDecimal(row.original.quantity)}</p>
+        <p className="mt-1 text-[10px] text-muted-foreground">
+          Lot size {groupDecimal(row.original.lotSize)}
+        </p>
+      </div>
+    ),
   },
   {
     id: "basis",
-    accessorFn: (holding) => holding.costBasis.state,
     header: "Cost basis",
     cell: ({ row }) => <BasisValue holding={row.original} />,
   },
@@ -100,26 +74,30 @@ const holdingColumns: ColumnDef<PortfolioHolding, unknown>[] = [
 
 function PriceSummary({ holding }: { holding: PortfolioHolding }) {
   const price = holding.price
+  const label = price.state === "reported" ? "Reported portfolio value"
+    : price.state === "current" ? "Current market price"
+      : price.state === "stale" ? "Stale price" : "Price unavailable"
+  const confidence = price.confidence === "limited" ? "Limited"
+    : price.confidence === "moderate" ? "Moderate" : "Strong"
   return (
     <div className="max-w-64 text-xs">
-      <p>{price.label}</p>
+      <p>{label}</p>
       <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-        {price.updatedAt ? `Updated ${formatProductTime(price.updatedAt)}. ` : ""}
-        {price.explanation}
+        As of {formatUnixNanos(price.asOfUnixNanos)} · {confidence} confidence
       </p>
+      <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{price.explanation}</p>
     </div>
   )
 }
 
 function BasisValue({ holding }: { holding: PortfolioHolding }) {
-  switch (holding.costBasis.state) {
+  const basis = holding.costBasis
+  switch (basis.state) {
     case "available":
       return (
         <div>
-          <p className="font-mono tabular-nums">{formatMoney(holding.costBasis.amount)}</p>
-          <p className="mt-1 text-[10px] text-muted-foreground">
-            {holding.costBasis.methodLabel}
-          </p>
+          <p className="font-mono tabular-nums">{formatMoney(basis.amount)}</p>
+          <p className="mt-1 text-[10px] text-muted-foreground">{basis.method}</p>
         </div>
       )
     case "needs_review":
@@ -127,25 +105,18 @@ function BasisValue({ holding }: { holding: PortfolioHolding }) {
         <div className="max-w-64">
           <p className="text-amber-300">Review needed</p>
           <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-            {holding.costBasis.explanation}
+            {basis.method} · Conflicting reported amounts; no cost basis has been selected.
           </p>
-          {holding.costBasis.choices.length > 0 ? (
-            <ul className="mt-2 space-y-1 text-[10px] text-muted-foreground">
-              {holding.costBasis.choices.map((choice) => (
-                <li key={choice.choiceToken}>
-                  {choice.label}
-                  {choice.amount ? ` · ${formatMoney(choice.amount)}` : ""}
-                </li>
-              ))}
-            </ul>
-          ) : null}
+          <ul className="mt-2 space-y-1 text-[10px] text-muted-foreground">
+            {basis.choices.map((choice, index) => (
+              <li key={`${choice.currency}:${choice.amount}:${index}`} className="font-mono tabular-nums">
+                {formatMoney(choice)}
+              </li>
+            ))}
+          </ul>
         </div>
       )
     case "not_available":
-      return (
-        <span className="max-w-64 text-xs text-muted-foreground">
-          {holding.costBasis.explanation}
-        </span>
-      )
+      return <span className="text-xs text-muted-foreground">Cost basis not available</span>
   }
 }

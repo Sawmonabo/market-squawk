@@ -102,9 +102,9 @@ export type ProductQuery =
       limit?: number
     }
   | { query: "portfolioAccounts"; cursor?: string; limit?: number }
+  | { query: "portfolioHoldings"; accountToken: string; cursor?: string; limit?: number }
   | {
       query:
-        | "portfolioHoldings"
         | "portfolioTransactions"
         | "portfolioExposure"
       accountId: string

@@ -5,7 +5,9 @@ mod advanced;
 mod analytics;
 mod backup;
 mod candidate;
+mod holdings;
 mod import;
+mod instrument_display;
 mod model;
 mod paper;
 mod product;
@@ -68,6 +70,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use market_squawk_data::MarketDataInstrumentReadCapability;
 use market_squawk_domain::{AccountId, Money};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
 use market_squawk_portfolio::PortfolioRevision;
@@ -256,6 +259,7 @@ impl PortfolioApplicationService {
                 limits,
                 authority: std::sync::Mutex::new(authority),
                 image: ArcSwap::from(Arc::new(image)),
+                instruments: OnceLock::new(),
                 candidate_resolution: OnceLock::new(),
                 accepting: AtomicBool::new(true),
                 cancellation: CancellationToken::new(),
@@ -270,6 +274,17 @@ impl PortfolioApplicationService {
         PortfolioBackupAuthority {
             runtime: Arc::clone(&self.runtime),
         }
+    }
+
+    /// Shares the canonical catalog reader for historical position names without mutation authority.
+    pub(crate) fn register_instrument_reader(
+        &self,
+        instruments: MarketDataInstrumentReadCapability,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        self.runtime
+            .instruments
+            .set(instruments)
+            .map_err(|_| PortfolioApplicationServiceError::Authority)
     }
 
     /// Maximum verified bytes the staged-input boundary may transfer to this authority.
@@ -626,6 +641,7 @@ struct Runtime {
     limits: PortfolioApplicationLimits,
     authority: std::sync::Mutex<ImportAuthority>,
     image: ArcSwap<PortfolioReadImage>,
+    instruments: OnceLock<MarketDataInstrumentReadCapability>,
     candidate_resolution: OnceLock<Arc<dyn PortfolioCandidateResolutionAuthority>>,
     accepting: AtomicBool,
     cancellation: CancellationToken,
@@ -726,6 +742,25 @@ impl ApplicationDomainService for PortfolioApplicationService {
             )
             .await
             .map_err(|error| error.as_service_error());
+        }
+        if request.name() == "Portfolio.GetHoldings" {
+            let runtime = Arc::clone(&self.runtime);
+            return tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                ensure_live(&runtime, &context)?;
+                let result = holdings::call(
+                    &runtime.image.load(),
+                    &request,
+                    &context,
+                    runtime.limits,
+                    runtime.instruments.get(),
+                )?;
+                ensure_live(&runtime, &context)?;
+                Ok(result)
+            })
+            .await
+            .map_err(|_| ServiceError::Internal)?
+            .map_err(|error: PortfolioApplicationServiceError| error.as_service_error());
         }
         let _guard = guard;
         read::call(

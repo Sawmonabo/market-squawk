@@ -8,6 +8,7 @@ const productNameSchema = z.string().trim().min(1).max(160)
 const productSymbolSchema = z.string().trim().min(1).max(32)
 const currencySchema = z.string().regex(/^[A-Z]{3}$/)
 const productTimeSchema = z.string().datetime({ offset: true })
+const unixNanosSchema = z.string().regex(/^-?\d+$/)
 
 export const portfolioActionTokenSchema = z
   .string()
@@ -76,57 +77,60 @@ export function parsePortfolioAccountPage(result: ApplicationResult) {
   return page
 }
 
-const costBasisChoiceSchema = z
-  .object({
-    choiceToken: portfolioActionTokenSchema,
-    label: productNameSchema,
-    amount: moneySchema.nullable(),
-    explanation: productTextSchema,
-  })
-  .strict()
-
+const lotMethodSchema = z.enum([
+  "First in, first out", "Last in, first out", "Average cost", "Specific lots",
+])
 const costBasisSchema = z.discriminatedUnion("state", [
-  z
-    .object({
-      state: z.literal("available"),
-      amount: moneySchema,
-      methodLabel: productNameSchema,
-    })
-    .strict(),
-  z
-    .object({
-      state: z.literal("not_available"),
-      explanation: productTextSchema,
-    })
-    .strict(),
-  z
-    .object({
-      state: z.literal("needs_review"),
-      explanation: productTextSchema,
-      choices: z.array(costBasisChoiceSchema).max(24),
-    })
-    .strict(),
+  z.strictObject({ state: z.literal("available"), amount: moneySchema, method: lotMethodSchema }),
+  z.strictObject({ state: z.literal("not_available") }),
+  z.strictObject({ state: z.literal("needs_review"), choices: z.array(moneySchema), method: lotMethodSchema }),
 ])
 
-const priceSummarySchema = z
-  .object({
-    updatedAt: productTimeSchema.nullable(),
-    label: productNameSchema,
-    explanation: productTextSchema,
-  })
-  .strict()
+export const holdingSchema = z.strictObject({
+  accountId: z.string().min(1),
+  snapshotToken: z.string().uuid(),
+  instrumentId: z.string().min(1),
+  currency: currencySchema,
+  quantity: exactDecimalSchema,
+  lotSize: exactDecimalSchema,
+  marketValue: moneySchema,
+  asOfUnixNanos: unixNanosSchema,
+  costBasis: costBasisSchema,
+  price: z.strictObject({
+    asOfUnixNanos: unixNanosSchema,
+    state: z.enum(["reported", "current", "stale", "not_available"]),
+    confidence: z.enum(["limited", "moderate", "strong"]),
+    explanation: z.string(),
+  }),
+  investment: z.strictObject({ name: z.string().nullable(), symbol: z.string().nullable() }),
+})
 
-export const holdingSchema = z
-  .object({
-    positionActionToken: portfolioActionTokenSchema,
-    investment: investmentDisplaySchema,
-    quantity: exactDecimalSchema,
-    quantityLabel: productNameSchema,
-    marketValue: moneySchema,
-    price: priceSummarySchema,
-    costBasis: costBasisSchema,
-  })
-  .strict()
+export const portfolioHoldingsPageSchema = z.strictObject({
+  holdings: z.array(holdingSchema),
+  pageCursor: z.string().min(1).max(512),
+  nextCursor: z.string().min(1).max(512).nullable(),
+  snapshotToken: z.string().uuid(),
+  effectiveAtUnixNanos: unixNanosSchema,
+  availableAtUnixNanos: unixNanosSchema.nullable(),
+}).superRefine((page, context) => {
+  const instruments = new Set<string>()
+  for (const holding of page.holdings) {
+    if (holding.snapshotToken !== page.snapshotToken
+      || holding.marketValue.currency !== holding.currency
+      || instruments.has(holding.instrumentId)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Position evidence is inconsistent." })
+    }
+    instruments.add(holding.instrumentId)
+  }
+})
+
+export function parsePortfolioHoldings(result: ApplicationResult): PortfolioHoldingsPage {
+  const page = parsePortfolioResult(result, portfolioHoldingsPageSchema)
+  if (result.metadata.returnedItems !== page.holdings.length) {
+    throw new Error("Position counts are inconsistent.")
+  }
+  return page
+}
 
 export const portfolioTransactionSchema = z
   .object({
@@ -170,7 +174,6 @@ export const portfolioAttributionSchema = z
 
 // The performance read uses the canonical Portfolio.GetPerformance projection.
 // Keep its exact monetary values and optional history evidence intact.
-const unixNanosSchema = z.string().regex(/^-?\d+$/)
 const measuredAccountingSchema = z.strictObject({
   status: z.enum(["available", "partial", "not_available"]),
   amount: moneySchema.optional(),
@@ -366,6 +369,7 @@ const portfolioImportCommitSchema = z
 
 export type PortfolioAccount = z.infer<typeof portfolioAccountSchema>
 export type PortfolioHolding = z.infer<typeof holdingSchema>
+export type PortfolioHoldingsPage = z.infer<typeof portfolioHoldingsPageSchema>
 export type PortfolioTransaction = z.infer<typeof portfolioTransactionSchema>
 export type PortfolioRevisionChoice = z.infer<typeof portfolioRevisionChoiceSchema>
 export type PortfolioPerformance = z.infer<typeof performanceSchema>

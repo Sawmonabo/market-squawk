@@ -858,11 +858,17 @@ pub enum PortfolioCommand {
         #[arg(long)]
         confirm: bool,
     },
-    /// Report current holdings.
+    /// Report a page of positions from one portfolio snapshot.
     Holdings {
-        /// Exact account identity.
+        /// Opaque account token returned by portfolio accounts.
         #[arg(long)]
         account: String,
+        /// Continue the exact saved snapshot from a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Positions per page.
+        #[arg(long, default_value_t = 25)]
+        limit: u16,
     },
     /// Report normalized transactions.
     Transactions {

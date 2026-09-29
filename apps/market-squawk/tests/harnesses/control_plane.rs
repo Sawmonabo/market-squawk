@@ -126,30 +126,6 @@ mod portfolio_application {
             )
             .await
             .map_err(|error| format!("first import: {error}"))?;
-        let holdings = service
-            .call(
-                admitted(
-                    "Portfolio.GetHoldings",
-                    json!({
-                        "accountId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                        "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
-                    }),
-                )?,
-                context(2)?,
-            )
-            .await
-            .map_err(|error| format!("holdings: {error}"))?;
-
-        assert_eq!(imported.structured_content()["state"], "saved");
-        let holding = holdings
-            .structured_content()
-            .as_array()
-            .and_then(|rows| rows.first())
-            .ok_or("published holding is missing")?;
-        let snapshot = holding["snapshotToken"]
-            .as_str()
-            .ok_or("snapshot is missing")?;
-        uuid::Uuid::parse_str(snapshot)?;
         let accounts = service
             .call(
                 admitted(
@@ -165,6 +141,43 @@ mod portfolio_application {
         let token = accounts.structured_content()["accounts"][0]["accountToken"]
             .as_str()
             .ok_or("account token is missing")?;
+        let holdings = service
+            .call(
+                admitted(
+                    "Portfolio.GetHoldings",
+                    json!({
+                        "accountToken": token, "limit": 1,
+                        "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}
+                    }),
+                )?,
+                context(2)?,
+            )
+            .await
+            .map_err(|error| format!("holdings: {error}"))?;
+
+        assert_eq!(imported.structured_content()["state"], "saved");
+        let holding = holdings.structured_content()["holdings"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or("published holding is missing")?;
+        let snapshot = holding["snapshotToken"]
+            .as_str()
+            .ok_or("snapshot is missing")?;
+        uuid::Uuid::parse_str(snapshot)?;
+        let first_page_arguments = json!({"accountToken": token,
+            "cursor": holdings.structured_content()["pageCursor"], "limit": 1,
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}});
+        let continuation = holdings.structured_content()["nextCursor"]
+            .as_str()
+            .ok_or("holdings continuation missing")?
+            .to_owned();
+        holdings.validate_for(
+            application_capabilities()?
+                .find("Portfolio.GetHoldings")
+                .ok_or("holdings descriptor missing")?,
+        )?;
+        assert_eq!(holding["quantity"], "2");
+        assert_eq!(holding["investment"], json!({"name": null, "symbol": null}));
         let arguments = json!({
             "accountToken": token,
             "instrumentIds": ["11111111-1111-4111-8111-111111111111"],
@@ -195,11 +208,11 @@ mod portfolio_application {
         );
         assert_eq!(
             report["accountingEvidence"]["reportedMarketValue"]["amount"],
-            "50"
+            "75"
         );
         assert_eq!(
             report["accountingEvidence"]["unrealizedGain"]["amount"]["amount"],
-            "10"
+            "35"
         );
         assert_eq!(
             report["accountingEvidence"]["realizedGain"]["status"],
@@ -249,6 +262,44 @@ mod portfolio_application {
             )
             .await
             .map_err(|error| format!("second import: {error}"))?;
+        let continuation_arguments = json!({"accountToken": token, "cursor": continuation, "limit": 1,
+            "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}});
+        let next_holdings = service
+            .call(
+                admitted("Portfolio.GetHoldings", continuation_arguments.clone())?,
+                context(11)?,
+            )
+            .await?;
+        assert_eq!(
+            next_holdings.structured_content()["snapshotToken"],
+            snapshot
+        );
+        assert_eq!(
+            next_holdings.structured_content()["holdings"][0]["marketValue"]["amount"],
+            "25"
+        );
+        assert!(next_holdings.structured_content()["nextCursor"].is_null());
+        let first_page_again = service
+            .call(
+                admitted("Portfolio.GetHoldings", first_page_arguments.clone())?,
+                context(14)?,
+            )
+            .await?;
+        assert_eq!(
+            first_page_again.structured_content(),
+            holdings.structured_content()
+        );
+        let mut wrong_scope = continuation_arguments.clone();
+        wrong_scope["instrumentIds"] = json!(["11111111-1111-4111-8111-111111111111"]);
+        assert!(
+            service
+                .call(
+                    admitted("Portfolio.GetHoldings", wrong_scope)?,
+                    context(12)?
+                )
+                .await
+                .is_err()
+        );
         let updated = service
             .call(
                 admitted("Portfolio.GetPerformance", arguments.clone())?,
@@ -319,6 +370,28 @@ mod portfolio_application {
                 .ok_or("performance descriptor missing")?,
         )?;
         assert_eq!(retained.structured_content(), &expected);
+        let retained_holdings = reopened
+            .call(
+                admitted("Portfolio.GetHoldings", continuation_arguments)?,
+                context(13)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_holdings.structured_content(),
+            next_holdings.structured_content()
+        );
+
+        let retained_first_page = reopened
+            .call(
+                admitted("Portfolio.GetHoldings", first_page_arguments)?,
+                context(15)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_first_page.structured_content(),
+            holdings.structured_content()
+        );
+
         Ok(())
     }
 
@@ -382,6 +455,10 @@ mod portfolio_application {
             record(
                 "holding",
                 json!({"kind": "holding", "account_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instrument_id": "11111111-1111-4111-8111-111111111111", "currency": "USD", "quantity": "2", "lot_size": "1", "market_value": market_value, "as_of_unix_nanos": at.to_string(), "cost_basis": {"status": "resolved", "amount": "40", "lot_method": "fifo"}}),
+            )?,
+            record(
+                "second-holding",
+                json!({"kind": "holding", "account_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instrument_id": "22222222-2222-4222-8222-222222222222", "currency": "USD", "quantity": "1.000000000000000001", "lot_size": "0.000000000000000001", "market_value": (25 * revision).to_string(), "as_of_unix_nanos": at.to_string(), "cost_basis": {"status": "resolved", "amount": "0", "lot_method": "fifo"}}),
             )?,
         ];
         let object_bytes = payloads.concat();
