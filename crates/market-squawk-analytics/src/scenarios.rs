@@ -1,5 +1,7 @@
 //! Exact portfolio exposure, attribution, and composable scenario-stress kernels.
 
+use std::collections::BTreeMap;
+
 use market_squawk_domain::{Currency, Money};
 use rust_decimal::Decimal;
 
@@ -106,7 +108,7 @@ impl ScenarioShock {
     ///
     /// # Errors
     ///
-    /// Rejects an invalid dimension identifier.
+    /// Rejects an invalid dimension identifier or a price change below -100%.
     pub fn try_new(dimension: &str, return_shock: ExactRate) -> Result<Self, AnalyticsError> {
         validate_identifier(dimension)?;
         if return_shock.value() < -Decimal::ONE {
@@ -253,8 +255,8 @@ pub fn portfolio_attribution(
 ///
 /// # Errors
 ///
-/// Rejects empty/excessive allocations, excessive shocks, mixed currencies, unmapped shocks, or
-/// unrepresentable exact composition/money arithmetic.
+/// Rejects empty/excessive allocations, excessive shocks, mixed currencies, unmapped shocks,
+/// a composed price change below -100%, or unrepresentable exact composition/money arithmetic.
 pub fn scenario_impact(
     allocations: &[PortfolioAllocation],
     shocks: &[ScenarioShock],
@@ -265,23 +267,29 @@ pub fn scenario_impact(
         return Err(AnalyticsError::ObservationLimitExceeded);
     }
     let (currency, basis) = common_measurement(allocations)?;
-    if shocks.iter().any(|shock| {
-        !allocations
-            .iter()
-            .any(|allocation| allocation.dimension == shock.dimension)
-    }) {
-        return Err(AnalyticsError::UnknownShockDimension);
+    let mut by_dimension = BTreeMap::<&str, Vec<Decimal>>::new();
+    for allocation in allocations {
+        by_dimension.entry(&allocation.dimension).or_default();
     }
+    for shock in shocks {
+        by_dimension
+            .get_mut(shock.dimension.as_str())
+            .ok_or(AnalyticsError::UnknownShockDimension)?
+            .push(shock.return_shock.value());
+    }
+    let rates = by_dimension
+        .into_iter()
+        .map(|(dimension, values)| {
+            compose_shocks(values.into_iter(), composition, currency).map(|rate| (dimension, rate))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let contributions = allocations
         .iter()
         .map(|allocation| {
-            let rate = compose_shocks(
-                shocks
-                    .iter()
-                    .filter(|shock| shock.dimension == allocation.dimension)
-                    .map(|shock| shock.return_shock.value()),
-                composition,
-            )?;
+            let rate = rates
+                .get(allocation.dimension.as_str())
+                .copied()
+                .ok_or(AnalyticsError::UnknownShockDimension)?;
             allocation
                 .market_value
                 .money()
@@ -334,24 +342,32 @@ fn attribution_from_contributions(
 fn compose_shocks(
     mut shocks: impl Iterator<Item = Decimal>,
     composition: ShockComposition,
+    currency: Currency,
 ) -> Result<Decimal, AnalyticsError> {
-    match composition {
+    // Apply the shocks to a one-unit reference price so composition reuses Money's exact
+    // operators. Decimal's checked operators alone permit precision loss and underflow.
+    let unit_price = Money::new(Decimal::ONE, currency);
+    let rate = match composition {
         ShockComposition::Additive => shocks
-            .try_fold(Decimal::ZERO, |total, shock| {
+            .try_fold(Money::new(Decimal::ZERO, currency), |total, shock| {
                 total
-                    .checked_add(shock)
-                    .ok_or(AnalyticsError::DecimalArithmetic)
+                    .checked_add(Money::new(shock, currency))
+                    .map_err(|_| AnalyticsError::DecimalArithmetic)
             })
-            .map(|value| value.normalize()),
+            .map(|value| value.amount()),
         ShockComposition::Compounded => shocks
-            .try_fold(Decimal::ONE, |factor, shock| {
-                Decimal::ONE
-                    .checked_add(shock)
-                    .and_then(|shock_factor| factor.checked_mul(shock_factor))
-                    .ok_or(AnalyticsError::DecimalArithmetic)
+            .try_fold(unit_price, |price, shock| {
+                unit_price
+                    .checked_add(Money::new(shock, currency))
+                    .and_then(|shock_price| price.checked_mul_decimal(shock_price.amount()))
+                    .map_err(|_| AnalyticsError::DecimalArithmetic)
             })?
-            .checked_sub(Decimal::ONE)
-            .map(|value| value.normalize())
-            .ok_or(AnalyticsError::DecimalArithmetic),
+            .checked_sub(unit_price)
+            .map(|value| value.amount())
+            .map_err(|_| AnalyticsError::DecimalArithmetic),
+    }?;
+    if rate < -Decimal::ONE {
+        return Err(AnalyticsError::ReturnBelowFloor);
     }
+    Ok(rate)
 }

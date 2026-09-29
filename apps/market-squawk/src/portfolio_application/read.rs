@@ -7,6 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use market_squawk_adapter_portfolio::{LotMethod, TransactionKind};
+use market_squawk_data::MarketDataInstrumentReadCapability;
 use market_squawk_domain::{AccountId, InstrumentId, Money, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
@@ -148,25 +149,43 @@ pub(super) fn call(
     request: &TypedToolRequest,
     context: &RequestContext,
     limits: PortfolioApplicationLimits,
+    instruments: Option<&MarketDataInstrumentReadCapability>,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     if request.name() == "Portfolio.ListAccounts" {
         return list_accounts(image, request, context, limits);
     }
     let scope = if matches!(
         request.name(),
-        "Portfolio.GetPerformance" | "Portfolio.GetRisk"
+        "Portfolio.GetPerformance"
+            | "Portfolio.GetRisk"
+            | "Portfolio.EvaluateScenario"
+            | "Portfolio.EvaluateScenarioBatch"
     ) {
         ReadScope::from_product_request(image, request, limits)?
     } else {
         ReadScope::from_request(request, limits)?
     };
-    let revision = select_revision(image, &scope)?;
+    let revision = if matches!(
+        request.name(),
+        "Portfolio.EvaluateScenario" | "Portfolio.EvaluateScenarioBatch"
+    ) {
+        let token = request
+            .arguments()
+            .get("snapshotToken")
+            .and_then(Value::as_str)
+            .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+        super::snapshot_page::selected_revision(image, &scope, token, context)?
+    } else {
+        select_revision(image, &scope)?
+    };
     match request.name() {
         "Portfolio.GetPerformance" => analytics::performance(image, revision, &scope, context),
         "Portfolio.GetRisk" => analytics::risk(image, revision, &scope, context),
         "Portfolio.EvaluateScenario"
         | "Portfolio.EvaluateScenarioBatch"
-        | "Portfolio.ProposeRebalance" => super::advanced::call(revision, &scope, request, context),
+        | "Portfolio.ProposeRebalance" => {
+            super::advanced::call(revision, &scope, request, context, instruments)
+        }
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
 }

@@ -1435,6 +1435,16 @@ async fn portfolio(
             arguments.insert("accountToken".to_owned(), json!(account));
             (page_operation, arguments, "portfolio observation page read")
         }
+        PortfolioCommand::Scenario { request } => (
+            "Portfolio.EvaluateScenario",
+            read_json_object(&request)?,
+            "hypothetical portfolio change calculated",
+        ),
+        PortfolioCommand::ScenarioBatch { request } => (
+            "Portfolio.EvaluateScenarioBatch",
+            read_json_object(&request)?,
+            "hypothetical portfolio changes compared",
+        ),
         PortfolioCommand::Performance { request } => (
             "Portfolio.GetPerformance",
             read_json_object(&request)?,

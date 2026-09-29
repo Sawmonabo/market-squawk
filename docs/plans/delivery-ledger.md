@@ -1,5 +1,58 @@
 # Market Squawk Delivery Ledger
 
+## Integrated stress-scenario calculation — 2026-09-29
+
+Acceptance 4/5/6, refreshed at `005037da`: stress UI is an unconditional prepared-choice
+placeholder; existing exact calculation selects latest account state and can compose additive
+price shocks below -100%. Replace the active path in place, not a preset registry or second engine.
+
+| Owner | Exclusive files | Dependency and completion evidence |
+| --- | --- | --- |
+| Astra High financial | `apps/market-squawk/src/portfolio_application/advanced.rs`, `advanced/scenario.rs`; `crates/market-squawk-analytics/src/scenarios.rs`, existing `tests/golden.rs` | Frozen selected-snapshot input below. Correct composed price floor; calculate only explicitly affected holdings with cancellation, preserve submitted assumptions and historical display. Extend existing exact scenario critical case. No builds or Git. |
+| Sol High Desktop | Desktop `src/features/portfolio/portfolio-scenarios.tsx`, `portfolio-contracts.ts`, `use-portfolio.ts`, `portfolio-page.tsx` | Frozen response below. Demand-loaded paged position selector, explicit single/batch assumptions and calculation, cancellation and selection invalidation. Replace obsolete stress choices in place. No financial arithmetic, builds or Git. |
+| Lead | Shared Rust operation/output contracts, read/snapshot selection and service composition; TS/native transport; CLI adapter/docs; existing control-plane/Desktop critical journey; ledger/PR/Git | Pin opaque account plus snapshot; integrate all consumers, inspect handoffs, serialize one-job Rust checks, typecheck and existing critical UI/service/math cases, then commit and push. |
+
+Contract: EvaluateScenario/Batch take `accountToken`, `snapshotToken` and `scenario`/`scenarios`.
+Each scenario has `id`, explicit `composition` (additive/compounded), and `shocks` containing
+`instrumentId` plus exact string `percentChange` (e.g. `-10`). Backend alone converts percent to
+rate. Results retain report clocks/confidence/snapshot, submitted shocks, affected contributions
+with `instrumentId`, nullable `investment:{name,symbol}`, money `amount`, and money `total`.
+Unshocked positions and cash are unchanged; results are hypothetical position-value changes,
+not forecasts, probabilities, trades or saved scenario records. No scenario or shock defaults.
+Single and batch use the same admission/calculation. Work is request-sized rather than rejecting
+large portfolios through the existing arbitrary allocation-times-shock budget.
+
+DAG: frozen contracts → disjoint financial/UI implementation → lead producer/consumer integration
+→ critical checks → pushed checkpoint and ownership release. Native live stock remains pending
+owner unlock/setup; independently useful work continues. No full CI, release gate or RAM measurement.
+
+Financial and Desktop handoffs are complete and inspected; their ownership is released to the
+lead for final integration. Exact affected-holding calculation replaces whole-portfolio materialization
+and the arbitrary allocation-times-shock cap. Repeated shocks are grouped by investment and
+composed with the existing exact money operators; a negative terminal price or precision loss is
+rejected as an invalid calculation, not clamped into a plausible result. Submitted names/percentages
+are retained without the old generic report string rewriting. The same selected-snapshot request
+runs through Desktop, CLI and shared MCP descriptors. Historical display uses original clocks.
+
+The Desktop stress panel loads only on expansion, pages holdings within one fixed observation,
+accepts explicit single/batch assumptions, and clears/cancels obsolete calculations on edit,
+refresh or close. Ordinary account-directory refresh retains its existing semantics. No compatibility
+path, preset registry, new branch/worktree or financial calculation in React was added.
+
+Critical evidence: existing exact scenario golden case passed (1 selected); existing portfolio
+import/restart case passed (1 selected, 28.65 seconds), including single/batch schema validation,
+submitted-string preservation, invalid combined-price rejection and identical original-snapshot
+calculation after restart plus two later imports. Existing Desktop selected-portfolio journey passed
+(1 selected, 8 skipped), covering actual form/request/result and late-response cancellation;
+TypeScript and native Desktop library compilation passed; `git diff --check` passed.
+All checkpoint source ownership is released; the lead owns only commit/push and evidence recording.
+
+These are critical fixture proofs, not live or installed acceptance. Stress results remain transient
+calculations over durable portfolio observations; saved planning assumptions/results and reopening
+still require implementation. Next dependency after this checkpoint is corrected rebalance planning,
+then common saved planning evidence/reopening. Native setup and the real saved stock journey remain
+open independently; no full CI, release gate or whole-app memory measurement ran.
+
 ## Current execution — first-stock wave resumed — 2026-09-29
 
 The owner resumed the registered goal after reviewed planning. The [owner-test goal](v1-owner-test-goal.md)

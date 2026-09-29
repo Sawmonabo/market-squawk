@@ -514,11 +514,13 @@ pub(crate) enum DashboardQueryCommand {
         limit: Option<u16>,
     },
     PortfolioScenario {
-        account_id: String,
+        account_token: String,
+        snapshot_token: String,
         scenario: Map<String, Value>,
     },
     PortfolioScenarioBatch {
-        account_id: String,
+        account_token: String,
+        snapshot_token: String,
         scenarios: Vec<Value>,
     },
     PortfolioRebalance {

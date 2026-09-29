@@ -899,6 +899,16 @@ pub enum PortfolioCommand {
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
+    /// Calculate a hypothetical change against a selected saved portfolio.
+    Scenario {
+        /// Confined JSON request containing accountToken, snapshotToken and scenario.
+        request: PathBuf,
+    },
+    /// Compare explicit hypothetical changes against the same saved portfolio.
+    ScenarioBatch {
+        /// Confined JSON request containing accountToken, snapshotToken and scenarios.
+        request: PathBuf,
+    },
     /// Measure point-in-time portfolio performance.
     Performance {
         /// Confined JSON request file.

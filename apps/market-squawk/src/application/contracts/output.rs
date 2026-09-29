@@ -6574,13 +6574,21 @@ fn portfolio_attribution() -> Value {
 }
 
 fn portfolio_contribution() -> Value {
-    closed_complete(vec![("instrumentId", text()), ("amount", money())])
+    closed_complete(vec![
+        ("instrumentId", text()),
+        ("investment", nullable(portfolio_investment_display())),
+        ("amount", money()),
+    ])
 }
 
 fn portfolio_evaluated_scenario() -> Value {
     closed_complete(vec![
         ("id", text()),
         ("composition", enumeration(&["additive", "compounded"])),
+        ("shocks", array(closed_complete(vec![
+            ("instrumentId", text()),
+            ("percentChange", text()),
+        ]))),
         ("contributions", array(portfolio_contribution())),
         ("total", money()),
     ])

@@ -22,6 +22,7 @@ import {
   productLookupCategory,
   type DesktopTransport,
   type ProductTransport,
+  type ProductQuery,
   type SystemTransport,
 } from "@/lib/transport"
 
@@ -997,6 +998,18 @@ describe("Market Squawk desktop boundary", () => {
         calculationStatus: "available", classificationStatus: "not_supplied_by_portfolio_source",
       } }
     }
+    const scenarioReads: ProductQuery[] = []
+    let scenarioSignal: AbortSignal | undefined
+    let resolveScenario: ((value: ApplicationResult) => void) | undefined
+    const scenarioResult = (request: Extract<ProductQuery, { query: "portfolioScenario" }>) => result({
+      accountId: cashReport.accountId, snapshotToken: request.snapshotToken,
+      effectiveAtUnixNanos: cashReport.effectiveAtUnixNanos, availableAtUnixNanos: cashReport.availableAtUnixNanos,
+      dataConfidence: "limited", scenario: { ...request.scenario,
+        contributions: [{ instrumentId: "11111111-1111-4111-8111-111111111111",
+          investment: { name: "Stress investment", symbol: null }, amount: { amount: "-900719925474099.301", currency: "USD" } }],
+        total: { amount: "-900719925474099.301", currency: "USD" },
+      },
+    })
     const exposureReads: { account: string; cursor?: string }[] = []
     const baselineSnapshot = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     const historyPage = {
@@ -1059,7 +1072,15 @@ describe("Market Squawk desktop boundary", () => {
     let resolveFirst: ((value: ApplicationResult) => void) | undefined
     render(
       <MemoryRouter initialEntries={["/portfolio"]}>
-        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution", "portfolio_transactions"] }, undefined, async (request, options) => {
+        <App transport={transport({ ...blockedBootstrap, capabilities: ["portfolio_account_list", "portfolio_risk", "portfolio_performance", "portfolio_holdings", "portfolio_exposure", "portfolio_revision_list", "portfolio_attribution", "portfolio_transactions", "portfolio_scenario", "portfolio_scenario_batch"] }, undefined, async (request, options) => {
+          if (request.query === "portfolioScenario") {
+            scenarioReads.push(request)
+            if (scenarioReads.length > 1) {
+              scenarioSignal = options?.signal
+              return new Promise<ApplicationResult>((resolve) => { resolveScenario = resolve })
+            }
+            return scenarioResult(request)
+          }
           if (request.query === "portfolioAccounts") return result({ accounts, nextCursor: null }, 2)
           if (request.query === "portfolioTransactions") {
             transactionReads.push({ account: request.accountToken, cursor: request.cursor })
@@ -1128,7 +1149,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(exposureReads).toEqual([])
     expect(historyReads).toEqual([])
     expect(comparisonReads).toEqual([])
-    await user.click(screen.getByText("History, stress tests, and planning"))
+    await user.click(screen.getByText("History and planning"))
     await waitFor(() => expect(historyReads).toEqual([first]))
     expect(transactionReads).toEqual([])
     await user.click(screen.getByText("Transaction history", { selector: "summary" }))
@@ -1204,7 +1225,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(screen.queryByText("Wrong account exposure")).toBeNull()
     await user.click(screen.getByText("Exposure", { selector: "summary" }))
     await waitFor(() => expect(screen.queryByText("Exposure investment")).toBeNull())
-    await user.click(screen.getByText("History, stress tests, and planning"))
+    await user.click(screen.getByText("History and planning"))
     const chooseEarlier = await screen.findByRole("button", { name: "Compare with this version" })
     expect(comparisonReads).toEqual([])
     resolveHistory?.(result({ ...historyPage, selectedSnapshotToken: baselineSnapshot }, 2))
@@ -1238,8 +1259,33 @@ describe("Market Squawk desktop boundary", () => {
     expect(transactionReads.at(-1)?.cursor).toBe("first-transaction-page")
     await user.click(screen.getByText("Transaction history", { selector: "summary" }))
     await waitFor(() => expect(screen.queryByLabelText("Transaction history for Portfolio 2")).toBeNull())
-    await user.click(screen.getByText("History, stress tests, and planning"))
+    await user.click(screen.getByText("History and planning"))
     await waitFor(() => expect(screen.queryByLabelText("Saved portfolio history for Portfolio 2")).toBeNull())
+    expect(scenarioReads).toEqual([])
+    await user.click(screen.getByText("Stress tests", { selector: "summary" }))
+    await user.type(await screen.findByLabelText("Scenario name"), "decline")
+    await user.selectOptions(screen.getByLabelText("Shock composition"), "additive")
+    await user.click(screen.getByRole("button", { name: "Add price shock" }))
+    await user.selectOptions(screen.getByLabelText("Shock investment"), "11111111-1111-4111-8111-111111111111")
+    await user.type(screen.getByLabelText("Price change (%)"), "-10.0")
+    await user.click(screen.getByRole("button", { name: "Calculate scenario" }))
+    expect(await screen.findByRole("rowheader", { name: "Stress investment" })).toBeTruthy()
+    expect(scenarioReads).toEqual([{ query: "portfolioScenario", accountToken: second,
+      snapshotToken: cashReport.snapshotToken,
+      scenario: { id: "decline", composition: "additive", shocks: [{
+        instrumentId: "11111111-1111-4111-8111-111111111111", percentChange: "-10.0",
+      }] },
+    }])
+    fireEvent.change(screen.getByLabelText("Price change (%)"), { target: { value: "-20" } })
+    expect(screen.queryByText("Stress investment")).toBeNull()
+    await user.click(screen.getByRole("button", { name: "Calculate scenario" }))
+    await waitFor(() => expect(scenarioReads).toHaveLength(2))
+    await user.click(screen.getByText("Stress tests", { selector: "summary" }))
+    expect(scenarioSignal?.aborted).toBe(true)
+    const lateScenario = scenarioReads[1]
+    if (lateScenario?.query === "portfolioScenario") resolveScenario?.(scenarioResult(lateScenario))
+    await waitFor(() => expect(screen.queryByText("Stress investment")).toBeNull())
+
   })
 
   it("keeps portfolio planning explicit and analysis-only", async () => {

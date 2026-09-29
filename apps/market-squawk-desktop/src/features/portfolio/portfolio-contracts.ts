@@ -391,9 +391,85 @@ const preparedDecisionSchema = z
   })
   .strict()
 
-export const stressChoiceSchema = preparedDecisionSchema
-  .extend({ result: productTextSchema, estimatedImpact: moneySchema.nullable() })
-  .strict()
+export const portfolioScenarioInputSchema = z.strictObject({
+  id: z.string().min(1).max(512)
+    .refine((value) => new TextEncoder().encode(value).length <= 512
+      && !/[\p{White_Space}\p{Cc}]/u.test(value), "Use a scenario name without spaces or control characters."),
+  composition: z.enum(["additive", "compounded"]),
+  shocks: z.array(z.strictObject({
+    instrumentId: z.string().uuid(),
+    percentChange: exactDecimalSchema,
+  })).min(1),
+})
+
+const portfolioScenarioResultSchema = portfolioScenarioInputSchema.extend({
+  contributions: z.array(z.strictObject({
+    instrumentId: z.string().uuid(),
+    investment: z.strictObject({ name: z.string().nullable(), symbol: z.string().nullable() }).nullable(),
+    amount: moneySchema,
+  })),
+  total: moneySchema,
+}).superRefine((scenario, context) => {
+  const affected = new Set(scenario.shocks.map((shock) => shock.instrumentId))
+  const returned = new Set<string>()
+  for (const contribution of scenario.contributions) {
+    if (!affected.has(contribution.instrumentId) || returned.has(contribution.instrumentId)
+      || contribution.amount.currency !== scenario.total.currency) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Scenario contributions are inconsistent." })
+    }
+    returned.add(contribution.instrumentId)
+  }
+  if (returned.size !== affected.size) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Scenario contributions are incomplete." })
+  }
+})
+
+const scenarioReportFields = {
+  accountId: z.string().min(1),
+  snapshotToken: z.string().uuid(),
+  effectiveAtUnixNanos: unixNanosSchema,
+  availableAtUnixNanos: unixNanosSchema.nullable(),
+  dataConfidence: z.literal("limited"),
+}
+const portfolioScenarioReportSchema = z.strictObject({
+  ...scenarioReportFields, scenario: portfolioScenarioResultSchema,
+})
+const portfolioScenarioBatchReportSchema = z.strictObject({
+  ...scenarioReportFields, scenarios: z.array(portfolioScenarioResultSchema).min(1),
+})
+
+export function parsePortfolioScenarioReport(
+  result: ApplicationResult,
+  selection: { snapshotToken: string; effectiveAtUnixNanos: string; availableAtUnixNanos: string | null; accountId?: string },
+  submitted: PortfolioScenarioInput[],
+  batch: boolean,
+): PortfolioScenarioReport {
+  if (result.metadata.returnedItems !== 1 || result.metadata.availableItems !== 1) {
+    throw new Error("The stress calculation is incomplete.")
+  }
+  const report = batch
+    ? parsePortfolioResult(result, portfolioScenarioBatchReportSchema)
+    : parsePortfolioResult(result, portfolioScenarioReportSchema)
+  const scenarios = "scenarios" in report ? report.scenarios : [report.scenario]
+  if (report.snapshotToken !== selection.snapshotToken
+    || report.effectiveAtUnixNanos !== selection.effectiveAtUnixNanos
+    || report.availableAtUnixNanos !== selection.availableAtUnixNanos
+    || (selection.accountId !== undefined && report.accountId !== selection.accountId)
+    || scenarios.length !== submitted.length
+    || new Set(scenarios.map((scenario) => scenario.id)).size !== scenarios.length
+    || scenarios.some((scenario, index) => {
+      const original = submitted[index]
+      return !original || scenario.id !== original.id || scenario.composition !== original.composition
+        || scenario.shocks.length !== original.shocks.length
+        || scenario.shocks.some((shock, shockIndex) => {
+          const input = original.shocks[shockIndex]
+          return !input || shock.instrumentId !== input.instrumentId || shock.percentChange !== input.percentChange
+        })
+    })) {
+    throw new Error("The stress calculation does not match your selected portfolio and assumptions.")
+  }
+  return { ...report, scenarios }
+}
 
 export const positionChoiceSchema = preparedDecisionSchema
   .extend({ investment: investmentDisplaySchema })
@@ -472,7 +548,9 @@ export type PortfolioExposure = z.infer<typeof exposureSchema>
 export type PortfolioExposurePage = z.infer<typeof portfolioExposurePageSchema>
 export type PortfolioRisk = z.infer<typeof riskSchema>
 export type PortfolioAttribution = z.infer<typeof portfolioAttributionSchema>
-export type PortfolioStressChoice = z.infer<typeof stressChoiceSchema>
+export type PortfolioScenarioInput = z.infer<typeof portfolioScenarioInputSchema>
+export type PortfolioScenarioResult = z.infer<typeof portfolioScenarioResultSchema>
+export type PortfolioScenarioReport = z.infer<typeof portfolioScenarioBatchReportSchema>
 export type PortfolioPositionChoice = z.infer<typeof positionChoiceSchema>
 export type PortfolioRebalanceChoice = z.infer<typeof rebalanceChoiceSchema>
 export type PortfolioImportPreview = z.infer<typeof portfolioImportPreviewSchema>

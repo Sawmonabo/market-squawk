@@ -3,9 +3,7 @@
 mod planning;
 mod scenario;
 
-use market_squawk_analytics::{
-    ExactDecimalScale, ExactRate, MonetaryBasis, MonetaryValue, PortfolioAllocation,
-};
+use market_squawk_data::MarketDataInstrumentReadCapability;
 use market_squawk_domain::{Currency, InstrumentId, Money};
 use market_squawk_services::{RequestContext, TypedToolRequest, TypedToolResult};
 use rust_decimal::Decimal;
@@ -20,34 +18,18 @@ pub(super) fn call(
     scope: &ReadScope,
     request: &TypedToolRequest,
     context: &RequestContext,
+    instruments: Option<&MarketDataInstrumentReadCapability>,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     match request.name() {
-        "Portfolio.EvaluateScenario" => scenario::evaluate_one(revision, scope, request, context),
+        "Portfolio.EvaluateScenario" => {
+            scenario::evaluate_one(revision, scope, request, context, instruments)
+        }
         "Portfolio.EvaluateScenarioBatch" => {
-            scenario::evaluate_batch(revision, scope, request, context)
+            scenario::evaluate_batch(revision, scope, request, context, instruments)
         }
         "Portfolio.ProposeRebalance" => planning::rebalance(revision, scope, request, context),
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
-}
-
-pub(super) fn allocations(
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-) -> Result<Vec<PortfolioAllocation>, PortfolioApplicationServiceError> {
-    revision
-        .holdings
-        .iter()
-        .filter(|holding| scope.admits_instrument(holding.instrument_id()))
-        .map(|holding| {
-            PortfolioAllocation::try_new(
-                &instrument_dimension(holding.instrument_id()),
-                MonetaryValue::new(holding.market_value(), MonetaryBasis::Total),
-                exact_rate(Decimal::ZERO)?,
-            )
-            .map_err(|_| PortfolioApplicationServiceError::Analytics)
-        })
-        .collect()
 }
 
 pub(super) fn base_report(revision: &PublishedRevision, _report_kind: &str) -> Map<String, Value> {
@@ -94,11 +76,6 @@ pub(super) fn parse_decimal(value: &str) -> Result<Decimal, PortfolioApplication
     value
         .parse::<Decimal>()
         .map(|decimal| decimal.normalize())
-        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)
-}
-
-pub(super) fn exact_rate(value: Decimal) -> Result<ExactRate, PortfolioApplicationServiceError> {
-    ExactRate::try_new(value, ExactDecimalScale::Unit)
         .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)
 }
 

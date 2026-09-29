@@ -104,6 +104,18 @@ export type ProductQuery =
   | { query: "portfolioAccounts"; cursor?: string; limit?: number }
   | { query: "portfolioHoldings" | "portfolioExposure"; accountToken: string; cursor?: string; limit?: number }
   | { query: "portfolioTransactions"; accountToken: string; cursor?: string; limit?: number }
+  | {
+      query: "portfolioScenario"
+      accountToken: string
+      snapshotToken: string
+      scenario: Record<string, unknown>
+    }
+  | {
+      query: "portfolioScenarioBatch"
+      accountToken: string
+      snapshotToken: string
+      scenarios: unknown[]
+    }
   | { query: "portfolioRisk" | "portfolioPerformance"; accountToken: string }
   | {
       query: "portfolioRevisions"
@@ -178,16 +190,6 @@ export type SystemQuery =
       query: "researchSourceObjects"
       provider: string
       dataset: string
-    }
-  | {
-      query: "portfolioScenario"
-      accountId: string
-      scenario: Record<string, unknown>
-    }
-  | {
-      query: "portfolioScenarioBatch"
-      accountId: string
-      scenarios: unknown[]
     }
   | {
       query: "portfolioRebalance"

@@ -240,8 +240,7 @@ pub(crate) async fn dashboard_query(
             portfolio_page_arguments(account_token, cursor, limit)?,
         ),
         DashboardQueryCommand::PortfolioPerformance { account_token } => {
-            let mut arguments = Map::new();
-            arguments.insert("accountToken".to_owned(), json!(account_token));
+            let arguments = account_token_arguments(account_token);
             ("Portfolio.GetPerformance", arguments)
         }
         DashboardQueryCommand::PortfolioExposure {
@@ -253,8 +252,7 @@ pub(crate) async fn dashboard_query(
             portfolio_page_arguments(account_token, cursor, limit)?,
         ),
         DashboardQueryCommand::PortfolioRisk { account_token } => {
-            let mut arguments = Map::new();
-            arguments.insert("accountToken".to_owned(), json!(account_token));
+            let arguments = account_token_arguments(account_token);
             ("Portfolio.GetRisk", arguments)
         }
         DashboardQueryCommand::PortfolioRevisions {
@@ -284,18 +282,22 @@ pub(crate) async fn dashboard_query(
             ("Portfolio.GetAttribution", arguments)
         }
         DashboardQueryCommand::PortfolioScenario {
-            account_id,
+            account_token,
+            snapshot_token,
             scenario,
         } => {
-            let mut arguments = account_arguments(account_id);
+            let mut arguments = account_token_arguments(account_token);
+            arguments.insert("snapshotToken".to_owned(), json!(snapshot_token));
             arguments.insert("scenario".to_owned(), Value::Object(scenario));
             ("Portfolio.EvaluateScenario", arguments)
         }
         DashboardQueryCommand::PortfolioScenarioBatch {
-            account_id,
+            account_token,
+            snapshot_token,
             scenarios,
         } => {
-            let mut arguments = account_arguments(account_id);
+            let mut arguments = account_token_arguments(account_token);
+            arguments.insert("snapshotToken".to_owned(), json!(snapshot_token));
             arguments.insert("scenarios".to_owned(), Value::Array(scenarios));
             ("Portfolio.EvaluateScenarioBatch", arguments)
         }
@@ -2290,6 +2292,12 @@ fn require_confirmation(confirmed: bool) -> Result<(), DesktopCommandError> {
 fn map_with_job_id(job_id: uuid::Uuid) -> Map<String, Value> {
     let mut arguments = Map::new();
     arguments.insert("jobId".to_owned(), json!(job_id));
+    arguments
+}
+
+fn account_token_arguments(account_token: String) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    arguments.insert("accountToken".to_owned(), json!(account_token));
     arguments
 }
 

@@ -218,6 +218,85 @@ mod portfolio_application {
             .as_str()
             .ok_or("snapshot is missing")?;
         uuid::Uuid::parse_str(snapshot)?;
+        // Scenario assumptions must use the explicitly selected observation, even after later imports.
+        let scenario_arguments = json!({"accountToken": token, "snapshotToken": snapshot,
+            "scenario": {"id":"source_classified", "composition":"additive", "shocks":[{
+                "instrumentId":"11111111-1111-4111-8111-111111111111", "percentChange":"-10.0"
+            }]}, "resultLimits":{"maximumItems":16,"maximumBytes":65536}});
+        let scenario = service
+            .call(
+                admitted("Portfolio.EvaluateScenario", scenario_arguments.clone())?,
+                context(35)?,
+            )
+            .await?;
+        scenario.validate_for(
+            application_capabilities()?
+                .find("Portfolio.EvaluateScenario")
+                .ok_or("scenario descriptor missing")?,
+        )?;
+        assert_eq!(scenario.structured_content()["snapshotToken"], snapshot);
+        assert_eq!(
+            scenario.structured_content()["scenario"]["id"],
+            "source_classified"
+        );
+        assert_eq!(
+            scenario.structured_content()["scenario"]["total"],
+            json!({"amount":"-5", "currency":"USD"})
+        );
+        assert_eq!(
+            scenario.structured_content()["scenario"]["shocks"],
+            scenario_arguments["scenario"]["shocks"]
+        );
+        assert_eq!(
+            scenario.structured_content()["scenario"]["contributions"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let mut invalid_snapshot = scenario_arguments.clone();
+        invalid_snapshot["snapshotToken"] = json!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        assert!(
+            service
+                .call(
+                    admitted("Portfolio.EvaluateScenario", invalid_snapshot)?,
+                    context(36)?
+                )
+                .await
+                .is_err()
+        );
+        let batch_arguments = json!({"accountToken":token,"snapshotToken":snapshot,
+            "scenarios":[scenario_arguments["scenario"], {"id":"sequential", "composition":"compounded", "shocks":[
+                {"instrumentId":"11111111-1111-4111-8111-111111111111", "percentChange":"-50"},
+                {"instrumentId":"11111111-1111-4111-8111-111111111111", "percentChange":"-50"}
+            ]}], "resultLimits":{"maximumItems":16,"maximumBytes":65536}});
+        let scenarios = service
+            .call(
+                admitted("Portfolio.EvaluateScenarioBatch", batch_arguments.clone())?,
+                context(37)?,
+            )
+            .await?;
+        scenarios.validate_for(
+            application_capabilities()?
+                .find("Portfolio.EvaluateScenarioBatch")
+                .ok_or("batch descriptor missing")?,
+        )?;
+        assert_eq!(
+            scenarios.structured_content()["scenarios"][1]["total"]["amount"],
+            "-37.5"
+        );
+        let mut below_floor = batch_arguments;
+        below_floor["scenarios"][1]["composition"] = json!("additive");
+        below_floor["scenarios"][1]["shocks"][0]["percentChange"] = json!("-75");
+        below_floor["scenarios"][1]["shocks"][1]["percentChange"] = json!("-75");
+        assert!(
+            service
+                .call(
+                    admitted("Portfolio.EvaluateScenarioBatch", below_floor)?,
+                    context(38)?
+                )
+                .await
+                .is_err()
+        );
         let first_page_arguments = json!({"accountToken": token,
             "cursor": holdings.structured_content()["pageCursor"], "limit": 1,
             "resultLimits": {"maximumItems": 16, "maximumBytes": 65536}});
@@ -655,6 +734,16 @@ mod portfolio_application {
                 context(26)?,
             )
             .await?;
+        let retained_scenario = reopened
+            .call(
+                admitted("Portfolio.EvaluateScenario", scenario_arguments)?,
+                context(39)?,
+            )
+            .await?;
+        assert_eq!(
+            retained_scenario.structured_content(),
+            scenario.structured_content()
+        );
         let mut pinned_history_arguments = history_arguments;
         pinned_history_arguments["cursor"] = history.structured_content()["pageCursor"].clone();
         let retained_history = reopened

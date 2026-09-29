@@ -1,13 +1,13 @@
 import { useQuery } from "@tanstack/react-query"
-import { useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 
 import { productKeys } from "@/app/query-client"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 import { useCursorNavigation } from "../shared/cursor-navigation"
-import { parsePortfolioAccountPage, parsePortfolioAttribution, parsePortfolioExposure, parsePortfolioHoldings, parsePortfolioPerformance, parsePortfolioRevisions, parsePortfolioTransactions } from "./portfolio-contracts"
-import type { PortfolioExposurePage, PortfolioHoldingsPage } from "./portfolio-contracts"
+import { parsePortfolioAccountPage, parsePortfolioAttribution, parsePortfolioExposure, parsePortfolioHoldings, parsePortfolioPerformance, parsePortfolioRevisions, parsePortfolioScenarioReport, parsePortfolioTransactions } from "./portfolio-contracts"
+import type { PortfolioExposurePage, PortfolioHoldingsPage, PortfolioScenarioInput, PortfolioScenarioReport } from "./portfolio-contracts"
 
 // Both account consumers share raw native responses and the same summary
 // projection. Navigation retains only cursor identities and the current page.
@@ -126,6 +126,102 @@ function usePinnedPortfolioPage() {
       if (after === undefined) firstPageCursor.current = pageCursor
     },
   }
+}
+
+export type PortfolioScenarioSelection = Pick<PortfolioHoldingsPage,
+  "snapshotToken" | "effectiveAtUnixNanos" | "availableAtUnixNanos"> & { accountId?: string }
+
+// This independent selector keeps one page of holdings and a minimal immutable
+// selection. Refresh remounts it, releasing its pin and every prior assumption.
+export function usePortfolioScenarioPositions(
+  transport: ProductTransport,
+  bootstrap: DesktopBootstrap,
+  accountToken: string,
+  readSession: string,
+) {
+  const available = hasProductCapability(bootstrap, "portfolio_holdings")
+    && (hasProductCapability(bootstrap, "portfolio_scenario")
+      || hasProductCapability(bootstrap, "portfolio_scenario_batch"))
+  const navigation = useCursorNavigation()
+  const pinned = usePinnedPortfolioPage()
+  const [selection, setSelection] = useState<PortfolioScenarioSelection | null>(null)
+  const query = useQuery({
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "portfolio", "Portfolio.GetHoldings",
+      { accountToken, cursor: navigation.after, limit: 25, readSession }),
+    enabled: available,
+    gcTime: 0,
+    retry: false,
+    queryFn: async ({ signal }) => {
+      const page = parsePortfolioHoldings(await transport.query({
+        query: "portfolioHoldings", accountToken, cursor: pinned.cursor(navigation.after), limit: 25,
+      }, { signal }))
+      pinned.retain(page.snapshotToken, page.pageCursor, navigation.after, signal)
+      setSelection((current) => current ?? {
+        snapshotToken: page.snapshotToken,
+        effectiveAtUnixNanos: page.effectiveAtUnixNanos,
+        availableAtUnixNanos: page.availableAtUnixNanos,
+        accountId: page.holdings[0]?.accountId,
+      })
+      return page
+    },
+  })
+  return { available, query, navigation, selection }
+}
+
+// Calculations are transient reads. Editing, cancellation, and unmount all
+// retire the request identity before aborting; even a late reply is discarded.
+export function usePortfolioScenarioCalculation(
+  transport: ProductTransport,
+  accountToken: string,
+  selection: PortfolioScenarioSelection | null,
+) {
+  const active = useRef<AbortController | null>(null)
+  const [state, setState] = useState<{
+    pending: boolean; result: PortfolioScenarioReport | null; error: string | null; cancelled: boolean
+  }>({ pending: false, result: null, error: null, cancelled: false })
+  const retire = () => {
+    const controller = active.current
+    active.current = null
+    controller?.abort()
+  }
+  useEffect(() => () => {
+    const controller = active.current
+    active.current = null
+    controller?.abort()
+  }, [accountToken, selection?.snapshotToken, transport])
+
+  const invalidate = () => {
+    retire()
+    setState({ pending: false, result: null, error: null, cancelled: false })
+  }
+  const cancel = () => {
+    retire()
+    setState({ pending: false, result: null, error: null, cancelled: true })
+  }
+  const calculate = async (scenarios: PortfolioScenarioInput[], batch: boolean) => {
+    if (!selection) return
+    retire()
+    const controller = new AbortController()
+    active.current = controller
+    setState({ pending: true, result: null, error: null, cancelled: false })
+    try {
+      const request = batch
+        ? { query: "portfolioScenarioBatch" as const, accountToken, snapshotToken: selection.snapshotToken, scenarios }
+        : { query: "portfolioScenario" as const, accountToken, snapshotToken: selection.snapshotToken, scenario: scenarios[0]! }
+      const response = await transport.query(request, { signal: controller.signal })
+      if (active.current !== controller || controller.signal.aborted) return
+      const result = parsePortfolioScenarioReport(response, selection, scenarios, batch)
+      active.current = null
+      setState({ pending: false, result, error: null, cancelled: false })
+    } catch (error) {
+      if (active.current !== controller || controller.signal.aborted) return
+      active.current = null
+      setState({ pending: false, result: null,
+        error: error instanceof Error ? error.message : "The stress calculation could not be completed. Try again.",
+        cancelled: false })
+    }
+  }
+  return { ...state, calculate, invalidate, cancel }
 }
 
 export function usePortfolioTransactions(

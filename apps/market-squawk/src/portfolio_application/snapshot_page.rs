@@ -97,7 +97,12 @@ impl<'image> SnapshotPage<'image> {
                 if version != 1 || cursor_scope != scope_digest {
                     return Err(PortfolioApplicationServiceError::InvalidRequest);
                 }
-                pinned_revision(image, &scope, revision, context)?
+                pinned_revision(
+                    image,
+                    &scope,
+                    |candidate| hex(&candidate.token().bytes()) == revision,
+                    context,
+                )?
             }
             None => select_revision(image, &scope)?,
         };
@@ -169,10 +174,25 @@ impl<'image> SnapshotPage<'image> {
     }
 }
 
+/// Selects a saved product snapshot without silently falling forward to the current head.
+pub(super) fn selected_revision<'image>(
+    image: &'image PortfolioReadImage,
+    scope: &ReadScope,
+    token: &str,
+    context: &RequestContext,
+) -> Result<&'image PublishedRevision, PortfolioApplicationServiceError> {
+    pinned_revision(
+        image,
+        scope,
+        |revision| snapshot_token(revision) == token,
+        context,
+    )
+}
+
 fn pinned_revision<'image>(
     image: &'image PortfolioReadImage,
     scope: &ReadScope,
-    cursor_revision: &str,
+    matches: impl Fn(&PublishedRevision) -> bool,
     context: &RequestContext,
 ) -> Result<&'image PublishedRevision, PortfolioApplicationServiceError> {
     let history = image
@@ -181,7 +201,7 @@ fn pinned_revision<'image>(
         .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
     for revision in &history.revisions {
         check_context(context)?;
-        if hex(&revision.token().bytes()) != cursor_revision {
+        if !matches(revision) {
             continue;
         }
         if scope.end.is_some_and(|end| {

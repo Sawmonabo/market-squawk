@@ -545,5 +545,58 @@ fn portfolio_attribution_and_composed_scenarios_remain_exact() -> TestResult {
         ScenarioShock::try_new("equity", rate(Decimal::new(-15, 1))?),
         Err(AnalyticsError::ReturnBelowFloor)
     );
+    let repeated_loss = [
+        ScenarioShock::try_new("equity", rate(Decimal::new(-75, 2))?)?,
+        ScenarioShock::try_new("equity", rate(Decimal::new(-75, 2))?)?,
+    ];
+    assert_eq!(
+        scenario_impact(&allocations, &repeated_loss, ShockComposition::Additive),
+        Err(AnalyticsError::ReturnBelowFloor)
+    );
+    let sequential = scenario_impact(&allocations, &repeated_loss, ShockComposition::Compounded)?;
+    assert_eq!(
+        sequential.total().money(),
+        Money::new(Decimal::new(-5625, 1), usd)
+    );
+    assert_eq!(
+        sequential.contributions()[1].amount().money().amount(),
+        Decimal::ZERO
+    );
+    // The additive floor applies to the final composed price, including offsetting shocks.
+    let mut floor = repeated_loss.to_vec();
+    floor.push(ScenarioShock::try_new("equity", rate(Decimal::new(5, 1))?)?);
+    assert_eq!(
+        scenario_impact(&allocations, &floor, ShockComposition::Additive)?
+            .total()
+            .money(),
+        Money::new(Decimal::new(-600, 0), usd)
+    );
+    let short = [PortfolioAllocation::try_new(
+        "equity",
+        monetary(Money::new(Decimal::new(-600, 0), usd), MonetaryBasis::Total),
+        rate(Decimal::ZERO)?,
+    )?];
+    assert_eq!(
+        scenario_impact(&short, &repeated_loss, ShockComposition::Additive),
+        Err(AnalyticsError::ReturnBelowFloor)
+    );
+    assert_eq!(
+        scenario_impact(&short, &floor, ShockComposition::Additive)?
+            .total()
+            .money(),
+        Money::new(Decimal::new(600, 0), usd)
+    );
+    // A positive terminal price too small to represent must not round to a total loss.
+    let unrepresentable = [
+        ScenarioShock::try_new(
+            "equity",
+            rate(Decimal::from_str_exact("-0.9999999999999999999999999999")?)?,
+        )?,
+        repeated_loss[0].clone(),
+    ];
+    assert_eq!(
+        scenario_impact(&allocations, &unrepresentable, ShockComposition::Compounded),
+        Err(AnalyticsError::DecimalArithmetic)
+    );
     Ok(())
 }

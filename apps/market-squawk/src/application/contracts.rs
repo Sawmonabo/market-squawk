@@ -874,11 +874,13 @@ const PORTFOLIO_ATTRIBUTION_ARGUMENTS: &[ArgumentSpec] = &[
     CURSOR_PAGE_ARGUMENTS[1],
 ];
 const PORTFOLIO_SCENARIO_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
+    ArgumentSpec::required("snapshotToken", ArgumentKind::Uuid),
     ArgumentSpec::required("scenario", ArgumentKind::Object),
 ];
 const PORTFOLIO_SCENARIO_BATCH_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    PORTFOLIO_ACCOUNT_TOKEN_ARGUMENTS[0],
+    ArgumentSpec::required("snapshotToken", ArgumentKind::Uuid),
     ArgumentSpec::required("scenarios", ArgumentKind::Array),
 ];
 const PORTFOLIO_REBALANCE_ARGUMENTS: &[ArgumentSpec] = &[

@@ -174,17 +174,17 @@ function SelectedPortfolio({
         </p>
         <AccountRisk account={account} bootstrap={bootstrap} transport={transport} />
       </DemandPanel>
-      <DemandPanel title="History, stress tests, and planning" className="group rounded-xl border border-border bg-card/20 p-4">
+      <DemandPanel title="Stress tests" className="rounded-xl border border-border bg-card/30 p-4">
+        <PortfolioScenarios account={account} bootstrap={bootstrap} transport={transport} />
+      </DemandPanel>
+      <DemandPanel title="History and planning" className="group rounded-xl border border-border bg-card/20 p-4">
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
-          No comparison, stress scenario, position change, or rebalance plan is selected by
+          No comparison, position change, or rebalance plan is selected by
           default. These tools cannot place an order.
         </p>
         <div className="mt-4 space-y-4">
           <PortfolioHistory account={account} bootstrap={bootstrap} transport={transport} />
-          <div className="grid gap-4 2xl:grid-cols-2">
-            <PortfolioScenarios choices={null} />
-            <PortfolioPlanning positionChoices={null} rebalanceChoices={null} />
-          </div>
+          <PortfolioPlanning positionChoices={null} rebalanceChoices={null} />
 
         </div>
       </DemandPanel>
