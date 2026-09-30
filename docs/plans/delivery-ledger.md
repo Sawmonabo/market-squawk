@@ -1,85 +1,69 @@
 # Market Squawk Delivery Ledger
 
-## Active previous-close delivery wave — 2026-09-30
+## Active previous-close and startup delivery wave — 2026-09-30
 
-Desktop reconnect checkpoint: the existing secure-startup critical test passes (1.96s), and
-Desktop typecheck passes. Native workspace reload cleared a development-only React context HMR
-exception. All 17 routes then retained ready Product/System states and a connected event stream.
-Markets settled without query errors. Settings had one initial `Operations.GetSettings` service
-rejection; retry and 12 subsequent concurrent refreshes succeeded. That transient failure remains
-unresolved pending a typed backend diagnosis; this is not a claim that all startup defects are
-closed. Evidence: `.agents/tmp/v1-first-stock/event-recovery-{test,typecheck}.log` and
-`event-recovery-native-*.json`. The history/data integration below remains uncommitted work.
+Current pushed checkpoint: `73ea4778` — Desktop reconnects valid interrupted event streams at the
+retained session/cursor, with backoff and native admission before reopening product pages.
+PR #43: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5920292726.
+Existing secure-startup/reconnect critical case passed (1.96s); Desktop typecheck passed. Native
+reload cleared a development HMR context exception. All 17 routes retained ready Product/System
+states and a connected stream; Markets settled without query errors. Settings had one initial
+`Operations.GetSettings` rejection, followed by a successful retry and 12 concurrent refreshes.
+Its original typed cause and the discarded original event failure remain unproven. Evidence:
+`.agents/tmp/v1-first-stock/event-recovery-{test,typecheck}.log` and `event-recovery-native-*.json`.
 
-Current correction ownership (supersedes the initial implementation assignments below):
-- Astra `stock_capture_trace`: `application/research/ingest/alpaca_historical.rs`,
-  `application/market_runtime/alpaca_historical.rs` and `calendar.rs`, plus the runtime admission
-  method in `market_runtime.rs`; carry the frozen current catalog capability end to end.
-- Astra `historical_identity_store`: manifest history, nominal initializer, existing publication
-  fixture, and extraction of the existing catalog identity replay into a connection-level helper.
-- GPT-6.1 Sol `desktop_event_recovery`: ProductProvider and its existing critical startup case;
-  reconnect only validated same-session/cursor disconnections, retaining terminal integrity errors.
-- Lead: source capture contract/hash, adapter helper export, preflight identity selection, all
-  integration, verification and Git. No competing compilation or additional branches.
-The original native disconnect payload was discarded: replay establishes that the retained journal
-is readable, but does not prove its original failure classification. Recheck the actual native
-screens after integration before claiming that failure resolved.
+Secure-startup routing checkpoint: a genuinely locked launch correctly returned System
+`recovery_required`, but Home displayed generic “Investment workspace unavailable” because only
+Settings rendered the recovery form. `AppRoutes` now renders that existing form for every locked
+entry while retaining the original URL; normal routes resume after unlock/event admission. Astra
+`startup_bootstrap_trace` returned `routes.tsx` and the extended existing `src/test/app.test.tsx`.
+The critical Home → secure recovery → Home/reconnect case passes (1.07s); typecheck passes.
+Evidence: `history-native-locked-start.json`, `history-native-bootstrap-context.json`, and
+`startup-recovery-gate-{test,typecheck}.log`. Fresh live unlock after this correction is pending.
 
-Live follow-through found two concrete barriers after the successful integrated build:
-the historical adapter requires a pre-existing historical identity interval while fresh native
-asset records start at observation time; and the native event subscription can become unavailable,
-turning every product screen into a workspace error despite a ready service. Astra
-`startup_source_authority` traces the former (producer file ownership retained; broader changes
-await lead-assigned exact paths). GPT-6.1 Sol `desktop_event_recovery` owns
-`apps/market-squawk-desktop/src/app/product-context.tsx` and
-`apps/market-squawk-desktop/src/lib/tauri-transport.ts` for the latter, initially read-only cause
-tracing; native/shared changes remain with the lead. These lanes are independent and converge at
-the same serial integrated build and native startup/restart check. Evidence is under
-`.agents/tmp/v1-first-stock/previous-close-*`; no completed price workflow is claimed yet.
+The integrated backend build passed, and the local development catalog's exact unreleased v21
+history trigger/checksum was refreshed offline after backup under `.market-squawk/recovery/`.
+All original product data is preserved; no shipping migration was added. Real source Retry then
+exposed a worker-stack overflow in managed history extraction. Astra `stock_capture_trace` owns
+diagnosis/fix in its existing history-ingestion file; other edits require lead ownership. No
+stack-size increase or capability restriction. Restart after the crash reports “structured log
+store is corrupt”; Astra `startup_catalog_contention` owns a read-only trace of exact log recovery.
+Retained logs must be preserved. Lead owns native reproduction and integration. These failures
+block live market-data completion; do not substitute the successful fixtures for that proof.
 
-Historical identity correction contract: reuse `CurrentCatalogProviderIdentity` and its retained
-`ProviderIdentitySelectionEvidence`. Alpaca binds an explicit symbol `asof` date and today's exact
-native UUID/symbol selection to its existing history plan. This permits retrospective acquisition
-without claiming that today's reference was known in the past. The existing timestamped complete
-history capture gains mandatory `identity_selection` and `symbol_asof` fields; nominal-date
-providers retain their separate native semantics. Lead owns this shared capture contract and
-application/runtime integration. Astra `startup_source_authority` owns adapter `config.rs`,
-`historical.rs`, `historical_transport.rs` and affected existing adapter tests after this API freeze.
-Astra `historical_identity_store` owns the data manifest history implementation and its existing
-publication-recovery fixture, consuming the frozen capture fields. No new authority stack or
-backdated identity interval. Adapter and durable-data changes converge with lead call sites before
-one serial build; the native Desktop event defect remains an independent lane.
+Outcome being integrated: real completed-session closes in the shared nine-investment collection,
+retained across restart, plus the evidenced concurrent-workspace-read defect. No fabricated prices,
+backdated identity intervals, current-price trading authority or source freshness relaxation.
+DAG: current native reference → ordinary historical acquisition → canonical capture/publication →
+provider-neutral previous-close reader → shared Home/Markets cards → native restart evidence.
 
-Startup/collection checkpoint `e3ed2f1b331cedd0e56604eeca891320a619f883` is pushed to origin;
-PR #43 evidence: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5919627904.
-Fresh source Retry also provisioned TSLA through the existing canonical reference owner:
-`source-renewal-home-settled.json` now contains Tesla's actual name. The earlier missing-TSLA
-observation below predates that renewal. No additional reference implementation is necessary.
-
-Outcome: Home/Markets retain genuine completed-session closes when live quotes are absent,
-without presenting stale data as live or requiring an investment-analysis job to see a price.
-DAG: existing active source/reference → reused daily-history publication → provider-neutral
-previous-close read → shared cards/native restart evidence. No source limits or authority relaxed.
-
-| Owner | Exclusive files / barrier | Finishable outcome / smallest check |
+| Owner / status | Exact ownership and dependency | Evidence / next barrier |
 | --- | --- | --- |
-| Astra `stock_capture_trace` | `application/paper/market/durable_product.rs`, `application/research/market_history.rs` (module export only), new `application/research/market_history/previous_close.rs` | Read latest canonical unadjusted completed daily close after live/display miss; rejoin the retained native calendar through the existing cursor reader, verify exact identity/currency/session time, truthful previous-close projection. No network on reads, no authority for sizing or trading. Inspect existing history critical test for the minimal case; lead alone builds. |
-| Astra `startup_source_authority` | `application/research/corporate_actions/preflight.rs` (module export only), new `preflight/display_history.rs` | Implement `SourceActionPreparationCapability::prepare_market_display_histories(records, context)` with existing raw/day plan and canonical publication, reusing the consumer previous-close read to skip sufficiently current stored data. No new source runtime/polling/read-side mutation; lead owns lifecycle hook. |
-| Lead | Shared service/source composition, contracts if required, critical test scheduling, UI timestamp, Git/docs | Freeze acquisition interface/hook from the trace, integrate producer and consumer, prove actual stored closes and restart. Keep single compilation queue and preserve current source authority. |
+| Astra `startup_source_authority`, implementation returned | Alpaca config/historical/transport and existing tests: current native UUID capability, explicit NY symbol `asof`, completed daily request bounds | All six adapter tests pass (`history-native-adapter-final-test.log`), including mismatch/revocation, page completion, rate admission and DST boundary. |
+| Astra `historical_identity_store`, implementation returned | Data catalog identity replay helper/export; manifest history/nominal initializer; existing v21 history trigger; existing publication/restart fixture | Focused `complete_alpaca_history_is_exact_clock_safe_and_restart_selectable` passes on ordinary stack, 1.29s (`history-native-publication-schema-test.log`). |
+| Astra `stock_capture_trace`, implementation returned | Existing app history directory, runtime admission and calendar capture | Current identity capability retained and revalidated through publication. Existing directory case passes after updating its frozen parent digest for the required `asof` endpoint contract; integrated build passes. Real managed extraction exposed the separate stack failure above. |
+| Astra `startup_catalog_contention`, implementation returned | `application/lifecycle.rs` only | Shared read locks replace exclusive read/read contention; switch/journal writes remain exclusive. Extended existing lifecycle case passes (`startup-lifecycle-critical-test.log`). Native events use a different authority. |
+| Lead, integration active | Shared source capture contract/hash, preflight identity selection, source lifecycle hook/composition, previous-close consumer, card timestamp, schema digest, sanitized Operations diagnostics, builds/Git | Single compilation queue. Helpers released ownership. No new branches/worktrees. |
 
-The initial history projection drops native session coordinates; daily provider period ends are
-not market closing times. Consumer ownership therefore includes one cohesive previous-close reader
-that reuses the verified history cursor and native-calendar rejoin, retaining only the terminal
-completed bar and its authentic session close. No whole-history copy or new calendar source.
+The exact catalog selection is retained through `CurrentCatalogProviderIdentity` and
+`ProviderIdentitySelectionEvidence`. Timestamped history capture requires identity/asof; the
+nominal-date path retains its existing separate semantics. Publication and reopening reproduce the
+original catalog selection at its original knowledge/effective cutoffs. Current-research and
+retrospective classifications remain unchanged; today's reference is never claimed as past knowledge.
+The existing v21 schema definition and embedded checksum are updated in place, with no new migration.
+The fixture's large inline async futures were boxed, and rejection windows separated to avoid
+revision interference; no application stack/resource limits were raised.
 
-Frozen shared reader: `MarketHistoryReadCapability::read_latest_previous_close(research,
-instrument_id, knowledge_cutoff, context) -> Result<Option<PreviousClose>, ServiceError>`;
-`PreviousClose` retains instrument identity, exact close Money, and native closing timestamp/date.
-The producer reuses it to avoid a second selection/cursor path. The lifecycle hook awaits finite
-history preparation after persisting Active, through the original deadline/cancellation; missing
-optional display history does not undo the healthy connection or block ordinary startup.
+The previous-close reader reuses the canonical history cursor and native-calendar rejoin, retaining
+only the terminal completed bar and its authentic session close. Source activation awaits finite
+missing-history preparation using the existing publisher and original cancellation/deadline;
+optional display-history failure does not undo a healthy connection. Daily requests end at the
+last complete NY provider day after the existing delay; the same plan endpoint governs the skip
+check. Reads never start provider acquisition.
 
-All earlier implementation ownership is released. No new branch/worktree or review quarter.
+Remaining barrier: integrated application critical checks/build, safe local development-catalog
+schema refresh with original data preserved, real source retry, native startup/price/restart checks,
+then a coherent pushed checkpoint. Whole-app RAM and full V1/installed acceptance remain pending.
 
 ## Active market-startup delivery wave — 2026-09-30
 

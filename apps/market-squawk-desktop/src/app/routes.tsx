@@ -1,7 +1,7 @@
 import { Component, lazy, Suspense, type ErrorInfo, type ReactNode } from "react"
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom"
 
-import { useProduct } from "@/app/product-context"
+import { useProduct, useSystem } from "@/app/product-context"
 import { McpPage } from "@/components/mcp-page"
 
 const OverviewPage = lazy(() =>
@@ -61,36 +61,41 @@ const SettingsPage = lazy(() =>
 export function AppRoutes() {
   const location = useLocation()
   const product = useProduct()
+  const system = useSystem()
 
   if (product.status === "loading") return <RouteLoading />
 
   return (
     <RouteErrorBoundary key={location.pathname}>
       <Suspense fallback={<RouteLoading />}>
-        <Routes>
-          <Route path="/home" element={<OverviewPage />} />
-          <Route path="/markets" element={<MarketsPage />} />
-          <Route path="/opportunities" element={<DecisionsPage />} />
-          <Route path="/portfolio" element={<PortfolioPage />} />
-          <Route path="/paper-execution" element={<PaperExecutionPage />} />
-          <Route path="/advanced" element={<AdvancedOverviewPage />} />
-          <Route path="/advanced/research-data" element={<ResearchPage />} />
-          <Route path="/advanced/models-forecasts" element={<ModelsPage />} />
-          <Route path="/advanced/backtests" element={<BacktestsPage />} />
-          <Route path="/advanced/valuation-targets" element={<FairValuePage />} />
-          <Route path="/advanced/risk-recommendation-policy" element={<RiskPage />} />
-          <Route path="/system/ai-connections" element={<McpPage />} />
-          <Route path="/system/operations-jobs" element={<OperationsPage />} />
-          <Route path="/system/updates-repair" element={<LifecyclePage />} />
-          <Route path="/system/backup-recovery" element={<BackupRecoveryPage />} />
-          <Route path="/system/logs-diagnostics" element={<LogsPage />} />
-          <Route path="/system/settings" element={<SettingsPage />} />
-          <Route
-            path="/system/settings/onboarding"
-            element={<SettingsPage section="onboarding" />}
-          />
-          <Route path="*" element={<Navigate to="/home" replace />} />
-        </Routes>
+        {system.status === "recovery_required" ? (
+          <SettingsPage section="onboarding" />
+        ) : (
+          <Routes>
+            <Route path="/home" element={<OverviewPage />} />
+            <Route path="/markets" element={<MarketsPage />} />
+            <Route path="/opportunities" element={<DecisionsPage />} />
+            <Route path="/portfolio" element={<PortfolioPage />} />
+            <Route path="/paper-execution" element={<PaperExecutionPage />} />
+            <Route path="/advanced" element={<AdvancedOverviewPage />} />
+            <Route path="/advanced/research-data" element={<ResearchPage />} />
+            <Route path="/advanced/models-forecasts" element={<ModelsPage />} />
+            <Route path="/advanced/backtests" element={<BacktestsPage />} />
+            <Route path="/advanced/valuation-targets" element={<FairValuePage />} />
+            <Route path="/advanced/risk-recommendation-policy" element={<RiskPage />} />
+            <Route path="/system/ai-connections" element={<McpPage />} />
+            <Route path="/system/operations-jobs" element={<OperationsPage />} />
+            <Route path="/system/updates-repair" element={<LifecyclePage />} />
+            <Route path="/system/backup-recovery" element={<BackupRecoveryPage />} />
+            <Route path="/system/logs-diagnostics" element={<LogsPage />} />
+            <Route path="/system/settings" element={<SettingsPage />} />
+            <Route
+              path="/system/settings/onboarding"
+              element={<SettingsPage section="onboarding" />}
+            />
+            <Route path="*" element={<Navigate to="/home" replace />} />
+          </Routes>
+        )}
       </Suspense>
     </RouteErrorBoundary>
   )

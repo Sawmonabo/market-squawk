@@ -1512,12 +1512,14 @@ describe("Market Squawk desktop boundary", () => {
     } satisfies DesktopTransport
 
     const view = render(
-      <MemoryRouter initialEntries={["/system/settings/onboarding"]}>
+      <MemoryRouter initialEntries={["/home"]}>
         <App transport={bootstrapTransport} />
       </MemoryRouter>,
     )
 
     const field = await screen.findByLabelText("Local security password")
+    expect(screen.queryByText("Investment workspace unavailable")).toBeNull()
+    expect(subscriptions).toHaveLength(0)
     await user.type(field, "process-local-test-unlock")
     await user.click(screen.getByRole("button", { name: "Unlock secure storage" }))
 
@@ -1526,7 +1528,7 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => {
       expect(screen.queryByLabelText("Local security password")).toBeNull()
     })
-    expect(screen.getByRole("heading", { name: "Settings" })).toBeTruthy()
+    expect(await screen.findByRole("heading", { name: "What needs your attention now?" })).toBeTruthy()
 
     const summary = within(screen.getByRole("region", { name: "Workspace summary" }))
     await waitFor(() => expect(summary.getByText("Ready")).toBeTruthy())
