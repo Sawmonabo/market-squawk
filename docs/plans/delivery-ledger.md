@@ -2,6 +2,11 @@
 
 ## Position-impact integration — 2026-09-30
 
+Pushed source checkpoint: `afa8ae6ccb2cd2669ddd056127c9d61d574892c2`.
+[PR #43 evidence](https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5906585986)
+records critical check scope and remaining live/installed gaps. No lane remains assigned for this
+calculation checkpoint; lead owns next saved-planning integration and live setup follow-through.
+
 Audit base: pushed `d151c37f777fb0acd6369c3a5264c303be7e05a5`, then a clean primary worktree.
 Acceptance 4/5/6 defect: Portfolio supplied `positionChoices={null}`, and the existing candidate
 operation used recommendation setup rather than the displayed account. The integrated change
