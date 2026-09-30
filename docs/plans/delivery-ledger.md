@@ -2,6 +2,9 @@
 
 ## Active saved-planning and live-input wave — 2026-09-30
 
+Pushed discovery checkpoint: `8f18c9ad` (three critical Rust checks, Desktop typecheck and
+CLI/service build passed; ticker search and corrected source status live verified).
+
 Current outcome: secure startup, protected credential import, fresh doctor verification and live
 Alpaca Start/publication are verified at `88cf3ff1`, with evidence checkpoint `cbec2f05` and
 PR #43 comments `5908352575` / `5908549656`. Desktop runs on the fresh corrected-schema roots
@@ -33,14 +36,29 @@ case passed (1 test, 17 filtered), including repeated observations and equal-coh
 the existing canonical catalog identity case passed (1 test, 6 filtered), including ticker/name
 matching and expired-alias exclusion. The product search regression passed (one test, 129 filtered), and the single-job CLI/service
 build passed. Same-root restart/unlock and uppercase/lowercase SPY searches passed. The expired
-doctor was renewed through Verify, then Start succeeded. Actual selection still fails through the closed transport error; it is not live verified.
-The retained quote/trade source clocks predate the newly admitted definition interval. Native
-reference validation occurs before freshness exclusion, treating that unavailable evidence as an
-invalid result instead of returning an unavailable price. The original reference/freshness checks
-must remain intact; the next fix must distinguish ineligible evidence from corrupted identity. Astra
-`native_setup_current` owns read-only diagnosis of that current-selection path and retained
-`market-discovery-live-*` evidence; no edits/builds/Git or credential reads. Other writers are
-frozen; lead owns verification/integration.
+doctor was renewed through Verify, then Start succeeded. The follow-up freshness correction is critically and live verified against these same roots:
+SPY selection and the SPY/VTI overview succeed with original selection/history identity and
+null price/asOf plus unavailable status. Existing source eligibility/freshness exclusions now
+run before current native-reference validation; every surviving fresh candidate still receives
+all reference and optional execution-term checks. No freshness limit, interval or identity was
+weakened or backdated. The extended existing product case passed (one test, 129 filtered), and
+the single-job CLI/service build passed. Same-root shutdown, secure startup, credential unlock
+and retained-data CLI selection/overview passed; Desktop was reopened, not claimed as a fresh
+installed package or visually verified complete workflow. Both code files are frozen and agent
+ownership released. Evidence: `.agents/tmp/v1-first-stock/stale-market-product-critical.log`,
+`stale-market-live-build.log`, `stale-market-live-selection.json`, `stale-market-live-overview.json`.
+After renewing the expired doctor through Verify and successfully starting the source, SPY
+selection also passed (`stale-market-live-active-selection.json`). The stale price remains null.
+A separate runtime log reports ProviderIdentityAuthorityUnavailable; shared-catalog try_lock
+contention and SQLite Busy/Locked currently share that category, so its cause is not yet proved.
+Astra contention diagnosis is complete and ownership released. A single native identity
+try_lock WouldBlock or SQLite Busy/Locked can terminate the async source supervisor before
+using its existing selection deadline. The next bounded fix needs a distinct transient-busy
+error and cancellation/deadline-bound async retry before session admission, covering constructor
+and runtime selection through one owner. Preserve terminal poison/corruption/auth/stale-identity
+handling and all-or-nothing mapping installation; do not block a Tokio worker or blanket-retry
+AuthorityUnavailable. Reuse existing catalog custody and supervisor critical cases. No contention
+implementation has begun; it remains separate from the frozen freshness correction.
 
 Next dependency after this checkpoint: the installed source resolver currently admits only
 predeclared SPY/VTI fund scopes and skips selected common stocks as CanonicalInstrumentUnresolved.
@@ -56,7 +74,8 @@ Saved-planning implementation has not begun and remains required. No new worktre
 review round, release build or whole-app RAM measurement. This checkpoint has three passing
 critical Rust cases, passing Desktop typecheck and a passing CLI/service build. Same-root secure
 startup, credential unlock, Verify/Start, ticker search and active-group status are live verified;
-full selection and installed stock-analysis completion are explicitly still open. Exactly three local/origin branches and
+stale-price selection is now live verified by the follow-up above; complete installed stock
+analysis remains open. Exactly three local/origin branches and
 one primary worktree were verified; no extra branches require removal.
 
 Current checkpoint evidence: `.agents/tmp/v1-first-stock/market-discovery-live-*`,

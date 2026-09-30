@@ -10,9 +10,9 @@ use market_squawk_data::{
     AuthorizedResearchUse, CatalogLimit, DatasetManifestRef, InstrumentDefinitionReadCapability,
     MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationSelection,
     MarketDataInstrumentReadCapability, PinnedInstrumentDefinitions,
-    ProviderMarketEventPointInTimeSelection,
-    ProviderMarketEventSelectedCandidate, ProviderMarketEventSelectionCompleteness, ResearchUse,
-    ResearchUseCatalogError, ResearchUseGraphDigest, ResearchUseLimits, ResearchUseRequest,
+    ProviderMarketEventPointInTimeSelection, ProviderMarketEventSelectedCandidate,
+    ProviderMarketEventSelectionCompleteness, ResearchUse, ResearchUseCatalogError,
+    ResearchUseGraphDigest, ResearchUseLimits, ResearchUseRequest,
 };
 
 use market_squawk_domain::{
@@ -850,6 +850,59 @@ impl MarketInvestmentReadCapability {
                 let Some(source_at) = provenance.source_timestamp() else {
                     continue;
                 };
+                // Archived snapshots can predate the current reference interval. Exclude
+                // ineligible marks before requiring the current reference at every mark clock.
+                let Some(metadata) = self
+                    .research
+                    .analytical()
+                    .retained_source_metadata(
+                        provenance.binding().source_id(),
+                        provenance.binding().metadata_revision(),
+                        as_of,
+                        deadline,
+                        &cancellation,
+                    )
+                    .map_err(map_durable_market_ingest_error)?
+                else {
+                    continue;
+                };
+                if provenance.binding().metadata_revision() != metadata.revision()
+                    || !metadata.is_effective_at(source_at)
+                    || !metadata.is_effective_at(as_of)
+                    || provenance.binding().source_id() != metadata.source_id()
+                    || provenance.binding().instrument_id() != Some(instrument_id)
+                    || provenance.binding().venue_id() != route.venue_id()
+                    || matches!(
+                        provenance.recorded_quality(),
+                        DataQuality::Modeled
+                            | DataQuality::Estimated
+                            | DataQuality::Stale
+                            | DataQuality::Quarantined
+                    )
+                {
+                    continue;
+                }
+                let freshness = metadata.freshness_policy();
+                let age = self
+                    .maximum_mark_age_nanos
+                    .min(freshness.max_source_age_nanos())
+                    .min(freshness.max_market_age_nanos());
+                let mut fresh_until = source_at
+                    .checked_add_nanos(i64::try_from(age).map_err(|_| ServiceError::InvalidResult)?)
+                    .map_err(|_| ServiceError::InvalidResult)?;
+                for until in [
+                    metadata.authorization().inclusive_authorization_deadline(),
+                    metadata.coverage().inclusive_coverage_deadline(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    fresh_until = fresh_until.min(until);
+                }
+                if fresh_until < as_of || receipt.selection().manifest_published_at() > fresh_until
+                {
+                    continue;
+                }
                 let native_price = match candidate.event() {
                     MarketEvent::MarketDataQuote(quote) => {
                         validate_native_reference(
@@ -911,57 +964,6 @@ impl MarketInvestmentReadCapability {
                 // decimal mark remains usable when independently retained sizing terms are absent
                 // or do not cover the same identity, asset family, currency and full observation interval.
                 if !native_price && execution_terms.is_none() {
-                    continue;
-                }
-                let Some(metadata) = self
-                    .research
-                    .analytical()
-                    .retained_source_metadata(
-                        provenance.binding().source_id(),
-                        provenance.binding().metadata_revision(),
-                        as_of,
-                        deadline,
-                        &cancellation,
-                    )
-                    .map_err(map_durable_market_ingest_error)?
-                else {
-                    continue;
-                };
-                if provenance.binding().metadata_revision() != metadata.revision()
-                    || !metadata.is_effective_at(source_at)
-                    || !metadata.is_effective_at(as_of)
-                    || provenance.binding().source_id() != metadata.source_id()
-                    || provenance.binding().instrument_id() != Some(instrument_id)
-                    || provenance.binding().venue_id() != route.venue_id()
-                    || matches!(
-                        provenance.recorded_quality(),
-                        DataQuality::Modeled
-                            | DataQuality::Estimated
-                            | DataQuality::Stale
-                            | DataQuality::Quarantined
-                    )
-                {
-                    continue;
-                }
-                let freshness = metadata.freshness_policy();
-                let age = self
-                    .maximum_mark_age_nanos
-                    .min(freshness.max_source_age_nanos())
-                    .min(freshness.max_market_age_nanos());
-                let mut fresh_until = source_at
-                    .checked_add_nanos(i64::try_from(age).map_err(|_| ServiceError::InvalidResult)?)
-                    .map_err(|_| ServiceError::InvalidResult)?;
-                for until in [
-                    metadata.authorization().inclusive_authorization_deadline(),
-                    metadata.coverage().inclusive_coverage_deadline(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    fresh_until = fresh_until.min(until);
-                }
-                if fresh_until < as_of || receipt.selection().manifest_published_at() > fresh_until
-                {
                     continue;
                 }
                 let (authorization, authorized_at) = match self.authorize_local_analysis(

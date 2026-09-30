@@ -478,6 +478,29 @@ mod tests {
             ticker[0].instrument_id()
         );
 
+        let identity = ticker
+            .iter()
+            .find(|identity| identity.instrument_id() == selected)
+            .ok_or("missing selected identity")?;
+        let unavailable_page = project_product_page(
+            &ticker,
+            select_product_page(std::slice::from_ref(identity), None, 1, None)?,
+            &[json!({
+                "instrumentId": selected.to_string(),
+                "currentPrice": null,
+                "availability": "unavailable",
+            })],
+        )?;
+        let unavailable = &unavailable_page["data"][0];
+        assert_eq!(unavailable["selectionToken"], token);
+        assert_eq!(unavailable["historyToken"], identity.history_token());
+        assert_eq!(unavailable["identity"]["symbol"], "SPY");
+        assert_eq!(unavailable["identity"]["name"], identity.name());
+        assert_eq!(unavailable["availability"], "unavailable");
+        assert!(unavailable["price"].is_null());
+        assert!(unavailable["asOf"].is_null());
+        assert_eq!(unavailable_page["page"]["hasMore"], false);
+
         let all = product_market_identities(&records, cutoff, Some("etf"))?;
         let (first, count, more) = product_search_page(&all, "etf", 1, None)?;
         assert_eq!(count, 2);
