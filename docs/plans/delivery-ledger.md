@@ -2,7 +2,7 @@
 
 ## Active live-stock and harmonic-evidence wave — 2026-09-30
 
-Refresh base `08d23518082d24801827d372c93002f301fcbed4`; execution remains authorized.
+Refresh base `60bdf0715ccb8880d7d8f249b3e820d74135f980`; execution remains authorized.
 One primary worktree and only the three approved local/origin branches were verified live.
 Old roots and matching binaries are preserved; the old service/Desktop stopped normally.
 Current live root: `.market-squawk/v1-owner-test-stock/{data,installation}`. Protected startup,
@@ -10,9 +10,10 @@ unlock and credential import succeeded. The rebuilt Desktop is running on this r
 
 | Owner | Exclusive scope | Outcome, verification and next dependency |
 | --- | --- | --- |
-| Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | One single-job CLI/service rebuild is active. After successful exit, stop the existing processes normally, restart on this same root, unlock, renew actual source verification and retry stock startup. |
-| Astra `native_setup_current` — released | Native fund catalog admission plus existing catalog case | Pushed `4139b2a1`: remove the artificial new-ETF rejection; derive Equity/Fund from the official listing; preserve existing issuer and native identity evidence. Critical catalog creation/conflict/revocation/reopen/replay case passed (1 test). Live retry awaits the rebuilt service. |
-| GPT-6.1 Sol `brief_pattern_projection` — released; lead integrated schema | Saved Brief status projection and one existing-module critical case | Actual retained disposition now supplies required `pricePattern.state/outcome/summary`; reasons reuse its explanation. Whole projected Brief passes its published descriptor for expired and unevaluated evidence; missing/contradictory outcome fails. One critical case passed. Shared Rust schema matches existing strict Desktop fields. No new compatibility path. |
+| Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | Single-job CLI/service rebuild passed. Same-root shutdown/restart and protected unlock succeeded. Native Retry reconciled interrupted stock activation and renewed verification; catalog startup succeeded, but live publication then failed capture/current-source qualification. Investigate that concrete next edge. |
+| Astra `stock_capture_trace` | Read-only `application/market_runtime/alpaca_publication.rs`, capture/current-source qualification and this root's sanitized logs | Acceptance 1/7: identify the first actual capture/health failure after successful native catalog admission, exact proposed fix and smallest existing critical check. No edits/builds/Git, secrets or provider calls; report to lead before implementation ownership. |
+| Astra `native_setup_current` — released | Native fund catalog admission plus existing catalog case | Pushed `4139b2a1`: remove the artificial new-ETF rejection; derive Equity/Fund from the official listing; preserve existing issuer and native identity evidence. Critical catalog creation/conflict/revocation/reopen/replay case passed (1 test). Native Retry now passed this admission edge on the rebuilt service; live continuity still fails downstream. |
+| GPT-6.1 Sol `brief_pattern_projection` — released; lead integrated schema | Saved Brief status projection and one existing-module critical case | Pushed `60bdf071`: actual retained disposition now supplies required `pricePattern.state/outcome/summary`; reasons reuse its explanation. Whole projected Brief passes its published descriptor for expired and unevaluated evidence; missing/contradictory outcome fails. One critical case passed. Shared Rust schema matches existing strict Desktop fields. No new compatibility path. |
 | GPT-6.1 Sol `live_input_recipe` — released | Read-only SEC producer/consumer handoff | Exact company/security and fiscal wiring gaps below; no implementation or live completion claimed. |
 | Astra `harmonic_status_v1` — released | Read-only full harmonic status/geometry contract | Forming and terminal geometry preservation remain required, beyond this Brief decoding fix. Lead must freeze shared declarations before disjoint producer/renderer edits. |
 
@@ -31,8 +32,21 @@ issuer identities remain unchanged. No schema change or migration is needed for 
 The initial standalone Nasdaq `kind:source` request was invalid; existing demand-loaded directory
 publication owns that route. H.15's expired anonymous session was renewed through native Start,
 then activation succeeded on session `816af143-1016-4450-98f8-e248b89aae06`. This proves setup
-recovery only; publication/typed read on this root still need verification. Actual virtual-account
-options were retrieved; owner balance/cost selection is pending. No account or order was invented.
+recovery only; publication/typed read on this root still need verification. Owner selected $100,000 USD and 0.25% simulated costs. Fresh native choices, Prepare and
+Create succeeded; the virtual account is ready with its session stopped and no orders. Evidence:
+`stock-account-{choices-current,prepared,created,readback}.json`. No arbitrary account values
+were supplied.
+
+Live readback at `60bdf071`: native Retry admitted the configured stock/fund group; AAPL search
+returns a stock and QQQ search returns a fund through the ordinary market API. AAPL selection
+returns its genuine identity/history token with unavailable price after the source failure, not
+invented market values. Rebuilt Desktop was reopened on the same service/root. This is catalog
+and account readback evidence, not sustained live-market or complete Investment Brief acceptance.
+`stock-admission-live-retry.json`, `stock-admission-{aapl,qqq}-search.json`,
+`stock-admission-aapl-selection.json` and `stock-admission-live-service.log` retain the actual results.
+The earlier Verify error was a reconciliation precondition, resolved by native Retry without edits.
+Astra's current diagnosis owns the subsequent live capture/health error; do not reclassify it as
+an admission failure or hide it behind the successful startup response.
 
 Next dependencies (handoff details retained under the same scratch directory):
 
@@ -54,7 +68,7 @@ DAG: protected setup → actual stock/native identities → SEC/history/rates �
 readiness → saved Investment Brief → same-root restart. In parallel: fixed harmonic contract →
 disjoint producer/renderer changes → critical saved-evidence proof. Existing valuation and portfolio
 work is reused. No new branches/worktrees, broad CI, review round, release build or whole-app RAM
-measurement. Account/allocation choices remain owner-selected; all full V1 acceptance remains open
+measurement. Remaining allocation choices remain owner-selected; all full V1 acceptance remains open
 until actual end-to-end evidence exists.
 
 ## Completed stock admission and saved-planning implementation wave — 2026-09-30
