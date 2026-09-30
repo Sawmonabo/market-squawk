@@ -94,7 +94,10 @@ pub(crate) async fn ensure_alpaca_iex_asset_reference(
             },
         )
         .await
-        .map_err(|_| ServiceError::Unavailable)?;
+        .map_err(|error| {
+            tracing::warn!(%error, symbol, stage = "asset_reference_acquisition", "native asset reference unavailable");
+            ServiceError::Unavailable
+        })?;
     operation
         .validate_precommit()
         .map_err(|_| ServiceError::Unavailable)?;
@@ -118,7 +121,10 @@ pub(crate) async fn ensure_alpaca_iex_asset_reference(
             cancellation.clone(),
         )
         .await
-        .map_err(|_| ServiceError::Unavailable)?;
+        .map_err(|error| {
+            tracing::warn!(%error, symbol, stage = "asset_reference_publication", "native asset reference unavailable");
+            ServiceError::Unavailable
+        })?;
     let cutoff = after.published_at();
     let native = ProviderNativeIdentityRequest {
         namespace: operation.source().source_id().clone(),

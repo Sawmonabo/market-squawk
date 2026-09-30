@@ -90,7 +90,7 @@ impl CatalogAuthority {
                 deadline,
                 cancellation,
             )?;
-            if self.catalog().source(input.source.source_id())?.is_none() {
+            if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {
                 self.catalog().register_source(&input.source, at)?;
             }
             if self.catalog().source(input.source.source_id())?.as_ref() != Some(&input.source) {

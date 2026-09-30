@@ -5,9 +5,34 @@
 Current outcome: local secure startup and provider storage are unlocked. Connection recovery is
 implemented and critically verified; live cleanup, protected reimport and fresh Alpaca verification
 also passed in the preserved owner-test roots. Market-runtime Start still fails separately, so this
-is not a live-market or installed-workflow completion claim. Lead owns integration; Astra
-`native_setup_current` is read-only on that exact runtime failure. All implementation writers are
-frozen; saved-planning implementation has not begun.
+is not a live-market or installed-workflow completion claim. Lead owns integration; all prior
+implementation writers are complete. Saved-planning implementation has not begun.
+
+Recovery checkpoint pushed: `44ba9cb6`; PR #43 evidence comment `5907711371`.
+Next concrete defect: native Alpaca asset-reference publication registers a source only when absent,
+then rejects changed metadata. The retained source binds the expired doctor; fresh verification
+necessarily changes that metadata. Lead exclusively owns
+`crates/market-squawk-data/src/catalog/market_data_instruments/alpaca_asset_reference.rs` and
+`apps/market-squawk/src/application/market_runtime/alpaca_asset_reference.rs` for the existing
+register-on-change revision path and typed publication-error logging. Preserve exact equality after
+registration and all custody/identity/precommit checks. Existing source-revision coverage plus a
+single-job binary build and actual retained Retry are the relevant checks; no new harness.
+
+Native reference revision fix critically and live verified: the existing catalog recovery/revision
+case passed (one test), and the CLI/service single-job build passed. Same-root secure bootstrap and
+credential unlock succeeded. Retained Retry renewed the expired doctor without reimport and
+published genuine SPY and VTI native references at 2026-09-30T09:09:48Z; the onboarding session
+advanced to `active_scoped`. The market publication worker then failed with
+`analytical manifest catalog operation failed`, leaving the runtime inactive and cleanup retained.
+This is the next concrete blocker, not a password failure or a completed live-stock journey.
+Evidence: `.agents/tmp/v1-first-stock/asset-reference-source-revision-critical.log`,
+`asset-reference-recovery-build.log`, `asset-reference-recovery-service.log`,
+`asset-reference-recovery-retry.err`, and `asset-reference-recovery-status.json`.
+Astra `native_setup_current` next owns read-only diagnosis of the publication failure and retained
+worker cleanup, tracing `market_runtime/alpaca_publication.rs` through the existing publication and
+manifest owners. Return the smallest concrete fix and existing critical check; no edits/build/Git
+or credential reads. Lead alone owns further integration. One worktree and exactly three local and
+origin branches (feature/main/release) were freshly verified; none require cleanup.
 
 Audit base: `bcf22c8c`, primary feature branch, clean worktree. Acceptance 4/5/6 requires saved
 portfolio scenarios, rebalance and position comparisons to reopen with their original assumptions
