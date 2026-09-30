@@ -64,6 +64,10 @@ const DEVELOPMENT_MCP_RELAY_PROGRAM: &str = "MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY
 #[command(about = "Market Squawk Obsidian Signal desktop application")]
 #[command(version)]
 struct DesktopArgs {
+    /// Run the hidden native WebView with a loopback WebDriver endpoint (development only).
+    #[cfg(all(debug_assertions, feature = "desktop-automation"))]
+    #[arg(long, hide = true)]
+    webdriver_port: Option<std::num::NonZeroU16>,
     /// Explicit local Market Squawk TOML configuration.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -258,7 +262,30 @@ fn run_stdio_mcp(_args: DesktopArgs) -> Result<i32, DesktopStartupError> {
 fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let installation_data_root =
         selected_installation_data_root(args.installation_data_root.clone())?;
-    let app = tauri::Builder::default()
+    let background_automation = {
+        #[cfg(all(debug_assertions, feature = "desktop-automation"))]
+        {
+            args.webdriver_port.is_some()
+        }
+        #[cfg(not(all(debug_assertions, feature = "desktop-automation")))]
+        {
+            false
+        }
+    };
+    let mut context = tauri::generate_context!();
+    if background_automation {
+        for window in &mut context.config_mut().app.windows {
+            window.focus = false;
+            window.visible = false;
+        }
+    }
+    let builder = tauri::Builder::default();
+    #[cfg(all(debug_assertions, feature = "desktop-automation"))]
+    let builder = match args.webdriver_port {
+        Some(port) => builder.plugin(tauri_plugin_wdio_webdriver::init_with_port(port.get())),
+        None => builder,
+    };
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .manage(DesktopEventSubscriptions::default())
         .invoke_handler(tauri::generate_handler![
@@ -300,7 +327,12 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             subscribe_service_events,
             unsubscribe_service_events
         ])
-        .build(tauri::generate_context!())?;
+        .build(context)?;
+    #[cfg(target_os = "macos")]
+    if background_automation {
+        app.handle()
+            .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+    }
     let installation = installation::prepare(app.handle(), installation_data_root.join("program"))?;
     if let Some(program) = installation.handoff_program.as_ref() {
         return handoff_to_selected_release(program);
@@ -352,6 +384,9 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let runtime_startup_error_for_event = Rc::clone(&runtime_startup_error);
     let exit_code = app.run_return(move |handle, event| match event {
         tauri::RunEvent::Ready => {
+            if background_automation {
+                return;
+            }
             let show_result = (|| -> Result<(), DesktopStartupError> {
                 let window = handle
                     .get_webview_window("main")

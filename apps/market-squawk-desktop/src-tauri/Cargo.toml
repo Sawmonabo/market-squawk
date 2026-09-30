@@ -11,6 +11,9 @@ publish = false
 [lib]
 name = "market_squawk_desktop"
 
+[features]
+desktop-automation = ["dep:tauri-plugin-wdio-webdriver"]
+
 [build-dependencies]
 tauri-build = { workspace = true }
 
@@ -31,6 +34,7 @@ sha2 = { workspace = true }
 tauri = { workspace = true }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-opener = { workspace = true }
+tauri-plugin-wdio-webdriver = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -13,6 +13,8 @@ binding rewrite is authorized or implemented.
 
 | Owner | Exclusive scope | Outcome, verification and next dependency |
 | --- | --- | --- |
+| Lead — background native automation and read-command admission verified | Desktop Cargo feature/dependency, native startup, command manifest/capability, generated permissions and troubleshooting instructions | Base `52c415ad`. Embedded WebdriverIO operated the actual hidden WKWebView. Native transport reproduced `register_read not allowed. Command not found`; six registered commands were missing from the manifest and five lacked main-window grants. All explicit registrations/grants are corrected, retaining cancellation/session checks. Rebuild passed; native Market.GetOverview now returns eight canonical investments, all 17 routes rendered, and clicking Apple opened genuine detail/comparison choices. Corrected launch/navigation/screenshot/selection remained behind Terminal throughout 1,200 foreground samples. Live prices and full analytical workflows remain incomplete. No global keystrokes, mock backend or release endpoint. |
+| Astra `stock_capture_trace` — read-only follow-up complete | Fresh-root source health and quote publication/selection path; no edits | At pushed `52c415ad`, Verify/Start succeeded and 383 canonical rows were published before raw capture failed at 19:14:33.762881Z; downstream `CaptureMaterial` followed 71.562 ms later. Runtime is now inactive while onboarding remains `active_scoped`; all eight overview prices are unavailable. `ProductionSinkFailure::Capture` discards its typed reason in Display and publisher health is not drained. Lead must retain those existing diagnostic reasons, then retry the same source to identify the actual correction. No limit increase, quote fallback or selection change is justified by current evidence. |
 | GPT-6.1 Sol `starter_market_trace` — read-only | Current startup/source activation, catalog population, Home/Markets and existing preference persistence | Owner requires a default keep/remove collection with genuine quotes/details on first launch, including TSLA. Locate the smallest complete existing producer-to-screen path and exact gaps; no edits, Git or builds. Lead freezes the shared contract after this handoff; implementation follows integration of the pending Desktop/restart correction. |
 | Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | Pushed healthy-renewal fix `be143bf1` and persistent endpoint fix `028248c8`, with focused critical checks passed. Desktop event metadata and complete paged-history verification are implemented; TypeScript passed. The service check passed setup events and paged history, then exposed timing-dependent macro evidence after restart. Its shared semantic-identity correction passed the query identity case; the full installed-service case passed, including exact restart equality and later publication. Fresh normal service startup and native Home rendering passed; the full native route sweep/restart remains pending background automation. Cleanup is complete. |
 | GPT-6.1 Sol `desktop_bootstrap_trace` — released; lead implements | Lead: installed source/governance/MCP descriptors, MCP cache key and existing installed-service critical case | Native inspector proves bootstrap succeeds but staged CLI unlock emits an operation missing from the Desktop event index; native Apply also emits wrong-case source domain. Correct producer metadata and preserve private CLI/ticket authority, then prove actual Desktop admission. Same confirmed gap affects governance and MCP control: use canonical domains and the existing operations cache. |
@@ -29,6 +31,16 @@ Earlier resource interruption (historical): the lead stopped the sole Cargo buil
 after machine pressure; that check did not pass. Concurrent renderer Vitest workers belong to the
 separate `ai-sidekicks` Claude session and remain untouched, as directed. Memory pressure later
 returned to normal; current compilation remains single-job and low priority.
+
+Background native evidence under `.agents/tmp/v1-first-stock/`:
+`native-webdriver-permissions-build.log` (exit 0), `native-webdriver-market-query.json`
+(original command rejection), `native-webdriver-market-query-corrected.json` (successful real
+transport read), `native-webdriver-routes-corrected.json` (17 route/content observations),
+`native-webdriver-corrected-{home,markets}.png`, `native-webdriver-market-selection.json`, and
+`native-webdriver-corrected-focus.log` (Terminal remained foreground for the complete 1,200-sample
+run). The first hidden Desktop also exited normally through WebDriver window closure. No release
+build, broad CI or whole-app RAM measurement was run. Source capture failure still explains missing
+prices; missing model/data inputs and trusted-update setup are not reclassified as completed workflows.
 
 Authorized stale-artifact cleanup completed: removed 123 obsolete September live-test
 executable copies, 23 disposable hashed build/test executables and 3,026 compiler intermediates.

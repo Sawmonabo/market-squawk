@@ -175,6 +175,7 @@ tauri-build = { version = "=2.6.3", default-features = false }
 # Tauri's supported GTK dialog backend matches the Linux GTK/WebKit runtime we package.
 tauri-plugin-dialog = { version = "=2.7.2", default-features = false, features = ["gtk3"] }
 tauri-plugin-opener = { version = "=2.5.4", default-features = false }
+tauri-plugin-wdio-webdriver = { version = "=1.4.0", default-features = false }
 tempfile = "3.15"
 thiserror = "2.0"
 trybuild = "1.0"

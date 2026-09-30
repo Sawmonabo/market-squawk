@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-register-read"
+description = "Enables the register_read command without any pre-configured scope."
+commands.allow = ["register_read"]
+
+[[permission]]
+identifier = "deny-register-read"
+description = "Denies the register_read command without any pre-configured scope."
+commands.deny = ["register_read"]

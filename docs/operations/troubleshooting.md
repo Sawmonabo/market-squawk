@@ -275,6 +275,44 @@ du -sh /absolute/path/to/.market-squawk
 Use [Backup and recovery](backup-and-recovery.md) for the service-owned backup, verification,
 preview-bound fresh-workspace restore, workspace-switch, update, and program-rollback procedure.
 
+## Background native Desktop checks
+
+The optional `desktop-automation` Cargo feature embeds WebdriverIO's WebDriver server in the
+actual development Desktop. This follows the current [Tauri recommendation](https://v2.tauri.app/develop/tests/webdriver/)
+and [WebdriverIO plugin setup](https://webdriver.io/docs/desktop-testing/tauri/plugin-setup/).
+It uses the real WebView, Tauri commands and installed service; it does not substitute a browser
+mock or synthetic backend. The dependency is pinned to `tauri-plugin-wdio-webdriver` 1.4.0.
+
+Build once through the lead's serialized compiler queue:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 nice -n 19 cargo build --locked \
+  -p market-squawk-desktop --features desktop-automation
+```
+
+With the normal frontend development server and service available, launch against the selected
+development data and installation roots:
+
+```bash
+target/debug/market-squawk-desktop --webdriver-port 4445 \
+  --data-dir /absolute/development/data \
+  --installation-data-root /absolute/development/installation
+```
+
+The explicit port enables a loopback-only WebDriver endpoint, keeps the native window hidden and
+skips foreground activation. On macOS the application uses accessory activation policy. Standard
+WebDriver session, element, script and screenshot requests operate within the native WebView.
+Check `http://127.0.0.1:4445/status`, then create a session with `POST /session` and
+`{"capabilities":{"alwaysMatch":{}}}`. Delete the session when finished. Keep the endpoint local
+and stop the development process when the check is complete.
+
+The feature is off by default; the port option and plugin registration are compiled only with
+debug assertions. A feature-enabled development binary without the port follows normal visible
+startup. Release builds cannot activate this endpoint. Do not use an instrumented build for final
+whole-application resource acceptance. Background WebView interaction does not establish support
+for native file pickers, OS security dialogs or external OAuth pages; those require separate
+evidence. Do not fall back to global keystrokes or foreground automation while the owner works.
+
 ## Maintainer build diagnostics
 
 Generated Cargo output is not product size. Each active Git worktree owns one default local

@@ -35,6 +35,12 @@ an uncovered critical failure. No blanket TDD or per-task CI/review rounds. Exis
 quarter reviews and remediation remain required; ordinary integration checkpoints are not final
 approval and need not repeat that ceremony. Final whole-app measurement follows complete workflows.
 
+The owner approved background native Desktop checks on 2026-09-30 so work does not take the Mac's
+focus or screen. Use the optional development-only embedded WebDriver path documented in
+[troubleshooting](operations/troubleshooting.md#background-native-desktop-checks), with the real
+service. Do not resume global keystrokes or foreground automation while the owner works. Native
+dialog and external OAuth interaction require separate evidence; WebView checks do not prove them.
+
 ## Owner correction: whole-application memory and complete capability — 2026-09-28
 
 The owner clarified the intended RAM range as **500 MB to 1.5 GB, with a 2 GB maximum**
