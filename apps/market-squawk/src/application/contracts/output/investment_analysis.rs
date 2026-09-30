@@ -779,7 +779,6 @@ fn analytical_evidence() -> Value {
     let mut fields = [
         "currentMarket",
         "broaderResearch",
-        "pricePattern",
         "forecast",
         "financialModel",
         "valuation",
@@ -799,6 +798,7 @@ fn analytical_evidence() -> Value {
         )
     })
     .collect::<Vec<_>>();
+    fields.push(("pricePattern", price_pattern_evidence()));
     fields.push((
         "combination",
         closed_complete(vec![
@@ -807,6 +807,41 @@ fn analytical_evidence() -> Value {
         ]),
     ));
     closed_complete(fields)
+}
+
+fn price_pattern_evidence() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            (
+                "outcome",
+                enumeration(&[
+                    "pattern_detected",
+                    "no_matching_pattern",
+                    "pattern_expired",
+                    "pattern_invalidated",
+                ]),
+            ),
+            ("summary", product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            (
+                "outcome",
+                enumeration(&[
+                    "insufficient_bars",
+                    "insufficient_turning_points",
+                    "history_unavailable",
+                    "adjustment_unavailable",
+                    "trading_activity_unavailable",
+                    "price_precision_unavailable",
+                    "assessment_unavailable",
+                    "not_evaluated",
+                ]),
+            ),
+            ("summary", product_text()),
+        ]),
+    ])
 }
 
 fn liquidity() -> Value {

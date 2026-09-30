@@ -9,15 +9,15 @@ use market_squawk_data::{MarketDataInstrumentCatalogError, MarketDataInstrumentR
 use market_squawk_decisions::{
     CostAdjustedBacktestEvidence, ExactFinancialRatio, ExpectedGrossPricePnlAvailability,
     ExpectedReturnAvailability, FeasibleLotRangeAvailability, FeasibleNotionalRangeAvailability,
-    GrossPricePnlAvailability, InvestmentAnalysisEvidence, InvestmentOutcomeProjection,
-    InvestmentProposalDecision, InvestmentProposalIndexEntry, InvestmentProposalIndexOutcome,
-    InvestmentSizingProjection, MarkToZoneDistance, NoActionReason, PortfolioPositionState,
-    ProposalInvalidator, ProposalUnavailableReason, RecommendationAction, RecommendationConfidence,
-    RecommendationConfidenceComponentKind, RecommendationConfidenceComponentValue,
-    RecommendationConfidenceMeaning, RecommendationConfidenceUnavailableReason,
-    RecommendationOutcomeCohort, RecommendationOutcomeStatus,
-    RecommendationOutcomeUnavailableReason, RecommendationStudyQualification,
-    RecommendationTrackRecord, RecommendationTrackRecordGroup,
+    GrossPricePnlAvailability, HarmonicHistoryDisposition, InvestmentAnalysisEvidence,
+    InvestmentOutcomeProjection, InvestmentProposalDecision, InvestmentProposalIndexEntry,
+    InvestmentProposalIndexOutcome, InvestmentSizingProjection, MarkToZoneDistance, NoActionReason,
+    PortfolioPositionState, ProposalInvalidator, ProposalUnavailableReason, RecommendationAction,
+    RecommendationConfidence, RecommendationConfidenceComponentKind,
+    RecommendationConfidenceComponentValue, RecommendationConfidenceMeaning,
+    RecommendationConfidenceUnavailableReason, RecommendationOutcomeCohort,
+    RecommendationOutcomeStatus, RecommendationOutcomeUnavailableReason,
+    RecommendationStudyQualification, RecommendationTrackRecord, RecommendationTrackRecordGroup,
     RecommendationTrackRecordPerformance, SignedMoneyRange, SizingConstraintCap,
     SizingConstraintKind, SizingUnavailableReason, TargetPriceRange,
 };
@@ -28,7 +28,7 @@ use market_squawk_services::{
     RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -847,12 +847,13 @@ fn recommendation_reasons(
             money_text(valuation.fair_value())
         ));
     }
+    reasons.push(price_pattern_assessment(evidence).summary.to_owned());
     if let Some(pattern) = evidence.harmonic_pattern() {
         let direction = match pattern.direction() {
             market_squawk_analytics::HarmonicDirection::Bullish => "bullish",
             market_squawk_analytics::HarmonicDirection::Bearish => "bearish",
         };
-        reasons.push(format!("The observed price pattern is {direction}. It provides research context but does not increase the confidence score."));
+        reasons.push(format!("The observed price pattern is {direction}."));
         if let (Some(forecast), Some(market)) = (evidence.price_forecast(), evidence.market()) {
             let forecast_change = forecast
                 .cases()
@@ -873,11 +874,6 @@ fn recommendation_reasons(
                 reasons.push("The observed pattern points in the opposite direction to the central price forecast; both are shown in this analysis.".to_owned());
             }
         }
-    } else if evidence.harmonic_history().is_some() {
-        reasons.push(
-            "The price history was fully evaluated, but no qualifying harmonic pattern was found."
-                .to_owned(),
-        );
     }
     if let Some(backtest) = evidence.backtest() {
         reasons.push(format!(
@@ -900,9 +896,6 @@ fn recommendation_reasons(
             portfolio_label,
             percentage_from_ppm(portfolio.risk_capacity_ppm())
         ));
-    }
-    if reasons.is_empty() {
-        reasons.push("The saved evidence met every required check for this action.".to_owned());
     }
     reasons
 }
@@ -986,11 +979,7 @@ fn analytical_evidence_value(decision: &InvestmentProposalDecision) -> Value {
             "Broader research inputs were retained with the selected candidate; no one input set the recommendation.",
             "No qualifying broader research contribution was retained with the selected candidate."
         ),
-        "pricePattern": evidence_family_value(
-            evidence.harmonic_pattern().is_some(),
-            "A confirmed price-pattern observation was retained; it did not set evidence reliability or create an action by itself.",
-            "No current valid price pattern was retained."
-        ),
+        "pricePattern": price_pattern_assessment(evidence),
         "forecast": evidence_family_value(
             evidence.price_forecast().is_some(),
             "A horizon-aligned calibrated price forecast contributed to the decision.",
@@ -1035,6 +1024,66 @@ fn analytical_evidence_value(decision: &InvestmentProposalDecision) -> Value {
             }
         }
     })
+}
+
+#[derive(Serialize)]
+struct PricePatternAssessment {
+    state: &'static str,
+    outcome: &'static str,
+    summary: &'static str,
+}
+
+fn price_pattern_assessment(evidence: &InvestmentAnalysisEvidence) -> PricePatternAssessment {
+    let disposition = evidence
+        .harmonic_history()
+        .map(|audit| audit.input().disposition)
+        .or_else(|| {
+            evidence
+                .harmonic_pattern()
+                .map(|_| HarmonicHistoryDisposition::Pattern)
+        });
+    let (state, outcome, summary) = match disposition {
+        Some(HarmonicHistoryDisposition::Pattern) => (
+            "available",
+            "pattern_detected",
+            "A confirmed price-pattern observation was retained; it did not set evidence reliability or create an action by itself.",
+        ),
+        Some(HarmonicHistoryDisposition::NoMatchingPattern) => (
+            "available",
+            "no_matching_pattern",
+            "The saved price history was evaluated, but no qualifying price pattern was found.",
+        ),
+        Some(HarmonicHistoryDisposition::Expired) => (
+            "available",
+            "pattern_expired",
+            "A price pattern was found, but it had expired by the saved analysis cutoff.",
+        ),
+        Some(HarmonicHistoryDisposition::Invalidated) => (
+            "available",
+            "pattern_invalidated",
+            "A price pattern was found, but a later price move had invalidated it by the saved analysis cutoff.",
+        ),
+        Some(HarmonicHistoryDisposition::InsufficientBars) => (
+            "unavailable",
+            "insufficient_bars",
+            "The saved price history contained too few bars to assess price patterns.",
+        ),
+        Some(HarmonicHistoryDisposition::InsufficientPivots) => (
+            "unavailable",
+            "insufficient_turning_points",
+            "The saved price history contained too few confirmed turning points to assess price patterns.",
+        ),
+        None => (
+            "unavailable",
+            "not_evaluated",
+            "No price-pattern assessment was retained with this saved analysis.",
+        ),
+    };
+    PricePatternAssessment {
+        state,
+        outcome,
+        summary,
+    }
 }
 
 fn broader_research_availability(evidence: &InvestmentAnalysisEvidence) -> bool {
@@ -1758,4 +1807,141 @@ fn valuation_method_set_value(
             }
         }).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use market_squawk_analytics::KnownFeatureImplementation;
+    use market_squawk_decisions::{
+        HarmonicHistoryAudit, HarmonicHistoryAuditInput, InvestmentAnalysisEvidenceInput,
+        InvestmentProposalAuthority, RecommendationPolicy,
+    };
+    use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, TickSize, Timestamp};
+    use market_squawk_services::{JsonStructureLimits, ServiceLimits};
+
+    #[test]
+    fn saved_brief_price_pattern_matches_published_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let instrument_id = "018f8f6a-9d6f-7b43-9f38-55db5f4b0e01".parse::<InstrumentId>()?;
+        let currency = market_squawk_domain::Currency::try_from("USD")?;
+        let cutoff = Timestamp::from_unix_nanos(1_790_107_200_000_000_000);
+        let evidence = InvestmentAnalysisEvidence::new(InvestmentAnalysisEvidenceInput {
+            instrument_id,
+            currency,
+            account_id: "018f8f6a-9d6f-7b43-9f38-55db5f4b1a01".parse::<AccountId>()?,
+            as_of: cutoff,
+            admitted_at: cutoff,
+            market: None,
+            price_forecast: None,
+            valuation: None,
+            financial_model: None,
+            backtest: None,
+            out_of_sample: None,
+            harmonic_pattern: None,
+            liquidity: None,
+            portfolio_risk: None,
+        });
+        let project = |evidence| -> Result<Value, Box<dyn std::error::Error>> {
+            let read = InvestmentAnalysisRead {
+                decision: InvestmentProposalAuthority::generate(
+                    evidence,
+                    RecommendationPolicy::v1()?,
+                )?,
+                current: None,
+                outcome_projection: None,
+                sizing_projection: None,
+                sizing_price_scale_unavailable: false,
+            };
+            let mut value = investment_analysis_value(
+                &read,
+                Uuid::new_v4(),
+                InvestmentDisplay::default(),
+                "Portfolio 1".to_owned(),
+            )?;
+            value["chart"] = Value::Null;
+            value["chartAvailable"] = json!(false);
+            Ok(value)
+        };
+        let capabilities = crate::application::application_capabilities()?;
+        let descriptor = capabilities
+            .tools()
+            .iter()
+            .find(|descriptor| descriptor.name() == GET_INVESTMENT_ANALYSIS)
+            .ok_or("missing saved investment analysis descriptor")?;
+        let limits = ServiceLimits::try_new(
+            1024 * 1024,
+            1024,
+            1024 * 1024,
+            1024,
+            JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)?,
+        )?;
+        let validate = |value| -> Result<(), Box<dyn std::error::Error>> {
+            TypedToolResult::try_new(
+                value,
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                limits,
+            )?
+            .validate_for(descriptor)?;
+            Ok(())
+        };
+        let absent = project(evidence.clone())?;
+        assert_eq!(
+            absent["analyticalEvidence"]["pricePattern"]["outcome"],
+            "not_evaluated"
+        );
+        validate(absent)?;
+
+        let identity = EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]);
+        let audit = HarmonicHistoryAudit::try_new(HarmonicHistoryAuditInput {
+            instrument_id,
+            currency,
+            execution_tick: None,
+            analytical_tick: TickSize::try_from_decimal(Decimal::ONE)?,
+            source_cutoff: cutoff,
+            observed_through: cutoff,
+            observed_at: cutoff,
+            available_at: cutoff,
+            rights_decision_identity: identity,
+            rights_graph_identity: identity,
+            rights_checked_at: cutoff,
+            rights_expires_at: cutoff.checked_add_nanos(1)?,
+            evaluated_at: cutoff,
+            source_identity: identity,
+            selected_manifest: identity,
+            origin_manifest: identity,
+            adjustment_identity: identity,
+            calendar_identity: identity,
+            completeness_identity: identity,
+            marketability_identity: identity,
+            implementation_identity: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                KnownFeatureImplementation::BatchHarmonicPatterns
+                    .implementation_digest()?
+                    .as_bytes(),
+            ),
+            materialized_bars: 7,
+            start_ordinal: 0,
+            evaluated_bars: 7,
+            disposition: HarmonicHistoryDisposition::Expired,
+            pattern_digest: None,
+            geometry: None,
+        })?;
+        let mut expired = project(evidence.try_with_harmonic_history(audit)?)?;
+        assert_eq!(
+            expired["analyticalEvidence"]["pricePattern"]["outcome"],
+            "pattern_expired"
+        );
+        validate(expired.clone())?;
+        let mut missing = expired.clone();
+        missing["analyticalEvidence"]["pricePattern"]
+            .as_object_mut()
+            .ok_or("missing price-pattern assessment")?
+            .remove("outcome");
+        assert!(validate(missing).is_err());
+        expired["analyticalEvidence"]["pricePattern"]["state"] = json!("unavailable");
+        assert!(validate(expired).is_err());
+        Ok(())
+    }
 }

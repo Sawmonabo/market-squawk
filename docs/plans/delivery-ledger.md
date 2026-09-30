@@ -2,79 +2,60 @@
 
 ## Active live-stock and harmonic-evidence wave — 2026-09-30
 
-Refresh base `08d23518082d24801827d372c93002f301fcbed4`, clean and pushed. Prior turn was
-progress: stock admission (`9e4bef63`) and saved planning (`08d23518`) passed critical checks;
-PR #43 comment 5910695937 records the evidence. Existing old-root service/Desktop are live and
-must be stopped normally before new-root setup; preserve their roots and retained matching binaries.
+Refresh base `08d23518082d24801827d372c93002f301fcbed4`; execution remains authorized.
+One primary worktree and only the three approved local/origin branches were verified live.
+Old roots and matching binaries are preserved; the old service/Desktop stopped normally.
+Current live root: `.market-squawk/v1-owner-test-stock/{data,installation}`. Protected startup,
+unlock and credential import succeeded. The rebuilt Desktop is running on this root.
 
-| Owner | Exclusive scope | Finishable outcome / dependency / smallest evidence |
+| Owner | Exclusive scope | Outcome, verification and next dependency |
 | --- | --- | --- |
-| Lead | Ledger, runtime processes, setup receipts, shared contracts/codecs/transports, Git/build scheduling | Start current-schema service on a fresh V1 root; use authorized protected unlock/import and actual returned source sessions; prove selected stock/benchmark/fiscal reads, then first stock analysis. One compiler job; no old-root migration. |
-| GPT-6.1 Sol `live_input_recipe` | Read-only SEC activation, company/security enrichment and typed fiscal consumers; write only `.agents/tmp/v1-first-stock/current-sec-recipe.md` | Refresh the exact existing route from a newly admitted MSFT/AAPL equity to usable fiscal inputs. Hand off supported CLI requests, actual code prerequisites and first missing producer/consumer edge; no provider calls, credentials, builds or Git. |
-| Astra `native_setup_current` | Read-only current managed-model-runtime receipts, builder and forecast admission; write only `.agents/tmp/v1-first-stock/current-model-runtime-recipe.md` | Determine the supported minimal refresh needed for the current positive forecasting journey, reusing retained components. Report exact command dependencies and current receipt mismatch; no builds, mutations, credentials or Git. |
-| Astra `harmonic_status_v1` | Read-only `application/research/market_history/harmonic.rs`, owning harmonic types/codecs and downstream projection; write only `.agents/tmp/v1-first-stock/harmonic-status-contract.md` | Specify the smallest complete in-place forming/confirmed/invalidated/expired contract and geometry retention fix. Current source drops invalidated/expired geometry. Exact producer/consumer ownership and one relevant critical check; await lead shared-contract handoff before implementation. |
+| Lead | Runtime/setup, shared contracts/composition, ledger, Git and builds | One single-job CLI/service rebuild is active. After successful exit, stop the existing processes normally, restart on this same root, unlock, renew actual source verification and retry stock startup. |
+| Astra `native_setup_current` — released | Native fund catalog admission plus existing catalog case | Pushed `4139b2a1`: remove the artificial new-ETF rejection; derive Equity/Fund from the official listing; preserve existing issuer and native identity evidence. Critical catalog creation/conflict/revocation/reopen/replay case passed (1 test). Live retry awaits the rebuilt service. |
+| GPT-6.1 Sol `brief_pattern_projection` — released; lead integrated schema | Saved Brief status projection and one existing-module critical case | Actual retained disposition now supplies required `pricePattern.state/outcome/summary`; reasons reuse its explanation. Whole projected Brief passes its published descriptor for expired and unevaluated evidence; missing/contradictory outcome fails. One critical case passed. Shared Rust schema matches existing strict Desktop fields. No new compatibility path. |
+| GPT-6.1 Sol `live_input_recipe` — released | Read-only SEC producer/consumer handoff | Exact company/security and fiscal wiring gaps below; no implementation or live completion claimed. |
+| Astra `harmonic_status_v1` — released | Read-only full harmonic status/geometry contract | Forming and terminal geometry preservation remain required, beyond this Brief decoding fix. Lead must freeze shared declarations before disjoint producer/renderer edits. |
 
-Live refresh: only the three approved local and origin branches and the primary worktree remain
-(verified 2026-09-30). The old service/Desktop stopped normally. Fresh-root protected startup,
-unlock and credential import succeeded; Alpaca verification passed. Start now fails at QQQ native
-asset publication with `SourceIdentityConflict`; do not bypass identity checks or drop the benchmark.
-The standalone Nasdaq `kind:source` request was invalid; the existing resolver owns demand-loaded
-listing publication. Desktop debug compilation remains the single active build.
+Critical evidence under `.agents/tmp/v1-first-stock/`: `fund-admission-critical.log`
+(1 passed, 7 filtered), `brief-pattern-contract-critical.log` (1 passed, 132 filtered),
+and `stock-live-desktop-build.log` (successful single-job debug build). The Brief case closes an
+uncovered essential workflow failure: its real backend payload omitted a required Desktop field.
+The first compile caught a test-only array dereference; corrected before the passing run.
+This is critically verified implementation, not complete live/installed Investment Brief acceptance.
 
-Additional bounded assignment: Astra `native_setup_current` owns read-only diagnosis of the QQQ
-publication failure across retained asset/listing/issuer evidence and admission/resolver callers;
-write `.agents/tmp/v1-first-stock/qqq-admission-failure.md` only. No provider calls, builds, Git,
-credentials or product edits. Hand off the exact conflicting fields and smallest justified fix.
-Its completed model-runtime recipe is retained; defer refresh until source edits are frozen.
-Harmonic and SEC handoffs are pending lead integration, not replacement implementation lanes.
+Live stock verification succeeded, then startup failed at QQQ because new Fund identities were
+rejected despite authentic current listing/native evidence. `4139b2a1` fixes that generic rule
+without a fund whitelist, invented CUSIP, fabricated issuer relationship or weakened custody check.
+Retained evidence and exact failure analysis are in `qqq-admission-failure.md`; prior SPY/VTI
+issuer identities remain unchanged. No schema change or migration is needed for this correction.
+The initial standalone Nasdaq `kind:source` request was invalid; existing demand-loaded directory
+publication owns that route. H.15's expired anonymous session was renewed through native Start,
+then activation succeeded on session `816af143-1016-4450-98f8-e248b89aae06`. This proves setup
+recovery only; publication/typed read on this root still need verification. Actual virtual-account
+options were retrieved; owner balance/cost selection is pending. No account or order was invented.
 
-Producer/consumer repair now authorized within this wave: GPT-6.1 Sol
-`brief_pattern_projection` exclusively owns
-`apps/market-squawk/src/service/decision/investment_analysis.rs` and one cohesive sibling
-projection module if warranted. Emit the existing Desktop `pricePattern` state/outcome contract
-from actual retained harmonic disposition; reuse its status-specific explanation in reasons.
-No new forming status or geometry changes in this checkpoint. Lead owns the shared Rust output
-schema and verification, followed by coherent commit/push. This closes a concrete essential
-workflow failure: strict Desktop decoding rejects every current brief missing `outcome`.
-The full four-state geometry contract remains required subsequent work, not waived acceptance.
+Next dependencies (handoff details retained under the same scratch directory):
 
-QQQ diagnosis established a local artificial admission barrier: canonical market-data Fund
-identities do not require CUSIP or issuer facts; exact current listing plus sealed native UUID and
-quote-unit evidence satisfy the existing identity contract. Astra `native_setup_current` now owns
-`crates/market-squawk-data/src/catalog/market_data_instruments/alpaca_asset_reference.rs` and the
-existing Alpaca admission case in `crates/market-squawk-data/tests/catalog.rs`. Remove only the
-new-fund rejection, derive the new class from official ETF status using the existing shared rule,
-preserve current issuer-enriched records, and extend that critical replay/conflict case to cover
-fund creation. No hardcoded new fund list, invented CUSIP, weakened identity checks, Git or builds.
-Root schedules verification after both writers freeze; provider and Brief repairs remain separate
-coherent checkpoints.
+- SEC currently normalizes under a CIK-derived instrument rather than the catalog equity. Existing
+  company/security review has no installed caller. Complete company capture, evidence-bound
+  relationship and canonical fiscal selection together; a link-only or arbitrary ID replacement is
+  insufficient. Inspect whether company-scoped provenance should stay unchanged through the
+  authorized security join before choosing a normalization change. `current-sec-recipe.md` locates
+  the exact current interfaces and critical coverage.
+- Fiscal plan/build/forecast operations are declared and driven but lack installed service handlers;
+  reuse existing preparation, job and model owners rather than create another pipeline.
+- Retained managed-runtime receipts disagree and required release binaries are absent. Use the
+  supported cache-reusing refresh and compile-time foundation path in `current-model-runtime-recipe.md`
+  after source changes are frozen; do not forge receipts or launch competing builders.
+- `harmonic-status-contract.md` defines required causal forming evidence and retained original
+  invalidated/expired geometry, with active decision receipts confined to confirmed patterns.
 
-Completed read-only handoffs identify the next stock-analysis dependencies precisely:
-SEC currently normalizes under a CIK-derived instrument rather than the catalog equity; the existing
-reviewed company/security authority has no installed caller, and the fiscal dataset/forecast
-operations are declared but lack service handlers. The next coherent SEC slice must preserve
-company capture → reviewed relationship → canonical fiscal read; a link-only or arbitrary ID
-replacement is insufficient. See `current-sec-recipe.md` under the wave's scratch directory.
-Retained model-runtime receipts disagree and required release binaries are absent; use the existing
-cache-reusing refresh and compile-time foundation path in `current-model-runtime-recipe.md` after
-source changes are frozen. Neither handoff establishes live analytical completion.
-
-The generic listed-fund admission repair passed the extended existing catalog case
-(`fund-admission-critical.log`: 1 passed, 7 filtered). It proves Equity and Fund creation from
-retained listing/native evidence, conflicting UUID rejection, unchanged revocation checks and
-exact replay after catalog reopen. It adds no identifier or issuer facts. This is critical fixture
-evidence; the current live service still runs the prior binary until the coherent rebuild/restart.
-Desktop debug build completed successfully and its new-root process is live. Whole-app RAM was not
-measured. Actual virtual-account options were retrieved; owner selection of balance/cost settings
-is pending while provider and Brief repairs continue independently.
-
-DAG: current service → protected setup → actual stock/native identities → SEC/history/rates →
-managed forecasting readiness → saved Investment Brief → same-root restart readback. In parallel,
-current harmonic classification → fixed shared contract → disjoint backend/renderer implementation →
-critical saved-evidence check. Already completed valuation/portfolio wiring is reused, not rebuilt.
-No new branches/worktrees, broad CI, review quarter or whole-app measurement. No live/installed
-completion is inferred from prior fixtures. Account/allocation choices must come from owner-approved
-product choices; do not invent a cash balance or allocation to force analysis admission.
+DAG: protected setup → actual stock/native identities → SEC/history/rates → managed forecast
+readiness → saved Investment Brief → same-root restart. In parallel: fixed harmonic contract →
+disjoint producer/renderer changes → critical saved-evidence proof. Existing valuation and portfolio
+work is reused. No new branches/worktrees, broad CI, review round, release build or whole-app RAM
+measurement. Account/allocation choices remain owner-selected; all full V1 acceptance remains open
+until actual end-to-end evidence exists.
 
 ## Completed stock admission and saved-planning implementation wave — 2026-09-30
 
