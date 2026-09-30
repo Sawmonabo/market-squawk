@@ -2089,23 +2089,28 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?);
     let native_id = uuid::Uuid::from_u128(701);
-    let material = |native_id: uuid::Uuid,
+    let material = |symbol: &str,
+                    exchange: &str,
+                    native_id: uuid::Uuid,
                     extra: &str,
                     received_at: Timestamp|
      -> TestResult<ProviderCaptureMaterial> {
         let body = Bytes::from(format!(
-            r#"{{"id":"{native_id}","symbol":"AAPL","exchange":"NASDAQ","class":"us_equity","status":"active"{extra}}}"#
+            r#"{{"id":"{native_id}","symbol":"{symbol}","exchange":"{exchange}","class":"us_equity","status":"active"{extra}}}"#
         ));
         let body_digest =
             EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
         let request_digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
-            Sha256::digest(b"https://paper-api.alpaca.markets/v2/assets/AAPL").into(),
+            Sha256::digest(
+                format!("https://paper-api.alpaca.markets/v2/assets/{symbol}").as_bytes(),
+            )
+            .into(),
         );
         let receipt = ProviderCaptureSetReceipt::try_new(
             source.source_id().clone(),
             source.revision().clone(),
-            SourceIdentifier::try_from("alpaca:asset-reference:AAPL")?,
+            SourceIdentifier::try_from(format!("alpaca:asset-reference:{symbol}"))?,
             request_digest,
             ProviderCaptureTerminalDisposition::StandaloneResponse,
             vec![ProviderCapturePageReceipt::try_new(
@@ -2134,37 +2139,36 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
         )?;
         Ok(ProviderCaptureMaterial::try_new(receipt, vec![record])?)
     };
-    let original = material(native_id, "", received_at)?;
+    let original = material("AAPL", "NASDAQ", native_id, "", received_at)?;
     let original_receipt = original.receipt().clone();
     let original_records = original.records().to_vec();
-    let admission =
-        |material: ProviderCaptureMaterial| -> TestResult<AlpacaAssetReferenceAdmission> {
-            let pending = AlpacaPendingAssetReference::restore_original(
-                material.receipt(),
-                material.records(),
-            )?;
-            let (rejoin, seal) = pending.into_seal_parts()?;
-            let (asset, capture) = rejoin.try_rejoin(seal.seal(&raw_store)?)?;
-            let mut rights = test_rights_input(
-                source.source_id().clone(),
-                capture.persisted_receipt().capture().observation_digest(),
-                i64::MAX,
-            )?;
-            rights.retrieved_at = asset.received_at();
-            rights.permitted_operations.push(SourceOperation::Display);
-            Ok(AlpacaAssetReferenceAdmission {
-                source: source.clone(),
-                rights,
-                capture,
-                asset,
-                official_listing: listing.clone(),
-                expected_current: None,
-            })
-        };
+    let admission = |material: ProviderCaptureMaterial,
+                     listing: &market_squawk_data::ListingReferenceRecord|
+     -> TestResult<AlpacaAssetReferenceAdmission> {
+        let pending =
+            AlpacaPendingAssetReference::restore_original(material.receipt(), material.records())?;
+        let (rejoin, seal) = pending.into_seal_parts()?;
+        let (asset, capture) = rejoin.try_rejoin(seal.seal(&raw_store)?)?;
+        let mut rights = test_rights_input(
+            source.source_id().clone(),
+            capture.persisted_receipt().capture().observation_digest(),
+            i64::MAX,
+        )?;
+        rights.retrieved_at = asset.received_at();
+        rights.permitted_operations.push(SourceOperation::Display);
+        Ok(AlpacaAssetReferenceAdmission {
+            source: source.clone(),
+            rights,
+            capture,
+            asset,
+            official_listing: listing.clone(),
+            expected_current: None,
+        })
+    };
     let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
     let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
     let created = publisher.publish_alpaca_asset_reference(
-        admission(original)?,
+        admission(original, &listing)?,
         &allowed,
         deadline(),
         &cancellation,
@@ -2216,7 +2220,16 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     // A different native security cannot take the same official listing or consume a new ID.
     assert!(matches!(
         publisher.publish_alpaca_asset_reference(
-            admission(material(uuid::Uuid::from_u128(702), "", received_at)?)?,
+            admission(
+                material(
+                    "AAPL",
+                    "NASDAQ",
+                    uuid::Uuid::from_u128(702),
+                    "",
+                    received_at
+                )?,
+                &listing
+            )?,
             &allowed,
             deadline(),
             &cancellation
@@ -2232,11 +2245,16 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     )?);
     assert!(matches!(
         publisher.publish_alpaca_asset_reference(
-            admission(material(
-                native_id,
-                r#", "name":"changed source body""#,
-                changed_at
-            )?)?,
+            admission(
+                material(
+                    "AAPL",
+                    "NASDAQ",
+                    native_id,
+                    r#", "name":"changed source body""#,
+                    changed_at
+                )?,
+                &listing
+            )?,
             &revoked,
             deadline(),
             &cancellation
@@ -2249,10 +2267,80 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
         Some(created.clone())
     );
     // The restoration boundary rejects an original body substituted under another receipt.
-    let other = material(uuid::Uuid::from_u128(703), "", received_at)?;
+    let other = material(
+        "AAPL",
+        "NASDAQ",
+        uuid::Uuid::from_u128(703),
+        "",
+        received_at,
+    )?;
     assert!(
         AlpacaPendingAssetReference::restore_original(&original_receipt, other.records()).is_err()
     );
+
+    // A current ETF listing and sealed native asset establish a non-execution Fund without
+    // inventing a CUSIP or issuer link. Reuse the fixture's existing SPY directory membership.
+    let fund_listing = listing_reader
+        .exact_current(
+            "SPY",
+            &VenueId::try_from("ARCX")?,
+            deadline(),
+            &cancellation,
+        )?
+        .ok_or("missing SPY listing")?;
+    let fund_native_id = uuid::Uuid::from_u128(704);
+    let fund_original = material("SPY", "ARCA", fund_native_id, "", received_at)?;
+    let fund_receipt = fund_original.receipt().clone();
+    let fund_records = fund_original.records().to_vec();
+    let fund = publisher.publish_alpaca_asset_reference(
+        admission(fund_original, &fund_listing)?,
+        &allowed,
+        deadline(),
+        &cancellation,
+    )?;
+    let fund_definition = fund.definition();
+    assert_eq!(fund_definition.asset_class(), AssetClass::Fund);
+    assert_ne!(fund_definition.instrument_id().as_uuid(), fund_native_id);
+    assert_eq!(
+        fund_definition.quote_currency(),
+        definition.quote_currency()
+    );
+    assert_eq!(
+        fund_definition.quote_currency_evidence(),
+        definition.quote_currency_evidence()
+    );
+    assert_eq!(fund_definition.identifiers().len(), 1);
+    assert!(
+        matches!(fund_definition.identifiers()[0].identifier(), ExternalIdentifier::Ticker(ticker) if ticker.as_str() == "SPY")
+    );
+    assert_eq!(
+        fund_definition.provider_identities()[0]
+            .provider_instrument_id()
+            .as_str(),
+        fund_native_id.to_string()
+    );
+    assert_eq!(fund_definition.venue_mappings().len(), 2);
+    for venue in ["ARCX", "iex"] {
+        assert!(
+            fund_definition
+                .venue_mappings()
+                .iter()
+                .any(|mapping| mapping.venue_id().as_str() == venue
+                    && mapping.venue_symbol().as_str() == "SPY")
+        );
+    }
+    assert!(matches!(
+        publisher.publish_alpaca_asset_reference(
+            admission(
+                material("SPY", "ARCA", uuid::Uuid::from_u128(705), "", received_at)?,
+                &fund_listing
+            )?,
+            &allowed,
+            deadline(),
+            &cancellation,
+        ),
+        Err(MarketDataInstrumentCatalogError::SourceIdentityConflict)
+    ));
 
     drop(reader);
     drop(publisher);
@@ -2265,7 +2353,7 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     // Replay the original received timestamp, which necessarily preceded catalog publication.
     let retained = ProviderCaptureMaterial::try_new(original_receipt, original_records)?;
     let replay = publisher.publish_alpaca_asset_reference(
-        admission(retained)?,
+        admission(retained, &listing)?,
         &allowed,
         deadline(),
         &cancellation,
@@ -2274,6 +2362,20 @@ fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() ->
     assert_eq!(
         reader.latest(canonical, deadline(), &cancellation)?,
         Some(created)
+    );
+    let fund_replay = publisher.publish_alpaca_asset_reference(
+        admission(
+            ProviderCaptureMaterial::try_new(fund_receipt, fund_records)?,
+            &fund_listing,
+        )?,
+        &allowed,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(fund_replay, fund);
+    assert_eq!(
+        reader.latest(fund.definition().instrument_id(), deadline(), &cancellation)?,
+        Some(fund)
     );
     Ok(())
 }

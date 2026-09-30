@@ -155,9 +155,6 @@ impl CatalogAuthority {
                 if input.expected_current.is_none() && !has_native_identity(current, &input)? {
                     return Err(Error::ReferencePositionConflict);
                 }
-            } else if input.official_listing.is_etf() {
-                // Fund creation still requires its separately admitted original issuer facts.
-                return Err(Error::SourceIdentityConflict);
             }
             let record = if let Some(current) = current.as_ref()
                 && already_accepted(current, &input)?
@@ -324,12 +321,7 @@ fn validate_current(
 ) -> Result<(), Error> {
     let definition = current.definition();
     let at = input.asset.received_at();
-    let class = if input.official_listing.is_etf() {
-        AssetClass::Fund
-    } else {
-        AssetClass::Equity
-    };
-    if definition.asset_class() != class
+    if definition.asset_class() != listing_asset_class(&input.official_listing)
         || definition.quote_currency() != input.asset.quote_currency().map_err(|_| Error::InvalidInput)?
         // Replaying the retained original is valid even though its durable catalog commit
         // followed HTTP receipt. Only the already accepted exact body/native UUID may do so.
@@ -355,6 +347,14 @@ fn validate_current(
         return Err(Error::SourceIdentityConflict);
     }
     Ok(())
+}
+
+fn listing_asset_class(listing: &ListingReferenceRecord) -> AssetClass {
+    if listing.is_etf() {
+        AssetClass::Fund
+    } else {
+        AssetClass::Equity
+    }
 }
 
 fn has_native_identity(
@@ -558,7 +558,7 @@ fn build_definition(
         effective_interval: validity,
         asset_class: current
             .map(MarketDataInstrumentDefinition::asset_class)
-            .unwrap_or(AssetClass::Equity),
+            .unwrap_or_else(|| listing_asset_class(&input.official_listing)),
         display_name,
         quote_currency: input
             .asset
