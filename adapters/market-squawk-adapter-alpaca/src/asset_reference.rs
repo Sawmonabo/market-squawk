@@ -6,15 +6,18 @@ use std::{sync::Arc, time::Instant};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    AssetClass, CoverageDelay, Currency, DeliveryEvidence, DigestAlgorithm, EvidenceDigest,
+    ExactPayloadEvidence, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    VersionPinnedSourceLocator,
 };
 use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
-    BudgetDispatchDecision, BudgetReservationDecision, HttpRequestBounds, ProviderCaptureMaterial,
+    ApiEndpointRule, AuthorizationMode, BudgetDispatchDecision, BudgetReservationDecision,
+    EndpointPolicy, HttpRequestBounds, NetworkAccessPolicy, PathScope, ProviderCaptureMaterial,
     ProviderCapturePageReceipt, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
     ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderWholeCaptureToken,
     SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt, SharedProviderBudget,
-    SourceMetadata, apply_http_retry_after,
+    SourceClass, SourceMetadata, SourceProtocolProfile, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use serde::Deserialize;
@@ -34,6 +37,15 @@ pub const ALPACA_ASSET_REFERENCE_ENDPOINT: &str = "https://paper-api.alpaca.mark
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const USER_AGENT: &str = "market-squawk/0.1 alpaca-asset-reference";
 
+// Primary-source denomination contract checked 2026-09-30. It applies to the existing IEX
+// startup snapshots request with no currency parameter; it is not an asset-response field.
+const US_EQUITY_SNAPSHOT_CURRENCY_EXCERPT: &[u8] =
+    b"GET https://data.alpaca.markets/v2/stocks/snapshots\ncurrency: The currency of all prices in ISO 4217 format. Default: USD.\n";
+const US_EQUITY_SNAPSHOT_CURRENCY_SHA256: &str =
+    "a3a45e964d08bdcfdbb2da373e8421d83d60bbc5d8e92ffc3a5df9d0559c1e1a";
+const US_EQUITY_SNAPSHOT_CURRENCY_SOURCE: &str =
+    "https://docs.alpaca.markets/us/reference/stocksnapshots-1";
+
 /// Exact provider asset metadata, issued only after physical seal rejoin.
 pub struct AlpacaOriginalAssetReference {
     id: Uuid,
@@ -44,6 +56,39 @@ pub struct AlpacaOriginalAssetReference {
 }
 
 impl AlpacaOriginalAssetReference {
+    /// Physical rejoin exposes this value only after the exact response declares active us_equity.
+    /// This classification does not establish common-share or execution eligibility.
+    pub const fn is_active_us_equity(&self) -> bool {
+        true
+    }
+
+    /// Quote denomination for the existing IEX snapshots request with currency omitted.
+    /// The unit comes from the provider request contract, never from an issuer assumption.
+    pub fn quote_currency(&self) -> Result<Currency, AlpacaError> {
+        self.quote_currency_evidence()?;
+        Currency::try_from("USD").map_err(|_| AlpacaError::Protocol)
+    }
+
+    /// Exact hash-pinned primary-source excerpt for the default snapshot denomination.
+    pub fn quote_currency_evidence(&self) -> Result<ExactPayloadEvidence, AlpacaError> {
+        let digest = hash(US_EQUITY_SNAPSHOT_CURRENCY_EXCERPT);
+        let actual: String = digest
+            .bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if actual != US_EQUITY_SNAPSHOT_CURRENCY_SHA256 {
+            return Err(AlpacaError::Protocol);
+        }
+        Ok(ExactPayloadEvidence::with_version_pinned_locator(
+            digest,
+            VersionPinnedSourceLocator::new(
+                SourceIdentifier::try_from(US_EQUITY_SNAPSHOT_CURRENCY_SOURCE)?,
+                SourceIdentifier::try_from(format!("sha256:{actual}"))?,
+            ),
+        ))
+    }
+
     pub const fn id(&self) -> Uuid {
         self.id
     }
@@ -79,9 +124,33 @@ impl AlpacaAssetReferenceClient {
             return Err(AlpacaError::InvalidCoverage);
         };
         if metadata.provider().as_str() != "alpaca-market-data"
-            || !metadata.capabilities().live()
+            || metadata.source_class() != SourceClass::Broker
+            || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
+            || metadata.capabilities().live()
+            || !metadata.capabilities().extraction()
+            || metadata.protocol_profile() != &SourceProtocolProfile::NotLive
+            || !metadata
+                .coverage()
+                .asset_classes()
+                .contains(&AssetClass::Equity)
+            || metadata.coverage().delay() != CoverageDelay::NotApplicable
+            || metadata.coverage().delivery() != DeliveryEvidence::AuthorizedBroker
+            || !metadata.coverage().live_channels().is_empty()
             || venue.as_str() != "iex"
         {
+            return Err(AlpacaError::InvalidCoverage);
+        }
+        let network = NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_from_api_rules(
+            vec![ApiEndpointRule::try_new(
+                ALPACA_ASSET_REFERENCE_ENDPOINT,
+                PathScope::Descendants,
+                vec![],
+                1,
+                128,
+            )?],
+            bounds,
+        )?);
+        if metadata.network_policy() != &network {
             return Err(AlpacaError::InvalidCoverage);
         }
         Ok(Self {
@@ -166,6 +235,37 @@ pub struct AlpacaPendingAssetReference {
 }
 
 impl AlpacaPendingAssetReference {
+    /// Reopens pending decoding from exact original catalog receipts and raw envelopes.
+    /// As with live acquisition, physical seal rejoin is required before reference admission.
+    pub fn restore_original(
+        expected: &ProviderCaptureSetReceipt,
+        records: &[RawCaptureRecord],
+    ) -> Result<Self, AlpacaError> {
+        let ([page], [record]) = (expected.pages(), records) else {
+            return Err(AlpacaError::CaptureMaterial);
+        };
+        let symbol = expected
+            .dataset()
+            .as_str()
+            .strip_prefix("alpaca:asset-reference:")
+            .ok_or(AlpacaError::CaptureMaterial)?;
+        let pending = Self::from_body(
+            expected.source_id().clone(),
+            expected.metadata_revision().clone(),
+            symbol.to_owned(),
+            Bytes::copy_from_slice(record.payload()),
+            page.received_at(),
+        )?;
+        decode(&pending.body, symbol)?;
+        let material = pending.material()?;
+        if material.receipt() != expected || material.records() != records {
+            return Err(AlpacaError::CaptureMaterial);
+        }
+        ProviderCaptureMaterial::try_new(expected.clone(), records.to_vec())
+            .map_err(|_| AlpacaError::CaptureMaterial)?;
+        Ok(pending)
+    }
+
     fn from_body(
         source: SourceId,
         revision: MetadataRevision,

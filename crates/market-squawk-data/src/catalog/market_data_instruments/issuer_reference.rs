@@ -429,7 +429,7 @@ impl CatalogAuthority {
     }
 }
 
-fn require_listing_membership(
+pub(super) fn require_listing_membership(
     transaction: &Transaction<'_>,
     listing: &ListingReferenceRecord,
 ) -> Result<(), Error> {
@@ -444,7 +444,7 @@ fn require_listing_membership(
     Ok(())
 }
 
-fn listing_rights_policy(
+pub(super) fn listing_rights_policy(
     transaction: &Transaction<'_>,
     listing: &ListingReferenceRecord,
     at: Timestamp,

@@ -1,6 +1,61 @@
 # Market Squawk Delivery Ledger
 
-## Active native-identity contention wave — 2026-09-30
+## Active stock admission and saved-planning wave — 2026-09-30
+
+Refresh base `505685e667a4650506556ee5725cc8ec3e8bcabb`, clean and pushed; contention checkpoint
+completed with four critical cases and live startup/read evidence (PR #43 comment 5909800002).
+One primary worktree and exactly three local/origin branches remain, freshly verified with live
+remote heads. No extra branch was created. The contracts below define this wave; this table alone
+owns current assignments. Lead schedules one single-job critical check at a time.
+
+| Owner | Exclusive files | Outcome / dependency / critical evidence |
+| --- | --- | --- |
+| GPT-6.1 Sol `live_input_recipe` | `adapters/market-squawk-adapter-alpaca/src/asset_reference.rs`; `crates/market-squawk-data/src/catalog/market_data_instruments/alpaca_asset_reference.rs`; existing `crates/market-squawk-data/tests/catalog.rs` | Generic selected-equity creation from current listing/native UUID and documented quote units, retaining exact replay/conflict/currentness. Hand off the admission DTO before dependent composition changes. No build/Git. |
+| GPT-6.1 Sol `saved_planning_catalog` | New cohesive `crates/market-squawk-data/src/catalog/portfolio_planning.rs` only | Immutable completion records, idempotent saved markers, account-bound paged reads and backup inventory fences. Follow the prepared contract below; send exact schema/export/factory needs to lead. No service dependency, whole-inventory cache, migration, build/Git or extra harness. |
+| Astra `native_setup_current` | `provider_activation/alpaca.rs`, `provider_activation/market_config.rs`, `local_product/market_provider_configuration.rs`, `application/market_runtime/group.rs`, `application/market_runtime/alpaca_asset_reference.rs`, resolver cancellation handoff in `application/market_runtime.rs` under `apps/market-squawk/src/` | Integrate native acquisition before canonical binding with one retained account owner; disjoint provider composition ownership delegated by lead after fixed admission DTO. Resolve reference metadata without fictional canonical IDs. No Git/build. |
+| GPT-6.1 Sol `position_desktop_trace` | `apps/market-squawk/src/portfolio_application.rs`, new `portfolio_application/saved_planning.rs`, existing `portfolio_application/advanced/scenario.rs`, `advanced/planning.rs`, `candidate.rs` | Persist completed calculations and expose shared Save/List/Get against catalog and controlled artifacts; retain internal candidate evidence. Stable catalog DTO dependency. No financial math changes, Git or builds; lead owns operation schemas/composition/backup/UI. |
+| Astra `position_authority_trace` | `apps/market-squawk/src/portfolio_application/backup.rs`; `local_product/operations/portfolio_backup.rs`, `workspace_restore.rs`; `local_product/operations/portfolio_backup/planning.rs`; joined I/O method only in `research_service.rs` | Include completion/save fences and every retained planning artifact in streamed backup/restore, with restored-catalog agreement; coordinate narrow portfolio runtime access with app owner. No Git/build or unrelated backup redesign. |
+| GPT-6.1 Sol `rebalance_desktop_v1` | Portfolio feature files under `apps/market-squawk-desktop/src/features/portfolio/` only | Shared Save control for completed scenario/rebalance/position results; demand-loaded saved list/detail with original backend output. Stable Save/List/Get contract; lead owns native bridge/transport declarations. No financial calculations, Git or builds. |
+| Lead | Shared catalog schema/export/factory, issuer helper visibility, saved-planning application contracts/composition; ledger/Git/builds | Wire saved completion storage through application/client/backup consumers before claiming that journey complete. Serialize shared schema and transport changes. |
+
+DAG: native evidence + catalog creation → lead account preparation/binding/runtime integration →
+existing critical stock/replay check → real stock discovery/restart. Independently, planning catalog
+→ application Save/List/Get and completion hooks → backup/client integration → existing critical
+saved-result/restart case. Assign dependent writers only when the shared interface is fixed. Each
+complete producer-to-consumer checkpoint is verified and pushed separately; no scaffold is completion.
+
+Implementation is frozen and all worker ownership is released. Generic-equity creation, native
+UUID replay, conflicting-identity rejection and revoked publication passed the focused catalog
+case. Initial failures were incomplete fixture broker-budget and process TLS setup; production
+safeguards remain unchanged. The extended Desktop selected-portfolio journey passed explicit Save,
+reopening without recalculation, mutation independence and closed-detail read cancellation. Desktop
+typecheck passed again after that fixture extension. Lead inspection
+corrected saved-list pagination admission and separated public result limits from private artifact
+reads; backup and application reuse one artifact-reference converter.
+
+The new inline backup roundtrip passed with real catalog, controlled artifact repository and owned
+worker: saved/unsaved bytes survive reopen, missing payloads fail backup, damaged/truncated streams
+fail restore. Its metadata fixture represents the analytical snapshot precondition; it does not
+claim an installed full-backup journey. The existing LocalProduct restart/import case passed
+(1 test, 33 filtered), including idempotent Save, account isolation, one-row cursor continuation and
+exact original-result reopening after later import. Its first run exposed fixture initialization/stack setup and a real
+saved-result metadata mismatch: Save/List now use non-source storage metadata, while Get requires
+the retained original source evidence. The fixture initializes storage before writing imports and
+uses the installed service entry point's existing 8 MiB thread stack. Native runtime and Desktop
+bridge check follows, serialized. Native cancellation custody, exact account rebinding and
+candidate-impact evidence each passed their focused existing lib case. The formatted equity
+admission catalog case passed again. No new harness, CI, release build or whole-app RAM measurement
+is scheduled.
+
+Schema changes update V1 in place. Existing live roots are preserved; matching pre-change debug
+programs are retained under `.agents/tmp/v1-first-stock/pre-planning-schema-505685e6-binaries/`.
+A later new-schema live journey uses a fresh root, not a migration or rewrite of old evidence.
+Stock admission is critically verified and ready for its separate integration commit; saved planning
+has passed persistence, backup and Desktop critical checks, with native bridge compilation pending.
+Neither outcome is yet live verified on the updated schema. After both pushed checkpoints, the next
+dependency is fresh-root live stock discovery through the complete saved Investment Brief workflow.
+
+## Completed native-identity contention wave — 2026-09-30
 
 Audit base `5d9a137e`, clean primary worktree; prior turn made verified progress. Discovery and
 stale-price selection are pushed and live verified (PR #43 comments 5909221084 / 5909403787).

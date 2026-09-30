@@ -2,6 +2,7 @@
 
 mod account_stop;
 mod alpaca_asset_reference;
+pub(crate) use alpaca_asset_reference::ensure_alpaca_iex_asset_reference;
 mod alpaca_historical;
 mod alpaca_publication;
 pub(crate) use alpaca_publication::AlpacaPublicationRuntime;
@@ -608,9 +609,10 @@ impl MarketRuntimeRegistry {
             ),
             AccountMarketSurface::AlpacaBasic | AccountMarketSurface::KrakenLevel3 => {
                 PreparedAccountMarketRuntimeStart::Standard(
-                    await_service_before(
+                    await_owned_configuration_resolution(
                         deadline,
                         cancellation,
+                        resolution_guard.token(),
                         self.prepared_configuration.resolve(
                             request,
                             deadline,
@@ -3156,6 +3158,36 @@ where
     }
 }
 
+/// Keeps the resolver and its account/capture owner alive until cancellation has drained it.
+async fn await_owned_configuration_resolution<T, F>(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    owned_cancellation: CancellationToken,
+    future: F,
+) -> Result<T, ServiceError>
+where
+    F: std::future::Future<Output = Result<T, ServiceError>>,
+{
+    tokio::pin!(future);
+    let cause = tokio::select! { biased;
+        () = cancellation.cancelled() => ServiceError::Cancelled,
+        () = tokio::time::sleep_until(deadline.into()) => ServiceError::DeadlineExceeded,
+        result = &mut future => return result,
+    };
+    owned_cancellation.cancel();
+    // A successful late value is dropped only after all reference custody has completed.
+    match future.await {
+        Err(error)
+            if !matches!(
+                error,
+                ServiceError::Cancelled | ServiceError::DeadlineExceeded
+            ) =>
+        {
+            Err(error)
+        }
+        _ => Err(cause),
+    }
+}
 async fn await_service_before<T, F>(
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -3853,6 +3885,60 @@ mod tests {
     use super::*;
     use market_squawk_domain::DigestAlgorithm;
 
+    #[tokio::test]
+    async fn cancelled_configuration_resolution_finishes_original_custody() {
+        for (expires, completion, expected) in [
+            (false, Ok(()), ServiceError::Cancelled),
+            (true, Ok(()), ServiceError::DeadlineExceeded),
+            (
+                false,
+                Err(ServiceError::Unavailable),
+                ServiceError::Unavailable,
+            ),
+        ] {
+            let caller = CancellationToken::new();
+            let owned = CancellationToken::new();
+            let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let finalized = Arc::clone(&finished);
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let watched = owned.clone();
+            let request_cancellation = caller.clone();
+            let deadline = Instant::now()
+                + if expires {
+                    Duration::from_millis(10)
+                } else {
+                    Duration::from_secs(1)
+                };
+            let resolver = tokio::spawn(async move {
+                await_owned_configuration_resolution(
+                    deadline,
+                    &request_cancellation,
+                    watched.clone(),
+                    async move {
+                        let _sent = started.send(());
+                        watched.cancelled().await;
+                        tokio::task::yield_now().await;
+                        finalized.store(true, std::sync::atomic::Ordering::Release);
+                        completion
+                    },
+                )
+                .await
+            });
+            ready.await.expect("original resolver starts");
+            if !expires {
+                caller.cancel();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), resolver)
+                    .await
+                    .expect("original resolver is drained")
+                    .expect("resolver joins"),
+                Err(expected),
+            );
+            assert!(owned.is_cancelled());
+            assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
     #[test]
     fn historical_lookup_rejects_receipt_and_credential_generation_mismatch() {
         let session_id = uuid::Uuid::new_v4();

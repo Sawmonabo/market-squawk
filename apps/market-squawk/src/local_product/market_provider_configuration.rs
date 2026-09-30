@@ -1,10 +1,8 @@
 //! Installed account-market configuration resolution.
 //!
-//! This boundary corroborates the small code-owned overview set against repository-owned identity
-//! and official reference evidence. It never turns a listing symbol or external identifier into
-//! an internal identity, never creates execution terms for listed securities, and never reads an
-//! account credential. Credential activation and provider connections remain owned by the
-//! market-runtime registry after this resolver returns.
+//! This boundary acquires the sole account owner, publishes native references against official
+//! listings, then builds canonical display bindings. It transfers the same owner to the runtime;
+//! the catalog alone creates identities and no listed-security execution terms are fabricated.
 
 use std::{
     num::NonZeroUsize,
@@ -21,23 +19,26 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::AppConfig;
 use market_squawk_services::ServiceError;
-use market_squawk_sources::FreshnessPolicy;
+use market_squawk_sources::{FreshnessPolicy, HttpRequestBounds};
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{
     AccountMarketSurface, PreparedMarketProviderConfigurationRequest,
-    PreparedMarketProviderConfigurationResolver,
+    PreparedMarketProviderConfigurationResolver, ResearchProviderPublicationOperation,
+    ensure_alpaca_iex_asset_reference,
 };
 use crate::provider_activation::nasdaq_reference::NasdaqReferenceUniverseService;
 use crate::provider_activation::{
-    AlpacaBasicMarketConfigurationInput, BoundedMarketDataInstrumentSet,
-    BoundedMarketInstrumentSet, KrakenL3MarketConfigurationInput, MarketDataInstrumentBinding,
-    MarketInstrumentBinding, MarketReferenceIdentityAuthority, MarketReferenceIdentityRequest,
-    MarketReferenceIdentityResolution, MarketSourceEvidence, MarketSubscriptionPriority,
+    AlpacaBasicAccountActivation, AlpacaBasicMarketConfigurationInput,
+    BoundedMarketDataInstrumentSet, BoundedMarketInstrumentSet, KrakenL3MarketConfigurationInput,
+    MarketDataInstrumentBinding, MarketInstrumentBinding, MarketReferenceIdentityAuthority,
+    MarketReferenceIdentityRequest, MarketReferenceIdentityResolution,
+    MarketReferenceIdentityUnavailable, MarketSourceEvidence, MarketSubscriptionPriority,
     PreparedMarketProviderConfiguration, ProviderMarketConfigurationRequest,
 };
 use crate::{ProviderAdapterActivation, ProviderOnboardingService, ResearchService};
 
+const ALPACA_ASSET_REFERENCE_SOURCE: &str = "alpaca-basic-asset-reference-v1";
 const ALPACA_IEX_SOURCE: &str = "alpaca-basic-iex-market-data";
 const ALPACA_OPTION_CHAIN_SOURCE: &str = "alpaca-basic-indicative-option-chain-v1";
 const KRAKEN_LEVEL3_SOURCE: &str = "kraken-authenticated-level3-market-data";
@@ -82,6 +83,54 @@ impl ProductionMarketProviderConfigurationResolver {
 
     async fn resolve_display_bindings(
         &self,
+        activation: &AlpacaBasicAccountActivation,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedMarketDataInstrumentSet, ServiceError> {
+        let metadata = self
+            .provider_activation
+            .alpaca_asset_reference_metadata(
+                activation,
+                source_evidence(activation.lease(), ALPACA_ASSET_REFERENCE_SOURCE)?,
+                HttpRequestBounds::default(),
+            )
+            .map_err(|error| map_reference_error(error, deadline, cancellation))?;
+        let generation = self
+            .provider_activation
+            .register_alpaca_publication_generation(activation, &metadata)
+            .map_err(|error| map_reference_error(error, deadline, cancellation))?;
+        let result = async {
+            let operation = self
+                .provider_activation
+                .acquire_alpaca_reference_operation(
+                    &generation,
+                    cancellation.child_token(),
+                    deadline,
+                )
+                .await
+                .map_err(|error| map_reference_error(error, deadline, cancellation))?;
+            self.resolve_display_bindings_with_reference(
+                activation,
+                &operation,
+                deadline,
+                cancellation,
+            )
+            .await
+        }
+        .await;
+        // End the temporary reference admission even when acquisition fails. The caller cancels
+        // and joins this original resolver, preserving raw custody and exact-generation drain.
+        self.provider_activation
+            .revoke_research_runtime(&generation)
+            .await
+            .map_err(|error| map_reference_error(error, deadline, cancellation))?;
+        result
+    }
+
+    async fn resolve_display_bindings_with_reference(
+        &self,
+        activation: &AlpacaBasicAccountActivation,
+        operation: &ResearchProviderPublicationOperation,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<BoundedMarketDataInstrumentSet, ServiceError> {
@@ -111,7 +160,12 @@ impl ProductionMarketProviderConfigurationResolver {
                 continue;
             }
             let listing = reader
-                .exact_current(issuer.symbol().as_str(), issuer.venue(), deadline, cancellation)
+                .exact_current(
+                    issuer.symbol().as_str(),
+                    issuer.venue(),
+                    deadline,
+                    cancellation,
+                )
                 .map_err(|error| map_reference_error(error, deadline, cancellation))?
                 .ok_or(ServiceError::Unavailable)?;
             let now = system_timestamp()?;
@@ -141,52 +195,82 @@ impl ProductionMarketProviderConfigurationResolver {
         bindings
             .try_reserve_exact(listings.len())
             .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let budget = activation
+            .asset_reference_budget()
+            .map_err(|error| map_reference_error(error, deadline, cancellation))?;
         for listing in listings {
-            let resolution = self
+            ensure_before(deadline, cancellation)?;
+            let request = MarketReferenceIdentityRequest::new(
+                listing.key().symbol().clone(),
+                listing.key().mic().clone(),
+            );
+            let before = match self
                 .reference_identity
-                .resolve(
-                    MarketReferenceIdentityRequest::new(
-                        listing.key().symbol().clone(),
-                        listing.key().mic().clone(),
-                    ),
+                .resolve(request.clone(), deadline, cancellation)
+                .await
+                .map_err(|error| map_reference_error(error, deadline, cancellation))?
+            {
+                MarketReferenceIdentityResolution::Available(approval) => Some(
+                    self.market_data_instruments
+                        .latest(approval.instrument_id(), deadline, cancellation)
+                        .map_err(|error| map_reference_error(error, deadline, cancellation))?
+                        .ok_or(ServiceError::Unavailable)?,
+                ),
+                MarketReferenceIdentityResolution::Unavailable(
+                    MarketReferenceIdentityUnavailable::CanonicalInstrumentUnresolved,
+                ) => None,
+                MarketReferenceIdentityResolution::Unavailable(_) => {
+                    return Err(ServiceError::Unavailable);
+                }
+            };
+            let official_listing = reader
+                .exact_current(
+                    listing.key().symbol().as_str(),
+                    listing.key().mic(),
                     deadline,
                     cancellation,
                 )
+                .map_err(|error| map_reference_error(error, deadline, cancellation))?
+                .ok_or(ServiceError::Unavailable)?;
+            let route = ensure_alpaca_iex_asset_reference(
+                activation,
+                &self.research,
+                operation,
+                &budget,
+                HttpRequestBounds::default(),
+                before,
+                official_listing,
+                deadline,
+                cancellation,
+            )
+            .await?;
+            let MarketReferenceIdentityResolution::Available(approval) = self
+                .reference_identity
+                .resolve(request, deadline, cancellation)
                 .await
-                .map_err(|error| {
-                    tracing::warn!(%error, "repository-owned market identity resolution failed");
-                    request_state_error(deadline, cancellation)
-                })?;
-            let MarketReferenceIdentityResolution::Available(approval) = resolution else {
-                tracing::debug!(
-                    symbol = listing.key().symbol().as_str(),
-                    venue = listing.key().mic().as_str(),
-                    "default market listing has no exact canonical identity approval"
-                );
-                continue;
-            };
-            let Some(record) = self
-                .market_data_instruments
-                .latest(approval.instrument_id(), deadline, cancellation)
-                .map_err(|error| {
-                    tracing::error!(%error, "repository-owned market identity read failed");
-                    request_state_error(deadline, cancellation)
-                })?
+                .map_err(|error| map_reference_error(error, deadline, cancellation))?
             else {
-                continue;
+                return Err(ServiceError::Unavailable);
             };
+            let binding = MarketDataInstrumentBinding::try_from_nasdaq_session_listing(
+                MarketSubscriptionPriority::Benchmark,
+                route.after.clone(),
+                listing.key().symbol().clone(),
+                listing,
+                &approval,
+            )
+            .map_err(|error| map_reference_error(error, deadline, cancellation))?;
             bindings.push(
-                MarketDataInstrumentBinding::try_from_nasdaq_session_listing(
-                    MarketSubscriptionPriority::Benchmark,
-                    record,
-                    listing.key().symbol().clone(),
-                    listing,
-                    &approval,
-                )
-                .map_err(|error| {
-                    tracing::error!(%error, "market display symbol binding failed");
-                    ServiceError::InvalidResult
-                })?,
+                binding
+                    .try_rebind_after_alpaca_reference(
+                        &route.after,
+                        &route.after,
+                        &route.native,
+                        &self.market_data_instruments,
+                        deadline,
+                        cancellation,
+                    )
+                    .map_err(|error| map_reference_error(error, deadline, cancellation))?,
             );
         }
         BoundedMarketDataInstrumentSet::try_new(bindings).map_err(|error| {
@@ -201,12 +285,18 @@ impl ProductionMarketProviderConfigurationResolver {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<PreparedMarketProviderConfiguration, ServiceError> {
+        let activation = self
+            .provider_activation
+            .activate_alpaca_basic_account(lease.clone(), cancellation.child_token())
+            .await
+            .map_err(|error| map_reference_error(error, deadline, cancellation))?;
         let instruments = self
-            .resolve_display_bindings(deadline, cancellation)
+            .resolve_display_bindings(&activation, deadline, cancellation)
             .await?;
         let configured_at = system_timestamp()?;
         let request =
             ProviderMarketConfigurationRequest::AlpacaBasic(AlpacaBasicMarketConfigurationInput {
+                activation,
                 configured_at,
                 iex_evidence: source_evidence(&lease, ALPACA_IEX_SOURCE)?,
                 calendar_evidence: calendar_source_evidence(&lease)?,

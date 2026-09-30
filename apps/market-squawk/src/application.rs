@@ -71,6 +71,7 @@ pub use fair_value::{
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub(crate) use market_runtime::{
+    ensure_alpaca_iex_asset_reference,
     AlpacaPublicationRuntime,
     AlpacaOptionChainRuntime, OptionChainDemand, OptionChainDemandError, OptionChainDemandResult,
     AccountGroupStopReceipt, AccountMarketRuntimeReconnect, PreparedAccountStop,

@@ -1940,6 +1940,344 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     Ok(())
 }
 
+#[test]
+fn alpaca_asset_reference_creates_equity_and_replays_sealed_native_identity() -> TestResult {
+    let _tls = market_squawk_platform::install_ring_tls_provider()?;
+    use bytes::Bytes;
+    use chrono::{DateTime, Utc};
+    use market_squawk_adapter_alpaca::{
+        ALPACA_ASSET_REFERENCE_ENDPOINT, AlpacaAssetReferenceClient, AlpacaPendingAssetReference,
+    };
+    use market_squawk_data::{
+        AlpacaAssetReferenceAdmission, IngestError, IngestPrecommitAuthority,
+    };
+    use market_squawk_platform::RawCaptureRecord;
+    use market_squawk_sources::{
+        ApiEndpointRule, BackoffPolicy, BudgetScope, EndpointPolicy, HttpRequestBounds, PathScope,
+        ProviderBudgetPolicy, ProviderCaptureMaterial, ProviderCapturePageReceipt,
+        ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    };
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct Precommit {
+        checks: AtomicUsize,
+        revoke_on: usize,
+    }
+    impl IngestPrecommitAuthority for Precommit {
+        fn validate_precommit(&self) -> Result<(), IngestError> {
+            if self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.revoke_on {
+                Err(IngestError::PublicationAuthorityRevoked)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let allowed = Precommit {
+        checks: AtomicUsize::new(0),
+        revoke_on: usize::MAX,
+    };
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("alpaca-native-equity"))?;
+    let config = CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let catalog = CatalogAuthority::open(config.clone())?;
+    let listing_source = listing_reference_source()?;
+    catalog.register_source(&listing_source, Timestamp::from_unix_nanos(10))?;
+    let generation = listing_reference_generation(listing_source.clone(), None, 20, 91)?;
+    let rights = catalog.admit_source_rights(listing_reference_rights(
+        listing_source.source_id().clone(),
+        generation.source_payload_set_digest(),
+    )?)?;
+    let authority = Arc::new(Mutex::new(catalog));
+    let deadline = || Instant::now() + Duration::from_secs(10);
+    let cancellation = CancellationToken::new();
+    let listing_publisher = ListingReferencePublicationCapability::try_new(
+        Arc::clone(&authority),
+        SourceIdentifier::try_from("nasdaq.symbol-directory.us-listed.v1")?,
+        listing_source.source_id().clone(),
+        rights,
+    )?;
+    listing_publisher.publish(generation, deadline(), &cancellation)?;
+    let listing_reader = ListingReferenceReadCapability::new(
+        Arc::clone(&authority),
+        SourceIdentifier::try_from("nasdaq.symbol-directory.us-listed.v1")?,
+        listing_source.source_id().clone(),
+    );
+    let listing = listing_reader
+        .exact_current(
+            "AAPL",
+            &VenueId::try_from("XNAS")?,
+            deadline(),
+            &cancellation,
+        )?
+        .ok_or("missing AAPL listing")?;
+
+    // The reference profile has no canonical IDs or live authority; its only remote resource is
+    // authenticated asset metadata. The same profile is accepted by the production client.
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+    let bounds = HttpRequestBounds::default();
+    let provider = SourceIdentifier::try_from("alpaca-market-data")?;
+    let authorization = AuthorizationGrant::new(
+        AuthorizationMode::UserAuthorized,
+        AuthorizationBasis::new(SourceIdentifier::try_from("test-owner-authorized-account")?),
+        ExactPayloadEvidence::from_content_digest(digest(151)),
+        effective,
+    );
+    let budget = ProviderBudgetPolicy::try_new(
+        BudgetScope::for_authorization(provider.clone(), &authorization)?,
+        NonZeroU32::new(200).ok_or("nonzero reference request limit")?,
+        NonZeroU64::new(60_000_000_000).ok_or("nonzero reference window")?,
+        NonZeroU16::new(2).ok_or("nonzero reference concurrency")?,
+        BackoffPolicy::try_new(
+            NonZeroU64::new(1_000_000_000).ok_or("nonzero initial reference backoff")?,
+            NonZeroU64::new(60_000_000_000).ok_or("nonzero maximum reference backoff")?,
+            1_000,
+        )?,
+    )?;
+    let source = SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        SourceId::try_from("alpaca-basic-asset-reference-v1")?,
+        RevisionBoundPayloadEvidence::new(
+            MetadataRevision::new(SourceIdentifier::try_from("alpaca-assets-test-v1")?),
+            ExactPayloadEvidence::from_content_digest(digest(150)),
+        ),
+        SourceClass::Broker,
+        provider,
+        authorization,
+        SourceCoverage::try_instrument(
+            ExactPayloadEvidence::from_content_digest(digest(152)),
+            effective,
+            vec![AssetClass::Equity, AssetClass::Fund],
+            CoverageTopology::partial_venues(vec![VenueId::try_from("iex")?])?,
+            InstrumentCoverage::partial(),
+            None,
+            CoverageDelay::NotApplicable,
+            DeliveryEvidence::AuthorizedBroker,
+        )?,
+        DataQuality::DirectUnverified,
+        NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_from_api_rules(
+            vec![ApiEndpointRule::try_new(
+                ALPACA_ASSET_REFERENCE_ENDPOINT,
+                PathScope::Descendants,
+                vec![],
+                1,
+                128,
+            )?],
+            bounds,
+        )?),
+        FreshnessPolicy::try_new(1, 1, 1, 1, 0)?,
+        Some(budget),
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::None,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))?;
+    AlpacaAssetReferenceClient::try_new(source.clone(), bounds)?;
+    let raw_store = paths.sealed_research_journal_store()?;
+    let received_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    let native_id = uuid::Uuid::from_u128(701);
+    let material = |native_id: uuid::Uuid,
+                    extra: &str,
+                    received_at: Timestamp|
+     -> TestResult<ProviderCaptureMaterial> {
+        let body = Bytes::from(format!(
+            r#"{{"id":"{native_id}","symbol":"AAPL","exchange":"NASDAQ","class":"us_equity","status":"active"{extra}}}"#
+        ));
+        let body_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
+        let request_digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(b"https://paper-api.alpaca.markets/v2/assets/AAPL").into(),
+        );
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            source.source_id().clone(),
+            source.revision().clone(),
+            SourceIdentifier::try_from("alpaca:asset-reference:AAPL")?,
+            request_digest,
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![ProviderCapturePageReceipt::try_new(
+                0,
+                request_digest,
+                None,
+                None,
+                200,
+                u64::try_from(body.len())?,
+                body_digest,
+                received_at,
+            )?],
+        )?;
+        let connection = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            &receipt.observation_digest().bytes(),
+        );
+        let record = RawCaptureRecord::try_new_live(
+            uuid::Uuid::new_v5(&connection, &body_digest.bytes()),
+            Arc::from(source.source_id().as_str()),
+            connection,
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            body,
+        )?;
+        Ok(ProviderCaptureMaterial::try_new(receipt, vec![record])?)
+    };
+    let original = material(native_id, "", received_at)?;
+    let original_receipt = original.receipt().clone();
+    let original_records = original.records().to_vec();
+    let admission =
+        |material: ProviderCaptureMaterial| -> TestResult<AlpacaAssetReferenceAdmission> {
+            let pending = AlpacaPendingAssetReference::restore_original(
+                material.receipt(),
+                material.records(),
+            )?;
+            let (rejoin, seal) = pending.into_seal_parts()?;
+            let (asset, capture) = rejoin.try_rejoin(seal.seal(&raw_store)?)?;
+            let mut rights = test_rights_input(
+                source.source_id().clone(),
+                capture.persisted_receipt().capture().observation_digest(),
+                i64::MAX,
+            )?;
+            rights.retrieved_at = asset.received_at();
+            rights.permitted_operations.push(SourceOperation::Display);
+            Ok(AlpacaAssetReferenceAdmission {
+                source: source.clone(),
+                rights,
+                capture,
+                asset,
+                official_listing: listing.clone(),
+                expected_current: None,
+            })
+        };
+    let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let created = publisher.publish_alpaca_asset_reference(
+        admission(original)?,
+        &allowed,
+        deadline(),
+        &cancellation,
+    )?;
+    let definition = created.definition();
+    let canonical = definition.instrument_id();
+    assert_ne!(canonical.as_uuid(), native_id);
+    assert_eq!(definition.asset_class(), AssetClass::Equity);
+    assert_eq!(definition.quote_currency(), Currency::try_from("USD")?);
+    assert_eq!(
+        definition
+            .quote_currency_evidence()
+            .version_pinned_locator()
+            .ok_or("missing currency locator")?
+            .reference()
+            .as_str(),
+        "https://docs.alpaca.markets/us/reference/stocksnapshots-1"
+    );
+    assert_eq!(
+        definition
+            .display_name()
+            .ok_or("missing listing name")?
+            .as_str(),
+        "Apple Inc. - Common Stock"
+    );
+    assert_eq!(definition.identifiers().len(), 1);
+    assert!(
+        matches!(definition.identifiers()[0].identifier(), ExternalIdentifier::Ticker(ticker) if ticker.as_str() == "AAPL")
+    );
+    assert_eq!(
+        definition.provider_identities()[0].source_id(),
+        source.source_id()
+    );
+    assert_eq!(
+        definition.provider_identities()[0]
+            .provider_instrument_id()
+            .as_str(),
+        native_id.to_string()
+    );
+    assert_eq!(definition.venue_mappings().len(), 2);
+    assert!(
+        definition
+            .venue_mappings()
+            .iter()
+            .any(|mapping| mapping.venue_id().as_str() == "iex"
+                && mapping.venue_symbol().as_str() == "AAPL")
+    );
+
+    // A different native security cannot take the same official listing or consume a new ID.
+    assert!(matches!(
+        publisher.publish_alpaca_asset_reference(
+            admission(material(uuid::Uuid::from_u128(702), "", received_at)?)?,
+            &allowed,
+            deadline(),
+            &cancellation
+        ),
+        Err(MarketDataInstrumentCatalogError::SourceIdentityConflict)
+    ));
+    let revoked = Precommit {
+        checks: AtomicUsize::new(0),
+        revoke_on: 3,
+    };
+    let changed_at = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?);
+    assert!(matches!(
+        publisher.publish_alpaca_asset_reference(
+            admission(material(
+                native_id,
+                r#", "name":"changed source body""#,
+                changed_at
+            )?)?,
+            &revoked,
+            deadline(),
+            &cancellation
+        ),
+        Err(MarketDataInstrumentCatalogError::PublicationAuthority(_))
+    ));
+    assert_eq!(revoked.checks.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        reader.latest(canonical, deadline(), &cancellation)?,
+        Some(created.clone())
+    );
+    // The restoration boundary rejects an original body substituted under another receipt.
+    let other = material(uuid::Uuid::from_u128(703), "", received_at)?;
+    assert!(
+        AlpacaPendingAssetReference::restore_original(&original_receipt, other.records()).is_err()
+    );
+
+    drop(reader);
+    drop(publisher);
+    drop(listing_reader);
+    drop(listing_publisher);
+    drop(authority);
+    let reopened = Arc::new(Mutex::new(CatalogAuthority::open(config)?));
+    let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&reopened));
+    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&reopened));
+    // Replay the original received timestamp, which necessarily preceded catalog publication.
+    let retained = ProviderCaptureMaterial::try_new(original_receipt, original_records)?;
+    let replay = publisher.publish_alpaca_asset_reference(
+        admission(retained)?,
+        &allowed,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(replay, created);
+    assert_eq!(
+        reader.latest(canonical, deadline(), &cancellation)?,
+        Some(created)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn native_reference_custody_preserves_prior_identity_and_recovers_original() -> TestResult {
     use bytes::Bytes;

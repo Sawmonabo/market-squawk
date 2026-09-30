@@ -944,8 +944,10 @@ impl BoundedMarketInstrumentSet {
 }
 
 /// Explicit Alpaca Basic construction inputs.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AlpacaBasicMarketConfigurationInput {
+    /// Sole account owner, retained from native reference acquisition.
+    pub activation: super::AlpacaBasicAccountActivation,
     /// Trusted caller instant at which every retained authority is jointly revalidated.
     pub configured_at: Timestamp,
     pub iex_evidence: MarketSourceEvidence,
@@ -974,15 +976,16 @@ pub struct KrakenL3MarketConfigurationInput {
 }
 
 /// Closed account-market request paired with an exact active activation lease.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ProviderMarketConfigurationRequest {
     AlpacaBasic(AlpacaBasicMarketConfigurationInput),
     KrakenLevel3(KrakenL3MarketConfigurationInput),
 }
 
 /// Prepared Alpaca configs plus the exact lease and canonical definitions that produced them.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PreparedAlpacaBasicMarketConfiguration {
+    activation: super::AlpacaBasicAccountActivation,
     lease: ProviderActivationLease,
     account: ProviderAccountBinding,
     iex: AlpacaIexLiveConfig,
@@ -1047,7 +1050,7 @@ impl PreparedAlpacaBasicMarketConfiguration {
         &self.calendar_rights
     }
 
-    /// Moves the exact lease, configs, and route-definition inputs into central composition.
+    /// Moves the retained account owner, configs, and route-definition inputs into composition.
     #[allow(
         clippy::type_complexity,
         reason = "the exact handoff remains one atomic value tuple"
@@ -1055,7 +1058,7 @@ impl PreparedAlpacaBasicMarketConfiguration {
     pub fn into_parts(
         self,
     ) -> (
-        ProviderActivationLease,
+        super::AlpacaBasicAccountActivation,
         AlpacaIexLiveConfig,
         Box<[MarketDataInstrumentBinding]>,
         SourceMetadata,
@@ -1066,7 +1069,7 @@ impl PreparedAlpacaBasicMarketConfiguration {
         Option<(AlpacaOptionsLiveConfig, Box<[MarketDataInstrumentBinding]>)>,
     ) {
         (
-            self.lease,
+            self.activation,
             self.iex,
             self.iex_instruments,
             self.historical_metadata,
@@ -1137,18 +1140,91 @@ impl PreparedKrakenL3MarketConfiguration {
     }
 }
 
-/// One exact account-provider configuration prepared without secrets or network access.
-#[derive(Clone, Debug)]
+/// One exact configuration retaining its already acquired account owner when required.
+#[derive(Debug)]
 pub enum PreparedMarketProviderConfiguration {
     AlpacaBasic(PreparedAlpacaBasicMarketConfiguration),
     KrakenLevel3(PreparedKrakenL3MarketConfiguration),
 }
 
 impl ProviderAdapterActivation {
+    /// Exact account-qualified reference contract; canonical identities are discovered afterward.
+    pub(crate) fn alpaca_asset_reference_metadata(
+        &self,
+        activation: &super::AlpacaBasicAccountActivation,
+        evidence: MarketSourceEvidence,
+        bounds: HttpRequestBounds,
+    ) -> Result<SourceMetadata, MarketProviderConfigurationError> {
+        use market_squawk_domain::{
+            ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence, SchemaVersion,
+            SequenceCapability,
+        };
+        use market_squawk_sources::{
+            ApiEndpointRule, CoverageTopology, EndpointPolicy, HistoricalCapability,
+            InstrumentCoverage, NetworkAccessPolicy, PathScope, SourceCapabilities, SourceClass,
+            SourceCoverage, SourceMetadataInput, SourceProtocolProfile,
+        };
+        let lease = activation.lease();
+        let account = activation.account_binding();
+        let budget = qualified_budget(lease, account)?;
+        validate_source_evidence(lease.authority_effective_at(), &evidence)?;
+        let endpoint = market_squawk_adapter_alpaca::ALPACA_ASSET_REFERENCE_ENDPOINT;
+        let digest = metadata_digest_for_bindings(
+            b"market-squawk/alpaca-native-asset-reference/v1\0",
+            lease,
+            lease.authority_effective_at(),
+            account,
+            &budget,
+            &evidence,
+            MetadataProfile::AlpacaAssetReference { endpoint },
+            (),
+            &bounds,
+        )?;
+        let coverage = SourceCoverage::try_instrument(
+            evidence.coverage_evidence.clone(),
+            evidence.coverage_effective,
+            vec![AssetClass::Equity, AssetClass::Fund],
+            CoverageTopology::single_venue(VenueId::try_from("iex")?),
+            InstrumentCoverage::partial(),
+            None,
+            CoverageDelay::NotApplicable,
+            DeliveryEvidence::AuthorizedBroker,
+        )
+        .map_err(AlpacaError::from)?;
+        let endpoint = ApiEndpointRule::try_new(endpoint, PathScope::Descendants, Vec::new(), 1, 128)
+            .map_err(AlpacaError::from)?;
+        let network =
+            EndpointPolicy::try_from_api_rules(vec![endpoint], bounds).map_err(AlpacaError::from)?;
+        SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            evidence.source_id.clone(),
+            revision_evidence(lease, "alpaca-asset-reference", digest)?,
+            SourceClass::Broker,
+            SourceIdentifier::try_from("alpaca-market-data")?,
+            authorization(lease, account)?,
+            coverage,
+            DataQuality::DirectUnverified,
+            NetworkAccessPolicy::Allowlisted(network),
+            evidence.freshness,
+            Some(budget),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::None,
+                false,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))
+        .map_err(AlpacaError::from)
+        .map_err(Into::into)
+    }
+
     /// Constructs adapter configurations while holding exact active-lease mutation authority.
     ///
-    /// This method performs no network access, reads no credential, and retains no secret. It
-    /// validates the exact active lease before and after construction while the onboarding
+    /// This method performs no network access or credential acquisition. Alpaca retains the
+    /// account owner supplied after native reference preparation. It validates the exact active lease before and after construction while the onboarding
     /// mutation guard is held. Every metadata revision is a deterministic SHA-256 commitment to
     /// the lease, qualified account budget, logical source evidence, provider profile, transport
     /// bounds, caller-supplied configuration instant, and sorted canonical instrument bindings.
@@ -1203,6 +1279,20 @@ fn prepare_alpaca(
     lease: &ProviderActivationLease,
     input: AlpacaBasicMarketConfigurationInput,
 ) -> Result<PreparedAlpacaBasicMarketConfiguration, MarketProviderConfigurationError> {
+    let acquired = input.activation.lease();
+    if acquired.session_id() != lease.session_id()
+        || acquired.generation() != lease.generation()
+        || acquired.capability_digest() != lease.capability_digest()
+        || acquired.capability_revision() != lease.capability_revision()
+        || acquired.rights_decision_digest() != lease.rights_decision_digest()
+        || acquired.secret_reference() != lease.secret_reference()
+        || acquired.authority_effective_at() != lease.authority_effective_at()
+        || acquired.verification_expires_at() != lease.verification_expires_at()
+        || acquired.public_configuration_digest() != lease.public_configuration_digest()
+        || acquired.runtime_evidence_digest() != lease.runtime_evidence_digest()
+    {
+        return Err(MarketProviderConfigurationError::LeaseBinding);
+    }
     validate_configured_at(lease, input.configured_at)?;
     let account =
         ProviderAccountBinding::try_from_lease(ProviderMarketAccount::AlpacaBasic, lease)?;
@@ -1447,7 +1537,15 @@ fn prepare_alpaca(
             );
         }
     };
+    let activation = input
+        .activation
+        .with_live_configurations(
+            iex.clone(),
+            options.as_ref().map(|(config, _)| config.clone()),
+        )
+        .map_err(|_| MarketProviderConfigurationError::LeaseBinding)?;
     Ok(PreparedAlpacaBasicMarketConfiguration {
+        activation,
         lease: lease.clone(),
         account,
         iex,
@@ -2031,6 +2129,7 @@ fn authorization(
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum MetadataProfile {
+    AlpacaAssetReference { endpoint: &'static str },
     AlpacaIex {
         current_source_id: &'static str,
         indicative_options_configured: bool,

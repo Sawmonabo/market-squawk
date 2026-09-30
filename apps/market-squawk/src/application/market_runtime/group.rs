@@ -13,7 +13,7 @@ use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp, VenueId,
 use market_squawk_live::ShardKey;
 use market_squawk_platform::{AppConfig, CaptureProcessInfrastructure};
 use market_squawk_services::ServiceError;
-use market_squawk_sources::{HttpRequestBounds, ProviderNativeIdentityRequest, ProviderRateAuthority};
+use market_squawk_sources::{ProviderNativeIdentityRequest, ProviderRateAuthority};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -37,7 +37,6 @@ use crate::{
 };
 
 use super::{
-    alpaca_asset_reference::ensure_alpaca_iex_asset_reference,
     alpaca_historical::{
         AlpacaHistoricalCapabilityError, AlpacaHistoricalCapabilityOwner,
         AlpacaHistoricalRuntimeCapability,
@@ -1001,7 +1000,7 @@ async fn start_alpaca(
 > {
     let option_chain_config = prepared.option_chain_config().cloned();
     let (
-        lease,
+        mut activation,
         iex_config,
         iex_bindings,
         historical_metadata,
@@ -1012,14 +1011,17 @@ async fn start_alpaca(
         optional,
     ) = prepared.into_parts();
     let iex_config_for_mappings = iex_config.clone();
-    let options_config_for_mappings = optional.as_ref().map(|(config, _)| config.clone());
     let mut metadata = vec![iex_config.metadata().clone()];
     let mut routes = Vec::new();
-    for (source, bindings) in std::iter::once((iex_config.metadata(), iex_bindings.as_ref()))
-        .chain(optional.as_ref().map(|(config, bindings)| (config.metadata(), bindings.as_ref())))
-    {
+    for (source, bindings) in std::iter::once((iex_config.metadata(), iex_bindings.as_ref())).chain(
+        optional
+            .as_ref()
+            .map(|(config, bindings)| (config.metadata(), bindings.as_ref())),
+    ) {
         let [venue] = source.coverage().topology().venues() else {
-            return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+            return Err(AccountRuntimeStartFailure::before_owner(
+                ServiceError::InvalidResult,
+            ));
         };
         for binding in bindings {
             routes.push(ShardKey::new(venue.clone(), binding.instrument_id()));
@@ -1029,21 +1031,13 @@ async fn start_alpaca(
         metadata.push(config.metadata().clone());
     }
     let options_expected = optional.is_some();
-    let options_config = options_config_for_mappings.clone();
-    let mut activation_guard = StartupCancellation::new(group_cancellation.child_token());
-    let mut activation = await_before(
+    await_before(
         deadline,
         cancellation,
-        provider_activation.activate_alpaca_basic_account(
-            lease,
-            iex_config,
-            options_config,
-            activation_guard.token(),
-        ),
+        activation.require_prepared_or_active(),
     )
     .await
     .map_err(AccountRuntimeStartFailure::before_owner)?;
-    activation_guard.disarm();
     let credentials = activation.credentials();
     let iex_generation = provider_activation
         .register_alpaca_publication_generation(&activation, &metadata[0])
@@ -1051,134 +1045,179 @@ async fn start_alpaca(
             tracing::error!(%error, "Alpaca IEX publication generation failed");
             AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable)
         })?;
-    let iex_operation = await_before(
-        deadline,
-        cancellation,
-        provider_activation.acquire_alpaca_reference_operation(
-            &iex_generation, group_cancellation.child_token(), deadline,
-        ),
-    ).await.map_err(AccountRuntimeStartFailure::before_owner)?;
-    let asset_budget = activation.asset_reference_budget()
-        .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
     let catalog_reader = provider_activation.market_data_instruments();
-    let research = provider_activation.research_service();
     if iex_bindings.len() != iex_config_for_mappings.mappings().len() {
-        return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+        return Err(AccountRuntimeStartFailure::before_owner(
+            ServiceError::InvalidResult,
+        ));
     }
-    let mut iex_rebound = Vec::new();
     let mut iex_native_mappings = Vec::new();
     let mut iex_native_requests = Vec::new();
     for (binding, mapping) in iex_bindings.iter().zip(iex_config_for_mappings.mappings()) {
-        if binding.instrument_id() != mapping.instrument() {
-            return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+        let native = binding
+            .native_identity()
+            .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult))?;
+        if binding.instrument_id() != mapping.instrument()
+            || native.instrument != binding.instrument_id()
+            || native.venue_symbol.as_str() != mapping.symbol()
+        {
+            return Err(AccountRuntimeStartFailure::before_owner(
+                ServiceError::InvalidResult,
+            ));
         }
-        let before = catalog_reader.latest(binding.instrument_id(), deadline, cancellation)
-            .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?
-            .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
-        let route = await_before(
-            deadline,
-            cancellation,
-            ensure_alpaca_iex_asset_reference(
-                &activation, &research, &iex_operation, &asset_budget,
-                HttpRequestBounds::default(), before, mapping.symbol(), deadline, cancellation,
-            ),
-        ).await.map_err(AccountRuntimeStartFailure::before_owner)?;
-        let rebound = binding.try_rebind_after_alpaca_reference(
-            &route.before, &route.after, &route.native, &catalog_reader,
-            deadline, cancellation,
-        ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
-        iex_native_mappings.push(mapping.clone().try_with_native_identity(route.native.clone())
-            .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
-        iex_native_requests.push(route.native);
-        iex_rebound.push(rebound);
+        iex_native_mappings.push(
+            mapping
+                .clone()
+                .try_with_native_identity(native.clone())
+                .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?,
+        );
+        iex_native_requests.push(native.clone());
     }
-    drop(iex_operation);
-    let iex_publication_bindings = iex_rebound.into_boxed_slice();
-    let iex_catalog = ProductionCatalogSelection::try_new(
-        catalog_reader.clone(), iex_native_requests,
-    ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+    let iex_publication_bindings = iex_bindings;
+    let iex_catalog =
+        ProductionCatalogSelection::try_new(catalog_reader.clone(), iex_native_requests)
+            .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
     let mut options_native_mappings = Vec::new();
     let mut options_publication_bindings = None;
     let mut options_catalog = None;
     if let Some((option_config, original_bindings)) = optional.as_ref() {
         if original_bindings.len() != option_config.mappings().len() {
-            return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+            return Err(AccountRuntimeStartFailure::before_owner(
+                ServiceError::InvalidResult,
+            ));
         }
-        let chain = option_chain_config.as_ref()
+        let chain = option_chain_config
+            .as_ref()
             .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
         let namespace = chain.metadata().source_id();
-        let selected_at = wall_timestamp()
-            .map_err(AccountRuntimeStartFailure::before_owner)?;
+        let selected_at = wall_timestamp().map_err(AccountRuntimeStartFailure::before_owner)?;
         let mut rebound = Vec::new();
         let mut requests = Vec::new();
         for (binding, mapping) in original_bindings.iter().zip(option_config.mappings()) {
             if binding.instrument_id() != mapping.instrument() {
-                return Err(AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult));
+                return Err(AccountRuntimeStartFailure::before_owner(
+                    ServiceError::InvalidResult,
+                ));
             }
-            let record = catalog_reader.latest(binding.instrument_id(), deadline, cancellation)
+            let record = catalog_reader
+                .latest(binding.instrument_id(), deadline, cancellation)
                 .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?
-                .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
-            let mut accepted = record.definition().provider_identities().iter()
-                .filter(|identity| identity.source_id() == namespace
-                    && record.definition().provider_identity_at(
-                        identity.source_id(), identity.provider_instrument_id(), selected_at,
-                    ) == Some(*identity));
-            let identity = accepted.next()
-                .ok_or_else(|| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+                .ok_or_else(|| {
+                    AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable)
+                })?;
+            let mut accepted =
+                record
+                    .definition()
+                    .provider_identities()
+                    .iter()
+                    .filter(|identity| {
+                        identity.source_id() == namespace
+                            && record.definition().provider_identity_at(
+                                identity.source_id(),
+                                identity.provider_instrument_id(),
+                                selected_at,
+                            ) == Some(*identity)
+                    });
+            let identity = accepted.next().ok_or_else(|| {
+                AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable)
+            })?;
             if accepted.next().is_some() {
-                return Err(AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable));
+                return Err(AccountRuntimeStartFailure::before_owner(
+                    ServiceError::Unavailable,
+                ));
             }
             let native = ProviderNativeIdentityRequest {
                 namespace: identity.source_id().clone(),
                 provider_instrument_id: identity.provider_instrument_id().clone(),
                 instrument: binding.instrument_id(),
-                venue: VenueId::try_from("alpaca-indicative-options")
-                    .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult))?,
-                venue_symbol: VenueSymbol::try_from(mapping.symbol())
-                    .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult))?,
+                venue: VenueId::try_from("alpaca-indicative-options").map_err(|_| {
+                    AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult)
+                })?,
+                venue_symbol: VenueSymbol::try_from(mapping.symbol()).map_err(|_| {
+                    AccountRuntimeStartFailure::before_owner(ServiceError::InvalidResult)
+                })?,
                 knowledge_at: selected_at,
                 effective_at: selected_at,
             };
-            rebound.push(binding.try_rebind_after_alpaca_reference(
-                &record, &record, &native, &catalog_reader, deadline, cancellation,
-            ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
-            options_native_mappings.push(mapping.clone().try_with_native_identity(native.clone())
-                .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
+            rebound.push(
+                binding
+                    .try_rebind_after_alpaca_reference(
+                        &record,
+                        &record,
+                        &native,
+                        &catalog_reader,
+                        deadline,
+                        cancellation,
+                    )
+                    .map_err(|_| {
+                        AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable)
+                    })?,
+            );
+            options_native_mappings.push(
+                mapping
+                    .clone()
+                    .try_with_native_identity(native.clone())
+                    .map_err(|_| {
+                        AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable)
+                    })?,
+            );
             requests.push(native);
         }
-        options_catalog = Some(ProductionCatalogSelection::try_new(catalog_reader.clone(), requests)
-            .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?);
+        options_catalog = Some(
+            ProductionCatalogSelection::try_new(catalog_reader.clone(), requests)
+                .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?,
+        );
         options_publication_bindings = Some(rebound.into_boxed_slice());
     }
     // No further catalog writes may occur between this point and source registration.
-    let iex_publication = provider_activation.bind_alpaca_publication_runtime_after_reference(
-        &activation, iex_generation, &iex_publication_bindings,
-        group_cancellation.child_token(), deadline,
-    ).map_err(|error| { tracing::error!(%error, "Alpaca IEX publication binding failed");
-        AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable) })?;
+    let iex_publication = provider_activation
+        .bind_alpaca_publication_runtime_after_reference(
+            &activation,
+            iex_generation,
+            &iex_publication_bindings,
+            group_cancellation.child_token(),
+            deadline,
+        )
+        .map_err(|error| {
+            tracing::error!(%error, "Alpaca IEX publication binding failed");
+            AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable)
+        })?;
     let mut durable_reads = vec![iex_publication.durable_read()];
     let mut options_publication = match options_publication_bindings.as_ref() {
         Some(bindings) => {
-            let generation = provider_activation.register_alpaca_publication_generation(
-                &activation, &metadata[1],
-            ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
-            let publication = provider_activation.bind_alpaca_publication_runtime_after_reference(
-                &activation, generation, bindings, group_cancellation.child_token(), deadline,
-            ).map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+            let generation = provider_activation
+                .register_alpaca_publication_generation(&activation, &metadata[1])
+                .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
+            let publication = provider_activation
+                .bind_alpaca_publication_runtime_after_reference(
+                    &activation,
+                    generation,
+                    bindings,
+                    group_cancellation.child_token(),
+                    deadline,
+                )
+                .map_err(|_| AccountRuntimeStartFailure::before_owner(ServiceError::Unavailable))?;
             durable_reads.push(publication.durable_read());
             Some(publication)
         }
         None => None,
     };
     let iex_descriptor = DisplaySourceDescriptor::try_new(
-        AccountMarketSurface::AlpacaBasic.surface_id(), metadata[0].clone(),
+        AccountMarketSurface::AlpacaBasic.surface_id(),
+        metadata[0].clone(),
         iex_publication_bindings.clone(),
-    ).map_err(AccountRuntimeStartFailure::before_owner)?;
+    )
+    .map_err(AccountRuntimeStartFailure::before_owner)?;
     let mut descriptors = vec![iex_descriptor];
     if let Some(bindings) = options_publication_bindings {
-        descriptors.push(DisplaySourceDescriptor::try_new(
-            AccountMarketSurface::AlpacaBasic.surface_id(), metadata[1].clone(), bindings,
-        ).map_err(AccountRuntimeStartFailure::before_owner)?);
+        descriptors.push(
+            DisplaySourceDescriptor::try_new(
+                AccountMarketSurface::AlpacaBasic.surface_id(),
+                metadata[1].clone(),
+                bindings,
+            )
+            .map_err(AccountRuntimeStartFailure::before_owner)?,
+        );
     }
     let descriptors = descriptors.into_boxed_slice();
     let mut historical = AlpacaHistoricalCapabilityOwner::try_new(
@@ -1200,7 +1239,10 @@ async fn start_alpaca(
                 historical.begin_shutdown();
                 group_cancellation.cancel();
                 let cleanup = historical.finish_shutdown().await;
-                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, cleanup));
+                return Err(AccountRuntimeStartFailure::after_cleanup(
+                    ServiceError::Unavailable,
+                    cleanup,
+                ));
             }
         },
         None => {
@@ -1260,23 +1302,38 @@ async fn start_alpaca(
                 Ok(config) => config,
                 Err(error) => {
                     tracing::error!(%error, "Alpaca selected options mappings were rejected");
-                    historical.begin_shutdown(); group_cancellation.cancel();
+                    historical.begin_shutdown();
+                    group_cancellation.cancel();
                     let history_cleanup = historical.finish_shutdown().await;
-                    let display_cleanup = cleanup_display_runtime(iex, "Alpaca options mapping cleanup").await;
-                    return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, history_cleanup.and(display_cleanup)));
+                    let display_cleanup =
+                        cleanup_display_runtime(iex, "Alpaca options mapping cleanup").await;
+                    return Err(AccountRuntimeStartFailure::after_cleanup(
+                        ServiceError::Unavailable,
+                        history_cleanup.and(display_cleanup),
+                    ));
                 }
             };
             let Some(catalog) = options_catalog.take() else {
-                historical.begin_shutdown(); group_cancellation.cancel();
+                historical.begin_shutdown();
+                group_cancellation.cancel();
                 let history_cleanup = historical.finish_shutdown().await;
-                let display_cleanup = cleanup_display_runtime(iex, "Alpaca options catalog cleanup").await;
-                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, history_cleanup.and(display_cleanup)));
+                let display_cleanup =
+                    cleanup_display_runtime(iex, "Alpaca options catalog cleanup").await;
+                return Err(AccountRuntimeStartFailure::after_cleanup(
+                    ServiceError::Unavailable,
+                    history_cleanup.and(display_cleanup),
+                ));
             };
             let Some(publication) = options_publication.take() else {
-                historical.begin_shutdown(); group_cancellation.cancel();
+                historical.begin_shutdown();
+                group_cancellation.cancel();
                 let history_cleanup = historical.finish_shutdown().await;
-                let display_cleanup = cleanup_display_runtime(iex, "Alpaca missing publication cleanup").await;
-                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, history_cleanup.and(display_cleanup)));
+                let display_cleanup =
+                    cleanup_display_runtime(iex, "Alpaca missing publication cleanup").await;
+                return Err(AccountRuntimeStartFailure::after_cleanup(
+                    ServiceError::Unavailable,
+                    history_cleanup.and(display_cleanup),
+                ));
             };
             let mut options_guard = StartupCancellation::new(group_cancellation.child_token());
             match await_owned_start(
@@ -1350,18 +1407,35 @@ async fn start_alpaca(
     };
     let option_chain = match option_chain_config {
         Some(config) => match provider_activation.prepare_alpaca_option_chain_child(
-            &activation, config, iex_publication_bindings.into_vec(), group_cancellation.child_token(),
+            &activation,
+            config,
+            iex_publication_bindings.into_vec(),
+            group_cancellation.child_token(),
         ) {
             Ok(child) => Some(child),
             Err(error) => {
                 tracing::error!(%error, "Alpaca option-chain child startup failed");
-                historical.begin_shutdown(); group_cancellation.cancel();
+                historical.begin_shutdown();
+                group_cancellation.cancel();
                 let mut cleanup = historical.finish_shutdown().await.err();
                 if let Some(options) = options {
-                    retain_shutdown_error(&mut cleanup, cleanup_display_runtime(options, "Alpaca chain partial-start options cleanup").await);
+                    retain_shutdown_error(
+                        &mut cleanup,
+                        cleanup_display_runtime(
+                            options,
+                            "Alpaca chain partial-start options cleanup",
+                        )
+                        .await,
+                    );
                 }
-                retain_shutdown_error(&mut cleanup, cleanup_display_runtime(iex, "Alpaca chain partial-start IEX cleanup").await);
-                return Err(AccountRuntimeStartFailure::after_cleanup(ServiceError::Unavailable, cleanup.map_or(Ok(()),Err)));
+                retain_shutdown_error(
+                    &mut cleanup,
+                    cleanup_display_runtime(iex, "Alpaca chain partial-start IEX cleanup").await,
+                );
+                return Err(AccountRuntimeStartFailure::after_cleanup(
+                    ServiceError::Unavailable,
+                    cleanup.map_or(Ok(()), Err),
+                ));
             }
         },
         None => None,
@@ -1530,7 +1604,6 @@ fn duration_until(
     let remaining = u64::try_from(remaining).map_err(|_error| ServiceError::Unavailable)?;
     Ok(Duration::from_nanos(remaining))
 }
-
 #[allow(
     clippy::too_many_arguments,
     reason = "every account, capture, rate, order-level, and lifecycle authority remains explicit"

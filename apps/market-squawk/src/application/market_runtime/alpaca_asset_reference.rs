@@ -2,11 +2,13 @@
 
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use market_squawk_adapter_alpaca::{AlpacaAssetReferenceClient, AlpacaError};
-use market_squawk_data::{AlpacaAssetReferenceAdmission, MarketDataInstrumentRecord};
+use market_squawk_data::{
+    AlpacaAssetReferenceAdmission, ListingReferenceRecord, MarketDataInstrumentRecord,
+};
 use market_squawk_domain::{ProviderInstrumentId, VenueId, VenueSymbol};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
@@ -19,16 +21,15 @@ use crate::{
     provider_activation::AlpacaBasicAccountActivation,
 };
 
-/// Before/after canonical position and genuine native coordinates for one configured IEX route.
+/// Published canonical position and genuine native coordinates for one selected IEX route.
 pub(crate) struct AlpacaNativeAssetRoute {
-    pub(crate) before: MarketDataInstrumentRecord,
     pub(crate) after: MarketDataInstrumentRecord,
     pub(crate) native: ProviderNativeIdentityRequest,
 }
 
 /// Acquires exactly one authenticated Paper asset response, seals its original body, then
-/// atomically adds its UUID to the existing instrument catalog. The returned coordinates still
-/// require the source registry's current catalog selection before session startup.
+/// atomically creates or enriches its canonical identity against the current official listing.
+/// The returned coordinates require current catalog selection before live session startup.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure_alpaca_iex_asset_reference(
     activation: &AlpacaBasicAccountActivation,
@@ -36,21 +37,24 @@ pub(crate) async fn ensure_alpaca_iex_asset_reference(
     operation: &ResearchProviderPublicationOperation,
     budget: &SharedProviderBudget,
     bounds: HttpRequestBounds,
-    before: MarketDataInstrumentRecord,
-    symbol: &str,
+    before: Option<MarketDataInstrumentRecord>,
+    listing: ListingReferenceRecord,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<AlpacaNativeAssetRoute, ServiceError> {
     if cancellation.is_cancelled()
         || Instant::now() >= deadline
         || operation.source().source_id() != operation.rights().source_id()
-        || !matches!(
-            before.definition().asset_class(),
-            market_squawk_domain::AssetClass::Equity | market_squawk_domain::AssetClass::Fund
-        )
+        || before.as_ref().is_some_and(|record| {
+            !matches!(
+                record.definition().asset_class(),
+                market_squawk_domain::AssetClass::Equity | market_squawk_domain::AssetClass::Fund
+            )
+        })
     {
         return Err(ServiceError::Unavailable);
     }
+    let symbol = listing.provider_symbol().to_owned();
     operation
         .validate_precommit()
         .map_err(|_| ServiceError::Unavailable)?;
@@ -66,7 +70,7 @@ pub(crate) async fn ensure_alpaca_iex_asset_reference(
         .acquire(
             activation.credentials().as_ref(),
             budget,
-            symbol,
+            &symbol,
             deadline,
             cancellation,
             move |pending| {
@@ -114,7 +118,8 @@ pub(crate) async fn ensure_alpaca_iex_asset_reference(
                 rights,
                 capture,
                 asset,
-                expected_current: before.clone(),
+                official_listing: listing,
+                expected_current: before,
             },
             operation.precommit_authority(),
             deadline,
@@ -125,21 +130,27 @@ pub(crate) async fn ensure_alpaca_iex_asset_reference(
             tracing::warn!(%error, symbol, stage = "asset_reference_publication", "native asset reference unavailable");
             ServiceError::Unavailable
         })?;
-    let cutoff = after.published_at();
+    // Exact replays retain their original publication time. Selection uses today's knowledge
+    // cutoff without changing the native observation or catalog revision timestamp.
+    let cutoff = market_squawk_domain::Timestamp::from_unix_nanos(
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ServiceError::Unavailable)?
+                .as_nanos(),
+        )
+        .map_err(|_| ServiceError::Unavailable)?,
+    );
     let native = ProviderNativeIdentityRequest {
         namespace: operation.source().source_id().clone(),
         provider_instrument_id: ProviderInstrumentId::try_from(native_uuid.to_string())
             .map_err(|_| ServiceError::Unavailable)?,
-        instrument: before.definition().instrument_id(),
+        instrument: after.definition().instrument_id(),
         venue: VenueId::try_from("iex").map_err(|_| ServiceError::Unavailable)?,
         venue_symbol: VenueSymbol::try_from(native_symbol)
             .map_err(|_| ServiceError::Unavailable)?,
         knowledge_at: cutoff,
         effective_at: cutoff,
     };
-    Ok(AlpacaNativeAssetRoute {
-        before,
-        after,
-        native,
-    })
+    Ok(AlpacaNativeAssetRoute { after, native })
 }

@@ -308,6 +308,20 @@ impl Drop for AlpacaOptionChainOperation<'_> {
 }
 
 impl AlpacaBasicAccountActivation {
+    /// Seals live configurations onto the same account owner that acquired native references.
+    pub(crate) fn with_live_configurations(
+        mut self,
+        iex: AlpacaIexLiveConfig,
+        options: Option<AlpacaOptionsLiveConfig>,
+    ) -> Result<Self, AlpacaBasicActivationError> {
+        if self.iex.is_some() || self.options.is_some() {
+            return Err(AlpacaBasicActivationError::SourceBinding);
+        }
+        validate_configurations(self.lease(), self.account_binding(), &iex, options.as_ref())?;
+        self.iex = Some(iex);
+        self.options = options;
+        Ok(self)
+    }
     /// Returns the immutable onboarding lease retained by this runtime owner.
     pub fn lease(&self) -> &ProviderActivationLease {
         self.authority.lease()
@@ -465,26 +479,21 @@ impl std::fmt::Debug for AlpacaBasicAccountActivation {
 }
 
 impl ProviderAdapterActivation {
-    /// Activates one Alpaca Basic account across its IEX and indicative-options surfaces.
+    /// Acquires the sole Alpaca account owner before native reference discovery or live bindings.
     ///
     /// # Errors
     ///
-    /// Fails closed for a stale/mismatched lease, duplicated account runtime, metadata that does
-    /// not bind the verified account and shared budget, any quality overstatement, invalid secret
-    /// envelope, or cancellation.
+    /// Fails closed for a stale/mismatched lease, duplicated account runtime, invalid secret
+    /// envelope, or cancellation. Live configurations are bound after native reference admission.
     pub(crate) async fn activate_alpaca_basic_account(
         &self,
         lease: ProviderActivationLease,
-        iex: AlpacaIexLiveConfig,
-        options: Option<AlpacaOptionsLiveConfig>,
         cancellation: CancellationToken,
     ) -> Result<AlpacaBasicAccountActivation, AlpacaBasicActivationError> {
         if cancellation.is_cancelled() {
             return Err(AlpacaBasicActivationError::Cancelled);
         }
-        let binding =
-            ProviderAccountBinding::try_from_lease(ProviderMarketAccount::AlpacaBasic, &lease)?;
-        validate_configurations(&lease, &binding, &iex, options.as_ref())?;
+        ProviderAccountBinding::try_from_lease(ProviderMarketAccount::AlpacaBasic, &lease)?;
         let secret = self
             .onboarding
             .read_secret_for_activation_request(&lease, cancellation)
@@ -514,10 +523,11 @@ impl ProviderAdapterActivation {
             credentials,
             historical_provider_rate: provider_rate,
             trading_api_environment,
-            iex: Some(iex),
-            options,
+            iex: None,
+            options: None,
         })
     }
+
 }
 
 fn expected_budget(
