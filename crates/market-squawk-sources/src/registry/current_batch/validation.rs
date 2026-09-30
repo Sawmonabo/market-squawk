@@ -5,7 +5,8 @@ fn validate_observation_profile(
 ) -> Result<(), RegistryError> {
     if matches!(
         observation.event_class(),
-        market_squawk_domain::LiveEventClass::Chart | market_squawk_domain::LiveEventClass::Screener
+        market_squawk_domain::LiveEventClass::Chart
+            | market_squawk_domain::LiveEventClass::Screener
     ) {
         return Err(RegistryError::DecoderProfileMismatch);
     }
@@ -189,7 +190,10 @@ pub enum RegistryError {
     /// Catalog-backed provider identity selection exceeded its monotonic deadline.
     #[error("provider identity selection deadline elapsed")]
     ProviderIdentitySelectionDeadlineExceeded,
-    /// The catalog identity authority is currently contended or unavailable.
+    /// The catalog identity authority is temporarily busy; retry only within the selection deadline.
+    #[error("provider identity catalog authority is busy")]
+    ProviderIdentityAuthorityBusy,
+    /// The catalog identity authority is unavailable.
     #[error("provider identity catalog authority is unavailable")]
     ProviderIdentityAuthorityUnavailable,
     /// Required identity/rights authority rejected the operation; retry is not authorization.

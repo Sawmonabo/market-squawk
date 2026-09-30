@@ -57,6 +57,7 @@ const CAPTURE_FLUSH_RECORDS: usize = 256;
 const CAPTURE_HELPER_STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKOFF_JITTER_SAMPLE_BASIS_POINTS: u16 = 1_000;
 const CATALOG_SELECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const CATALOG_SELECTION_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 /// One completed exact-generation source run after all generation-owned resources were reaped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,11 +69,6 @@ pub(super) struct ProductionGenerationOutcome {
 }
 
 impl ProductionGenerationOutcome {
-    #[cfg(test)]
-    pub(super) const fn generation(self) -> ConnectionGeneration {
-        self.generation
-    }
-
     pub(super) const fn source_error(self) -> Option<SourceError> {
         self.source_error
     }
@@ -97,6 +93,7 @@ pub(super) struct ProductionSourceSupervisor {
     publication: ProductionCapturedPublicationIngress,
     registry: Option<AuthoritativeSourceRegistry>,
     catalog: Option<ProductionCatalogSelection>,
+    startup_catalog_admission: Option<(Instant, CancellationToken)>,
     registered: RegisteredSource,
     backoff: ProviderBackoffAuthority,
     paths: LocalPaths,
@@ -133,30 +130,6 @@ enum PreparedGenerationOutput {
 }
 
 impl ProductionSourceSupervisor {
-    #[cfg(test)]
-    pub(super) fn try_new(
-        config: &AppConfig,
-        profile: ProductionSourceProfile,
-        paths: LocalPaths,
-        capture_process: CaptureProcessInfrastructure,
-        live_ingress: LiveRuntimeIngress,
-        routes: Vec<ShardKey>,
-        route_buffer_limits: RouteBufferLimits,
-    ) -> Result<Self, ProductionSupervisorError> {
-        let provider_rate =
-            crate::provider_rate::open_provider_rate_authority(paths.control_root()?.root())?;
-        Self::try_new_with_provider_rate(
-            config,
-            profile,
-            paths,
-            capture_process,
-            live_ingress,
-            routes,
-            route_buffer_limits,
-            provider_rate,
-        )
-    }
-
     #[allow(
         clippy::too_many_arguments,
         reason = "independent live-plane dependencies stay explicit at supervisor composition"
@@ -187,8 +160,8 @@ impl ProductionSourceSupervisor {
         )
     }
 
-    /// Installs the actual catalog reader and selects every native route before registration can
-    /// yield a live session or capture/network work can begin.
+    /// Installs the actual catalog reader and retains startup admission for async selection of
+    /// every native route before a live session or capture/network work can begin.
     #[allow(
         clippy::too_many_arguments,
         reason = "catalog selection, live ingress, rate, capture, and route bounds are separate authorities"
@@ -306,32 +279,21 @@ impl ProductionSourceSupervisor {
         if let Some((selection, _, _)) = catalog {
             registry = registry.with_provider_identity_authority(Arc::new(selection.reader()))?;
         }
-        let registered = match (|| {
-            let registered =
-                registry.register_or_resume_exact(profile.metadata().clone(), registered_at)?;
-            if let Some((selection, deadline, cancellation)) = catalog {
-                registry.record_provider_identities(
-                    &registered,
-                    selection.requests(),
-                    deadline,
-                    cancellation,
-                )?;
-            }
-            Ok::<_, RegistryError>(registered)
-        })() {
-            Ok(registered) => registered,
-            Err(source) => {
-                return match registry.shutdown() {
-                    Ok(()) => Err(ProductionSupervisorError::from_registry_selection(source)),
-                    Err(cleanup) => Err(ProductionSupervisorError::RegistryStartupCleanup {
-                        source: Box::new(ProductionSupervisorError::from_registry_selection(
-                            source,
-                        )),
-                        cleanup,
-                    }),
-                };
-            }
-        };
+        let registered =
+            match registry.register_or_resume_exact(profile.metadata().clone(), registered_at) {
+                Ok(registered) => registered,
+                Err(source) => {
+                    return match registry.shutdown() {
+                        Ok(()) => Err(ProductionSupervisorError::from_registry_selection(source)),
+                        Err(cleanup) => Err(ProductionSupervisorError::RegistryStartupCleanup {
+                            source: Box::new(ProductionSupervisorError::from_registry_selection(
+                                source,
+                            )),
+                            cleanup,
+                        }),
+                    };
+                }
+            };
         let backoff = match registry.provider_backoff_authority(&registered) {
             Ok(backoff) => backoff,
             Err(source) => {
@@ -350,6 +312,8 @@ impl ProductionSourceSupervisor {
             publication: ProductionCapturedPublicationIngress::none(),
             registry: Some(registry),
             catalog: catalog.map(|(selection, _, _)| selection.clone()),
+            startup_catalog_admission: catalog
+                .map(|(_, deadline, cancellation)| (deadline, cancellation.clone())),
             registered,
             backoff,
             paths,
@@ -385,7 +349,6 @@ impl ProductionSourceSupervisor {
             self.config.capture_shutdown(),
             self.config.capture_shutdown(),
         )?;
-        let at = system_timestamp()?;
         let session_id = SessionId::new(SourceIdentifier::try_from(format!(
             "{}-{}",
             self.profile.source_key(),
@@ -411,25 +374,39 @@ impl ProductionSourceSupervisor {
             let selection_deadline = Instant::now()
                 .checked_add(CATALOG_SELECTION_TIMEOUT)
                 .ok_or(ProductionSupervisorError::InvalidStaticPolicy)?;
-            let requests = selection
-                .requests()
-                .iter()
-                .cloned()
-                .map(|mut request| {
-                    request.knowledge_at = at;
-                    request.effective_at = at;
-                    request
-                })
-                .collect::<Vec<_>>();
-            registry
-                .record_provider_identities(
-                    &self.registered,
-                    &requests,
-                    selection_deadline,
-                    &cancellation,
-                )
-                .map_err(ProductionSupervisorError::from_registry_selection)?;
+            let startup_admission = self.startup_catalog_admission.take();
+            let selection_deadline = startup_admission
+                .as_ref()
+                .map_or(selection_deadline, |(deadline, _)| {
+                    selection_deadline.min(*deadline)
+                });
+            let startup_cancellation = startup_admission
+                .as_ref()
+                .map(|(_, cancellation)| cancellation);
+            let mut requests = selection.requests().to_vec();
+            retry_catalog_selection(
+                selection_deadline,
+                &cancellation,
+                startup_cancellation,
+                || {
+                    let at = system_timestamp()?;
+                    for request in &mut requests {
+                        request.knowledge_at = at;
+                        request.effective_at = at;
+                    }
+                    registry
+                        .record_provider_identities(
+                            &self.registered,
+                            &requests,
+                            selection_deadline,
+                            &cancellation,
+                        )
+                        .map_err(ProductionSupervisorError::from_registry_selection)
+                },
+            )
+            .await?;
         }
+        let at = system_timestamp()?;
         let session = registry.begin_next_session(&self.registered, session_id, at)?;
         let generation = session.generation();
         let startup_required = startup.is_some();
@@ -846,14 +823,6 @@ impl ProductionSourceSupervisor {
         }
     }
 
-    #[cfg(test)]
-    pub(super) async fn run_one_generation_for_test(
-        &mut self,
-        cancellation: CancellationToken,
-    ) -> Result<ProductionGenerationOutcome, ProductionSupervisorError> {
-        self.run_one_generation(cancellation, &mut None).await
-    }
-
     const fn provider_backoff(&self) -> &ProviderBackoffAuthority {
         &self.backoff
     }
@@ -865,6 +834,58 @@ impl ProductionSourceSupervisor {
             .ok_or(ProductionSupervisorError::AlreadyShutdown)?;
         registry.shutdown()?;
         Ok(())
+    }
+}
+
+/// Waits only for transient catalog contention; each attempt installs one complete route set.
+/// No registry/catalog guard or partial mapping survives the asynchronous wait.
+pub(super) async fn retry_catalog_selection(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    startup_cancellation: Option<&CancellationToken>,
+    mut select: impl FnMut() -> Result<(), ProductionSupervisorError>,
+) -> Result<(), ProductionSupervisorError> {
+    loop {
+        if cancellation.is_cancelled()
+            || startup_cancellation.is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(RegistryError::ProviderIdentitySelectionCancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(RegistryError::ProviderIdentitySelectionDeadlineExceeded.into());
+        }
+        match select() {
+            Err(ProductionSupervisorError::Registry(
+                RegistryError::ProviderIdentityAuthorityBusy,
+            )) => {}
+            Ok(()) => {
+                if cancellation.is_cancelled()
+                    || startup_cancellation.is_some_and(CancellationToken::is_cancelled)
+                {
+                    return Err(RegistryError::ProviderIdentitySelectionCancelled.into());
+                }
+                if Instant::now() >= deadline {
+                    return Err(RegistryError::ProviderIdentitySelectionDeadlineExceeded.into());
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        let retry_at = Instant::now()
+            .checked_add(CATALOG_SELECTION_RETRY_DELAY)
+            .unwrap_or(deadline)
+            .min(deadline);
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(RegistryError::ProviderIdentitySelectionCancelled.into()),
+            () = async {
+                match startup_cancellation {
+                    Some(cancellation) => cancellation.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err(RegistryError::ProviderIdentitySelectionCancelled.into()),
+            () = tokio::time::sleep_until(retry_at.into()) => {}
+        }
     }
 }
 

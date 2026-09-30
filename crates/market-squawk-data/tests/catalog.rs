@@ -2283,6 +2283,69 @@ async fn native_reference_custody_preserves_prior_identity_and_recovers_original
     assert_eq!(verified.receipt().claim(), &original_claim);
     assert_eq!(verified.records()[0].payload(), body.as_ref());
     assert_eq!(reopened.received_at(), received_at);
+    drop(reader);
+    drop(service);
+
+    // The same real reopened custody distinguishes transient contention from terminal authority.
+    let authority = Arc::new(Mutex::new(CatalogAuthority::open(config.clone())?));
+    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let cutoff = now()?;
+    let request = ProviderNativeIdentityRequest {
+        knowledge_at: cutoff,
+        effective_at: cutoff,
+        ..request
+    };
+    let guard = authority.lock().map_err(|_| "catalog lock poisoned")?;
+    assert!(matches!(
+        reader.select_current(&request, deadline(), &cancellation),
+        Err(RegistryError::ProviderIdentityAuthorityBusy)
+    ));
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        reader.select_current(&request, deadline(), &cancelled),
+        Err(RegistryError::ProviderIdentitySelectionCancelled)
+    ));
+    assert!(matches!(
+        reader.select_current(&request, Instant::now(), &cancellation),
+        Err(RegistryError::ProviderIdentitySelectionDeadlineExceeded)
+    ));
+    drop(guard);
+    reader
+        .select_current(&request, deadline(), &cancellation)?
+        .validate_at(now()?)?;
+
+    let external = Connection::open(paths.catalog()?.path())?;
+    external.execute_batch("BEGIN IMMEDIATE")?;
+    let busy = reader.select_current(
+        &request,
+        Instant::now() + Duration::from_millis(200),
+        &cancellation,
+    );
+    external.execute_batch("ROLLBACK")?;
+    assert!(matches!(
+        busy,
+        Err(RegistryError::ProviderIdentityAuthorityBusy)
+    ));
+    reader
+        .select_current(&request, deadline(), &cancellation)?
+        .validate_at(now()?)?;
+
+    #[expect(
+        clippy::panic,
+        reason = "the regression must distinguish a poisoned mutex from transient contention"
+    )]
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        panic!("poison the test catalog authority");
+    }));
+    assert!(poisoned.is_err());
+    assert!(matches!(
+        reader.select_current(&request, deadline(), &cancellation),
+        Err(RegistryError::InvalidAuthorityState)
+    ));
     Ok(())
 }
 

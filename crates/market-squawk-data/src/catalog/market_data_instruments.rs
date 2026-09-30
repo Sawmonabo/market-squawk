@@ -864,8 +864,8 @@ fn provider_identity_registry_error(error: MarketDataInstrumentCatalogError) -> 
         Error::Storage(error) => provider_identity_storage_error(&error),
         Error::SourceAuthority(error) => match error {
             super::CatalogError::AuthorityClockRollback => RegistryError::DurableWallRollback,
-            super::CatalogError::AuthorityBusy
-            | super::CatalogError::WriterAlreadyOpen
+            super::CatalogError::AuthorityBusy => RegistryError::ProviderIdentityAuthorityBusy,
+            super::CatalogError::WriterAlreadyOpen
             | super::CatalogError::WriterRegistryUnavailable => {
                 RegistryError::ProviderIdentityAuthorityUnavailable
             }
@@ -901,7 +901,7 @@ fn provider_identity_storage_error(error: &rusqlite::Error) -> RegistryError {
     use rusqlite::ErrorCode;
     match error.sqlite_error_code() {
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
-            RegistryError::ProviderIdentityAuthorityUnavailable
+            RegistryError::ProviderIdentityAuthorityBusy
         }
         Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => {
             RegistryError::InvalidAuthorityState
@@ -924,7 +924,9 @@ impl MarketDataInstrumentReadCapability {
         check_operation(deadline, cancellation)?;
         let catalog = self.authority.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => {
-                MarketDataInstrumentCatalogError::AuthorityUnavailable
+                MarketDataInstrumentCatalogError::SourceAuthority(
+                    super::CatalogError::AuthorityBusy,
+                )
             }
             std::sync::TryLockError::Poisoned(_) => {
                 MarketDataInstrumentCatalogError::SourceAuthority(
@@ -933,8 +935,11 @@ impl MarketDataInstrumentReadCapability {
             }
         })?;
         let connection = &catalog.catalog().connection;
-        install_progress_handler(connection, deadline, cancellation)?;
+        let busy_millis: u32 =
+            connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
         let result = (|| {
+            install_progress_handler(connection, deadline, cancellation)?;
             let transaction = connection.unchecked_transaction()?;
             let now = trusted_catalog_now(&transaction)?;
             if request.knowledge_at > now {
@@ -1012,7 +1017,11 @@ impl MarketDataInstrumentReadCapability {
                 retained_bytes,
             })
         })();
-        clear_progress_handler(connection)?;
+        let progress_cleanup = clear_progress_handler(connection);
+        let busy_cleanup =
+            connection.busy_timeout(std::time::Duration::from_millis(u64::from(busy_millis)));
+        progress_cleanup?;
+        busy_cleanup?;
         classify_operation(result, deadline, cancellation)
     }
 }

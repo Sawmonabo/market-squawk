@@ -1,6 +1,114 @@
 # Market Squawk Delivery Ledger
 
-## Active saved-planning and live-input wave — 2026-09-30
+## Active native-identity contention wave — 2026-09-30
+
+Audit base `5d9a137e`, clean primary worktree; prior turn made verified progress. Discovery and
+stale-price selection are pushed and live verified (PR #43 comments 5909221084 / 5909403787).
+Acceptance 1/7 defect: normal catalog contention can end a live source immediately, despite the
+existing identity-selection deadline. Fix that cause without retrying invalid authority or blocking
+a Tokio worker. Provider and saved-product preparation continue independently below.
+
+| Owner | Exclusive scope | Dependency / finish evidence |
+| --- | --- | --- |
+| Lead | Registry error declaration `crates/market-squawk-sources/src/registry/current_batch/validation.rs`; shared consumers/ledger/Git/builds | Add explicit transient `ProviderIdentityAuthorityBusy`, retaining terminal unavailable/poison/auth meanings; serialize integration/checks. |
+| Astra `native_setup_current` | `crates/market-squawk-data/src/catalog/market_data_instruments.rs`, existing `tests/catalog.rs`; `apps/market-squawk/src/live_source/supervisor.rs` and existing supervisor test module | Map only genuine mutex/SQLite busy to transient error; one cancellation/deadline-bound async selection path before session admission, including startup; existing critical contention/cancellation tests. No builds/Git. Request any additional caller ownership first. |
+| GPT-6.1 Sol `live_input_recipe` | Read-only native asset/listing publication and installed selected-equity composition | Refresh prior generic-stock gap into exact proposed producer/consumer patch and evidence authority; no hardcoded subject, no repeated provider audit, no edits/builds/Git/credentials. |
+| Astra `position_authority_trace` | Read-only saved portfolio calculation/artifact/backup owners | Resolve only remaining completed-result retention/backup contract using existing authorities; exact shared operation/schema changes and smallest restart test. Reuse prior saved-planning trace; no implementation or new harness. |
+
+DAG: lead transient error → contention data/supervisor implementation → critical checks → actual
+live selection/continuity → pushed checkpoint. Independent provider and saved-result contracts
+feed the next implementation assignments; no new worktree, branch or review ceremony.
+
+Implementation is frozen across the five code/test files and agent ownership is released. The
+existing catalog custody/restart case passed (one test, six filtered), exercising real mutex and
+SQLite contention, recovery, cancellation/deadline precedence and terminal poison handling.
+Evidence: `.agents/tmp/v1-first-stock/native-contention-catalog-critical.log`. Of the existing three
+supervisor cases, the extended contention/cancellation case passed; restart and capture-activation
+cases failed `LiveScopeNotCovered` (`native-contention-supervisor-critical.log`). Their unchanged
+fixtures omitted catalog identities now required for market sessions. Both now share real parsed
+Coinbase product evidence published through the catalog. Restart checks reopen catalog/durable
+registry/rate owners, resume exact metadata and select identity before generation admission;
+capture cleanup retains its assertions. The old pre-cancelled supervisor fixture is removed,
+along with its three unused test-only helpers; no production cancellation hook was added.
+The corrected three-case rerun passed (three tests, 127 filtered;
+`native-contention-supervisor-catalog-critical.log`).
+
+The single-job CLI/service build passed. Same-root service shutdown exited zero, rebuilt startup
+and protected credential unlock succeeded, then expired doctor renewal through Verify and Start
+succeeded. Runtime reports `active_group` / lifecycle `active`; concurrent SPY search and selection
+passed with retained selection/history identity and truthful stale-price absence. The new service
+log contains no supervisor/registry failure at this cutoff. Desktop was reopened using its existing
+binary; this is not a newly built installed package or full stock-analysis acceptance. Evidence:
+`.agents/tmp/v1-first-stock/native-contention-live-{build,service}.log`,
+`native-contention-live-{verify,start,search,selection,status}.json`. Test-only helper removal
+followed the binary build and changes no non-test code. This is critically and live verified
+contention recovery, not complete V1 or final installed acceptance. No schema, data limit or
+compatibility path changed. All agents are finished and ownership released; the next dependency
+is selected-stock admission alongside saved-planning implementation below.
+
+### Saved-planning contract ready for the next implementation checkpoint
+
+Acceptance 4/5/6: freeze one immutable completed calculation and a separate idempotent saved
+marker. Persist every successful calculation's original request/output/account/snapshot/time and
+internal evidence in the existing ControlledArtifactRepository plus indexed catalog completion
+row before returning `calculationToken` / `calculatedAtUnixNanos`. No second in-memory result
+store, TTL or automatic eviction; completed-unsaved results remain reachable and included in backup.
+Save takes only account/token and never recalculates. List exposes saved results with account-bound
+sequence-fenced cursors; Get reads one verified artifact and retains original evidence after expiry
+or later imports. Operations: `Portfolio.SavePlanningResult`, `Portfolio.ListPlanningResults`,
+`Portfolio.GetPlanningResult`. Cancellation of a later read cannot undo an accepted Save.
+
+Persistence owner: cohesive `catalog/portfolio_planning.rs` using existing catalog authority;
+lead owns current schema/export/factory changes in place, no new migration. Application owner:
+`portfolio_application/saved_planning.rs` plus existing scenario/planning/candidate calculation hooks;
+lead owns dispatch/contracts/transports. Backup owner: existing Portfolio component and
+`local_product/operations/portfolio_backup.rs`, with a cohesive stream helper only if warranted.
+Use completion/save head fences and streamed pages/one artifact at a time, including unsaved
+completions. Retain heads before analytical catalog backup, revalidate after streaming and final
+lease check. Restore through existing staged verify-and-rewind, match the restored catalog inventory
+and exact artifact references before activation; index-only backup is insufficient.
+
+Extend the existing portfolio control-plane restart case: save/reopen original results after
+restart/import, idempotent Save, account isolation and backup/restored artifact agreement. Reuse
+existing candidate evidence coverage; no new harness or routine component-test expansion. Writers
+are not yet assigned: this contract is ready, but contention checkpoint integration remains first.
+
+### Selected-stock admission contract ready for the next implementation checkpoint
+
+Acceptance 1/2/3: remove the existing preparation cycle in which canonical IEX bindings are needed
+before native assets can be acquired. Acquire the existing account/credential/rate owner before
+binding construction, publish the selected native references, then transfer that same owner into
+runtime startup. Do not acquire a second account owner or append routes after configuration seals.
+Extend the existing Alpaca asset publisher with catalog-owned creation from a verified native UUID,
+active US-equity classification and exact current official listing join. Allocate identity only
+inside its transaction; replay resolves the source-qualified native UUID and rejects conflicting
+listing/security joins. Preserve rights, custody, precommit and currentness checks. MSFT may be a
+verification subject, never an admission allowlist. Do not invent a CUSIP or loosen the separate
+Schwab source-reference contract. An Equity identity alone does not establish common-share fiscal
+eligibility; the existing SEC company/security authority still owns that richer claim.
+
+Use the adapter's existing `options_contract_reference.rs` pattern for hash-pinned primary-source
+denomination evidence, tied to the actual request mode. The Alpaca
+[latest-quote](https://docs.alpaca.markets/us/reference/stocklatestquotesingle-1) and
+[startup snapshot](https://docs.alpaca.markets/us/reference/stocksnapshots-1) contracts (checked
+2026-09-30) explicitly default prices to USD; that establishes quote units, not issuer
+facts. The production publisher remains `market_data_instruments/alpaca_asset_reference.rs`;
+adapter evidence belongs in `asset_reference.rs`. Composition changes span
+`provider_activation/alpaca.rs`, `provider_activation/market_config.rs`,
+`local_product/market_provider_configuration.rs`, `market_runtime/group.rs` and
+`market_runtime/alpaca_asset_reference.rs`. Shared contracts/composition remain lead-owned.
+
+Extend the existing production Alpaca composition/restart check with canonical stock creation,
+native UUID retention, duplicate-free replay, token discovery and PIT/restart preservation;
+use the existing catalog harness for conflict/revocation. There is no existing stock-creation case
+that proves this missing branch. Preparation currently uses the resolver's bounded overview
+selections; an already healthy group's Retry may return existing evidence without reconfiguration.
+No new selection operation or reconfiguration behavior is claimed by this preparatory contract.
+Read-only handoffs are complete and released; implementation ownership follows the contention
+checkpoint. No new branches or worktrees were created. Fresh local and `git ls-remote --heads
+origin` inventory confirms only feature/main/release; the separate `bundle-backup` is preserved.
+
+## Prior discovery and freshness checkpoint — 2026-09-30
 
 Pushed discovery checkpoint: `8f18c9ad` (three critical Rust checks, Desktop typecheck and
 CLI/service build passed; ticker search and corrected source status live verified).
