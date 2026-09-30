@@ -5551,13 +5551,8 @@ fn source_runtime_status() -> Value {
             vec![
                 ("state", constant("active_group")),
                 ("runtimeGenerationSha256", investment_analysis_sha256()),
-                ("qualifiedRuntimeRecordCount", constant_unsigned(0)),
             ],
-            &[
-                "state",
-                "runtimeGenerationSha256",
-                "qualifiedRuntimeRecordCount",
-            ],
+            &["state", "runtimeGenerationSha256"],
         ),
         closed(
             vec![

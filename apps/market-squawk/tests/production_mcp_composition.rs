@@ -1095,7 +1095,6 @@ fn active_real_alpaca_status(data: &Value) -> TestResult<ActiveRealAlpacaStatus>
     );
     let runtime = &row["runtime"];
     assert_eq!(runtime["state"], "active_group");
-    assert_eq!(runtime["qualifiedRuntimeRecordCount"], 0);
     assert_eq!(
         runtime["runtimeGenerationSha256"],
         runtime_generation_sha256

@@ -1595,7 +1595,6 @@ fn account_group_runtime_status(
     Ok(Some(json!({
         "state": "active_group",
         "runtimeGenerationSha256": runtime_generation,
-        "qualifiedRuntimeRecordCount": 0,
     })))
 }
 

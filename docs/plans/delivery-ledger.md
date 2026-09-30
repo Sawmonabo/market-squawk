@@ -3,21 +3,70 @@
 ## Active saved-planning and live-input wave — 2026-09-30
 
 Current outcome: secure startup, protected credential import, fresh doctor verification and live
-Alpaca market-runtime Start all succeeded with `88cf3ff1` in the fresh corrected-schema roots
-`.market-squawk/v1-owner-test-current`. The active runtime has stored eight successful market-event
-generations (32 cumulative rows) plus the 23-row exchange calendar; the fingerprint repair is now
-live verified. Desktop is running on those roots. Market search still returns no SPY result and the
-runtime reports zero qualified records, so a usable stock selection/analysis is not yet proven.
-Lead owns live operations/integration; GPT-6.1 Sol `live_input_recipe` has a bounded read-only trace
-of this selection/qualification gap from actual retained evidence, with no edits/builds/Git or
-credential access. Other agents are complete and no writers overlap. Saved-planning implementation
-has not begun. No full installed-workflow completion claim is established.
+Alpaca Start/publication are verified at `88cf3ff1`, with evidence checkpoint `cbec2f05` and
+PR #43 comments `5908352575` / `5908549656`. Desktop runs on the fresh corrected-schema roots
+`.market-squawk/v1-owner-test-current`. The retained cutoff shows eight successful market-event
+generations (32 cumulative rows) and a 23-row exchange calendar. This is not yet a complete stock
+analysis or installed journey. Original roots and matching recovery binaries remain preserved.
 
-Pushed checkpoint: `88cf3ff1`; PR #43 comment `5908352575`. CLI/service build passed. Live evidence:
-`.agents/tmp/v1-first-stock/current-live-publication-evidence.json`, `current-live-alpaca-start.json`,
-`current-live-alpaca-status.json`, `current-live-spy-search.json`, and `current-live-service.log`.
-Prior `.market-squawk/v1-owner-test` roots and matching binaries under
-`.agents/tmp/v1-first-stock/pre-schema-a63d286b-binaries` remain preserved, not migrated or rewritten.
+Next concrete acceptance 1/3/5/6 defects: Market search matches only case-sensitive display names,
+so admitted SPY is not found by ticker; source status exposes a hard-coded zero as a measured
+qualified-record count. Quote timestamps from the prior session remain a separate freshness limit;
+do not weaken that check or infer qualification from the placeholder count.
+
+| Owner | Exclusive scope | Dependency and completion evidence |
+| --- | --- | --- |
+| GPT-6.1 Sol `live_input_recipe` | `crates/market-squawk-data/src/catalog/market_data_instruments.rs`, its existing `tests/catalog.rs` case; `application/market_selection/product.rs`, `application/paper/market/product.rs`, `durable_product.rs` | Reuse canonical term normalization/validity for ticker/name matching, project only an unambiguous admitted symbol, preserve full population binding/opaque pagination. Existing critical discovery coverage; no builds/Git. |
+| GPT-6.1 Sol `position_desktop_trace` | `apps/market-squawk-desktop/src/features/sources/source-evidence.ts` only | Remove the fictional qualified-record-count field from active-group type/parser alongside lead contract change; no new UI, tests, builds or Git. |
+| Astra `native_setup_current` | `crates/market-squawk-data/src/provider_event_selection.rs`, `src/manifest/catalog.rs`, existing `tests/publication_recovery.rs`; app `application/research/ingest/crypto_market.rs`, `application/market_selection/investment.rs`, `application/paper/market.rs` | Explicit current-mark tie policy: latest eligible source timestamp then latest received cohort, preserving equal-cohort ambiguity and original freshness. Generic historical all-ties remains intact; bind policy/exclusions into exact restart evidence. Extend existing publication/restart case with repeated observations. No cap/schema changes, builds or Git. |
+| Lead | `application/source.rs`, source output contract in `application/contracts/output.rs`, existing `tests/production_mcp_composition.rs`, CLI/shared operation descriptions, data `lib.rs` export; shared authority, ledger, Git and checks | Remove fabricated count rather than manufacture a measurement; inspect consumers, one relevant existing critical check and integrated build. |
+
+DAG: independent source-status correction and canonical search implementation →
+integrated discovery check/build → actual ticker selection using current roots → pushed checkpoint.
+Live name search `SPDR` returns the retained SPY token, proving identity publication. Selecting it
+fails before freshness evaluation: 43 captures at the retained failure cutoff share the same source
+timestamp, exceeding the historical all-ties request bound of 32. The current-read policy repair
+selects the latest eligible received cohort without dropping historical rows or raising the bound;
+equal-cohort ambiguity remains explicit. Source-status removal and Desktop typecheck are complete.
+Search and current-selection implementations are frozen. The existing data publication/restart
+case passed (1 test, 17 filtered), including repeated observations and equal-cohort conflict;
+the existing canonical catalog identity case passed (1 test, 6 filtered), including ticker/name
+matching and expired-alias exclusion. The product search regression passed (one test, 129 filtered), and the single-job CLI/service
+build passed. Same-root restart/unlock and uppercase/lowercase SPY searches passed. The expired
+doctor was renewed through Verify, then Start succeeded. Actual selection still fails through the closed transport error; it is not live verified.
+The retained quote/trade source clocks predate the newly admitted definition interval. Native
+reference validation occurs before freshness exclusion, treating that unavailable evidence as an
+invalid result instead of returning an unavailable price. The original reference/freshness checks
+must remain intact; the next fix must distinguish ineligible evidence from corrupted identity. Astra
+`native_setup_current` owns read-only diagnosis of that current-selection path and retained
+`market-discovery-live-*` evidence; no edits/builds/Git or credential reads. Other writers are
+frozen; lead owns verification/integration.
+
+Next dependency after this checkpoint: the installed source resolver currently admits only
+predeclared SPY/VTI fund scopes and skips selected common stocks as CanonicalInstrumentUnresolved.
+Stock admission must use genuine listing/native-asset evidence for supported selected equities,
+with catalog-minted identity and exact currency/class/venue evidence. Do not add an MSFT-only
+allowlist as a demonstration; MSFT may be the verification subject, not the admission rule.
+Primary-source check on 2026-09-30: Alpaca's [latest-quote contract](https://docs.alpaca.markets/us/reference/stocklatestquotesingle-1)
+explicitly declares a currency parameter with USD default; its [asset guide](https://docs.alpaca.markets/us/docs/working-with-assets)
+describes genuine US-equity asset lookup. These are inputs to the next admission design, not proof
+of an implemented stock identity or permission to infer issuer/share-class facts.
+
+Saved-planning implementation has not begun and remains required. No new worktree/branch, full CI,
+review round, release build or whole-app RAM measurement. This checkpoint has three passing
+critical Rust cases, passing Desktop typecheck and a passing CLI/service build. Same-root secure
+startup, credential unlock, Verify/Start, ticker search and active-group status are live verified;
+full selection and installed stock-analysis completion are explicitly still open. Exactly three local/origin branches and
+one primary worktree were verified; no extra branches require removal.
+
+Current checkpoint evidence: `.agents/tmp/v1-first-stock/market-discovery-live-*`,
+`current-market-ties-critical.log`, `market-search-catalog-critical.log`,
+`market-search-product-critical.log` and `search-status-desktop-typecheck.log`.
+
+Prior live evidence: `.agents/tmp/v1-first-stock/current-live-publication-evidence.json`,
+`current-live-alpaca-start.json`, `current-live-alpaca-status.json`, `current-live-spy-search.json`,
+and `current-live-service.log`. Prior `.market-squawk/v1-owner-test` roots and matching binaries at
+`.agents/tmp/v1-first-stock/pre-schema-a63d286b-binaries` are preserved, not migrated or rewritten.
 
 Recovery checkpoint pushed: `44ba9cb6`; PR #43 evidence comment `5907711371`.
 Next concrete defect: native Alpaca asset-reference publication registers a source only when absent,

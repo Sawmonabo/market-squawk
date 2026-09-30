@@ -16,7 +16,7 @@ use market_squawk_data::{
     InstrumentDefinitionReadCapability, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
     MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationQuery,
     MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
-    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventSelectedCandidate,
+    ProviderMarketEventSelectedCandidate,
     ProviderMarketEventSelectionCompleteness,
 };
 use market_squawk_domain::{
@@ -961,13 +961,12 @@ async fn load_durable_route_evidence(
         ensure_live(context)?;
         match read
             .point_in_time_selector()
-            .select_latest(
+            .select_current(
                 route.instrument(),
                 route.venue().clone(),
                 event_kind,
                 reference_at,
                 reference_at,
-                ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
                 MAXIMUM_DURABLE_EVENT_CANDIDATES,
                 context.deadline(),
                 context.cancellation().clone(),

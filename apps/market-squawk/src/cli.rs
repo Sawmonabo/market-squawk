@@ -529,7 +529,7 @@ pub enum MarketCommand {
         #[arg(long)]
         page_token: Option<String>,
     },
-    /// Find investments by canonical product name.
+    /// Find investments by ticker, name or admitted identifier.
     Search {
         #[arg(long)]
         query: String,

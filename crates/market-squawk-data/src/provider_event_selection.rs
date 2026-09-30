@@ -17,7 +17,7 @@ use crate::{
 };
 
 const SELECTION_DIGEST_DOMAIN: &[u8] =
-    b"market-squawk/provider-market-event-point-in-time-selection/v2";
+    b"market-squawk/provider-market-event-point-in-time-selection/v1";
 
 /// Maximum exact event rows one point-in-time request may retain across source surfaces.
 pub const MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES: usize = 256;
@@ -31,6 +31,15 @@ pub enum ProviderMarketEventEffectiveTimeBasis {
     ReceivedAt,
 }
 
+/// Tie handling after selecting each source's newest eligible effective time.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProviderMarketEventTiePolicy {
+    /// Retain every exact row at that effective time for historical point-in-time analysis.
+    AllNewestEffectiveTimeTies,
+    /// Retain only the newest local receive observation, preserving every equal-receive tie.
+    LatestReceivedObservation,
+}
+
 /// Bounded immutable provider-market-event point-in-time request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMarketEventPointInTimeRequest {
@@ -42,6 +51,7 @@ pub struct ProviderMarketEventPointInTimeRequest {
     knowledge_cutoff: Timestamp,
     effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
     maximum_candidates: usize,
+    tie_policy: ProviderMarketEventTiePolicy,
     exact_manifest: Option<DatasetManifestRef>,
     exact_source_surface: Option<SourceId>,
     exact_product: Option<ProviderProduct>,
@@ -264,6 +274,7 @@ impl ProviderMarketEventPointInTimeRequest {
             knowledge_cutoff,
             effective_time_basis,
             maximum_candidates,
+            tie_policy: ProviderMarketEventTiePolicy::AllNewestEffectiveTimeTies,
             exact_manifest,
             exact_source_surface,
             exact_product,
@@ -312,6 +323,18 @@ impl ProviderMarketEventPointInTimeRequest {
     /// Returns the explicitly selected effective-time basis.
     pub const fn effective_time_basis(&self) -> ProviderMarketEventEffectiveTimeBasis {
         self.effective_time_basis
+    }
+
+    /// Sets the explicit tie policy without changing either cutoff or effective-time clock.
+    #[must_use]
+    pub const fn with_tie_policy(mut self, policy: ProviderMarketEventTiePolicy) -> Self {
+        self.tie_policy = policy;
+        self
+    }
+
+    /// Returns the digest-bound policy applied within each newest effective-time cohort.
+    pub const fn tie_policy(&self) -> ProviderMarketEventTiePolicy {
+        self.tie_policy
     }
 
     /// Returns the complete cross-source candidate ceiling.
@@ -365,6 +388,7 @@ impl ProviderMarketEventPointInTimeRequest {
             self.exact_product.clone(),
             self.exact_channel.clone(),
         )
+        .map(|request| request.with_tie_policy(self.tie_policy))
     }
 }
 
@@ -559,7 +583,7 @@ impl ProviderMarketEventSelectedCandidate {
     }
 }
 
-/// All newest effective-time ties for one exact source surface.
+/// Newest effective-time candidates retained by the request tie policy for one exact source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMarketEventSourceSelection {
     source_surface: SourceId,
@@ -578,7 +602,7 @@ impl ProviderMarketEventSourceSelection {
         self.effective_at
     }
 
-    /// Returns every exact row tied at that effective time in deterministic evidence order.
+    /// Returns every policy-admitted tie in deterministic evidence order.
     pub fn tied_candidates(&self) -> &[ProviderMarketEventSelectedCandidate] {
         &self.tied_candidates
     }
@@ -593,6 +617,7 @@ pub struct ProviderMarketEventExclusionCounts {
     ingested_after_knowledge: u64,
     origin_published_after_knowledge: u64,
     superseded_effective_time: u64,
+    superseded_received_observation: u64,
 }
 
 impl ProviderMarketEventExclusionCounts {
@@ -603,6 +628,7 @@ impl ProviderMarketEventExclusionCounts {
         ingested_after_knowledge: u64,
         origin_published_after_knowledge: u64,
         superseded_effective_time: u64,
+        superseded_received_observation: u64,
     ) -> Self {
         Self {
             missing_source_timestamp,
@@ -611,6 +637,7 @@ impl ProviderMarketEventExclusionCounts {
             ingested_after_knowledge,
             origin_published_after_knowledge,
             superseded_effective_time,
+            superseded_received_observation,
         }
     }
 
@@ -642,6 +669,11 @@ impl ProviderMarketEventExclusionCounts {
     /// Returns otherwise eligible rows older than their source's retained newest effective time.
     pub const fn superseded_effective_time(self) -> u64 {
         self.superseded_effective_time
+    }
+
+    /// Returns newest-effective-time rows superseded by a later admitted receive observation.
+    pub const fn superseded_received_observation(self) -> u64 {
+        self.superseded_received_observation
     }
 }
 
@@ -777,6 +809,8 @@ impl ProviderMarketEventPointInTimeSelection {
                     .ok_or(ProviderMarketEventSelectionError::EvidenceMismatch)?;
                 if effective_time(&candidate.coordinate, request.effective_time_basis)?
                     != effective_at
+                    || (request.tie_policy == ProviderMarketEventTiePolicy::LatestReceivedObservation
+                        && candidate.coordinate.received_at != tied[0].coordinate.received_at)
                 {
                     return Err(ProviderMarketEventSelectionError::EvidenceMismatch);
                 }
@@ -1024,6 +1058,10 @@ fn selection_digest(
         ProviderMarketEventEffectiveTimeBasis::SourceTimestamp => 1,
         ProviderMarketEventEffectiveTimeBasis::ReceivedAt => 2,
     }]);
+    hash.update([match request.tie_policy {
+        ProviderMarketEventTiePolicy::AllNewestEffectiveTimeTies => 1,
+        ProviderMarketEventTiePolicy::LatestReceivedObservation => 2,
+    }]);
     hash.update(
         u64::try_from(request.maximum_candidates)
             .map_err(|_| ProviderMarketEventSelectionError::DigestOverflow)?
@@ -1046,6 +1084,7 @@ fn selection_digest(
             .to_be_bytes(),
     );
     hash.update(selection.exclusions.superseded_effective_time.to_be_bytes());
+    hash.update(selection.exclusions.superseded_received_observation.to_be_bytes());
     hash.update([1]);
     hash.update(
         u64::try_from(selection.sources.len())

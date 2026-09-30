@@ -3163,7 +3163,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
     let (publication, expected_claim, expected_event) =
-        sealed_market_event_microbatch(&capture_store)?;
+        sealed_market_event_microbatch(&capture_store, 1, &[(500, 10_150)])?;
     let publication_digest = provider_market_event_publication_digest(&publication)?;
     let rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: source.source_id().clone(),
@@ -3227,7 +3227,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             CancellationToken::new(),
         )
         .await?;
-    assert_eq!(reopened.events(), &[expected_event]);
+    assert_eq!(reopened.events(), expected_event.as_slice());
     let evidence = restarted.provider_market_event_publication_evidence(
         &manifest,
         restarted_selectors[0],
@@ -3374,6 +3374,147 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             .await,
         Err(IngestError::Cancelled)
     ));
+    // Repeated observations of one provider event must not exhaust a current mark's tie
+    // budget. A conflict at the newest exact receive time remains an explicit two-row tie.
+    let capture_store = Arc::new(paths.sealed_research_journal_store()?);
+    for (batch_number, observations, expected_ties) in [
+        (
+            2,
+            (501..=533).map(|time| (time, 10_150)).collect::<Vec<_>>(),
+            1,
+        ),
+        (3, vec![(533, 10_151)], 2),
+    ] {
+        let (publication, _, _) =
+            sealed_market_event_microbatch(&capture_store, batch_number, &observations)?;
+        let publication_digest = provider_market_event_publication_digest(&publication)?;
+        let cancellation = CancellationToken::new();
+        let reservation = restarted
+            .reserve_source_ingest(
+                &source,
+                Timestamp::from_unix_nanos(10),
+                RightsDecisionInput {
+                    source_id: source.source_id().clone(),
+                    payload_digest: publication_digest,
+                    retrieved_at: Timestamp::from_unix_nanos(533),
+                    basis: RightsBasis::reviewed_terms(
+                        "https://example.test/alpaca-terms/v1",
+                        digest(41),
+                    )?,
+                    authorization_evidence: digest(43),
+                    authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                    permitted_operations: vec![SourceOperation::Persist],
+                },
+                &IngestIdentity::try_new(
+                    source.source_id().clone(),
+                    publication_digest,
+                    SourceOperation::Persist,
+                    format!("alpaca:iex:events:repeat-{batch_number}:v1"),
+                )?,
+                &cancellation,
+            )
+            .await?;
+        let committed = restarted
+            .ingest_provider_market_events(
+                reservation,
+                manifest.dataset_id().clone(),
+                publication,
+                cancellation.clone(),
+                Arc::new(AllowProviderEventPublication),
+            )
+            .await?;
+        let request = market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
+            manifest.dataset_id().clone(),
+            instrument,
+            retained_routes[0].venue_id().clone(),
+            LiveEventClass::Trade,
+            Timestamp::from_unix_nanos(490),
+            Timestamp::from_unix_nanos(i64::MAX),
+            market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+            32,
+            committed.manifest().clone(),
+            Some(source.source_id().clone()),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(matches!(
+            restarted
+                .read_provider_market_event_point_in_time(
+                    &request,
+                    Arc::clone(&capture_store),
+                    deadline,
+                    cancellation.clone(),
+                )
+                .await,
+            Err(IngestError::ProviderMarketEventSelection(
+                market_squawk_data::ProviderMarketEventSelectionError::CandidateLimitExceeded
+            ))
+        ));
+        let current_request = request.clone().with_tie_policy(
+            market_squawk_data::ProviderMarketEventTiePolicy::LatestReceivedObservation,
+        );
+        let current = restarted
+            .read_provider_market_event_point_in_time(
+                &current_request,
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await?
+            .ok_or("missing repeated-observation current selection")?;
+        assert_eq!(current.sources()[0].tied_candidates().len(), expected_ties);
+        assert_eq!(
+            current.sources()[0].effective_at(),
+            Timestamp::from_unix_nanos(490)
+        );
+        assert!(
+            current.sources()[0]
+                .tied_candidates()
+                .iter()
+                .all(|candidate| candidate.coordinate().received_at()
+                    == Timestamp::from_unix_nanos(533))
+        );
+        assert_eq!(current.exclusions().superseded_received_observation(), 33);
+        assert_eq!(
+            current.exact_restart_request()?.tie_policy(),
+            current_request.tie_policy()
+        );
+        restarted
+            .verify_provider_market_event_point_in_time_restart(
+                &current,
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await?;
+        // A larger explicitly admitted historical request still returns every source-time tie.
+        let historical_request =
+            market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
+                manifest.dataset_id().clone(),
+                instrument,
+                retained_routes[0].venue_id().clone(),
+                LiveEventClass::Trade,
+                Timestamp::from_unix_nanos(490),
+                Timestamp::from_unix_nanos(i64::MAX),
+                market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+                64,
+                committed.manifest().clone(),
+                Some(source.source_id().clone()),
+            )?;
+        let historical = restarted
+            .read_provider_market_event_point_in_time(
+                &historical_request,
+                Arc::clone(&capture_store),
+                deadline,
+                cancellation.clone(),
+            )
+            .await?
+            .ok_or("missing historical source-time ties")?;
+        assert_eq!(
+            historical.sources()[0].tied_candidates().len(),
+            33 + expected_ties
+        );
+        assert_eq!(historical.exclusions().superseded_received_observation(), 0);
+    }
     Ok(())
 }
 
@@ -6237,87 +6378,104 @@ fn market_source(
 
 fn sealed_market_event_microbatch(
     store: &SealedResearchJournalStore,
+    batch_number: u128,
+    observations: &[(i64, i64)],
 ) -> Result<
     (
         SealedProviderPublicationBinding,
         market_squawk_platform::SealedResearchJournalSegmentClaim,
-        MarketEvent,
+        Vec<MarketEvent>,
     ),
     Box<dyn Error>,
 > {
     let source_id = SourceId::try_from("alpaca-historical-fixture")?;
     let revision = MetadataRevision::new(SourceIdentifier::try_from("alpaca-revision-1")?);
     let dataset = SourceIdentifier::try_from("alpaca-live-events-fixture")?;
-    let payload = Bytes::from_static(b"{\"T\":\"t\",\"S\":\"AAPL\",\"p\":101.5,\"s\":2}");
-    let payload_digest =
-        EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
-    let received_at = Timestamp::from_unix_nanos(500);
-    let material = ProviderEventMicrobatchMaterial::try_new(
-        source_id.clone(),
-        revision.clone(),
-        dataset.clone(),
-        SourceIdentifier::try_from("alpaca-live-events-fixture:batch-1")?,
-        vec![RawCaptureRecord::try_new_live(
-            Uuid::from_u128(7_001),
+    let mut records = Vec::new();
+    let mut events = Vec::new();
+    let mut native_rows = Vec::new();
+    let mut frame_indices = Vec::new();
+    for (index, &(received_ns, price_ticks)) in observations.iter().enumerate() {
+        let payload = Bytes::from(format!(
+            "{{\"T\":\"t\",\"S\":\"AAPL\",\"p\":{}.{:02},\"s\":2}}",
+            price_ticks / 100,
+            price_ticks % 100,
+        ));
+        let payload_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
+        let received_at = Timestamp::from_unix_nanos(received_ns);
+        records.push(RawCaptureRecord::try_new_live(
+            Uuid::from_u128(7_000 + batch_number * 100 + u128::try_from(index)?),
             Arc::from(source_id.as_str()),
             Uuid::from_u128(7_002),
             Some(u64::MAX),
             Some(DateTime::<Utc>::from_timestamp_nanos(490)),
-            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            DateTime::<Utc>::from_timestamp_nanos(received_ns),
             payload,
-        )?],
+        )?);
+        let live_binding = LiveEvidenceBinding::new(
+            source_id.clone(),
+            SourceIdentifier::try_from("alpaca-live-session-1")?,
+            revision.clone(),
+            AuthorizationBasis::new(SourceIdentifier::try_from("fixture-user-credential")?),
+            VenueId::try_from("iex")?,
+            market_bar_instrument(1)?,
+            ConnectionGeneration::new(1)?,
+            ProviderProduct::new(SourceIdentifier::try_from("AAPL")?),
+            ProviderChannel::new(SourceIdentifier::try_from("trades")?),
+            LiveEventClass::Trade,
+            SourceIdentifier::try_from("alpaca-live-trade-1")?,
+            payload_digest,
+            CanonicalStateDigest::new(
+                digest(201),
+                CanonicalizationRule::new(
+                    SourceIdentifier::try_from("market-squawk.fixture.trade-v1")?,
+                    RuleVersion::new(1)?,
+                ),
+            ),
+            None,
+        )?;
+        events.push(MarketEvent::Trade(TradeEvent::new(
+            LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+                live_binding,
+                Some(Timestamp::from_unix_nanos(490)),
+                received_at,
+                received_at,
+                Timestamp::from_unix_nanos(received_ns + 1),
+                DataQuality::DirectUnverified,
+                CoverageStatus::Sufficient,
+                PayloadReference::SourceReference(SourceIdentifier::try_from(
+                    "alpaca-live-frame-1",
+                )?),
+            ))?,
+            PriceTicks::new(price_ticks),
+            QuantityLots::new(2)?,
+            AggressorSide::Buy,
+            None,
+        )?));
+        native_rows.push(Bytes::from(format!("{{\"frame\":{index}}}")));
+        frame_indices.push(u16::try_from(index)?);
+    }
+    let material = ProviderEventMicrobatchMaterial::try_new(
+        source_id.clone(),
+        revision.clone(),
+        dataset.clone(),
+        SourceIdentifier::try_from(format!("alpaca-live-events-fixture:batch-{batch_number}"))?,
+        records,
     )?;
     let (expectation, seal_request) = material.into_sealing_parts();
     let token = expectation.try_rejoin(seal_request.seal(store)?)?;
-    let live_binding = LiveEvidenceBinding::new(
-        source_id.clone(),
-        SourceIdentifier::try_from("alpaca-live-session-1")?,
-        revision.clone(),
-        AuthorizationBasis::new(SourceIdentifier::try_from("fixture-user-credential")?),
-        VenueId::try_from("iex")?,
-        market_bar_instrument(1)?,
-        ConnectionGeneration::new(1)?,
-        ProviderProduct::new(SourceIdentifier::try_from("AAPL")?),
-        ProviderChannel::new(SourceIdentifier::try_from("trades")?),
-        LiveEventClass::Trade,
-        SourceIdentifier::try_from("alpaca-live-trade-1")?,
-        payload_digest,
-        CanonicalStateDigest::new(
-            digest(201),
-            CanonicalizationRule::new(
-                SourceIdentifier::try_from("market-squawk.fixture.trade-v1")?,
-                RuleVersion::new(1)?,
-            ),
-        ),
-        None,
-    )?;
-    let event = MarketEvent::Trade(TradeEvent::new(
-        LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
-            live_binding,
-            Some(Timestamp::from_unix_nanos(490)),
-            received_at,
-            received_at,
-            Timestamp::from_unix_nanos(501),
-            DataQuality::DirectUnverified,
-            CoverageStatus::Sufficient,
-            PayloadReference::SourceReference(SourceIdentifier::try_from("alpaca-live-frame-1")?),
-        ))?,
-        PriceTicks::new(10_150),
-        QuantityLots::new(2)?,
-        AggressorSide::Buy,
-        None,
-    )?);
-    let batch =
-        ProviderMarketEventBatch::try_new(source_id, revision, dataset, vec![event.clone()])?;
+    let batch = ProviderMarketEventBatch::try_new(source_id, revision, dataset, events.clone())?;
     let native = ProviderMarketEventNativeLineageBatch::try_new(
         ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1,
         &batch,
-        vec![Bytes::from_static(b"{\"frame\":0}")],
+        native_rows,
         Some(Bytes::from_static(b"{\"connection_generation\":1}")),
     )?;
-    let binding = SealedProviderEventMicrobatchBinding::try_new(token, batch, native, vec![0])?;
+    let binding =
+        SealedProviderEventMicrobatchBinding::try_new(token, batch, native, frame_indices)?;
     let claim = binding.persisted_receipt().segment().claim().clone();
-    Ok((binding.into(), claim, event))
+    Ok((binding.into(), claim, events))
 }
 
 fn fund_nav_instrument() -> Result<InstrumentId, Box<dyn Error>> {

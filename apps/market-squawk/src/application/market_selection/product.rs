@@ -194,6 +194,8 @@ pub(crate) struct ProductMarketIdentity {
     selection_token: Box<str>,
     history_token: Box<str>,
     name: Box<str>,
+    symbol: Option<Box<str>>,
+    matches_search_query: bool,
     asset_class: &'static str,
     population_binding: [u8; 32],
 }
@@ -215,6 +217,14 @@ impl ProductMarketIdentity {
         &self.name
     }
 
+    pub(crate) fn symbol(&self) -> Option<&str> {
+        self.symbol.as_deref()
+    }
+
+    pub(crate) const fn matches_search_query(&self) -> bool {
+        self.matches_search_query
+    }
+
     pub(crate) const fn asset_class(&self) -> &'static str {
         self.asset_class
     }
@@ -227,6 +237,8 @@ impl ProductMarketIdentity {
 /// Builds the complete bounded token population and rejects every ambiguity or collision.
 pub(crate) fn product_market_identities(
     market_data: &[MarketDataInstrumentRecord],
+    effective_at: Timestamp,
+    query: Option<&str>,
 ) -> Result<Vec<ProductMarketIdentity>, ServiceError> {
     if market_data.len() > MAXIMUM_PRODUCT_MARKET_POPULATION
         || market_data.windows(2).any(|pair| {
@@ -260,6 +272,17 @@ pub(crate) fn product_market_identities(
             instrument_id: definition.instrument_id(),
             selection_token,
             history_token,
+            symbol: record
+                .display_symbol_at(effective_at)
+                .map(|symbol| try_boxed_product_text(symbol, 256))
+                .transpose()
+                .map_err(|_| ServiceError::ResourceExhausted)?,
+            matches_search_query: match query.map(str::trim).filter(|query| !query.is_empty()) {
+                Some(query) => record
+                    .matches_search_query_at(query, effective_at)
+                    .map_err(map_market_definition_read_error)?,
+                None => true,
+            },
             name: record
                 .definition()
                 .display_name()

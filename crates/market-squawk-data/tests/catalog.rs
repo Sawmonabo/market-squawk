@@ -1215,6 +1215,13 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         .latest(instrument_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
     assert_eq!(retained.revision_sequence(), 1);
+    assert!(retained.matches_search_query_at("aapl", Timestamp::from_unix_nanos(10))?);
+    assert!(retained.matches_search_query_at("apple", Timestamp::from_unix_nanos(10))?);
+    assert_eq!(
+        retained.display_symbol_at(Timestamp::from_unix_nanos(10)),
+        Some("AAPL")
+    );
+    assert!(!retained.matches_search_query_at("aapl", Timestamp::from_unix_nanos(9))?);
     let unique_before_competitor = reader.resolve_exact_as_of(
         "AAPL",
         retained.published_at(),
@@ -1567,6 +1574,8 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     assert!(future_parent.published_at() > retained.published_at());
     assert!(future_parent.published_at() < successor_effective_start);
     let valid_lower_rank_at = shift_timestamp(expired_alias_end, 1)?;
+    assert!(!future_parent.matches_search_query_at("AAPL.AAA", valid_lower_rank_at)?);
+    assert!(future_parent.matches_search_query_at("aapl.new", valid_lower_rank_at)?);
     let valid_lower_rank = reader.search_as_of(
         "AAPL.",
         future_parent.published_at(),

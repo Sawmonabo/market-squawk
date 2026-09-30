@@ -117,7 +117,6 @@ type SourceStatusRuntime =
   | {
       state: "active_group"
       runtimeGenerationSha256: string
-      qualifiedRuntimeRecordCount: 0
     }
   | SourceActiveRuntime
 
@@ -1538,17 +1537,15 @@ function sourceStatusRuntime(value: unknown): SourceStatusRuntime | null {
   const inactive = exactRecord(value, ["state"])
   if (inactive?.state === "not_active") return { state: "not_active" }
   const activeGroup = exactRecord(value, [
-    "state", "runtimeGenerationSha256", "qualifiedRuntimeRecordCount",
+    "state", "runtimeGenerationSha256",
   ])
   if (
     activeGroup?.state === "active_group" &&
-    nonzeroSha256(activeGroup.runtimeGenerationSha256) &&
-    activeGroup.qualifiedRuntimeRecordCount === 0
+    nonzeroSha256(activeGroup.runtimeGenerationSha256)
   ) {
     return {
       state: "active_group",
       runtimeGenerationSha256: activeGroup.runtimeGenerationSha256,
-      qualifiedRuntimeRecordCount: 0,
     }
   }
   const active = exactRecord(value, [

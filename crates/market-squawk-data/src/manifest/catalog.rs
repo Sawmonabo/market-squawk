@@ -424,7 +424,7 @@ impl AnalyticalManifestCatalog {
              ), keyed_rows AS (
                  SELECT publication.publication_digest, publication.publication_kind,
                         indexed.publication_row_ordinal, indexed.coordinate_digest,
-                        indexed.source_id,
+                        indexed.source_id, indexed.received_at_ns,
                         CASE WHEN ?6=0 THEN indexed.source_timestamp_ns
                              ELSE indexed.received_at_ns END AS effective_at_ns,
                         origin.origin_published_at_ns
@@ -451,13 +451,17 @@ impl AnalyticalManifestCatalog {
              ), newest_by_source AS (
                  SELECT *, MAX(effective_at_ns) OVER (
                      PARTITION BY source_id
-                 ) AS newest_effective_at_ns
+                 ) AS newest_effective_at_ns,
+                 MAX(received_at_ns) OVER (
+                     PARTITION BY source_id, effective_at_ns
+                 ) AS newest_received_at_ns
                  FROM keyed_rows
              )
              SELECT publication_digest, publication_kind, publication_row_ordinal,
                     coordinate_digest, source_id, effective_at_ns, origin_published_at_ns
              FROM newest_by_source
              WHERE effective_at_ns=newest_effective_at_ns
+               AND (?14=0 OR received_at_ns=newest_received_at_ns)
              ORDER BY source_id, publication_digest, publication_row_ordinal
              LIMIT ?10",
             )?;
@@ -480,6 +484,7 @@ impl AnalyticalManifestCatalog {
                 request
                     .exact_channel()
                     .map(|value| value.as_source_identifier().as_str()),
+                request.tie_policy() == crate::ProviderMarketEventTiePolicy::LatestReceivedObservation,
             ])?;
             let mut candidates = Vec::new();
             candidates
@@ -3236,7 +3241,7 @@ fn provider_market_event_exclusion_counts(
     clock: i64,
 ) -> Result<ProviderMarketEventExclusionCounts, ManifestCatalogError> {
     let instrument = request.instrument_id().map(|id| id.as_uuid());
-    let counts: (i64, i64, i64, i64, i64, i64) = connection.query_row(
+    let counts: (i64, i64, i64, i64, i64, i64, i64) = connection.query_row(
         "WITH publication_origin AS (
              SELECT publication.publication_digest,
                     MIN(generation.available_at_ns) AS origin_published_at_ns
@@ -3272,7 +3277,10 @@ fn provider_market_event_exclusion_counts(
          ), eligible AS (
              SELECT *, MAX(effective_at_ns) OVER (
                  PARTITION BY source_id
-             ) AS newest_effective_at_ns
+             ) AS newest_effective_at_ns,
+             MAX(received_at_ns) OVER (
+                 PARTITION BY source_id, effective_at_ns
+             ) AS newest_received_at_ns
              FROM keyed_rows
              WHERE ((?6=0 AND source_timestamp_ns IS NOT NULL
                              AND source_timestamp_ns<=?7)
@@ -3305,7 +3313,10 @@ fn provider_market_event_exclusion_counts(
                        AND available_at_ns<=?8 AND ingested_at_ns<=?8
                        AND origin_published_at_ns>?8), 0),
            COALESCE((SELECT COUNT(*) FROM eligible
-                     WHERE effective_at_ns<newest_effective_at_ns), 0)",
+                     WHERE effective_at_ns<newest_effective_at_ns), 0),
+           COALESCE((SELECT COUNT(*) FROM eligible
+                     WHERE ?13=1 AND effective_at_ns=newest_effective_at_ns
+                       AND received_at_ns<newest_received_at_ns), 0)",
         params![
             request.dataset().as_str(),
             generation_sequence,
@@ -3323,6 +3334,7 @@ fn provider_market_event_exclusion_counts(
             request
                 .exact_channel()
                 .map(|value| value.as_source_identifier().as_str()),
+            request.tie_policy() == crate::ProviderMarketEventTiePolicy::LatestReceivedObservation,
         ],
         |row| {
             Ok((
@@ -3332,6 +3344,7 @@ fn provider_market_event_exclusion_counts(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
@@ -3342,6 +3355,7 @@ fn provider_market_event_exclusion_counts(
         exclusion_count(counts.3)?,
         exclusion_count(counts.4)?,
         exclusion_count(counts.5)?,
+        exclusion_count(counts.6)?,
     ))
 }
 

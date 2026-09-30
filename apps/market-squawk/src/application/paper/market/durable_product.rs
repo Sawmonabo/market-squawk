@@ -23,8 +23,9 @@ impl MarketDomainService {
         let records = selections
             .population(reference_at, context.deadline(), context.cancellation())
             .await?;
-        let identities = product::product_market_identities(&records)?;
         let argument = |name: &str| request.arguments().get(name).and_then(Value::as_str);
+        let identities =
+            product::product_market_identities(&records, reference_at, argument("query"))?;
         let maximum_rows = limits
             .maximum_result_items()
             .min(product::MAXIMUM_PRODUCT_MARKET_ROWS);

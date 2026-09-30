@@ -223,6 +223,60 @@ pub struct MarketDataInstrumentRecord {
 }
 
 impl MarketDataInstrumentRecord {
+    /// Matches an already pinned revision using the catalog's admitted, effective search terms.
+    /// This does not select a revision or resolve ambiguity between instruments.
+    pub fn matches_search_query_at(
+        &self,
+        query: &str,
+        effective_at: Timestamp,
+    ) -> Result<bool, MarketDataInstrumentCatalogError> {
+        validate_search(query, 1)?;
+        let query = normalize(query.trim());
+        for term in search_terms(self.definition())? {
+            if term.normalized.contains(&query)
+                && matched_identity_is_effective(
+                    self.definition(),
+                    parse_match_kind(term.kind)?,
+                    &term.display,
+                    effective_at,
+                )
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns a display symbol only when effective admitted tickers and venue symbols agree.
+    /// Provider-native routing aliases never participate in this presentation choice.
+    pub fn display_symbol_at(&self, effective_at: Timestamp) -> Option<&str> {
+        if !interval_contains(self.definition().effective_interval(), effective_at) {
+            return None;
+        }
+        let tickers = self.definition().identifiers().iter().filter_map(|record| {
+            if record.assignment_verification() != AssignmentVerification::VerifiedAssigned
+                || !interval_contains(record.validity(), effective_at)
+            {
+                return None;
+            }
+            match record.identifier() {
+                ExternalIdentifier::Ticker(ticker) => Some(ticker.as_str()),
+                _ => None,
+            }
+        });
+        let venues = self
+            .definition()
+            .venue_mappings()
+            .iter()
+            .map(|mapping| mapping.venue_symbol().as_str());
+        let mut symbols = tickers.chain(venues);
+        let symbol = symbols.next()?;
+        (symbols.all(|candidate| candidate == symbol)
+            && symbol.chars().count() <= 64
+            && !symbol.chars().any(char::is_control))
+        .then_some(symbol)
+    }
+
     /// Conservative owned retention: native vector elements plus measured serialized strings.
     /// Serialization writes only to a counter; it does not allocate a second JSON body.
     pub fn retained_bytes(&self) -> Result<usize, MarketDataInstrumentCatalogError> {

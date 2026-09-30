@@ -10,7 +10,7 @@ use market_squawk_data::{
     AuthorizedResearchUse, CatalogLimit, DatasetManifestRef, InstrumentDefinitionReadCapability,
     MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationSelection,
     MarketDataInstrumentReadCapability, PinnedInstrumentDefinitions,
-    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeSelection,
+    ProviderMarketEventPointInTimeSelection,
     ProviderMarketEventSelectedCandidate, ProviderMarketEventSelectionCompleteness, ResearchUse,
     ResearchUseCatalogError, ResearchUseGraphDigest, ResearchUseLimits, ResearchUseRequest,
 };
@@ -819,13 +819,12 @@ impl MarketInvestmentReadCapability {
             for event_kind in [LiveEventClass::Quote, LiveEventClass::Trade] {
                 check_market_read(as_of, deadline, &cancellation)?;
                 let child = cancellation.child_token();
-                let read = selector.select_latest(
+                let read = selector.select_current(
                     instrument_id,
                     route.venue_id().clone(),
                     event_kind,
                     as_of,
                     as_of,
-                    ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
                     MAX_SOURCE_EVENT_TIES,
                     deadline,
                     child.clone(),

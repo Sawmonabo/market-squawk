@@ -1951,7 +1951,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     read(
         "Market.SearchUniverse",
-        "Find investments by name.",
+        "Find investments by ticker, name or admitted identifier.",
         ServiceDomain::Market,
         JOB_SCOPE,
         MARKET_UNIVERSE_SEARCH_ARGUMENTS,

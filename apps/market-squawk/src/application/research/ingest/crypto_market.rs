@@ -26,7 +26,7 @@ use market_squawk_data::{
     IngestPrecommitAuthority, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
     ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeRequest,
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventPublicationKind,
-    ProviderMarketEventSelectionError, RightsError, SourceOperation,
+    ProviderMarketEventSelectionError, ProviderMarketEventTiePolicy, RightsError, SourceOperation,
     provider_market_event_publication_digest,
 };
 use market_squawk_domain::{
@@ -820,20 +820,19 @@ impl MarketEventPointInTimeSelector {
         &self.source_surface
     }
 
-    /// Selects bounded newest ties for one exact canonical instrument, venue, event kind, clock,
-    /// and source surface. An empty result remains distinct from an empty, complete generation.
+    /// Selects the newest source-time cohort and latest admitted receive observation for a
+    /// current mark, retaining equal-observation ambiguity and the original source clock.
     #[allow(
         clippy::too_many_arguments,
         reason = "canonical identity, venue, event family, both PIT clocks, basis, and bound stay explicit"
     )]
-    pub(crate) async fn select_latest(
+    pub(crate) async fn select_current(
         &self,
         instrument_id: InstrumentId,
         venue_id: VenueId,
         event_kind: LiveEventClass,
         as_of_cutoff: Timestamp,
         knowledge_cutoff: Timestamp,
-        effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
         deadline: Instant,
         cancellation: CancellationToken,
@@ -845,10 +844,11 @@ impl MarketEventPointInTimeSelector {
             event_kind,
             as_of_cutoff,
             knowledge_cutoff,
-            effective_time_basis,
+            ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
             maximum_candidates,
             Some(self.source_surface.clone()),
-        )?;
+        )?
+        .with_tie_policy(ProviderMarketEventTiePolicy::LatestReceivedObservation);
         let store = self.research.provider_capture_store();
         let selection = self
             .research

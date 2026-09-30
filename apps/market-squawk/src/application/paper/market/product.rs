@@ -65,7 +65,7 @@ pub(super) fn select_product_page(
         .try_reserve_exact(identities.len())
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     for identity in identities {
-        if query.is_empty() || identity.name().contains(query) {
+        if query.is_empty() || identity.matches_search_query() {
             visible.push(identity);
         }
     }
@@ -201,7 +201,7 @@ pub(super) fn product_search_page(
             .ok_or(ServiceError::InvalidResult)?;
         rows.push(json!({
             "selectionToken": identity.selection_token(),
-            "symbol": Value::Null,
+            "symbol": identity.symbol(),
             "name": identity.name(),
             "kind": product_kind(identity.asset_class()),
         }));
@@ -257,7 +257,7 @@ pub(super) fn product_row(
         "selectionToken": identity.selection_token(),
         "historyToken": identity.history_token(),
         "identity": {
-            "symbol": Value::Null,
+            "symbol": identity.symbol(),
             "name": identity.name(),
             "assetClass": identity.asset_class(),
         },
@@ -351,4 +351,156 @@ fn canonical_time(value: &Value) -> Result<String, ServiceError> {
 
 fn native_instrument_id(value: &Value) -> Option<InstrumentId> {
     value.get("instrumentId")?.as_str()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use market_squawk_data::{
+        CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
+        MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
+        MarketDataInstrumentSynchronizationCapability,
+    };
+    use market_squawk_domain::{
+        AssetClass, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+        IdentifierEntitlement, IdentifierRightsPolicyReference, MarketDataDisplayName,
+        MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, MetadataRevision,
+        RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp, VenueId, VenueMapping,
+        VenueSymbol,
+    };
+    use market_squawk_platform::LocalPaths;
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn canonical_ticker_search_preserves_selection_and_population_bound_continuation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path().join("catalog"))?;
+        let authority = Arc::new(Mutex::new(CatalogAuthority::open(CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?)?));
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let evidence = ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [1; 32],
+        ));
+        let mut definitions = Vec::new();
+        for (id, symbol, name) in [
+            (
+                "00000000-0000-0000-0000-000000000101",
+                "SPY",
+                "State Street SPDR S&P 500 ETF Trust",
+            ),
+            (
+                "00000000-0000-0000-0000-000000000102",
+                "VTI",
+                "Vanguard Total Stock Market ETF",
+            ),
+        ] {
+            definitions.push(MarketDataInstrumentDefinition::try_new(
+                MarketDataInstrumentDefinitionInput {
+                    instrument_id: id.parse()?,
+                    reference_evidence: RevisionBoundPayloadEvidence::new(
+                        MetadataRevision::new(SourceIdentifier::try_from("official-listing-v1")?),
+                        evidence.clone(),
+                    ),
+                    effective_interval: EffectiveInterval::new(
+                        Timestamp::from_unix_nanos(1),
+                        None,
+                    )?,
+                    asset_class: AssetClass::Fund,
+                    display_name: Some(MarketDataDisplayName::try_new(
+                        name,
+                        SourceId::try_from("official-listing")?,
+                        evidence.clone(),
+                        IdentifierRightsPolicyReference::new(
+                            SourceIdentifier::try_from("local-use-v1")?,
+                            IdentifierEntitlement::LicensedInternalUse,
+                            SourceIdentifier::try_from("https://example.test/listing")?,
+                        ),
+                    )?),
+                    quote_currency: Currency::try_from("USD")?,
+                    quote_currency_evidence: evidence.clone(),
+                    venue_mappings: vec![VenueMapping::new(
+                        VenueId::try_from("ARCX")?,
+                        VenueSymbol::try_from(symbol)?,
+                    )],
+                    provider_identities: Vec::new(),
+                    identifiers: Vec::new(),
+                },
+            )?);
+        }
+        MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority)).synchronize(
+            MarketDataInstrumentSynchronization::try_new(definitions, 2)?,
+            deadline,
+            &cancellation,
+        )?;
+        let reader = MarketDataInstrumentReadCapability::new(authority);
+        let mut records = Vec::new();
+        for id in [
+            "00000000-0000-0000-0000-000000000101",
+            "00000000-0000-0000-0000-000000000102",
+        ] {
+            records.push(
+                reader
+                    .latest(id.parse()?, deadline, &cancellation)?
+                    .ok_or("missing identity")?,
+            );
+        }
+        let cutoff = records
+            .iter()
+            .map(|record| record.published_at())
+            .max()
+            .ok_or("missing cutoff")?;
+        let ticker = product_market_identities(&records, cutoff, Some("spy"))?;
+        let (ticker_page, count, more) = product_search_page(&ticker, "spy", 100, None)?;
+        assert_eq!(count, 1);
+        assert!(!more);
+        assert_eq!(ticker_page["data"][0]["symbol"], "SPY");
+        let token = ticker_page["data"][0]["selectionToken"]
+            .as_str()
+            .ok_or("missing token")?;
+        let selected = resolve_selection_token(&ticker, token)?;
+        assert_eq!(selected.to_string(), "00000000-0000-0000-0000-000000000101");
+        let named = product_market_identities(&records, cutoff, Some("spdr"))?;
+        let (name_page, _, _) = product_search_page(&named, "spdr", 100, None)?;
+        assert_eq!(name_page["data"][0]["selectionToken"], token);
+        assert_eq!(
+            resolve_history_token(&named, ticker[0].history_token())?,
+            ticker[0].instrument_id()
+        );
+
+        let all = product_market_identities(&records, cutoff, Some("etf"))?;
+        let (first, count, more) = product_search_page(&all, "etf", 1, None)?;
+        assert_eq!(count, 2);
+        assert!(more);
+        let cursor = first["page"]["nextPageToken"]
+            .as_str()
+            .ok_or("missing cursor")?;
+        let (second, count, more) = product_search_page(&all, "etf", 1, Some(cursor))?;
+        assert_eq!(count, 1);
+        assert!(!more);
+        assert_ne!(
+            first["data"][0]["selectionToken"],
+            second["data"][0]["selectionToken"]
+        );
+        assert!(matches!(
+            product_search_page(&all, "ETF", 1, Some(cursor)),
+            Err(ServiceError::Unavailable)
+        ));
+        let reduced = product_market_identities(&records[..1], cutoff, Some("etf"))?;
+        assert!(matches!(
+            product_search_page(&reduced, "etf", 1, Some(cursor)),
+            Err(ServiceError::Unavailable)
+        ));
+        Ok(())
+    }
 }

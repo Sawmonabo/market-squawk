@@ -312,6 +312,7 @@ pub use provider_event_selection::{
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventSelectedCandidate,
     ProviderMarketEventSelectionCompleteness, ProviderMarketEventSelectionCoordinate,
     ProviderMarketEventSelectionError, ProviderMarketEventSourceSelection,
+    ProviderMarketEventTiePolicy,
 };
 pub(crate) use provider_event_selection::{
     ProviderMarketEventCatalogCandidate, ProviderMarketEventCatalogPlan,
