@@ -439,7 +439,14 @@ impl MarketDataInstrumentBinding {
             || old.quote_currency() != new.quote_currency()
             || old.quote_currency_evidence() != new.quote_currency_evidence()
             || old.reference_evidence() != new.reference_evidence()
-            || old.effective_interval() != new.effective_interval()
+            // Native-reference publication begins a later catalog revision at acquisition.
+            // It may narrow the original authority, but cannot backdate or extend it.
+            || !interval_contains(old.effective_interval(), at)
+            || !interval_contains(new.effective_interval(), at)
+            || new.effective_interval().starts_at() < old.effective_interval().starts_at()
+            || old.effective_interval().ends_at().is_some_and(|end| {
+                new.effective_interval().ends_at().is_none_or(|new_end| new_end > end)
+            })
             || !old.venue_mappings().iter().all(|mapping| new.venue_mappings().contains(mapping))
             || !old.identifiers().iter().all(|identifier| new.identifiers().contains(identifier))
             || !old.provider_identities().iter().all(|identity| new.provider_identities().contains(identity))
@@ -2547,4 +2554,259 @@ pub enum MarketProviderConfigurationError {
     /// Kraken rejected authenticated level-3 metadata.
     #[error(transparent)]
     KrakenMetadata(#[from] KrakenL3MetadataError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
+
+    use market_squawk_data::{
+        CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
+        MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
+    };
+    use market_squawk_domain::{
+        Currency, ExternalIdentifierRecordInput, IdentifierRightsPolicyReference,
+        MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+        ProviderIdentityEvidence, ProviderIdentityRecordInput, Ticker, VenueMapping, VenueSymbol,
+    };
+    use market_squawk_platform::LocalPaths;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[test]
+    fn alpaca_native_rebind_accepts_later_catalog_publication_and_rejects_changed_authority()
+    -> TestResult {
+        let root = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(root.path().join("catalog"))?;
+        let authority = Arc::new(Mutex::new(CatalogAuthority::open(CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?)?));
+        let publisher = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
+        let reader = MarketDataInstrumentReadCapability::new(authority);
+        let cancellation = CancellationToken::new();
+        let deadline = || Instant::now() + Duration::from_secs(2);
+        let instrument: InstrumentId = "00000000-0000-0000-0000-000000000101".parse()?;
+        let original = reference_definition(instrument, 10, false, "USD")?;
+        publisher.synchronize(
+            MarketDataInstrumentSynchronization::try_new(vec![original.clone()], 1)?,
+            deadline(),
+            &cancellation,
+        )?;
+        let before = reader
+            .latest(instrument, deadline(), &cancellation)?
+            .ok_or("missing original")?;
+        let binding = listing_binding(&before)?;
+
+        // Use the catalog's real publication/read path. The asset-reference producer retains
+        // issuer authority while adding IEX/native identity at a later effective start.
+        let successor = reference_definition(instrument, 20, true, "USD")?;
+        publisher.synchronize(
+            MarketDataInstrumentSynchronization::try_new(vec![successor.clone()], 1)?,
+            deadline(),
+            &cancellation,
+        )?;
+        let after = reader
+            .latest(instrument, deadline(), &cancellation)?
+            .ok_or("missing successor")?;
+        assert_eq!(after.revision_sequence(), before.revision_sequence() + 1);
+        let native = ProviderNativeIdentityRequest {
+            namespace: SourceId::try_from("alpaca-basic-iex-current-v1")?,
+            provider_instrument_id: ProviderInstrumentId::try_from(
+                "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+            )?,
+            instrument,
+            venue: VenueId::try_from("iex")?,
+            venue_symbol: VenueSymbol::try_from("SPY")?,
+            knowledge_at: after.published_at(),
+            effective_at: after.published_at(),
+        };
+        let rebound = binding.try_rebind_after_alpaca_reference(
+            &before,
+            &after,
+            &native,
+            &reader,
+            deadline(),
+            &cancellation,
+        )?;
+        assert_eq!(rebound.definition_revision_digest, after.revision_digest());
+        assert_eq!(
+            rebound.definition_effective,
+            after.definition().effective_interval()
+        );
+        assert_eq!(rebound.native_identity(), Some(&native));
+        assert!(
+            rebound
+                .publication_reference(&after, native.effective_at)
+                .is_ok()
+        );
+        // An exact already-published native reference remains reusable on retry.
+        assert!(
+            rebound
+                .try_rebind_after_alpaca_reference(
+                    &after,
+                    &after,
+                    &native,
+                    &reader,
+                    deadline(),
+                    &cancellation,
+                )
+                .is_ok()
+        );
+
+        // A prior genuine catalog revision cannot replace the newly pinned revision.
+        assert!(
+            rebound
+                .try_rebind_after_alpaca_reference(
+                    &after,
+                    &before,
+                    &native,
+                    &reader,
+                    deadline(),
+                    &cancellation,
+                )
+                .is_err()
+        );
+        // A current revision changing canonical currency cannot pass as a native-only update.
+        publisher.synchronize(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![reference_definition(instrument, 30, true, "EUR")?],
+                1,
+            )?,
+            deadline(),
+            &cancellation,
+        )?;
+        let changed = reader
+            .latest(instrument, deadline(), &cancellation)?
+            .ok_or("missing changed identity")?;
+        assert!(
+            binding
+                .try_rebind_after_alpaca_reference(
+                    &before,
+                    &changed,
+                    &native,
+                    &reader,
+                    deadline(),
+                    &cancellation,
+                )
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    fn listing_binding(
+        record: &MarketDataInstrumentRecord,
+    ) -> TestResult<MarketDataInstrumentBinding> {
+        let identifier = record
+            .definition()
+            .identifiers()
+            .first()
+            .ok_or("missing ticker")?;
+        Ok(MarketDataInstrumentBinding::from_validated_parts(
+            MarketSubscriptionPriority::Benchmark,
+            record,
+            ProviderInstrumentId::try_from("SPY")?,
+            MarketDataSubscriptionSymbolEvidence {
+                kind: MarketDataSubscriptionSymbolEvidenceKind::NasdaqSessionListing {
+                    source_id: identifier.source_id().clone(),
+                    metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                        "listing-v1",
+                    )?),
+                    source_payload_evidence: identifier.source_evidence().clone(),
+                    source_timestamp: Timestamp::from_unix_nanos(1),
+                    observed_at: Timestamp::from_unix_nanos(10),
+                    symbol: ProviderInstrumentId::try_from("SPY")?,
+                    mic: VenueId::try_from("ARCX")?,
+                    asset_class: AssetClass::Fund,
+                    effective: EffectiveInterval::new(Timestamp::from_unix_nanos(10), None)?,
+                },
+            },
+        ))
+    }
+
+    fn reference_definition(
+        instrument_id: InstrumentId,
+        starts_at: i64,
+        native: bool,
+        currency: &str,
+    ) -> TestResult<MarketDataInstrumentDefinition> {
+        let evidence = ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [1; 32],
+        ));
+        let mut mappings = vec![VenueMapping::new(
+            VenueId::try_from("ARCX")?,
+            VenueSymbol::try_from("SPY")?,
+        )];
+        let provider_identities = if native {
+            mappings.push(VenueMapping::new(
+                VenueId::try_from("iex")?,
+                VenueSymbol::try_from("SPY")?,
+            ));
+            vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id,
+                source_id: SourceId::try_from("alpaca-basic-iex-current-v1")?,
+                provider_instrument_id: ProviderInstrumentId::try_from(
+                    "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+                )?,
+                evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    [2; 32],
+                )),
+                source_timestamp: None,
+                observed_at: Timestamp::from_unix_nanos(20),
+                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                    "alpaca-asset-reference-v1",
+                )?),
+                validity: EffectiveInterval::new(Timestamp::from_unix_nanos(20), None)?,
+                supersedes: None,
+            })]
+        } else {
+            Vec::new()
+        };
+        Ok(MarketDataInstrumentDefinition::try_new(
+            MarketDataInstrumentDefinitionInput {
+                instrument_id,
+                reference_evidence: RevisionBoundPayloadEvidence::new(
+                    MetadataRevision::new(SourceIdentifier::try_from("issuer-v1")?),
+                    evidence.clone(),
+                ),
+                effective_interval: EffectiveInterval::new(
+                    Timestamp::from_unix_nanos(starts_at),
+                    None,
+                )?,
+                asset_class: AssetClass::Fund,
+                display_name: None,
+                quote_currency: Currency::try_from(currency)?,
+                quote_currency_evidence: evidence.clone(),
+                venue_mappings: mappings,
+                provider_identities,
+                identifiers: vec![ExternalIdentifierRecord::new(
+                    ExternalIdentifierRecordInput {
+                        identifier: ExternalIdentifier::Ticker(Ticker::try_from("SPY")?),
+                        assignment_verification: AssignmentVerification::VerifiedAssigned,
+                        source_id: SourceId::try_from("nasdaq-trader-symbol-directory-reference")?,
+                        source_evidence: evidence,
+                        source_timestamp: Some(Timestamp::from_unix_nanos(1)),
+                        observed_at: Timestamp::from_unix_nanos(10),
+                        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(10), None)?,
+                        rights_policy: IdentifierRightsPolicyReference::new(
+                            SourceIdentifier::try_from("reference-local-use")?,
+                            IdentifierEntitlement::LicensedInternalUse,
+                            SourceIdentifier::try_from("https://www.nasdaqtrader.com")?,
+                        ),
+                    },
+                )],
+            },
+        )?)
+    }
 }

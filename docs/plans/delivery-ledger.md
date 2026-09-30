@@ -1,5 +1,86 @@
 # Market Squawk Delivery Ledger
 
+## Active saved-planning and live-input wave — 2026-09-30
+
+Audit base: `bcf22c8c`, primary feature branch, clean worktree. Acceptance 4/5/6 requires saved
+portfolio scenarios, rebalance and position comparisons to reopen with their original assumptions
+and evidence. These calculations now work across shared contracts, but the product has no save/read
+journey. Acceptance 1/2/7 independently requires actual admitted stock/benchmark/fiscal inputs;
+service unlock/import and Alpaca doctor probes now pass, but they are not publication evidence.
+
+| Owner | Exclusive scope | Required handoff |
+| --- | --- | --- |
+| Astra High financial authority | Read-only existing portfolio calculation outputs, durable repositories/artifacts and relevant persistence tests | Smallest reusable saved-plan authority for all three results; exact input/output/persistence/identity/cancellation contracts and existing critical restart check. No edits/builds/Git. |
+| GPT-6.1 Sol High Desktop | Read-only Portfolio panels/hooks plus existing saved-result selection/rendering | Precise reusable save/list/reopen UX and file ownership after backend contract; no duplicate calculator or whole-list preload. No edits/builds/Git. |
+| GPT-6.1 Sol High provider | Read-only current provider/market-evidence preparation and retained non-secret readiness evidence | Exact existing operation sequence from imported/verified Alpaca plus references/SEC/rates to admitted subject/SPY/VTI history/fiscal inputs. Locate first real prerequisite; no credentials, network mutations, builds or Git. |
+| Astra High lifecycle diagnosis | Read-only `local_product/source_lifecycle.rs`, account-group runtime and retained non-secret source status/logs | Reproduce from recorded start failure: doctor passed, Source.Start unavailable, revision 3 blocked/reconciliation. Identify exact failing transition and existing repair; no edits/builds/mutations/credential reads. |
+| Lead | Shared contracts/composition/transport, live service actions, ledger, Git and builds | Freeze save contract after authority trace, then assign disjoint writers; perform current live-input operations independently. |
+
+DAG: independent saved-authority and Desktop traces → one frozen persistence contract → disjoint
+backend/Desktop implementation → lead integration and one critical save/restart check → pushed
+checkpoint. Provider trace → lead live acquisition/typed read runs concurrently. Traces are bounded
+handoffs, not new planning/review rounds; no broad audit or new branch/worktree.
+
+Provider diagnosis complete: native asset-reference publication legitimately advances the effective
+start, while `try_rebind_after_alpaca_reference` incorrectly requires an identical interval. Astra
+`native_setup_current` now exclusively owns `apps/market-squawk/src/provider_activation/market_config.rs`
+including one existing-library-target regression for this uncovered admission seam. Replace interval
+equality with valid-at-cutoff, non-backdating/non-widening checks; retain every identity, currency,
+reference, mapping and latest-revision check. No lifecycle reset or credential reimport. Lead reviews,
+runs the single-job critical check, rebuilds the needed existing binaries once, and resumes the retained
+transition through its supported recovery operation. Other authority/schema writers remain held until
+this small provider checkpoint is frozen. Lead additionally owns `cli.rs`, `local_product/cli_transport.rs`
+and the two source CLI reference/runbook entries for a thin `source retry` binding: ordinary MCP
+intentionally omits source administration, and research-only RestoreSaved cannot resume Alpaca.
+Reuse the existing lifecycle helper and its revision/configuration fencing; do not add a recovery owner. Saved-plan traces are complete; their implementation has
+not started and remains the next independent product checkpoint.
+
+Desktop recovery dependency: the existing blocked-source controls explicitly omit Alpaca Retry even
+when a retained transition needs reconciliation. GPT-6.1 Sol `position_desktop_trace` exclusively owns
+`apps/market-squawk-desktop/src/features/sources/source-evidence.ts` and its existing focused critical
+control test, if present, to expose that existing native Retry action for the actual recoverable saved
+configuration. Request remains observed revision plus reason, without replacement session/configuration.
+No new transport, backend authority, build, Git operation or independent review is needed.
+
+Native reference regression passed: the existing library binary ran exactly one
+`provider_activation::market_config::tests::alpaca_native_rebind_accepts_later_catalog_publication_and_rejects_changed_authority`
+case (later real catalog publication, reusable exact revision, stale/currency-changing rejection).
+The first Cargo name filter selected zero cases; its exit status was not accepted as verification.
+The built binary was then invoked with the fully qualified exact name and passed one case.
+Evidence: `.agents/tmp/v1-first-stock/alpaca-rebind-critical-result.log`.
+
+Live setup: runtime/provider unlock and credential import remain successful; H.15 expired anonymous
+setup was refreshed through staged Start, then real activation succeeded, retaining its new recipe.
+This establishes activation, not full historical publication. Source recovery exposed a separate
+expired-pending-doctor dead end: Verify rejects the unfinished transition and Retry cannot renew its
+expired candidate. The CLI/service build was interrupted early to avoid a duplicate build before
+that repair. No active compiler remains; no state or credential reset was performed.
+
+Next bounded authority remediation: Astra `native_setup_current` prepares changes only in
+`apps/market-squawk/src/local_product/source_lifecycle.rs`,
+`apps/market-squawk/src/provider_onboarding/service.rs`,
+`crates/market-squawk-data/src/catalog_capabilities.rs`,
+`crates/market-squawk-sources/src/onboarding/lifecycle.rs` and its existing `tests.rs`.
+Preserve the existing RuntimeVerified event and same candidate generation. Only an expired exact
+Alpaca receipt may gain fresh doctor evidence, with retained predecessor/configuration/credential
+identity and current/newer verification checks; remain RuntimeVerificationPending until runtime
+activation succeeds. Lead retains final shared-authority integration and all checks/Git. Extend the
+existing same-generation renewal critical test; no new event/schema, authority bypass or reset.
+Desktop's existing `src/test/app.test.tsx` is assigned solely for the one missing recovery control assertion.
+
+Saved-planning handoff (implementation pending): share the existing SQLite catalog authority and
+`ControlledArtifactRepository`; do not retain a whole saved-results index in application memory.
+All three calculations must issue an opaque server-owned completed-result token with their original
+request, output, account/snapshot, calculation time and source evidence. Save takes account plus token,
+never client financial JSON or recalculation. List uses account-bound, sequence-fenced cursors; Get
+loads one immutable artifact and preserves the original evidence after later imports or price expiry.
+Desktop reuses the three existing result renderers, adds explicit Save and one demand-loaded saved
+panel with cursor navigation and selection-only detail fetch. Cancellation of detail reads must not
+undo an accepted save. Before assigning writers, lead must settle completed-but-unsaved artifact
+retention and include artifact reachability in existing backup/export; index-only backup is insufficient.
+Extend the existing portfolio control-plane restart case to reopen saved outputs, rather than adding
+another harness or accepting its current post-restart recalculation as save/reopen proof.
+
 ## Position-impact integration — 2026-09-30
 
 Pushed source checkpoint: `afa8ae6ccb2cd2669ddd056127c9d61d574892c2`.
