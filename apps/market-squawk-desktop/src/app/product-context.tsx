@@ -135,55 +135,87 @@ export function ProductProvider({
     let active = true
     let failed = false
     let subscription: DesktopEventSubscription | null = null
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let reconnectDelay = 1_000
     let previousSequence =
       eventCursor.current &&
       sameProductSession(scope, eventCursor.current.productSessionToken)
         ? eventCursor.current.sequence
         : "0"
-    const requestedSequence = previousSequence
-
     const release = () => {
       const current = subscription
       subscription = null
-      if (current) void current.unsubscribe().catch(() => undefined)
+      return current ? current.unsubscribe() : Promise.resolve()
     }
     const unavailable = () => {
       if (!active) return
       failed = true
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer)
+      reconnectTimer = null
       setEventAdmissionPending(false)
       setEventAdmittedProductSession(null)
       setEventConnection({ status: "unavailable" })
-      release()
+      void release().catch(() => undefined)
     }
-
-    setEventAdmissionPending(true)
-    setEventAdmittedProductSession(null)
-    setEventConnection({ status: "connecting" })
-    transport.system
-      .subscribe(
-        { productSessionToken: scope, afterSequence: requestedSequence },
-        (event) => {
-          if (!active) return
-          if (rejectsProductEvent(scope, previousSequence, event)) {
-            unavailable()
-            return
-          }
-          previousSequence = event.sequence
-          eventCursor.current = {
-            productSessionToken: scope,
-            sequence: previousSequence,
-          }
-          void Promise.all(
-            affectedDomains(event).map((domain) =>
-              queryClient.invalidateQueries({
-                queryKey: productKeys.domain(scope, domain),
-              }),
-            ),
-          )
-        },
-        unavailable,
-      )
-      .then((connected) => {
+    const connecting = () => {
+      setEventAdmissionPending(true)
+      setEventAdmittedProductSession(null)
+      setEventConnection({ status: "connecting" })
+    }
+    const scheduleReconnect = () => {
+      if (!active || failed) return
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null
+        void connect()
+      }, reconnectDelay)
+      reconnectDelay = Math.min(reconnectDelay * 2, 30_000)
+    }
+    const reconnect = async () => {
+      try {
+        await release()
+        scheduleReconnect()
+      } catch {
+        unavailable()
+      }
+    }
+    const connect = async () => {
+      const requestedSequence = previousSequence
+      let disconnected = false
+      try {
+        const connected = await transport.system.subscribe(
+          { productSessionToken: scope, afterSequence: requestedSequence },
+          (event) => {
+            if (!active || failed || disconnected) return
+            if (
+              event.body.type === "stream_disconnected" &&
+              sameProductSession(scope, event.productSessionToken) &&
+              event.sequence === previousSequence
+            ) {
+              disconnected = true
+              connecting()
+              if (subscription) void reconnect()
+              return
+            }
+            if (rejectsProductEvent(scope, previousSequence, event)) {
+              unavailable()
+              return
+            }
+            reconnectDelay = 1_000
+            previousSequence = event.sequence
+            eventCursor.current = {
+              productSessionToken: scope,
+              sequence: previousSequence,
+            }
+            void Promise.all(
+              affectedDomains(event).map((domain) =>
+                queryClient.invalidateQueries({
+                  queryKey: productKeys.domain(scope, domain),
+                }),
+              ),
+            )
+          },
+          unavailable,
+        )
         if (!active || failed) {
           void connected.unsubscribe().catch(() => undefined)
           return
@@ -199,18 +231,28 @@ export function ProductProvider({
           return
         }
         subscription = connected
+        if (disconnected) {
+          await reconnect()
+          return
+        }
         setEventAdmittedProductSession(receipt.productSessionToken)
         setEventAdmissionPending(false)
         setEventConnection({
           status: "connected",
           resumed: receipt.resumed,
         })
-      })
-      .catch(unavailable)
+      } catch {
+        unavailable()
+      }
+    }
+
+    connecting()
+    void connect()
 
     return () => {
       active = false
-      release()
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer)
+      void release().catch(() => undefined)
     }
   }, [
     bootstrap.data,

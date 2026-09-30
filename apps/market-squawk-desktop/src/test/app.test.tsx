@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { QueryClientProvider } from "@tanstack/react-query"
@@ -23,6 +23,7 @@ import {
   productLookupActions,
   productLookupCategory,
   type DesktopTransport,
+  type DesktopEventSubscription,
   type ProductTransport,
   type ProductQuery,
   type SystemTransport,
@@ -1460,10 +1461,16 @@ describe("Market Squawk desktop boundary", () => {
     await waitFor(() => expect(screen.queryByLabelText("Position comparison results")).toBeNull())
   })
 
-  it("keeps fallback bootstrap native and enters the ready workspace only after reconnect", async () => {
+  it("admits secure startup and resumes a disconnected stream without accepting an old session", async () => {
     const user = userEvent.setup()
     let ready = false
     let submittedUnlock: string | null = null
+    const subscriptions: {
+      request: Parameters<SystemTransport["subscribe"]>[0]
+      onEvent: Parameters<SystemTransport["subscribe"]>[1]
+      unsubscribe: DesktopEventSubscription["unsubscribe"]
+    }[] = []
+    let resolveResume: ((subscription: DesktopEventSubscription) => void) | undefined
     const baseTransport = transport()
     const bootstrapTransport = {
       product: baseTransport.product,
@@ -1483,10 +1490,28 @@ describe("Market Squawk desktop boundary", () => {
           submittedUnlock = request.unlock
           ready = true
         },
+        subscribe: async (request, onEvent) => {
+          const unsubscribe = vi.fn(async () => undefined)
+          subscriptions.push({ request, onEvent, unsubscribe })
+          if (subscriptions.length === 2) {
+            return new Promise<DesktopEventSubscription>((resolve) => {
+              resolveResume = resolve
+            })
+          }
+          return {
+            receipt: {
+              subscriptionId: "f49e02f6-8c47-43a5-bb33-030e8e0d12bb",
+              productSessionToken: request.productSessionToken,
+              sequence: request.afterSequence,
+              resumed: request.afterSequence !== "0",
+            },
+            unsubscribe,
+          }
+        },
       },
     } satisfies DesktopTransport
 
-    render(
+    const view = render(
       <MemoryRouter initialEntries={["/system/settings/onboarding"]}>
         <App transport={bootstrapTransport} />
       </MemoryRouter>,
@@ -1502,6 +1527,59 @@ describe("Market Squawk desktop boundary", () => {
       expect(screen.queryByLabelText("Local security password")).toBeNull()
     })
     expect(screen.getByRole("heading", { name: "Settings" })).toBeTruthy()
+
+    const summary = within(screen.getByRole("region", { name: "Workspace summary" }))
+    await waitFor(() => expect(summary.getByText("Ready")).toBeTruthy())
+    vi.useFakeTimers()
+    try {
+      await act(async () => {
+        subscriptions[0]!.onEvent({
+          productSessionToken: blockedBootstrap.productSessionToken,
+          sequence: "1",
+          body: { type: "invalidate", domains: ["job"] },
+        })
+        subscriptions[0]!.onEvent({
+          productSessionToken: blockedBootstrap.productSessionToken,
+          sequence: "1",
+          body: { type: "stream_disconnected" },
+        })
+      })
+      expect(summary.getByText("Starting")).toBeTruthy()
+      expect(subscriptions[0]!.unsubscribe).toHaveBeenCalledOnce()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      expect(subscriptions).toHaveLength(2)
+      expect(subscriptions[1]!.request).toEqual({
+        productSessionToken: blockedBootstrap.productSessionToken,
+        afterSequence: "1",
+      })
+      expect(summary.getByText("Starting")).toBeTruthy()
+      await act(async () => {
+        resolveResume!({
+          receipt: {
+            subscriptionId: "1aa5a4c6-c80e-4a09-b123-2ca6a4d24f47",
+            productSessionToken: blockedBootstrap.productSessionToken,
+            sequence: "1",
+            resumed: true,
+          },
+          unsubscribe: subscriptions[1]!.unsubscribe,
+        })
+      })
+      expect(summary.getByText("Ready")).toBeTruthy()
+      await act(async () => {
+        subscriptions[1]!.onEvent({
+          productSessionToken: "8cfa9e1a-652b-4475-ab21-15a28186c449",
+          sequence: "1",
+          body: { type: "stream_disconnected" },
+        })
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      expect(summary.getByText("Unavailable")).toBeTruthy()
+      expect(subscriptions).toHaveLength(2)
+      expect(subscriptions[1]!.unsubscribe).toHaveBeenCalledOnce()
+    } finally {
+      view.unmount()
+      vi.useRealTimers()
+    }
   })
 
   it("offers Retry for blocked Alpaca with retained configuration", () => {
