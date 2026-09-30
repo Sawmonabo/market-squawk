@@ -5248,6 +5248,7 @@ dependencies = [
  "libc",
  "loom",
  "market-squawk-domain",
+ "objc2-foundation",
  "memory-stats",
  "process-wrap",
  "proptest",

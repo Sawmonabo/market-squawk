@@ -70,6 +70,7 @@ process-wrap = { workspace = true }
 loom = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL"] }
 security-framework = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

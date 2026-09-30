@@ -6,10 +6,12 @@ mod config;
 mod input;
 mod journal;
 mod paths;
+mod persistent_endpoint;
 mod raw_record;
 mod secrets;
 mod tls;
 
+pub use persistent_endpoint::persistent_endpoint_identity;
 pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 
 pub use authority_state::{

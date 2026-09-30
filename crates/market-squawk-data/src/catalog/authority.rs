@@ -1018,14 +1018,8 @@ pub(crate) fn exact_catalog_file_binding(
     file: &File,
     path: &Path,
 ) -> Result<[u8; 32], CatalogError> {
-    use cap_fs_ext::MetadataExt as _;
-
-    let metadata = cap_std::fs::File::from_std(file.try_clone()?).metadata()?;
-    Ok(hash_catalog_file_identity(
-        path,
-        metadata.dev(),
-        metadata.ino(),
-    ))
+    let endpoint = market_squawk_platform::persistent_endpoint_identity(file, path)?;
+    Ok(hash_catalog_file_identity(path, endpoint))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1036,14 +1030,13 @@ pub(crate) fn exact_catalog_file_binding(
     Err(CatalogError::UnsafePath)
 }
 
-fn hash_catalog_file_identity(path: &Path, device: u64, inode: u64) -> [u8; 32] {
+fn hash_catalog_file_identity(path: &Path, endpoint: [u8; 32]) -> [u8; 32] {
     let path = path.as_os_str().as_encoded_bytes();
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/catalog-artifact-root-binding/v2");
     digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_be_bytes());
     digest.update(path);
-    digest.update(device.to_be_bytes());
-    digest.update(inode.to_be_bytes());
+    digest.update(endpoint);
     digest.finalize().into()
 }
 

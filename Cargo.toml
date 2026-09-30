@@ -116,6 +116,7 @@ market-squawk-sources = { path = "crates/market-squawk-sources", version = "=1.0
 market-squawk-valuation = { path = "crates/market-squawk-valuation", version = "=1.0.0" }
 memory-stats = "=1.2.0"
 num-bigint = "0.4"
+objc2-foundation = { version = "=0.3.2", default-features = false }
 parking_lot = "0.12"
 parquet = { version = "=58.3.0", default-features = false, features = [
     "arrow",

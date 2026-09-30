@@ -150,6 +150,25 @@ Compaction produces a new immutable generation from an exact pinned parent. It d
 parent or weaken lineage. Consumers can continue reading a prior pin while a later generation is
 being published.
 
+### Persistent endpoint identity
+
+Catalog and artifact-root bindings retain the canonical path and exact file identity. On macOS,
+the shared platform helper uses the volume's persistent UUID and file ID for the durable digest;
+a mount's device number is used only for live handle/path validation. Device numbers can change
+across a machine restart and must not make an unchanged saved workspace appear replaced.
+The helper brackets the Foundation lookup with retained-handle and no-follow path checks, so file,
+directory and symlink substitution still fail. Other platforms retain their existing identity
+inputs; this correction does not establish new native-platform restart evidence.
+
+This updates the active V1 binding in place. Old diagnostic roots are preserved as evidence;
+startup does not rewrite their bindings, bypass a mismatch or introduce a compatibility migration.
+Fresh validation roots exercise the corrected format. Implementation:
+[shared endpoint identity](../../crates/market-squawk-platform/src/persistent_endpoint.rs),
+[catalog binding](../../crates/market-squawk-data/src/catalog/authority.rs) and
+[artifact binding](../../crates/market-squawk-data/src/parquet_store/authority.rs).
+Reviewed 2026-09-30 against Apple's
+[persistent volume UUID contract](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumeuuidstring).
+
 ## Point-in-time construction
 
 The dataset builder consumes exact parent manifest pins and a digest-bound build specification. It
