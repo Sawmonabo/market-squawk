@@ -23,6 +23,8 @@ use super::{
     StructuredLogPage, StructuredLogQuery, StructuredLogRecord,
 };
 
+const WRITER_LOCK_FILE: &str = ".structured-logs.writer.lock";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PersistedLogRecord {
@@ -215,15 +217,18 @@ pub struct StructuredLogStore {
     directory: Dir,
     policy: LogStoragePolicy,
     state: Mutex<LogState>,
+    _writer_lock: std::fs::File,
 }
 
 impl StructuredLogStore {
     /// Opens the fixed no-follow log directory beneath the retained prepared control root.
+    /// Retains the exclusive writer lease before reading sequences or applying retention.
     pub fn try_open(
         control_root: &ControlRoot,
         policy: LogStoragePolicy,
         observed_at: Timestamp,
     ) -> Result<Self, StructuredLogError> {
+        let writer_lock = acquire_writer_lock(control_root)?;
         let directory = prepare_log_directory(control_root)?;
         let mut state = load_state(&directory, policy)?;
         if state.current_bytes >= policy.segment_bytes {
@@ -236,6 +241,7 @@ impl StructuredLogStore {
             directory,
             policy,
             state: Mutex::new(state),
+            _writer_lock: writer_lock,
         })
     }
 
@@ -490,6 +496,31 @@ fn search_matches(record: &StructuredLogRecord, search: Option<&str>) -> bool {
                     || value.to_ascii_lowercase().contains(&search)
             })
     })
+}
+
+fn acquire_writer_lock(control_root: &ControlRoot) -> Result<std::fs::File, StructuredLogError> {
+    let control = control_root.try_clone_directory()?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .follow(FollowSymlinks::No);
+    configure_private_file(&mut options);
+    let file = control
+        .open_with(WRITER_LOCK_FILE, &options)
+        .map_err(|source| StructuredLogError::Io { source })?;
+    validate_private_file(
+        &file
+            .metadata()
+            .map_err(|source| StructuredLogError::Io { source })?,
+    )?;
+    let file = file.into_std();
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StructuredLogError::Unavailable),
+        Err(std::fs::TryLockError::Error(source)) => Err(StructuredLogError::Io { source }),
+    }
 }
 
 fn prepare_log_directory(control_root: &ControlRoot) -> Result<Dir, StructuredLogError> {

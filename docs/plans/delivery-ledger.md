@@ -2,7 +2,11 @@
 
 ## Active previous-close and startup delivery wave — 2026-09-30
 
-Current pushed checkpoint: `73ea4778` — Desktop reconnects valid interrupted event streams at the
+Current pushed checkpoint: `38d1203e` — every locked startup route renders secure recovery,
+retaining the original URL and resuming it after unlock. PR #43:
+https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5920710814.
+
+Previous pushed checkpoint: `73ea4778` — Desktop reconnects valid interrupted event streams at the
 retained session/cursor, with backoff and native admission before reopening product pages.
 PR #43: https://github.com/Sawmonabo/market-squawk/pull/43#issuecomment-5920292726.
 Existing secure-startup/reconnect critical case passed (1.96s); Desktop typecheck passed. Native
@@ -19,16 +23,24 @@ entry while retaining the original URL; normal routes resume after unlock/event 
 `startup_bootstrap_trace` returned `routes.tsx` and the extended existing `src/test/app.test.tsx`.
 The critical Home → secure recovery → Home/reconnect case passes (1.07s); typecheck passes.
 Evidence: `history-native-locked-start.json`, `history-native-bootstrap-context.json`, and
-`startup-recovery-gate-{test,typecheck}.log`. Fresh live unlock after this correction is pending.
+`startup-recovery-gate-{test,typecheck}.log`. Fresh native form unlock after this correction is pending; no foreground automation is used.
 
 The integrated backend build passed, and the local development catalog's exact unreleased v21
 history trigger/checksum was refreshed offline after backup under `.market-squawk/recovery/`.
 All original product data is preserved; no shipping migration was added. Real source Retry then
 exposed a worker-stack overflow in managed history extraction. Astra `stock_capture_trace` owns
 diagnosis/fix in its existing history-ingestion file; other edits require lead ownership. No
-stack-size increase or capability restriction. Restart after the crash reports “structured log
-store is corrupt”; Astra `startup_catalog_contention` owns a read-only trace of exact log recovery.
-Retained logs must be preserved. Lead owns native reproduction and integration. These failures
+stack-size increase or capability restriction. The crash stack confirms nested polling exhausted the worker stack; the exact extraction future now
+runs in an owned Tokio task with abort-on-drop, preserving runtime/cancellation/identity authority.
+The log reopen failure was independently traced to two valid records with sequence 94: a rejected
+duplicate launch installed logging before service-instance admission. Astra `startup_catalog_contention`
+returned `application/logs.rs` and `logs/store.rs`: an exclusive lifetime writer lease precedes load,
+retention and append; existing readers retain the same shared store. Original log bytes are backed up
+under `.market-squawk/recovery/pre-log-sequence-20260930/`; all 99 event values remain unchanged,
+with only the last five duplicate/overlapping sequence numbers and their hashes repaired offline.
+The existing critical log pipeline case now checks second-owner rejection and reopened sequencing;
+the focused case passes (0.06s), and the history-directory case still passes after the owned-task fix.
+The service rebuild is running; actual extraction and fresh native startup remain unproven. Lead owns native reproduction and integration. These failures
 block live market-data completion; do not substitute the successful fixtures for that proof.
 
 Outcome being integrated: real completed-session closes in the shared nine-investment collection,

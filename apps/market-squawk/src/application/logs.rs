@@ -609,6 +609,14 @@ mod tests {
             LogStoragePolicy::default(),
             Timestamp::from_unix_nanos(0),
         )?);
+        assert!(matches!(
+            StructuredLogStore::try_open(
+                paths.control_root()?,
+                LogStoragePolicy::default(),
+                Timestamp::from_unix_nanos(0),
+            ),
+            Err(StructuredLogError::Unavailable)
+        ));
         let (layer, _drain, mut worker) = StructuredLogLayer::try_spawn(Arc::clone(&store), 16)?;
         let terminal = CapturedTerminal::default();
         let subscriber = tracing_subscriber::registry().with(layer).with(
@@ -641,10 +649,26 @@ mod tests {
         assert_eq!(evidence.dropped_overflow, 0);
         assert_eq!(evidence.rejected_unsafe, 0);
         assert_eq!(evidence.write_failures, 0);
-        assert_eq!(
-            store.query(&StructuredLogQuery::default())?.records().len(),
-            1
-        );
+        let first = store.query(&StructuredLogQuery::default())?;
+        assert_eq!(first.records().len(), 1);
+        assert_eq!(first.records()[0].sequence(), 1);
+        drop(store);
+        let reopened = StructuredLogStore::try_open(
+            paths.control_root()?,
+            LogStoragePolicy::default(),
+            first.records()[0].event().observed_at,
+        )?;
+        assert_eq!(reopened.append(first.records()[0].event().clone())?, 2);
+        drop(reopened);
+        let reopened = StructuredLogStore::try_open(
+            paths.control_root()?,
+            LogStoragePolicy::default(),
+            first.records()[0].event().observed_at,
+        )?;
+        let restored = reopened.query(&StructuredLogQuery::default())?;
+        assert_eq!(restored.records().len(), 2);
+        assert_eq!(restored.records()[0], first.records()[0]);
+        assert_eq!(restored.records()[1].sequence(), 2);
         Ok(())
     }
 }
