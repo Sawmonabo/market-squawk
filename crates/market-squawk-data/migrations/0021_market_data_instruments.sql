@@ -19,7 +19,7 @@ WHEN NOT (
         NEW.schema_name = 'market_squawk.market_events'
         AND NEW.schema_version = 1
         AND NEW.schema_fingerprint =
-            X'631b28797ea2bacb7fd09f1669478f3a02d6a264c93d1929650ddef2ca3c96f4'
+            X'e0bf8cc9a74c880cc772d3987907b13eb3d4d8fc2dc3ca1a239873d650a151f0'
     )
 ) BEGIN
     SELECT RAISE(ABORT, 'analytical generation schema identity is not registered');

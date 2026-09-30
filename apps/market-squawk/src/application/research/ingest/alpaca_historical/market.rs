@@ -803,6 +803,8 @@ fn require_digest(digest: EvidenceDigest) -> Result<(), AlpacaMarketPublicationE
 /// Closed Alpaca immutable-publication and restart failure.
 #[derive(Debug, Error)]
 pub(crate) enum AlpacaMarketPublicationError {
+    #[error("Alpaca original capture custody failed")]
+    Custody(#[source] ResearchServiceError),
     #[error("Alpaca market publication authority is invalid or no longer current")]
     AuthorityInvalid,
     #[error("Alpaca market publication admission failed: {0}")]
@@ -999,7 +1001,8 @@ impl AlpacaPublicationRuntimeInput {
             .publication
             .research
             .seal_provider_capture(seal_request, &custody, deadline)
-            .await?;
+            .await
+            .map_err(AlpacaMarketPublicationError::Custody)?;
         if self.registration.cancellation.is_cancelled() {
             return Ok(AlpacaLivePublicationOutcome::RawRetained);
         }

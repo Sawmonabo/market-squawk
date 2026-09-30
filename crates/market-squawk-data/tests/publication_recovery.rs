@@ -55,16 +55,17 @@ use market_squawk_domain::{
     FundNavCompleteness, FundNavCorrectionState, FundNavDisposition, FundNavEntitlementEvidence,
     FundNavFinality, FundNavLineage, FundNavNativeSchema, FundNavObservation,
     FundNavObservationInput, FundNavRevisionEvidence, FundNavValuationBasis, FundNavValue,
-    InstrumentId, LiveEventClass, LiveEvidenceBinding, LiveProvenance, MacroObservation,
-    MarketBarAdjustment, MarketBarObservation, MarketBarSessionEvidence, MarketBarSessionKind,
-    MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, MarketEvent,
-    MetadataRevision, Money, PayloadReference, PriceTicks, ProviderChannel,
+    InstrumentId, IntegrityRule, LiveEventClass, LiveEvidenceBinding, LiveProvenance,
+    MacroObservation, MarketBarAdjustment, MarketBarObservation, MarketBarSessionEvidence,
+    MarketBarSessionKind, MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+    MarketEvent, MetadataRevision, Money, PayloadReference, PriceTicks, ProviderChannel,
     ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
     ProviderInstrumentId, ProviderProduct, QuantityLots, ResearchContext, ResearchObservation,
     ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
     RevisionBoundPayloadEvidence, RevisionNumber, RuleVersion, SchemaVersion, SequenceCapability,
-    SourceId, SourceIdentifier, Timestamp, TradeEvent, UniverseMembershipObservation, VenueId,
-    VenueMapping, VenueSymbol, feature_dataset_macro_components_v1,
+    SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, TradeEvent,
+    UniverseMembershipObservation, VenueId, VenueMapping, VenueSymbol,
+    feature_dataset_macro_components_v1,
 };
 use market_squawk_platform::{
     LocalPaths, RawCaptureRecord, ResearchObjectControl, ResearchObjectControlError,
@@ -76,15 +77,17 @@ use market_squawk_sources::{
     CanonicalObservationPayload, CompleteMarketBarHistoryV1, CoverageDomain, CoverageTopology,
     DiscoveryRequest, EndpointPolicy, ExtractionBatch, ExtractionRecord, ExtractionRequest,
     ExtractionRevisionEvidence, ExtractionRevisionPlan, FreshnessPolicy, HistoricalCapability,
-    HttpRequestBounds, InstrumentCoverage, NetworkAccessPolicy, ObservedProviderOrder, PathScope,
+    HttpRequestBounds, InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule,
+    LiveProtocolProfile, NetworkAccessPolicy, ObservedProviderOrder, PathScope,
     ProviderBudgetPolicy, ProviderCaptureMaterial, ProviderCapturePageReceipt,
     ProviderCaptureSemanticBinding, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
     ProviderEventMicrobatchMaterial, ProviderMarketEventBatch,
     ProviderMarketEventNativeLineageBatch, ProviderNativeLineageBatchBuilder,
-    ProviderNativeLineageImplementation, SealedProviderCaptureBinding,
-    SealedProviderEventMicrobatchBinding, SealedProviderPublicationBinding, SourceCapabilities,
-    SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceObject,
-    SourceObjectCaptureIdentity, SourceProtocolProfile,
+    ProviderNativeLineageImplementation, ProviderNumericPolicy, SealedProviderCaptureBinding,
+    SealedProviderEventMicrobatchBinding, SealedProviderPublicationBinding,
+    SemanticInterpretationProfile, SequenceValidationProfile, SourceCapabilities, SourceClass,
+    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceObject, SourceObjectCaptureIdentity,
+    SourceProtocolProfile,
 };
 use rusqlite::params;
 use rust_decimal::Decimal;
@@ -3156,7 +3159,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
     let location = paths.catalog()?.clone();
     let catalog_config = test_catalog_config(location.clone())?;
     let authority = CatalogAuthority::open(catalog_config.clone())?;
-    let source = market_bar_source()?;
+    let source = market_event_source()?;
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     let capture_store = Arc::new(paths.sealed_research_journal_store()?);
     let (publication, expected_claim, expected_event) =
@@ -6118,6 +6121,53 @@ fn market_bar_instrument(suffix: u128) -> Result<InstrumentId, Box<dyn Error>> {
 }
 
 fn market_bar_source() -> Result<SourceMetadata, Box<dyn Error>> {
+    market_source(None, SourceProtocolProfile::NotLive)
+}
+
+fn market_event_source() -> Result<SourceMetadata, Box<dyn Error>> {
+    let rule = |name: &str| -> Result<IntegrityRule, Box<dyn Error>> {
+        Ok(IntegrityRule::new(
+            SourceIdentifier::try_from(name)?,
+            RuleVersion::new(1)?,
+        ))
+    };
+    let live = LiveCoverageDeclaration::try_new(
+        ProviderProduct::new(SourceIdentifier::try_from("AAPL")?),
+        ProviderChannel::new(SourceIdentifier::try_from("trades")?),
+        vec![LiveCoverageRule::try_new(
+            LiveEventClass::Trade,
+            None,
+            SnapshotApplicability::NotApplicable {
+                metadata_rule: rule("fixture-trade-no-snapshot-v1")?,
+            },
+        )?],
+    )?;
+    let protocol = LiveProtocolProfile::new(
+        rule("market-squawk.fixture.trade-v1")?,
+        SemanticInterpretationProfile::new(
+            rule("fixture-aggressor-v1")?,
+            rule("fixture-auction-v1")?,
+            rule("fixture-trading-status-v1")?,
+            rule("fixture-corporate-action-v1")?,
+        ),
+        rule("fixture-source-timestamp-v1")?,
+        SequenceValidationProfile::Unsupported {
+            rule: rule("fixture-trade-no-sequence-v1")?,
+        },
+        market_squawk_sources::ChecksumValidationProfile::Unsupported {
+            rule: rule("fixture-trade-no-checksum-v1")?,
+        },
+        true,
+        ProviderNumericPolicy::ExactDecimalLexeme,
+    );
+    market_source(Some(live), SourceProtocolProfile::Live(Box::new(protocol)))
+}
+
+fn market_source(
+    live: Option<LiveCoverageDeclaration>,
+    protocol: SourceProtocolProfile,
+) -> Result<SourceMetadata, Box<dyn Error>> {
+    let is_live = live.is_some();
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let provider = SourceIdentifier::try_from("alpaca-market-data")?;
     let authorization = AuthorizationGrant::new(
@@ -6156,7 +6206,7 @@ fn market_bar_source() -> Result<SourceMetadata, Box<dyn Error>> {
                 market_bar_instrument(1)?,
                 market_bar_instrument(2)?,
             ])?,
-            None,
+            live,
             CoverageDelay::Delayed(1),
             DeliveryEvidence::AuthorizedBroker,
         )?,
@@ -6174,14 +6224,14 @@ fn market_bar_source() -> Result<SourceMetadata, Box<dyn Error>> {
         FreshnessPolicy::try_new(1, 1, 1, 1, 0)?,
         Some(budget),
         SourceCapabilities::new(
-            false,
+            is_live,
             true,
             SequenceCapability::Unsupported,
             ChecksumCapability::Unsupported,
             HistoricalCapability::Historical,
-            false,
+            is_live,
         ),
-        SourceProtocolProfile::NotLive,
+        protocol,
     ))?)
 }
 

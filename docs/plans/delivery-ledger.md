@@ -2,11 +2,16 @@
 
 ## Active saved-planning and live-input wave — 2026-09-30
 
-Current outcome: local secure startup and provider storage are unlocked. Connection recovery is
-implemented and critically verified; live cleanup, protected reimport and fresh Alpaca verification
-also passed in the preserved owner-test roots. Market-runtime Start still fails separately, so this
-is not a live-market or installed-workflow completion claim. Lead owns integration; all prior
-implementation writers are complete. Saved-planning implementation has not begun.
+Current outcome: secure startup and provider unlock are live verified; native SPY/VTI reference
+publication is live verified at `a63d286b`. The next market-data write failed because the existing
+SQL schema fingerprint was stale. That V1 definition is corrected in place; the existing
+market-event publication/restart test and the focused custody/cleanup regression both pass.
+The next barrier is rebuilding CLI/service and a fresh-root live run. Preserve the previous
+`.market-squawk/v1-owner-test` roots and matching binaries under
+`.agents/tmp/v1-first-stock/pre-schema-a63d286b-binaries`; do not rewrite its schema history.
+Use `.market-squawk/v1-owner-test-current` for fresh corrected-schema verification. All agents have
+released their files; lead owns build, live operations and integration. Saved-planning implementation
+has not begun. No live-stock or installed-workflow completion claim is established.
 
 Recovery checkpoint pushed: `44ba9cb6`; PR #43 evidence comment `5907711371`.
 Next concrete defect: native Alpaca asset-reference publication registers a source only when absent,
@@ -33,6 +38,47 @@ worker cleanup, tracing `market_runtime/alpaca_publication.rs` through the exist
 manifest owners. Return the smallest concrete fix and existing critical check; no edits/build/Git
 or credential reads. Lead alone owns further integration. One worktree and exactly three local and
 origin branches (feature/main/release) were freshly verified; none require cleanup.
+
+Native reference checkpoint is pushed as `a63d286b`; PR #43 comment `5908009405`.
+Next bounded remediation (acceptance 1/7): the first market-event Parquet object is present but its
+catalog transaction never committed; the generic ingest error hid the manifest cause. Astra
+`native_setup_current` owns only `apps/market-squawk/src/application/market_runtime/alpaca_publication.rs`
+for bounded nested manifest diagnostics and separating failed workload from confirmed joined cleanup,
+and `apps/market-squawk/src/application/research/ingest/alpaca_historical/market.rs` for an explicit
+initial capture-custody error. Extend the existing library test module for the otherwise uncovered
+cleanup distinction; no data-crate edit or tracing dependency is needed. Preserve genuine custody/join failures and all publication guards;
+no speculative manifest behavior change, SQL/error-body logging, state edits or new harness.
+Lead runs the existing `provider_market_event_publication_is_restart_queryable` data test and then
+schedules integrated checks/build/live Retry. No other writer overlaps these files.
+
+Existing data critical check is red: `provider_market_event_publication_is_restart_queryable`
+fails `Catalog(ProviderEventMismatch)` (one test, 17 filtered) before the live path's generic
+Manifest failure. Astra `position_authority_trace` has bounded read-only ownership of that existing
+case and provider-event/catalog admission to identify whether it is a fixture defect or a producer
+contract defect. The deterministic mismatch is a stale test source: the market-event fixture emits
+AAPL/trades but reuses history-only source coverage with no live channel. Astra may fix that fixture
+only in `crates/market-squawk-data/tests/publication_recovery.rs`, leaving the historical helper and
+production admission unchanged. No new harness, builds/Git or production edits; root reruns and
+retains data-crate integration. Its result must be reconciled
+before accepting publication behavior; do not weaken the check or assume identical live cause.
+
+Corrected fixture reaches the production defect: `Manifest(Sqlite(...1811...))`, because the
+market-event schema fingerprint in the existing `0021_market_data_instruments.sql` differs from
+canonical Arrow output. The actual live Parquet footer retains fingerprint
+`e0bf8cc9a74c880cc772d3987907b13eb3d4d8fc2dc3ca1a239873d650a151f0`; SQL still pins
+`631b28797ea2bacb7fd09f1669478f3a02d6a264c93d1929650ddef2ca3c96f4`.
+Lead alone owns updating that existing schema definition and its digest in `src/migrations.rs`.
+No new migration or compatibility bypass. Existing owner-test roots remain preserved; a fresh
+owner-test root is required for the corrected greenfield schema, rather than rewriting retained
+catalog history. Preserve the current matching binaries before rebuilding for recovery.
+
+Publication repair verification passed: `provider_market_event_publication_is_restart_queryable`
+(one test, 17 filtered) now publishes and reopens the exact market-event evidence. The application
+library case `joined_publication_failure_preserves_custody_cleanup_authority` also passed (one test,
+128 filtered), retaining the original publication failure while distinguishing confirmed cleanup
+from custody/bounds/join failure. Evidence: `market-event-publication-critical.log` and
+`publication-cleanup-critical.log` under `.agents/tmp/v1-first-stock`. No new migration/harness,
+full CI, review round or resource measurement. Actual corrected-schema live acquisition is pending.
 
 Audit base: `bcf22c8c`, primary feature branch, clean worktree. Acceptance 4/5/6 requires saved
 portfolio scenarios, rebalance and position comparisons to reopen with their original assumptions

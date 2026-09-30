@@ -3,6 +3,7 @@ use crate::application::{AlpacaMarketPublicationError, AlpacaPublicationRuntimeI
 use crate::live_source::AlpacaCapturedPublicationReceiver;
 use market_squawk_services::ServiceError;
 use std::{
+    error::Error,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct AlpacaPublicationRuntime {
     input: Arc<AlpacaPublicationRuntimeInput>,
     cancellation: CancellationToken,
-    worker: Option<tokio::task::JoinHandle<Result<(), AlpacaPublicationRuntimeError>>>,
+    worker: Option<tokio::task::JoinHandle<AlpacaPublicationWorkerOutcome>>,
+    run_failure: Option<AlpacaPublicationRuntimeError>,
     result: Option<Result<(), ServiceError>>,
 }
 impl AlpacaPublicationRuntime {
@@ -27,7 +29,7 @@ impl AlpacaPublicationRuntime {
         let stop = cancellation.clone();
         let worker = tokio::spawn(async move {
             let _cancel_on_exit = stop.clone().drop_guard();
-            let mut failure = None;
+            let mut outcome = AlpacaPublicationWorkerOutcome::default();
             loop {
                 let next = if stop.is_cancelled() {
                     owned.begin_shutdown();
@@ -55,9 +57,7 @@ impl AlpacaPublicationRuntime {
                 // item._bytes remains owned until publication completes, including error paths.
                 drop(item._bytes);
                 if let Err(error) = result {
-                    if failure.is_none() {
-                        failure = Some(error);
-                    }
+                    outcome.record_failure(error);
                     owned.begin_shutdown();
                     stop.cancel();
                     receiver.close();
@@ -66,17 +66,19 @@ impl AlpacaPublicationRuntime {
             owned.begin_shutdown();
             owned.finish_shutdown().await;
             stop.cancel();
-            failure.map_or(Ok(()), Err)
+            outcome
         });
         Self {
             input,
             cancellation,
             worker: Some(worker),
+            run_failure: None,
             result: None,
         }
     }
     pub(crate) fn is_healthy(&self) -> bool {
-        !self.cancellation.is_cancelled()
+        self.run_failure.is_none()
+            && !self.cancellation.is_cancelled()
             && self
                 .worker
                 .as_ref()
@@ -104,22 +106,96 @@ impl AlpacaPublicationRuntime {
             return result.clone();
         }
         let result = match self.worker.as_mut() {
-            Some(worker) => match worker.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => {
-                    tracing::error!(%error,"Alpaca publication worker failed");
+            Some(worker) => {
+                let outcome = joined_publication_outcome(worker.await);
+                let cleanup = if outcome.cleanup_failed {
                     Err(ServiceError::Unavailable)
-                }
-                Err(error) => {
-                    tracing::error!(%error,"Alpaca publication worker join failed");
-                    Err(ServiceError::Unavailable)
-                }
-            },
+                } else {
+                    Ok(())
+                };
+                self.run_failure = outcome.failure;
+                cleanup
+            }
             None => Err(ServiceError::Unavailable),
         };
         self.worker.take();
         self.result = Some(result.clone());
         result
+    }
+}
+
+#[derive(Debug, Default)]
+struct AlpacaPublicationWorkerOutcome {
+    failure: Option<AlpacaPublicationRuntimeError>,
+    cleanup_failed: bool,
+}
+
+impl AlpacaPublicationWorkerOutcome {
+    fn record_failure(&mut self, error: AlpacaPublicationRuntimeError) {
+        log_publication_failure(&error);
+        // Every other publication error occurs after the original capture was sealed. The
+        // worker still drains queued captures and revokes publication admission before joining.
+        self.cleanup_failed |= matches!(
+            &error,
+            AlpacaPublicationRuntimeError::Bounds
+                | AlpacaPublicationRuntimeError::Join(_)
+                | AlpacaPublicationRuntimeError::Publication(
+                    AlpacaMarketPublicationError::Custody(_)
+                )
+        );
+        if self.failure.is_none() {
+            self.failure = Some(error);
+        }
+    }
+}
+
+fn joined_publication_outcome(
+    joined: Result<AlpacaPublicationWorkerOutcome, tokio::task::JoinError>,
+) -> AlpacaPublicationWorkerOutcome {
+    match joined {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let mut outcome = AlpacaPublicationWorkerOutcome::default();
+            outcome.record_failure(AlpacaPublicationRuntimeError::Join(error));
+            outcome
+        }
+    }
+}
+
+fn log_publication_failure(error: &AlpacaPublicationRuntimeError) {
+    tracing::error!(%error, "Alpaca publication worker failed");
+    let mut cause: &(dyn Error + 'static) = error;
+    for _ in 0..8 {
+        if let Some(manifest) = cause.downcast_ref::<market_squawk_data::ManifestCatalogError>() {
+            use market_squawk_data::ManifestCatalogError;
+            match manifest {
+                ManifestCatalogError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => {
+                    tracing::error!(
+                        manifest_error = %manifest,
+                        sqlite_code = code.extended_code & 0xff,
+                        sqlite_extended_code = code.extended_code,
+                        "Alpaca publication manifest failure"
+                    );
+                }
+                ManifestCatalogError::Plan(plan) => {
+                    tracing::error!(manifest_error = %manifest, plan_error = %plan,
+                        "Alpaca publication manifest failure");
+                }
+                ManifestCatalogError::PopulationResearchUse(_) => {
+                    tracing::error!(
+                        manifest_error = "population research use unavailable",
+                        "Alpaca publication manifest failure"
+                    );
+                }
+                _ => tracing::error!(manifest_error = %manifest,
+                    "Alpaca publication manifest failure"),
+            }
+            break;
+        }
+        let Some(source) = cause.source() else {
+            break;
+        };
+        cause = source;
     }
 }
 impl Drop for AlpacaPublicationRuntime {
@@ -131,6 +207,59 @@ impl Drop for AlpacaPublicationRuntime {
 pub(crate) enum AlpacaPublicationRuntimeError {
     #[error("Alpaca publication bounds are invalid")]
     Bounds,
+    #[error("Alpaca publication worker did not join successfully")]
+    Join(#[source] tokio::task::JoinError),
     #[error(transparent)]
     Publication(#[from] AlpacaMarketPublicationError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn joined_publication_failure_preserves_custody_cleanup_authority() {
+        let mut outcome = AlpacaPublicationWorkerOutcome::default();
+        outcome.record_failure(AlpacaPublicationRuntimeError::Publication(
+            AlpacaMarketPublicationError::Ingest(market_squawk_data::IngestError::Manifest(
+                market_squawk_data::ManifestCatalogError::AnchorMismatch,
+            )),
+        ));
+        let mut joined = joined_publication_outcome(Ok(outcome));
+        assert!(!joined.cleanup_failed);
+        assert!(matches!(
+            joined.failure,
+            Some(AlpacaPublicationRuntimeError::Publication(
+                AlpacaMarketPublicationError::Ingest(_)
+            ))
+        ));
+
+        // A later queued item's custody failure must still block cleanup even when the
+        // first retained error describes a canonical publication failure.
+        joined.record_failure(AlpacaPublicationRuntimeError::Publication(
+            AlpacaMarketPublicationError::Custody(
+                crate::ResearchServiceError::ProviderCaptureSealWorkerUnavailable,
+            ),
+        ));
+        assert!(joined.cleanup_failed);
+        assert!(matches!(
+            joined.failure,
+            Some(AlpacaPublicationRuntimeError::Publication(
+                AlpacaMarketPublicationError::Ingest(_)
+            ))
+        ));
+
+        let mut unsealed = AlpacaPublicationWorkerOutcome::default();
+        unsealed.record_failure(AlpacaPublicationRuntimeError::Bounds);
+        assert!(joined_publication_outcome(Ok(unsealed)).cleanup_failed);
+
+        let worker = tokio::spawn(std::future::pending::<AlpacaPublicationWorkerOutcome>());
+        worker.abort();
+        let interrupted = joined_publication_outcome(worker.await);
+        assert!(interrupted.cleanup_failed);
+        assert!(matches!(
+            interrupted.failure,
+            Some(AlpacaPublicationRuntimeError::Join(_))
+        ));
+    }
 }
