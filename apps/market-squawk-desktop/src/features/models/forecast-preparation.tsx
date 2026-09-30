@@ -68,7 +68,7 @@ export function ForecastPreparation({
   const optionsQuery = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
-      "Model",
+      "model",
       "Model.GetForecastPreparation",
       { cursor: navigation.after, limit: 25 },
     ),

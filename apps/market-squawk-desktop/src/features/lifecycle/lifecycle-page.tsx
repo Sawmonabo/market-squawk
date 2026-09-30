@@ -129,7 +129,7 @@ function ReadyLifecycle({
       ),
   })
   const installation = useQuery({
-    queryKey: productKeys.operation(scope, "installation", "Installation.Status", {}),
+    queryKey: productKeys.operation(scope, "operations", "Installation.Status", {}),
     queryFn: async () => (await transport.installation({ action: "status" }, false)).status,
     refetchInterval: 15_000,
   })
@@ -206,9 +206,6 @@ function ReadyLifecycle({
         }),
         queryClient.invalidateQueries({
           queryKey: productKeys.domain(scope, "job"),
-        }),
-        queryClient.invalidateQueries({
-          queryKey: productKeys.domain(scope, "installation"),
         }),
       ])
     },
@@ -586,7 +583,7 @@ function NativeProgramControls({
         <dl className="mt-4 grid gap-3 rounded-lg border border-border bg-background/35 p-4 sm:grid-cols-3">
           <Fact label="Installed version" value={installation.active_version ?? "Not installed"} />
           <Fact label="Platform target" value={installation.target ?? "Unavailable"} />
-          <Fact label="Component verification" value={installation.healthy ? "Healthy" : "Repair required"} />
+          <Fact label="Component verification" value={!installation.installed ? "Not installed" : installation.healthy ? "Healthy" : "Repair required"} />
         </dl>
       ) : null}
       <div className="mt-5 grid gap-4 md:grid-cols-2">

@@ -563,6 +563,27 @@ async fn market(
             )
             .await
         }
+        MarketCommand::Collection => {
+            invoke_without_result_limits(
+                authority,
+                "Market.GetCollection",
+                json!({}),
+                "market collection read",
+            )
+            .await
+        }
+        MarketCommand::SetCollectionChoice {
+            expected_revision,
+            symbol,
+            kept,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            require_installed(authority, "Market.SetCollectionChoice")?;
+            invoke_without_result_limits(authority, "Market.SetCollectionChoice", json!({
+                "expectedRevision": expected_revision.to_string(), "symbol": symbol, "kept": kept, "confirm": true,
+            }), "market collection saved").await
+        }
         MarketCommand::Overview { page_token } => {
             let mut arguments = Map::new();
             if let Some(token) = page_token {

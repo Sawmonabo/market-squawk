@@ -101,6 +101,7 @@ pub struct PaperApplicationServices {
     market_data_instruments: MarketDataInstrumentReadCapability,
     reference_search: Arc<dyn market::MarketReferenceSearchAuthority>,
     market_history: MarketHistoryReadCapability,
+    market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
     product_research: Arc<crate::ResearchService>,
     product_markets: super::market_selection::MarketInvestmentReadCapability,
 }
@@ -212,6 +213,7 @@ impl PaperApplicationServices {
         market_history: MarketHistoryReadCapability,
         equity: EquityPaperServices,
         portfolio_publisher: crate::portfolio_application::PaperPortfolioPublishCapability,
+        market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
         product_research: Arc<crate::ResearchService>,
         product_markets: super::market_selection::MarketInvestmentReadCapability,
     ) -> Self {
@@ -230,6 +232,7 @@ impl PaperApplicationServices {
             market_data_instruments,
             reference_search,
             market_history,
+            market_collection,
             product_research,
             product_markets,
         }
@@ -257,6 +260,7 @@ impl PaperApplicationServices {
             self.market_data_instruments.clone(),
             Arc::clone(&self.reference_search),
             self.market_history.clone(),
+            Arc::clone(&self.market_collection),
             Arc::clone(&self.product_research),
             self.product_markets.clone(),
         ))
@@ -597,11 +601,18 @@ impl PaperController {
             }
         }
         let account = manual_paper_account_id().map_err(|_| ServiceError::Unavailable)?;
-        if self.portfolio_publisher.current_revision(account).map_err(|_| ServiceError::Unavailable)?.is_none() {
+        if self
+            .portfolio_publisher
+            .current_revision(account)
+            .map_err(|_| ServiceError::Unavailable)?
+            .is_none()
+        {
             return Ok(json!({"availability":"account_required",
                 "message":"Create a virtual account before starting a paper session. Choose and confirm its virtual cash, reporting currency, and estimated trading costs below."}));
         }
-        let Some((original_currency, original_cash, original_cost)) = self.original_start_choices(context).await? else {
+        let Some((original_currency, original_cash, original_cost)) =
+            self.original_start_choices(context).await?
+        else {
             return Ok(json!({"availability":"account_unavailable",
                 "message":"The saved virtual account's original cash or trading-cost settings cannot be used by this version. Keep the account and its history; no balance has been reset."}));
         };
@@ -641,10 +652,17 @@ impl PaperController {
         let mut preparation = paper_start_preparation(original_currency)?;
         let cash_token = paper_choice_token("cash", original_cash.id)?;
         let cost_token = paper_choice_token("cost", original_cost.id)?;
-        for (field, token) in [("virtualCashChoices", cash_token), ("costChoices", cost_token)] {
-            let choices = preparation[field].as_array_mut().ok_or(ServiceError::Internal)?;
+        for (field, token) in [
+            ("virtualCashChoices", cash_token),
+            ("costChoices", cost_token),
+        ] {
+            let choices = preparation[field]
+                .as_array_mut()
+                .ok_or(ServiceError::Internal)?;
             choices.retain(|choice| choice["choiceToken"].as_str() == Some(token.as_ref()));
-            if choices.len() != 1 { return Err(ServiceError::Internal); }
+            if choices.len() != 1 {
+                return Err(ServiceError::Internal);
+            }
         }
         preparation["marketChoices"] = json!(choices);
         Ok(preparation)
@@ -670,18 +688,28 @@ impl PaperController {
         let currency = self
             .selected_currency(purpose, context.deadline(), context.cancellation())
             .await?;
-        let (original_currency, cash, cost) = self.original_start_choices(context).await?
+        let (original_currency, cash, cost) = self
+            .original_start_choices(context)
+            .await?
             .ok_or(ServiceError::InvalidRequest)?;
         if currency != original_currency
-            || required_string(request, "cashChoice")? != paper_choice_token("cash", cash.id)?.as_ref()
-            || required_string(request, "costChoice")? != paper_choice_token("cost", cost.id)?.as_ref()
-        { return Err(ServiceError::InvalidRequest); }
+            || required_string(request, "cashChoice")?
+                != paper_choice_token("cash", cash.id)?.as_ref()
+            || required_string(request, "costChoice")?
+                != paper_choice_token("cost", cost.id)?.as_ref()
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
         let mode = resolve_paper_mode_choice(required_string(request, "modeChoice")?)?;
         if purpose == PaperMarketPurpose::Equities {
             if mode.mode != PaperStrategyMode::Manual {
                 return Err(ServiceError::InvalidRequest);
             }
-            if self.equity_routes(context.deadline(), context.cancellation()).await?.is_none() {
+            if self
+                .equity_routes(context.deadline(), context.cancellation())
+                .await?
+                .is_none()
+            {
                 return Err(ServiceError::Unavailable);
             }
         }
@@ -769,12 +797,20 @@ impl PaperController {
                 return Err(ServiceError::InvalidRequest);
             }
         }
-        let (currency, cash, cost) = self.original_start_choices(context).await?
+        let (currency, cash, cost) = self
+            .original_start_choices(context)
+            .await?
             .ok_or(ServiceError::InvalidRequest)?;
         if currency != prepared.currency
-            || cash.amount.parse::<Decimal>().map_err(|_| ServiceError::Internal)? != prepared.initial_cash
+            || cash
+                .amount
+                .parse::<Decimal>()
+                .map_err(|_| ServiceError::Internal)?
+                != prepared.initial_cash
             || cost.basis_points != prepared.fee_basis_points
-        { return Err(ServiceError::InvalidRequest); }
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
         let market_selection = self
             .select_market(prepared.purpose, deadline, request_cancellation)
             .await?;

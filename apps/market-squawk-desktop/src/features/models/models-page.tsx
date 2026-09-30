@@ -76,7 +76,7 @@ function ModelsWorkspace({
   const models = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
-      "Model",
+      "model",
       "Model.ListBundles",
       { cursor: navigation.after, limit: 25 },
     ),
@@ -90,7 +90,7 @@ function ModelsWorkspace({
   const forecasts = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
-      "Model",
+      "model",
       "Model.ListForecasts",
       { cursor: forecastNavigation.after, limit: 25 },
     ),
@@ -103,7 +103,7 @@ function ModelsWorkspace({
   const activities = useQuery({
     queryKey: productKeys.operation(
       bootstrap.productSessionToken,
-      "Model",
+      "model",
       "Model.ListProductActivity",
       { cursor: activityNavigation.after, limit: 25 },
     ),
@@ -119,7 +119,7 @@ function ModelsWorkspace({
   })
 
   const selectedModelEvidence = useQuery({
-    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetBundle", { modelToken: selectedModelToken }),
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "model", "Model.GetBundle", { modelToken: selectedModelToken }),
     enabled: modelsAvailable && selectedModelToken !== null,
     gcTime: 0,
     queryFn: async ({ signal }) => parseModelEvidence(await transport.modelProducts({ action: "get", modelToken: selectedModelToken! }, { signal }), selectedModelToken!),

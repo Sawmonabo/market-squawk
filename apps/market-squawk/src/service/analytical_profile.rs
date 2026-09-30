@@ -34,6 +34,7 @@ pub(super) async fn call(
     context: &RequestContext,
     forecasts: &super::forecast_preparation::InstalledForecastPreparation,
     benchmarks: &crate::application::RecommendationBenchmarkSelectionReadCapability,
+    research: &crate::ResearchService,
 ) -> Result<TypedToolResult, ServiceError> {
     ensure_live(context)?;
     let arguments = super::business_arguments(request.arguments());
@@ -56,12 +57,22 @@ pub(super) async fn call(
                 .await?;
             let observed_at =
                 super::runtime::current_timestamp().map_err(|_| ServiceError::Internal)?;
-            let choices = benchmarks.comparison_choices(
-                observed_at,
-                observed_at,
-                context.deadline(),
-                context.cancellation(),
-            )?;
+            let benchmarks = benchmarks.clone();
+            let deadline = context.deadline();
+            let choices = research
+                .run_owned_research_io(deadline, context.cancellation(), move |cancellation| {
+                    benchmarks.comparison_choices(observed_at, observed_at, deadline, &cancellation)
+                })
+                .await
+                .map_err(|error| match error {
+                    crate::ResearchServiceError::Ingest(
+                        market_squawk_data::IngestError::Cancelled,
+                    ) => ServiceError::Cancelled,
+                    crate::ResearchServiceError::Ingest(
+                        market_squawk_data::IngestError::DeadlineExceeded,
+                    ) => ServiceError::DeadlineExceeded,
+                    _ => ServiceError::Internal,
+                })??;
             (catalog(models.as_ref(), &choices)?, 10)
         }
         RESOLVE => {

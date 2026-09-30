@@ -14,6 +14,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { MarketHistoryChart } from "./market-history-chart"
+import { MarketCollection, useMarketCollection } from "./market-collection"
 import { parseMarketHistoryResult, sourceInstantUnixNanos, type MarketHistoryBar, type MarketHistoryViewportInput } from "./market-history"
 import {
   marketSelectionTokenSchema, marketSessionRequestSchema, parseMarketInstrumentResult, parseMarketProductResult,
@@ -49,6 +50,7 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
   const searchNavigation = useCursorNavigation()
   const overviewPageToken = overviewNavigation.after
   const searchPageToken = searchNavigation.after
+  const collection = useMarketCollection(transport, bootstrap.productSessionToken)
   const overview = useQuery({
     queryKey: productKeys.operation(bootstrap.productSessionToken, "market", "Market.GetOverview", { query: "marketOverview", ...(overviewPageToken ? { pageToken: overviewPageToken } : {}) }),
     gcTime: 0,
@@ -62,7 +64,10 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
     queryFn: ({ signal }) => transport.query({ query: "marketUniverse", text: submittedSearch!, ...(searchPageToken ? { pageToken: searchPageToken } : {}) }, { signal }),
     ...queryPolicy,
   })
-  const rows = overview.data ? parseMarketProductResult(overview.data).data : []
+  const collectionSymbols = new Set(collection.collection.data?.entries.map((entry) => entry.symbol) ?? [])
+  const rows = overview.data ? parseMarketProductResult(overview.data).data.filter((row) =>
+    !((row.identity.assetClass === "equity" || row.identity.assetClass === "fund")
+      && row.identity.symbol !== null && collectionSymbols.has(row.identity.symbol))) : []
   const searchPage = searchResult.data ? parseInvestmentSearchPage(searchResult.data) : null
   const matches = searchPage?.data ?? []
   const detail = useQuery({
@@ -81,6 +86,8 @@ function ReadyMarketsPage({ bootstrap, transport }: { bootstrap: DesktopBootstra
   const historyToken = detailRow?.historyToken ?? null
 
   return <Page>
+    <MarketCollection state={collection} onSelect={selectInvestment} layout="grid" />
+    <h2 className="mt-6 text-lg font-semibold">Explore investments</h2>
     <form className="flex gap-2" onSubmit={(event) => {
       event.preventDefault()
       const value = search.trim()

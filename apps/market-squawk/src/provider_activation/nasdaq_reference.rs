@@ -66,8 +66,7 @@ const MINUTE_NANOS: u64 = 60 * 1_000_000_000;
 const NASDAQ_CONNECT_TIMEOUT_NANOS: u64 = 30 * 1_000_000_000;
 const NASDAQ_READ_TIMEOUT_NANOS: u64 = MINUTE_NANOS;
 const NASDAQ_TERMS_URL: &str = "https://www.nasdaqtrader.com/Trader.aspx?id=CopyDisclaimMain";
-const DEFAULT_OVERVIEW_SYMBOLS: [&str; 8] =
-    ["SPY", "QQQ", "DIA", "IWM", "VTI", "AAPL", "MSFT", "NVDA"];
+use crate::application::market_collection::STARTER_MARKET_SYMBOLS as DEFAULT_OVERVIEW_SYMBOLS;
 
 /// Exact current-directory key accepted by bounded identity enrichment.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

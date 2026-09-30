@@ -4,7 +4,7 @@ use super::AnalyticalWorkflowController;
 use market_squawk_platform::LocalPaths;
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ResultEnvelopeProjection,
-    ServiceError, ServiceLimits, ToolAuthorization, ToolServices,
+    ServiceCapabilities, ServiceError, ServiceLimits, ToolAuthorization, ToolServices,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -87,9 +87,16 @@ impl WorkflowOrigin {
     }
 }
 
+// Private native descriptors and their sole dispatcher are bound atomically. External MCP
+// discovery stays filtered; this binding does not relax operation admission or caller authority.
+struct WorkflowServices {
+    dispatcher: Weak<dyn ToolServices>,
+    capabilities: ServiceCapabilities,
+}
+
 pub(crate) struct WorkflowHost {
     controller: Arc<AnalyticalWorkflowController>,
-    services: OnceLock<Weak<dyn ToolServices>>,
+    services: OnceLock<WorkflowServices>,
     work_available: tokio::sync::Notify,
     background_failure: std::sync::Mutex<Option<WorkflowError>>,
     cancellation: CancellationToken,
@@ -108,9 +115,16 @@ impl WorkflowHost {
             task: tokio::sync::Mutex::new(None),
         }))
     }
-    pub(crate) fn bind(&self, services: Weak<dyn ToolServices>) -> Result<(), WorkflowError> {
+    pub(crate) fn bind(
+        &self,
+        services: Weak<dyn ToolServices>,
+        capabilities: ServiceCapabilities,
+    ) -> Result<(), WorkflowError> {
         self.services
-            .set(services)
+            .set(WorkflowServices {
+                dispatcher: services,
+                capabilities,
+            })
             .map_err(|_| WorkflowError::internal())
     }
     pub(crate) fn generation(
@@ -228,12 +242,21 @@ impl WorkflowGeneration {
         self.host
             .services
             .get()
-            .and_then(Weak::upgrade)
+            .and_then(|binding| binding.dispatcher.upgrade())
+            .ok_or_else(WorkflowError::internal)
+    }
+    fn capabilities(&self) -> Result<&ServiceCapabilities, WorkflowError> {
+        self.host
+            .services
+            .get()
+            .map(|binding| &binding.capabilities)
             .ok_or_else(WorkflowError::internal)
     }
     pub(super) fn has_operation(&self, name: &str) -> bool {
-        self.services()
-            .is_ok_and(|s| s.capabilities().find(name).is_some())
+        self.services().is_ok()
+            && self
+                .capabilities()
+                .is_ok_and(|capabilities| capabilities.find(name).is_some())
     }
 }
 
@@ -252,8 +275,7 @@ pub(super) fn prepare_analytical_arguments(
     mut arguments: Map<String, Value>,
     authority: InvocationAuthority,
 ) -> Result<Map<String, Value>, WorkflowError> {
-    let services = generation.services()?;
-    let capabilities = services.capabilities();
+    let capabilities = generation.capabilities()?;
     let descriptor = capabilities
         .find(operation)
         .ok_or_else(|| WorkflowError::from(ServiceError::NotFound))?;
@@ -292,7 +314,7 @@ pub(super) async fn invoke_analytical_operation(
 ) -> Result<Value, WorkflowError> {
     WorkflowState.admit_current(generation)?;
     let services = generation.services()?;
-    let capabilities = services.capabilities();
+    let capabilities = generation.capabilities()?;
     let descriptor = capabilities
         .find(operation)
         .ok_or_else(|| WorkflowError::from(ServiceError::NotFound))?;

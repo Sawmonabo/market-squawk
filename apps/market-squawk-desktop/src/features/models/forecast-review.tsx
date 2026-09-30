@@ -117,13 +117,13 @@ function ForecastEvidenceRead({ summary, bootstrap, transport }: {
   const detailAvailable = capabilities.has("forecast_detail")
   const outcomesAvailable = capabilities.has("forecast_outcomes")
   const detail = useQuery({
-    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecast", { forecastToken: summary.forecastToken }),
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "model", "Model.GetForecast", { forecastToken: summary.forecastToken }),
     gcTime: 0,
     queryFn: async ({ signal }) => parseForecastVintage(await transport.query({ query: "forecast", forecastToken: summary.forecastToken }, { signal })),
     enabled: detailAvailable,
   })
   const chart = useQuery({
-    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecastChart", { forecastToken: summary.forecastToken, ...viewport }),
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "model", "Model.GetForecastChart", { forecastToken: summary.forecastToken, ...viewport }),
     gcTime: 0,
     placeholderData: keepPreviousData,
     enabled: detailAvailable,
@@ -178,7 +178,7 @@ function OriginalForecastPointRead({ point, forecastToken, bootstrap, transport 
   const viewport: ForecastChartViewportInput = point.time !== undefined ? { startUnixNanos: point.time, endUnixNanos: point.time, pointLimit: 8 }
     : { startFiscalOrdinal: point.fiscalOrdinal, endFiscalOrdinal: point.fiscalOrdinal, pointLimit: 8 }
   const original = useQuery({
-    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecastChart", { forecastToken, ...viewport }),
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "model", "Model.GetForecastChart", { forecastToken, ...viewport }),
     gcTime: 0,
     queryFn: async ({ signal }) => {
       const chart = parseForecastChart(await transport.query({ query: "forecastChart", forecastToken, ...viewport }, { signal }), forecastToken, viewport)
@@ -203,7 +203,7 @@ function ForecastOutcomeRead({ bootstrap, transport, ...detailProps }: {
   const forecastToken = detailProps.summary!.forecastToken
   const navigation = useCursorNavigation()
   const outcomes = useQuery({
-    queryKey: productKeys.operation(bootstrap.productSessionToken, "Model", "Model.GetForecastOutcomes", { forecastToken, cursor: navigation.after, limit: 25 }),
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "model", "Model.GetForecastOutcomes", { forecastToken, cursor: navigation.after, limit: 25 }),
     gcTime: 0,
     queryFn: async ({ signal }) => parseForecastOutcomes(await transport.query({ query: "forecastOutcomes", forecastToken, cursor: navigation.after, limit: 25 }, { signal }), forecastToken),
   })

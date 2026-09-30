@@ -113,6 +113,8 @@ pub(crate) enum ProductCapability {
     MarketHistory,
     MarketInstrument,
     MarketOverview,
+    MarketCollection,
+    MarketCollectionChoice,
     MarketSessionContext,
     MarketSessionRead,
     MarketUniverse,
@@ -210,6 +212,8 @@ impl ProductCapability {
             "Market.GetHistory" => Self::MarketHistory,
             "Market.GetInstrument" => Self::MarketInstrument,
             "Market.GetOverview" => Self::MarketOverview,
+            "Market.GetCollection" => Self::MarketCollection,
+            "Market.SetCollectionChoice" => Self::MarketCollectionChoice,
             "Market.GetSessionContext" => Self::MarketSessionContext,
             "Market.ReadSessionContext" => Self::MarketSessionRead,
             "Market.SearchUniverse" => Self::MarketUniverse,
@@ -408,6 +412,13 @@ pub(crate) enum DashboardQueryCommand {
     Lookup {
         text: String,
         categories: Option<Vec<String>>,
+    },
+    MarketCollection,
+    MarketSetCollectionChoice {
+        expected_revision: String,
+        symbol: String,
+        kept: bool,
+        confirmed: bool,
     },
     MarketOverview {
         page_token: Option<String>,

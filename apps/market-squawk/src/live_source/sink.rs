@@ -458,7 +458,27 @@ impl<'a> ProductionRawMarketSink<'a> {
         let receipt = self
             .capture
             .try_publish(frame)
-            .map_err(ProductionSinkFailure::Capture)?;
+            .map_err(|error| {
+                // These closed errors/reasons contain only classifications and byte counts.
+                // Never include the frame, payload, or capture publisher's debug representation.
+                tracing::warn!(
+                    source = self.session.source_id().as_str(),
+                    generation = self.session.generation().get(),
+                    capture_error = %error,
+                    dropped_health_events = self.capture.dropped_health_events(),
+                    "raw capture publication rejected"
+                );
+                while let Some(event) = self.capture.try_next_health() {
+                    tracing::warn!(
+                        source = event.identity().source_id().as_str(),
+                        generation = event.identity().connection_generation().get(),
+                        reason = ?event.reason(),
+                        integrity = ?event.integrity(),
+                        "retained capture health event after publication rejection"
+                    );
+                }
+                ProductionSinkFailure::Capture(error)
+            })?;
         self.output.poll_failures()?;
         Ok(receipt)
     }
@@ -1297,8 +1317,8 @@ pub enum RouteActivationFailure {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ProductionSinkFailure {
-    #[error("raw capture publication failed")]
-    Capture(CapturePublishError),
+    #[error("raw capture publication failed: {0}")]
+    Capture(#[source] CapturePublishError),
     #[error("raw capture continuation is missing, duplicated or transplanted")]
     CaptureHandoffMismatch,
     #[error("source authority validation failed: {0}")]

@@ -217,6 +217,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Market.GetComparisons" => market_comparison_rows(),
         "Market.GetUnifiedFeed" => unified_market_rows(),
         "Market.GetOverview" => market_product_page(),
+        "Market.GetCollection" => market_collection(true),
+        "Market.SetCollectionChoice" => market_collection(false),
         "Market.GetInstrument" => market_product_selection(),
         "Market.GetSessionContext" | "Market.ReadSessionContext" => {
             market_session_context::result()
@@ -2075,6 +2077,32 @@ fn unified_market_rows() -> Value {
             "selectionReceipt",
         ],
     ))
+}
+
+fn market_collection(with_market: bool) -> Value {
+    let mut fields = vec![
+        (
+            "symbol",
+            enumeration(&crate::application::market_collection::STARTER_MARKET_SYMBOLS),
+        ),
+        ("kept", boolean()),
+    ];
+    if with_market {
+        fields.push(("market", nullable(market_product_row())));
+    }
+    closed_complete(vec![
+        (
+            "revision",
+            json!({"type":"string", "pattern":"^[1-9][0-9]*$", "maxLength":20}),
+        ),
+        (
+            if with_market { "entries" } else { "choices" },
+            bounded_array(
+                closed_complete(fields),
+                crate::application::market_collection::STARTER_MARKET_SYMBOLS.len(),
+            ),
+        ),
+    ])
 }
 
 fn market_product_page() -> Value {

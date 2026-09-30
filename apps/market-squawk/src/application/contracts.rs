@@ -49,6 +49,8 @@ pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
             | "Analysis.StartForecastDelivery"
             | "Analysis.StartBacktestDelivery"
             | "Market.GetOverview"
+            | "Market.GetCollection"
+            | "Market.SetCollectionChoice"
             | "Market.GetSessionContext"
             | "Market.ReadSessionContext"
             | "Market.GetInstrument"
@@ -600,6 +602,14 @@ const ANALYSIS_LOOKUP_ARGUMENTS: &[ArgumentSpec] = &[
         "categories",
         ArgumentKind::EnumerationArray(PRODUCT_LOOKUP_CATEGORIES),
     ),
+];
+const MARKET_COLLECTION_CHOICE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("expectedRevision", ArgumentKind::PositiveUnsignedText),
+    ArgumentSpec::required(
+        "symbol",
+        ArgumentKind::Enumeration(&super::market_collection::STARTER_MARKET_SYMBOLS),
+    ),
+    ArgumentSpec::required("kept", ArgumentKind::Boolean),
 ];
 const MARKET_OVERVIEW_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
     "pageToken",
@@ -1886,6 +1896,27 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Market.GetUnifiedFeed",
         "Return one source-preserving market view per exact instrument.",
     ),
+    read(
+        "Market.GetCollection",
+        "Read saved starter investments and their available market information.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    OperationSpec {
+        name: "Market.SetCollectionChoice",
+        description: "Keep or remove one starter investment from the saved collection.",
+        domain: ServiceDomain::Market,
+        scope: LOCAL_SCOPE,
+        arguments: MARKET_COLLECTION_CHOICE_ARGUMENTS,
+        authorization: ToolAuthorization::LocalConfirmation,
+        source_evidence: SourceEvidencePolicy::NotApplicable,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    },
     read(
         "Market.GetOverview",
         "Show a concise overview of current investment prices and market conditions.",
@@ -3895,6 +3926,7 @@ impl ArgumentSpec {
 
 #[derive(Clone, Copy)]
 enum ArgumentKind {
+    Boolean,
     RequestId,
     Identifier,
     SourceObjectIdentifier,
@@ -4273,6 +4305,7 @@ fn argument_schema(kind: ArgumentKind) -> Value {
         ]}),
         ArgumentKind::ResearchFileMapping => research_file_mapping_schema(),
         ArgumentKind::SettingsChanges => settings_changes_schema(),
+        ArgumentKind::Boolean => json!({"type": "boolean"}),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
         ArgumentKind::Signed { minimum, maximum } => json!({
             "type": "integer",
@@ -4842,6 +4875,7 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         .map_err(|_| ToolInputError::Invalid),
         ArgumentKind::ResearchFileMapping => admit_research_file_mapping(value),
         ArgumentKind::SettingsChanges => admit_settings_changes(value),
+        ArgumentKind::Boolean => value.as_bool().map(|_| ()).ok_or(ToolInputError::Invalid),
         ArgumentKind::Enumeration(values) => value
             .as_str()
             .filter(|value| values.contains(value))

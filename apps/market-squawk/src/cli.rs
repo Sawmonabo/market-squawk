@@ -498,6 +498,19 @@ pub enum SourceCommand {
 /// Unified market-data operation.
 #[derive(Debug, Subcommand)]
 pub enum MarketCommand {
+    /// Read saved starter investments and their current information.
+    Collection,
+    /// Keep or remove a starter investment at the displayed collection revision.
+    SetCollectionChoice {
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        kept: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Acquire reported trading-session information for one product and civil date.
     GetSessionContext {
         /// Product whose reported sessions should be acquired.

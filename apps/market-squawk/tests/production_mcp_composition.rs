@@ -421,6 +421,7 @@ async fn run_installed_service_authority_scenario(
             connector.connect_mcp_relay(NamedClient::Codex),
             Err(InstalledServiceError::AdmissionRejected)
         ));
+        exercise_market_collection(&desktop, false).await?;
         cli.probe_ready(CancellationToken::new())
             .await
             .context("probe initial CLI client readiness")?;
@@ -487,6 +488,7 @@ async fn run_installed_service_authority_scenario(
         let restarted_cli = connector
             .connect(NamedClient::Cli, None)
             .context("admit CLI client after service restart")?;
+        exercise_market_collection(&restarted_desktop, true).await?;
         assert_owner_research_file_available(&restarted_desktop)
             .await
             .context("query guided owner research file after service restart")?;
@@ -1040,6 +1042,91 @@ fn real_alpaca_remaining_timeout(deadline: Instant) -> TestResult<Duration> {
         anyhow::bail!("real Alpaca market-readiness deadline elapsed");
     }
     Ok(remaining.min(INSTALLED_MCP_SERVICE_TIMEOUT))
+}
+
+// Critical persistence gap: removed defaults must not be silently reseeded on service restart.
+async fn exercise_market_collection(
+    client: &LoopbackApplicationClient,
+    restored: bool,
+) -> TestResult {
+    // The private workflow needs native job/setup descriptors while MCP discovery remains filtered.
+    let workflow = client
+        .invoke_operation(
+            RequestId::try_string(format!("workflow-startup-{restored}"))?,
+            "Analysis.ReadWorkflow",
+            json!({"request":{"action":"status"}, "resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(workflow.result()["ok"], true, "{}", workflow.result());
+    assert_eq!(
+        workflow.result()["value"]["data"]["workflowAvailability"]["state"],
+        "available",
+        "{}",
+        workflow.result()
+    );
+    // Ordinary first-load reads share the catalog worker instead of failing on mutex contention.
+    let (comparison, response) = tokio::try_join!(
+        client.invoke_operation(
+            RequestId::try_string(format!("comparison-startup-{restored}"))?,
+            "Analysis.ReadWorkflow",
+            json!({"request":{"action":"profileOptions"}, "resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        ),
+        client.invoke_operation(
+            RequestId::try_string(format!("collection-read-{restored}"))?,
+            "Market.GetCollection",
+            json!({}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+    )?;
+    assert_eq!(comparison.result()["ok"], true, "{}", comparison.result());
+    assert_eq!(
+        comparison.result()["value"]["data"]["kind"],
+        "profile_options"
+    );
+    assert_eq!(response.result()["ok"], true, "{}", response.result());
+    let data = &response.result()["value"]["data"];
+    let entries = data["entries"].as_array().context("collection entries")?;
+    assert_eq!(entries.len(), 9);
+    assert!(entries.iter().any(|entry| entry["symbol"] == "TSLA"));
+    assert!(entries.iter().all(|entry| entry["kept"] == !restored));
+    if restored {
+        return Ok(());
+    }
+    let mut revision = data["revision"]
+        .as_str()
+        .context("collection revision")?
+        .to_owned();
+    for entry in entries {
+        let symbol = entry["symbol"].as_str().context("collection symbol")?;
+        let changed = client.invoke_operation(
+            RequestId::try_string(format!("collection-remove-{symbol}"))?, "Market.SetCollectionChoice",
+            json!({"expectedRevision": revision, "symbol": symbol, "kept": false, "confirm": true,
+                "resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT, CancellationToken::new(),
+        ).await?;
+        assert_eq!(changed.result()["ok"], true, "{}", changed.result());
+        revision = changed.result()["value"]["data"]["revision"]
+            .as_str()
+            .context("saved collection revision")?
+            .to_owned();
+    }
+    let stale = client
+        .invoke_operation(
+            RequestId::try_string("collection-stale-choice")?,
+            "Market.SetCollectionChoice",
+            json!({"expectedRevision": "1", "symbol": "TSLA", "kept": true, "confirm": true,
+                "resultLimits":{"maximumItems":1000,"maximumBytes":1_048_576}}),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(stale.result()["ok"], false);
+    Ok(())
 }
 
 async fn invoke_real_alpaca(
@@ -3513,6 +3600,8 @@ async fn exercise_installed_relay_with_gate(
         .collect::<Result<Vec<_>, _>>()?;
     assert!(names.contains(&"Analysis.Lookup"));
     assert!(names.contains(&"Market.GetOverview"));
+    assert!(names.contains(&"Market.GetCollection"));
+    assert!(!names.contains(&"Portfolio.GetRecommendationSetup"));
     assert!(names.contains(&"Macro.GetContext"));
     assert!(names.contains(&"Model.ListProductActivity"));
     assert!(names.iter().all(|name| {

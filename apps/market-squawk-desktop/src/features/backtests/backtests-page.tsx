@@ -79,7 +79,7 @@ function RecommendationStudyRead({ actionToken, transport, scope }: {
   scope: ProductScope
 }) {
   const study = useQuery({
-    queryKey: productKeys.operation(scope, "backtest", "Analysis.GetRecommendationBacktest", { actionToken }),
+    queryKey: productKeys.operation(scope, "analysis", "Analysis.GetRecommendationBacktest", { actionToken }),
     gcTime: 0,
     retry: false,
     queryFn: async ({ signal }) => parseRecommendationBacktest(await transport.backtestProducts({ action: "recommendationStudy", actionToken }, { signal })),
@@ -320,7 +320,7 @@ function BacktestsWorkspace({
   const activityNavigation = useCursorNavigation()
   const activitiesKey = productKeys.operation(
     scope,
-    "backtest",
+    "analysis",
     "Analysis.ListProductBacktests",
     { cursor: activityNavigation.after, limit: 25 },
   )
@@ -344,7 +344,7 @@ function BacktestsWorkspace({
   const resultQuery = useQuery({
     queryKey: productKeys.operation(
       scope,
-      "backtest",
+      "analysis",
       "Analysis.GetProductBacktest",
       { backtestToken: selected?.backtestToken ?? null },
     ),
@@ -466,7 +466,7 @@ function BacktestBuilder({
   const optionsQuery = useQuery({
     queryKey: productKeys.operation(
       scope,
-      "backtest",
+      "analysis",
       "Backtest.GetPreparation",
       {},
     ),

@@ -1282,7 +1282,7 @@ async fn compose_transport(
     let analytical_workflow = Arc::clone(&services.analytical_workflow);
     let workflow_services: Arc<dyn market_squawk_services::ToolServices> = services.clone();
     analytical_workflow
-        .bind(Arc::downgrade(&workflow_services))
+        .bind(Arc::downgrade(&workflow_services), services.capabilities())
         .map_err(|_| InstalledServiceError::CompositionStage("analytical workflow binding"))?;
     drop(workflow_services);
     let recovery_deadline = Instant::now()

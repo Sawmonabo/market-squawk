@@ -16,8 +16,7 @@ use market_squawk_data::{
     InstrumentDefinitionReadCapability, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
     MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationQuery,
     MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
-    ProviderMarketEventSelectedCandidate,
-    ProviderMarketEventSelectionCompleteness,
+    ProviderMarketEventSelectedCandidate, ProviderMarketEventSelectionCompleteness,
 };
 use market_squawk_domain::{
     AssetClass, CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentDefinition,
@@ -28,7 +27,8 @@ use market_squawk_live::{
     RouteSnapshot, ShardSnapshot, SnapshotCompleteness, SnapshotDimension, StreamSnapshot,
 };
 use market_squawk_services::{
-    RequestContext, ServiceDomain, ServiceError, TypedToolRequest, TypedToolResult,
+    RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
+    TypedToolResult,
 };
 use market_squawk_sources::SourceMetadata;
 use serde_json::Value;
@@ -355,7 +355,9 @@ const fn market_event_class(event: &MarketEvent) -> LiveEventClass {
     match event {
         MarketEvent::Trade(_) | MarketEvent::MarketDataTrade(_) => LiveEventClass::Trade,
         MarketEvent::Quote(_) | MarketEvent::MarketDataQuote(_) => LiveEventClass::Quote,
-        MarketEvent::BookSnapshot(_) | MarketEvent::MarketDataBook(_) => LiveEventClass::BookSnapshot,
+        MarketEvent::BookSnapshot(_) | MarketEvent::MarketDataBook(_) => {
+            LiveEventClass::BookSnapshot
+        }
         MarketEvent::MarketDataChart(_) => LiveEventClass::Chart,
         MarketEvent::MarketDataScreener(_) => LiveEventClass::Screener,
         MarketEvent::BookDelta(_) => LiveEventClass::BookDelta,
@@ -512,6 +514,7 @@ pub(super) struct MarketDomainService {
     market_data_instruments: MarketDataInstrumentReadCapability,
     reference_search: Arc<dyn MarketReferenceSearchAuthority>,
     market_history: MarketHistoryReadCapability,
+    market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
     product_research: Arc<crate::ResearchService>,
     product_markets: crate::application::market_selection::MarketInvestmentReadCapability,
 }
@@ -523,6 +526,7 @@ impl MarketDomainService {
         market_data_instruments: MarketDataInstrumentReadCapability,
         reference_search: Arc<dyn MarketReferenceSearchAuthority>,
         market_history: MarketHistoryReadCapability,
+        market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
         product_research: Arc<crate::ResearchService>,
         product_markets: crate::application::market_selection::MarketInvestmentReadCapability,
     ) -> Self {
@@ -532,6 +536,7 @@ impl MarketDomainService {
             market_data_instruments,
             reference_search,
             market_history,
+            market_collection,
             product_research,
             product_markets,
         }
@@ -562,10 +567,39 @@ impl ApplicationDomainService for MarketDomainService {
             // No historical authority is injected into this current-state service.
             return Err(ServiceError::Unavailable);
         }
+        if request.name() == "Market.SetCollectionChoice" {
+            let revision = request
+                .arguments()
+                .get("expectedRevision")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(ServiceError::InvalidRequest)?;
+            let symbol = request
+                .arguments()
+                .get("symbol")
+                .and_then(Value::as_str)
+                .ok_or(ServiceError::InvalidRequest)?;
+            let kept = request
+                .arguments()
+                .get("kept")
+                .and_then(Value::as_bool)
+                .ok_or(ServiceError::InvalidRequest)?;
+            let snapshot = self.market_collection.set_choice(revision, symbol, kept)
+                .map_err(|error| match error {
+                    crate::application::market_collection::MarketCollectionError::UnknownSymbol
+                    | crate::application::market_collection::MarketCollectionError::StaleRevision => ServiceError::InvalidRequest,
+                    _ => ServiceError::Unavailable,
+                })?;
+            return TypedToolResult::try_new(
+                serde_json::json!({"revision": snapshot.revision.to_string(), "choices": snapshot.choices}),
+                snapshot.choices.len(), ToolResultMetadata::complete_not_applicable(), context.limits(),
+            ).map_err(|_| ServiceError::ResourceExhausted);
+        }
         let reference_at = system_timestamp()?;
         if matches!(
             request.name(),
             MARKET_GET_OVERVIEW
+                | "Market.GetCollection"
                 | MARKET_GET_INSTRUMENT
                 | MARKET_GET_HISTORY
                 | MARKET_SEARCH_UNIVERSE

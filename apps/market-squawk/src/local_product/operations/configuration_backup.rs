@@ -1,4 +1,4 @@
-//! Workspace-backup adapter for settings and recommendation-setup authorities.
+//! Workspace-backup adapter for settings, recommendation setup and market preferences.
 
 use std::{fmt, io::Write, path::Path, sync::Arc};
 
@@ -16,6 +16,7 @@ use crate::application::{
         ProductBackupComponentKind, ProductBackupComponentSchema, ProductBackupError,
         ProductBackupSensitivity, ProductBackupSnapshot,
     },
+    market_collection::{MarketCollectionAuthority, RetainedMarketCollectionBackup},
     recommendation::{RecommendationSetupAuthority, RetainedRecommendationSetupBackup},
 };
 
@@ -32,10 +33,11 @@ const CONFIGURATION_FORMAT_VERSION: u16 = 2;
 const CONFIGURATION_AUTHORITY_DIGEST_DOMAIN: &[u8] =
     b"market-squawk/workspace-configuration-authorities/v2\0";
 
-/// The one Configuration component owner: settings plus explicit recommendation setup.
+/// The one Configuration component owner for the live workspace preferences.
 pub(crate) struct ConfigurationWorkspaceBackupAuthority {
     settings: Arc<ProductionSettingsOperations>,
     recommendation_setup: Arc<RecommendationSetupAuthority>,
+    market_collection: Arc<MarketCollectionAuthority>,
     descriptors: [WorkspaceComponentDescriptor; 1],
 }
 
@@ -44,6 +46,7 @@ impl ConfigurationWorkspaceBackupAuthority {
     pub(super) fn try_new(
         settings: Arc<ProductionSettingsOperations>,
         recommendation_setup: Arc<RecommendationSetupAuthority>,
+        market_collection: Arc<MarketCollectionAuthority>,
     ) -> Result<Self, ProductBackupError> {
         let producer = SourceIdentifier::try_from(CONFIGURATION_PRODUCER)
             .map_err(|_| ProductBackupError::InvalidComponent)?;
@@ -52,6 +55,7 @@ impl ConfigurationWorkspaceBackupAuthority {
         Ok(Self {
             settings,
             recommendation_setup,
+            market_collection,
             descriptors: [WorkspaceComponentDescriptor::try_new(
                 ProductBackupComponentKind::Configuration,
                 producer,
@@ -91,13 +95,23 @@ impl WorkspaceComponentSnapshotAuthority for ConfigurationWorkspaceBackupAuthori
             .recommendation_setup
             .retain_workspace_backup()
             .map_err(|_| ProductBackupError::SnapshotMismatch)?;
-        let component = RetainedConfigurationComponent::try_new(&retained, &recommendation_setup)?;
+        let market_collection = self
+            .market_collection
+            .retain_workspace_backup()
+            .map_err(|_| ProductBackupError::SnapshotMismatch)?;
+        let component = RetainedConfigurationComponent::try_new(
+            &retained,
+            &recommendation_setup,
+            &market_collection,
+        )?;
         Ok(Box::new(RetainedConfigurationWorkspaceSnapshot {
             settings: Arc::clone(&self.settings),
             recommendation_setup: Arc::clone(&self.recommendation_setup),
+            market_collection: Arc::clone(&self.market_collection),
             descriptors: self.descriptors.clone(),
             retained,
             retained_recommendation_setup: recommendation_setup,
+            retained_market_collection: market_collection,
             canonical_bytes: component.canonical_bytes,
             authority_revision_sha256: component.authority_revision_sha256,
         }))
@@ -107,9 +121,11 @@ impl WorkspaceComponentSnapshotAuthority for ConfigurationWorkspaceBackupAuthori
 struct RetainedConfigurationWorkspaceSnapshot {
     settings: Arc<ProductionSettingsOperations>,
     recommendation_setup: Arc<RecommendationSetupAuthority>,
+    market_collection: Arc<MarketCollectionAuthority>,
     descriptors: [WorkspaceComponentDescriptor; 1],
     retained: RetainedWorkspaceConfiguration,
     retained_recommendation_setup: RetainedRecommendationSetupBackup,
+    retained_market_collection: RetainedMarketCollectionBackup,
     canonical_bytes: Vec<u8>,
     authority_revision_sha256: [u8; 32],
 }
@@ -169,6 +185,9 @@ impl WorkspaceComponentSnapshotLease for RetainedConfigurationWorkspaceSnapshot 
             .map_err(|_| ProductBackupError::SnapshotMismatch)?;
         self.recommendation_setup
             .revalidate_workspace_backup(&self.retained_recommendation_setup)
+            .map_err(|_| ProductBackupError::SnapshotMismatch)?;
+        self.market_collection
+            .revalidate_workspace_backup(&self.retained_market_collection)
             .map_err(|_| ProductBackupError::SnapshotMismatch)
     }
 }
@@ -179,8 +198,10 @@ struct ConfigurationComponentBackup {
     format_version: u16,
     settings_base64: String,
     recommendation_setup_base64: String,
+    market_collection_base64: String,
     settings_bytes_sha256: [u8; 32],
     recommendation_setup_bytes_sha256: [u8; 32],
+    market_collection_sha256: [u8; 32],
     settings_authority_sha256: [u8; 32],
     recommendation_setup_authority_sha256: [u8; 32],
     semantic_authority_sha256: [u8; 32],
@@ -195,6 +216,7 @@ impl RetainedConfigurationComponent {
     fn try_new(
         settings: &RetainedWorkspaceConfiguration,
         recommendation_setup: &RetainedRecommendationSetupBackup,
+        market_collection: &RetainedMarketCollectionBackup,
     ) -> Result<Self, ProductBackupError> {
         let settings_bytes_sha256 = Sha256::digest(settings.canonical_bytes()).into();
         let recommendation_setup_bytes_sha256 =
@@ -205,12 +227,15 @@ impl RetainedConfigurationComponent {
         let semantic_authority_sha256 = configuration_authority_digest(
             settings_authority_sha256,
             recommendation_setup_authority_sha256,
+            market_collection.authority_revision_sha256(),
         );
         let backup = ConfigurationComponentBackup {
             format_version: CONFIGURATION_FORMAT_VERSION,
             settings_base64: STANDARD_NO_PAD.encode(settings.canonical_bytes()),
             recommendation_setup_base64: STANDARD_NO_PAD
                 .encode(recommendation_setup.canonical_bytes()),
+            market_collection_base64: STANDARD_NO_PAD.encode(market_collection.canonical_bytes()),
+            market_collection_sha256: market_collection.authority_revision_sha256(),
             settings_bytes_sha256,
             recommendation_setup_bytes_sha256,
             settings_authority_sha256,
@@ -229,7 +254,7 @@ impl RetainedConfigurationComponent {
     }
 }
 
-/// Restores the strict Configuration envelope through both fresh-target typed authorities.
+/// Restores the strict Configuration envelope through the fresh-target typed authorities.
 pub(super) fn restore_configuration_component_absent(
     control_root: &Path,
     target_workspace: WorkspaceId,
@@ -246,13 +271,16 @@ pub(super) fn restore_configuration_component_absent(
             != configuration_authority_digest(
                 backup.settings_authority_sha256,
                 backup.recommendation_setup_authority_sha256,
+                backup.market_collection_sha256,
             )
     {
         return Err(ServiceError::InvalidRequest);
     }
     let settings = decode_component(&backup.settings_base64)?;
     let recommendation_setup = decode_component(&backup.recommendation_setup_base64)?;
-    if <[u8; 32]>::from(Sha256::digest(&settings)) != backup.settings_bytes_sha256
+    let market_collection = decode_component(&backup.market_collection_base64)?;
+    if <[u8; 32]>::from(Sha256::digest(&market_collection)) != backup.market_collection_sha256
+        || <[u8; 32]>::from(Sha256::digest(&settings)) != backup.settings_bytes_sha256
         || <[u8; 32]>::from(Sha256::digest(&recommendation_setup))
             != backup.recommendation_setup_bytes_sha256
     {
@@ -263,6 +291,10 @@ pub(super) fn restore_configuration_component_absent(
         &recommendation_setup,
     )
     .map_err(|_| ServiceError::InvalidRequest)?;
+    MarketCollectionAuthority::validate_workspace_backup(&market_collection)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    MarketCollectionAuthority::ensure_workspace_backup_target_absent(control_root)
+        .map_err(|_| ServiceError::InvalidResult)?;
     RecommendationSetupAuthority::ensure_workspace_backup_target_absent(control_root)
         .map_err(|_| ServiceError::InvalidResult)?;
     let _settings = ProductionSettingsOperations::restore_workspace_configuration_absent(
@@ -275,6 +307,11 @@ pub(super) fn restore_configuration_component_absent(
         control_root,
         target_workspace,
         &recommendation_setup,
+    )
+    .map_err(|_| ServiceError::Unavailable)?;
+    let _collection = MarketCollectionAuthority::restore_workspace_backup_absent(
+        control_root,
+        &market_collection,
     )
     .map_err(|_| ServiceError::Unavailable)?;
     if restored.owner_workspace() != target_workspace {
@@ -295,10 +332,12 @@ fn decode_component(encoded: &str) -> Result<Vec<u8>, ServiceError> {
 fn configuration_authority_digest(
     settings_authority_sha256: [u8; 32],
     recommendation_setup_authority_sha256: [u8; 32],
+    market_collection_sha256: [u8; 32],
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(CONFIGURATION_AUTHORITY_DIGEST_DOMAIN);
     digest.update(settings_authority_sha256);
     digest.update(recommendation_setup_authority_sha256);
+    digest.update(market_collection_sha256);
     digest.finalize().into()
 }

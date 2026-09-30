@@ -26,7 +26,6 @@ export function AnalysisActivity({ transport, scope }: {
     if (!published || published === previouslyPublished.current) return
     previouslyPublished.current = published
     void queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "decision") })
-    void queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "overview") })
   }, [published, queryClient, scope])
   const resume = useMutation({
     mutationFn: (workflowToken: string) => transport.analyticalController({ action: "resumeWorkflow", workflowToken }, true),

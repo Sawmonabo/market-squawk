@@ -201,7 +201,7 @@ function ReadyPaperExecution({
           && capabilities.has("bot_prepare_account") && capabilities.has("bot_create_account")}
         onCreated={async (message) => {
           setControlMessage(message)
-          await Promise.all(["bot", "portfolio"].map((domain) =>
+          await Promise.all((["bot", "portfolio"] as const).map((domain) =>
             queryClient.invalidateQueries({ queryKey: productKeys.domain(bootstrap.productSessionToken, domain) }),
           ))
         }}
@@ -235,8 +235,11 @@ function ReadyPaperExecution({
             transport={transport}
             scope={bootstrap.productSessionToken}
             enabled={
-              status.data?.value.sessionAvailability === "active" && manualPaperAvailable
+              !status.isError && status.data?.value.sessionAvailability === "active" && manualPaperAvailable
             }
+            sessionStatus={status.data?.value}
+            statusLoading={statusAvailable && status.isPending}
+            statusFailed={status.isError}
             busy={control.isPending}
             onAccepted={async () => {
               await Promise.all([

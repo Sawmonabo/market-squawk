@@ -1,17 +1,17 @@
 import { QueryClient } from "@tanstack/react-query"
 
-import type { DesktopBootstrap } from "@/lib/schemas"
+import type { DesktopBootstrap, DesktopInvalidationDomain } from "@/lib/schemas"
 
 export type ProductScope = DesktopBootstrap["productSessionToken"]
 
 export const productKeys = {
   bootstrap: ["market-squawk", "bootstrap"] as const,
   root: (scope: ProductScope) => ["market-squawk", scope] as const,
-  domain: (scope: ProductScope, domain: string) =>
+  domain: (scope: ProductScope, domain: DesktopInvalidationDomain) =>
     [...productKeys.root(scope), "domain", domain] as const,
   operation: (
     scope: ProductScope,
-    domain: string,
+    domain: DesktopInvalidationDomain,
     operation: string,
     input: Readonly<object>,
   ) => [...productKeys.domain(scope, domain), operation, input] as const,

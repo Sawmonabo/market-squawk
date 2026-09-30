@@ -24,8 +24,34 @@ impl MarketDomainService {
             .population(reference_at, context.deadline(), context.cancellation())
             .await?;
         let argument = |name: &str| request.arguments().get(name).and_then(Value::as_str);
-        let identities =
+        let mut identities =
             product::product_market_identities(&records, reference_at, argument("query"))?;
+        let collection = if matches!(request.name(), MARKET_GET_OVERVIEW | "Market.GetCollection") {
+            Some(
+                self.market_collection
+                    .snapshot()
+                    .map_err(|_| ServiceError::Unavailable)?,
+            )
+        } else {
+            None
+        };
+        if let Some(collection) = &collection {
+            identities.retain(|identity| {
+                let choice = matches!(identity.asset_class(), "equity" | "fund")
+                    .then(|| {
+                        collection
+                            .choices
+                            .iter()
+                            .find(|choice| Some(choice.symbol.as_str()) == identity.symbol())
+                    })
+                    .flatten();
+                if request.name() == "Market.GetCollection" {
+                    choice.is_some()
+                } else {
+                    choice.is_none_or(|choice| choice.kept)
+                }
+            });
+        }
         let maximum_rows = limits
             .maximum_result_items()
             .min(product::MAXIMUM_PRODUCT_MARKET_ROWS);
@@ -137,6 +163,40 @@ impl MarketDomainService {
         let has_more = page.has_more();
         let content = product::project_product_page(&identities, page, &rows)?;
         ensure_live(context)?;
+        if request.name() == "Market.GetCollection" {
+            let collection = collection.ok_or(ServiceError::InvalidResult)?;
+            let projected = content
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::InvalidResult)?;
+            let entries: Vec<_> = collection
+                .choices
+                .iter()
+                .map(|choice| {
+                    // Check the complete selected population, not only its displayed page.
+                    let unambiguous = identities
+                        .iter()
+                        .filter(|identity| identity.symbol() == Some(choice.symbol.as_str()))
+                        .count()
+                        == 1;
+                    let market = unambiguous
+                        .then(|| {
+                            projected.iter().find(|row| {
+                                row["identity"]["symbol"].as_str() == Some(choice.symbol.as_str())
+                            })
+                        })
+                        .flatten();
+                    json!({"symbol": choice.symbol, "kept": choice.kept, "market": market})
+                })
+                .collect();
+            return TypedToolResult::try_new(
+                json!({"revision": collection.revision.to_string(), "entries": entries}),
+                entries.len(),
+                ToolResultMetadata::complete_not_applicable(),
+                limits,
+            )
+            .map_err(|_| ServiceError::ResourceExhausted);
+        }
         product::product_result(content, available, has_more, limits)
     }
 

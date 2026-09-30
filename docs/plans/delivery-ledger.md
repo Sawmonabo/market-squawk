@@ -1,5 +1,130 @@
 # Market Squawk Delivery Ledger
 
+## Active market-startup delivery wave — 2026-09-30
+
+Refresh base `95871cc081dce724b707c6a3fb49f002b8976b4f`, clean and pushed. The previous wave
+made native reads work and proved background WebView interaction. This wave delivers the owner's
+first-launch investment collection and resolves the evidenced live-capture interruption.
+
+| Owner | Exclusive files | Finishable outcome / dependency / evidence |
+| --- | --- | --- |
+| Astra `stock_capture_trace` | `apps/market-squawk/src/live_source/sink.rs` only | Retain the typed capture rejection and existing capture-health reason in the current source-qualified failure diagnostics. Inspect redaction before logging. No changed limits, fallback, provider state, builds or Git. Lead then rebuilds/retries the same source and fixes the evidenced root cause. |
+| GPT-6.1 Sol `starter_market_trace` | New `apps/market-squawk/src/application/market_collection.rs` only | Durable nine-symbol keep/remove preference using `LocalAuthorityStateStore`, initializing once and preserving an entirely removed collection through restart. Closed revision-checked mutation and retained backup bytes/revalidation/fresh-target restore. No financial identity/price authority, migration, application wiring, builds or Git. |
+| GPT-6.1 Sol `starter_market_ui` | `features/markets/markets-page.tsx`, new `features/markets/market-collection.tsx`, `features/overview/use-overview.ts` and `overview-dashboard.tsx` under Desktop `src/` | Shared provider-neutral collection read/controls in Home and Markets, all kept starters visible, removed starters restorable, pending genuine data displayed honestly. Preserve search/detail/history and existing design. Uses the frozen wire contract below; no transport/schema/Git/build ownership. |
+| Lead | Shared exports/contracts/schemas, provider default selection, application/service composition, backup adapter, native/CLI/MCP transport, UI contract and integration checks | Wire the one collection authority into both ordinary screens and all shared consumers. Freeze the UI contract before assigning disjoint presentation work. Extend existing critical persistence/restart coverage; prove native remove/keep and genuine quote behavior after implementation. |
+
+Lead additionally owns `application/analytical_workflow/host.rs` and `service/mod.rs` for the
+substantiated startup defect: the private workflow was bound to filtered external MCP descriptors,
+so required portfolio/job operations were always considered absent. Bind full native descriptors
+with the existing weak dispatcher; preserve external MCP filtering and per-call authority checks.
+The same installed-service critical check must cover internal workflow availability and restricted
+external discovery. No additional review round or separate dispatcher is introduced.
+
+Owner follow-up: resolve the remaining startup page errors, not just read-command admission.
+GPT-6.1 Sol `starter_market_ui` has released its four implementation files and now owns a read-only
+startup-state trace: inspect the retained 17-route native evidence and affected page/bootstrap/query
+paths, classify concrete failures and identify minimal fixes. No edits, builds, Git, new worktrees
+or foreground interaction. Lead retains integration and the single compilation queue. This trace
+is independent of the frozen collection build and does not create a new review ceremony.
+
+Startup trace produced two additional concrete UI state defects. GPT-6.1 Sol `starter_market_ui`
+now exclusively owns Desktop `features/lifecycle/lifecycle-page.tsx`, `features/paper/manual-paper-draft.tsx`
+and `features/paper/paper-execution-page.tsx`: a development run with no installed release must not
+claim repair is required, and an inactive paper session must route to the existing start controls
+instead of a generic Connections/Updates failure. Preserve genuine read errors and execution
+checks; no fictitious readiness, release installation or paper start. No other edits/tests/builds/Git.
+Lead retains the pending Home comparison failure trace; its error must be captured before a fix.
+
+All three implementation helpers have released their files. Astra `startup_source_authority`
+owns a read-only diagnosis of the current source Verify/restore failure after both secure stores
+unlock: trace CLI admission, installed authority, source state and sanitized service diagnostics.
+No edits, provider mutations, builds or Git. Return the precise failing boundary and smallest
+correction; lead owns live retries and implementation. This runs independently of the lead's
+native collection and screen checks and the single existing critical test.
+
+Astra `startup_catalog_contention` owns a read-only trace of Home's reproducible first-load
+`Analysis.ReadWorkflow/profileOptions` unavailable error. Explicit retry returns genuine SPY/VTI/QQQ
+choices. Inspect shared catalog locking and concurrent Home reads; identify a minimal correction
+with cancellation/deadline and publication authority intact. No edits/builds/Git until ownership
+is narrowed. Lead retains native reproduction and shared integration.
+
+Source diagnosis is complete: the retained Alpaca Verify intent is in reconciliation, and Retry
+requires an unexpired lease before entering its renewal path. Astra `startup_source_authority`
+now exclusively owns `apps/market-squawk/src/local_product/source_lifecycle.rs`: correct explicit
+Retry admission and preserve expired-active-lease errors using existing retained bindings and
+doctor verification. Persist intent before renewal; require fresh admitted authority before
+runtime start. Preserve CAS, cancellation, draining and all other providers. No edits to tests,
+shared contracts, manifests or Git; lead owns the existing critical/live recovery verification.
+
+Catalog diagnosis is complete; Astra released ownership without edits. The comparison handler
+bypassed the existing single research I/O lane used by concurrent collection reads, hitting the
+catalog's fail-fast mutex. Lead owns `service/analytical_profile.rs` and its
+`service/tool_services.rs` call: execute comparisons on that same supervised worker with the
+original deadline and cancellation. No catalog lock changes, request retries or new worker are
+needed. Extend the existing installed-service case with concurrent comparison/collection reads.
+
+Verified checkpoint evidence (2026-09-30):
+
+- All 17 native Desktop routes loaded with zero query errors in
+  `.agents/tmp/v1-first-stock/startup-recovery-route-check.json`. Fresh Home comparisons load
+  without Retry. The workflow now sees its private native capabilities while external MCP
+  discovery remains restricted.
+- Native Remove on Home / Keep on Markets persisted, and the nine saved choices survived service
+  restart. The existing installed-service critical test passed in 50.36 seconds, covering concurrent
+  comparison/collection reads, workflow availability, MCP filtering, stale revisions and the
+  entirely removed collection surviving restart. Its initial request-contract omission was fixed.
+- The final single-job build passed in 6m29s (`startup-source-renewal-build.log`); Desktop typecheck
+  passed (`market-startup-typecheck.log`). The final renewal-state change was live checked:
+  source Retry renewed the same session/configuration/generation with fresh doctor evidence and
+  transitioned Alpaca from blocked revision 4 to active revision 5. The retained receipt is
+  `source-renewal-retry.json`. No scope or credential replacement was introduced.
+- Fresh native Home after that rebuild/unlock still shows all nine choices and zero query errors
+  (`source-renewal-home-settled.json`). Native and service shutdown of the preceding run both
+  exited normally. Only the two new analytical-profile/test blocks received formatting afterward;
+  no post-build behavioral change was made. This is ordinary checkpoint evidence, not the final
+  unchanged-candidate release gate.
+
+Remaining data dependency is concrete: the eight retained canonical IDs and IEX mappings match,
+but their latest quotes are stale; TSLA has no canonical reference in this root yet. The source
+lifecycle now reports active, while generic `Source.Health` reports no generic runtime records;
+this is not proof of fresh capture. The doctor verifies historical access but does not publish
+OHLC bars. There are no complete-history publications, and collection pricing never reads daily
+history for its existing `previous_close` display state. Next checkpoint must reuse the canonical
+Alpaca history plan/publication and provider-neutral history reader for genuine completed-session
+closes, plus provision TSLA through the reference owner. No freshness relaxation, fabricated price
+or second ingestion stack. All current helper ownership is released; lead owns Git/checkpointing.
+No full investment-analysis, installed-package or whole-app RAM acceptance is claimed.
+
+Lead also owns `src/app/query-client.ts` and the affected Models/Forecast and Backup query callers:
+uppercase `Model`/`Operations` cache domains do not match lowercase native invalidation events,
+leaving startup-empty screens stale. Reuse the existing `DesktopInvalidationDomain` type at the
+shared query-key boundary and correct callers in place; no normalization shim or new event system.
+Typechecking additionally exposed Backtests, Settings/workspace and a dead Home invalidation key;
+lead owns those affected callers and the Overview helper type. Agent owns its lifecycle/paper
+caller corrections within the existing three-file assignment.
+
+Frozen collection authority contract: `STARTER_MARKET_SYMBOLS` contains SPY, QQQ, DIA, IWM, VTI,
+AAPL, MSFT, NVDA, TSLA. `MarketCollectionAuthority::try_open(control_root)` opens the single
+`market-collection-authority` directory. `snapshot()` returns `{revision, choices:[{symbol,kept}]}`;
+`set_choice(expected_revision, symbol, kept)` atomically persists a validated choice and returns
+that snapshot. Unknown symbols and stale revisions are rejected; repeated identical choices do
+not reset or recreate defaults. Backup methods retain canonical bytes/digest, revalidate the same
+state, verify an absent target and restore that state. This is a preference, not a canonical market
+identity or trade authority. Provider preparation uses the shared starter definition; changing
+visibility does not revoke independently needed data or benchmarks. No tests/builds outside the
+lead queue. DAG: authority → lead shared operation/projection → disjoint UI → native restart proof;
+capture diagnostics → same-source retry → evidenced producer correction runs concurrently.
+
+Frozen UI wire contract: `transport.query({query:"marketCollection"})` returns an ordinary
+ApplicationResult whose data is `{revision:string, entries:[{symbol:string, kept:boolean,
+market:MarketProductRow|null}]}` for the nine defaults in their defined order. Revision is lossless
+unsigned decimal text. `transport.query({query:"marketSetCollectionChoice", expectedRevision:string,
+symbol:string, kept:boolean, confirmed:true})` returns `{revision:string, choices:[{symbol,kept}]}`.
+Explicit Keep/Remove is the confirmation; invalidate/refetch both collection and market overview
+queries after success. Missing canonical metadata is null, never a fabricated selection token or
+price. Show the symbol while details load/become available. Search and detail/history remain
+independent; hiding a starter does not delete its catalog/data or revoke a benchmark.
+
 ## Active live-stock and harmonic-evidence wave — 2026-09-30
 
 Refresh base `1572f4fb19d18add8bcd73eee7d2f69ff2834fcf`; execution remains authorized.

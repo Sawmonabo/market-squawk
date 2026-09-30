@@ -103,7 +103,7 @@ function ReadyBackupRecovery({
 
   const navigation = useCursorNavigation()
   const inventory = useQuery({
-    queryKey: productKeys.operation(scope, "Operations", "Operations.ListBackups", {
+    queryKey: productKeys.operation(scope, "operations", "Operations.ListBackups", {
       limit: INVENTORY_LIMIT,
       afterBackupId: navigation.after,
     }),
@@ -189,7 +189,7 @@ function ReadyBackupRecovery({
         `The service queued job ${newReceipt.jobId.slice(0, 8)}. Completion is not yet confirmed.`,
       )
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "Operations") }),
+        queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "operations") }),
         queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "job") }),
       ])
     },

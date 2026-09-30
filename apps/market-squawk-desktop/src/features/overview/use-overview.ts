@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
-import { parseMarketProductResult } from "@/features/markets/market-product"
+import { useMarketCollection } from "@/features/markets/market-collection"
 import { parseInvestmentAnalysisPage } from "@/features/opportunities/contracts"
-import type { ApplicationResult } from "@/lib/schemas"
+import type { ApplicationResult, DesktopInvalidationDomain } from "@/lib/schemas"
 import type { ProductQuery, ProductTransport } from "@/lib/transport"
 
 export type ReadState<T> =
@@ -11,7 +11,6 @@ export type ReadState<T> =
   | { status: "ready"; data: T }
   | { status: "unavailable"; data: null }
 
-const MARKET_INPUT = { query: "marketOverview" } as const
 const ANALYSIS_INPUT = {
   query: "decisionInvestmentAnalyses",
   limit: 4,
@@ -30,28 +29,14 @@ export function useOverviewQueries(
     (result) =>
       parseInvestmentAnalysisPage(result, { limit: ANALYSIS_INPUT.limit }),
   )
-  const markets = useMarketOverviewQuery(transport, scope)
+  const markets = useMarketCollection(transport, scope)
   return { analyses, markets }
-}
-
-function useMarketOverviewQuery(
-  transport: ProductTransport,
-  scope: ProductScope,
-) {
-  return useParsedProductQuery(
-    transport,
-    scope,
-    "market",
-    "Market.GetOverview",
-    MARKET_INPUT,
-    (result) => parseMarketProductResult(result).data,
-  )
 }
 
 function useParsedProductQuery<Result>(
   transport: ProductTransport,
   scope: ProductScope,
-  domain: string,
+  domain: DesktopInvalidationDomain,
   operation: string,
   input: ProductQuery,
   parse: (result: ApplicationResult) => Result,

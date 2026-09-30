@@ -19,6 +19,7 @@ import { Label } from "@/components/ui/label"
 import { formatMoney } from "@/lib/formatters"
 import type { ProductTransport } from "@/lib/transport"
 
+import type { PaperStatus } from "./contracts"
 import {
   asManualPaperTransport,
   isPositiveLotQuantity,
@@ -54,6 +55,9 @@ export function ManualPaperDraftPanel({
   busy,
   onAccepted,
   analysisActionToken,
+  sessionStatus,
+  statusLoading,
+  statusFailed,
 }: {
   analysisActionToken?: string
   transport: ProductTransport
@@ -61,6 +65,9 @@ export function ManualPaperDraftPanel({
   enabled: boolean
   busy: boolean
   onAccepted: () => Promise<unknown>
+  sessionStatus: PaperStatus | undefined
+  statusLoading: boolean
+  statusFailed: boolean
 }) {
   const manualPaper = asManualPaperTransport(transport)
   const [draft, setDraft] = React.useState<Draft>(emptyDraft)
@@ -134,8 +141,21 @@ export function ManualPaperDraftPanel({
         <ShieldCheck className="size-5 text-primary" aria-hidden="true" />
       </div>
 
-      {!enabled || manualPaper === null ? (
-        <Unavailable detail={analysisActionToken ? "This saved recommendation needs an available, active paper session. Review the session controls below; trade details and confirmation remain separate." : undefined} />
+      {statusFailed ? (
+        <Status text="Paper session status could not be loaded. Use Refresh above before preparing a virtual trade." tone="error" />
+      ) : statusLoading ? (
+        <Status text="Checking the current paper session…" />
+      ) : sessionStatus?.sessionAvailability === "ready" ? (
+        <Unavailable
+          title="Start a paper session first"
+          detail="Use the session controls below to start paper practice. They show any current account or market requirements before you confirm a session."
+        />
+      ) : sessionStatus?.sessionAvailability === "unavailable" ? (
+        <Unavailable detail={sessionStatus.safeguards === "action_needed"
+          ? "Paper practice needs attention. Review the session controls below and Logs & Diagnostics."
+          : "Paper practice is temporarily unavailable. Review the session controls below, then try again shortly."} />
+      ) : !enabled || manualPaper === null ? (
+        <Unavailable />
       ) : targets.isPending ? (
         <Status text="Loading prepared paper choices…" />
       ) : targets.isError ? (
@@ -473,14 +493,16 @@ function Fact({ label, value }: { label: string; value: string }) {
 }
 
 function Unavailable({
-  detail = "Paper practice is not available right now. Review Connections or Updates & Repair, then try again.",
+  title = "Paper practice is unavailable",
+  detail = "Paper trade drafting is unavailable in the current setup. Review the session controls below.",
 }: {
+  title?: string
   detail?: string
 }) {
   return (
     <Alert className="mt-4">
       <CircleAlert aria-hidden="true" />
-      <AlertTitle>Paper practice is unavailable</AlertTitle>
+      <AlertTitle>{title}</AlertTitle>
       <AlertDescription>{detail}</AlertDescription>
     </Alert>
   )

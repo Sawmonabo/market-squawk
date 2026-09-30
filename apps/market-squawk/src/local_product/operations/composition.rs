@@ -98,6 +98,7 @@ pub(crate) fn try_compose_installed_workspace_backup(
         Arc::new(ConfigurationWorkspaceBackupAuthority::try_new(
             settings,
             recommendation_setup,
+            Arc::clone(&product.market_collection),
         )?),
         Arc::new(ProviderMetadataWorkspaceBackupAuthority::try_new(
             product.provider_metadata_backup_authority(),

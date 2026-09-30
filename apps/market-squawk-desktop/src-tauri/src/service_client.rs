@@ -43,6 +43,7 @@ pub(crate) async fn dashboard_query(
         &request,
         DashboardQueryCommand::MarketSessionContext { .. }
             | DashboardQueryCommand::PortfolioSavePlanningResult { .. }
+            | DashboardQueryCommand::MarketSetCollectionChoice { .. }
     ) {
         if request_id.is_some() || product_session_token.is_some() {
             return Err(DesktopCommandError::invalid_request(
@@ -83,6 +84,27 @@ pub(crate) async fn dashboard_query(
             arguments.insert("query".to_owned(), json!(text));
             insert_optional(&mut arguments, "categories", categories);
             ("Analysis.Lookup", arguments)
+        }
+        DashboardQueryCommand::MarketCollection => ("Market.GetCollection", Map::new()),
+        DashboardQueryCommand::MarketSetCollectionChoice {
+            expected_revision,
+            symbol,
+            kept,
+            confirmed,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("expectedRevision".to_owned(), json!(expected_revision));
+            arguments.insert("symbol".to_owned(), json!(symbol));
+            arguments.insert("kept".to_owned(), json!(kept));
+            return invoke_narrow(
+                "Market.SetCollectionChoice",
+                arguments,
+                true,
+                confirmed,
+                &state,
+                &generation,
+            )
+            .await;
         }
         DashboardQueryCommand::MarketOverview { page_token } => {
             let mut arguments = Map::new();

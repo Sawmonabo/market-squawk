@@ -47,7 +47,7 @@ use market_squawk_platform::{
 };
 use market_squawk_runtime::InstallationId;
 use market_squawk_services::{
-    ArtifactAuthority, ArtifactError, ArtifactReadContext, ArtifactRepository,
+    ArtifactAuthority, ArtifactError, ArtifactReadContext, ArtifactRepository, ServiceError,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationSubjectResolver, RESEARCH_SOURCE_AUTHORITY_DIRECTORY,
@@ -338,6 +338,7 @@ pub struct LocalProduct {
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
     source_lifecycle: Arc<ProductionSourceLifecycleAuthority>,
     market_runtime: Arc<MarketRuntimeRegistry>,
+    market_collection: Arc<crate::application::market_collection::MarketCollectionAuthority>,
     paper_activity: Arc<dyn PaperRuntimeActivityAuthority>,
     paper_backup: Arc<crate::application::PaperStoppedBackupAuthority>,
     portfolio_candidate_resolution: PortfolioCandidateResolutionFactory,
@@ -1218,6 +1219,12 @@ impl LocalProduct {
             )
             .await?,
         );
+        let market_collection = Arc::new(
+            crate::application::market_collection::MarketCollectionAuthority::try_open(
+                paths.control_root()?.root(),
+            )
+            .map_err(|_| ServiceError::Unavailable)?,
+        );
         let paper = PaperApplicationServices::new(
             config.clone(),
             Arc::clone(&decisions),
@@ -1232,6 +1239,7 @@ impl LocalProduct {
                 source_calendars.clone(),
             ),
             portfolio.paper_publisher(),
+            Arc::clone(&market_collection),
             Arc::clone(&research),
             product_markets,
         );
@@ -1317,6 +1325,7 @@ impl LocalProduct {
             research_ingest,
             source_lifecycle,
             market_runtime,
+            market_collection,
             paper_activity,
             paper_backup,
             portfolio_candidate_resolution,

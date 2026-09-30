@@ -147,9 +147,9 @@ function SettingsWorkspace({
   const [switchReceipt, setSwitchReceipt] = React.useState<JobReceipt | null>(null)
   const [announcement, setAnnouncement] = React.useState("")
 
-  const settingsKey = productKeys.operation(scope, "settings", "Operations.GetSettings", {})
+  const settingsKey = productKeys.operation(scope, "operations", "Operations.GetSettings", {})
   const workspaceNavigation = useCursorNavigation()
-  const workspaceKey = productKeys.operation(scope, "workspace", "Operations.ListWorkspaces", {
+  const workspaceKey = productKeys.operation(scope, "operations", "Operations.ListWorkspaces", {
     limit: WORKSPACE_PAGE_LIMIT,
     afterWorkspaceId: workspaceNavigation.after,
   })

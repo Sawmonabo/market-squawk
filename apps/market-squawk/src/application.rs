@@ -32,6 +32,7 @@ pub mod lifecycle;
 mod live_fair_value;
 pub mod logs;
 pub(crate) mod market_calendar;
+pub(crate) mod market_collection;
 mod market_runtime;
 pub(crate) mod market_selection;
 pub mod model;

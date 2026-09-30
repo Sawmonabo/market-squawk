@@ -1077,51 +1077,41 @@ impl ProductionSourceLifecycleAuthority {
             .target_configuration()
             .map_err(map_durable_error)?
             .ok_or(SourceLifecycleError::Unauthorized)?;
-        let lease = match self
-            .onboarding
-            .activation_lease(session)
-            .or_else(|_| self.onboarding.prepared_activation_lease(session))
-        {
-            Ok(lease) => lease,
-            Err(crate::ProviderOnboardingError::ActivationExpired)
-                if renew_expired_doctor && surface == AccountMarketSurface::AlpacaBasic =>
-            {
+        let lease = if renew_expired_doctor && surface == AccountMarketSurface::AlpacaBasic {
+            self.alpaca_retry_admission(&record, session, configuration)?
+        } else {
+            Some(
+                self.onboarding
+                    .activation_lease(session)
+                    .or_else(|_| self.onboarding.prepared_activation_lease(session))
+                    .map_err(|_| SourceLifecycleError::Unauthorized)?,
+            )
+        };
+        let lease = match lease {
+            Some(lease) => lease,
+            None => {
                 // Retry retains the saved target and successor intent. Only a fresh doctor
                 // can replace expired authority; configuration and generation remain bound.
-                let provider = SourceIdentifier::try_from(surface.surface_id())
-                    .map_err(|_| SourceLifecycleError::InvalidResult)?;
-                let current_configuration = self
-                    .onboarding
-                    .runtime_activation_target_public_configuration(session, &provider)
-                    .map_err(map_onboarding_error)?;
-                if current_configuration != configuration {
-                    return Err(SourceLifecycleError::Conflict);
-                }
-                if record.session_id() != Some(session) {
-                    return Err(SourceLifecycleError::Conflict);
-                }
                 let generation = record
                     .credential_generation()
                     .ok_or(SourceLifecycleError::Unauthorized)?;
-                self.onboarding
-                    .retained_runtime_verification_evidence(
-                        session,
-                        &provider,
-                        configuration,
-                        generation,
-                    )
-                    .map_err(map_onboarding_error)?;
-                let renewed = self
-                    .onboarding
-                    .verify_runtime_activation_target(session, cancellation.child_token())
-                    .await
-                    .map_err(map_onboarding_error)?;
+                ensure_status_live(cancellation, deadline)?;
+                let verification_cancellation = cancellation.child_token();
+                let _verification_guard = verification_cancellation.clone().drop_guard();
+                let renewed = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(SourceLifecycleError::Cancelled),
+                    () = tokio::time::sleep_until(deadline.into()) => return Err(SourceLifecycleError::DeadlineExceeded),
+                    result = self.onboarding.verify_runtime_activation_target(session, verification_cancellation) => {
+                        result.map_err(map_onboarding_error)?
+                    }
+                };
+                ensure_status_live(cancellation, deadline)?;
                 if renewed.generation() != Some(generation) {
                     return Err(SourceLifecycleError::Conflict);
                 }
                 renewed
             }
-            Err(_) => return Err(SourceLifecycleError::Unauthorized),
         };
         let request = account_group_request_from_binding(
             surface,
@@ -2312,11 +2302,21 @@ impl ProductionSourceLifecycleAuthority {
             .public_configuration_digest()
             .or(current.public_configuration_digest())
             .ok_or(SourceLifecycleError::Unauthorized)?;
-        let lease = self
-            .onboarding
-            .activation_lease(session_id)
-            .or_else(|_| self.onboarding.prepared_activation_lease(session_id))
-            .map_err(|_| SourceLifecycleError::Unauthorized)?;
+        let lease = if command.action() == SourceLifecycleAction::Retry
+            && command.provider().as_str() == ProviderMarketAccount::AlpacaBasic.surface_id()
+        {
+            match self.alpaca_retry_admission(current, session_id, public_configuration_digest)? {
+                Some(lease) => lease,
+                // Only renewal work is admitted. The durable account transition precedes the
+                // fresh doctor and ordinary runtime admission in continuation.
+                None => return Ok(()),
+            }
+        } else {
+            self.onboarding
+                .activation_lease(session_id)
+                .or_else(|_| self.onboarding.prepared_activation_lease(session_id))
+                .map_err(|_| SourceLifecycleError::Unauthorized)?
+        };
         if lease.surface_id() != command.provider()
             || lease.public_configuration_digest() != public_configuration_digest
             || command.action() != SourceLifecycleAction::Reconfigure
@@ -2329,6 +2329,89 @@ impl ProductionSourceLifecycleAuthority {
             return Err(SourceLifecycleError::Conflict);
         }
         Ok(())
+    }
+
+    /// Returns a current exact lease, or admits only renewal of the retained Alpaca doctor.
+    /// A missing lease never admits runtime start; continuation must obtain fresh authority.
+    fn alpaca_retry_admission(
+        &self,
+        record: &DurableSourceLifecycleRecord,
+        session_id: uuid::Uuid,
+        configuration: EvidenceDigest,
+    ) -> Result<Option<crate::ProviderActivationLease>, SourceLifecycleError> {
+        if record.session_id() != Some(session_id)
+            || record.public_configuration_digest() != Some(configuration)
+        {
+            return Err(SourceLifecycleError::Conflict);
+        }
+        let provider = SourceIdentifier::try_from(ProviderMarketAccount::AlpacaBasic.surface_id())
+            .map_err(|_| SourceLifecycleError::InvalidResult)?;
+        let current_configuration = self
+            .onboarding
+            .runtime_activation_target_public_configuration(session_id, &provider)
+            .map_err(map_onboarding_error)?;
+        if current_configuration != configuration {
+            return Err(SourceLifecycleError::Conflict);
+        }
+        let generation = record
+            .credential_generation()
+            .ok_or(SourceLifecycleError::Unauthorized)?;
+        let retained = self
+            .onboarding
+            .retained_runtime_verification_evidence(
+                session_id,
+                &provider,
+                configuration,
+                generation,
+            )
+            .map_err(map_onboarding_error)?;
+        let doctor = retained
+            .evidence()
+            .alpaca_paper_iex_receipt()
+            .ok_or(SourceLifecycleError::Unauthorized)?;
+        if doctor.surface_id() != &provider
+            || doctor.session_identifier().as_str() != session_id.hyphenated().to_string()
+            || doctor.public_configuration_digest() != configuration
+            || doctor.generation() != generation
+        {
+            return Err(SourceLifecycleError::Conflict);
+        }
+        let lease = self
+            .onboarding
+            .activation_lease(session_id)
+            .or_else(|error| {
+                // RenewalRequired rejects scoped authority before the expiry check. Preserve that
+                // result for classification against the exact retained state, not a prepared target.
+                if matches!(
+                    error,
+                    crate::ProviderOnboardingError::ActivationExpired
+                        | crate::ProviderOnboardingError::InvalidSessionState
+                ) {
+                    Err(error)
+                } else {
+                    self.onboarding.prepared_activation_lease(session_id)
+                }
+            });
+        match lease {
+            Ok(lease) => {
+                if lease.surface_id() != &provider
+                    || lease.session_id() != session_id
+                    || lease.public_configuration_digest() != configuration
+                    || lease.generation() != Some(generation)
+                {
+                    return Err(SourceLifecycleError::Conflict);
+                }
+                Ok(Some(lease))
+            }
+            Err(crate::ProviderOnboardingError::ActivationExpired) => Ok(None),
+            Err(crate::ProviderOnboardingError::InvalidSessionState)
+                if retained.onboarding_state()
+                    == market_squawk_sources::OnboardingState::RenewalRequired =>
+            {
+                Ok(None)
+            }
+            Err(_) => Err(SourceLifecycleError::Unauthorized),
+        }
     }
 
     fn lifecycle_transition_target(

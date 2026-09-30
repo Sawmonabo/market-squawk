@@ -14,7 +14,7 @@ import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import type { MarketProductRow } from "@/features/markets/market-product"
+import { MarketCollection } from "@/features/markets/market-collection"
 import { AnalysisLaunch } from "@/features/opportunities/analysis-launch"
 import {
   parseInvestmentAnalysis,
@@ -61,7 +61,7 @@ export function OverviewDashboard({
       />
 
       <section className="grid gap-4 lg:grid-cols-[minmax(0,1.25fr)_minmax(300px,0.75fr)]">
-        <MarketContext markets={queries.markets} />
+        <MarketCollection state={queries.markets} />
         <NextSteps />
       </section>
     </div>
@@ -332,85 +332,6 @@ function PriceContext({ analysis }: { analysis: InvestmentAnalysis }) {
   )
 }
 
-function MarketContext({ markets }: { markets: OverviewQueries["markets"] }) {
-  return (
-    <section
-      className="rounded-xl border border-border bg-card/45 p-5"
-      aria-labelledby="home-market-title"
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Current context
-          </p>
-          <h2 id="home-market-title" className="mt-1 text-base font-semibold">
-            Investments in view
-          </h2>
-        </div>
-        <Activity className="size-5 text-primary" aria-hidden="true" />
-      </div>
-
-      {markets.status === "loading" ? (
-        <Skeleton className="mt-5 h-40 rounded-lg" />
-      ) : markets.status === "unavailable" ? (
-        <Alert className="mt-5">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Current market information is unavailable</AlertTitle>
-          <AlertDescription>
-            Do not rely on a saved price until current information can be checked again.
-          </AlertDescription>
-        </Alert>
-      ) : markets.data.length === 0 ? (
-        <p className="mt-5 rounded-lg border border-dashed border-border p-5 text-xs text-muted-foreground">
-          No current market information is available yet.
-        </p>
-      ) : (
-        <ul className="mt-5 divide-y divide-border">
-          {markets.data.slice(0, 6).map((market) => (
-            <MarketRow key={market.selectionToken} market={market} />
-          ))}
-        </ul>
-      )}
-
-      <Button asChild className="mt-4" size="sm" variant="outline">
-        <Link to="/markets">Explore markets</Link>
-      </Button>
-    </section>
-  )
-}
-
-function MarketRow({ market }: { market: MarketProductRow }) {
-  return (
-    <li className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
-      <span
-        className={`size-2 rounded-full ${market.availability === "current" ? "bg-[var(--success)]" : "bg-[var(--warning)]"}`}
-        aria-hidden="true"
-      />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-xs font-medium">
-          {market.identity.name ?? market.identity.symbol ?? "Investment"}
-        </span>
-        {market.identity.name && market.identity.symbol ? (
-          <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">
-            {market.identity.symbol}
-          </span>
-        ) : null}
-      </span>
-      <span className="text-right text-[10px] text-muted-foreground">
-        <span className="block font-mono text-foreground">
-          {market.price
-            ? formatMoney({
-                amount: market.price.value,
-                currency: market.price.currency,
-              })
-            : "Price unavailable"}
-        </span>
-        <span className="block">{marketAvailabilityLabel(market)}</span>
-      </span>
-    </li>
-  )
-}
-
 function NextSteps() {
   return (
     <section
@@ -572,17 +493,4 @@ function formatRange(range: {
   upper: { amount: string; currency: string }
 }): string {
   return `${formatMoney(range.lower)} to ${formatMoney(range.upper)}`
-}
-
-function marketAvailabilityLabel(market: MarketProductRow): string {
-  switch (market.availability) {
-    case "current":
-      return "Current"
-    case "delayed":
-      return "Delayed"
-    case "previous_close":
-      return "Previous close"
-    case "unavailable":
-      return "Unavailable"
-  }
 }

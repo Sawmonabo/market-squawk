@@ -108,6 +108,7 @@ pub(super) struct InstalledToolServices {
     backtest_preparation: InstalledBacktestPreparation,
     forecast_preparation: InstalledForecastPreparation,
     profile_benchmarks: crate::application::RecommendationBenchmarkSelectionReadCapability,
+    profile_research: Arc<crate::ResearchService>,
     training_preparation: InstalledProductTraining,
     current_find: InstalledCurrentFind,
     market_evidence: Option<InstalledMarketEvidence>,
@@ -344,6 +345,7 @@ impl InstalledToolServices {
                 crate::application::RecommendationBenchmarkSelectionReadCapability::new(
                     product.research().market_data_instruments(),
                 ),
+            profile_research: product.research(),
             training_preparation: InstalledProductTraining::new(product, jobs),
             current_find: InstalledCurrentFind::new(product, runtime),
             market_evidence,
@@ -1474,6 +1476,7 @@ impl InstalledToolServices {
                     &context,
                     &self.forecast_preparation,
                     &self.profile_benchmarks,
+                    &self.profile_research,
                 )
                 .await?;
                 result

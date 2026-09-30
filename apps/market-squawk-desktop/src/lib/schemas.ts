@@ -49,6 +49,8 @@ const productCapabilities = [
   "market_history",
   "market_instrument",
   "market_overview",
+  "market_collection",
+  "market_collection_choice",
   "market_session_context",
   "market_session_read",
   "market_universe",
