@@ -415,6 +415,30 @@ pub enum SourceCommand {
         #[arg(long)]
         confirm: bool,
     },
+    /// Resume the saved source transition after correcting its reported failure.
+    Retry {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Stop source activity while retaining its configuration and stored data.
+    Stop {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Remove a source connection through its normal credential cleanup contract.
+    Remove {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Report explicit provider and instrument coverage.
     Coverage {
         /// Optional provider filter.

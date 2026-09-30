@@ -662,6 +662,16 @@ async fn source(
         SourceCommand::Start { provider, confirm } => {
             return source_lifecycle(authority, &provider, "Source.Start", "start", confirm).await;
         }
+        SourceCommand::Retry { provider, confirm } => {
+            return source_lifecycle(authority, &provider, "Source.Retry", "retry", confirm).await;
+        }
+        SourceCommand::Stop { provider, confirm } => {
+            return source_lifecycle(authority, &provider, "Source.Stop", "stop", confirm).await;
+        }
+        SourceCommand::Remove { provider, confirm } => {
+            return source_lifecycle(authority, &provider, "Source.Remove", "remove", confirm)
+                .await;
+        }
         SourceCommand::Coverage { provider } => (
             "Source.GetCoverage",
             source_filter(provider),
@@ -799,22 +809,28 @@ async fn source_lifecycle(
         "expectedStateRevision": revision,
         "confirm": true,
     }))?;
-    match (
-        lifecycle.get("configurationSessionId"),
-        lifecycle.get("publicConfigurationSha256"),
-    ) {
-        (Some(Value::Null), Some(Value::Null)) => {}
-        (Some(Value::String(session)), Some(Value::String(digest))) => {
-            let session_id =
-                uuid::Uuid::parse_str(session).map_err(|_| CliProductError::RuntimeRequest)?;
-            if session_id.is_nil() || session_id.to_string() != *session {
-                return Err(CliProductError::RuntimeRequest);
+    if matches!(action, "retry" | "stop" | "remove") {
+        // Recovery actions resolve the retained transition inside the lifecycle owner;
+        // they cannot nominate a replacement session or public configuration.
+        arguments.insert("reason".to_owned(), json!("cli-user-request"));
+    } else {
+        match (
+            lifecycle.get("configurationSessionId"),
+            lifecycle.get("publicConfigurationSha256"),
+        ) {
+            (Some(Value::Null), Some(Value::Null)) => {}
+            (Some(Value::String(session)), Some(Value::String(digest))) => {
+                let session_id =
+                    uuid::Uuid::parse_str(session).map_err(|_| CliProductError::RuntimeRequest)?;
+                if session_id.is_nil() || session_id.to_string() != *session {
+                    return Err(CliProductError::RuntimeRequest);
+                }
+                lowercase_sha256(digest)?;
+                arguments.insert("onboardingSessionId".to_owned(), json!(session));
+                arguments.insert("publicConfigurationSha256".to_owned(), json!(digest));
             }
-            lowercase_sha256(digest)?;
-            arguments.insert("onboardingSessionId".to_owned(), json!(session));
-            arguments.insert("publicConfigurationSha256".to_owned(), json!(digest));
+            _ => return Err(CliProductError::RuntimeRequest),
         }
-        _ => return Err(CliProductError::RuntimeRequest),
     }
     // Carry the observed revision exactly. A concurrent change must fail the existing CAS;
     // this command never rereads and retries a mutation against a replacement configuration.

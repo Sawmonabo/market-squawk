@@ -2,6 +2,13 @@
 
 ## Active saved-planning and live-input wave — 2026-09-30
 
+Current outcome: local secure startup and provider storage are unlocked. Connection recovery is
+implemented and critically verified; live cleanup, protected reimport and fresh Alpaca verification
+also passed in the preserved owner-test roots. Market-runtime Start still fails separately, so this
+is not a live-market or installed-workflow completion claim. Lead owns integration; Astra
+`native_setup_current` is read-only on that exact runtime failure. All implementation writers are
+frozen; saved-planning implementation has not begun.
+
 Audit base: `bcf22c8c`, primary feature branch, clean worktree. Acceptance 4/5/6 requires saved
 portfolio scenarios, rebalance and position comparisons to reopen with their original assumptions
 and evidence. These calculations now work across shared contracts, but the product has no save/read
@@ -60,6 +67,7 @@ Next bounded authority remediation: Astra `native_setup_current` prepares change
 `apps/market-squawk/src/local_product/source_lifecycle.rs`,
 `apps/market-squawk/src/provider_onboarding/service.rs`,
 `crates/market-squawk-data/src/catalog_capabilities.rs`,
+`crates/market-squawk-data/src/catalog/onboarding.rs` (the same retained-renewal deadline admission),
 `crates/market-squawk-sources/src/onboarding/lifecycle.rs` and its existing `tests.rs`.
 Preserve the existing RuntimeVerified event and same candidate generation. Only an expired exact
 Alpaca receipt may gain fresh doctor evidence, with retained predecessor/configuration/credential
@@ -67,6 +75,51 @@ identity and current/newer verification checks; remain RuntimeVerificationPendin
 activation succeeds. Lead retains final shared-authority integration and all checks/Git. Extend the
 existing same-generation renewal critical test; no new event/schema, authority bypass or reset.
 Desktop's existing `src/test/app.test.tsx` is assigned solely for the one missing recovery control assertion.
+
+Reference admission fix is pushed as `98fc0d43`. The pending-doctor repair and Desktop/CLI Retry
+bindings are integrated in the current worktree. Lead also updated the dependent Schwab reconnect
+caller in `source_lifecycle/reconnect.rs`; automatic reconnect does not gain Alpaca doctor renewal.
+The existing renewal authority case passes one exact test; Desktop's blocked-Alpaca Retry case
+passes one test and its actual `tsc --build` typecheck passes. The integration build found and
+corrected a private cross-crate comparison and the missed reconnect caller; rebuilding remains
+single-job. Live Retry and same-root reconstruction are not yet verified. No credential reset,
+reimport, new worktree, whole-app measurement or broad gate occurred.
+
+Live recovery exposed a further installed-startup defect: `resume()` expires the initial reservation
+even for a stored, verified pending Alpaca candidate, appending CleanupRequired (event 7) and
+unsupported remote revocation (event 8). Existing Retry cannot revive terminal credentials, while
+the unfinished Start blocks Remove/Reconfigure. No local credential deletion occurred. Astra
+`native_setup_current` now owns the bounded startup-retention fix in
+`provider_onboarding/service/lifecycle_runtime.rs` and pending-operation cancellation in
+`local_product/source_lifecycle.rs`, with the nearest existing critical test. Preserve terminal
+cleanup semantics and audit events; permit an explicit stop/remove to drain and finish the old
+intent under its exact revision before normal cleanup/new onboarding. Lead owns client bindings,
+integration, single-job checks and live recovery. This is acceptance 7 recovery, not a state reset.
+Integration additionally requires cancellation intent to be durable before any drain: a crash must
+reopen Stop/Remove, never resume the superseded Start. Astra owns the necessary exact-record
+transition change and existing durability regression in `local_product/provider_activation_state.rs`.
+That existing regression now passes exactly one test (127 filtered): both Stop/Remove take over
+under a new revision before cleanup, reject changed targets/stale callers, reopen as the replacement
+intent, and preserve the completed operation identity. Evidence:
+`.agents/tmp/v1-first-stock/account-cancellation-critical.log`. All writers are frozen; lead is
+building the CLI/service for the retained-root cleanup and new verification. The prior terminal
+onboarding session will not be revived or edited; supported cleanup and ordinary new setup are
+required, with audit history and market data preserved.
+
+Live evidence after the final binary build (`account-recovery-build.log`, passed): service shutdown
+completed normally, same-root secure bootstrap and provider unlock were accepted. `Source.Remove`
+completed at revision 4, preserving historical audit/data. Protected import reused existing saved
+credential setups and created Alpaca session `269ab508-a402-49c2-bb47-46b69d2ddb06`.
+Verification completed at revision 5: 31 historical bars on 31 dates, matching calendar and admitted
+quote/WebSocket probes. It does not establish SIP/NBBO or full returned snapshot coverage.
+The following Start failed at `application/market_runtime/group.rs::await_before` with unavailable;
+revision 6 remains blocked/reconciliation, with its fresh pending candidate preserved.
+Evidence: `.agents/tmp/v1-first-stock/native-alpaca-remove.json`,
+`native-provider-recovery-import.json`, `native-alpaca-recovery-verify.json`,
+`native-alpaca-recovery-start.err`, `native-alpaca-post-recovery-status.json` and
+`account-recovery-service.log` in the same directory. The source-expiry authority regression,
+existing durable cancellation/reopen regression, Desktop Retry regression and Desktop typecheck
+passed. No full CI, new quarter review, release build or whole-app RAM measurement ran.
 
 Saved-planning handoff (implementation pending): share the existing SQLite catalog authority and
 `ControlledArtifactRepository`; do not retain a whole saved-results index in application memory.

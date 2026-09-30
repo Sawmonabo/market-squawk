@@ -1456,6 +1456,40 @@ fn verify_reservation_audit(
 }
 
 fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &OnboardingEvent) -> bool {
+    // The setup reservation does not retire an already verified Alpaca credential. Renew only
+    // its retained doctor chain, then let ordinary lifecycle validation enforce currentness,
+    // exact authority and activation. Include the post-state for exact event replays.
+    if lifecycle.surface_id().as_str() == "alpaca.basic-market-data"
+        && let Some(generation) = event.generation()
+        && (lifecycle.candidate_generation() == Some(generation)
+            || lifecycle.active_generation() == Some(generation))
+        && let Some(prior) = lifecycle.generation_alpaca_paper_iex_doctor_receipt(generation)
+    {
+        match event {
+            OnboardingEvent::RuntimeVerified { evidence, .. }
+                if matches!(
+                    lifecycle.state(),
+                    OnboardingState::RuntimeVerificationPending
+                        | OnboardingState::RenewalRequired
+                        | OnboardingState::ActiveScoped
+                ) && evidence.alpaca_paper_iex_receipt().is_some_and(|next| {
+                    next.predecessor_digest() == Some(prior.receipt_sha256())
+                        || next.receipt_sha256() == prior.receipt_sha256()
+                }) =>
+            {
+                return true;
+            }
+            OnboardingEvent::Activate { .. }
+                if matches!(
+                    lifecycle.state(),
+                    OnboardingState::RuntimeVerificationPending | OnboardingState::ActiveScoped
+                ) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
     matches!(
         event,
         OnboardingEvent::Cancelled { .. }

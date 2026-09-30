@@ -151,6 +151,7 @@ impl ProviderOnboardingService {
             && resumed.lifecycle().state() != OnboardingState::ActiveScoped
             && resumed.lifecycle().active_generation().is_none()
             && !schwab_oauth_bootstrap_retained(resumed.lifecycle())
+            && !alpaca_verified_candidate_retained(resumed.lifecycle())
             && !matches!(
                 resumed.lifecycle().state(),
                 OnboardingState::Blocked
@@ -813,6 +814,22 @@ const fn startup_remote_cleanup_unresolved(outcome: Option<RemoteRevocationOutco
         outcome,
         Some(RemoteRevocationOutcome::Failed | RemoteRevocationOutcome::Indeterminate)
     )
+}
+
+fn alpaca_verified_candidate_retained(
+    lifecycle: &market_squawk_sources::OnboardingLifecycle,
+) -> bool {
+    lifecycle.surface_id().as_str() == "alpaca.basic-market-data"
+        && lifecycle.state() == OnboardingState::RuntimeVerificationPending
+        && lifecycle.active_generation().is_none()
+        && lifecycle.candidate_generation().is_some_and(|generation| {
+            lifecycle.generation_state(generation)
+                == Some(CredentialGenerationState::VerifiedLeastPrivilege)
+                && lifecycle.generation_reference(generation).is_some()
+                && lifecycle
+                    .generation_alpaca_paper_iex_doctor_receipt(generation)
+                    .is_some()
+        })
 }
 
 fn schwab_oauth_bootstrap_retained(lifecycle: &market_squawk_sources::OnboardingLifecycle) -> bool {

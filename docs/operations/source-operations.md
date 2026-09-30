@@ -41,6 +41,11 @@ The shipping source CLI is:
 source import-credentials <ABSOLUTE_FILE> --confirm
 source register <PROVIDER> --confirm
 source status [PROVIDER]
+source verify <PROVIDER> --confirm
+source start <PROVIDER> --confirm
+source retry <PROVIDER> --confirm
+source stop <PROVIDER> --confirm
+source remove <PROVIDER> --confirm
 source coverage [PROVIDER]
 source health [PROVIDER]
 source discover <PROVIDER> --dataset <DATASET> --confirm
@@ -56,12 +61,16 @@ profile, onboarding, extraction, publication, and live-runtime states.
 
 In the current candidate there is no generic:
 
-- `source start`;
-- `source stop`;
 - `source resynchronize`;
 - `source unregister`;
 - `source deactivate`;
 - `source cancel`.
+
+`source verify`, `source start` and `source retry` use the installed service lifecycle owner.
+Retry resumes the retained transition after its reported failure is corrected. It carries the
+observed state revision and reason; the service resolves the saved configuration without replacing it.
+Stop retains the source configuration and stored data. Remove drains activity and performs the
+existing credential cleanup contract; it does not erase the onboarding audit history or market data.
 
 Do not invent those operations or translate bot/capture lifecycle commands into source commands.
 Live venue reconnection and book recovery belong to their source runtime; research extraction is
@@ -408,9 +417,12 @@ For an existing recipe, replace `request` with exactly one of:
 {"action": "resumePublication", "sessionId": "<saved-session-uuid>"}
 ```
 
-These are the only staged action classes alongside `activate`. Credential import/unlock and
-new interactive setup remain native Settings actions. The private operations are absent from the
-ordinary MCP registry; MCP mutation access cannot invoke them. Historical evidence-file version
+A staged `start` request also prepares or reuses a setup session using its `surfaceId`,
+`organization` and `administrativeEmail`; it does not import credentials or activate a runtime.
+For an expired anonymous initial session, this creates a fresh reservation through the same
+onboarding owner. Use the returned session ID for activation. Credential import and foreground
+unlock also have the documented installed CLI commands; interactive key entry and OAuth remain
+in Settings. These private setup operations are absent from the ordinary MCP registry. Historical evidence-file version
 labels are not alternate active request schemas. Existing evidence custody, profile rights, exact
 lease validation, replay admission, and recipe recovery remain owned by the installed service.
 

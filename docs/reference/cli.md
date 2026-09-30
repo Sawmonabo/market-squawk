@@ -69,7 +69,11 @@ that name one; MCP never receives a filesystem path.
 | `source status [provider]`; `source coverage [provider]`; `source health [provider]` | Bounded provider status, explicit coverage, or connection/integrity/freshness facts. |
 | `source discover <provider> --dataset <dataset> --confirm` | Bounded exact objects with single-use ingestion receipts. |
 | `source inspect <provider> --onboarding-session-id <UUID> --dataset-identifier <dataset> [--page-index 0..63] [--max-records 1..1024]` | One non-persisting provider page; defaults are `0` and `256`. |
-| `source activate <request> --confirm` | One-shot, bounded installed-service request using `market-squawk.provider-setup.v1`. Supports `activate`, `verifySaved`, `restoreSaved`, and `resumePublication` for an existing session; see [the exact envelope](../operations/source-operations.md#understand-the-source-activate-boundary). |
+| `source verify <provider> --confirm` | Verify the saved connection without starting its runtime. |
+| `source start <provider> --confirm` | Start the verified saved source configuration through the installed service. |
+| `source retry <provider> --confirm` | Resume the retained source transition after correcting its reported failure, using the observed revision and saved configuration. |
+| `source stop <provider> --confirm`; `source remove <provider> --confirm` | Stop activity while retaining configuration, or remove the connection through its normal credential cleanup contract. Both use the observed revision; stored market data and audit history remain. |
+| `source activate <request> --confirm` | One-shot, bounded installed-service request using `market-squawk.provider-setup.v1`. Supports `start` to prepare/reuse a session and `activate`, `verifySaved`, `restoreSaved`, and `resumePublication` for an existing session; see [the exact envelope](../operations/source-operations.md#understand-the-source-activate-boundary). |
 | `ingest source <provider> <object> --dataset <dataset> --discovery-receipt <receipt> --confirm` | Consumes the original receipt for that exact object without rediscovery. |
 | `ingest file <manifest> --object <id> --dataset <id> --confirm` | CLI-owned confined local-file manifest admission. |
 | `dataset list [--after-dataset <id>]`; `dataset manifest <dataset>` | Bounded immutable dataset inventory or one manifest. |

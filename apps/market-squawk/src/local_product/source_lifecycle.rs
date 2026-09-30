@@ -179,6 +179,7 @@ impl ProductionSourceLifecycleAuthority {
                         deadline,
                         cancellation,
                         true,
+                        false,
                     )
                     .await
                 {
@@ -610,7 +611,7 @@ impl ProductionSourceLifecycleAuthority {
         let record = self
             .finish_account_predecessor(&record, surface, Some(prepared), deadline, cancellation)
             .await?;
-        self.continue_account_transition(record, surface, deadline, cancellation, false)
+        self.continue_account_transition(record, surface, deadline, cancellation, false, false)
             .await?;
         Ok(())
     }
@@ -640,7 +641,14 @@ impl ProductionSourceLifecycleAuthority {
                 .map_err(map_durable_error)?;
             if current.account().is_some_and(|pending| !pending.finished) {
                 if let Err(error) = self
-                    .continue_account_transition(current, surface, deadline, &cancellation, false)
+                    .continue_account_transition(
+                        current,
+                        surface,
+                        deadline,
+                        &cancellation,
+                        false,
+                        false,
+                    )
                     .await
                 {
                     failure.get_or_insert(error);
@@ -675,6 +683,59 @@ impl ProductionSourceLifecycleAuthority {
                 )
                 .await;
         }
+        let cancel_pending = matches!(
+            command.action(),
+            SourceLifecycleAction::Stop | SourceLifecycleAction::Remove
+        ) && current.account().is_some_and(|pending| {
+            !pending.finished
+                && matches!(
+                    pending.action,
+                    AccountLifecycleAction::Start
+                        | AccountLifecycleAction::Retry
+                        | AccountLifecycleAction::Resynchronize
+                        | AccountLifecycleAction::Reconfigure
+                        | AccountLifecycleAction::Verify
+                )
+        });
+        let current = if cancel_pending {
+            // Fence and persist Stop/Remove before retiring either allocation, so recovery
+            // cannot resume the superseded activation after an interrupted drain.
+            if command.expected_state_revision() != current.revision()
+                || command.expected_generation().is_some()
+            {
+                return Err(SourceLifecycleError::Conflict);
+            }
+            let observed = self
+                .live
+                .prepare_account_stop(surface, command.deadline(), command.cancellation())
+                .await
+                .map_err(map_live_error)?;
+            if command
+                .expected_runtime_generation_digest()
+                .is_some_and(|expected| {
+                    observed
+                        .predecessor()
+                        .map(|(_, generation)| generation.digest())
+                        != Some(expected)
+                })
+            {
+                return Err(SourceLifecycleError::Conflict);
+            }
+            let mut pending = current
+                .account()
+                .cloned()
+                .ok_or(SourceLifecycleError::InvalidResult)?;
+            pending.action = if command.action() == SourceLifecycleAction::Remove {
+                AccountLifecycleAction::Remove
+            } else {
+                AccountLifecycleAction::Stop
+            };
+            self.durable
+                .begin_account_lifecycle(provider, &current, operation.clone(), digest, pending)
+                .map_err(map_durable_error)?
+        } else {
+            current
+        };
         let mut record = if current.account().is_some_and(|pending| !pending.finished) {
             if (current.operation_id() != Some(&operation)
                 || current.command_digest() != Some(digest))
@@ -807,6 +868,7 @@ impl ProductionSourceLifecycleAuthority {
                 command.deadline(),
                 command.cancellation(),
                 true,
+                command.action() == SourceLifecycleAction::Retry,
             )
             .await?;
         let operation = record
@@ -875,12 +937,6 @@ impl ProductionSourceLifecycleAuthority {
             .await
             .map_err(map_live_error)?
             .ok_or(SourceLifecycleError::InvalidResult)?;
-        if pending.action == AccountLifecycleAction::Remove {
-            self.portal
-                .cancel(request.onboarding_session_id(), cancellation.child_token())
-                .await
-                .map_err(|_| SourceLifecycleError::ReconciliationRequired)?;
-        }
         let mut committed = None;
         self.live
             .acknowledge_account_group_stop(
@@ -908,6 +964,7 @@ impl ProductionSourceLifecycleAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
         start_successor: bool,
+        renew_expired_doctor: bool,
     ) -> Result<DurableSourceLifecycleRecord, SourceLifecycleError> {
         ensure_status_live(cancellation, deadline)?;
         let mut record = self
@@ -926,13 +983,31 @@ impl ProductionSourceLifecycleAuthority {
             | AccountLifecycleAction::OAuthProcessShutdown
             | AccountLifecycleAction::OAuthUnlink
             | AccountLifecycleAction::OAuthCredentialReplacement => {
+                if matches!(
+                    pending.action,
+                    AccountLifecycleAction::Stop | AccountLifecycleAction::Remove
+                ) {
+                    record = self
+                        .drain_account_successor(record, surface, deadline, cancellation)
+                        .await?;
+                    pending = record
+                        .account()
+                        .cloned()
+                        .ok_or(SourceLifecycleError::InvalidResult)?;
+                }
                 if pending.action == AccountLifecycleAction::Remove {
-                    if let Some(session) = record.session_id().or_else(|| {
+                    let sessions = [
+                        record.session_id(),
+                        pending.target_session_id,
                         pending
                             .predecessor
                             .as_ref()
-                            .map(AccountAllocationCoordinates::session_id)
-                    }) {
+                            .map(AccountAllocationCoordinates::session_id),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<std::collections::BTreeSet<_>>();
+                    for session in sessions {
                         self.portal
                             .cancel(session, cancellation.child_token())
                             .await
@@ -1002,11 +1077,52 @@ impl ProductionSourceLifecycleAuthority {
             .target_configuration()
             .map_err(map_durable_error)?
             .ok_or(SourceLifecycleError::Unauthorized)?;
-        let lease = self
+        let lease = match self
             .onboarding
             .activation_lease(session)
             .or_else(|_| self.onboarding.prepared_activation_lease(session))
-            .map_err(|_| SourceLifecycleError::Unauthorized)?;
+        {
+            Ok(lease) => lease,
+            Err(crate::ProviderOnboardingError::ActivationExpired)
+                if renew_expired_doctor && surface == AccountMarketSurface::AlpacaBasic =>
+            {
+                // Retry retains the saved target and successor intent. Only a fresh doctor
+                // can replace expired authority; configuration and generation remain bound.
+                let provider = SourceIdentifier::try_from(surface.surface_id())
+                    .map_err(|_| SourceLifecycleError::InvalidResult)?;
+                let current_configuration = self
+                    .onboarding
+                    .runtime_activation_target_public_configuration(session, &provider)
+                    .map_err(map_onboarding_error)?;
+                if current_configuration != configuration {
+                    return Err(SourceLifecycleError::Conflict);
+                }
+                if record.session_id() != Some(session) {
+                    return Err(SourceLifecycleError::Conflict);
+                }
+                let generation = record
+                    .credential_generation()
+                    .ok_or(SourceLifecycleError::Unauthorized)?;
+                self.onboarding
+                    .retained_runtime_verification_evidence(
+                        session,
+                        &provider,
+                        configuration,
+                        generation,
+                    )
+                    .map_err(map_onboarding_error)?;
+                let renewed = self
+                    .onboarding
+                    .verify_runtime_activation_target(session, cancellation.child_token())
+                    .await
+                    .map_err(map_onboarding_error)?;
+                if renewed.generation() != Some(generation) {
+                    return Err(SourceLifecycleError::Conflict);
+                }
+                renewed
+            }
+            Err(_) => return Err(SourceLifecycleError::Unauthorized),
+        };
         let request = account_group_request_from_binding(
             surface,
             Some(session),
@@ -1102,7 +1218,10 @@ impl ProductionSourceLifecycleAuthority {
                     }
                 })?;
             if calendar.is_none() {
-                tracing::warn!(stage = "alpaca_calendar_publication", "source activation calendar unavailable");
+                tracing::warn!(
+                    stage = "alpaca_calendar_publication",
+                    "source activation calendar unavailable"
+                );
                 return Err(SourceLifecycleError::Unavailable);
             }
             ensure_status_live(cancellation, deadline)?;

@@ -491,9 +491,14 @@ impl OnboardingCatalogCapability {
         if rights_decision_digest != verification.restrictions_digest() {
             return Err(CatalogError::InvalidRecord);
         }
-        let predecessor_digest = if lifecycle.state() == OnboardingState::RenewalRequired
-            && lifecycle.active_generation() == Some(generation)
-            && lifecycle.candidate_generation().is_none()
+        let pending_renewal = lifecycle.state() == OnboardingState::RuntimeVerificationPending
+            && lifecycle.active_generation().is_none()
+            && lifecycle.candidate_generation() == Some(generation)
+            && lifecycle.generation_runtime_evidence(generation).is_some();
+        let predecessor_digest = if pending_renewal
+            || (lifecycle.state() == OnboardingState::RenewalRequired
+                && lifecycle.active_generation() == Some(generation)
+                && lifecycle.candidate_generation().is_none())
         {
             Some(
                 lifecycle

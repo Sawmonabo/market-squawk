@@ -136,7 +136,7 @@ impl AccountMarketRuntimeReconnect for ProductionSourceLifecycleAuthority {
         }
         // Equality includes revision, action, original predecessor, target, partial successor,
         // credential and verification receipt. Resume this exact record after renewal.
-        self.continue_account_transition(record, surface, deadline, &cancellation, true)
+        self.continue_account_transition(record, surface, deadline, &cancellation, true, false)
             .await
             .map_err(reconnect_error)?;
         Ok(())

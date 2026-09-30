@@ -1119,6 +1119,106 @@ fn alpaca_doctor_receipt_closes_contract_graph_and_same_generation_renewal() -> 
         lifecycle.generation_runtime_digest(generation),
         Some(initial_digest)
     );
+    // A failed initial start keeps this candidate and its intent. Once its doctor expires,
+    // renewal must replace only the receipt and must not activate the credential generation.
+    let mut pending_renewal = lifecycle.clone();
+    let pending_verified_at = initial_expires_at.checked_add_nanos(100)?;
+    let pending_expires_at = pending_verified_at.checked_add_nanos(1_000)?;
+    assert!(
+        pending_renewal
+            .apply(
+                capability,
+                OnboardingEvent::Activate {
+                    generation: Some(generation)
+                },
+                pending_verified_at,
+            )
+            .is_err()
+    );
+    for (configuration, credential_generation, principal, predecessor) in [
+        (
+            public_configuration_digest,
+            generation,
+            principal_digest,
+            digest(77),
+        ),
+        (digest(78), generation, principal_digest, initial_digest),
+        (
+            public_configuration_digest,
+            SecretGeneration::new(2)?,
+            principal_digest,
+            initial_digest,
+        ),
+        (
+            public_configuration_digest,
+            generation,
+            digest(79),
+            initial_digest,
+        ),
+    ] {
+        let rejected = AlpacaPaperIexDoctorReceiptV1::try_new(alpaca_doctor_input(
+            profile,
+            &session_identifier,
+            configuration,
+            credential_generation,
+            principal,
+            pending_verified_at,
+            pending_expires_at,
+            Some(predecessor),
+        )?)?;
+        assert!(
+            pending_renewal
+                .apply(
+                    capability,
+                    OnboardingEvent::RuntimeVerified {
+                        generation: Some(generation),
+                        evidence: alpaca_runtime_evidence(rejected),
+                    },
+                    pending_verified_at,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            pending_renewal.state(),
+            OnboardingState::RuntimeVerificationPending
+        );
+        assert_eq!(
+            pending_renewal.generation_runtime_digest(generation),
+            Some(initial_digest)
+        );
+    }
+    let refreshed = AlpacaPaperIexDoctorReceiptV1::try_new(alpaca_doctor_input(
+        profile,
+        &session_identifier,
+        public_configuration_digest,
+        generation,
+        principal_digest,
+        pending_verified_at,
+        pending_expires_at,
+        Some(initial_digest),
+    )?)?;
+    let refreshed_digest = refreshed.receipt_sha256();
+    assert_eq!(
+        pending_renewal.apply(
+            capability,
+            OnboardingEvent::RuntimeVerified {
+                generation: Some(generation),
+                evidence: alpaca_runtime_evidence(refreshed),
+            },
+            pending_verified_at,
+        )?,
+        OnboardingState::RuntimeVerificationPending
+    );
+    assert_eq!(pending_renewal.active_generation(), None);
+    assert_eq!(pending_renewal.candidate_generation(), Some(generation));
+    assert_eq!(
+        pending_renewal.generation_state(generation),
+        Some(CredentialGenerationState::VerifiedLeastPrivilege)
+    );
+    assert_eq!(
+        pending_renewal.generation_runtime_digest(generation),
+        Some(refreshed_digest)
+    );
     lifecycle.apply(
         capability,
         OnboardingEvent::Activate {

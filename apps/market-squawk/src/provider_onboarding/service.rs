@@ -1475,8 +1475,11 @@ impl ProviderOnboardingService {
         cancellation: CancellationToken,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let source_doctor_session = matches!(
-            self.catalog.resume_provider_onboarding(session_id)?
-                .lifecycle().surface_id().as_str(),
+            self.catalog
+                .resume_provider_onboarding(session_id)?
+                .lifecycle()
+                .surface_id()
+                .as_str(),
             "eia.api-v2" | "census.data-api"
         );
         let mut activation = Some(if source_doctor_session {
@@ -1780,23 +1783,31 @@ impl ProviderOnboardingService {
         }
         let resumed = self.catalog.resume_provider_onboarding(session_id)?;
         let profile = self.current_profile_for(&resumed)?;
+        let pending_candidate = resumed.lifecycle().state()
+            == OnboardingState::RuntimeVerificationPending
+            && resumed.lifecycle().active_generation().is_none();
         if profile.id() == "alpaca.basic-market-data"
-            && matches!(
-                resumed.lifecycle().state(),
-                OnboardingState::ActiveScoped | OnboardingState::RenewalRequired
-            )
+            && (pending_candidate
+                || matches!(
+                    resumed.lifecycle().state(),
+                    OnboardingState::ActiveScoped | OnboardingState::RenewalRequired
+                ))
         {
-            if let Some((generation, exclusive_expires_at)) = resumed
-                .lifecycle()
-                .active_generation()
-                .and_then(|generation| {
-                    resumed
-                        .lifecycle()
-                        .generation_runtime_evidence(generation)
-                        .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
-                        .map(|receipt| (generation, receipt.exclusive_expires_at()))
-                })
-            {
+            let target = if pending_candidate {
+                resumed.lifecycle().candidate_generation()
+            } else {
+                resumed.lifecycle().active_generation()
+            };
+            if let Some((generation, exclusive_expires_at)) = target.and_then(|generation| {
+                resumed
+                    .lifecycle()
+                    .generation_runtime_evidence(generation)
+                    .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
+                    .map(|receipt| (generation, receipt.exclusive_expires_at()))
+            }) {
+                if pending_candidate && system_timestamp()? < exclusive_expires_at {
+                    return self.prepared_lease_from_resumed(&resumed, profile);
+                }
                 let renewal_required =
                     if resumed.lifecycle().state() == OnboardingState::ActiveScoped {
                         self.append(
@@ -2537,9 +2548,15 @@ impl ProviderOnboardingService {
         cancellation: CancellationToken,
     ) -> Result<Vec<u8>, ProviderOnboardingError> {
         self.collect_probe_response_bounded(
-            request, policy, rate_permit, credential_probe, fred_v1_credential,
-            cancellation, MAX_PROBE_BODY_BYTES,
-        ).await
+            request,
+            policy,
+            rate_permit,
+            credential_probe,
+            fred_v1_credential,
+            cancellation,
+            MAX_PROBE_BODY_BYTES,
+        )
+        .await
     }
 
     async fn collect_probe_response_bounded(

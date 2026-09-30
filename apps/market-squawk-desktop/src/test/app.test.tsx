@@ -13,6 +13,7 @@ import type { MarketProductRow } from "@/features/markets/market-product"
 import { parseInvestmentAnalysis, type InvestmentAnalysis } from "@/features/opportunities/contracts"
 import { PortfolioPlanning } from "@/features/portfolio/portfolio-planning"
 import type { PortfolioRiskReport } from "@/features/risk/contracts"
+import { lifecycleControls, type SourceEvidence } from "@/features/sources/source-evidence"
 import {
   type ApplicationResult,
   type DesktopSystemBootstrap,
@@ -1443,6 +1444,41 @@ describe("Market Squawk desktop boundary", () => {
       expect(screen.queryByLabelText("Local security password")).toBeNull()
     })
     expect(screen.getByRole("heading", { name: "Settings" })).toBeTruthy()
+  })
+
+  it("offers Retry for blocked Alpaca with retained configuration", () => {
+    const source = {
+      id: "alpaca.basic-market-data", name: "Alpaca",
+      declaredCoverage: null, qualityCeiling: null, releaseState: null, zeroFee: null,
+      accountRequirement: null, credentialRequirement: null, setupState: null, nextAction: null,
+      lifecycleSupport: "managed", operationalState: "blocked", runtimeState: "not_active",
+      sourceId: null, venueId: null, instrumentId: null, connection: null,
+      marketFreshness: null, integrity: null, quality: null, coverageState: null,
+      runtimeObservedAt: null, latestSetupSessionId: null, providerDatasetIdentifier: null,
+      storedData: null, storedDataQuarantine: null,
+      lifecycle: {
+        provider: "alpaca.basic-market-data", state: "blocked", stateRevision: "3",
+        configurationSessionId: "11111111-1111-4111-8111-111111111111",
+        publicConfigurationSha256: "a".repeat(64), doctor: null,
+        startEligibility: "reconciliation_required", blocker: "reconciliation",
+        observedAt: "2026-09-30T14:30:00.000000000Z",
+      },
+    } satisfies SourceEvidence
+
+    expect(lifecycleControls(source).find((control) => control.action === "retry")).toEqual({
+      action: "retry", label: "Retry", destructive: false,
+      request: {
+        provider: "alpaca.basic-market-data",
+        expectedStateRevision: "3",
+        reason: "desktop-user-request",
+      },
+    })
+    expect(lifecycleControls({ ...source, lifecycle: {
+      ...source.lifecycle, configurationSessionId: null,
+    } }).some((control) => control.action === "retry")).toBe(false)
+    expect(lifecycleControls({ ...source, lifecycle: {
+      ...source.lifecycle, publicConfigurationSha256: undefined,
+    } }).some((control) => control.action === "retry")).toBe(false)
   })
 
   it("keeps provider plumbing behind Settings onboarding", async () => {

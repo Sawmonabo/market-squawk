@@ -1183,7 +1183,13 @@ impl OnboardingLifecycle {
                     if targets_active_generation && self.state != OnboardingState::RenewalRequired {
                         return Err(OnboardingStateError::InvalidTransition);
                     }
-                    let renewal = targets_active_generation;
+                    let pending_renewal = self.state == OnboardingState::RuntimeVerificationPending
+                        && self.active_generation.is_none()
+                        && self.candidate_generation == Some(generation)
+                        && self
+                            .generation_alpaca_paper_iex_doctor_receipt(generation)
+                            .is_some();
+                    let renewal = targets_active_generation || pending_renewal;
                     if renewal {
                         self.validate_runtime_renewal(
                             capability,
@@ -1192,7 +1198,9 @@ impl OnboardingLifecycle {
                             observed_at,
                         )?;
                         self.generation_mut(generation)?.runtime_evidence = Some(evidence);
-                        self.state = OnboardingState::ActiveScoped;
+                        if targets_active_generation {
+                            self.state = OnboardingState::ActiveScoped;
+                        }
                     } else {
                         self.require_candidate(generation)?;
                         self.validate_initial_runtime_evidence(
@@ -2056,12 +2064,16 @@ impl OnboardingLifecycle {
             .revalidate()
             .map_err(|_| OnboardingStateError::InvalidEvidence)?;
         let record = self.generation(generation)?;
-        if self.state != OnboardingState::RenewalRequired
-            || self.active_generation != Some(generation)
-            || self.candidate_generation.is_some()
-            || record.state != CredentialGenerationState::ActiveScoped
-            || !evidence.admits_activation_at(observed_at)
-        {
+        let pending_renewal = self.state == OnboardingState::RuntimeVerificationPending
+            && self.active_generation.is_none()
+            && self.candidate_generation == Some(generation)
+            && record.state == CredentialGenerationState::VerifiedLeastPrivilege
+            && evidence.alpaca_paper_iex_receipt().is_some();
+        let active_renewal = self.state == OnboardingState::RenewalRequired
+            && self.active_generation == Some(generation)
+            && self.candidate_generation.is_none()
+            && record.state == CredentialGenerationState::ActiveScoped;
+        if !(pending_renewal || active_renewal) || !evidence.admits_activation_at(observed_at) {
             return Err(OnboardingStateError::InvalidTransition);
         }
         match evidence {
@@ -2072,6 +2084,12 @@ impl OnboardingLifecycle {
                     .as_ref()
                     .and_then(RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
                     .ok_or(OnboardingStateError::EvidenceMismatch)?;
+                if pending_renewal
+                    && (observed_at < prior.exclusive_expires_at()
+                        || next.verified_at() < prior.exclusive_expires_at())
+                {
+                    return Err(OnboardingStateError::InvalidEvidence);
+                }
                 if next.predecessor_digest() != Some(prior.receipt_sha256())
                     || next.verified_at() <= prior.verified_at()
                     || !next.same_authority_as(prior)

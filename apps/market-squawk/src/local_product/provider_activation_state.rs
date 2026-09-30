@@ -743,6 +743,27 @@ impl DurableProviderActivationState {
         pending: PendingAccountLifecycle,
     ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
         pending.validate()?;
+        let cancels_activation = expected.account.as_ref().is_some_and(|original| {
+            if original.finished
+                || !matches!(
+                    original.action,
+                    AccountLifecycleAction::Start
+                        | AccountLifecycleAction::Retry
+                        | AccountLifecycleAction::Resynchronize
+                        | AccountLifecycleAction::Reconfigure
+                        | AccountLifecycleAction::Verify
+                )
+                || !matches!(
+                    pending.action,
+                    AccountLifecycleAction::Stop | AccountLifecycleAction::Remove
+                )
+            {
+                return false;
+            }
+            let mut retained = original.clone();
+            retained.action = pending.action;
+            retained == pending
+        });
         if AccountMarketSurface::parse(surface).is_none()
             || command_digest.bytes() == [0; 32]
             || self.source_lifecycle_record(surface)? != *expected
@@ -750,6 +771,7 @@ impl DurableProviderActivationState {
                 .account
                 .as_ref()
                 .is_some_and(|pending| !pending.finished)
+                && !cancels_activation
         {
             return Err(DurableProviderActivationStateError::StaleState);
         }
@@ -889,14 +911,6 @@ impl DurableProviderActivationState {
         }
         pending.disposition = AccountStopDisposition::GracefullyDrained;
         let phase = match pending.action {
-            AccountLifecycleAction::Stop => {
-                pending.finished = true;
-                DurableSourceLifecyclePhase::Stopped
-            }
-            AccountLifecycleAction::Remove => {
-                pending.finished = true;
-                DurableSourceLifecyclePhase::Removed
-            }
             AccountLifecycleAction::OAuthProcessShutdown
             | AccountLifecycleAction::OAuthUnlink
             | AccountLifecycleAction::OAuthCredentialReplacement => {
@@ -3081,6 +3095,89 @@ mod tests {
             recovery.record().revision().get(),
             blocked.revision().get() + 1
         );
+
+        // Cancellation persists its own operation before cleanup. Reopening must retain
+        // Stop/Remove, never restart the superseded activation or lose its exact target.
+        let account_surface = "alpaca.basic-market-data";
+        for action in [AccountLifecycleAction::Stop, AccountLifecycleAction::Remove] {
+            let before = state.source_lifecycle_record(account_surface)?;
+            let pending = PendingAccountLifecycle {
+                action: AccountLifecycleAction::Start,
+                predecessor: None,
+                disposition: AccountStopDisposition::NoPredecessor,
+                target_session_id: Some(Uuid::new_v4()),
+                target_configuration_sha256: Some(lower_hex(&generation_digest(11).bytes())),
+                successor: None,
+                retired_successor: None,
+                successor_retirement: None,
+                finished: false,
+                oauth_restore_active: false,
+            };
+            let started = state.begin_account_lifecycle(
+                account_surface,
+                &before,
+                SourceIdentifier::try_from("interrupted-account-start")?,
+                generation_digest(12),
+                pending.clone(),
+            )?;
+            let mut cancellation = pending.clone();
+            cancellation.action = action;
+            let mut changed_target = cancellation.clone();
+            changed_target.target_session_id = Some(Uuid::new_v4());
+            assert!(matches!(
+                state.begin_account_lifecycle(
+                    account_surface,
+                    &started,
+                    SourceIdentifier::try_from("cancel-account-start")?,
+                    generation_digest(13),
+                    changed_target,
+                ),
+                Err(DurableProviderActivationStateError::StaleState)
+            ));
+            let cancelling = state.begin_account_lifecycle(
+                account_surface,
+                &started,
+                SourceIdentifier::try_from("cancel-account-start")?,
+                generation_digest(13),
+                cancellation.clone(),
+            )?;
+            assert_eq!(cancelling.revision().get(), started.revision().get() + 1);
+            assert_ne!(cancelling.operation_id(), started.operation_id());
+            assert_eq!(cancelling.account(), Some(&cancellation));
+            let reopened = DurableProviderActivationState::new(temporary.path().to_path_buf());
+            assert_eq!(
+                reopened.source_lifecycle_record(account_surface)?,
+                cancelling
+            );
+            assert!(matches!(
+                reopened.begin_account_lifecycle(
+                    account_surface,
+                    &started,
+                    SourceIdentifier::try_from("stale-account-cancellation")?,
+                    generation_digest(14),
+                    cancellation.clone(),
+                ),
+                Err(DurableProviderActivationStateError::StaleState)
+            ));
+            cancellation.finished = true;
+            let phase = if action == AccountLifecycleAction::Remove {
+                DurableSourceLifecyclePhase::Removed
+            } else {
+                DurableSourceLifecyclePhase::Stopped
+            };
+            let completed = reopened.update_account_lifecycle(
+                account_surface,
+                &cancelling,
+                cancellation,
+                phase,
+                None,
+            )?;
+            assert_eq!(completed.phase(), phase);
+            assert_eq!(completed.revision(), cancelling.revision());
+            assert_eq!(completed.operation_id(), cancelling.operation_id());
+            assert_eq!(completed.command_digest(), cancelling.command_digest());
+            assert_eq!(completed.transition_digest, cancelling.transition_digest);
+        }
         Ok(())
     }
 

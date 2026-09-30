@@ -1187,8 +1187,7 @@ export function lifecycleControls(source: SourceEvidence): LifecycleControl[] {
               ]
             : [control("verify", "Run doctor", { ...base, ...exactConfiguration })]
           : []),
-        ...(PUBLIC_LIVE_SOURCES.has(source.id) ||
-        (hasConfiguration && source.id !== "alpaca.basic-market-data")
+        ...(PUBLIC_LIVE_SOURCES.has(source.id) || hasConfiguration
           ? [
               control("retry", "Retry", {
                 ...base,
